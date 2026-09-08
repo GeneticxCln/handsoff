@@ -7,7 +7,7 @@ TTS, keyboard takeover, settings opener `Mod+Shift+S`, autostart, crash log).
 ## Addendum — 2026-09-08 external audit closure
 
 Every priority finding and most "remaining gaps" from the external audit are
-now closed (218 tests green):
+now closed (220 tests green):
 
 - Command whitelist bypass via absolute `niri` paths — closed (basename-keyed
   spawn checks; `TestSpawnInterpreterBoundary` extended).
@@ -24,6 +24,11 @@ now closed (218 tests green):
 - Dependency manifest — `requirements.txt` (installer now consumes it).
 - Portable config — `niri-window-rule.kdl` no longer hardcodes a username.
 - Historical patcher — moved to `attic/` with an explanatory README.
+- Git baseline — repo initialized with `.gitignore` (runtime state excluded),
+  CI smoke job for the installer, single-source-of-truth restart script, and a
+  versioned pre-commit hook (`githooks/`, enable via
+  `git config core.hooksPath githooks`) so broken self-edits can't be
+  committed — pinned by `TestPrecommitHook`.
 
 Still open, accepted consciously: real-hardware acceptance session (mic, echo,
 suspend/resume), CI rehearse-runs of the installer, ICS MONTHLY/YEARLY RRULE.
@@ -40,7 +45,7 @@ suspend/resume), CI rehearse-runs of the installer, ICS MONTHLY/YEARLY RRULE.
 - Ops: niri window rule (round bubble), autostart, keybinds Mod+V / Mod+Shift+V
   / Mod+Shift+H / Mod+Shift+S (settings, works even when the bubble is dead),
   restart script with lock race fixed, faulthandler crash log
-- 218 tests, all green
+- 220 tests, all green
 
 ## P0 — reliability gaps (the bubble must never be a zombie again)
 

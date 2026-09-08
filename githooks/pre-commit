@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# handsoff pre-commit gate — a self-edit that breaks the suite cannot be committed.
+#
+# Enabled by `git config core.hooksPath githooks` (pinned by
+# test_precommit_hook_is_versioned). Skip deliberately with:
+#   git commit --no-verify
+set -u
+
+# Only gate commits that actually change shipped sources; commits touching
+# nothing (rare) pass through.
+changed=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -z "$changed" ]; then
+    exit 0
+fi
+
+fail=0
+
+# 1. Byte-compile every staged Python source (cheap, catches syntax rot first).
+for f in $(echo "$changed" | grep '\.py$' || true); do
+    if [ -f "$f" ]; then
+        python3 -m py_compile "$f" || fail=1
+    fi
+done
+
+# 2. Shell syntax for staged shell scripts.
+for f in $(echo "$changed" | grep -E '(^|/)[^/]+\.sh$|^install\.sh$|^handsoff-restart$' || true); do
+    if [ -f "$f" ]; then
+        bash -n "$f" || fail=1
+    fi
+done
+
+# 3. The full suite whenever shipped sources changed. Deliberately broad:
+# handsoff.py is both app and self-edit target, and the suite pins prompt
+# text, tool census, and restart-script internals — narrow filters miss rot.
+if echo "$changed" | grep -qE '\.(py|sh)$|^install\.sh$|^handsoff-restart$|^pytest\.ini$|\.github/'; then
+    echo "pre-commit: running test suite (218 tests, ~5s)…"
+    python3 -m pytest test_handsoff.py -q || fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo ""
+    echo "✗ pre-commit checks FAILED — commit refused (the self-edit would break the repo)."
+    echo "  Fix the failure, or bypass deliberately with: git commit --no-verify"
+    exit 1
+fi
+exit 0

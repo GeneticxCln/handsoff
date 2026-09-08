@@ -26,7 +26,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All 29 tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 218 tests pin the behavior (`python -m pytest test_handsoff.py`).
+automatically. 220 tests pin the behavior (`python -m pytest test_handsoff.py`).
 
 ## Requirements
 
@@ -259,7 +259,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest test_handsoff.py -q     # 218 tests
+python -m pytest test_handsoff.py -q     # 220 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
@@ -268,6 +268,17 @@ CI (`.github/workflows/ci.yml`) runs exactly these gates on every push: the
 suite on Python 3.12 and 3.13 (offscreen Qt, no audio hardware needed),
 byte-compilation of every source file, and shell syntax checks. Background-
 thread exceptions fail the run via `pytest.ini` rather than passing silently.
+
+**Pre-commit gate** — the repo ships `githooks/pre-commit`, which runs the
+compile, shell-syntax, and full-suite gates before every commit, so a broken
+self-edit cannot be committed. Enable it after cloning (one time):
+
+```bash
+git config core.hooksPath githooks
+```
+
+A regression test (`TestPrecommitHook`) pins the hook's presence; bypass
+deliberately with `git commit --no-verify`.
 
 Layout of `handsoff.py`: config → system prompt → Ollama client → audio
 (STT/TTS) → tools → Assistant state machine → Bubble UI → main(). The

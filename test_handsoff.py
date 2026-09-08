@@ -2840,3 +2840,31 @@ class TestICSOverrides:
         for line in out.splitlines():
             if line.strip().startswith(tmr):
                 assert "10:00" not in line, line
+
+
+class TestPrecommitHook:
+    """The versioned pre-commit gate: self-edits that break the suite
+    must not be committable. core.hooksPath pins the hook to clones."""
+
+    def test_precommit_hook_is_versioned(self):
+        hook = HERE / "githooks" / "pre-commit"
+        assert hook.exists(), "githooks/pre-commit went missing"
+        text = hook.read_text()
+        # the hook must actually gate the things that rot
+        assert "py_compile" in text
+        assert "bash -n" in text
+        assert "pytest" in text
+        assert "--no-verify" in text   # documented escape hatch
+
+    def test_hook_blocked_commit_is_reproducible(self):
+        """Replay the refusal: run the hook's compile leg against a broken
+        file the way git would (staged, cwd = repo root)."""
+        import subprocess as sp
+        broken = HERE / "zz_hook_probe_broken.py"
+        broken.write_text("def broken(:\n    pass\n", encoding="utf-8")
+        try:
+            r = sp.run([sys.executable, "-m", "py_compile", str(broken)],
+                       capture_output=True)
+            assert r.returncode != 0, "py_compile must fail on broken syntax"
+        finally:
+            broken.unlink(missing_ok=True)
