@@ -133,6 +133,32 @@ def _reload_niri() -> None:
         pass
 
 
+def systemd_owns_autostart() -> bool:
+    """True when the systemd user unit is enabled: systemd then owns the
+    bubble's autostart and niri spawn-at-startup must NOT be added (single
+    autostart owner — same rule the installer applies)."""
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", "is-enabled", "handsoff.service"],
+            capture_output=True, text=True, timeout=5,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
+def apply_autostart(enable: bool) -> str:
+    """Autostart part of a settings save; returns the human message.
+
+    Defers to systemd when the user unit is enabled: adding niri
+    spawn-at-startup then would double-start the bubble (its instance lock
+    blocks the second bubble, but ownership/restart behaviour gets murky).
+    """
+    if enable and systemd_owns_autostart():
+        return ("Autostart: systemd already manages handsoff — niri "
+                "spawn-at-startup NOT added (double-start guard).")
+    return set_autostart(enable)
+
+
 def set_autostart(enable: bool) -> str:
     """Add or remove the spawn-at-startup line in the niri config (with backup)."""
     try:
@@ -1197,22 +1223,9 @@ class SettingsWindow(QMainWindow):
         except OSError as e:
             self._status(f"cannot save settings: {e}")
             return False
-        # One autostart owner, same rule as the installer: if the systemd
-        # user unit manages the bubble, spawn-at-startup would double-start
-        # it (the lock blocks the second bubble but ownership gets murky).
-        if self.autostart_chk.isChecked():
-            try:
-                unit_enabled = subprocess.run(
-                    ["systemctl", "--user", "is-enabled", "handsoff.service"],
-                    capture_output=True, text=True, timeout=5,
-                ).returncode == 0
-            except Exception:
-                unit_enabled = False
-            if unit_enabled:
-                self._status("Saved to settings. Autostart: systemd already owns it "
-                             "— niri spawn-at-startup NOT added.")
-                return True
-        msg = set_autostart(self.autostart_chk.isChecked())
+        # One autostart owner, same rule as the installer: when the systemd
+        # user unit manages the bubble, niri spawn-at-startup is NOT added.
+        msg = apply_autostart(self.autostart_chk.isChecked())
         warn = f"  (ignored, always blocked: {', '.join(blocked_chosen)})" if blocked_chosen else ""
         self._status(f"Saved to {H.SETTINGS_FILE}. {msg}{warn}{cleared_note}")
         return True

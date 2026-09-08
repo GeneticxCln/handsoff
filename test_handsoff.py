@@ -530,6 +530,67 @@ class TestSettingsApp:
         assert merged["bubble_size"] == mod.H.DEFAULT_SETTINGS["bubble_size"]  # default fills
         assert mod.merge_settings({}) == mod.H.DEFAULT_SETTINGS  # empty file -> pure defaults
 
+    def test_settings_app_coerces_garbage_values(self):
+        """Audit #2 regression: hand-edited garbage ("abc", "1,5", "32k") must
+        coerce to defaults inside merge_settings — _load_values' int()/float()
+        then see clean types instead of crashing SettingsWindow.__init__ (the
+        recovery tool must open even when the config is broken)."""
+        mod = _load("handsoff_settings_3", HERE / "handsoff-settings.py")
+        for bad in ({"engage_seconds": "abc"}, {"tts_rate": "1,5"},
+                    {"num_ctx": "32k"}):
+            m = mod.merge_settings(bad)
+            for k in bad:
+                assert m[k] == mod.H.DEFAULT_SETTINGS[k], (k, m[k])
+        # numeric keys come out as real numbers, never strings
+        m = mod.merge_settings({"num_ctx": "16384", "tts_rate": "1.25"})
+        assert isinstance(m["num_ctx"], int) and m["num_ctx"] == 16384
+        assert isinstance(m["tts_rate"], float) and abs(m["tts_rate"] - 1.25) < 1e-9
+        # the coercion wiring itself is pinned (not easily removable)
+        import inspect
+        assert "coerce_settings" in inspect.getsource(mod.merge_settings)
+
+    def test_autostart_defers_to_enabled_systemd_unit(self, monkeypatch):
+        """With the systemd unit enabled, checking the autostart checkbox must
+        NOT write niri spawn-at-startup (single autostart owner)."""
+        mod = _load("handsoff_settings_4", HERE / "handsoff-settings.py")
+        monkeypatch.setattr(mod, "systemd_owns_autostart", lambda: True)
+        called = []
+        monkeypatch.setattr(mod, "set_autostart",
+                            lambda enable: called.append(enable) or "wrote")
+        msg = mod.apply_autostart(True)
+        assert called == [], "spawn-at-startup must not be written"
+        assert "NOT added" in msg
+
+    def test_autostart_applies_when_systemd_absent(self, monkeypatch):
+        """No systemd unit -> the checkbox still manages the niri spawn line
+        (both enable and disable paths)."""
+        mod = _load("handsoff_settings_5", HERE / "handsoff-settings.py")
+        monkeypatch.setattr(mod, "systemd_owns_autostart", lambda: False)
+        called = []
+        monkeypatch.setattr(mod, "set_autostart",
+                            lambda enable: called.append(enable) or f"wrote {enable}")
+        assert mod.apply_autostart(True) == "wrote True"
+        assert mod.apply_autostart(False) == "wrote False"
+        assert called == [True, False]
+
+    def test_autostart_probe_fails_open_to_niri(self, monkeypatch):
+        """systemctl unavailable (no systemd session) -> systemd does NOT own
+        autostart, so the niri path stays usable."""
+        mod = _load("handsoff_settings_6", HERE / "handsoff-settings.py")
+        def boom(*a, **k):
+            raise FileNotFoundError("systemctl")
+        monkeypatch.setattr(mod.subprocess, "run", boom)
+        assert mod.systemd_owns_autostart() is False
+
+    def test_save_routes_through_apply_autostart(self):
+        """The GUI save path must call the deferral-aware helper, not
+        set_autostart directly (the call site was the original bug)."""
+        import inspect
+        mod = _load("handsoff_settings_7", HERE / "handsoff-settings.py")
+        src = inspect.getsource(mod.SettingsWindow.save)
+        assert "apply_autostart(" in src
+        assert "set_autostart(" not in src.replace("apply_autostart(", "")
+
 
 # ---------------------------------------------------------------- keyboard takeover
 
