@@ -9,7 +9,7 @@ jobs:
   # PySide6 and sounddevice are the suite's hard imports — whisper/piper/
   # openwakeword are lazy-imported and every test that touches them
   # monkeypatches the call, so they are not installed here (verified: the
-  # suite passes 230/230 in a clean venv with only these four).
+  # suite passes 232/232 in a clean venv with only these four).
   tests:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

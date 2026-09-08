@@ -322,20 +322,38 @@ def _is_wake_utt(text: str) -> bool:
             and words[1:] == name_words)
 
 
+def _wake_skeleton(word: str) -> str:
+    """Pronunciation-ish skeleton: consonants only, c/k/q/x/z→s, h/w dropped,
+    liquids/nasals (r/l/m) unified to n. Whistle-down of whisper mishearings
+    like 'cypher'→'Siphon' (both → 'spn'): wake matching must err toward
+    LISTENING, not toward ignoring its own user."""
+    w = word.lower().translate(str.maketrans("", "", "hw"))
+    w = w.translate(str.maketrans("ckqxz", "sssss"))
+    w = "".join(ch for ch in w if ch not in "aeiouy")
+    return w.replace("r", "n").replace("m", "n").replace("l", "n")
+
+
 def _match_wake(text: str) -> str | None:
     """If `text` starts with the wake name, return the rest (possibly '').
     Accepts 'name ...', 'hey name ...', 'name, ...'. None if no wake word.
     Word-token based, name tried before the filler skip (so a custom name
-    that itself starts with 'hey' still works)."""
+    that itself starts with 'hey' still works). Falls back to a fuzzy
+    pronunciation-skeleton match for misheard names (Siphon~cypher)."""
     words = _norm_words(text)
     if not words:
         return None
     lw = [w.lower() for w in words]
     name_words = _wake_name().split()
+    fuzzy_ok = all(len(nw) >= 4 for nw in name_words)   # never fuzzy on tiny names
     for skip in (0, 1):
         if skip and (len(lw) <= skip or lw[skip - 1] not in _WAKE_FILLER):
             continue
-        if lw[skip:skip + len(name_words)] == name_words:
+        seg = lw[skip:skip + len(name_words)]
+        if seg == name_words:
+            return " ".join(words[skip + len(name_words):])
+        if (fuzzy_ok and len(seg) == len(name_words)
+                and [_wake_skeleton(w) for w in seg]
+                == [_wake_skeleton(nw) for nw in name_words]):
             return " ".join(words[skip + len(name_words):])
     return None
 
@@ -686,6 +704,42 @@ def _read_http_error(e: urllib.error.HTTPError) -> str:
 # ------------------------------------------------------------------------ audio in
 
 
+def _resample_to_16k(data: np.ndarray, rate: int) -> np.ndarray:
+    """Resample flat int16 audio to SAMPLE_RATE (linear interp, speech-grade).
+
+    Some input devices (e.g. Logitech StreamCam) cannot capture at 16 kHz at
+    all; they are opened at their native rate and every frame is converted
+    here so the pipeline always sees 16 kHz audio."""
+    if rate == SAMPLE_RATE or data.size == 0:
+        return data
+    duration = data.size / float(rate)
+    target_n = max(1, int(round(duration * SAMPLE_RATE)))
+    x_old = np.linspace(0.0, duration, num=data.size, endpoint=False)
+    x_new = np.linspace(0.0, duration, num=target_n, endpoint=False)
+    return np.interp(x_new, x_old, data.astype(np.float32)).astype(np.int16)
+
+
+def _open_input(device, rate: int, blocksize: int, cb) -> tuple:
+    """Open a mono int16 InputStream at `rate`; if the device rejects that
+    rate (PortAudio 'Invalid sample rate'), retry once at the device's
+    native default rate. Returns (stream, actual_rate)."""
+    try:
+        return sd.InputStream(samplerate=rate, channels=1, dtype="int16",
+                              blocksize=blocksize, callback=cb, device=device), rate
+    except Exception:
+        try:
+            info = (sd.query_devices(device, kind="input") if device is not None
+                    else sd.query_devices(kind="input"))
+            native = int(float(info.get("default_samplerate") or rate))
+        except Exception:
+            native = rate
+        if native == rate:
+            raise
+        stream = sd.InputStream(samplerate=native, channels=1, dtype="int16",
+                                blocksize=blocksize, callback=cb, device=device)
+        return stream, native
+
+
 class Recorder:
     """16 kHz mono int16 microphone capture with live RMS levels."""
 
@@ -700,10 +754,10 @@ class Recorder:
 
     def start(self) -> None:
         self._frames = []
-        self._stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-            blocksize=1024, callback=self._cb, device=self._device,
-        )
+        # devices that can't capture at 16 kHz (StreamCam…) are opened at
+        # their native rate; stop() resamples everything to 16 kHz for STT
+        self._stream, self._native_rate = _open_input(
+            self._device, SAMPLE_RATE, 1024, self._cb)
         self._stream.start()
 
     def _cb(self, indata, frames, time_info, status) -> None:
@@ -727,7 +781,8 @@ class Recorder:
                 log.exception("failed to close input stream")
         if not self._frames:
             return None
-        return np.concatenate(self._frames).reshape(-1)
+        audio = np.concatenate(self._frames).reshape(-1)
+        return _resample_to_16k(audio, getattr(self, "_native_rate", SAMPLE_RATE))
 
 
 # ------------------------------------------------------------------------ STT / TTS
@@ -2983,6 +3038,9 @@ class ContinuousListener:
             self._assistant._vad_speech(False)
             if len(frames) >= min_frames:
                 audio = np.concatenate(frames).reshape(-1)
+                # convert to the pipeline's 16 kHz domain (no-op at 16 kHz)
+                audio = _resample_to_16k(
+                    audio, getattr(self, "_capture_rate", SAMPLE_RATE))
                 if self._spotter is not None and self._spotter._armed:
                     # spotter caught the wake phrase; VAD caught the command —
                     # merge and mark so the transcript gate is bypassed
@@ -3038,10 +3096,11 @@ class ContinuousListener:
             # re-resolve the device each (re)open so settings changes apply live
             device = str(SETTINGS["mic_device"]) if SETTINGS["mic_device"] else None
             try:
-                self._stream = sd.InputStream(
-                    samplerate=SAMPLE_RATE, channels=1, dtype="int16",
-                    blocksize=self.FRAME, callback=cb, device=device,
-                )
+                # devices that reject 16 kHz (e.g. StreamCam) are opened at
+                # their native rate instead; utterances are resampled to
+                # 16 kHz at ingestion so the pipeline is rate-agnostic
+                self._stream, rate = _open_input(
+                    device, SAMPLE_RATE, self.FRAME, cb)
                 self._stream.start()
             except Exception as e:
                 open_failures += 1
@@ -3068,6 +3127,10 @@ class ContinuousListener:
                 time.sleep(2.0 if open_failures < 30 else 10.0)
                 continue
             open_failures = 0
+            self._capture_rate = rate
+            if rate != SAMPLE_RATE:
+                log.info("mic opened at native %d Hz (resampling to %d)",
+                         rate, SAMPLE_RATE)
             if getattr(self, "_was_struggling", False):
                 self._was_struggling = False
                 notify("hands-free: microphone is back")

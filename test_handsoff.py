@@ -3083,3 +3083,42 @@ class TestAuditRoundTwo:
         ]), encoding="utf-8")
         loaded = H.Assistant._load_history()
         assert all(m.get("role") != "system" for m in loaded)
+
+
+class TestNativeRateMicAndFuzzyWake:
+    """E2E findings (2026-09-08): StreamCam can't capture at 16 kHz and the
+    wake gate rejected the wake name on a whisper mishearing (cypher→Siphon)."""
+
+    def test_resample_to_16k(self, H):
+        # 1 s of 48 kHz sine → exactly 1 s of 16 kHz
+        t = np.arange(48000, dtype=np.float32) / 48000.0
+        hi = (np.sin(2 * np.pi * 440 * t) * 8000).astype(np.int16)
+        out = H._resample_to_16k(hi, 48000)
+        assert out.dtype == np.int16 and len(out) == 16000
+        # 44.1 → 16 keeps duration
+        t = np.arange(44100, dtype=np.float32) / 44100.0
+        lo = (np.sin(2 * np.pi * 220 * t) * 8000).astype(np.int16)
+        assert len(H._resample_to_16k(lo, 44100)) == 16000
+        # 16 kHz input is a passthrough (same object, no copy)
+        same = np.zeros(1600, dtype=np.int16)
+        assert H._resample_to_16k(same, 16000) is same
+
+    def test_match_wake_fuzzy_misheard_name(self, H):
+        # the exact E2E failure: piper's 'cypher' transcribed as 'Siphon'
+        assert H._match_wake("Hey Siphon, what is the capital of France?") == \
+            "what is the capital of France"
+        assert H._match_wake("Hey Siphon") == ""
+        # correct name still works, junk still rejected
+        assert H._match_wake("hey cypher what's the weather") == "what's the weather"
+        assert H._match_wake("stop the music") is None
+        assert H._match_wake("what time is it") is None
+        assert H._match_wake("hey siphonatic overlord") is None
+        # tiny wake names never go fuzzy (too many false accepts)
+        H_obj = H.Assistant.__new__(H.Assistant)   # noqa: F841
+        old = H._wake_name
+        H._wake_name = lambda: "bo"
+        try:
+            assert H._match_wake("hey bonobo over there") is None
+            assert H._match_wake("hey bo hello") == "hello"
+        finally:
+            H._wake_name = old

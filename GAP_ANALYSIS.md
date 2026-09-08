@@ -7,7 +7,7 @@ TTS, keyboard takeover, settings opener `Mod+Shift+S`, autostart, crash log).
 ## Addendum — 2026-09-08 external audit closure
 
 Every priority finding and most "remaining gaps" from the external audit are
-now closed (230 tests green):
+now closed (232 tests green):
 
 - Command whitelist bypass via absolute `niri` paths — closed (basename-keyed
   spawn checks; `TestSpawnInterpreterBoundary` extended).
@@ -45,7 +45,7 @@ suspend/resume), CI rehearse-runs of the installer, ICS MONTHLY/YEARLY RRULE.
 - Ops: niri window rule (round bubble), autostart, keybinds Mod+V / Mod+Shift+V
   / Mod+Shift+H / Mod+Shift+S (settings, works even when the bubble is dead),
   restart script with lock race fixed, faulthandler crash log
-- 230 tests, all green
+- 232 tests, all green
 
 ## P0 — reliability gaps (the bubble must never be a zombie again)
 
