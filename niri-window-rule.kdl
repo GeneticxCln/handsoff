@@ -1,0 +1,33 @@
+// handsoff voice-assistant bubble — niri config snippet (PORTABLE EXAMPLE)
+//
+// NOTE: install.sh writes a real copy with your absolute install path into
+// ~/.config/handsoff/niri-window-rule.kdl — prefer that file. This example is
+// for manual setups and works for any user: the commands run via `sh -c`, so
+// `~` expands to your home directory (niri itself does not expand `~`).
+//
+// 1) window-rule + spawn line: top level of ~/.config/niri/config.kdl
+// 2) keybinds: merge into your binds { ... } section
+
+window-rule {
+    match app-id=r#"^handsoff$"#
+    open-floating true
+    // 16 px in from the bottom-right corner of the usable area
+    default-floating-position x=16 y=16 relative-to="bottom-right"
+    focus-ring { off; }
+    border { off; }
+    shadow { off; }
+}
+
+// Launch the bubble at niri startup (top level of the config):
+spawn-at-startup "sh" "-c" "exec python ~/.local/bin/handsoff.py"
+
+// Keyboard control — merge into binds { ... } and reload niri's config.
+// niri cannot bind key release, so "toggle" = press to start, press again to send.
+binds {
+    // talk toggle: start when idle, send while recording, interrupt otherwise
+    Mod+V repeat=false hotkey-overlay-title="handsoff: talk" { spawn "sh" "-c" "exec python ~/.local/bin/handsoff.py --ptt toggle"; }
+    // make the bubble stop talking / thinking immediately
+    Mod+Shift+V repeat=false { spawn "sh" "-c" "exec python ~/.local/bin/handsoff.py --ptt interrupt"; }
+    // toggle continuous hands-free listening on/off
+    Mod+H repeat=false { spawn "sh" "-c" "exec python ~/.local/bin/handsoff.py --ptt handsfree"; }
+}

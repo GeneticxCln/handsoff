@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# handsoff-restart — stop the running bubble and start the (possibly self-edited) new one.
+# Used by the assistant itself after edit_file, and by the "Restart" right-click menu.
+set -u
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
+LOG="$STATE/handsoff.log"
+SCRIPT="$HOME/.local/bin/handsoff.py"
+mkdir -p "$STATE"
+
+stop_instances() {
+    local sig="$1" pid exe
+    for pid in $(pgrep -f 'handsoff\.py' 2>/dev/null); do
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
+        case "$(basename "$exe")" in
+            python|python3|python[0-9].*) ;;
+            *) continue ;;   # never touch editors, tails, shells that merely mention the path
+        esac
+        tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -qxF "$SCRIPT" || continue
+        kill "-$sig" "$pid" 2>/dev/null || true
+    done
+}
+
+stop_instances TERM
+sleep 0.4
+stop_instances KILL
+
+# wait for the lock to actually free, or the new instance will hit
+# "already running, exiting" and leave nothing running
+for _ in $(seq 1 40); do
+    pgrep -f 'handsoff\.py' >/dev/null 2>&1 || break
+    sleep 0.1
+done
+
+# if systemd owns the bubble, ask it to restart — a nohup spawn here would
+# collide with the unit's own Restart=always (double bubble race)
+if systemctl --user is-active --quiet handsoff.service 2>/dev/null \
+        || systemctl --user is-enabled --quiet handsoff.service 2>/dev/null; then
+    systemctl --user restart handsoff.service
+    echo "handsoff restarted via systemd"
+    exit 0
+fi
+
+nohup setsid /usr/bin/python "$SCRIPT" >>"$LOG" 2>&1 &
+disown
+echo "handsoff restarted (pid $!)"
