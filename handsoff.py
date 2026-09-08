@@ -155,6 +155,7 @@ DEFAULT_SETTINGS: dict = {
         "web_access": True,
         "media": True,
         "screen_access": True,
+        "paste_text": True,   # reading the user's clipboard gets its own switch
     },
     "extra_allowed_commands": [],
     "tool_call_times": None,          # filled per-ToolBelt: deque of monotonic times
@@ -175,29 +176,12 @@ DEFAULT_SETTINGS: dict = {
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
 
-def _load_settings() -> dict:
-    """Built-in defaults <- environment <- settings.json (the settings app wins)."""
-    s = json.loads(json.dumps(DEFAULT_SETTINGS))
-    env_map = {
-        "ollama_host": "OLLAMA_HOST", "model": "HANDSOFF_MODEL",
-        "num_ctx": "HANDSOFF_NUM_CTX", "whisper_size": "HANDSOFF_WHISPER",
-        "piper_voice": "HANDSOFF_VOICE",
-    }
-    for key, var in env_map.items():
-        if os.environ.get(var):
-            s[key] = os.environ[var]
-    try:
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError, OSError):
-        data = {}
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k not in s:
-                continue
-            if isinstance(s[k], dict) and isinstance(v, dict):
-                s[k].update(v)
-            else:
-                s[k] = v
+def coerce_settings(s: dict) -> dict:
+    """Coerce/validate raw merged settings IN PLACE. Shared by the bubble's
+    _load_settings AND the settings app (a hand-edited settings.json must
+    never crash either program; the settings app is the recovery tool and
+    must open even when the config is garbage)."""
+    log = logging.getLogger("handsoff")
 
     def _num(key: str, cast, lo, hi) -> None:
         """Coerce one numeric setting; on garbage, warn and use the default
@@ -205,9 +189,9 @@ def _load_settings() -> dict:
         try:
             s[key] = min(hi, max(lo, cast(s[key])))
         except (TypeError, ValueError):
-            logging.getLogger("handsoff").warning(
-                "invalid %s in %s — using default %r",
-                key, SETTINGS_FILE, DEFAULT_SETTINGS[key])
+            log.warning(
+                "invalid %s — using default %r",
+                key, DEFAULT_SETTINGS[key])
             s[key] = DEFAULT_SETTINGS[key]
 
     _num("num_ctx", int, 1024, 2 ** 20)
@@ -250,6 +234,32 @@ def _load_settings() -> dict:
     if not isinstance(s.get("tool_call_times"), (list, type(None))):
         s["tool_call_times"] = None
     return s
+
+
+def _load_settings() -> dict:
+    """Built-in defaults <- environment <- settings.json (the settings app wins)."""
+    s = json.loads(json.dumps(DEFAULT_SETTINGS))
+    env_map = {
+        "ollama_host": "OLLAMA_HOST", "model": "HANDSOFF_MODEL",
+        "num_ctx": "HANDSOFF_NUM_CTX", "whisper_size": "HANDSOFF_WHISPER",
+        "piper_voice": "HANDSOFF_VOICE",
+    }
+    for key, var in env_map.items():
+        if os.environ.get(var):
+            s[key] = os.environ[var]
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError, OSError):
+        data = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if k not in s:
+                continue
+            if isinstance(s[k], dict) and isinstance(v, dict):
+                s[k].update(v)
+            else:
+                s[k] = v
+    return coerce_settings(s)
 
 
 SETTINGS = _load_settings()
@@ -1648,10 +1658,17 @@ class ToolBelt:
             if shutil.which(rest[0]) is None:
                 return f"ERROR: no program named '{target}' is installed"
             arg_str = " ".join(shlex.quote(a) for a in rest[1:]).lower()
+            # script-executing flags of ANY spawned binary: '--script=/tmp/x'
+            # (mpv), '-x <file>' (gdb), 'source <file>' patterns, plus the
+            # interpreter flags. niri spawn must not become an arbitrary-
+            # code-execution route around the BLOCKED list.
             if (" -e " in f" {arg_str} " or "--command" in arg_str
                     or "--eval" in arg_str or "--print" in arg_str
-                    or "-c" == arg_str.strip()):
-                return ("REFUSED: passing interpreter/code flags to spawned programs "
+                    or "--script" in arg_str or "-x" == arg_str.strip()
+                    or " -x " in f" {arg_str} " or "-c" == arg_str.strip()
+                    or "source " in arg_str or ".lua" in arg_str
+                    or ".js" in arg_str or ".py" in arg_str):
+                return ("REFUSED: passing script/code flags to spawned programs "
                         "is not allowed")
         try:
             proc = subprocess.run(
@@ -1693,7 +1710,10 @@ class ToolBelt:
         try:
             proc = subprocess.run(
                 ["ydotool", *args], capture_output=True, text=True,
-                timeout=20 + len(args) // 64,
+                # typing takes ~6 ms per char on the "type" path: the timeout
+                # must scale with payload size or long texts (cap 20k chars
+                # = ~2 min of typing) die with a false "timed out".
+                timeout=20 + 0.01 * sum(len(a) for a in args),
             )
         except FileNotFoundError:
             return "ERROR: ydotool not installed (pacman -S ydotool)"
@@ -2110,8 +2130,14 @@ class ToolBelt:
         if not text:
             return "REFUSED: nothing to copy"
         try:
+            # DEVNULL, not capture_output: wl-copy forks a background child
+            # that SERVES the clipboard and inherits our stdout pipe — with
+            # capture_output, communicate() blocks on that inherited pipe
+            # until the timeout and a SUCCESSFUL copy reports a false
+            # "wl-copy timed out". No pipe, no false wait.
             subprocess.run(["wl-copy", "--", text],
-                           capture_output=True, timeout=8)
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=8)
         except FileNotFoundError:
             return "ERROR: wl-clipboard is not installed (pacman -S wl-clipboard)"
         except subprocess.TimeoutExpired:
@@ -3204,7 +3230,13 @@ class Assistant(QObject):
                         gen, cancel), self._set(gen, IDLE)),
                     name="crash-report", daemon=True,
                 ).start()
-                crash.unlink(missing_ok=True)
+                # truncate (do NOT unlink): faulthandler still holds the fd
+                # opened at startup. Unlinking orphans it — a LATER crash
+                # would write to a deleted inode and never be reported again.
+                # The fd is O_APPEND, so after truncation the next crash
+                # appends from offset 0 and is visible on the next boot.
+                with open(crash, "w"):
+                    pass
         except Exception:
             log.exception("crash report failed")
 
@@ -3355,7 +3387,7 @@ class Assistant(QObject):
         self._set(gen, THINKING)
         # zero-LLM stop: probe the transcript in parallel; if it is a bare
         # stop command the queued turn is drained before the brain ever runs
-        self._maybe_instant_stop(audio)
+        self._maybe_instant_stop(audio, gen)
         # hand off to the single pipeline worker: two overlapping pipelines
         # would race the shared history, _stream_result and tool belt (the old
         # thread-per-utterance design let an interrupted-but-still-running
@@ -3392,32 +3424,43 @@ class Assistant(QObject):
             "thats all", "that is all",
         }
 
-    def _maybe_instant_stop(self, audio: np.ndarray) -> None:
+    def _maybe_instant_stop(self, audio: np.ndarray, gen: int) -> None:
         """Zero-LLM voice stop: transcribe in a throwaway thread the moment an
         utterance arrives; if it is a bare stop command, the pipeline turn is
         drained (interrupt() already silenced playback) and the transcript is
         handed to the brain anyway so 'stop the music' still works.
 
         The transcription is reused by _pipeline via _last_transcript, so the
-        audio is never transcribed twice."""
+        audio is never transcribed twice. `gen` is THIS utterance's generation,
+        captured at submission: the probe thread may finish after a newer
+        utterance has bumped _gen, and stamping then would attach this
+        utterance's text to the wrong turn (cross-turn transcript reuse)."""
         def _probe() -> None:
             try:
                 text = transcribe(audio)
             except Exception:
                 log.exception("stop-probe transcription failed")
                 return
-            self._last_transcript = (text, self._gen, _tick_now())
+            self._last_transcript = (text, gen, _tick_now())
             if self._is_stop_utt(text):
                 log.info("voice stop: draining pipeline for %r", text)
                 # no lock here: get_nowait() takes the queue's own (non-
                 # reentrant) mutex — holding it would deadlock. If the worker
                 # dequeues first, _pipeline's stop check still drops it.
+                # Only drop THIS utterance's turn (gen <= probe gen): a probe
+                # finishing late must never swallow a newer utterance's turn.
+                kept = []
                 while True:
                     try:
-                        self._pipeline_q.get_nowait()
-                        self._pipeline_q.task_done()
+                        item = self._pipeline_q.get_nowait()
                     except queue.Empty:
                         break
+                    if item[1] <= gen:
+                        self._pipeline_q.task_done()
+                    else:
+                        kept.append(item)
+                for it in kept:
+                    self._pipeline_q.put(it)
 
         threading.Thread(target=_probe, name="stop-probe", daemon=True).start()
 
@@ -3458,8 +3501,21 @@ class Assistant(QObject):
         self._handsfree = on
         SETTINGS["handsfree"] = on
         try:
+            # read-merge-write, NOT a dump of the in-memory snapshot: the
+            # Settings app may have saved changes since our startup (model,
+            # permissions, …) and this process's SETTINGS copy is stale —
+            # dumping it would silently revert the user's saves.
+            disk = {}
+            if SETTINGS_FILE.exists():
+                try:
+                    loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        disk = loaded
+                except (OSError, ValueError):
+                    disk = {}
+            disk["handsfree"] = on
             tmp = SETTINGS_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(SETTINGS, ensure_ascii=False, indent=1),
+            tmp.write_text(json.dumps(disk, ensure_ascii=False, indent=1),
                            encoding="utf-8")
             os.replace(tmp, SETTINGS_FILE)
         except OSError:
@@ -3756,12 +3812,32 @@ class Assistant(QObject):
                 tool_calls = self._stream_result.get("tool_calls") or []
                 content = self._stream_result.get("content", "")
             else:
-                try:
-                    msg = ollama_chat(conversation, tools)
-                except RuntimeError as e:
-                    log.error("ollama: %s", e)
-                    self._speak(f"Sorry, my brain is offline. {e}", gen, cancel)
+                # non-streaming fallback: run the blocking call in a helper
+                # thread and watch `cancel` — barge-in must not leave the
+                # pipeline worker stuck behind a quiet 300 s request. The
+                # abandoned HTTP call finishes in its thread; the result is
+                # simply discarded (the turn is over).
+                box: dict = {}
+
+                def _run_call() -> None:
+                    try:
+                        box["msg"] = ollama_chat(conversation, tools)
+                    except RuntimeError as e:
+                        box["err"] = e
+
+                _t = threading.Thread(target=_run_call, name="brain-call",
+                                      daemon=True)
+                _t.start()
+                while _t.is_alive():
+                    if cancel.is_set():
+                        log.info("non-streaming brain call abandoned (barge-in)")
+                        return
+                    _t.join(0.2)
+                if "err" in box:
+                    log.error("ollama: %s", box["err"])
+                    self._speak(f"Sorry, my brain is offline. {box['err']}", gen, cancel)
                     return
+                msg = box.get("msg") or {}
                 content = strip_thinking(msg.get("content") or "")
                 tool_calls = msg.get("tool_calls") or []
                 if content:
@@ -3795,7 +3871,13 @@ class Assistant(QObject):
         # only THIS turn may publish history: a newer utterance owns the
         # assistant's memory once it has started (its own pipeline will write)
         if gen == self._gen:
-            self._history = _trim_history(conversation[1:])  # [1:]: drop the system prompt
+            self._history = _trim_history(
+                [m for m in conversation[1:]
+                 if m.get("role") != "system"])
+            # ^ drop the main system prompt [1:] AND the memory block: the
+            # block is injected fresh by _conversation_for on every turn —
+            # persisting it would accumulate one stale copy per turn (token
+            # bloat, broken KV-cache prefix, and a superseded fact could win)
             _strip_images(self._history)   # screenshots: this turn's model call only
             self._save_history()
         else:
@@ -3873,6 +3955,9 @@ class Assistant(QObject):
         try:
             data = json.loads(HISTORY_FILE.read_text())
             msgs = [m for m in data if isinstance(m, dict) and m.get("role") and m.get("content") is not None]
+            # heal histories written by older versions, which persisted the
+            # per-turn memory block (it is injected fresh each turn instead)
+            msgs = [m for m in msgs if m.get("role") != "system"]
             return _trim_history(msgs)
         except Exception:
             return []

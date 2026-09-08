@@ -33,7 +33,7 @@ done
 # handsoff.py is both app and self-edit target, and the suite pins prompt
 # text, tool census, and restart-script internals — narrow filters miss rot.
 if echo "$changed" | grep -qE '\.(py|sh)$|^install\.sh$|^handsoff-restart$|^pytest\.ini$|\.github/'; then
-    echo "pre-commit: running test suite (218 tests, ~5s)…"
+    echo "pre-commit: running the test suite (~5s)…"
     python3 -m pytest test_handsoff.py -q || fail=1
 fi
 

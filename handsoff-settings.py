@@ -94,7 +94,10 @@ AUTOSTART_COMMENT = "// handsoff voice assistant bubble"
 
 
 def merge_settings(data: dict) -> dict:
-    """defaults <- settings.json values (dicts merge key-wise, like the bubble does)."""
+    """defaults <- settings.json values (dicts merge key-wise, like the bubble
+    does), then run the SHARED coercion from handsoff.py: a hand-edited
+    settings.json with garbage values ("1,5", "32k", "abc") must produce a
+    working UI, not a crashed recovery tool."""
     merged = json.loads(json.dumps(H.DEFAULT_SETTINGS))  # deep copy of defaults
     if isinstance(data, dict):
         for k, v in data.items():
@@ -104,7 +107,7 @@ def merge_settings(data: dict) -> dict:
                 merged[k].update(v)
             else:
                 merged[k] = v
-    return merged
+    return H.coerce_settings(merged)
 
 
 def http_json(url: str, payload: dict | None = None, timeout: int = 10):
@@ -881,6 +884,8 @@ class SettingsWindow(QMainWindow):
                           "(chat boxes, editors) via ydotool"),
             "press_keys": ("Press keys in apps", "key combos like enter/ctrl+v in the "
                            "focused window via ydotool"),
+            "paste_text": ("Read your clipboard", "wl-paste: the AI can read whatever "
+                           "you last copied — passwords included"),
             "web_access": ("Internet knowledge", "weather (Open-Meteo), facts (Wikipedia), "
                            "web search (DuckDuckGo) — read-only, fixed endpoints"),
             "screen_access": ("See the screen", "screenshots + OCR of your display; the "
@@ -1192,6 +1197,21 @@ class SettingsWindow(QMainWindow):
         except OSError as e:
             self._status(f"cannot save settings: {e}")
             return False
+        # One autostart owner, same rule as the installer: if the systemd
+        # user unit manages the bubble, spawn-at-startup would double-start
+        # it (the lock blocks the second bubble but ownership gets murky).
+        if self.autostart_chk.isChecked():
+            try:
+                unit_enabled = subprocess.run(
+                    ["systemctl", "--user", "is-enabled", "handsoff.service"],
+                    capture_output=True, text=True, timeout=5,
+                ).returncode == 0
+            except Exception:
+                unit_enabled = False
+            if unit_enabled:
+                self._status("Saved to settings. Autostart: systemd already owns it "
+                             "— niri spawn-at-startup NOT added.")
+                return True
         msg = set_autostart(self.autostart_chk.isChecked())
         warn = f"  (ignored, always blocked: {', '.join(blocked_chosen)})" if blocked_chosen else ""
         self._status(f"Saved to {H.SETTINGS_FILE}. {msg}{warn}{cleared_note}")

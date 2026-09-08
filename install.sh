@@ -31,7 +31,8 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
 
 WHISPER_SIZE="${HANDSOFF_WHISPER:-tiny}"
 OLLAMA_MODEL="${HANDSOFF_MODEL:-qwen3:8b}"
-PIPER_VOICE_URL="${PIPER_VOICE_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx}"
+VOICE_URL_DEFAULT="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
+PIPER_VOICE_URL="${PIPER_VOICE_URL:-$VOICE_URL_DEFAULT}"
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Uninstalling handsoff"
@@ -40,7 +41,19 @@ if [ "${1:-}" = "--uninstall" ]; then
           "$BIN_DIR/handsoff.py" "$BIN_DIR/handsoff-restart" \
           "$BIN_DIR/handsoff-settings.py"
     systemctl --user daemon-reload 2>/dev/null || true
-    pkill -TERM -f '[h]andsoff.py' 2>/dev/null || true
+    # kill only real bubble processes: python executable + EXACT cmdline match.
+    # A bare `pkill -f handsoff.py` would kill bystanders whose cmdline merely
+    # mentions the path (an editor with the file open, a running pytest run).
+    for pid in $(pgrep -f 'handsoff\.py' 2>/dev/null); do
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
+        case "$(basename "$exe")" in
+            python|python3|python[0-9].*) ;;
+            *) continue ;;   # never touch editors, tails, shells
+        esac
+        tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null \
+            | grep -qxF "$BIN_DIR/handsoff.py" || continue
+        kill -TERM "$pid" 2>/dev/null || true
+    done
     if [ "${2:-}" = "--purge" ]; then
         tar czf "$HOME/handsoff-backup-$(date +%Y%m%d).tar.gz" \
             -C "$HOME" .config/handsoff .local/state/handsoff 2>/dev/null || true
@@ -58,9 +71,13 @@ echo "==> [1/8] System packages (pacman)"
 # -Sy alone would create an unsupported partial-upgrade state on Arch:
 # refresh the DB AND upgrade the system in one supported transaction.
 echo "    refreshing databases and upgrading the system (supported Arch policy)"
+# Feature deps provisioned here so advertised tools work out of the box:
+# ydotool (typing/keys), wl-clipboard (clipboard), grim (screenshots),
+# tesseract (OCR), mpc (music control).
 sudo pacman -Syu --needed --noconfirm \
     python-pyside6 python-sounddevice python-numpy python-pip \
-    alsa-utils ollama curl
+    alsa-utils ollama curl \
+    ydotool wl-clipboard grim tesseract mpc
 
 echo "==> [2/8] Python packages (pip, user site)"
 # Single source of truth: the manifest. Core deps also come from pacman above;
@@ -92,11 +109,11 @@ echo "==> [6/8] Downloading piper voice (sha256-verified)"
 voice="$(basename "$PIPER_VOICE_URL")"
 VOICE_SHA256="${PIPER_VOICE_SHA256:-5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f}"
 VOICE_JSON_SHA256="${PIPER_VOICE_JSON_SHA256:-efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0}"
-download_verified() {  # <url> <dest> <expected-sha256>
+download_verified() {  # <url> <dest> <expected-sha256-or-empty>
     local url="$1" dest="$2" want="$3" got
     # existing files are verified too: an interrupted earlier download must
     # not be silently accepted (a truncated voice crashes piper at runtime)
-    if [ -f "$dest" ]; then
+    if [ -f "$dest" ] && [ -n "$want" ]; then
         got="$(sha256sum "$dest" | awk '{print $1}')"
         if [ "$got" == "$want" ]; then
             return 0
@@ -106,6 +123,13 @@ download_verified() {  # <url> <dest> <expected-sha256>
     fi
     local tmp="$dest.part.$$"
     curl -fL --retry 3 -o "$tmp" "$url"
+    if [ -z "$want" ]; then
+        # URL overridden without a SHA256: user's explicit choice — install
+        # unverified but say so loudly (default voice stays strictly checked)
+        echo "    WARNING: $(basename "$dest") downloaded WITHOUT checksum verification" >&2
+        mv "$tmp" "$dest"
+        return 0
+    fi
     got="$(sha256sum "$tmp" | awk '{print $1}')"
     if [ "$got" != "$want" ]; then
         echo "    FATAL: checksum mismatch for $(basename "$dest")" >&2
@@ -116,6 +140,13 @@ download_verified() {  # <url> <dest> <expected-sha256>
     fi
     mv "$tmp" "$dest"
 }
+# a custom URL with no PIPER_VOICE_SHA256/_JSON set downloads unverified
+# (with a warning); the default lessac voice is always strictly checked.
+if [ "$PIPER_VOICE_URL" != "$VOICE_URL_DEFAULT" ] \
+        && [ -z "${PIPER_VOICE_SHA256:-}" ]; then
+    echo "    NOTE: custom PIPER_VOICE_URL without PIPER_VOICE_SHA256 — download will be unverified"
+    VOICE_SHA256=""
+fi
 download_verified "$PIPER_VOICE_URL" "$CONF_DIR/piper-voice/$voice" "$VOICE_SHA256"
 download_verified "$PIPER_VOICE_URL.json" "$CONF_DIR/piper-voice/$voice.json" "$VOICE_JSON_SHA256"
 
@@ -144,6 +175,9 @@ TimeoutStartSec=30
 WantedBy=graphical-session.target
 UNIT_EOF
 if systemctl --user daemon-reload 2>/dev/null; then
+    # ydotoold must be running for ydotool (typing/keys) to work at all
+    systemctl --user enable --now ydotoold.service 2>/dev/null \
+        || echo "    WARN: could not enable ydotoold — typing tools will error until it runs"
     systemctl --user enable handsoff.service 2>/dev/null || true
     echo "    installed + enabled: systemctl --user start handsoff   (auto-restarts on crash)"
     echo "    note: remove 'spawn-at-startup' for handsoff from niri's autostart to avoid double-start"

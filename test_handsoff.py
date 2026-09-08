@@ -589,6 +589,10 @@ class TestKeyboardTakeover:
 
     def test_press_keys_enter(self, belt, monkeypatch):
         calls = []
+        # hermetic: never depend on the live desktop focus (CI has no niri,
+        # and a focused terminal on a dev box must not change the outcome)
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "firefox", "title": "Firefox"})
         def fake_ydotool(self, *args):
             calls.append(args)
             return "ok"
@@ -599,6 +603,8 @@ class TestKeyboardTakeover:
 
     def test_press_keys_ctrl_a(self, belt, monkeypatch):
         calls = []
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "firefox", "title": "Firefox"})
         def fake_ydotool(self, *args):
             calls.append(args)
             return "ok"
@@ -607,11 +613,17 @@ class TestKeyboardTakeover:
         assert not err
         assert calls == [("key", "29:1", "30:1", "30:0", "29:0")]
 
-    def test_press_keys_unknown_key_refused(self, belt):
+    def test_press_keys_unknown_key_refused(self, belt, monkeypatch):
+        # hermetic focus: assert the KEY-VALIDATION refusal, not an accidental
+        # fail-closed or terminal-guard refusal from whatever is on screen
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "firefox", "title": "Firefox"})
         out, err = belt.execute("press_keys", {"combo": "ctrl+frobnicate"})
         assert err and "unknown key" in out
 
-    def test_press_keys_modifiers_only_refused(self, belt):
+    def test_press_keys_modifiers_only_refused(self, belt, monkeypatch):
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "firefox", "title": "Firefox"})
         out, err = belt.execute("press_keys", {"combo": "ctrl+shift"})
         assert err and out.startswith("REFUSED")
 
@@ -619,6 +631,8 @@ class TestKeyboardTakeover:
 
     def test_press_hotkey_mod_e_argv(self, belt, monkeypatch):
         calls = []
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "firefox", "title": "Firefox"})
         def fake_ydotool(self, *args):
             calls.append(args)
             return "ok"
@@ -630,6 +644,8 @@ class TestKeyboardTakeover:
 
     def test_press_hotkey_mod_return(self, belt, monkeypatch):
         calls = []
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "firefox", "title": "Firefox"})
         def fake_ydotool(self, *args):
             calls.append(args)
             return "ok"
@@ -639,6 +655,8 @@ class TestKeyboardTakeover:
         assert calls == [("key", "125:1", "28:1", "28:0", "125:0")]
 
     def test_press_hotkey_synonym_and_case_insensitive(self, belt, monkeypatch):
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "firefox", "title": "Firefox"})
         calls = []
         def fake_ydotool(self, *args):
             calls.append(args)
@@ -997,7 +1015,10 @@ class TestCapabilityBoundaries:
         fake_crash.write_text("Current thread 0x0000... Fatal Python error: Segmentation fault", encoding="utf-8")
         asst._maybe_report_crash()
         assert len(spoken) == 1 and "crashed" in spoken[0]
-        assert not fake_crash.exists()   # consumed after reporting
+        # consumed by TRUNCATION, not unlink: faulthandler keeps the fd open
+        # from startup, so unlinking would orphan it and a LATER crash would
+        # write to a deleted inode — never reportable again.
+        assert fake_crash.exists() and fake_crash.stat().st_size == 0
 
 
 class TestStreamingChat:
@@ -1835,13 +1856,46 @@ class TestAuditFixes:
         a._pipeline_q = H.queue.Queue()
         a._pipeline_q.put((b"audio", 1, H.threading.Event()))  # pending turn
         a._last_transcript = ("", 0, 0.0)
-        a._gen = 1                             # probe tags the transcript with it
-        a._maybe_instant_stop(None)
+        a._maybe_instant_stop(None, 1)         # gen captured at submission
         deadline = H.time.time() + 5
         while not a._pipeline_q.empty() and H.time.time() < deadline:
             H.time.sleep(0.02)
         assert a._pipeline_q.empty(), "stop must drain the queued turn"
         assert a._last_transcript[0] == "stop", "transcript must be reused"
+        assert a._last_transcript[1] == 1, "transcript must carry its own gen"
+
+    def test_stop_probe_late_finish_never_stamps_newer_turn(self, H,
+                                                            monkeypatch):
+        """Audit race: utterance A's probe finishes AFTER B was submitted
+        (_gen bumped). A's transcript must be stamped with A's gen, never
+        B's — otherwise B's pipeline would execute A's text."""
+        a = H.Assistant.__new__(H.Assistant)
+        a._pipeline_q = H.queue.Queue()
+        a._last_transcript = ("", 0, 0.0)
+        monkeypatch.setattr(H, "transcribe", lambda audio: "hello A")
+        # simulate: B already bumped _gen to 5 before A's probe completes
+        a._gen = 5
+        a._maybe_instant_stop(None, 2)         # A was submitted at gen 2
+        deadline = H.time.time() + 5
+        while a._last_transcript[1] == 0 and H.time.time() < deadline:
+            H.time.sleep(0.02)
+        assert a._last_transcript == ("hello A", 2, a._last_transcript[2]), \
+            "probe must stamp the submitted gen, not the current _gen"
+        # and B's queued turn (gen 5) must survive A's stop-drain
+        a._pipeline_q.put((b"audioB", 5, H.threading.Event()))
+        a._last_transcript = ("stop", 2, H._tick_now())  # A was a stop command
+        a._maybe_instant_stop(None, 2)
+        deadline = H.time.time() + 5
+        items = []
+        while H.time.time() < deadline:
+            try:
+                items.append(a._pipeline_q.get_nowait())
+            except H.queue.Empty:
+                if items or H.time.time() > deadline - 0.5:
+                    break
+                H.time.sleep(0.02)
+        assert len(items) == 1 and items[0][1] == 5, \
+            "a late stop probe must not swallow a newer utterance's turn"
 
     def test_pipeline_reuses_stop_probe_transcript(self, H, monkeypatch):
         """When the probe already transcribed this utterance, the pipeline
@@ -2868,3 +2922,103 @@ class TestPrecommitHook:
             assert r.returncode != 0, "py_compile must fail on broken syntax"
         finally:
             broken.unlink(missing_ok=True)
+
+
+class TestAuditRoundTwo:
+    """Second external-audit fixes (verified 2026-09-08)."""
+
+    def test_handsfree_toggle_preserves_concurrent_settings_saves(
+            self, H, monkeypatch, tmp_path):
+        """Toggling hands-free must read-merge-write settings.json, never
+        dump the bubble's stale startup snapshot over newer disk state."""
+        cfg = tmp_path / "settings.json"
+        # disk state is NEWER than the bubble's memory (user saved in the
+        # Settings app after the bubble started): different model + a key
+        # the bubble's snapshot doesn't even have
+        cfg.write_text(H.json.dumps({"model": "newer:model",
+                                     "wake_word": "cypher",
+                                     "handsfree": False}), encoding="utf-8")
+        monkeypatch.setattr(H, "SETTINGS_FILE", cfg)
+        a = H.Assistant.__new__(H.Assistant)
+        a._handsfree = False
+        a._gen = 0
+        a._listener = type("L", (), {"start": lambda self: None,
+                                     "stop": lambda self: None})()
+        a._set = lambda *x: None
+        a.set_handsfree(True)
+        disk = H.json.loads(cfg.read_text(encoding="utf-8"))
+        assert disk["handsfree"] is True
+        assert disk["model"] == "newer:model", "user save must survive"
+        assert disk["wake_word"] == "cypher", "unknown keys must survive"
+
+    def test_handsfree_toggle_survives_corrupt_settings(self, H, monkeypatch,
+                                                        tmp_path):
+        cfg = tmp_path / "settings.json"
+        cfg.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(H, "SETTINGS_FILE", cfg)
+        a = H.Assistant.__new__(H.Assistant)
+        a._handsfree = True
+        a._gen = 0
+        a._listener = type("L", (), {"start": lambda self: None,
+                                     "stop": lambda self: None})()
+        a._set = lambda *x: None
+        a.set_handsfree(False)          # must not raise
+        disk = H.json.loads(cfg.read_text(encoding="utf-8"))
+        assert disk == {"handsfree": False}
+
+    def test_settings_app_coerces_garbage_values(self, H):
+        """Audit #2: a hand-edited settings.json with garbage must not crash
+        the settings app (the recovery tool). The app's merge_settings now
+        applies the bubble's shared coerce_settings — bad values fall back
+        to defaults instead of raising in _load_values' int()/float()."""
+        for bad in ({"engage_seconds": "abc"}, {"tts_rate": "1,5"},
+                    {"num_ctx": "32k"}):
+            merged = H.json.loads(H.json.dumps(H.DEFAULT_SETTINGS))
+            merged.update(bad)
+            out = H.coerce_settings(merged)
+            for k in bad:
+                assert out[k] == H.DEFAULT_SETTINGS[k], (k, out[k])
+        # valid values survive untouched
+        merged = H.json.loads(H.json.dumps(H.DEFAULT_SETTINGS))
+        merged.update({"num_ctx": 16384, "tts_rate": 1.25})
+        out = H.coerce_settings(merged)
+        assert out["num_ctx"] == 16384 and out["tts_rate"] == 1.25
+
+    def test_memory_block_never_persists_into_history(self, H, monkeypatch,
+                                                      tmp_path):
+        """Audit #3: _brain_turn used to persist conversation[1:] INCLUDING
+        the per-turn memory block — one stale copy accumulated per turn.
+        History must contain only user/assistant/tool messages; the memory
+        block is injected fresh by _conversation_for every turn."""
+        a = H.Assistant.__new__(H.Assistant)
+        hist_file = tmp_path / "history.json"
+        monkeypatch.setattr(H, "HISTORY_FILE", hist_file)
+        a._gen = 1
+        a._history = []
+        a._memory = [{"k": "name", "v": "Quinton"}]
+        saved = {}
+        monkeypatch.setattr(H.Assistant, "_save_history",
+                            lambda self: saved.setdefault("h", list(self._history)))
+        monkeypatch.setattr(H, "_strip_images", lambda h: None)
+        monkeypatch.setattr(H, "_trim_history", lambda msgs: msgs)
+
+        msgs = [
+            {"role": "system", "content": "MAIN PROMPT"},
+            {"role": "system",
+             "content": "Facts you remember about the user:\n- Quinton"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        # the same slice/filter the history-publish tail now applies
+        a._history = [m for m in msgs[1:] if m.get("role") != "system"]
+        roles = [m["role"] for m in a._history]
+        assert "system" not in roles, roles
+        assert roles == ["user", "assistant"], roles
+        # and the loader heals an already-polluted old history file
+        hist_file.write_text(H.json.dumps([
+            {"role": "system", "content": "Facts you remember about the user:\n- old"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]), encoding="utf-8")
+        loaded = H.Assistant._load_history()
+        assert all(m.get("role") != "system" for m in loaded)

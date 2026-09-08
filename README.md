@@ -26,7 +26,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All 29 tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 220 tests pin the behavior (`python -m pytest test_handsoff.py`).
+automatically. 225 tests pin the behavior (`python -m pytest test_handsoff.py`).
 
 ## Requirements
 
@@ -72,7 +72,7 @@ installer will **not** also add `spawn-at-startup` to niri.
 |---|---|---|
 | `HANDSOFF_MODEL` | `qwen3:8b` | Ollama model to pull/use |
 | `HANDSOFF_WHISPER` | `tiny` | whisper size (`tiny`…`large-v3`) |
-| `PIPER_VOICE_URL` | en_US lessac medium | any piper `.onnx` URL |
+| `PIPER_VOICE_URL` | en_US lessac medium | any piper `.onnx` URL — set `PIPER_VOICE_SHA256`/`PIPER_VOICE_JSON_SHA256` too or the download is unverified (with a warning) |
 
 At runtime, environment overrides (only where settings.json has no value):
 `HANDSOFF_MODEL`, `HANDSOFF_NUM_CTX`, `HANDSOFF_WHISPER`, `HANDSOFF_VOICE`,
@@ -259,7 +259,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest test_handsoff.py -q     # 220 tests
+python -m pytest test_handsoff.py -q     # 225 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
