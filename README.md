@@ -30,9 +30,11 @@ and speaks back with Piper TTS. Everything runs on your machine.
   break cycles, threshold alerts for RAM/GPU memory, and bounded file/process
   watchers that announce matching failures or exits.
 
-All 38 tools are declared in one place (`@tool`-decorated methods in
+All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 350 tests pin the behavior (`python -m pytest test_handsoff.py`).
+automatically. 400+ tests pin the behavior (`python -m pytest tests/`),
+split by area: audio, policy, desktop, calendar, settings, lifecycle,
+regression, and ops.
 
 ## Requirements
 
@@ -126,13 +128,34 @@ Any of these work from a script or keybind, even while the bubble runs:
 
 ```bash
 python ~/.local/bin/handsoff.py --ptt status      # state, handsfree, model
-python ~/.local/bin/handsoff.py --ptt health      # JSON: mic + brain + TTS
+python ~/.local/bin/handsoff.py --ptt health      # JSON: mic + brain + TTS + deployment
+python ~/.local/bin/handsoff.py --ptt doctor      # full diagnostic (works even when the bubble is dead)
 python ~/.local/bin/handsoff.py --ptt toggle      # start/stop/interrupt
 python ~/.local/bin/handsoff.py --ptt interrupt   # silence it now
 python ~/.local/bin/handsoff.py --ptt handsfree   # toggle hands-free
 python ~/.local/bin/handsoff.py --ptt handsfree-status  # speak mic state
 python ~/.local/bin/handsoff.py --ptt settings    # open Settings
 ```
+
+## Trust & self-diagnosis
+
+**Deployment hashes** — every health snapshot carries a `deployment` section:
+sha256 of the running code, the installed `~/.local/bin` copy, and the
+checkout, plus the installer's `~/.config/handsoff/deployment.json` manifest.
+`installed-drift` means the running product is not the tested source —
+re-run `install.sh`. The installer writes the manifest; the doctor, the
+`--ptt health` line, and the Settings health bar all surface it.
+
+**Doctor** — `python ~/.local/bin/handsoff.py --ptt doctor` (or the
+`handsoff_doctor` tool) runs one diagnostic pass: deployment status, Ollama
+reachability, TTS/STT readiness, mic visibility, niri IPC, ydotool, restart
+script, systemd unit `Restart=`, and the crash log. It works even when the
+bubble is dead.
+
+**Decision log** — every tool decision lands in
+`~/.local/state/handsoff/decisions.jsonl` with an action id, timestamp, tool,
+target, decision (`ALLOW`/`DENY`/`CONFIRM`/`DRY-RUN`) and result, so "why did
+it do that" always has an answer.
 
 ## Permissions
 
@@ -163,6 +186,15 @@ Safety boundaries enforced in code (not just the prompt):
 - `edit_file` refuses to touch anything outside its own source and its config
   dir; self-edits must keep the marker line and compile
 - Tool-call rate limiting is available in Settings (default: unlimited)
+- **Centralized policy** — per-tool `ALLOW` / `DENY` / `CONFIRM`
+  (`command_policy` in settings.json or the Permissions tab). `DENY` refuses
+  before anything runs, regardless of permission switches; `CONFIRM` offers
+  out loud and runs only after a separate next-turn `confirm_action('yes')`
+  — one-turn separation, the same two-step pattern as `kill_process`.
+- **Dry-run mode** — with `dry_run: true` the desktop-action tools
+  (run_command, open_app, close_window, focus_window, workspace, typing,
+  scroll, clicks) *report* what they would do instead of doing it: rehearse
+  a scripted sequence before letting it act.
 
 ## Configuration
 
@@ -183,6 +215,9 @@ Safety boundaries enforced in code (not just the prompt):
 | `resource_alerts` / `ram_alert_percent` / `vram_alert_percent` | false / 90 / 90 | opt-in crossing alerts for system RAM and NVIDIA VRAM |
 | `notification_reader` / `notification_mute_apps` | false / [] | opt-in future desktop notification reader and muted app names |
 | `workspace_aliases` | `{}` | e.g. `{"code": "2"}` → "go to code" |
+| `command_policy` | `{}` | per-tool `ALLOW`/`DENY`/`CONFIRM`; empty = all ALLOW |
+| `confirm_seconds` | 90 | how long a CONFIRM offer stays valid |
+| `dry_run` | false | desktop actions report instead of act |
 | `permissions` | all true | the switches above |
 
 ## Files
@@ -195,6 +230,8 @@ Safety boundaries enforced in code (not just the prompt):
 | `~/.config/handsoff/whisper-model/` | STT model cache |
 | `~/.config/handsoff/piper-voice/` | TTS voice |
 | `~/.local/state/handsoff/reminders.json` | pending reminders |
+| `~/.local/state/handsoff/decisions.jsonl` | one JSON line per tool-policy decision (capped) |
+| `~/.config/handsoff/deployment.json` | installer manifest: source/installed sha256 per file |
 | `~/.local/state/handsoff/handsoff.log` | rotating log (1 MB × 2) |
 | `~/.local/state/handsoff/crash.log` | native-crash traceback (faulthandler) |
 | `~/.local/state/handsoff/control.sock` | local control socket (mode 0600) |
@@ -295,7 +332,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest test_handsoff.py -q     # 350 tests
+python -m pytest tests/ -q     # 400+ tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
@@ -304,6 +341,9 @@ CI (`.github/workflows/ci.yml`) runs exactly these gates on every push: the
 suite on Python 3.12 and 3.13 (offscreen Qt, no audio hardware needed),
 byte-compilation of every source file, and shell syntax checks. Background-
 thread exceptions fail the run via `pytest.ini` rather than passing silently.
+The suite includes an **installed-copy smoke test**: a fake `~/.local/bin`
+deployment is booted offscreen and poked over the control socket, so a
+checkout that works but deploys broken cannot slip through.
 
 **Pre-commit gate** — the repo ships `githooks/pre-commit`, which runs the
 compile, shell-syntax, and full-suite gates before every commit, so a broken

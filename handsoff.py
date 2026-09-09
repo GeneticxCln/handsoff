@@ -35,12 +35,14 @@ Files:
     ~/.local/bin/handsoff-restart       kills + relaunches this program
     ~/.local/bin/handsoff-settings.py   the settings GUI
     ~/.local/state/handsoff/            logs, lock, pending-restart note
+    ~/.local/state/handsoff/decisions.jsonl  one line per tool-policy decision
 """
 from __future__ import annotations
 
 import base64
 import faulthandler
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -52,6 +54,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -176,6 +179,9 @@ DEFAULT_SETTINGS: dict = {
     "extra_allowed_commands": [],
     "tool_call_times": None,          # filled per-ToolBelt: deque of monotonic times
     "max_tool_calls": 0,             # 0 = no limit; set an int to rate-limit tool calls
+    "command_policy": {},            # tool -> ALLOW | DENY | CONFIRM (empty = all ALLOW)
+    "confirm_seconds": 90.0,         # how long a CONFIRM offer stays valid
+    "dry_run": False,                # desktop actions report instead of act
     "streaming_tts": True,
     "autostart": False,
     "assistant_name": "assistant",
@@ -198,6 +204,484 @@ DEFAULT_SETTINGS: dict = {
 }
 
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
+DEPLOYMENT_FILE = CONFIG_DIR / "deployment.json"
+SYSTEMD_UNIT_FILE = HOME / ".config/systemd/user/handsoff.service"
+
+
+def _sha256_file(path: Path) -> str | None:
+    """Return a file hash for deployment diagnostics without raising."""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except (OSError, ValueError):
+        return None
+
+
+def _repo_source_path() -> Path | None:
+    """Find the checkout that should match an installed handsoff copy.
+
+    The installed service normally runs from ``~/.local/bin`` while
+    development happens in ``~/Projects/handsoff``.  The old implementation
+    returned ``SELF_PATH`` first, which made an installed copy compare against
+    itself and report a false "in sync" result.  Prefer an explicit source,
+    a real checkout, or a common checkout location; only use the running file
+    itself when it is actually inside a checkout.
+    """
+    try:
+        self_path = SELF_PATH.resolve()
+    except OSError:
+        self_path = SELF_PATH
+
+    def as_file(value: str | Path) -> Path:
+        candidate = Path(value).expanduser()
+        return candidate / "handsoff.py" if candidate.is_dir() else candidate
+
+    candidates: list[Path] = []
+    explicit = os.environ.get("HANDSOFF_SOURCE_PATH")
+    if explicit:
+        candidates.append(as_file(explicit))
+    # A checkout has a .git entry beside the source.  This also supports a
+    # clone in a non-standard directory when handsoff is run from that clone.
+    if (self_path.parent / ".git").exists():
+        candidates.append(self_path)
+    candidates.extend((
+        HOME / "Projects/handsoff/handsoff.py",
+        HOME / "projects/handsoff/handsoff.py",
+        Path.cwd() / "handsoff.py",
+        self_path,
+    ))
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = as_file(candidate).resolve()
+        except OSError:
+            continue
+        # An installed ~/.local/bin copy is not a source checkout.  Do not
+        # let it satisfy the comparison merely because it exists.
+        if (resolved == self_path and resolved.parent.name == "bin"
+                and resolved.parent.parent.name == ".local"):
+            continue
+        if str(resolved) in seen or not resolved.is_file():
+            continue
+        seen.add(str(resolved))
+        return resolved
+    return None
+
+
+def _deployment_snapshot() -> dict:
+    """Describe the code actually running and whether it matches the checkout.
+
+    This is deliberately based on hashes, not mtimes: a stale installed copy
+    can have a newer timestamp after a failed deployment.  No settings values
+    or calendar secrets are included in this diagnostic payload.
+    """
+    try:
+        current = SELF_PATH.resolve()
+    except OSError:
+        current = SELF_PATH
+    repo = _repo_source_path()
+    try:
+        installed = (HOME / ".local/bin/handsoff.py").resolve()
+    except OSError:
+        installed = HOME / ".local/bin/handsoff.py"
+    current_hash = _sha256_file(current)
+    repo_hash = _sha256_file(repo) if repo else None
+    installed_hash = _sha256_file(installed)
+    manifest: dict = {}
+    try:
+        raw = json.loads(DEPLOYMENT_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            manifest = raw
+    except (OSError, ValueError):
+        pass
+    same_current_repo = bool(current_hash and repo_hash and current_hash == repo_hash)
+    same_installed_repo = bool(installed_hash and repo_hash and installed_hash == repo_hash)
+    if not current_hash:
+        status = "running-missing"
+    elif not repo_hash:
+        status = "source-unknown"
+    elif not installed_hash:
+        status = "installed-missing"
+    elif same_installed_repo:
+        status = "in-sync"
+    else:
+        status = "installed-drift"
+    return {
+        "status": status,
+        "running_path": str(current),
+        "running_sha256": current_hash,
+        "repo_path": str(repo) if repo else None,
+        "repo_sha256": repo_hash,
+        "installed_path": str(installed),
+        "installed_sha256": installed_hash,
+        "running_is_installed": current == installed,
+        "running_matches_repo": same_current_repo,
+        "installed_matches_repo": same_installed_repo,
+        "manifest": manifest,
+    }
+
+
+# --------------------------------------------------------------- doctor report
+
+
+def run_doctor() -> str:
+    """One human-readable diagnostic pass over everything the bubble needs.
+
+    Read-only, side-effect-free (the Ollama probe is a 2 s GET). Served via
+    `--ptt doctor` and the `handsoff_doctor` tool; the AI reads it to fix
+    itself instead of guessing.
+    """
+    lines: list[str] = []
+
+    d = _deployment_snapshot()
+    status = d["status"]
+    deploy_note = {
+        "in-sync": "installed copy matches the checkout",
+        "installed-drift": (
+            "INSTALLED COPY IS STALE — the running code is not the checkout. "
+            "Re-run install.sh to deploy the tested source."),
+        "source-unknown": "no checkout found (nothing to compare against)",
+        "installed-missing": "no copy at ~/.local/bin/handsoff.py — run install.sh",
+        "running-missing": "running source unreadable",
+    }.get(status, status)
+    lines.append(f"deployment: {status} — {deploy_note}")
+    lines.append(f"  running: {d['running_path']}")
+    if d["running_sha256"]:
+        lines.append(f"  running sha256: {d['running_sha256'][:16]}…")
+    if d["repo_path"]:
+        lines.append(f"  checkout: {d['repo_path']}")
+
+    if ollama_available():
+        lines.append(f"brain: Ollama reachable at {OLLAMA_BASE} (model {OLLAMA_MODEL})")
+    else:
+        lines.append(
+            f"brain: OLLAMA UNREACHABLE at {OLLAMA_BASE} — "
+            "`systemctl status ollama`, then `ollama pull " + OLLAMA_MODEL + "`")
+
+    lines.append(f"tts: {'voice loaded' if _piper_voice is not None else 'voice NOT loaded yet'}; "
+                 f"stt: {'whisper loaded' if _whisper_model is not None else 'whisper NOT loaded yet'}")
+
+    try:
+        import sounddevice as _sd
+        devs = [dd for dd in _sd.query_devices() if dd.get("max_input_channels", 0) > 0]
+        if devs:
+            lines.append(f"mic: {len(devs)} input device(s) visible")
+        else:
+            lines.append("mic: NO input devices visible — check the mic is plugged in")
+    except Exception as e:
+        lines.append(f"mic: audio subsystem error: {e}")
+
+    try:
+        r = ToolBelt._niri_msg("msg", "--json", "windows")
+        if r.returncode == 0:
+            n = len(json.loads(r.stdout or "[]"))
+            lines.append(f"niri IPC: ok ({n} window(s))")
+        else:
+            lines.append("niri IPC: refused — desktop actions will fail")
+    except Exception as e:
+        lines.append(f"niri IPC: UNAVAILABLE ({e}) — desktop actions will fail")
+
+    yd = "ok" if shutil.which("ydotool") else "NOT INSTALLED (typing tools will fail)"
+    lines.append(f"ydotool: {yd}")
+
+    if RESTART_SCRIPT.exists():
+        lines.append(f"restart script: present at {RESTART_SCRIPT}")
+    else:
+        lines.append(f"restart script: MISSING at {RESTART_SCRIPT} — run install.sh")
+
+    unit = SYSTEMD_UNIT_FILE
+    if unit.exists():
+        txt = ""
+        try:
+            txt = unit.read_text(encoding="utf-8")
+        except OSError:
+            pass
+        if "Restart=always" in txt or "Restart=on-failure" in txt:
+            lines.append("systemd unit: present, auto-restart configured")
+        else:
+            lines.append("systemd unit: present but has NO Restart= — crashes stay dead")
+    else:
+        lines.append("systemd unit: not installed (autostart falls back to niri spawn)")
+
+    if CRASH_LOG.exists():
+        try:
+            age = time.time() - CRASH_LOG.stat().st_mtime
+            lines.append(f"crash log: exists, last modified {age / 3600:.1f}h ago")
+        except OSError:
+            lines.append("crash log: exists (age unknown)")
+    else:
+        lines.append("crash log: none (no native crashes recorded)")
+    return "\n".join(lines)
+
+
+def doctor_json() -> dict:
+    """Machine-readable doctor output for the control socket."""
+    d = _deployment_snapshot()
+    out: dict = {"deployment": d}
+    if CRASH_LOG.exists():
+        try:
+            out["crash_log_age_hours"] = round(
+                (time.time() - CRASH_LOG.stat().st_mtime) / 3600.0, 2)
+        except OSError:
+            pass
+    out["restart_script"] = RESTART_SCRIPT.exists()
+    out["systemd_unit"] = {
+        "present": SYSTEMD_UNIT_FILE.exists(),
+        "auto_restart": False,
+    }
+    if SYSTEMD_UNIT_FILE.exists():
+        try:
+            txt = SYSTEMD_UNIT_FILE.read_text(encoding="utf-8")
+            out["systemd_unit"]["auto_restart"] = bool(
+                re.search(r"^Restart=(always|on-failure|on-abnormal)$", txt, re.M))
+        except OSError:
+            pass
+    return out
+
+
+# ------------------------------------------------------------ decision log
+
+
+DECISIONS_FILE = STATE_DIR / "decisions.jsonl"
+_DECISIONS_LOCK = threading.Lock()
+_DECISIONS_MAX = 500
+
+
+def log_decision(tool: str, target: str, decision: str,
+                 result: str = "dispatched") -> None:
+    """Append one JSON line to ~/.local/state/handsoff/decisions.jsonl.
+
+    Every tool decision — ALLOW, DENY, CONFIRM, DRY-RUN — lands here with an
+    action id, so 'why did it do that' always has an answer. Best-effort:
+    a failed log write must never break the tool call itself."""
+    entry = {
+        "id": f"{int(time.time() * 1000):x}-{random.randrange(1 << 16):04x}",
+        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "tool": tool,
+        "target": str(target)[:200],
+        "decision": decision,
+        "result": result,
+    }
+    try:
+        with _DECISIONS_LOCK:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with DECISIONS_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            os.chmod(DECISIONS_FILE, 0o600)
+            try:
+                with DECISIONS_FILE.open("r", encoding="utf-8") as fh:
+                    lines = fh.readlines()
+                if len(lines) > _DECISIONS_MAX * 2:
+                    keep = DECISIONS_FILE.with_suffix(".tmp")
+                    with keep.open("w", encoding="utf-8") as dst:
+                        dst.writelines(lines[-_DECISIONS_MAX:])
+                    keep.replace(DECISIONS_FILE)
+            except OSError:
+                pass   # trim is cosmetic; the append already succeeded
+    except Exception:
+        # the decision log must NEVER break the tool call it records
+        log.debug("decision log write failed", exc_info=True)
+
+
+class DecisionPolicy:
+    """Central tool policy: every tool call classifies to ALLOW, DENY or
+    CONFIRM before it runs.
+
+    - ALLOW: run normally (the default; per-tool permission gates still apply).
+    - DENY:  the user disabled this tool in settings['command_policy'] —
+             refused before any code runs, regardless of permission switches.
+    - CONFIRM: the tool self-manages a one-turn-separated spoken confirmation
+             (like kill_process → confirm_kill): the first call only proposes,
+             the second call — a separate model turn after the user heard the
+             offer — executes. Tools classified CONFIRM must be two-step.
+    Dry-run mode (settings['dry_run']) makes desktop actions REPORT what they
+    would do without doing it — for rehearsing a scripted sequence.
+    """
+
+    def __init__(self, settings: "dict | None" = None) -> None:
+        self._settings = settings if settings is not None else SETTINGS
+
+    def classify(self, tool: str) -> str:
+        pol = self._settings.get("command_policy") or {}
+        if not isinstance(pol, dict):
+            return "ALLOW"
+        v = pol.get(tool)
+        if isinstance(v, str) and v.strip().upper() in ("ALLOW", "DENY", "CONFIRM"):
+            return v.strip().upper()
+        return "ALLOW"
+
+    def is_denied(self, tool: str) -> bool:
+        return self.classify(tool) == "DENY"
+
+    def request_confirm(self, tool: str) -> bool:
+        """True when a CONFIRM-classified tool should stop and offer."""
+        return self.classify(tool) == "CONFIRM"
+
+    def confirm_seconds(self) -> float:
+        try:
+            s = float(self._settings.get("confirm_seconds", 90.0))
+        except (TypeError, ValueError):
+            s = 90.0
+        return min(max(s, 5.0), 600.0)
+
+    @staticmethod
+    def is_desktop_action(tool: str) -> bool:
+        """Tools that change the desktop (or spawn work) and thus honour
+        dry-run mode."""
+        return tool in ("run_command", "start_command", "open_app",
+                        "close_window", "focus_window", "workspace",
+                        "type_text", "press_keys", "press_hotkey", "scroll",
+                        "click_element", "click_at", "copy_text",
+                        "paste_text")
+
+
+# ------------------------------------------------------------ bounded jobs
+
+
+class BoundedJob:
+    """A long-running whitelisted command with a hard cap and bounded output.
+
+    `start_command` runs e.g. a test suite in the background, stores the
+    Popen here, and `job_status` polls it. Everything is bounded: max jobs,
+    output bytes, lifetime — so a runaway job cannot eat the machine."""
+
+    MAX_JOBS = 4
+    MAX_OUTPUT = 200_000
+    MAX_LIFETIME_S = 1800.0
+
+    def __init__(self, job_id: str, command: str, proc: subprocess.Popen) -> None:
+        self.id = job_id
+        self.command = command
+        self.proc = proc
+        self.started = time.monotonic()
+        self._announced = False
+
+    def poll(self) -> tuple[str, bool]:
+        """(state, done): 'running' | 'done' | 'timeout-killed'.
+
+        Reaping goes through Popen.poll() ONLY: a raw waitpid here would
+        reap the child behind Popen's back and returncode would stay None
+        forever (a job that finished but never reads as finished)."""
+        if self.proc.returncode is not None:
+            return "done", True
+        if time.monotonic() - self.started > self.MAX_LIFETIME_S:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+            try:
+                self.proc.wait(timeout=2)   # finalize returncode
+            except Exception:
+                pass
+            return "timeout-killed", True
+        self.proc.poll()
+        if self.proc.returncode is not None:
+            return "done", True
+        return "running", False
+
+    def status_text(self) -> str:
+        state, done = self.poll()
+        elapsed = time.monotonic() - self.started
+        if state == "running":
+            return f"job {self.id}: still running ({elapsed:.0f}s) — {self.command}"
+        if state == "timeout-killed":
+            return (f"job {self.id}: KILLED after {BoundedJob.MAX_LIFETIME_S:.0f}s "
+                    f"(lifetime cap) — {self.command}")
+        rc = self.proc.returncode
+        return f"job {self.id}: finished, exit code {rc} ({elapsed:.0f}s) — {self.command}"
+
+
+def _private_dir(path: Path) -> bool:
+    """Create a state/config directory and make it owner-only.
+
+    Refuse symlinked directories: configuration and the control socket must
+    never be redirected to an attacker-controlled location.
+    """
+    try:
+        if path.is_symlink():
+            return False
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o700)
+        info = path.stat()
+        return (stat.S_ISDIR(info.st_mode)
+                and (info.st_mode & 0o077) == 0
+                and info.st_uid == os.getuid())
+    except OSError:
+        return False
+
+
+def _secure_file(path: Path) -> bool:
+    """Make an existing runtime/config file owner-only, without creating it.
+
+    ``Path.exists()`` is not sufficient here: it returns false for a broken
+    symlink, which would let an attacker redirect a later atomic write. Use
+    lstat first and reject every symlink, including broken ones. A live Unix
+    socket is checked for ownership/mode but is not chmod-ed through a regular
+    file path operation on platforms where that is unsupported.
+    """
+    try:
+        if path.is_symlink():
+            return False
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return True
+        if info.st_uid != os.getuid() or not (
+                stat.S_ISREG(info.st_mode) or stat.S_ISSOCK(info.st_mode)):
+            return False
+        if stat.S_ISREG(info.st_mode):
+            path.chmod(0o600)
+            info = path.stat()
+        return ((info.st_mode & 0o077) == 0
+                and info.st_uid == os.getuid())
+    except OSError:
+        return False
+
+
+def _secure_runtime_files() -> bool:
+    """Harden files that can contain secrets, transcripts, or control state."""
+    paths = (SETTINGS_FILE, HISTORY_FILE, MEMORY_FILE, CRASH_LOG,
+             PENDING_FILE, LOCK_FILE, LOG_FILE, CONTROL_SOCK, MIC_EVENTS_FILE,
+             REMINDERS_FILE)
+    return all(_secure_file(path) for path in paths)
+
+
+def _atomic_private_write(path: Path, text: str) -> None:
+    """Write a sensitive text file with mode 0600 and an atomic replacement.
+
+    A unique temporary name prevents unrelated writers from swapping the same
+    ``.tmp`` file, while the mode is set before the file becomes visible at
+    its final path. The caller still owns any higher-level read/modify/write
+    lock needed for its data structure.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.",
+                                    suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        if not _secure_file(path):
+            raise OSError(f"refusing insecure runtime file: {path}")
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _prepare_runtime() -> bool:
+    """Create the runtime roots privately and harden existing state files."""
+    for directory in (CONFIG_DIR, STATE_DIR, WHISPER_MODEL_DIR, PIPER_VOICE_DIR):
+        if not _private_dir(directory):
+            return False
+    return _secure_runtime_files()
 
 
 def coerce_settings(s: dict) -> dict:
@@ -227,6 +711,17 @@ def coerce_settings(s: dict) -> dict:
     _num("max_tool_calls", int, 0, 10_000)
     _num("ram_alert_percent", float, 50.0, 99.0)
     _num("vram_alert_percent", float, 50.0, 99.0)
+    _num("confirm_seconds", float, 5.0, 600.0)
+    s["dry_run"] = bool(s.get("dry_run", False))
+    _pol = s.get("command_policy")
+    if isinstance(_pol, dict):
+        s["command_policy"] = {
+            str(k).strip(): str(v).strip().upper()
+            for k, v in _pol.items()
+            if str(k).strip() and str(v).strip().upper() in ("ALLOW", "DENY", "CONFIRM")
+        }
+    else:
+        s["command_policy"] = {}
     s["resource_alerts"] = bool(s.get("resource_alerts", False))
     s["notification_reader"] = bool(s.get("notification_reader", False))
     _nm = s.get("notification_mute_apps", [])
@@ -309,8 +804,8 @@ def _persist_setting(key: str, value) -> None:
         data[key] = value
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = SETTINGS_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, SETTINGS_FILE)
+        _atomic_private_write(
+            SETTINGS_FILE, json.dumps(data, ensure_ascii=False, indent=1))
 
 
 SETTINGS = _load_settings()
@@ -504,6 +999,8 @@ Useful examples:
 - Windows: niri msg action focus-window-right, focus-window-left, focus-workspace-down, focus-workspace-up, move-window-right, toggle-window-floating, maximize-column, overview
 - Launch an app: niri msg action spawn -- alacritty
 Never attempt destructive or unsafe commands (sudo, rm, pacman, shutdown, ...). If a request is unsafe, refuse politely in one short sentence.
+- Long builds: start_command = background job; poll job_status; finish announced. Same whitelist as run_command.
+- handsoff_doctor self-reports hashes/Ollama/mic/niri/systemd. "CONFIRM REQUIRED": NEXT turn confirm_action. "DRY-RUN": nothing ran.
 
 FILES
 - read_file(path): read any text file, including your own source code.
@@ -552,7 +1049,7 @@ AMBIENT ASSISTANCE — notification_reader, pomodoro, watch_file, watch_process
 
 EYES & APPS — see_screen, read_screen_text, open_app, focus_window
 - see_screen shows the screen as an image; read_screen_text reads text via OCR. Use when the user says "this", "that error", "on my screen".
-- open_app launches; then focus_window + type_text to interact. Never open_app into a terminal to run commands — a run_command bypass, forbidden.
+- open_app waits for the window and reports it; wait_for_window or focus_window before typing. Re-run screen_elements after scrolling; wait before acting on a fresh dialog. Never open_app into a terminal to run commands — a run_command bypass, forbidden.
 
 WINDOW MANAGEMENT — close_window
 - 'close firefox' → close_window(app="firefox"); 'close this window' → close_window(app="this"). Polite close (unsaved work prompts). Report what the tool returned; never force-kill.
@@ -1093,9 +1590,7 @@ def _load_reminders() -> list[dict]:
 def _save_reminders(items: list[dict]) -> None:
     """Caller MUST hold REMINDERS_LOCK: the tmp filename is fixed, so two
     concurrent writers would corrupt each other's swap."""
-    tmp = REMINDERS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(items, indent=1))
-    os.replace(tmp, REMINDERS_FILE)
+    _atomic_private_write(REMINDERS_FILE, json.dumps(items, indent=1))
 
 
 def _update_reminders(mutate) -> list[dict]:
@@ -1704,7 +2199,21 @@ class ToolBelt:
         self._on_notification = on_notification
         self._on_announce = on_announce
         self._on_pomodoro = on_pomodoro
+        self._policy = DecisionPolicy()
+        # bounded background jobs (start_command): job_id -> BoundedJob
+        self._jobs: dict[str, BoundedJob] = {}
+        self._job_seq = 0
+        self._job_lock = threading.Lock()
+        # pending CONFIRM offers (confirm_action): {tool, until}
+        self._pending_confirm: dict | None = None
+        self._confirm_running: str | None = None   # bypass while running the confirmed call
         self._last_images: list[str] = []
+        # operator state: OCR element scan freshness + focused-output pointer
+        # scale (screen pixels / scale = pointer coordinates); refreshed by
+        # every screen_elements scan, invalidated by anything that changes
+        # the screen (_mark_elements_stale)
+        self._elements_ts: float = 0.0
+        self._pointer_scale: float = 1.0
         self._watch_lock = threading.RLock()
         self._file_watchers: dict[str, tuple[threading.Event, threading.Thread]] = {}
         self._process_watchers: dict[str, tuple[threading.Event, threading.Thread]] = {}
@@ -1716,6 +2225,17 @@ class ToolBelt:
         }
 
     # -- public dispatch -----------------------------------------------------
+
+    def _announce_job(self, text: str) -> None:
+        """Speak a job completion through the assistant's announcement path
+        (same channel as watcher alerts); a bare ToolBelt without one logs."""
+        if self._on_announce is not None:
+            try:
+                self._on_announce(text)
+            except Exception:
+                log.exception("job announcement failed")
+        else:
+            log.info("%s", text)
 
     def _tool_methods(self) -> dict:
         """{tool name: bound method} for every @tool-decorated method."""
@@ -1738,6 +2258,8 @@ class ToolBelt:
             self._tool_times.popleft()
         if limit > 0:
             if len(self._tool_times) >= limit:
+                log_decision(name, json.dumps(args)[:120], "RATE-LIMITED",
+                             "refused: rate limit")
                 return (f"REFUSED: tool-call rate limit reached ({limit} calls/60s) — "
                         "stop calling tools, answer from what you have, or wait"), True
             self._tool_times.append(now)
@@ -1747,7 +2269,48 @@ class ToolBelt:
         # permission gate declared on the tool itself
         gate = fn._tool_gates
         if gate and not self._perm.get(gate, True):
+            log_decision(name, json.dumps(args)[:120], "DENY",
+                         "refused: permission gate disabled")
             return f"REFUSED: the '{gate}' tool is disabled in handsoff settings", True
+        # centralized policy: ALLOW / DENY / CONFIRM (one-turn separation).
+        # kill_process/confirm_kill manage their own two-step confirm and stay
+        # out of this path.
+        if name in ("kill_process", "confirm_kill"):
+            verdict = "ALLOW"
+        else:
+            verdict = self._policy.classify(name)
+        target = json.dumps(args, sort_keys=True)[:200] if args else ""
+        if verdict == "DENY":
+            log_decision(name, target, "DENY", "refused: command_policy DENY")
+            return (f"REFUSED: '{name}' is DENIED by the user's command policy "
+                    "(handsoff settings) — do not retry this turn"), True
+        if verdict == "CONFIRM" and getattr(self, "_confirm_running", None) != name:
+            # Strict one-turn separation: ONLY confirm_action('yes') runs a
+            # CONFIRM-class call. A repeated direct call never executes — it
+            # just re-surfaces the standing offer (fail-safe: the worst case
+            # is the user hearing the offer twice).
+            if (self._pending_confirm is None
+                    or self._pending_confirm.get("tool") != name):
+                self._pending_confirm = {
+                    "tool": name, "args": dict(args),
+                    "until": time.monotonic() + self._policy.confirm_seconds(),
+                }
+                log_decision(name, target, "CONFIRM", "offered; awaiting confirm_action")
+            else:
+                log_decision(name, target, "CONFIRM", "still awaiting confirm_action")
+            return (f"CONFIRM REQUIRED: about to call '{name}' with {target or 'no arguments'}. "
+                    "Nothing happened yet. The user must hear this offer and "
+                    "reply; call confirm_action(answer='yes') in the NEXT turn "
+                    "to run it, or confirm_action(answer='no') to cancel."), True
+        # dry-run: desktop actions report instead of act
+        dry_run = bool(SETTINGS.get("dry_run")) and DecisionPolicy.is_desktop_action(name)
+        if dry_run:
+            log_decision(name, target, "DRY-RUN", "reported; nothing executed")
+            return (f"DRY-RUN: {name} would run with {target or 'no arguments'}. "
+                    "Nothing was executed (dry_run is enabled in settings). "
+                    "Describe the plan to the user and stop."), True
+        log_decision(name, target, verdict if verdict != "CONFIRM" else "ALLOW",
+                     "dispatched")
         # accept common argument-name slips local models make
         alias_map = fn._tool_aliases
         sig = inspect.signature(fn)
@@ -1967,13 +2530,48 @@ class ToolBelt:
             return f"ERROR: ydotool failed: {msg}"
         return "ok"
 
+    # -- niri IPC plumbing (one place for every window query) -----------------
+
+    @staticmethod
+    def _niri_msg(*args: str, timeout: float = 8.0) -> subprocess.CompletedProcess:
+        return subprocess.run(["niri", *args], capture_output=True, text=True,
+                              timeout=timeout)
+
+    @classmethod
+    def _niri_windows(cls) -> list[dict]:
+        """One live window-list poll. Raises RuntimeError when the niri IPC
+        is unreachable or answers garbage — callers decide whether that is
+        fatal or ignorable."""
+        try:
+            r = cls._niri_msg("msg", "--json", "windows")
+            if r.returncode != 0:
+                raise RuntimeError(
+                    (r.stderr or r.stdout or "niri refused").strip()[:160])
+            return json.loads(r.stdout or "[]")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"niri IPC unavailable ({e})") from e
+
+    @staticmethod
+    def _win_label(w: dict) -> str:
+        """Compact human label: 'app_id: title'."""
+        return f"{w.get('app_id') or '?'}: {(w.get('title') or '')[:60]}"
+
+    @staticmethod
+    def _win_matches(w: dict, q: str) -> bool:
+        """Case-insensitive substring match on app-id or title."""
+        return (q in str(w.get("app_id", "")).lower()
+                or q in str(w.get("title", "")).lower())
+
+    @staticmethod
+    def _win_listing(wins: list[dict], limit: int = 12) -> str:
+        return " | ".join(ToolBelt._win_label(w) for w in wins[:limit])
+
     def _focused_window_info(self) -> dict | None:
         """Best-effort info about the focused window (niri)."""
         try:
-            raw = subprocess.run(["niri", "msg", "--json", "windows"],
-                                 capture_output=True, text=True, timeout=8)
-            wins = json.loads(raw.stdout or "[]")
-            for w in wins:
+            for w in self._niri_windows():
                 if w.get("is_focused"):
                     return w
         except Exception:
@@ -1991,13 +2589,27 @@ class ToolBelt:
         Raises RuntimeError when focus CANNOT be determined (niri IPC dead or
         no focused window): keyboard injection must FAIL CLOSED — typing into
         an unidentified window could execute text in a terminal."""
-        focused = self._focused_window_info()
-        if focused is None:
+        return self._terminal_marker(self._typing_guard())
+
+    def _typing_guard(self) -> dict:
+        """The verified focused window for a keyboard-injection operation.
+
+        EVERY typing operation calls this immediately before injecting keys:
+        focus may have moved since the model decided what to type (the user
+        clicked elsewhere, a dialog opened). Raises RuntimeError when focus
+        cannot be verified (fail-closed, as _focused_is_terminal)."""
+        w = self._focused_window_info()
+        if w is None:
             raise RuntimeError("cannot verify the focused window (niri IPC "
                                "unavailable) — refusing to inject keys")
-        app_id = str(focused.get("app_id", "")).lower()
-        title = str(focused.get("title", "")).lower()
-        if any(t in app_id or t in title for t in self._TERMINAL_MARKERS):
+        return w
+
+    @classmethod
+    def _terminal_marker(cls, w: dict) -> str | None:
+        """App-id/title of window `w` if it looks like a terminal, else None."""
+        app_id = str(w.get("app_id", "")).lower()
+        title = str(w.get("title", "")).lower()
+        if any(t in app_id or t in title for t in cls._TERMINAL_MARKERS):
             return app_id or title
         return None
 
@@ -2018,10 +2630,10 @@ class ToolBelt:
         # (they would execute it). FAIL CLOSED: if focus can't be verified,
         # refuse — an unidentified window might be a terminal.
         try:
-            term = self._focused_is_terminal()
+            target = self._typing_guard()
         except RuntimeError as e:
             return f"REFUSED: {e}"
-        if term:
+        if (term := self._terminal_marker(target)) is not None:
             return (f"REFUSED: the focused window is a terminal ({term}); "
                     "typing into terminals is forbidden")
         # bulk typing: ydotool types the whole string in one uinput burst
@@ -2030,7 +2642,16 @@ class ToolBelt:
         skipped = 0
         r = self._ydotool("type", "--key-delay", "6", "--", text)
         if r != "ok":
-            # retry once: uinput is unreliable for non-ASCII in ydotool 1.x
+            # retry once: uinput is unreliable for non-ASCII in ydotool 1.x.
+            # Focus is RE-VERIFIED first — the failed attempt may have taken
+            # long enough for focus to move (same fail-closed rules).
+            try:
+                target = self._typing_guard()
+            except RuntimeError as e:
+                return f"REFUSED: {e}"
+            if (term := self._terminal_marker(target)) is not None:
+                return (f"REFUSED: focus moved to a terminal ({term}) "
+                        "before the retry — typing aborted")
             ascii_text = (text.replace("\u2014", "-").replace("\u2013", "-")
                           .replace("\u201c", '"').replace("\u201d", '"')
                           .replace("\u2018", "'").replace("\u2019", "'")
@@ -2046,10 +2667,19 @@ class ToolBelt:
             typed = len(text)
         if typed == 0:
             return "ERROR: typing failed entirely"
-        note = f"typed {typed} chars into the focused window"
+        # post-action verification: a long burst can outlive a focus change
+        # (the user clicked elsewhere mid-type) — report where the text may
+        # have landed instead of silently claiming success.
+        note = f"typed {typed} chars into {self._win_label(target)}"
         if skipped:
             note += f" ({skipped} chars skipped: unsupported characters)"
-        log.info("type_text: %d chars (skipped %d)", typed, skipped)
+        end_focus = self._focused_window_info()
+        if end_focus is not None and end_focus.get("id") != target.get("id"):
+            note += (f" — WARNING: focus moved to {self._win_label(end_focus)} "
+                     "during typing; some text may have landed there")
+        self._mark_elements_stale()          # screen content changed
+        log.info("type_text: %d chars into %s (skipped %d)",
+                 typed, self._win_label(target), skipped)
         return note
 
     @tool(description=(
@@ -2064,7 +2694,7 @@ class ToolBelt:
         c = combo.strip().lower()
         if not c:
             return "REFUSED: empty combo"
-        # same fail-closed terminal guard as type_text
+        # same fail-closed verified-focus guard as type_text
         try:
             term = self._focused_is_terminal()
         except RuntimeError as e:
@@ -2097,7 +2727,10 @@ class ToolBelt:
             argv += [f"{k}:1", f"{k}:0"]
         for m in reversed(mods):
             argv += [f"{m}:0"]
-        return self._ydotool(*argv)
+        r = self._ydotool(*argv)
+        if r == "ok":
+            self._mark_elements_stale()      # e.g. enter submits, screen changed
+        return r
 
     # niri named keys for press_hotkey (evdev codes beyond letters/digits)
     _HOTKEY_NAMES = {
@@ -2173,6 +2806,7 @@ class ToolBelt:
             argv += [f"{m}:0"]
         r = self._ydotool(*argv)
         if r == "ok":
+            self._mark_elements_stale()      # compositor shortcuts change the screen
             log.info("press_hotkey: %s", c)
         return r
 
@@ -2463,9 +3097,37 @@ class ToolBelt:
         return (f"ERROR: unknown workspace action '{act}' — "
                 "use go / move / next / prev / list")
 
+    # polling cadence for window waits: niri maps windows instantly on spawn,
+    # but apps take 0.5-3 s to map their first window; 0.25 s is invisible to
+    # the user yet catches fast launchers on the very first poll
+    _WIN_POLL_S = 0.25
+
+    def _wait_window_match(self, q: str, timeout: float,
+                           ids_before: set | None = None) -> dict | None:
+        """Poll the live window list until a window matching `q` appears.
+
+        With ids_before, only windows NOT in that set are considered (used by
+        open_app to identify the freshly launched window). Returns the window
+        dict or None on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                wins = self._niri_windows()
+            except RuntimeError:
+                wins = []
+            for w in wins:
+                if ids_before is not None and w.get("id") in ids_before:
+                    continue
+                if self._win_matches(w, q):
+                    return w
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(self._WIN_POLL_S)
+
     @tool(description=(
         "Focus a desktop window by app name or title substring "
-        "('firefox', 'slack', 'alacritty')."),
+        "('firefox', 'slack', 'alacritty'). Confirms the window really got "
+        "focus before returning."),
         aliases={"app": ("window",)})
     def focus_window(self, app: str) -> str:
         """Focus a window by name.
@@ -2476,30 +3138,244 @@ class ToolBelt:
         if not q:
             return "REFUSED: name the app or window title to focus"
         try:
-            raw = subprocess.run(
-                ["niri", "msg", "--json", "windows"],
-                capture_output=True, text=True, timeout=8,
-            )
-            wins = json.loads(raw.stdout or "[]")
-        except Exception as e:
+            wins = self._niri_windows()
+        except RuntimeError as e:
             return f"ERROR: cannot list windows ({e})"
-        cands = [w for w in wins
-                 if q in str(w.get("app_id", "")).lower()
-                 or q in str(w.get("title", "")).lower()]
+        cands = [w for w in wins if self._win_matches(w, q)]
         if not cands:
-            titles = [f"{w.get('app_id')}: {w.get('title')}" for w in wins]
             return ("ERROR: no window matching " + q + ". Open windows: "
-                    + " | ".join(titles[:12]))
+                    + self._win_listing(wins))
         w = cands[0]
-        r = subprocess.run(
-            ["niri", "msg", "action", "focus-window",
-             "--id", str(w.get("id"))],
-            capture_output=True, text=True, timeout=8,
-        )
+        try:
+            r = self._niri_msg("msg", "action", "focus-window",
+                               "--id", str(w.get("id")))
+        except Exception as e:
+            return f"ERROR: focus failed: {e}"
         if r.returncode != 0:
             return f"ERROR: focus failed: {(r.stderr or 'unknown').strip()}"
-        log.info("focus_window: %s", w.get("app_id"))
-        return f"focused {w.get('app_id')}: {w.get('title')}"
+        # post-action verification: 'niri accepted the command' is not
+        # 'the window has focus'. Poll until it is (or admit we can't tell).
+        note = f"focused {self._win_label(w)}"
+        confirmed = self._wait_focus_id(w.get("id"), 2.0)
+        if confirmed:
+            note += " (focus confirmed)"
+        else:
+            note += " (focus NOT confirmed yet — it may still be switching)"
+        log.info("focus_window: %s", note)
+        return note
+
+    def _wait_focus_id(self, win_id, timeout: float) -> bool:
+        """True when window `win_id` reports is_focused within `timeout`."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                wins = self._niri_windows()
+            except RuntimeError:
+                return False
+            if any(w.get("id") == win_id and w.get("is_focused") for w in wins):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self._WIN_POLL_S)
+
+    @tool(description=(
+        "Wait until a window matching the name exists (apps take a moment to "
+        "appear after launch). Returns the window and whether it is focused. "
+        "Use after open_app, or when a window is slow to appear."),
+        gates="focus_window",
+        aliases={"app": ("window", "name")})
+    def wait_for_window(self, app: str, timeout: float = 10.0) -> str:
+        """Wait for a window to exist.
+
+        app: app-id or title substring to wait for
+        timeout: seconds to wait before giving up (max 30)
+        """
+        q = app.strip().lower()
+        if not q:
+            return "REFUSED: name the app or window title to wait for"
+        timeout = min(max(float(timeout or 10.0), 0.5), 30.0)
+        w = self._wait_window_match(q, timeout)
+        if w is None:
+            try:
+                listing = self._win_listing(self._niri_windows())
+            except RuntimeError:
+                listing = "window list unavailable (niri IPC down?)"
+            return (f"ERROR: no window matching '{q}' appeared within "
+                    f"{timeout:g}s. Open windows: {listing}")
+        focus = ("and focused" if w.get("is_focused")
+                 else "but NOT focused — call focus_window before typing")
+        log.info("wait_for_window: %s %s", self._win_label(w), focus)
+        return f"window ready: {self._win_label(w)} ({focus})"
+
+    @tool(description=(
+        "Sleep for `seconds` (0.5-30, default 1) before the next action: "
+        "lets an app finish drawing, an animation settle, or a dialog "
+        "appear. Prefer wait_for_window when waiting for an app window."),
+        gates="",
+        aliases={"seconds": ("secs", "delay", "duration")})
+    def wait(self, seconds: float = 1.0) -> str:
+        """Wait a moment.
+
+        seconds: how long to sleep (0.5 to 30)
+        """
+        try:
+            s = float(seconds)
+        except (TypeError, ValueError):
+            s = 1.0
+        s = min(max(s, 0.5), 30.0)
+        time.sleep(s)
+        log.info("wait: %.1fs", s)
+        return f"waited {s:.1f}s"
+
+    # -- live capability manifest (what THIS compositor can do right now) ------
+    # The AI must not guess niri's surface: actions differ across versions, so
+    # the manifest is polled live (cached briefly) instead of hardcoded.
+
+    _MANIFEST_TTL = 30.0
+    _MANIFEST_LOCK = threading.Lock()
+    _MANIFEST_CACHE: dict | None = None   # {"at": monotonic, "data": dict}
+
+    @classmethod
+    def _niri_manifest(cls, refresh: bool = False) -> dict:
+        """The live capability manifest, cached for _MANIFEST_TTL seconds."""
+        with cls._MANIFEST_LOCK:
+            c = cls._MANIFEST_CACHE
+            if (not refresh and c is not None
+                    and time.monotonic() - c["at"] < cls._MANIFEST_TTL):
+                return c["data"]
+            data = cls._build_manifest()
+            cls._MANIFEST_CACHE = {"at": time.monotonic(), "data": data}
+            return data
+
+    @staticmethod
+    def _niri_help_names(argv: list[str], section: str) -> list[str]:
+        """Enum names from a niri help text: the lines indented exactly two
+        spaces under `section:` ('Actions:', …), until the next left-flush
+        section. Tolerates missing niri (returns [])."""
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=8)
+            text = (r.stdout or "") + "\n" + (r.stderr or "")
+        except Exception:
+            return []
+        names: list[str] = []
+        inside = False
+        for line in text.splitlines():
+            if not inside:
+                if line.strip() == section + ":":
+                    inside = True
+                continue
+            if not line.startswith("  "):
+                if line.strip():
+                    break                     # next left-flush section
+                continue
+            m = re.fullmatch(r"  ([a-z0-9][a-z0-9-]*)\s*", line)
+            if m:
+                names.append(m.group(1))
+        return names
+
+    @classmethod
+    def _build_manifest(cls) -> dict:
+        """Poll niri for everything the desktop-action tools depend on.
+        Every piece is optional: a dead IPC just leaves that piece absent."""
+        m: dict = {}
+
+        def _json_cli(*args: str):
+            r = cls._niri_msg(*args)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or "niri refused").strip()[:120])
+            return json.loads(r.stdout or "null")
+
+        try:
+            v = _json_cli("msg", "--json", "version")
+            m["version"] = str(v.get("compositor") or v.get("cli") or "?")
+        except Exception:
+            m["version_error"] = "niri IPC unavailable"
+        try:
+            wins = cls._niri_windows()
+            m["windows"] = {
+                "count": len(wins),
+                "focused": next((cls._win_label(w) for w in wins
+                                 if w.get("is_focused")), None),
+            }
+        except Exception:
+            pass
+        try:
+            m["workspaces"] = {"count": len(_json_cli("msg", "--json",
+                                                      "workspaces"))}
+        except Exception:
+            pass
+        try:
+            outs = _json_cli("msg", "--json", "outputs")
+            try:
+                focused = _json_cli("msg", "--json", "focused-output").get("name")
+            except Exception:
+                focused = None
+            m["outputs"] = [
+                {"name": name,
+                 "make": str((o or {}).get("make") or "?")[:24],
+                 "model": str((o or {}).get("model") or "?")[:24],
+                 "scale": ((o or {}).get("logical") or {}).get("scale", 1.0),
+                 "focused": name == focused}
+                for name, o in (outs or {}).items()]
+        except Exception:
+            pass
+        try:
+            kl = _json_cli("msg", "--json", "keyboard-layouts")
+            names = [str(n) for n in (kl or {}).get("names") or []]
+            m["keyboard_layouts"] = {
+                "names": names,
+                "current": (names[(kl or {}).get("current_idx") or 0]
+                            if names else None),
+            }
+        except Exception:
+            pass
+        acts = cls._niri_help_names(["niri", "msg", "action", "--help"],
+                                    "Actions")
+        if acts:
+            m["actions"] = acts
+        return m
+
+    @tool(description=(
+        "Live capability manifest of the niri compositor: version, open "
+        "windows, workspaces, outputs (name and scale — needed to convert "
+        "screenshot pixels to pointer coordinates), keyboard layouts, and "
+        "every supported action on THIS version. Cached ~30s; refresh=true "
+        "forces a fresh poll."),
+        gates="",
+        aliases={"refresh": ("force",)})
+    def niri_capabilities(self, refresh: bool = False) -> str:
+        """Report what the running compositor supports right now.
+
+        refresh: true to bypass the 30s cache
+        """
+        m = self._niri_manifest(refresh=bool(refresh))
+        out: list[str] = []
+        if "version" in m:
+            out.append(f"niri {m['version']}")
+        elif "version_error" in m:
+            out.append(f"niri: {m['version_error']}")
+        w = m.get("windows")
+        if w:
+            out.append(f"windows: {w['count']}"
+                       + (f", focused: {w['focused']}" if w.get("focused") else ""))
+        if "workspaces" in m:
+            out.append(f"workspaces: {m['workspaces']['count']}")
+        outs = m.get("outputs")
+        if outs:
+            out.append("outputs: " + " ;; ".join(
+                f"{o['name']} {o['model']} scale {o.get('scale', 1.0)}"
+                + (" (focused)" if o.get("focused") else "")
+                for o in outs))
+        kl = m.get("keyboard_layouts")
+        if kl and kl.get("names"):
+            out.append("keyboard layouts: " + ", ".join(kl["names"])
+                       + (f" [current: {kl['current']}]" if kl.get("current") else ""))
+        acts = m.get("actions")
+        if acts:
+            shown = ", ".join(acts[:60])
+            more = f" … (+{len(acts) - 60} more)" if len(acts) > 60 else ""
+            out.append(f"actions ({len(acts)}): {shown}{more}")
+        return "\n".join(out) or "niri capability manifest unavailable"
 
     @tool(description=(
         "Close an app's windows by name ('firefox', 'spotify') or 'this' for "
@@ -2529,13 +3405,10 @@ class ToolBelt:
             if not targets:
                 return "ERROR: no focused window"
         else:
-            targets = [w for w in wins
-                       if q in str(w.get("app_id", "")).lower()
-                       or q in str(w.get("title", "")).lower()]
+            targets = [w for w in wins if self._win_matches(w, q)]
             if not targets:
-                titles = [f"{w.get('app_id')}: {w.get('title')}" for w in wins]
                 return ("ERROR: no window matching " + q + ". Open windows: "
-                        + " | ".join(titles[:12]))
+                        + self._win_listing(wins))
         targets = [w for w in targets
                    if "handsoff" not in str(w.get("app_id", "")).lower()]
         if not targets:
@@ -2543,17 +3416,42 @@ class ToolBelt:
                     "if a restart is needed, use self_restart")
         closed, failed = [], []
         for w in targets:
-            r = subprocess.run(
-                ["niri", "msg", "action", "close-window", "--id", str(w.get("id"))],
-                capture_output=True, text=True, timeout=8,
-            )
-            label = f"{w.get('app_id')}: {w.get('title')}"
+            try:
+                r = self._niri_msg("msg", "action", "close-window",
+                                   "--id", str(w.get("id")))
+            except Exception as e:
+                failed.append(f"{self._win_label(w)} ({e})")
+                continue
+            label = self._win_label(w)
             (closed if r.returncode == 0 else failed).append(label)
-        if closed:
-            log.info("close_window: %s", "; ".join(closed))
         if failed:
             return "ERROR: close failed for: " + " | ".join(failed)
-        return (f"closed {len(closed)} window(s): " + " | ".join(closed))
+        # post-action verification: a polite close can be declined (unsaved
+        # work opens a dialog) — check the windows are really gone.
+        lingering = list(closed)
+        if closed:
+            ids = {self._win_label(t): t.get("id") for t in targets}
+            deadline = time.monotonic() + 2.0
+            while lingering and time.monotonic() < deadline:
+                try:
+                    wins = self._niri_windows()
+                except RuntimeError:
+                    break
+                live_ids = {w.get("id") for w in wins}
+                lingering = [lbl for lbl in closed if ids.get(lbl) in live_ids]
+                if lingering:
+                    time.sleep(self._WIN_POLL_S)
+        gone = [lbl for lbl in closed if lbl not in lingering]
+        if gone:
+            log.info("close_window: %s", "; ".join(gone))
+        note = ""
+        if gone:
+            note += f"closed {len(gone)} window(s): " + " | ".join(gone)
+            note += " (confirmed gone)"
+        if lingering:
+            note += ("; still open: " + " | ".join(lingering)
+                     + " — the app may be asking about unsaved work")
+        return note or "ERROR: nothing was closed"
 
     @tool(gates="copy_text", description="Copy text to the Wayland clipboard.",
           aliases={"text": ("content",)})
@@ -3280,6 +4178,136 @@ class ToolBelt:
         log.warning("kill_process: SIGTERM pid %d (%s) confirmed", pid, name)
         return f"Stopped {name} (pid {pid}) (SIGTERM sent)."
 
+    # -- centralized confirm (one-turn separation for CONFIRM-class tools) ----
+
+    @tool(description=(
+        "Second step for a CONFIRM-offered tool: 'yes' runs, 'no' cancels."),
+        gates="", aliases={"answer": ("confirm", "reply")})
+    def confirm_action(self, answer: str = "yes") -> str:
+        offer = self._pending_confirm
+        if not offer:
+            return "ERROR: nothing to confirm — no CONFIRM-class tool call is pending"
+        if time.monotonic() >= offer["until"]:
+            self._pending_confirm = None
+            return "ERROR: the confirmation offer expired — make the request again"
+        ans = str(answer or "yes").strip().lower()
+        if ans not in ("yes", "no", "y", "n"):
+            return "ERROR: answer with yes or no"
+        if ans in ("no", "n"):
+            tool = offer["tool"]
+            self._pending_confirm = None
+            log_decision(tool, "", "CONFIRM", "cancelled by user")
+            log.info("confirm_action: %s cancelled", tool)
+            return f"Cancelled — {tool} was not run."
+        # yes: run the offered call now with the ORIGINAL arguments. The
+        # _confirm_running bypass stops the inner execute() from making a
+        # fresh offer (which would loop offers forever).
+        self._pending_confirm = None
+        tool, args = offer["tool"], offer["args"]
+        log_decision(tool, json.dumps(args)[:120], "CONFIRM", "confirmed; running")
+        self._confirm_running = tool
+        try:
+            out, err = self.execute(tool, args)
+        finally:
+            self._confirm_running = None
+        log_decision(tool, json.dumps(args)[:120], "EXECUTED",
+                     "refused/errored" if err else "ok")
+        return out
+
+    # -- bounded background jobs (long-running whitelisted commands) ----------
+
+    JOB_ANNOUNCE_S = 20.0   # first job_status poll that fast announces on finish
+
+    @tool(description=(
+        "Run a whitelisted command as a background job."),
+        gates="run_command")
+    def start_command(self, command: str) -> str:
+        """Run a whitelisted command as a bounded background job.
+
+        command: same single whitelisted command run_command accepts
+        """
+        with self._job_lock:
+            if len(self._jobs) >= BoundedJob.MAX_JOBS:
+                return (f"ERROR: job limit reached ({BoundedJob.MAX_JOBS}) — "
+                        f"check or reap with job_status first: "
+                        f"{', '.join(sorted(self._jobs))}")
+        # identical gate text as run_command on refusal: the policy is the
+        # whitelist, not the execution mode
+        probe = self.run_command(command)
+        if probe.startswith("REFUSED") or probe.startswith("ERROR"):
+            return probe
+        argv = shlex.split(command.strip())
+        argv[0] = os.path.expanduser(argv[0])
+        log.info("start_command: %s", command.strip())
+        try:
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, start_new_session=True,
+            )
+        except OSError as e:
+            return f"ERROR: launch failed: {e}"
+        with self._job_lock:
+            self._job_seq += 1
+            job_id = f"job-{self._job_seq}"
+            self._jobs[job_id] = BoundedJob(job_id, command.strip(), proc)
+        return (f"started {job_id}: {command.strip()} — it runs in the "
+                "background; call job_status to check it. I will announce "
+                "when it finishes.")
+
+    @tool(description=(
+        "State/output of start_command jobs; finished announced"),
+        gates="run_command", aliases={"job_id": ("id", "job")})
+    def job_status(self, job_id: str = "") -> str:
+        """Report state/output of background jobs.
+
+        job_id: a specific job id, or empty for all jobs
+        """
+        with self._job_lock:
+            jobs = dict(self._jobs)
+        if job_id:
+            job = jobs.get(job_id.strip())
+            if job is None:
+                known = ", ".join(sorted(jobs)) or "none"
+                return f"ERROR: no job {job_id!r} (jobs: {known})"
+            jobs = {job_id.strip(): job}
+        if not jobs:
+            return "no background jobs"
+        lines: list[str] = []
+        reaped: list[str] = []
+        for jid, job in sorted(jobs.items()):
+            state, done = job.poll()
+            if done:
+                if not job._announced:
+                    job._announced = True
+                    self._announce_job(job.status_text())
+                # bounded output tail (never the whole pipe)
+                try:
+                    out = job.proc.stdout.read(4096) if job.proc.stdout else ""
+                except (OSError, ValueError):
+                    out = ""
+                out = (out or "").strip()
+                if len(out) > BoundedJob.MAX_OUTPUT:
+                    out = out[:BoundedJob.MAX_OUTPUT] + " …(truncated)"
+                lines.append(f"{job.status_text()}\noutput:\n{out or '(no output)'}")
+                if state != "running":
+                    reaped.append(jid)
+            else:
+                lines.append(job.status_text())
+        with self._job_lock:
+            for jid in reaped:
+                self._jobs.pop(jid, None)
+        return "\n\n".join(lines)
+
+    # -- doctor (deployment + dependency diagnostics) --------------------------
+
+    @tool(description=(
+        "Self-diagnostic: deployment hashes, Ollama, TTS/STT, mic, niri, "
+        "systemd. Read-only"),
+        gates="")
+    def handsoff_doctor(self) -> str:
+        """Run the doctor diagnostic and return the report."""
+        return run_doctor()
+
     # -- operator: element-grounded clicking (Self-Operating-Computer pattern) --
 
     @staticmethod
@@ -3334,18 +4362,61 @@ class ToolBelt:
             assert 0 <= x <= 20000 and 0 <= y <= 20000
         except (TypeError, ValueError, AssertionError):
             return f"ERROR: invalid click target ({x}, {y})"
-        r1 = self._ydotool("mousemove", "-a", "-x", str(x), "-y", str(y))
+        pre_note = self._stale_scan_note()
+        # screen pixels (grim/OCR) → pointer space (logical): divide by the
+        # focused output's scale; 1.0 when unknown = plain pass-through
+        scale = getattr(self, "_pointer_scale", 1.0) or 1.0
+        px = max(0, int(round(x / scale)))
+        py = max(0, int(round(y / scale)))
+        r1 = self._ydotool("mousemove", "-a", "-x", str(px), "-y", str(py))
         if r1 != "ok":
             return f"ERROR: mouse move failed: {r1}"
         r2 = self._ydotool("click", "0xC0")
         if r2 != "ok":
             return f"ERROR: click failed: {r2}"
-        log.info("operator: clicked %s at (%d,%d)", what, x, y)
-        return f"clicked {what} at ({x},{y})"
+        self._mark_elements_stale()
+        conv = "" if scale == 1.0 else f" → pointer ({px},{py})"
+        log.info("operator: clicked %s at (%d,%d)%s", what, x, y, conv)
+        return f"clicked {what} at ({x},{y}){conv}{pre_note}"
+
+    def _detect_pointer_scale(self) -> float:
+        """Pointer-space scale of the focused output.
+
+        grim screenshots and tesseract coordinates are PHYSICAL pixels while
+        ydotool mousemove -a moves the LOGICAL pointer — clicks must divide
+        by this scale. Falls back to 1.0 when niri cannot be asked (CI, IPC
+        down): on scale-1 setups the no-op is exactly right."""
+        try:
+            r = self._niri_msg("msg", "--json", "focused-output")
+            out = json.loads(r.stdout or "null")
+            scale = float((out.get("logical") or {}).get("scale") or 1.0)
+            if scale > 0:
+                return scale
+        except Exception:
+            pass
+        return 1.0
+
+    def _mark_elements_stale(self) -> None:
+        """Forget the freshness of the last screen_elements scan — the
+        screen just changed (typing, keys, click, scroll, launch…)."""
+        self._elements_ts = 0.0
+
+    def _stale_scan_note(self) -> str:
+        """Warning suffix when the cached element scan may be outdated."""
+        ts = getattr(self, "_elements_ts", 0.0)
+        if not ts:
+            return ""
+        age = time.monotonic() - ts
+        if age > 90:
+            return (f" (element scan is {age:.0f}s old — the screen may "
+                    "have changed; run screen_elements again)")
+        return ""
 
     @tool(gates="screen_access", description=(
         "List clickable text elements on screen with numbers and positions. "
-        "Run this before click_element; re-run after anything changes."))
+        "Run this before click_element; re-run after anything changes — "
+        "clicks, typing, scrolling and launches all make the last scan "
+        "stale, and click_element will warn when it is."))
     def screen_elements(self) -> str:
         if not hasattr(self, "_elements"):
             self._elements = []
@@ -3362,10 +4433,16 @@ class ToolBelt:
             return "ERROR: OCR timed out"
         self._elements = self._parse_tsv(proc.stdout)
         if not self._elements:
+            self._mark_elements_stale()
             return "No clickable text elements found on screen."
-        log.info("screen_elements: %d lines", len(self._elements))
-        return (f"{len(self._elements)} clickable text elements:\n"
-                + self._screen_elements_fmt())
+        # refresh the pointer scale alongside the scan it will be applied to
+        self._pointer_scale = self._detect_pointer_scale()
+        self._elements_ts = time.monotonic()
+        log.info("screen_elements: %d lines (pointer scale %.2f)",
+                 len(self._elements), self._pointer_scale)
+        return (f"{len(self._elements)} clickable text elements "
+                f"(coordinates are screen pixels; pointer scale "
+                f"{self._pointer_scale:g}):\n" + self._screen_elements_fmt())
 
     @tool(gates="operator", description=(
         "Click a text element from the last screen_elements scan by its "
@@ -3395,6 +4472,51 @@ class ToolBelt:
     def click_at(self, x: int, y: int) -> str:
         return self._operator_click(x, y, "target")
 
+    # ydotool wheel mode passes -y straight to REL_WHEEL with no sign flip,
+    # and libinput defines REL_WHEEL +1 as wheel-up; horizontal REL_HWHEEL
+    # +1 is tilt-right. Flip these signs if a ydotool update inverts them.
+    _SCROLL_SIGNS = {"up": 1, "down": -1, "right": 1, "left": -1}
+
+    @tool(gates="operator", description=(
+        "Scroll the mouse wheel by `amount` notches (default 3): direction "
+        "up / down / left / right. Affects whatever window is under the "
+        "pointer — click_element or click_at first to aim it. Content "
+        "moves, so re-run screen_elements before clicking anything after."),
+        aliases={"direction": ("dir", "way"),
+                 "amount": ("notches", "clicks", "lines")})
+    def scroll(self, direction: str = "down", amount: int = 3) -> str:
+        """Scroll the mouse wheel.
+
+        direction: 'up', 'down', 'left' or 'right'
+        amount: wheel notches (1-25)
+        """
+        # Keep the capability boundary inside the method as well as in the
+        # dispatcher.  Unit callers and any future internal route must not be
+        # able to bypass the operator permission by invoking scroll directly.
+        if not getattr(self, "_perm", {}).get("operator", False):
+            return ("REFUSED: mouse control ('operator') is disabled in "
+                    "handsoff settings")
+        d = str(direction or "down").strip().lower()
+        if d not in self._SCROLL_SIGNS:
+            return "REFUSED: direction must be up, down, left or right"
+        try:
+            n = int(amount)
+        except (TypeError, ValueError):
+            n = 3
+        n = max(1, min(n, 25))
+        pre_note = self._stale_scan_note()
+        sign = self._SCROLL_SIGNS[d]
+        if d in ("up", "down"):
+            argv = ("mousemove", "-w", "-x", "0", "-y", str(sign * n))
+        else:
+            argv = ("mousemove", "-w", "-x", str(sign * n), "-y", "0")
+        r = self._ydotool(*argv)
+        if r != "ok":
+            return f"ERROR: scroll failed: {r}"
+        self._mark_elements_stale()
+        log.info("scroll: %s x%d", d, n)
+        return f"scrolled {d} {n} notch(es){pre_note}"
+
     # -- app launching (focused, safe aliases) ---------------------------------
 
     APP_ALIASES = {
@@ -3411,8 +4533,17 @@ class ToolBelt:
         "terminal": ("foot", "alacritty", "kitty"),
     }
 
+    # how long open_app waits for the launched app to map a window before
+    # giving up on identification (browsers/IDEs take 2-8 s on a cold start)
+    OPEN_APP_WAIT_S = 12.0
+    # how long open_app trusts "any new window" / "already open" fallbacks
+    # before them: within the grace period a name-matched window may still
+    # appear, which beats both
+    _WIN_GRACE_S = 3.0
+
     @tool(description=(
-        "Launch a desktop app by name ('firefox', 'spotify', 'files'…). "
+        "Launch a desktop app by name ('firefox', 'spotify', 'files'…), "
+        "wait for its window to appear and report which window it is. "
         "Then focus_window to aim typing at it."),
         gates="run_command",
         aliases={"app": ("name",)})
@@ -3433,6 +4564,13 @@ class ToolBelt:
                 break
         if resolved is None:
             return f"ERROR: no program matching '{app}' is installed"
+        # snapshot BEFORE spawning: the launched window is identified as the
+        # new one that appears (spawn alone says nothing — the app may fail,
+        # fork, or already be running)
+        try:
+            ids_before = {w.get("id") for w in self._niri_windows()}
+        except RuntimeError:
+            ids_before = None
         try:
             subprocess.Popen(
                 ["niri", "msg", "action", "spawn", "--", resolved],
@@ -3442,7 +4580,57 @@ class ToolBelt:
         except Exception as e:
             return f"ERROR: launch failed: {e}"
         log.info("open_app: %s", chosen)
-        return f"launched {chosen}"
+        if ids_before is None:
+            return (f"launched {chosen} (could not verify the window — "
+                    "niri window list unavailable)")
+        w, already = self._wait_new_window(ids_before, chosen,
+                                           self.OPEN_APP_WAIT_S)
+        if w is None:
+            return (f"launched {chosen}, but no new window appeared within "
+                    f"{self.OPEN_APP_WAIT_S:.0f}s — it may still be starting "
+                    "(or failed to launch); try wait_for_window or focus_window")
+        if already:
+            log.info("open_app: %s was already open", chosen)
+            return (f"{chosen} is already open — window: {self._win_label(w)} "
+                    "(NOT focused — call focus_window to raise it)")
+        note = f"launched {chosen} — window ready: {self._win_label(w)}"
+        note += (" (focused)" if w.get("is_focused")
+                 else " (NOT focused — call focus_window before typing)")
+        self._mark_elements_stale()
+        return note
+
+    def _wait_new_window(self, ids_before: set, name: str,
+                         timeout: float) -> tuple[dict | None, bool]:
+        """Wait for the launched app's window after spawn.
+
+        Priority: (1) a NEW window matching `name`; (2) after a short grace
+        period, any NEW window; (3) an EXISTING window matching `name` — the
+        app was likely already running and mapped nothing. Returns
+        (window, already_open); (None, False) when nothing appeared."""
+        start = time.monotonic()
+        deadline = start + timeout
+        fallback: dict | None = None
+        while True:
+            try:
+                wins = self._niri_windows()
+            except RuntimeError:
+                wins = []
+            fresh = [w for w in wins if w.get("id") not in ids_before]
+            for w in fresh:
+                if name and self._win_matches(w, name):
+                    return w, False
+            if fallback is None and fresh:
+                fallback = fresh[0]
+            now = time.monotonic()
+            if now - start >= self._WIN_GRACE_S:
+                if fallback is not None:
+                    return fallback, False
+                for w in wins:
+                    if name and self._win_matches(w, name):
+                        return w, True
+            if now >= deadline:
+                return None, False
+            time.sleep(self._WIN_POLL_S)
 
     # -- read_file -------------------------------------------------------------
 
@@ -4064,6 +5252,7 @@ class Assistant(QObject):
             "ready": _piper_voice is not None,
             "whisper_ready": _whisper_model is not None,
         }
+        snap["deployment"] = _deployment_snapshot()
         return snap
 
     # -- mic self-heal -------------------------------------------------------
@@ -4401,8 +5590,7 @@ class Assistant(QObject):
                 # would write to a deleted inode and never be reported again.
                 # The fd is O_APPEND, so after truncation the next crash
                 # appends from offset 0 and is visible on the next boot.
-                with open(crash, "w"):
-                    pass
+                _truncate_file_preserving_fd(crash)
         except Exception:
             log.exception("crash report failed")
 
@@ -5276,7 +6464,7 @@ class Assistant(QObject):
         """Called just before the restart script runs; leaves a note for our next self."""
         note = "" if self._turn_spoke else "I'm back, with my changes applied."
         try:
-            PENDING_FILE.write_text(json.dumps({"note": note}))
+            _atomic_private_write(PENDING_FILE, json.dumps({"note": note}))
         except OSError:
             pass
 
@@ -5296,9 +6484,8 @@ class Assistant(QObject):
 
     def _save_history(self) -> None:
         try:
-            tmp = HISTORY_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self._history, ensure_ascii=False, indent=1))
-            os.replace(tmp, HISTORY_FILE)
+            _atomic_private_write(
+                HISTORY_FILE, json.dumps(self._history, ensure_ascii=False, indent=1))
         except OSError:
             log.exception("cannot save history")
 
@@ -5426,9 +6613,8 @@ def _load_memory() -> list[dict]:
 
 def _save_memory(items: list[dict]) -> None:
     try:
-        tmp = MEMORY_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(items, ensure_ascii=False, indent=1))
-        os.replace(tmp, MEMORY_FILE)
+        _atomic_private_write(
+            MEMORY_FILE, json.dumps(items, ensure_ascii=False, indent=1))
     except OSError:
         log.exception("cannot save memory")
 
@@ -5785,75 +6971,150 @@ class BubbleWidget(QWidget):
 PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                "handsfree", "handsfree-on", "handsfree-off",
                "handsfree-status", "dictation", "dictation-on", "dictation-off",
-               "status", "health", "settings"}
+               "status", "health", "doctor", "settings"}
 
 
 class ControlServer:
-    """Unix-socket remote control so niri keybinds can drive the bubble."""
+    """Unix-socket remote control so niri keybinds can drive the bubble.
+
+    The server owns its socket and stop event. This matters on a clean Qt
+    shutdown: a daemon thread that outlives the widget can otherwise keep a
+    stale socket inode around until the process is killed, confusing the next
+    startup and making a failed launch look like a live bubble.
+    """
 
     def __init__(self, assistant: "Assistant") -> None:
         self._assistant = assistant
+        self._stop = threading.Event()
+        self._server: socket.socket | None = None
+        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        threading.Thread(target=self._serve, name="control", daemon=True).start()
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._serve, name="control", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the accept loop and remove only our owner-owned socket."""
+        self._stop.set()
+        server, self._server = self._server, None
+        if server is not None:
+            try:
+                server.close()
+            except OSError:
+                pass
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        try:
+            _remove_stale_control_socket()
+        except OSError:
+            log.exception("could not remove control socket during shutdown")
 
     def _serve(self) -> None:
+        server = None
         try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            if CONTROL_SOCK.exists():
-                CONTROL_SOCK.unlink()
+            if not _prepare_runtime():
+                raise OSError("runtime/config directories or files are not private")
+            _remove_stale_control_socket()
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.bind(str(CONTROL_SOCK))
             os.chmod(CONTROL_SOCK, 0o600)
             server.listen(4)
             server.settimeout(1.0)
+            self._server = server
         except OSError as e:
             log.error("control socket unavailable: %s", e)
+            if server is not None:
+                server.close()
             return
         log.info("control socket at %s", CONTROL_SOCK)
-        while True:
-            try:
-                conn, _ = server.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            try:
-                conn.settimeout(5.0)
-                action = conn.recv(1024).decode("utf-8", "replace").strip().lower()
-                if action in PTT_ACTIONS:
-                    if action == "status":
-                        reply = (f"state={self._assistant.state} "
-                                 f"handsfree={'on' if self._assistant._handsfree else 'off'} "
-                                 f"model={OLLAMA_MODEL}")
-                    elif action == "health":
-                        try:
-                            reply = json.dumps(
-                                self._assistant.mic_health(),
-                                ensure_ascii=False)
-                        except Exception:
-                            log.exception("health snapshot failed")
-                            reply = "error: health snapshot failed (see log)"
-                    elif action == "settings":
-                        if SETTINGS_APP.exists():
-                            subprocess.Popen(
-                                [sys.executable, str(SETTINGS_APP)], start_new_session=True,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            )
-                            reply = "ok: settings window launched"
+        try:
+            while not self._stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if not self._stop.is_set():
+                        log.exception("control socket accept failed")
+                    return
+                try:
+                    conn.settimeout(5.0)
+                    action = conn.recv(1024).decode("utf-8", "replace").strip().lower()
+                    if action in PTT_ACTIONS:
+                        if action == "status":
+                            reply = (f"state={self._assistant.state} "
+                                     f"handsfree={'on' if self._assistant._handsfree else 'off'} "
+                                     f"model={OLLAMA_MODEL}")
+                        elif action == "health":
+                            try:
+                                reply = json.dumps(
+                                    self._assistant.mic_health(),
+                                    ensure_ascii=False)
+                            except Exception:
+                                log.exception("health snapshot failed")
+                                reply = "error: health snapshot failed (see log)"
+                        elif action == "doctor":
+                            try:
+                                reply = run_doctor()
+                            except Exception:
+                                log.exception("doctor report failed")
+                                reply = "error: doctor report failed (see log)"
+                        elif action == "settings":
+                            if SETTINGS_APP.exists():
+                                subprocess.Popen(
+                                    [sys.executable, str(SETTINGS_APP)], start_new_session=True,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                )
+                                reply = "ok: settings window launched"
+                            else:
+                                reply = f"ERROR: settings app missing at {SETTINGS_APP}"
                         else:
-                            reply = f"ERROR: settings app missing at {SETTINGS_APP}"
+                            self._assistant.sigCommand.emit(action)
+                            reply = f"ok: {action}"
                     else:
-                        self._assistant.sigCommand.emit(action)
-                        reply = f"ok: {action}"
-                else:
-                    reply = (f"error: unknown command '{action}'. "
-                             f"commands: {' '.join(sorted(PTT_ACTIONS))}")
-                conn.sendall((reply + "\n").encode("utf-8"))
+                        reply = (f"error: unknown command '{action}'. "
+                                 f"commands: {' '.join(sorted(PTT_ACTIONS))}")
+                    conn.sendall((reply + "\n").encode("utf-8"))
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+        finally:
+            if self._server is server:
+                self._server = None
+            try:
+                server.close()
             except OSError:
                 pass
-            finally:
-                conn.close()
+            try:
+                _remove_stale_control_socket()
+            except OSError:
+                log.exception("could not remove control socket")
+
+
+def _remove_stale_control_socket() -> None:
+    """Remove a previous control socket only when it is safe to do so.
+
+    Never unlink a symlink, regular file, foreign-owned inode, or directory.
+    A stale socket from our own previous process is the only thing startup may
+    replace; anything else is a hard startup error instead of a path-traversal
+    or data-loss surprise.
+    """
+    try:
+        info = CONTROL_SOCK.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise OSError(f"refusing symlinked control socket: {CONTROL_SOCK}")
+    if info.st_uid != os.getuid():
+        raise OSError(f"control socket is not owned by uid {os.getuid()}")
+    if not stat.S_ISSOCK(info.st_mode):
+        raise OSError(f"control socket path is not a socket: {CONTROL_SOCK}")
+    CONTROL_SOCK.unlink()
 
 
 USAGE = """usage: python handsoff.py --ptt <command>   (remote-control a running bubble)
@@ -5871,7 +7132,8 @@ commands:
   dictation-on   enable voice dictation
   dictation-off  disable voice dictation
   status         report state, hands-free mode and model
-  health         full JSON health: mic, brain (Ollama) and TTS status"""
+  health         full JSON health: mic, brain (Ollama) and TTS status
+  doctor         human-readable diagnostic: deployment hashes, Ollama, mic, niri, systemd"""
 
 
 def ptt_client(argv: list[str]) -> int:
@@ -5890,6 +7152,29 @@ def ptt_client(argv: list[str]) -> int:
             return 0
         sys.stderr.write(f"handsoff: settings app not installed at {SETTINGS_APP}\n")
         return 1
+    if action == "doctor":
+        # the running bubble knows its live mic/brain state — ask it first;
+        # but a dead bubble must still report (deployment hashes, systemd,
+        # restart script), so fall back to a local run
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect(str(CONTROL_SOCK))
+            s.sendall(b"doctor")
+            s.shutdown(socket.SHUT_WR)
+            reply = b""
+            while True:
+                part = s.recv(4096)
+                if not part:
+                    break
+                reply += part
+            print(reply.decode("utf-8", "replace").strip())
+            return 0
+        except (FileNotFoundError, ConnectionRefusedError, OSError):
+            pass
+        print("(bubble not running — local report)\n")
+        print(run_doctor())
+        return 0
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5.0)
@@ -5913,6 +7198,13 @@ def ptt_client(argv: list[str]) -> int:
 
 
 # ------------------------------------------------------------------------------ main
+
+
+def _truncate_file_preserving_fd(path: Path) -> None:
+    """Truncate a crash log without replacing its inode or faulthandler fd."""
+    with path.open("r+b") as fh:
+        fh.truncate(0)
+        fh.flush()
 
 
 def _strip_images(history: list) -> None:
@@ -5956,12 +7248,17 @@ def acquire_lock():
 def main() -> int:
     if "--ptt" in sys.argv:
         return ptt_client(sys.argv[sys.argv.index("--ptt") + 1:])
-    for d in (CONFIG_DIR, STATE_DIR, WHISPER_MODEL_DIR, PIPER_VOICE_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+    if not _prepare_runtime():
+        sys.stderr.write(
+            "handsoff: refusing to start because config/state paths are "
+            "not private or are redirected by a symlink.\n")
+        return 1
     setup_logging()
     sys.excepthook = lambda *a: log.exception("uncaught exception", exc_info=a)
     threading.excepthook = lambda a: log.exception("uncaught thread exception", exc_info=a.exc_type)
-    faulthandler.enable(open(CRASH_LOG, "a"))  # native aborts (CUDA, Qt)
+    crash_fh = open(CRASH_LOG, "a", buffering=1)
+    os.chmod(CRASH_LOG, 0o600)
+    faulthandler.enable(crash_fh)  # native aborts (CUDA, Qt)
     log.info("handsoff %s starting (python %s, self=%s)", VERSION, sys.version.split()[0], SELF_PATH)
     log.info(
         "settings: model=%s num_ctx=%s whisper=%s streaming_tts=%s handsfree=%s "
@@ -5995,10 +7292,21 @@ def main() -> int:
 
     assistant = Assistant()
     bubble = BubbleWidget(assistant)
+    control = ControlServer(assistant)
     assistant.start()
-    ControlServer(assistant).start()
+    control.start()
+    app.aboutToQuit.connect(control.stop)
+    app.aboutToQuit.connect(assistant.shutdown)
     bubble.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        control.stop()
+        assistant.shutdown()
+        try:
+            lock.close()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

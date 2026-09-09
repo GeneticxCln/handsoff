@@ -1,9 +1,86 @@
 # handsoff — gap analysis & improvement roadmap
 
-Date: 2026-09-06 · All items reflect the state after the reliability hardening
-passed in this session (self-mute fix, mic watchdog, echo rejection, streaming
-TTS, keyboard takeover, settings opener `Mod+Shift+S`, autostart, crash log,
-resource alerts, notification reader, Pomodoro, and bounded watchers).
+Date: 2026-09-09 · Phase 0/1/2 of the external task list are closed (see the
+Addendum below); remaining consciously-accepted items are at the bottom.
+
+## Addendum — 2026-09-09 trust & reliability program (P0–P2 closed)
+
+403 tests green across the split suite (`tests/`: audio, policy, desktop,
+calendar, settings, lifecycle, regression, ops).
+
+### P0 — the running product is trustworthy
+- **Deployment hash reporting** — `_deployment_snapshot()` compares running /
+  installed / checkout by sha256 (mtime-independent); surfaced in the
+  `health` control command, the Settings health bar (`deploy: ok|drift`),
+  and the doctor. The known "installed copy compares against itself" bug is
+  fixed and pinned (`TestDeploymentReporting`).
+- **Installer manifest** — install.sh writes
+  `~/.config/handsoff/deployment.json` (source+installed sha256 per shipped
+  file) and prints a post-install `--ptt doctor` step.
+- **Doctor** — `run_doctor()` / `--ptt doctor` / `handsoff_doctor` tool: one
+  pass over deployment, Ollama, TTS/STT, mic visibility, niri IPC, ydotool,
+  restart script, systemd `Restart=`, crash log. Works when the bubble is
+  dead (client-side fallback).
+- **Stale autostart snippets** — installer now says systemd owns autostart
+  instead of the old confusing "remove spawn-at-startup" note.
+- **Lifecycle/installed-copy tests** — offscreen launch, restart resilience,
+  and a new **installed-copy smoke test**: a fake `~/.local/bin` deployment
+  is booted and poked over the control socket (`TestInstalledCopySmoke`).
+- **Hardware acceptance checklist** — `ACCEPTANCE.md` (Yeti, TTS echo,
+  ydotool, niri IPC, systemd restart/crash-loop/teardown).
+- **Runtime hardening (merged from a parallel session)** — `_prepare_runtime()`
+  refuses startup when config/state paths are symlinked or not owner-private;
+  `ControlServer` owns a stop event + `_remove_stale_control_socket()` that
+  only ever unlinks a socket we own (never a symlink/foreign inode), and
+  `control.stop()` is wired into `aboutToQuit` so a clean shutdown leaves no
+  stale socket inode; the crash report now **truncates** `crash.log` instead
+  of unlinking it (faulthandler keeps the fd — unlinking would orphan later
+  crashes), pinned by `test_crash_report_ignores_empty_log`.
+
+### P1 — desktop actions are reliable
+(landed in the prior session, pinned by tests)
+- Live niri capability manifest (`niri_capabilities`, 30 s cache).
+- `wait_for_window`, post-action verification on close_window,
+  open_app waits for and identifies the launched window.
+- Focus verified before every typing operation (`_typing_guard`, fail-closed).
+- scroll/wait tools + stale-scan rescan behavior around screen interaction.
+
+### P1 — safer developer automation
+- **Bounded jobs** — `start_command` / `job_status`: whitelisted background
+  commands with max 4 jobs, 200 KB output, 30 min lifetime cap, kill on
+  breach; completion announced via the same channel as watcher alerts.
+  Identical refusal policy to run_command (pinned by test).
+- **Exact output/status** — job_status returns state, exit code, bounded
+  output tail.
+- Destructive commands stay denied (BLOCKED list wins; no widening).
+
+### P1 — centralized policy
+- **ALLOW / DENY / CONFIRM** via `DecisionPolicy` + `command_policy`
+  settings; DENY wins over permission switches; kill_process keeps its own
+  two-step flow (not double-gated).
+- **One-turn-separated confirmation** — CONFIRM offers out loud;
+  `confirm_action('yes')` in a later turn runs the ORIGINAL arguments
+  (loop-free via a `_confirm_running` bypass — caught by test).
+- **Dry-run mode** — `dry_run: true` makes desktop-action tools report
+  instead of act.
+- **Decision log** — every decision (incl. DENY/rate-limit/DRY-RUN) appended
+  to `~/.local/state/handsoff/decisions.jsonl` with id, ts, tool, target,
+  decision, result; capped, and write failures never break tool calls.
+
+### P2 — maintainability & release confidence
+- Test file split into `tests/{conftest,audio,policy,desktop,calendar,
+  settings,lifecycle,regression,ops}.py` (the monolith is gone).
+- Installed-copy tests exist next to checkout tests (see P0).
+- `ACCEPTANCE.md` hardware checklist added.
+- Pre-commit + CI gates kept, now pointed at `tests/` and compiling the
+  split modules.
+- Installer, deployed files, service unit, and niri snippets remain
+  single-source-of-truth (repo files shipped as-is; manifest added).
+
+Still open, accepted consciously: real-hardware acceptance run (see
+`ACCEPTANCE.md`), CI rehearse-runs of the full installer, ICS MONTHLY/YEARLY
+RRULE, richer D-Bus notification formatting, and Settings UI rows for
+per-tool command_policy (the JSON path and dry-run checkbox exist).
 
 ## Addendum — 2026-09-08 external audit closure
 
@@ -55,18 +132,14 @@ Notify argument layouts.
 
 ## P0 — reliability gaps (the bubble must never be a zombie again)
 
-1. **No crash recovery.** The bubble starts at login (niri `spawn-at-startup`)
-   but a native abort (e.g. CUDA OOM with whisper-large-v3 + a 24B model on
-   16 GB VRAM) leaves it dead until the user notices.
-   → Run the bubble as a **systemd user service** with `Restart=on-failure`
-   (keep `spawn-at-startup` as fallback). This is the single highest-value fix.
+1. ~~**No crash recovery.**~~ **Done** — systemd user service with
+   `Restart=always` + crash-loop guard; the bubble reports its own crash on
+   the next start.
 2. **VRAM pressure is the likely killer.** whisper `large-v3` (~1.5 GB) + 24B
    Q4 LLM (~14 GB) exceed 16 GB together with desktop usage.
    → Default whisper back to `tiny` (or auto-select by free VRAM at load).
-3. **Crash evidence is invisible.** `~/.local/state/handsoff/crash.log` exists
-   but nothing tells the user.
-   → On startup, check for a recent crash log and speak/notify "I crashed last
-   night, here is why (short version)".
+3. ~~**Crash evidence is invisible.**~~ **Done** — startup crash report plus
+   the crash-log line in `--ptt doctor`.
 
 ## P1 — capability gaps (what users will ask for next)
 

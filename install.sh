@@ -97,6 +97,31 @@ fi
 # Single source of truth: the repo's handsoff-restart is shipped as-is
 # (a heredoc duplicate here silently drifted from it once already).
 install -m 755 "$HERE/handsoff-restart" "$BIN_DIR/handsoff-restart"
+# Deployment manifest: which checkout state produced the installed copy, per
+# file. The bubble reads this in its health/doctor reports, so a stale
+# ~/.local/bin copy is visible from inside the bubble and from --ptt doctor.
+mkdir -p "$CONF_DIR"
+sha_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}' || echo null; }
+cat > "$CONF_DIR/deployment.json" <<MANIFEST_EOF
+{
+  "installed_at": "$(date -Is)",
+  "source_dir": "$HERE",
+  "files": {
+    "handsoff.py": {
+      "source_sha256": "$(sha_of "$HERE/handsoff.py")",
+      "installed_sha256": "$(sha_of "$BIN_DIR/handsoff.py")"
+    },
+    "handsoff-settings.py": {
+      "source_sha256": "$(sha_of "$HERE/handsoff-settings.py")",
+      "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-settings.py")"
+    },
+    "handsoff-restart": {
+      "source_sha256": "$(sha_of "$HERE/handsoff-restart")",
+      "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"
+    }
+  }
+}
+MANIFEST_EOF
 echo "==> [5/8] Downloading whisper '$WHISPER_SIZE' model (one time)"
 python - "$WHISPER_SIZE" "$CONF_DIR/whisper-model" <<'PY_EOF'
 import sys
@@ -180,7 +205,7 @@ if systemctl --user daemon-reload 2>/dev/null; then
         || echo "    WARN: could not enable ydotoold — typing tools will error until it runs"
     systemctl --user enable handsoff.service 2>/dev/null || true
     echo "    installed + enabled: systemctl --user start handsoff   (auto-restarts on crash)"
-    echo "    note: remove 'spawn-at-startup' for handsoff from niri's autostart to avoid double-start"
+    echo "    note: systemd now owns autostart — do NOT also add handsoff to niri's spawn-at-startup"
 else
     echo "    WARN: systemd user session not reachable; keeping niri spawn-at-startup as the autostart"
 fi
@@ -230,5 +255,6 @@ echo "handsoff installed."
 echo "  1. Merge $CONF_DIR/niri-window-rule.kdl into ~/.config/niri/config.kdl"
 echo "     then: niri msg action reload-config"
 echo "  2. Start it now with:  systemctl --user start handsoff  (or: python ~/.local/bin/handsoff.py)"
-echo "  3. Uninstall anytime with:  $0 --uninstall"
+echo "  3. Verify the deployment:  python ~/.local/bin/handsoff.py --ptt doctor"
+echo "  4. Uninstall anytime with:  $0 --uninstall"
 

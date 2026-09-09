@@ -30,7 +30,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pytest PySide6 sounddevice
       - name: Run the test suite
-        run: python -m pytest test_handsoff.py -q
+        run: python -m pytest tests/ -q
 
   # Byte-compile every shipped Python source. py_compile never imports, so no
   # dependencies are needed and syntax rot in any file fails the build.
@@ -43,7 +43,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: python -m py_compile
-        run: python -m py_compile handsoff.py handsoff-settings.py test_handsoff.py attic/patch_wakeword.py tests/fake_ollama.py
+        run: |
+          python -m py_compile handsoff.py handsoff-settings.py attic/patch_wakeword.py tests/fake_ollama.py
+          python -m py_compile tests/*.py
 
   # Shell syntax checks for every shipped script.
   shell:

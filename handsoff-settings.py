@@ -623,7 +623,15 @@ def _fmt_health(snap: dict) -> str:
         tts_txt = "tts/stt: loading\u2026"
     else:
         tts_txt = "tts: ok, stt loading\u2026" if voice_ok else "stt: ok, voice loading\u2026"
-    return f"{mic_txt} · {brain_txt} · {tts_txt}"
+    dep = snap.get("deployment") or {}
+    if dep.get("status") == "in-sync":
+        deploy_txt = "deploy: ok"
+    elif dep.get("status"):
+        deploy_txt = f"deploy: {dep['status']}"
+    else:
+        deploy_txt = ""
+    parts = [p for p in (mic_txt, brain_txt, tts_txt, deploy_txt) if p]
+    return " · ".join(parts)
 
 
 def _health_tooltip(snap: dict | None) -> str:
@@ -1410,6 +1418,23 @@ class SettingsWindow(QMainWindow):
         blocked.setStyleSheet("color: #888;")
         el.addWidget(blocked)
         lay.addWidget(extra_group)
+
+        # centralized ALLOW/DENY/CONFIRM policy + dry-run rehearsal mode
+        pol_group = QGroupBox("Command policy (ALLOW / DENY / CONFIRM per tool)", w)
+        pl = QVBoxLayout(pol_group)
+        self.policy_edit = QPlainTextEdit(self)
+        self.policy_edit.setMaximumHeight(96)
+        self.policy_edit.setPlaceholderText(
+            "one per line:  tool = POLICY\n"
+            "e.g.\nrun_command = DENY\nopen_app = CONFIRM\n"
+            "CONFIRM asks the user out loud and runs only after a separate "
+            "'yes' reply")
+        pl.addWidget(self.policy_edit)
+        self.dryrun_chk = QCheckBox(
+            "Dry-run mode — desktop actions report what they would do, "
+            "without doing it", self)
+        pl.addWidget(self.dryrun_chk)
+        lay.addWidget(pol_group)
         lay.addStretch(1)
         return w
 
@@ -1609,6 +1634,11 @@ class SettingsWindow(QMainWindow):
         self.ctx_spin.setValue(int(self.cfg["num_ctx"]))
         self.hist_spin.setValue(int(self.cfg.get("history_tokens", 0)))
         self.toolrate_spin.setValue(int(self.cfg.get("max_tool_calls", 0)))
+        pol = self.cfg.get("command_policy") or {}
+        if isinstance(pol, dict) and pol:
+            self.policy_edit.setPlainText(
+                "\n".join(f"{k} = {v}" for k, v in sorted(pol.items())))
+        self.dryrun_chk.setChecked(bool(self.cfg.get("dry_run", False)))
         self.thresh_spin.setValue(int(self.cfg["mic_threshold"]))
         wi = self.whisper_combo.findData(self.cfg["whisper_size"])
         self.whisper_combo.setCurrentIndex(max(0, wi))
@@ -1687,6 +1717,16 @@ class SettingsWindow(QMainWindow):
         self.cfg["bubble_size"] = self.size_slider.value()
         self.cfg["colors"] = dict(self._colors)
         self.cfg["permissions"] = {k: chk.isChecked() for k, chk in self.perm_checks.items()}
+        policy_map = {}
+        for line in self.policy_edit.toPlainText().splitlines():
+            if "=" not in line or line.strip().startswith("#"):
+                continue
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip().upper()
+            if k and v in ("ALLOW", "DENY", "CONFIRM"):
+                policy_map[k] = v
+        self.cfg["command_policy"] = policy_map
+        self.cfg["dry_run"] = self.dryrun_chk.isChecked()
         self.cfg["extra_allowed_commands"] = [
             line.strip() for line in self.extra_edit.toPlainText().splitlines() if line.strip()]
         self.cfg["autostart"] = self.autostart_chk.isChecked()
