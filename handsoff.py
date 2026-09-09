@@ -466,6 +466,173 @@ def doctor_json() -> dict:
     return out
 
 
+# ------------------------------------------------------------ typing selftest
+
+def _selftest_check(results: list, name: str, status: str, detail: str) -> None:
+    results.append({"name": name, "status": status, "detail": detail})
+
+
+def _selftest_report(results: list) -> str:
+    lines = ["handsoff typing selftest"]
+    for r in results:
+        lines.append(f"  [{r['status']}] {r['name']} — {r['detail']}")
+    fails = sum(1 for r in results if r["status"] == "FAIL")
+    skips = sum(1 for r in results if r["status"] == "SKIP")
+    if fails:
+        verdict = f"FAIL ({fails} of {len(results)} checks failed)"
+    elif skips:
+        verdict = f"PASS ({len(results) - skips} passed, {skips} skipped)"
+    else:
+        verdict = f"PASS ({len(results)}/{len(results)} checks)"
+    lines.append(f"verdict: {verdict}")
+    return "\n".join(lines)
+
+
+def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -> str:
+    """The hardware typing checks of ACCEPTANCE.md section 5, one pass.
+
+    Launches its OWN scratch windows (a terminal and a text editor) and types
+    only into them, so it is safe on a live desktop; windows are closed and
+    the clipboard restored afterwards. Stages: ydotoold socket, focus
+    verification, terminal-refusal (fail-closed), type_text landing, and the
+    ctrl+a/ctrl+c clipboard round-trip. `belt` is injectable for tests.
+    """
+    belt = belt or ToolBelt(on_restart_pending=lambda: None)
+    deadline = time.monotonic() + timeout
+    results: list = []
+    procs: list[subprocess.Popen] = []
+    scratch: list[dict] = []
+    token = f"handsoff selftest {time.strftime('%H%M%S')}"
+    clip_before = None
+
+    def windows() -> list[dict]:
+        r = ToolBelt._niri_msg("msg", "--json", "windows")
+        if r.returncode != 0:
+            raise RuntimeError("niri IPC unavailable — cannot verify focus")
+        return json.loads(r.stdout or "[]")
+
+    def wait_for(app_id: str) -> dict:
+        while time.monotonic() < deadline:
+            for w in windows():
+                if w.get("app_id") == app_id:
+                    return w
+            time.sleep(0.4)
+        raise RuntimeError(f"{app_id} window did not appear within {timeout:.0f}s")
+
+    def focus(win: dict) -> None:
+        r = ToolBelt._niri_msg("msg", "action", "focus-window",
+                               "--id", str(win["id"]))
+        if r.returncode != 0:
+            raise RuntimeError("focus-window action failed")
+        time.sleep(0.6)
+        cur = next((w for w in windows() if w.get("id") == win["id"]), None)
+        if not (cur and cur.get("is_focused")):
+            raise RuntimeError("scratch window did not take focus")
+
+    # 1. the ydotool daemon the CLI must reach
+    try:
+        sock = ToolBelt._ydotool_socket()
+        if ToolBelt._socket_connectable(sock):
+            _selftest_check(results, "ydotool daemon", "PASS", f"socket {sock}")
+        else:
+            _selftest_check(results, "ydotool daemon", "FAIL",
+                            f"no live socket at {sock} — start the user daemon: "
+                            "systemctl --user enable --now ydotool.service")
+    except Exception as e:
+        _selftest_check(results, "ydotool daemon", "FAIL", str(e))
+
+    try:
+        if results[0]["status"] != "PASS":
+            raise RuntimeError("skipped: the ydotoold daemon is unreachable")
+
+        # 2. focus verification plumbing (niri live)
+        fw = belt._focused_window_info()
+        _selftest_check(results, "focus verification", "PASS",
+                        f"focused: {belt._win_label(fw)}" if fw else
+                        "no focused window (typing would fail closed)")
+
+        # 3. terminal refusal — never touches a pre-existing terminal
+        term = next(((b, a) for b, a in (("foot", "foot"), ("kitty", "kitty"),
+                    ("alacritty", "alacritty"), ("xterm", "xterm"))
+                    if shutil.which(b)), None)
+        if term is None:
+            _selftest_check(results, "terminal refusal", "SKIP",
+                            "no terminal emulator installed")
+        else:
+            bin_, app_id = term
+            procs.append(subprocess.Popen(
+                [bin_], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True))
+            tw = wait_for(app_id)
+            focus(tw)
+            marker = belt._terminal_marker(belt._typing_guard())
+            if not marker:
+                raise RuntimeError(f"{app_id} was not recognised as a terminal")
+            out, err = belt.execute("type_text", {"text": "selftest refused"})
+            out2, err2 = belt.execute("press_keys", {"combo": "enter"})
+            refused = (err and str(out).startswith("REFUSED")
+                       and err2 and str(out2).startswith("REFUSED"))
+            _selftest_check(results, "terminal refusal",
+                            "PASS" if refused else "FAIL",
+                            f"{marker}: type_text and press_keys refused"
+                            if refused else f"NOT refused: {out} / {out2}")
+
+        # 4. type_text lands in a scratch editor (focus-guarded by the tool)
+        if shutil.which("gnome-text-editor"):
+            procs.append(subprocess.Popen(
+                ["gnome-text-editor"], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True))
+            ed = wait_for("org.gnome.TextEditor")
+            scratch.append(ed)
+            focus(ed)
+            out, err = belt.execute("type_text", {"text": token})
+            ok = not err and "typed" in str(out) and "WARNING" not in str(out)
+            _selftest_check(results, "type_text", "PASS" if ok else "FAIL",
+                            str(out) if not err else str(out))
+
+            # 5. ctrl+a/ctrl+c round-trip proves what landed, byte-for-byte
+            try:
+                clip_before = subprocess.run(
+                    ["wl-paste", "--no-newline"], capture_output=True,
+                    text=True).stdout or ""
+            except Exception:
+                clip_before = None
+            o1, e1 = belt.execute("press_keys", {"combo": "ctrl+a"})
+            o2, e2 = belt.execute("press_keys", {"combo": "ctrl+c"})
+            time.sleep(0.8)
+            clip = subprocess.run(["wl-paste", "--no-newline"],
+                                  capture_output=True, text=True).stdout
+            match = not e1 and not e2 and clip == token
+            _selftest_check(results, "clipboard round-trip",
+                            "PASS" if match else "FAIL",
+                            f"wl-paste matches the typed token ({len(token)} chars)"
+                            if match else f"clipboard mismatch: {clip[:60]!r}")
+        else:
+            _selftest_check(results, "type_text", "SKIP",
+                            "gnome-text-editor not installed")
+            _selftest_check(results, "clipboard round-trip", "SKIP",
+                            "no scratch editor available")
+    except Exception as e:
+        _selftest_check(results, "selftest run", "FAIL", str(e))
+    finally:
+        for w in scratch:
+            try:
+                ToolBelt._niri_msg("msg", "action", "close-window",
+                                   "--id", str(w["id"]))
+            except Exception:
+                pass
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+        if clip_before is not None:
+            try:
+                subprocess.run(["wl-copy"], input=clip_before,
+                               capture_output=True, text=True)
+            except Exception:
+                pass
+    return _selftest_report(results)
+
+
 # ------------------------------------------------------------ decision log
 
 
@@ -7060,7 +7227,7 @@ class BubbleWidget(QWidget):
 PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                "handsfree", "handsfree-on", "handsfree-off",
                "handsfree-status", "dictation", "dictation-on", "dictation-off",
-               "status", "health", "doctor", "settings"}
+               "status", "health", "doctor", "settings", "selftest"}
 
 
 class ControlServer:
@@ -7227,7 +7394,9 @@ commands:
   dictation-off  disable voice dictation
   status         report state, hands-free mode and model
   health         full JSON health: mic, brain (Ollama) and TTS status
-  doctor         human-readable diagnostic: deployment hashes, Ollama, mic, niri, systemd"""
+  doctor         human-readable diagnostic: deployment hashes, Ollama, mic, niri, systemd
+  selftest       run the hardware typing checks (launches scratch windows on
+                 THIS desktop, types only into them, restores the clipboard)"""
 
 
 def ptt_client(argv: list[str]) -> int:
@@ -7246,6 +7415,12 @@ def ptt_client(argv: list[str]) -> int:
             return 0
         sys.stderr.write(f"handsoff: settings app not installed at {SETTINGS_APP}\n")
         return 1
+    if action == "selftest":
+        # runs LOCALLY (not via the bubble): it drives its own scratch windows
+        # and needs no assistant state, so it must also work when the bubble
+        # is dead — same contract as `settings`
+        print(run_typing_selftest())
+        return 0
     if action == "doctor":
         # the running bubble knows its live mic/brain state — ask it first;
         # but a dead bubble must still report (deployment hashes, systemd,

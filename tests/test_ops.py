@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+import types
 import time
 from collections import deque
 from pathlib import Path
@@ -17,6 +18,93 @@ import pytest
 from conftest import HERE as ROOT, _user_site
 
 HERE = ROOT   # the repo root
+
+
+class TestTypingSelftestWiring:
+    """--ptt selftest: the hardware typing checks as one local command.
+
+    The live run needs a desktop; here we pin the deterministic parts —
+    the report format, the verdict aggregation, the SKIP accounting and
+    the CLI wiring — so the command cannot rot silently."""
+
+    def test_selftest_in_ptt_actions_and_usage(self, H):
+        assert "selftest" in H.PTT_ACTIONS
+        assert "selftest" in H.USAGE
+
+    def test_report_pass_fail_skip(self, H):
+        results = [
+            {"name": "a", "status": "PASS", "detail": "d1"},
+            {"name": "b", "status": "FAIL", "detail": "d2"},
+        ]
+        text = H._selftest_report(results)
+        assert "[PASS] a — d1" in text and "[FAIL] b — d2" in text
+        assert "verdict: FAIL (1 of 2 checks failed)" in text
+        text = H._selftest_report(results[:1])
+        assert "verdict: PASS (1/1 checks)" in text
+        text = H._selftest_report([
+            {"name": "a", "status": "PASS", "detail": "d"},
+            {"name": "c", "status": "SKIP", "detail": "gone"},
+        ])
+        assert "verdict: PASS (1 passed, 1 skipped)" in text
+
+    def test_selftest_dead_daemon_fails_with_skip_reason(self, H, monkeypatch):
+        """No ydotoold: the daemon check FAILs and every later stage is
+        skipped with the reason — nothing launched, nothing typed."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(H.ToolBelt, "_ydotool_socket",
+                            classmethod(lambda cls: "/none/ydotool"))
+        monkeypatch.setattr(H.ToolBelt, "_socket_connectable",
+                            staticmethod(lambda p: False))
+        text = H.run_typing_selftest(belt=belt)
+        assert "[FAIL] ydotool daemon" in text
+        assert "skipped" in text            # later stages say why they ran not
+        assert "verdict: FAIL" in text
+
+    def test_selftest_terminal_refusal_and_cleanup(self, H, monkeypatch):
+        """With a fake window world: the scratch terminal is recognised,
+        both refusal results must PASS, and the process is terminated in the
+        finally block."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        terminated = {"flag": False}
+        foot_win = {"id": 7, "app_id": "foot", "title": "foot",
+                    "is_focused": True}
+
+        class FakeMsg:
+            returncode = 0
+            stdout = json.dumps([foot_win])
+
+        def fake_popen(*a, **k):
+            return types.SimpleNamespace(
+                poll=lambda: None,
+                terminate=lambda: terminated.update(flag=True))
+
+        monkeypatch.setattr(H.ToolBelt, "_niri_msg", staticmethod(lambda *a, **k: FakeMsg()))
+        monkeypatch.setattr(H.shutil, "which",
+                            lambda n: "/usr/bin/foot" if n == "foot" else None)
+        monkeypatch.setattr(H.ToolBelt, "_terminal_marker",
+                            classmethod(lambda cls, w: "foot"))
+        monkeypatch.setattr(H.ToolBelt, "_typing_guard",
+                            lambda self: foot_win)
+        outs = iter([("REFUSED: terminal (foot)", True),
+                     ("REFUSED: terminal (foot)", True)])
+        monkeypatch.setattr(H.ToolBelt, "execute",
+                            lambda self, name, args: next(outs))
+        monkeypatch.setattr(H.subprocess, "run",
+                            lambda *a, **k: types.SimpleNamespace(stdout=""))
+        monkeypatch.setattr(H.subprocess, "Popen", fake_popen)
+        text = H.run_typing_selftest(belt=belt, timeout=5)
+        assert "[PASS] terminal refusal" in text
+        assert "type_text" in text and "SKIP" in text   # no editor available
+        assert terminated["flag"], "scratch terminal must be terminated"
+
+    def test_ptt_selftest_runs_locally_without_bubble(self, H, monkeypatch, capsys):
+        """The CLI action works when the bubble is dead (local execution,
+        same contract as `settings`)."""
+        monkeypatch.setattr(H, "run_typing_selftest",
+                            lambda *a, **k: "verdict: PASS (0/0 checks)")
+        rc = H.ptt_client(["selftest"])
+        assert rc == 0
+        assert "verdict" in capsys.readouterr().out
 
 
 class TestDeploymentReporting:

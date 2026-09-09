@@ -20,6 +20,17 @@ stop_instances() {
     done
 }
 
+# if systemd owns a running bubble, restart through it directly: manual
+# TERM/KILL here would trigger the unit's Restart=always auto-spawn and race
+# the explicit restart below (transient double bubble).
+if systemctl --user is-active --quiet handsoff.service 2>/dev/null; then
+    systemctl --user restart handsoff.service
+    echo "handsoff restarted via systemd"
+    exit 0
+fi
+
+# unit not managing a bubble (stopped/failed/disabled): clear any manually
+# spawned instance, then let systemd start a fresh one if it owns autostart
 stop_instances TERM
 sleep 0.4
 stop_instances KILL
@@ -31,10 +42,7 @@ for _ in $(seq 1 40); do
     sleep 0.1
 done
 
-# if systemd owns the bubble, ask it to restart — a nohup spawn here would
-# collide with the unit's own Restart=always (double bubble race)
-if systemctl --user is-active --quiet handsoff.service 2>/dev/null \
-        || systemctl --user is-enabled --quiet handsoff.service 2>/dev/null; then
+if systemctl --user is-enabled --quiet handsoff.service 2>/dev/null; then
     systemctl --user restart handsoff.service
     echo "handsoff restarted via systemd"
     exit 0
