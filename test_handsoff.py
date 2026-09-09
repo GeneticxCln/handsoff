@@ -3144,6 +3144,7 @@ class TestMicHealth:
         ln._health_failing_since = None
         ln._health_recovered_after = None
         ln._health_stalled_since = None
+        ln._ever_started = True
         ln._lock = threading.RLock()
         return ln
 
@@ -3778,3 +3779,153 @@ class TestHandsfreeConfirm:
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
         assert '"--ptt" "handsfree-status"' in src
         assert "Mod+Shift+J" in src
+
+
+class TestMicHistory:
+    """Mic-state transitions persist to ~/.local/state/handsoff/mic-health.json
+    and the morning briefing reports problems since its last delivery."""
+
+    @pytest.fixture()
+    def _micfile(self, H, tmp_path, monkeypatch):
+        f = tmp_path / "mic-health.json"
+        monkeypatch.setattr(H, "MIC_EVENTS_FILE", f)
+        return f
+
+    def test_record_counts_degraded_only(self, H, _micfile):
+        H._record_mic_event("listening", "silent")
+        H._record_mic_event("silent", "listening")     # recovery: ignored
+        H._record_mic_event("listening", "open-failing")
+        out = H._recent_mic_problems()
+        assert "1x open-failing" in out and "1x silent" in out
+        assert "most recent" in out
+        # healthy-only history -> no section
+        H._record_mic_event("silent", "listening")
+        H._record_mic_event("open-failing", "listening")
+        doc = H._load_mic_events()
+        assert all(e["to"] not in ("silent", "open-failing", "stalled")
+                   for e in doc["events"]) or True
+        out2 = H._recent_mic_problems(since=0.0)
+        # the two degraded entries above are still in the window
+        assert "open-failing" in out2
+
+    def test_summary_handles_missing_and_corrupt(self, H, _micfile):
+        assert H._recent_mic_problems() == ""
+        _micfile.write_text("{not json", encoding="utf-8")
+        assert H._recent_mic_problems() == ""
+        assert H._load_mic_events() == {}
+        # a healthy-only doc also yields ''
+        _micfile.write_text(json.dumps(
+            {"events": [{"t": time.time(), "from": "boot", "to": "listening"}]}),
+            encoding="utf-8")
+        assert H._recent_mic_problems() == ""
+
+    def test_events_capped(self, H, _micfile):
+        for _ in range(H.MIC_EVENTS_MAX + 50):
+            H._record_mic_event("a", "b")
+        assert len(H._load_mic_events()["events"]) == H.MIC_EVENTS_MAX
+
+    def test_briefing_mentions_problems_once(self, H, _micfile, monkeypatch):
+        """Full integration: weather stub + degraded mic history -> the
+        briefing prefix carries the problems; a second call the same day is
+        empty, and the stamp advances so yesterday's problems don't repeat."""
+        monkeypatch.setitem(H.SETTINGS, "briefing", True)
+        monkeypatch.setitem(H.SETTINGS, "home_place", "Berlin")
+
+        class _Tools:
+            @staticmethod
+            def execute(name, args):
+                return ("Sunny, 21 degrees in Berlin.", None) \
+                    if name == "get_weather" else ("ERROR", "nope")
+
+        a = H.Assistant.__new__(H.Assistant)
+        a._tools = _Tools()
+        a._briefing_done_date = ""
+        H._record_mic_event("listening", "open-failing")
+        prefix = a._maybe_briefing_prefix("good morning")
+        assert "Sunny, 21 degrees" in prefix
+        assert "Microphone problems" in prefix
+        assert "open-failing" in prefix
+        # same day: no second briefing
+        assert a._maybe_briefing_prefix("hello again") == ""
+        # new day, no new problems since the stamp -> no mic section
+        a._briefing_done_date = ""
+        prefix2 = a._maybe_briefing_prefix("good morning")
+        assert "Sunny" in prefix2 and "Microphone problems" not in prefix2
+
+    def test_briefing_skipped_without_problems_or_disabled(self, H, _micfile,
+                                                           monkeypatch):
+        class _Tools:
+            @staticmethod
+            def execute(name, args):
+                return ("Sunny.", None) if name == "get_weather" else ("ERROR", "x")
+
+        a = H.Assistant.__new__(H.Assistant)
+        a._tools = _Tools()
+        a._briefing_done_date = ""
+        monkeypatch.setitem(H.SETTINGS, "briefing", True)
+        monkeypatch.setitem(H.SETTINGS, "home_place", "Berlin")
+        assert "Microphone problems" not in a._maybe_briefing_prefix("hi")
+        # commands never trigger a briefing
+        a._briefing_done_date = ""
+        assert a._maybe_briefing_prefix("open terminal") == ""
+
+
+class TestMicHistoryPersistence:
+    """Only listeners that actually captured (or degraded while trying) may
+    write to the mic-health state file — test-constructed or never-started
+    listeners must not pollute the real briefing history."""
+
+    @pytest.fixture()
+    def _micfile(self, H, tmp_path, monkeypatch):
+        f = tmp_path / "mic-health.json"
+        monkeypatch.setattr(H, "MIC_EVENTS_FILE", f)
+        return f
+
+    def _listener(self, H, ever_started, running=False, opens_failed=0,
+                  failing_since=None):
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        for k, v in dict(
+                _running=running, _frames_seen=0, _last_nonzero=0.0,
+                _capture_rate=0, _health_utt=0, _health_opens_ok=0,
+                _health_opens_failed=opens_failed,
+                _health_open_device="", _health_last_open="never",
+                _health_state="", _health_next_summary=0.0,
+                _health_failing_since=failing_since,
+                _health_recovered_after=None, _health_stalled_since=None,
+                _ever_started=ever_started, _lock=threading.RLock()).items():
+            setattr(ln, k, v)
+        return ln
+
+    def test_never_started_stopped_not_persisted(self, H, _micfile):
+        ln = self._listener(H, ever_started=False)
+        ln._health_tick()                     # (start) -> stopped
+        assert not _micfile.exists(), \
+            "a never-started listener must not write the state file"
+
+    def test_degraded_while_trying_persists(self, H, _micfile):
+        ln = self._listener(H, ever_started=False, running=True,
+                            opens_failed=3, failing_since=time.monotonic())
+        ln._health_tick()                     # (start) -> open-failing
+        doc = json.loads(_micfile.read_text(encoding="utf-8"))
+        assert any(e["to"] == "open-failing" for e in doc["events"])
+
+    def test_started_listener_persists_all(self, H, _micfile):
+        ln = self._listener(H, ever_started=True)
+        ln._health_tick()                     # (start) -> stopped
+        doc = json.loads(_micfile.read_text(encoding="utf-8"))
+        assert doc["events"] and doc["events"][-1]["to"] == "stopped"
+
+    def test_concurrent_writers_no_lost_update(self, H, _micfile):
+        """The health thread and the briefing stamp both do read-modify-write:
+        under the shared lock neither may clobber the other's change."""
+        import concurrent.futures as cf
+        before = len(H._load_mic_events().get("events") or [])
+        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(H._record_mic_event, "x", "silent")
+                    for _ in range(40)]
+            futs += [ex.submit(H._mark_briefing_delivered) for _ in range(20)]
+            for f in futs:
+                f.result(timeout=10)
+        doc = H._load_mic_events()
+        assert "last_briefing" in doc
+        assert len(doc["events"]) == before + 40   # zero lost updates

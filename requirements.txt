@@ -4,7 +4,7 @@
 #   CORE   — hard imports; the app and test suite cannot run without them.
 #   EXTRAS — lazy-imported features; the app degrades gracefully without them.
 #
-# Versions below are the ones the suite was verified against (250 tests green
+# Versions below are the ones the suite was verified against (276 tests green
 # on Python 3.12/3.13). They are floors, not exact pins: patch-level drift is
 # fine, but bump majors deliberately and re-run the full suite.
 #

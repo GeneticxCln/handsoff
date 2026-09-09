@@ -129,6 +129,9 @@ PENDING_FILE = STATE_DIR / "pending-restart.json"
 LOCK_FILE = STATE_DIR / "handsoff.lock"
 LOG_FILE = STATE_DIR / "handsoff.log"
 CONTROL_SOCK = STATE_DIR / "control.sock"
+MIC_EVENTS_FILE = STATE_DIR / "mic-health.json"   # mic transitions + last briefing
+MIC_EVENTS_MAX = 200                              # hard cap on recorded transitions
+_MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
 SELF_MARKER = "# handsoff-self-marker: this line must be preserved across self-edits"
 
 DEFAULT_SETTINGS: dict = {
@@ -1414,6 +1417,82 @@ def _fmt_events(events: list[dict]) -> str:
         loc = f" @ {e['location']}" if e["location"] else ""
         lines.append(f"{day} {when}: {e['summary']}{loc}")
     return "; ".join(lines)
+
+
+def _record_mic_event(from_state: str, to_state: str) -> None:
+    """Append one mic-state transition to the mic-health state file (best
+    effort: diagnostics must never break the audio path)."""
+    try:
+        now = time.time()
+        with _MIC_EVENTS_LOCK:
+            doc = _load_mic_events()
+            doc.setdefault("events", []).append({
+                "t": now, "from": from_state, "to": to_state,
+                "device": SETTINGS.get("mic_device") or "system default",
+            })
+            doc["events"] = doc["events"][-MIC_EVENTS_MAX:]
+            MIC_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = MIC_EVENTS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(doc), encoding="utf-8")
+            os.replace(tmp, MIC_EVENTS_FILE)
+    except Exception:
+        log.exception("cannot record mic event")
+
+
+def _load_mic_events() -> dict:
+    """Read the mic-events state file; any corruption or absence -> {}."""
+    try:
+        doc = json.loads(MIC_EVENTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _recent_mic_problems(since: float = 0.0) -> str:
+    """Human summary of degraded mic states (silent / open-failing / stalled)
+    recorded at or after `since`. Returns '' when the file is absent, empty,
+    corrupt or holds only healthy transitions — the briefing omits the
+    section then."""
+    doc = _load_mic_events()
+    events = doc.get("events")
+    if not isinstance(events, list):
+        return ""
+    recent = [e for e in events
+              if isinstance(e, dict) and isinstance(e.get("t"), (int, float))
+              and e["t"] >= since]
+    if not recent:
+        return ""
+    degraded = ("silent", "open-failing", "stalled")
+    counts: dict[str, int] = {}
+    last_t = 0.0
+    last_to = ""
+    for e in recent:
+        to = str(e.get("to", ""))
+        if to in degraded:
+            counts[to] = counts.get(to, 0) + 1
+            if e["t"] > last_t:
+                last_t, last_to = e["t"], to
+    if not counts:
+        return ""
+    parts = [f"{n}x {s}" for s, n in sorted(counts.items())]
+    return (f"Microphone problems since the last briefing: "
+            f"{', '.join(parts)}; most recent: {last_to} "
+            f"({_fmt_dur(time.time() - last_t)} ago)")
+
+
+def _mark_briefing_delivered() -> None:
+    """Stamp the mic-health state file with the briefing time, so the next
+    briefing reports only problems since then (best effort)."""
+    try:
+        with _MIC_EVENTS_LOCK:
+            doc = _load_mic_events()
+            doc["last_briefing"] = time.time()
+            MIC_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = MIC_EVENTS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(doc), encoding="utf-8")
+            os.replace(tmp, MIC_EVENTS_FILE)
+    except Exception:
+        log.exception("cannot stamp briefing time")
 
 
 def _today_events_summary() -> str:
@@ -2972,6 +3051,7 @@ class ContinuousListener:
         self._health_failing_since = None  # monotonic: open-failure streak start
         self._health_recovered_after = None  # seconds the last failure streak lasted
         self._health_stalled_since = None  # monotonic: zero-frames streak start
+        self._ever_started = False       # health reporting starts with the first start()
         self._lock = threading.RLock()   # guards the health snapshot above
         # hourly "mic health" journal line — silent mic failures must be
         # visible without debug logging. Spawned ONCE here (never in start(),
@@ -3060,6 +3140,12 @@ class ContinuousListener:
                     self._health_opens_ok, self._health_opens_failed,
                     self._health_utt)
             if changed:
+                # persist only listeners that really captured (or degraded
+                # while trying): a never-started listener (hands-free off
+                # since boot, or a bare test instance) has no mic story and
+                # must not pollute the state file
+                if self._ever_started or state != "stopped":
+                    _record_mic_event(last or "boot", state)
                 dur = ""
                 if last == "open-failing" and self._health_recovered_after:
                     dur = " after %.0fs failing" % self._health_recovered_after
@@ -3074,6 +3160,7 @@ class ContinuousListener:
             return
         self._run_id += 1
         run_id = self._run_id
+        self._ever_started = True
         old = self._thread
         if old is not None and old.is_alive():
             # a previous thread may still be sleeping up to 10s inside the
@@ -4004,10 +4091,18 @@ class Assistant(QObject):
         self._briefing_done_date = today
         log.info("morning briefing delivered for %s", today)
         cal = _today_events_summary()
+        _stamp = _load_mic_events().get("last_briefing")
+        mic_probs = _recent_mic_problems(
+            _stamp if isinstance(_stamp, (int, float))
+            else time.time() - 24 * 3600)
+        _mark_briefing_delivered()
         body = out + (f"\nToday\u2019s calendar: {cal}" if cal else "")
+        if mic_probs:
+            body += f"\n{mic_probs}"
         return ("[Daily briefing — greet the user briefly and naturally give "
                 "this weather summary FIRST (plus today\u2019s calendar events "
-                "if listed), then answer their request]\n" + body)
+                "if listed, and mention microphone problems if any are listed), "
+                "then answer their request]\n" + body)
 
     def _conversation_for(self, text: str) -> list[dict]:
         """Build the full message list for a turn: system prompt + history +

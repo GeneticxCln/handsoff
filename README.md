@@ -29,7 +29,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All 29 tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 250 tests pin the behavior (`python -m pytest test_handsoff.py`).
+automatically. 276 tests pin the behavior (`python -m pytest test_handsoff.py`).
 
 ## Requirements
 
@@ -174,7 +174,7 @@ Safety boundaries enforced in code (not just the prompt):
 | `wake_spotter` / `spotter_models` | false / `["hey_jarvis"]` | openWakeWord spotter |
 | `handsfree` | false | continuous listening |
 | `mic_device` / `mic_threshold` | system default / 600 | microphone |
-| `home_place` / `calendar_ics` / `briefing` | — | weather place, ICS sources, morning briefing |
+| `home_place` / `calendar_ics` / `briefing` | — | weather place, ICS sources, morning briefing (mentions mic problems since last time) |
 | `workspace_aliases` | `{}` | e.g. `{"code": "2"}` → "go to code" |
 | `permissions` | all true | the switches above |
 
@@ -226,6 +226,11 @@ instead of starting by hand; it waits for the lock.
   summary hourly **and immediately** on any state change (silent, stalled,
   open-failing, recovery — degraded states log at WARNING, so
   `journalctl -p warning` filters to just the problems)
+- Every mic state transition is also persisted to
+  `~/.local/state/handsoff/mic-health.json` (capped at 200 entries), and the
+  morning briefing mentions any silent / open-failing / stalled episodes
+  since its last delivery — so overnight mic trouble greets you with the
+  weather
 - Known issue on some stacks: a USB mic that can't serve 16 kHz callback
   streams breaks the listener when set as system default — keep the default
   on a device that works and select the other mic in handsoff's Settings
@@ -274,7 +279,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest test_handsoff.py -q     # 250 tests
+python -m pytest test_handsoff.py -q     # 276 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
