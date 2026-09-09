@@ -127,6 +127,7 @@ python ~/.local/bin/handsoff.py --ptt health      # JSON: mic + brain + TTS
 python ~/.local/bin/handsoff.py --ptt toggle      # start/stop/interrupt
 python ~/.local/bin/handsoff.py --ptt interrupt   # silence it now
 python ~/.local/bin/handsoff.py --ptt handsfree   # toggle hands-free
+python ~/.local/bin/handsoff.py --ptt handsfree-status  # speak mic state
 python ~/.local/bin/handsoff.py --ptt settings    # open Settings
 ```
 
