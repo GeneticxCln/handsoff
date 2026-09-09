@@ -197,6 +197,11 @@ DEFAULT_SETTINGS: dict = {
     "spotter_models": ["hey_jarvis"],   # stock: alexa, hey_jarvis, hey_mycroft, timer, weather
     "followup_seconds": 6.0,   # announce-and-listen: no-wake-word window after a reply
     "briefing": False,         # daily briefing on the first wake word
+    "world_warnings": False,   # opt-in proactive severe world-event warnings
+    "world_cooldown_min": 60.0,  # min minutes between world warnings
+    "hardware_watch": False,   # opt-in live hardware watch on the health tick
+    "hardware_cooldown_min": 60.0,  # min minutes between hardware urgents
+    "hardware_disk_gb": 5.0,   # disk-free floor (GiB) for the low-disk warning
     "resource_alerts": False,  # opt-in RAM/VRAM threshold announcements
     "ram_alert_percent": 90.0,
     "vram_alert_percent": 90.0,
@@ -327,6 +332,60 @@ def _deployment_snapshot() -> dict:
 
 # --------------------------------------------------------------- doctor report
 
+try:
+    import hardware as _hardware
+except ImportError:  # installed copy without the sibling module (yet)
+    _hardware = None
+
+_DOCTOR_TTL: dict = {}  # shared TTL cache for prompt-context snapshots
+
+
+def _doctor_ctx() -> dict:
+    """handsoff globals → hardware ctx (never the reverse: no SETTINGS import)."""
+    return {
+        "ollama_base": OLLAMA_BASE, "ollama_model": OLLAMA_MODEL,
+        "whisper_size": WHISPER_SIZE, "piper_voice": PIPER_VOICE_NAME,
+        "mic_device": str(SETTINGS.get("mic_device") or ""),
+        "whisper_model_dir": str(WHISPER_MODEL_DIR),
+        "piper_voice_dir": str(PIPER_VOICE_DIR),
+        "control_sock": str(CONTROL_SOCK), "state_dir": str(STATE_DIR),
+        "systemd_unit_file": str(SYSTEMD_UNIT_FILE),
+    }
+
+
+def _doctor_probers() -> dict:
+    """Existing seams as late-bound lambdas, so monkeypatch keeps working."""
+    return {
+        "niri_windows": lambda: ToolBelt._niri_msg("msg", "--json", "windows"),
+        "ydotool_which": lambda: shutil.which("ydotool"),
+        "ydotool_socket": lambda: ToolBelt._ydotool_socket(),
+        "socket_connectable": lambda sock: ToolBelt._socket_connectable(sock),
+    }
+
+
+def _doctor_snapshot(ttl_cache: dict | None) -> dict | None:
+    """hardware.snapshot() or None (module absent / unexpected failure)."""
+    if _hardware is None:
+        return None
+    try:
+        return _hardware.snapshot(_doctor_ctx(), _doctor_probers(), ttl_cache)
+    except Exception:
+        log.exception("hardware snapshot failed")
+        return None
+
+
+def _hardware_prompt_context() -> str:
+    """5-line system-prompt context: niri/wayland, mic, model, voices, mounts."""
+    if _hardware is None:
+        return ""
+    snap = _doctor_snapshot(_DOCTOR_TTL)
+    if not snap:
+        return ""
+    try:
+        return _hardware.prompt_context(snap)
+    except Exception:
+        return ""
+
 
 def run_doctor() -> str:
     """One human-readable diagnostic pass over everything the bubble needs.
@@ -355,45 +414,86 @@ def run_doctor() -> str:
     if d["repo_path"]:
         lines.append(f"  checkout: {d['repo_path']}")
 
-    if ollama_available():
-        lines.append(f"brain: Ollama reachable at {OLLAMA_BASE} (model {OLLAMA_MODEL})")
-    else:
-        lines.append(
-            f"brain: OLLAMA UNREACHABLE at {OLLAMA_BASE} — "
-            "`systemctl status ollama`, then `ollama pull " + OLLAMA_MODEL + "`")
-
-    lines.append(f"tts: {'voice loaded' if _piper_voice is not None else 'voice NOT loaded yet'}; "
-                 f"stt: {'whisper loaded' if _whisper_model is not None else 'whisper NOT loaded yet'}")
-
-    try:
-        import sounddevice as _sd
-        devs = [dd for dd in _sd.query_devices() if dd.get("max_input_channels", 0) > 0]
-        if devs:
-            lines.append(f"mic: {len(devs)} input device(s) visible")
+    # ponytail: probe once via hardware.snapshot(); format the same strings
+    # so --ptt doctor output stays byte-stable. Fresh cache: doctor must see
+    # live state, never a TTL entry. Legacy probes below run only when the
+    # sibling module is absent.
+    snap = _doctor_snapshot({})
+    if snap is not None:
+        if snap["ollama"].get("ok"):
+            lines.append(f"brain: Ollama reachable at {OLLAMA_BASE} (model {OLLAMA_MODEL})")
         else:
-            lines.append("mic: NO input devices visible — check the mic is plugged in")
-    except Exception as e:
-        lines.append(f"mic: audio subsystem error: {e}")
+            lines.append(
+                f"brain: OLLAMA UNREACHABLE at {OLLAMA_BASE} — "
+                "`systemctl status ollama`, then `ollama pull " + OLLAMA_MODEL + "`")
 
-    try:
-        r = ToolBelt._niri_msg("msg", "--json", "windows")
-        if r.returncode == 0:
-            n = len(json.loads(r.stdout or "[]"))
-            lines.append(f"niri IPC: ok ({n} window(s))")
+        lines.append(f"tts: {'voice loaded' if _piper_voice is not None else 'voice NOT loaded yet'}; "
+                     f"stt: {'whisper loaded' if _whisper_model is not None else 'whisper NOT loaded yet'}")
+
+        audio = snap["audio"]
+        if audio.get("ok") and audio.get("count"):
+            lines.append(f"mic: {audio['count']} input device(s) visible")
+        elif audio.get("ok"):
+            lines.append("mic: NO input devices visible — check the mic is plugged in")
+        else:
+            lines.append(f"mic: audio subsystem error: {audio.get('error', 'unknown')}")
+
+        comp = snap["compositor"]
+        if comp.get("ok"):
+            lines.append(f"niri IPC: ok ({comp.get('windows', 0)} window(s))")
+        elif comp.get("error"):
+            lines.append(f"niri IPC: UNAVAILABLE ({comp['error']}) — desktop actions will fail")
         else:
             lines.append("niri IPC: refused — desktop actions will fail")
-    except Exception as e:
-        lines.append(f"niri IPC: UNAVAILABLE ({e}) — desktop actions will fail")
 
-    if shutil.which("ydotool"):
-        sock = ToolBelt._ydotool_socket()
-        if ToolBelt._socket_connectable(sock):
-            lines.append(f"ydotool: ok (daemon reachable at {sock})")
+        ydo = snap["ydotool"]
+        if not ydo.get("installed", True):
+            lines.append("ydotool: NOT INSTALLED (typing tools will fail)")
+        elif ydo.get("reachable"):
+            lines.append(f"ydotool: ok (daemon reachable at {ydo.get('socket')})")
         else:
-            lines.append(f"ydotool: daemon UNREACHABLE (no socket at {sock}) — "
+            lines.append(f"ydotool: daemon UNREACHABLE (no socket at {ydo.get('socket')}) — "
                          "start it: systemctl --user enable --now ydotool.service")
     else:
-        lines.append("ydotool: NOT INSTALLED (typing tools will fail)")
+        if ollama_available():
+            lines.append(f"brain: Ollama reachable at {OLLAMA_BASE} (model {OLLAMA_MODEL})")
+        else:
+            lines.append(
+                f"brain: OLLAMA UNREACHABLE at {OLLAMA_BASE} — "
+                "`systemctl status ollama`, then `ollama pull " + OLLAMA_MODEL + "`")
+
+        lines.append(f"tts: {'voice loaded' if _piper_voice is not None else 'voice NOT loaded yet'}; "
+                     f"stt: {'whisper loaded' if _whisper_model is not None else 'whisper NOT loaded yet'}")
+
+        try:
+            import sounddevice as _sd
+            devs = [dd for dd in _sd.query_devices() if dd.get("max_input_channels", 0) > 0]
+            if devs:
+                lines.append(f"mic: {len(devs)} input device(s) visible")
+            else:
+                lines.append("mic: NO input devices visible — check the mic is plugged in")
+        except Exception as e:
+            lines.append(f"mic: audio subsystem error: {e}")
+
+        try:
+            r = ToolBelt._niri_msg("msg", "--json", "windows")
+            if r.returncode == 0:
+                n = len(json.loads(r.stdout or "[]"))
+                lines.append(f"niri IPC: ok ({n} window(s))")
+            else:
+                lines.append("niri IPC: refused — desktop actions will fail")
+        except Exception as e:
+            lines.append(f"niri IPC: UNAVAILABLE ({e}) — desktop actions will fail")
+
+        if shutil.which("ydotool"):
+            sock = ToolBelt._ydotool_socket()
+            if ToolBelt._socket_connectable(sock):
+                lines.append(f"ydotool: ok (daemon reachable at {sock})")
+            else:
+                lines.append(f"ydotool: daemon UNREACHABLE (no socket at {sock}) — "
+                             "start it: systemctl --user enable --now ydotool.service")
+        else:
+            lines.append("ydotool: NOT INSTALLED (typing tools will fail)")
 
     if RESTART_SCRIPT.exists():
         lines.append(f"restart script: present at {RESTART_SCRIPT}")
@@ -464,6 +564,10 @@ def doctor_json() -> dict:
                 re.search(r"^Restart=(always|on-failure|on-abnormal)$", txt, re.M))
         except OSError:
             pass
+    snap = _doctor_snapshot(_DOCTOR_TTL)
+    if snap is not None:
+        out["hardware"] = snap
+        out["prompt_context"] = _hardware_prompt_context()
     return out
 
 
@@ -1031,6 +1135,11 @@ def coerce_settings(s: dict) -> dict:
         if isinstance(aliases, dict) else {})
     s["home_place"] = str(s.get("home_place", "")).strip()
     s["briefing"] = bool(s.get("briefing", False))
+    s["world_warnings"] = bool(s.get("world_warnings", False))
+    _num("world_cooldown_min", float, 5.0, 1440.0)
+    s["hardware_watch"] = bool(s.get("hardware_watch", False))
+    _num("hardware_cooldown_min", float, 5.0, 1440.0)
+    _num("hardware_disk_gb", float, 0.5, 1000.0)
     # ponytail: permissions fail-closed — garbage must never enable tools
     _perms = s.get("permissions")
     if not isinstance(_perms, dict):
@@ -1370,14 +1479,94 @@ def setup_logging() -> None:
     )
 
 
-def notify(text: str) -> None:
-    """Desktop notification; best-effort (used only when TTS can't say it)."""
+_NOTIFY_DELAY = 0.5        # batch window: repeats inside it fold into one popup
+_NOTIFY_BURST = 8          # distinct popups per batch before summarizing
+_NOTIFY_MAX_PENDING = 64   # distinct texts kept per batch (rest → overflow)
+_NOTIFY_LOCK = threading.Lock()
+_NOTIFY_STATE: dict = {"pending": {}, "overflow": 0, "timer": None}
+
+_READER_APP_COOLDOWN = 60.0  # one spoken digest per app per minute, max
+_READER_COOLDOWN_LOCK = threading.Lock()
+_READER_APP_LAST: dict[str, float] = {}
+
+
+def _notify_send(text: str) -> None:
+    """One notify-send popup; best-effort, never raises."""
     try:
         subprocess.run(
             ["notify-send", "-a", APP_NAME, "handsoff", text[:300]],
             timeout=5, check=False,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+    except Exception:
+        pass
+
+
+def _notify_flush() -> None:
+    """Emit one batch: ≤BURST popups + a single overflow summary. Never raises."""
+    try:
+        with _NOTIFY_LOCK:
+            st = _NOTIFY_STATE
+            st["timer"] = None
+            batch = st["pending"]
+            overflow = st["overflow"]
+            st["pending"] = {}
+            st["overflow"] = 0
+        items = list(batch.items())
+        for msg, n in items[:_NOTIFY_BURST]:
+            _notify_send(f"{msg} ×{n}" if n > 1 else msg)
+        dropped = overflow + sum(n for _, n in items[_NOTIFY_BURST:])
+        if dropped:
+            _notify_send(
+                f"handsoff: {dropped} more notification"
+                f"{'s' if dropped != 1 else ''} (burst folded into this summary)")
+    except Exception:
+        pass
+
+
+def _notify_reset() -> None:
+    """Clear coalescing + reader-cooldown state (test hook / manual quiet)."""
+    try:
+        with _NOTIFY_LOCK:
+            t = _NOTIFY_STATE.get("timer")
+            _NOTIFY_STATE["timer"] = None
+            _NOTIFY_STATE["pending"] = {}
+            _NOTIFY_STATE["overflow"] = 0
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        with _READER_COOLDOWN_LOCK:
+            _READER_APP_LAST.clear()
+    except Exception:
+        pass
+
+
+def notify(text: str) -> None:
+    """Desktop notification with swarm coalescing; best-effort, never raises.
+
+    Identical repeats inside one short window fold into a single popup with
+    a ×N suffix; distinct-message bursts are capped per window with the
+    overflow folded into one summary popup (never dropped silently).
+    Thread-safe; an isolated notify still sends exactly one popup.
+    """
+    try:
+        msg = str(text or "")[:300]
+        if not msg:
+            return
+        with _NOTIFY_LOCK:
+            st = _NOTIFY_STATE
+            st["pending"][msg] = st["pending"].get(msg, 0) + 1
+            if len(st["pending"]) > _NOTIFY_MAX_PENDING:
+                # drop the oldest distinct text into the overflow count
+                old = next(iter(st["pending"]))
+                st["overflow"] += st["pending"].pop(old)
+            if st["timer"] is None:
+                t = threading.Timer(_NOTIFY_DELAY, _notify_flush)
+                t.daemon = True
+                st["timer"] = t
+                t.start()
     except Exception:
         pass
 
@@ -1425,14 +1614,14 @@ You can type into the FOCUSED window of the desktop (chat boxes, editors, forms)
 - type_text(text): types literal text into the focused input (newlines allowed).
 - press_keys(combo): presses a key combo like "enter", "ctrl+c", "ctrl+v".
 IMPORTANT:
-- Call these tools DIRECTLY — they are NOT shell commands; run_command refuses ydotool by design. Do NOT open the overview or run niri to "find" the window; the user already focused it. Just type and report what you typed.
-- A REFUSED run_command result means 'not whitelisted', NEVER 'not installed'.
+- Call these tools DIRECTLY, never via run_command; the window is already focused. Just type and report what you typed.
+- REFUSED means 'not whitelisted', NEVER 'not installed'.
 - Never type into a terminal. To replace input: press_keys "ctrl+a" then type_text; to send: type_text then "enter". For a specific app: focus_window first.
 
 OPERATOR — clicking UI elements (only if the 'operator' permission is enabled)
 - To click something on screen: run screen_elements (lists numbered text elements with positions), then click_element with the number or (part of the) text. Prefer this over guessing pixels.
 - click_at(x, y) is the fallback for icon-only UI. Re-run screen_elements after the screen changes — element numbers go stale.
-- You may not have the 'operator' permission; if a click is REFUSED, say so and ask the user to click it themselves — never retry.
+- A REFUSED click means no 'operator' permission: say so and stop.
 - Max a few clicks per request: act, re-scan, report. If it is not working, say what you see and stop.
 
 REMINDERS — set_reminder, list_reminders, cancel_reminder, snooze_reminder, calendar_month
@@ -1458,7 +1647,7 @@ MUSIC — media_play, media_control, media_volume, now_playing, search_library
 
 AMBIENT ASSISTANCE — notification_reader, pomodoro, watch_file, watch_process
 - Notifications are private and OFF by default. Only enable notification_reader when the user explicitly asks; it reads future desktop notifications aloud and supports a comma-separated mute list.
-- pomodoro(action="start", work_minutes=25, break_minutes=5) starts a repeating work/break timer; use action="status" or "stop". Announce each transition briefly.
+- pomodoro(action="start", work_minutes=25, break_minutes=5) is a repeating work/break timer (status/stop to inspect); announce transitions briefly.
 - watch_file and watch_process are bounded, stoppable monitors. Start them only when asked, stop them when no longer useful, and never claim a watcher is active unless the tool confirms it.
 
 EYES & APPS — see_screen, read_screen_text, open_app, focus_window
@@ -1935,6 +2124,143 @@ def _wiki_search(query: str) -> list[tuple[str, str]]:
         snippet = re.sub(r"<[^>]+>", "", str(hit.get("snippet", "")))
         out.append((title, _html_mod.unescape(snippet)))
     return out
+
+
+# -- world events: breaking news + severe-weather headlines -------------------
+
+WORLD_EVENTS_FILE = STATE_DIR / "world-events-seen.json"
+WORLD_EVENTS_MAX = 64
+WORLD_EVENTS_TTL_S = 36 * 3600  # inside the 24-48h dedup window
+_WORLD_EVENTS_LOCK = threading.Lock()
+
+_URGENT_WORDS = ("earthquake", "tsunami", "hurricane", "tornado", "flood",
+                 "wildfire", "volcano", "terror", "missile", "airstrike",
+                 "nuclear")
+_URGENT_PHRASES = ("severe thunderstorm", "tornado warning", "flood warning",
+                   "severe heat warning", "heat warning",
+                   "severe weather warning")
+_SEVERE_WMO = {95, 96, 99, 65, 75, 82}
+_SEVERE_WIND_KMH = 75.0
+
+
+def _world_is_urgent(title: str, snippet: str = "") -> bool:
+    """Deterministic severity: keyword/phrase match, no model judgment."""
+    t = f"{title or ''} {snippet or ''}".lower()
+    if any(re.search(rf"\b{re.escape(w)}\b", t) for w in _URGENT_WORDS):
+        return True
+    return any(p in t for p in _URGENT_PHRASES)
+
+
+def _world_norm_key(title: str) -> str:
+    return re.sub(r"\s+", " ", str(title or "").strip().lower())[:120]
+
+
+def _load_world_seen() -> dict:
+    """{norm_key: epoch} of spoken/announced events; corrupt → {}."""
+    try:
+        data = json.loads(WORLD_EVENTS_FILE.read_text(encoding="utf-8"))
+        now = time.time()
+        return {str(k): float(v) for k, v in data.items()
+                if str(k).strip() and float(v) > now - WORLD_EVENTS_TTL_S}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def _world_seen(key: str) -> bool:
+    return bool(key) and key in _load_world_seen()
+
+
+def _world_mark_seen(titles) -> None:
+    """Record spoken/announced headlines (briefing + proactive ONLY)."""
+    try:
+        with _WORLD_EVENTS_LOCK:
+            seen = _load_world_seen()
+            now = time.time()
+            for t in titles or ():
+                k = _world_norm_key(t)
+                if k:
+                    seen[k] = now
+            while len(seen) > WORLD_EVENTS_MAX:
+                seen.pop(min(seen, key=seen.get))
+            WORLD_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_private_write(WORLD_EVENTS_FILE, json.dumps(seen))
+    except Exception:
+        log.exception("cannot persist world-events seen store")
+
+
+def _world_news_queries() -> list:
+    """Fixed queries only — the model never chooses them."""
+    queries = ["breaking world news"]
+    place = str(SETTINGS.get("home_place", "")).strip()
+    if place:
+        variant = place.split(",")[-1].strip() if "," in place else place
+        if variant and variant.lower() not in queries[0]:
+            queries.append(f"breaking news {variant}")
+    return queries
+
+
+def _severe_weather_events() -> list:
+    """Severe-weather signal from open-meteo (needs home_place)."""
+    place = str(SETTINGS.get("home_place", "")).strip()
+    if not place:
+        return []
+    geo = _geocode(place)
+    if not geo:
+        return []
+    lat, lon, where = geo
+    data = json.loads(_http_get(
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+        "&current=weather_code,wind_speed_10m&forecast_days=1&timezone=auto"))
+    cur = data["current"]
+    code = int(cur["weather_code"])
+    wind = float(cur["wind_speed_10m"])
+    if code in _SEVERE_WMO or wind > _SEVERE_WIND_KMH:
+        desc = _WMO.get(code, "severe weather")
+        return [{"title": (f"Severe weather in {where}: {desc}, "
+                           f"wind {wind:.0f} km/h"),
+                 "snippet": "", "urgent": True, "source": "weather"}]
+    return []
+
+
+def _world_events(kind: str = "all", limit: int = 5) -> tuple:
+    """(events, degraded): fixed-query world headlines. Shared by briefing,
+    proactive warnings and the world_events tool. Never raises."""
+    try:
+        limit = max(1, min(int(limit or 5), 5))
+    except (TypeError, ValueError):
+        limit = 5
+    events: list = []
+    degraded = False
+    if kind in ("news", "all"):
+        try:
+            for query in _world_news_queries():
+                for title, snip in _ddg_lite(query):
+                    events.append({"title": title, "snippet": snip,
+                                   "urgent": _world_is_urgent(title, snip),
+                                   "source": "news"})
+                    if len(events) >= limit:
+                        break
+                if len(events) >= limit:
+                    break
+        except Exception:
+            log.warning("world news fetch failed", exc_info=True)
+            degraded = True
+    if kind in ("weather", "all") and len(events) < limit:
+        try:
+            events.extend(_severe_weather_events())
+        except Exception:
+            log.warning("world weather fetch failed", exc_info=True)
+            degraded = True
+    out, keys = [], set()
+    for e in events:
+        e["key"] = _world_norm_key(e.get("title", ""))
+        if not e["key"] or e["key"] in keys:
+            continue
+        keys.add(e["key"])
+        out.append(e)
+        if len(out) >= limit:
+            break
+    return out, degraded
 
 
 def tool(func=None, *, name=None, gates=None, aliases=None, description=None,
@@ -4579,6 +4905,27 @@ class ToolBelt:
             log.warning("web_search failed: %s", e)
             return f"ERROR: web search failed ({type(e).__name__})"
 
+    @tool(description=("World news headlines."),
+        gates="web_access",
+        aliases={"count": ("n", "limit")})
+    def world_events(self, count: int = 4) -> str:
+        """Show current world headlines."""
+        try:
+            n = int(count)
+        except (TypeError, ValueError):
+            n = 4
+        n = max(1, min(n, 5))
+        events, degraded = _world_events("all", n)
+        if not events:
+            return ("ERROR: world news unavailable (offline?)"
+                    if degraded else "no world headlines right now")
+        lines = ["World headlines:"]
+        for e in events:
+            mark = "⚠ " if e.get("urgent") else ""
+            lines.append(f"- {mark}{e['title']}")
+        # ponytail: read-only — reading headlines must never consume warnings
+        return "\n".join(lines)
+
     @tool(description=(
         "Look up an encyclopedia summary about a person, place, thing or "
         "concept (Wikipedia). Better than web_search for stable facts."),
@@ -5565,6 +5912,14 @@ class ContinuousListener:
                 self._assistant._resource_tick()              # RAM/VRAM crossing alerts
             except Exception:
                 log.exception("resource health check failed")
+            try:
+                self._assistant._world_tick()                 # world warnings (opt-in)
+            except Exception:
+                log.exception("world warnings check failed")
+            try:
+                self._assistant._hardware_tick()              # live hardware watch (opt-in)
+            except Exception:
+                log.exception("hardware watch check failed")
             # --- transition detection ---------------------------------
             changed = state != self._health_state
             last = self._health_state
@@ -5914,6 +6269,11 @@ class Assistant(QObject):
         # crossing, then re-arm only after usage falls below the threshold.
         self._resource_alerted = {"ram": False, "vram": False}
         self._resource_last = {"ram": None, "vram": None}
+        self._world_last_announce = 0.0  # monotonic: last proactive warning
+        self._hardware_note = ""       # 1-2 line change note for the next turn
+        self._hardware_last = {}       # change-detection state (in-memory only)
+        self._hardware_last_urgent = 0.0  # monotonic: last hardware urgent
+        self._hardware_tick_n = 0      # tick parity: GPU util at most every 2nd
         self._pipeline_q: "queue.Queue" = queue.Queue()
         threading.Thread(target=self._pipeline_worker, name="pipeline",
                          daemon=True).start()
@@ -6062,6 +6422,191 @@ class Assistant(QObject):
             self._announce_now(
                 f"Warning: {labels[kind]} is at {value:.0f} percent.")
 
+    def _world_tick(self) -> None:
+        """Proactive severe-world-event warnings; mirrors _resource_tick.
+
+        Opt-in: poll (cheap on cooldown), per-event seen-store, one global
+        cooldown, popup always + spoken unless already speaking.
+        """
+        if not bool(SETTINGS.get("world_warnings", False)):
+            return
+        try:
+            cooldown_s = float(SETTINGS.get("world_cooldown_min", 60.0)) * 60.0
+        except (TypeError, ValueError):
+            cooldown_s = 3600.0
+        if time.monotonic() - self._world_last_announce < cooldown_s:
+            return
+        events, _degraded = _world_events("all", 5)
+        fresh = [e for e in events
+                 if e.get("urgent") and not _world_seen(e.get("key", ""))]
+        if not fresh:
+            return
+        self._world_last_announce = time.monotonic()
+        _world_mark_seen([e["title"] for e in fresh])
+        text = "World warning: " + "; ".join(e["title"][:140] for e in fresh[:2])
+        log.warning("world warning: %s", text)
+        notify(text)
+        if self.state != SPEAKING:
+            self._announce_now(text)
+
+    def _hardware_tick(self) -> None:
+        """Live hardware watch: cheap sampling + change detection, ~10 s tick.
+
+        Opt-in via hardware_watch (off returns in <1 ms). Cheap signals only
+        (loadavg, meminfo, disk_usage, which, mic_snapshot); slow sections
+        are peeked from the shared TTL cache when fresh, never forced — the
+        nvidia-smi util query is the only in-tick subprocess, at most every
+        2nd tick with a 2 s timeout. Never raises (call site also isolates).
+        """
+        try:
+            if not bool(SETTINGS.get("hardware_watch", False)):
+                return
+            hw = _hardware
+            last = self._hardware_last
+            self._hardware_tick_n = self._hardware_tick_n + 1
+            notes: list = []
+            urgent: str | None = None
+            # -- mic: consume the listener state machine, never duplicate it
+            try:
+                mic = self._listener.mic_snapshot()
+            except Exception:
+                mic = {}
+            cur_mic = (mic.get("state"), mic.get("device"))
+            prev_mic = last.get("mic")
+            if prev_mic is not None and cur_mic != prev_mic:
+                if (self._handsfree and cur_mic[0] == "open-failing"
+                        and prev_mic[0] != "open-failing"):
+                    urgent = (f"Microphone failed ({cur_mic[1]}): "
+                              "hands-free is deaf")
+                else:
+                    notes.append(f"Mic: {prev_mic[0]} → {cur_mic[0]} "
+                                 f"({cur_mic[1]})")
+            last["mic"] = cur_mic
+            # -- cheap stdlib sampling (zero subprocess on this path)
+            try:
+                ttl_data = (_DOCTOR_TTL.get("data") or {}) \
+                    if isinstance(_DOCTOR_TTL, dict) else {}
+                ttl_at = (_DOCTOR_TTL.get("at") or {}) \
+                    if isinstance(_DOCTOR_TTL, dict) else {}
+            except Exception:
+                ttl_data, ttl_at = {}, {}
+            def _fresh(section: str) -> dict | None:
+                try:
+                    ttl = hw.TTL.get(section, 0) if hw else 0
+                    if (section in ttl_data and time.monotonic()
+                            - ttl_at.get(section, 0.0) < ttl):
+                        return ttl_data[section]
+                except Exception:
+                    pass
+                return None
+            # -- disk floor: crossing announces once, re-arm above threshold
+            try:
+                disk_gb = float(SETTINGS.get("hardware_disk_gb", 5.0))
+            except (TypeError, ValueError):
+                disk_gb = 5.0
+            disk = hw.disk_free("/") if hw else {"ok": False}
+            if isinstance(disk, dict) and disk.get("ok"):
+                try:
+                    free_gb = float(disk.get("free", 0)) / 2 ** 30
+                except (TypeError, ValueError):
+                    free_gb = disk_gb
+                if free_gb < disk_gb:
+                    if not last.get("disk_low"):
+                        last["disk_low"] = True
+                        urgent = urgent or (f"Disk critically low: "
+                                            f"{free_gb:.1f} GiB free")
+                else:
+                    if last.get("disk_low"):
+                        notes.append(f"Disk recovered: {free_gb:.1f} GiB free")
+                    last["disk_low"] = False
+            # -- GPU: presence every tick (which, no subprocess), util at
+            # most every 2nd tick — the single allowed in-tick subprocess
+            gpu_util: float | None = None
+            try:
+                gpu_present = bool(shutil.which("nvidia-smi"))
+            except Exception:
+                gpu_present = None
+            if gpu_present is not None:
+                if last.get("gpu_present") is not None \
+                        and last["gpu_present"] != gpu_present:
+                    notes.append("GPU " + ("appeared" if gpu_present
+                                           else "disappeared"))
+                last["gpu_present"] = gpu_present
+            if gpu_present and self._hardware_tick_n % 2 == 0:
+                try:
+                    p = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                         "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=2)
+                    rows = []
+                    for line in p.stdout.splitlines():
+                        parts = [x.strip() for x in line.split(",")]
+                        if len(parts) != 2:
+                            continue
+                        try:
+                            used, total = float(parts[0]), float(parts[1])
+                        except ValueError:
+                            continue
+                        if total > 0:
+                            rows.append(used / total * 100.0)
+                    if rows:
+                        gpu_util = max(rows)
+                except Exception:
+                    log.debug("hardware watch: nvidia-smi unavailable",
+                              exc_info=True)
+            # -- VRAM crossing here only when resource_alerts is off (else
+            # _resource_tick owns it — never double-announce)
+            if gpu_util is not None and not SETTINGS.get("resource_alerts", False):
+                try:
+                    vlim = float(SETTINGS.get("vram_alert_percent", 90.0))
+                except (TypeError, ValueError):
+                    vlim = 90.0
+                if gpu_util >= vlim:
+                    if not last.get("vram_alerted"):
+                        last["vram_alerted"] = True
+                        urgent = urgent or (f"GPU memory at {gpu_util:.0f}%")
+                else:
+                    last["vram_alerted"] = False
+            # -- Ollama flip from TTL cache only; 2 consecutive fresh-cache
+            # misses required (a single blip stays silent)
+            ollama = _fresh("ollama")
+            if ollama is not None:
+                if ollama.get("ok"):
+                    last["ollama_miss"] = 0
+                    if last.get("ollama_down"):
+                        last["ollama_down"] = False
+                        notes.append("Ollama is reachable again")
+                else:
+                    last["ollama_miss"] = last.get("ollama_miss", 0) + 1
+                    if last["ollama_miss"] >= 2 \
+                            and not last.get("ollama_down"):
+                        last["ollama_down"] = True
+                        urgent = urgent or "Ollama is down: voice brain offline"
+            # -- mic count via TTL-10 audio (peek only, never forced)
+            audio = _fresh("audio")
+            if isinstance(audio, dict) and self._handsfree \
+                    and audio.get("ok") and not audio.get("count") \
+                    and last.get("audio_count"):
+                urgent = urgent or "Microphone unplugged: no input devices"
+            if isinstance(audio, dict) and audio.get("count") is not None:
+                last["audio_count"] = audio.get("count")
+            # -- channels: note for the next turn, urgent via popup + speech
+            if notes:
+                self._hardware_note = "\n".join(notes[:2])[:200]
+            if urgent is not None:
+                try:
+                    cd = float(SETTINGS.get("hardware_cooldown_min", 60.0)) * 60.0
+                except (TypeError, ValueError):
+                    cd = 3600.0
+                if time.monotonic() - self._hardware_last_urgent >= cd:
+                    self._hardware_last_urgent = time.monotonic()
+                    log.warning("hardware watch: %s", urgent)
+                    notify(urgent)
+                    if self.state != SPEAKING:
+                        self._announce_now(urgent)
+        except Exception:
+            log.exception("hardware watch tick failed")
+
     # -- ambient services -------------------------------------------------------
 
     def _set_notification_reader(self, enabled: bool):
@@ -6132,9 +6677,17 @@ class Assistant(QObject):
                     app, _icon, summary, body = values[:4]
                     values = []
                     muted = [str(x).lower() for x in SETTINGS.get("notification_mute_apps", [])]
+                    muted.append(APP_NAME.lower())  # never echo our own popups
                     if any(m and m in app.lower() for m in muted):
                         log.info("notification muted from %s", app)
                         continue
+                    now = time.monotonic()
+                    with _READER_COOLDOWN_LOCK:
+                        last = _READER_APP_LAST.get(app.lower())
+                        if last is not None and now - last < _READER_APP_COOLDOWN:
+                            log.info("notification cooldown suppresses %s", app)
+                            continue
+                        _READER_APP_LAST[app.lower()] = now
                     text = f"Notification from {app}: {summary}"
                     if body.strip():
                         text += f". {body.strip()}"
@@ -6907,12 +7460,21 @@ class Assistant(QObject):
         if low.startswith(self._BRIEFING_SKIP_PREFIXES):
             return ""   # a command, not a greeting — don't hijack it
         place = str(SETTINGS.get("home_place", "")).strip()
-        if not place:
-            return ""
-        out, err = self._tools.execute("get_weather", {"place": place})
-        if err or out.startswith(("REFUSED", "ERROR")):
-            log.info("briefing skipped: %s", out[:80])
-            return ""
+        body = ""
+        if place:
+            out, err = self._tools.execute("get_weather", {"place": place})
+            if err or out.startswith(("REFUSED", "ERROR")):
+                log.info("briefing skipped: %s", out[:80])
+                return ""
+            body = out
+        # ponytail: world news needs no home_place; weather keeps its own.
+        events, _degraded = _world_events("all", 5)
+        world_lines = []
+        if events:
+            for e in events[:4]:
+                mark = "⚠ " if e.get("urgent") else ""
+                world_lines.append(f"- {mark}{e['title']}")
+            _world_mark_seen([e["title"] for e in events[:4]])
         self._briefing_done_date = today
         log.info("morning briefing delivered for %s", today)
         cal = _today_events_summary()
@@ -6921,12 +7483,17 @@ class Assistant(QObject):
             _stamp if isinstance(_stamp, (int, float))
             else time.time() - 24 * 3600)
         _mark_briefing_delivered()
-        body = out + (f"\nToday\u2019s calendar: {cal}" if cal else "")
+        if cal:
+            body += ("\n" if body else "") + f"Today\u2019s calendar: {cal}"
         if mic_probs:
-            body += f"\n{mic_probs}"
+            body += ("\n" if body else "") + mic_probs
+        if world_lines:
+            body += ("\n" if body else "") + "World:\n" + "\n".join(world_lines)
+        if not body:
+            return ""
         return ("[Daily briefing — greet the user briefly and naturally give "
-                "this weather summary FIRST (plus today\u2019s calendar events "
-                "if listed, and mention microphone problems if any are listed), "
+                "this weather summary FIRST (plus calendar events, mic "
+                "problems and world headlines if listed), "
                 "then answer their request]\n" + body)
 
     def _conversation_for(self, text: str) -> list[dict]:
@@ -6952,6 +7519,13 @@ class Assistant(QObject):
             facts = "\n".join(f"- {m['v']}" for m in self._memory)
             conversation.append({"role": "system",
                                  "content": "Facts you remember about the user:\n" + facts})
+        # ponytail: consumed-once hardware note goes last (same prefix-cache
+        # rationale as the memory block) and is cleared on attach.
+        hw_note = (getattr(self, "_hardware_note", "") or "")[:200]
+        self._hardware_note = ""
+        if hw_note:
+            conversation.append({"role": "system",
+                                 "content": "Live hardware note:\n" + hw_note})
         conversation.append({"role": "user", "content": user_content})
         return conversation
 

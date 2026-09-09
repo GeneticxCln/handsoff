@@ -785,12 +785,16 @@ class SettingsWindow(QMainWindow):
         self._live_probe: _LiveMicProbe | None = None   # live mic test (Voice tab)
 
         tabs = QTabWidget(self)
+        self.tabs = tabs
         tabs.addTab(self._brain_tab(), "Brain")
         tabs.addTab(self._voice_tab(), "Voice")
         tabs.addTab(self._permissions_tab(), "Permissions")
         tabs.addTab(self._memory_tab(), "Memory")
         tabs.addTab(self._appearance_tab(), "Appearance")
         tabs.addTab(self._startup_tab(), "Startup")
+        self._history_page = self._history_tab()
+        tabs.addTab(self._history_page, "History")
+        tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(tabs)
 
         bottom = QWidget(self)
@@ -1127,6 +1131,35 @@ class SettingsWindow(QMainWindow):
             "Needs a home place. On the first conversational utterance each day, "
             "the assistant greets you with the live weather before answering.")
         wake_form.addRow(self.brief_chk)
+        self.world_warn_chk = QCheckBox(
+            "World warnings — speak up about severe world events as they break", w)
+        self.world_warn_chk.setToolTip(
+            "Opt-in. Checks breaking-news and severe-weather headlines on the "
+            "existing health tick and announces urgent ones (popup always, "
+            "spoken unless already speaking), at most once per cooldown.")
+        wake_form.addRow(self.world_warn_chk)
+        self.hw_watch_chk = QCheckBox(
+            "Hardware watch — note machine changes, warn when critical", w)
+        self.hw_watch_chk.setToolTip(
+            "Opt-in. Samples cheap health signals on the existing tick and "
+            "tells the next turn about changes (popup + spoken only when "
+            "urgent: mic lost, disk critically low, Ollama down).")
+        wake_form.addRow(self.hw_watch_chk)
+        hw_row = QHBoxLayout()
+        self.hw_cool_spin = QSpinBox(w)
+        self.hw_cool_spin.setRange(5, 1440)
+        self.hw_cool_spin.setSuffix(" min")
+        self.hw_cool_spin.setToolTip("Min minutes between hardware urgents.")
+        self.hw_disk_spin = QSpinBox(w)
+        self.hw_disk_spin.setRange(1, 1000)
+        self.hw_disk_spin.setSuffix(" GiB")
+        self.hw_disk_spin.setToolTip("Warn when free disk drops below this.")
+        hw_row.addWidget(QLabel("Urgent cooldown", w))
+        hw_row.addWidget(self.hw_cool_spin)
+        hw_row.addWidget(QLabel("Disk floor", w))
+        hw_row.addWidget(self.hw_disk_spin)
+        hw_row.addStretch(1)
+        wake_form.addRow("Hardware watch", hw_row)
         self.cal_edit = QLineEdit(
             ", ".join(self.cfg.get("calendar_ics") or []), w)
         self.cal_edit.setPlaceholderText(
@@ -1527,7 +1560,7 @@ class SettingsWindow(QMainWindow):
             "focus_window": ("Focus windows", "raise any window by (part of its) "
                              "title — e.g. 'bring up the calculator'"),
             "web_access": ("Internet knowledge", "weather (Open-Meteo), facts (Wikipedia), "
-                           "web search (DuckDuckGo) — read-only, fixed endpoints"),
+                           "web search (DuckDuckGo), world warnings — read-only, fixed endpoints"),
             "screen_access": ("See the screen", "screenshots + OCR of your display; the "
                               "AI can look at what you look at"),
             "operator": ("Mouse control", "move the pointer and click UI elements "
@@ -1825,6 +1858,10 @@ class SettingsWindow(QMainWindow):
         self.notification_mute_edit.setText(", ".join(self.cfg.get("notification_mute_apps") or []))
         self.dictation_chk.setChecked(bool(self.cfg.get("dictation", True)))
         self.brief_chk.setChecked(bool(self.cfg.get("briefing", False)))
+        self.world_warn_chk.setChecked(bool(self.cfg.get("world_warnings", False)))
+        self.hw_watch_chk.setChecked(bool(self.cfg.get("hardware_watch", False)))
+        self.hw_cool_spin.setValue(int(float(self.cfg.get("hardware_cooldown_min", 60.0))))
+        self.hw_disk_spin.setValue(int(float(self.cfg.get("hardware_disk_gb", 5.0))))
         aliases = self.cfg.get("workspace_aliases") or {}
         self.alias_edit.setPlainText(
             "\n".join(f"{k} = {v}" for k, v in sorted(aliases.items())))
@@ -1855,6 +1892,10 @@ class SettingsWindow(QMainWindow):
         self.cfg["followup_seconds"] = float(self.followup_secs.value())
         self.cfg["home_place"] = self.home_edit.text().strip()
         self.cfg["briefing"] = self.brief_chk.isChecked()
+        self.cfg["world_warnings"] = self.world_warn_chk.isChecked()
+        self.cfg["hardware_watch"] = self.hw_watch_chk.isChecked()
+        self.cfg["hardware_cooldown_min"] = float(self.hw_cool_spin.value())
+        self.cfg["hardware_disk_gb"] = float(self.hw_disk_spin.value())
         self.cfg["calendar_ics"] = [
             x.strip() for x in self.cal_edit.text().split(",") if x.strip()]
         self.cfg["wake_spotter"] = self.spotter_chk.isChecked()
