@@ -45,6 +45,7 @@ import json
 import logging
 import math
 import os
+import signal
 import queue
 import random
 import re
@@ -1603,6 +1604,7 @@ def _take_missed_reminders() -> list[dict]:
 # one-off reminder without any LLM round-trip
 _snooze_offer: dict = {}        # {"name": str, "until": time.monotonic()}
 _SNOOZE_LOCK = threading.Lock()
+_kill_offer: dict = {}          # pending kill confirmation: {"pid", "name", "until"}
 SNOOZE_WINDOW_S = 90.0
 
 
@@ -2896,6 +2898,151 @@ class ToolBelt:
             return "OCR found no readable text on screen."
         log.info("read_screen_text: %d chars", len(text))
         return f"Text on screen: {text[:4000]}"
+
+    # -- process management (scoped: same-user, exact match, confirmed) --------
+
+    KILL_CONFIRM_S = 60.0          # how long a spoken 'confirm kill' stays valid
+
+    @staticmethod
+    def _same_user_procs() -> list[tuple[int, str]]:
+        """[(pid, name)] for every process owned by the CURRENT user — the
+        AI can never see (or kill) other users' processes, including root."""
+        out = []
+        me = os.getuid() if hasattr(os, "getuid") else -1
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/status", encoding="ascii",
+                          errors="replace") as fh:
+                    fields = dict(line.split(":", 1)
+                                  for line in fh if ":" in line)
+                if int(fields.get("Uid", "-1\t-1").split()[0]) != me:
+                    continue
+                name = fields.get("Name", "").strip()
+                if name:
+                    out.append((int(entry), name))
+            except (OSError, ValueError, KeyError, IndexError):
+                continue
+        return out
+
+    @staticmethod
+    def _port_owner(port: int) -> list[int]:
+        """PIDs of same-user processes with a LISTEN socket on this port
+        (parsed from /proc/net/tcp{,6}; no external tools)."""
+        inodes: set[str] = set()
+        for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(path, encoding="ascii") as fh:
+                    next(fh)                       # header
+                    for line in fh:
+                        f = line.split()
+                        if len(f) < 10 or f[3] != "0A":   # 0A = LISTEN
+                            continue
+                        try:
+                            if int(f[1].split(":")[1], 16) == port:
+                                inodes.add(f[9])
+                        except (ValueError, IndexError):
+                            continue
+            except OSError:
+                continue
+        pids = []
+        me = os.getuid() if hasattr(os, "getuid") else -1
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/status", encoding="ascii",
+                          errors="replace") as fh:
+                    fields = dict(line.split(":", 1)
+                                  for line in fh if ":" in line)
+                if int(fields.get("Uid", "-1\t-1").split()[0]) != me:
+                    continue
+                for fd in os.listdir(f"/proc/{entry}/fd"):
+                    try:
+                        link = os.readlink(f"/proc/{entry}/fd/{fd}")
+                    except OSError:
+                        continue
+                    if link.startswith("socket:["):
+                        ino = link[8:-1]
+                        if ino in inodes:
+                            pids.append(int(entry))
+                            break
+            except (OSError, ValueError, KeyError, IndexError):
+                continue
+        return pids
+
+    @tool(gates="run_command", description=(
+        "Stop (SIGTERM) one of the user's own processes by EXACT name or by "
+        "the port it listens on. Two steps: kill_process first shows the match "
+        "and asks to confirm; then confirm_kill('yes') actually stops it."))
+    def kill_process(self, target: str) -> str:
+        target = str(target or "").strip()
+        if not target:
+            return "ERROR: name the process or the port it listens on"
+        cands: list[tuple[int, str]] = []
+        if target.isdigit() and 0 < int(target) <= 65535:
+            port = int(target)
+            for pid in self._port_owner(port):
+                name = next((n for p, n in self._same_user_procs()
+                             if p == pid), str(pid))
+                cands.append((pid, name))
+        else:
+            low = target.lower()
+            cands = [(p, n) for p, n in self._same_user_procs()
+                     if n.lower() == low]
+        if not cands:
+            return (f"ERROR: no process of yours matches {target!r} "
+                    "(exact name or listening port; other users' processes "
+                    "are invisible)")
+        if len(cands) > 1:
+            listing = ", ".join(f"{n} (pid {p})" for p, n in cands[:6])
+            return (f"ERROR: {len(cands)} processes match — kill_process needs "
+                    f"an EXACT single match, these all match: {listing}")
+        pid, name = cands[0]
+        if pid == os.getpid():
+            return ("REFUSED: that is me — for a restart of the assistant, "
+                    "ask me to restart myself instead")
+        if name == "systemd":
+            # the user's own systemd --user manager: killing it would end
+            # every user service (including this bubble) at once
+            return ("REFUSED: systemd --user manages your whole session — "
+                    "killing it would stop every user service, including me")
+        _kill_offer.clear()
+        _kill_offer.update({"pid": pid, "name": name,
+                            "until": time.monotonic() + self.KILL_CONFIRM_S})
+        log.info("kill_process: offered pid %d (%s), awaiting confirm", pid, name)
+        return (f"About to stop {name} (pid {pid}). Nothing happened yet — "
+                "call confirm_kill('yes') to stop it, or confirm_kill('no') "
+                "to cancel.")
+
+    @tool(gates="run_command", description=(
+        "Second step of kill_process: confirm_kill('yes') stops the offered "
+        "process; confirm_kill('no') cancels the offer."))
+    def confirm_kill(self, answer: str = "yes") -> str:
+        offer = dict(_kill_offer) if _kill_offer else None
+        if not offer:
+            return "ERROR: nothing to confirm — call kill_process first"
+        if time.monotonic() >= offer["until"]:
+            _kill_offer.clear()
+            return "ERROR: the kill offer expired — run kill_process again"
+        ans = str(answer or "yes").strip().lower()
+        if ans not in ("yes", "no", "y", "n"):
+            return "ERROR: answer with yes or no"
+        if ans in ("no", "n"):
+            _kill_offer.clear()
+            log.info("kill_process: cancelled by user/model")
+            return "Cancelled — nothing was stopped."
+        pid, name = offer["pid"], offer["name"]
+        _kill_offer.clear()
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return f"{name} (pid {pid}) already exited."
+        except PermissionError:
+            return f"ERROR: not allowed to stop {name} (pid {pid})"
+        log.warning("kill_process: SIGTERM pid %d (%s) confirmed", pid, name)
+        return f"Stopped {name} (pid {pid}) (SIGTERM sent)."
 
     # -- operator: element-grounded clicking (Self-Operating-Computer pattern) --
 

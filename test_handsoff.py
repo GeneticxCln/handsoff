@@ -4553,3 +4553,101 @@ class TestOperator:
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
         assert '"operator":' in src
         assert H.DEFAULT_SETTINGS["permissions"]["operator"] is False
+
+
+class TestKillProcess:
+    """Scoped process management: exact-name or listening-port match among the
+    user's OWN processes only, two-step spoken confirm, session-critical
+    guards (systemd --user, self)."""
+
+    def _tb(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
+        tb._tool_times = deque()          # execute() rate-limit deque
+        H._kill_offer.clear()
+        return tb
+
+    def test_two_step_confirm_required(self, H, monkeypatch):
+        import subprocess as sp
+        tb = self._tb(H, monkeypatch)
+        d = sp.Popen(["sleep", "60"])
+        try:
+            r = tb.kill_process("sleep")
+            assert "About to stop" in r and d.poll() is None   # not killed yet
+            r, _e = tb.execute("confirm_kill", {"answer": "yes"})
+            assert "Stopped" in r
+            d.wait(timeout=5)
+            assert d.poll() is not None
+        finally:
+            d.kill(); d.wait()            # reap: zombies still appear in /proc
+
+    def test_cancel_leaves_process_alive(self, H, monkeypatch):
+        import subprocess as sp
+        tb = self._tb(H, monkeypatch)
+        d = sp.Popen(["sleep", "60"])
+        try:
+            tb.kill_process("sleep")
+            assert "Cancelled" in tb.confirm_kill("no")
+            assert d.poll() is None
+        finally:
+            d.kill(); d.wait()
+
+    def test_ambiguous_match_refused(self, H, monkeypatch):
+        import subprocess as sp, time as t
+        tb = self._tb(H, monkeypatch)
+        d2, d3 = sp.Popen(["sleep", "60"]), sp.Popen(["sleep", "60"])
+        t.sleep(0.05)
+        try:
+            r = tb.kill_process("sleep")
+            assert r.startswith("ERROR") and "EXACT" in r
+        finally:
+            d2.kill(); d2.wait(); d3.kill(); d3.wait()
+
+    def test_no_match_and_other_users_invisible(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        r = tb.kill_process("definitely-not-a-process-xyz")
+        assert "no process" in r
+        r = tb.kill_process("systemd")           # root's systemd invisible
+        assert "no process" in r or "session" in r
+
+    def test_systemd_user_manager_guarded(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        monkeypatch.setattr(tb, "_same_user_procs",
+                            lambda: [(123, "systemd"), (456, "sleep")])
+        r = tb.kill_process("systemd")
+        assert r.startswith("REFUSED") and "session" in r
+
+    def test_self_guarded(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        monkeypatch.setattr(tb, "_same_user_procs",
+                            lambda: [(os.getpid(), "python3")])
+        r = tb.kill_process("python3")
+        assert r.startswith("REFUSED") and "me" in r
+
+    def test_port_targeting(self, H, monkeypatch):
+        import subprocess as sp, time as t
+        tb = self._tb(H, monkeypatch)
+        srv = sp.Popen(["python3", "-m", "http.server", "18744"])
+        t.sleep(0.6)
+        try:
+            r = tb.kill_process("18744")
+            # the offered name is the process comm (truncated to 15 chars),
+            # so the python http.server shows up as 'python3'
+            assert "About to stop" in r and "python3" in r
+            tb.confirm_kill("no")
+        finally:
+            srv.kill(); srv.wait()
+
+    def test_expired_and_absent_offers(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        assert "nothing to confirm" in tb.confirm_kill("yes")
+        H._kill_offer.update({"pid": 1, "name": "x",
+                              "until": time.monotonic() - 10})
+        assert "expired" in tb.confirm_kill("yes")
+        assert not H._kill_offer
+
+    def test_registered_and_gated(self, H):
+        reg = H.ToolBelt(on_restart_pending=lambda: None)
+        names = set(reg._tool_methods().keys())
+        assert {"kill_process", "confirm_kill"} <= names
