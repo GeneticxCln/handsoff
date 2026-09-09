@@ -24,6 +24,7 @@ import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -569,6 +570,61 @@ class _LiveMicProbe:
             }
 
 
+def _health_query(sock_path, timeout: float = 1.5) -> "dict | None":
+    """Ask the running bubble for its JSON health snapshot over the control
+    socket. Returns the parsed dict, or None when the bubble isn't running,
+    the socket is stale or the answer isn't JSON (never raises)."""
+    if sock_path is None:
+        return None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(str(sock_path))
+        s.sendall(b"health")
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            part = s.recv(65536)
+            if not part:
+                break
+            buf += part
+        s.close()
+        doc = json.loads(buf.decode("utf-8", "replace"))
+        return doc if isinstance(doc, dict) else None
+    except Exception:
+        return None
+
+
+def _fmt_health(snap: dict) -> str:
+    """One compact status-bar line from a health snapshot."""
+    mic = snap.get("mic") or {}
+    brain = snap.get("brain") or {}
+    tts = snap.get("tts") or {}
+    mic_txt = f"mic: {mic.get('state', '?')}"
+    if mic.get("device"):
+        dev = str(mic["device"])
+        mic_txt += f" ({dev[:38]}…)" if len(dev) > 40 else f" ({dev})"
+    if mic.get("rate"):
+        mic_txt += f" @ {mic['rate']} Hz"
+    if mic.get("stalled"):
+        mic_txt += " · stalled"
+    if mic.get("failing_since") is not None:
+        mic_txt += f" · failing {int(mic['failing_since'])}s"
+    if mic.get("utterances"):
+        mic_txt += f" · {mic['utterances']} utt"
+    brain_txt = ("brain: ok " + str(brain.get("model", ""))
+                 if brain.get("reachable") else "brain: DOWN")
+    voice_ok = bool(tts.get("ready"))
+    stt_ok = bool(tts.get("whisper_ready"))
+    if voice_ok and stt_ok:
+        tts_txt = "tts/stt: ok"
+    elif not voice_ok and not stt_ok:
+        tts_txt = "tts/stt: loading\u2026"
+    else:
+        tts_txt = "tts: ok, stt loading\u2026" if voice_ok else "stt: ok, voice loading\u2026"
+    return f"{mic_txt} · {brain_txt} · {tts_txt}"
+
+
 class SettingsWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -603,9 +659,22 @@ class SettingsWindow(QMainWindow):
         bl.addWidget(quit_btn)
         bl.addWidget(save)
         bl.addWidget(apply_btn)
+
         outer = QWidget(self)
         ol = QVBoxLayout(outer)
         ol.addWidget(tabs, 1)
+
+        # live bubble-vitals line (health command via the control socket),
+        # refreshed every 3 s while the window is open
+        self.health_label = QLabel("bubble health: querying\u2026", self)
+        self.health_label.setStyleSheet("color: palette(mid);")
+        ol.addWidget(self.health_label)
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(3000)
+        self._health_timer.timeout.connect(self._refresh_health)
+        self._health_timer.start()
+        QTimer.singleShot(300, self._refresh_health)
+
         ol.addWidget(bottom)
         self.setCentralWidget(outer)
 
@@ -630,11 +699,34 @@ class SettingsWindow(QMainWindow):
         except OSError:
             pass
 
+    def _refresh_health(self) -> None:
+        """Poll the running bubble's `health` command off the GUI thread and
+        render one compact vitals line (mic, brain, tts) in the status bar."""
+        def fetch():
+            return _health_query(H.CONTROL_SOCK)
+
+        def done(ok, result):
+            if ok and result is not None:
+                self.health_label.setText(_fmt_health(result))
+                degraded = ((result.get("mic") or {}).get("state")
+                            in ("silent", "open-failing"))
+                self.health_label.setStyleSheet(
+                    "color: orange;" if degraded else "color: palette(mid);")
+            else:
+                self.health_label.setText(
+                    "bubble health: not running (settings still work)")
+                self.health_label.setStyleSheet("color: palette(mid);")
+
+        self.run_bg(fetch, done)
+
     def closeEvent(self, event) -> None:            # noqa: N802 (Qt naming)
-        """Stop the live mic test (and its stream + whisper worker) on close,
-        so the settings app never holds the mic after the window is gone."""
+        """Stop the live mic test (and its stream + whisper worker) and the
+        health poller on close, so the settings app never holds the mic or
+        keeps polling after the window is gone."""
         if self._live_probe is not None:
             self._live_probe.stop()
+        if getattr(self, "_health_timer", None) is not None:
+            self._health_timer.stop()
         super().closeEvent(event)
 
     def run_bg(self, fn, done) -> None:

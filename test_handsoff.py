@@ -3929,3 +3929,73 @@ class TestMicHistoryPersistence:
         doc = H._load_mic_events()
         assert "last_briefing" in doc
         assert len(doc["events"]) == before + 40   # zero lost updates
+
+
+class TestSettingsHealthBar:
+    """The settings app's status bar shows the running bubble's health
+    snapshot live: _health_query fetches, _fmt_health renders, the window
+    wires a 3 s timer and stops it on close."""
+
+    def _mod(self):
+        return _load("handsoff_settings_hb", HERE / "handsoff-settings.py")
+
+    def test_fmt_health_healthy(self):
+        mod = self._mod()
+        line = mod._fmt_health({
+            "mic": {"state": "listening", "device": "TestMic", "rate": 16000,
+                    "utterances": 3, "stalled": False, "failing_since": None},
+            "brain": {"reachable": True, "model": "m"},
+            "tts": {"ready": True, "whisper_ready": True}})
+        assert "mic: listening (TestMic)" in line and "@ 16000 Hz" in line
+        assert "3 utt" in line and "brain: ok m" in line and "tts/stt: ok" in line
+
+    def test_fmt_health_degraded_and_partial(self):
+        mod = self._mod()
+        line = mod._fmt_health({
+            "mic": {"state": "silent", "stalled": True, "failing_since": 12.4},
+            "brain": {"reachable": False},
+            "tts": {"ready": False, "whisper_ready": False}})
+        assert "silent" in line and "stalled" in line and "failing 12s" in line
+        assert "brain: DOWN" in line and "loading" in line
+        # empty/partial snapshots must never raise
+        assert "mic: ?" in mod._fmt_health({})
+        assert "brain: DOWN" in mod._fmt_health({"mic": {"state": "listening"}})
+
+    def test_query_dead_socket_returns_none(self, tmp_path):
+        mod = self._mod()
+        assert mod._health_query(tmp_path / "nope.sock") is None
+        assert mod._health_query(None) is None
+
+    def test_query_against_real_server(self, H, tmp_path):
+        """_health_query speaks to the real ControlServer implementation."""
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.instance() or QCoreApplication([])
+        mod = self._mod()
+        sock = tmp_path / "c.sock"
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(H, "CONTROL_SOCK", sock)
+        asst = H.Assistant()
+        srv = H.ControlServer(asst)
+        srv.start()
+        try:
+            deadline, snap = time.time() + 5, None
+            while time.time() < deadline and snap is None:
+                snap = mod._health_query(sock, timeout=2.0)
+                if snap is None:
+                    time.sleep(0.05)
+            assert isinstance(snap, dict) and "mic" in snap and "brain" in snap
+        finally:
+            monkey.undo()
+            asst.deleteLater()
+
+    def test_window_wires_timer_and_cleanup(self):
+        mod = self._mod()
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        assert "_health_timer.setInterval(3000)" in src
+        assert "_refresh_health" in src
+        ce = src[src.index("def closeEvent"):src.index("def closeEvent") + 500]
+        assert "_health_timer.stop()" in ce
+        # the fetch must run off the GUI thread (run_bg), not inline
+        rf = src[src.index("def _refresh_health"):
+                 src.index("def _refresh_health") + 900]
+        assert "self.run_bg(fetch, done)" in rf

@@ -29,7 +29,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All 29 tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 276 tests pin the behavior (`python -m pytest test_handsoff.py`).
+automatically. 281 tests pin the behavior (`python -m pytest test_handsoff.py`).
 
 ## Requirements
 
@@ -218,6 +218,10 @@ instead of starting by hand; it waits for the lock.
   speech that passes the threshold is transcribed with the bubble's own
   whisper model, shown under *Last transcript*. Use it to verify a mic (and
   tune the threshold) before switching the bubble to it.
+- **Live health bar** (Settings, bottom of the window): while the settings
+  app is open, a status line polls the running bubble every 3 s and shows
+  its mic state, brain (Ollama) reachability, and TTS/STT readiness —
+  mic problems turn it orange.
 - Pick a specific device in Settings → *Input device*; raise *Recording
   threshold* if it triggers on noise, lower it if speech is missed
 - The listener retries forever and never permanently disables hands-free;
@@ -279,7 +283,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest test_handsoff.py -q     # 276 tests
+python -m pytest test_handsoff.py -q     # 281 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
