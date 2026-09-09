@@ -173,6 +173,7 @@ DEFAULT_SETTINGS: dict = {
     "calendar_ics": [],        # ICS source(s): https URL(s) and/or .ics file paths
     "wake_spotter": False,     # openWakeWord audio spotter (near-zero CPU wake)
     "mic_selfheal": True,      # auto-restart a wedged mic + spoken explanation
+    "dictation": True,         # 'start dictation' types transcripts, no LLM turn
     "spotter_models": ["hey_jarvis"],   # stock: alexa, hey_jarvis, hey_mycroft, timer, weather
     "followup_seconds": 6.0,   # announce-and-listen: no-wake-word window after a reply
     "briefing": False,         # daily briefing on the first wake word
@@ -220,6 +221,7 @@ def coerce_settings(s: dict) -> dict:
     s["calendar_ics"] = _c[:10]
     s["wake_spotter"] = bool(s.get("wake_spotter", False))
     s["mic_selfheal"] = bool(s.get("mic_selfheal", True))
+    s["dictation"] = bool(s.get("dictation", True))
     _num("followup_seconds", float, 0.0, 120.0)   # 0 = feature off
     _sm = s.get("spotter_models", [])
     s["spotter_models"] = ([str(x).strip() for x in _sm if str(x).strip()]
@@ -3490,6 +3492,8 @@ class Assistant(QObject):
         self._heal_pending_since = None  # monotonic: first degraded sighting
         self._heal_attempts = 0          # restarts for the current degraded streak
         self._heal_last = 0.0            # monotonic: last recovery action (spam guard)
+        self._dictation = False          # voice dictation: transcripts get TYPED,
+                                         # never sent to the brain (session-only)
         self._spotter_wake = False               # last utterance woke via audio spotter
         self._briefing_done_date = ""            # last day the briefing was spoken
         self._last_transcript = ("", 0, 0.0)  # (text, gen, monotonic) per-utterance
@@ -3841,6 +3845,53 @@ class Assistant(QObject):
         except Exception:
             log.exception("utterance health line failed")
 
+    # -- dictation (zero-LLM type-what-I-say) --------------------------------
+
+    _DICTATION_RE = re.compile(
+        r"(?:hey\s+\w+[,\s]+)?"
+        r"(?:(start|begin|stop|end)\s+)?dictation(?:\s+mode)?[.!]?",
+        re.IGNORECASE)
+
+    def _try_dictation(self, text: str, gen: int,
+                       cancel: threading.Event) -> bool:
+        """Dictation fast path, checked before the wake gate so 'start
+        dictation' needs no wake word. Returns True when the utterance was
+        consumed (a toggle command, or transcribed speech to type)."""
+        if not bool(SETTINGS.get("dictation", True)):
+            return False
+        m = self._DICTATION_RE.fullmatch(text.strip())
+        if m:
+            word = (m.group(1) or "").lower()
+            on = ({"start": True, "begin": True, "stop": False,
+                   "end": False}).get(word, not self._dictation)
+            self._set_dictation(on, gen, cancel)
+            return True
+        if not getattr(self, "_dictation", False):   # bare/test instances
+            return False
+        # dictating: type the transcript into the focused window — same code
+        # path the model's type_text tool uses, so the terminal fail-closed
+        # guard and the permission switch apply unchanged
+        self._set(gen, THINKING)
+        out = self._tools.type_text(text)
+        log.info("dictation: typed %d chars (%s...)", len(text), text[:40])
+        if out.startswith("REFUSED"):
+            log.warning("dictation refused: %s", out[:120])
+            self._set_dictation(False, gen, cancel)
+            self._speak("Dictation stopped — I can't type into the focused "
+                        "window.", gen, cancel)
+        else:
+            self._set(gen, IDLE)
+        return True
+
+    def _set_dictation(self, on: bool, gen: int,
+                       cancel: threading.Event) -> None:
+        self._dictation = bool(on)
+        log.info("dictation %s", "on" if on else "off")
+        notify("dictation " + ("on" if on else "off"))
+        self._set(gen, IDLE)
+        self._speak("Dictation on — say stop dictation when done." if on
+                    else "Dictation off.", gen, cancel)
+
     def _pipeline_worker(self) -> None:
         """Single consumer: runs one _pipeline at a time, in utterance order."""
         while True:
@@ -4013,6 +4064,13 @@ class Assistant(QObject):
             self._confirm_handsfree()
         elif action == "handsfree-status":
             self._confirm_handsfree()
+        elif action in ("dictation", "dictation-on", "dictation-off"):
+            on = (True if action == "dictation-on" else
+                  False if action == "dictation-off"
+                  else not self._dictation)
+            self._gen += 1
+            gen, cancel = self._gen, threading.Event()
+            self._set_dictation(on, gen, cancel)
 
     def _confirm_handsfree(self) -> None:
         """Speak a short confirmation after a hands-free toggle, including the
@@ -4146,6 +4204,11 @@ class Assistant(QObject):
                     self._set(gen, IDLE)
                     return
             if cancel.is_set():
+                return
+            # -- dictation fast path (before the wake gate: 'start dictation'
+            #    must work without addressing the assistant; snooze/stop keep
+            #    priority above) -------------------------------------------
+            if self._try_dictation(text, gen, cancel):
                 return
             # -- wake-word gate (hands-free pre-command) -------------------
             if self._spotter_wake:
@@ -4974,7 +5037,8 @@ class BubbleWidget(QWidget):
 
 PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                "handsfree", "handsfree-on", "handsfree-off",
-               "handsfree-status", "status", "health", "settings"}
+               "handsfree-status", "dictation", "dictation-on", "dictation-off",
+               "status", "health", "settings"}
 
 
 class ControlServer:
@@ -5056,6 +5120,9 @@ commands:
   handsfree-on   enable continuous hands-free listening
   settings       open the settings window (works even if the bubble is dead)  handsfree-off  disable continuous hands-free listening
   handsfree-status  speak the hands-free and microphone health state
+  dictation      toggle voice dictation (type what you say, no AI turn)
+  dictation-on   enable voice dictation
+  dictation-off  disable voice dictation
   status         report state, hands-free mode and model
   health         full JSON health: mic, brain (Ollama) and TTS status"""
 

@@ -4359,3 +4359,76 @@ class TestWhitelistWidening:
         for target in ("git push", "git status", "cargo build"):
             out = tb.run_command("niri msg action spawn -- " + target)
             assert out.startswith("REFUSED") and "verb" in out, (target, out)
+
+
+class TestDictationMode:
+    """Zero-LLM dictation: 'start dictation' (no wake word) arms typing;
+    subsequent transcripts are typed into the focused window via the same
+    type_text path the model uses (terminal guard + permission apply)."""
+
+    def _mk(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        a = H.Assistant.__new__(H.Assistant)
+        a._dictation = False
+        a._handsfree = True
+        a._gen = 0
+        a._state = H.IDLE
+        a._tools = types.SimpleNamespace(type_text=lambda t: "ok")
+        a.spoken = []
+        a._speak = lambda text, gen, cancel: a.spoken.append(text)
+        a._set = lambda gen, s: None
+        return a
+
+    def test_toggle_phrases(self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        for phrase, want in [("start dictation", True), ("stop dictation", False),
+                             ("hey assistant, dictation", True),
+                             ("dictation mode", True), ("Dictation!", True)]:
+            a._dictation = not want
+            assert a._try_dictation(phrase, 1, threading.Event()) is True
+            assert a._dictation == want, phrase
+
+    def test_dictated_text_is_typed_not_sent_to_brain(self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        a._try_dictation("start dictation", 1, threading.Event())
+        typed = []
+        a._tools = types.SimpleNamespace(type_text=lambda t: typed.append(t) or "ok")
+        assert a._try_dictation("type this please", 2, threading.Event()) is True
+        assert typed == ["type this please"]
+
+    def test_normal_utterances_pass_through_when_off(self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        assert a._try_dictation("what's the weather in Berlin", 1,
+                                threading.Event()) is False
+        assert a._dictation is False
+
+    def test_setting_off_disables_even_the_toggle(self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        H.SETTINGS["dictation"] = False
+        assert a._try_dictation("start dictation", 1, threading.Event()) is False
+        assert a._dictation is False
+
+    def test_terminal_refusal_stops_dictation_and_explains(self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        a._dictation = True
+        a._tools = types.SimpleNamespace(
+            type_text=lambda t: "REFUSED: the focused window is a terminal (kitty)")
+        assert a._try_dictation("secret commands", 1, threading.Event()) is True
+        assert a._dictation is False
+        assert any("Dictation stopped" in s for s in a.spoken)
+
+    def test_socket_actions_exist(self, H):
+        assert {"dictation", "dictation-on", "dictation-off"} <= H.PTT_ACTIONS
+        usage = H.__dict__.get("USAGE", "") or inspect.getsource(H)[
+            H.__dict__.get("_usage_start", 0):]
+        src = inspect.getsource(H)
+        assert "dictation-on   enable voice dictation" in src
+
+    def test_setting_and_checkbox_wiring(self, H):
+        assert H.DEFAULT_SETTINGS["dictation"] is True
+        D = H.DEFAULT_SETTINGS
+        assert H.coerce_settings({**D, "dictation": 0})["dictation"] is False
+        assert H.coerce_settings(dict(D))["dictation"] is True
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        assert 'self.cfg["dictation"] = self.dictation_chk.isChecked()' in src
+        assert 'Mod+Shift+D' in src and '"dictation"' in src

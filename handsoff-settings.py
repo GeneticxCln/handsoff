@@ -1019,6 +1019,15 @@ class SettingsWindow(QMainWindow):
             "announce it out loud. Gives up after 3 tries (keeps logging until "
             "the mic recovers, then re-arms).")
         wake_form.addRow(self.selfheal_chk)
+        self.dictation_chk = QCheckBox(
+            "Voice dictation — 'start dictation' types what you say into the "
+            "focused window (no AI turn); Mod+Shift+D toggles", w)
+        self.dictation_chk.setToolTip(
+            "Zero-cost dictation: transcripts are typed into whatever window is "
+            "focused, exactly like the model's own typing tool — terminals are "
+            "refused fail-closed. Toggle by voice ('start dictation' / 'stop "
+            "dictation', no wake word needed) or the Mod+Shift+D keybind.")
+        wake_form.addRow(self.dictation_chk)
         hfl.addLayout(wake_form)
         lay.addWidget(hf_group)
 
@@ -1470,6 +1479,8 @@ class SettingsWindow(QMainWindow):
                 f'    Mod+Shift+H repeat=false {{ spawn "python" "{exe}" "--ptt" "handsfree"; }}\n'
                 "// ask the assistant to speak its hands-free / mic health state\n"
                 f'    Mod+Shift+J repeat=false {{ spawn "python" "{exe}" "--ptt" "handsfree-status"; }}\n'
+                f'    // voice dictation: what you say is TYPED into the focused window (no AI turn)\n'
+                f'    Mod+Shift+D repeat=false {{ spawn "python" "{exe}" "--ptt" "dictation"; }}\n'
                 "// open the settings window (works even when the bubble is dead)\n"
                 f'    Mod+Shift+S repeat=false {{ spawn "python" "{exe}" "--ptt" "settings"; }}\n',
                 encoding="utf-8",
@@ -1569,6 +1580,7 @@ class SettingsWindow(QMainWindow):
         self.spotter_chk.setChecked(bool(self.cfg.get("wake_spotter", False)))
         self.spotter_edit.setText(", ".join(self.cfg.get("spotter_models") or []))
         self.selfheal_chk.setChecked(bool(self.cfg.get("mic_selfheal", True)))
+        self.dictation_chk.setChecked(bool(self.cfg.get("dictation", True)))
         self.brief_chk.setChecked(bool(self.cfg.get("briefing", False)))
         aliases = self.cfg.get("workspace_aliases") or {}
         self.alias_edit.setPlainText(
@@ -1605,6 +1617,7 @@ class SettingsWindow(QMainWindow):
         self.cfg["spotter_models"] = [
             x.strip() for x in self.spotter_edit.text().split(",") if x.strip()]
         self.cfg["mic_selfheal"] = self.selfheal_chk.isChecked()
+        self.cfg["dictation"] = self.dictation_chk.isChecked()
         alias_map = {}
         for line in self.alias_edit.toPlainText().splitlines():
             if "=" not in line and ":" not in line:
