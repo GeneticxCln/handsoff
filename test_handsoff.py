@@ -3999,7 +3999,7 @@ class TestSettingsHealthBar:
         assert "_health_timer.stop()" in ce
         # the fetch must run off the GUI thread (run_bg), not inline
         rf = src[src.index("def _refresh_health"):
-                 src.index("def _refresh_health") + 900]
+                 src.index("def closeEvent")]
         assert "self.run_bg(fetch, done)" in rf
 
 
@@ -4235,3 +4235,38 @@ class TestUtteranceHealth:
     def test_heard_line_carries_gen(self, H):
         src = inspect.getsource(H.Assistant._pipeline)
         assert 'log.info("heard (gen=%d): %s", gen, text)' in src
+
+
+class TestHealthTooltip:
+    """The health bar's hover tooltip: the full health JSON as escaped
+    <pre> text, or a start-the-service hint when the bubble is unreachable."""
+
+    def _mod(self):
+        return _load("handsoff_settings_tip", HERE / "handsoff-settings.py")
+
+    def test_tooltip_shows_escaped_json(self):
+        mod = self._mod()
+        tip = mod._health_tooltip({
+            "mic": {"state": "listening", "device": 'Weird "Name" <x> & y'},
+            "brain": {"reachable": True, "model": "m"}})
+        assert tip.startswith("<pre>") and tip.endswith("</pre>")
+        assert "&quot;mic&quot;" in tip and "&quot;listening&quot;" in tip
+        # every HTML-significant character must be escaped, incl. in values
+        assert "&lt;x&gt;" in tip and "y" in tip
+        assert "<x>" not in tip and '"Name"' not in tip
+
+    def test_tooltip_dead_bubble_hint(self):
+        mod = self._mod()
+        tip = mod._health_tooltip(None)
+        assert "systemctl --user start handsoff.service" in tip
+        assert "<pre>" not in tip
+        # garbage payloads degrade to the hint, never raise
+        assert "systemctl" in mod._health_tooltip("junk")
+        assert "systemctl" in mod._health_tooltip(42)
+
+    def test_refresh_wires_the_tooltip(self):
+        mod = self._mod()
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        rf = src[src.index("def _refresh_health"):
+                 src.index("def _refresh_health") + 900]
+        assert "self.health_label.setToolTip(_health_tooltip(result))" in rf

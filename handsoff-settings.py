@@ -19,6 +19,7 @@ Add `--selftest` to run a headless smoke test (no window is shown).
 from __future__ import annotations
 
 import importlib.util
+import html
 import json
 import math
 import os
@@ -625,6 +626,17 @@ def _fmt_health(snap: dict) -> str:
     return f"{mic_txt} · {brain_txt} · {tts_txt}"
 
 
+def _health_tooltip(snap: dict | None) -> str:
+    """Full health JSON for the status bar's hover tooltip — every field the
+    bubble knows, one mouse-over away. Escaped so device names containing
+    angle brackets or ampersands render instead of vanishing."""
+    if not isinstance(snap, dict):
+        return ("The bubble is not running (or is still starting).\n"
+                "Start it with:  systemctl --user start handsoff.service")
+    body = json.dumps(snap, indent=2, sort_keys=True, ensure_ascii=False)
+    return ("<pre>" + html.escape(body) + "</pre>")
+
+
 class SettingsWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -706,6 +718,7 @@ class SettingsWindow(QMainWindow):
             return _health_query(H.CONTROL_SOCK)
 
         def done(ok, result):
+            self.health_label.setToolTip(_health_tooltip(result))
             if ok and result is not None:
                 self.health_label.setText(_fmt_health(result))
                 degraded = ((result.get("mic") or {}).get("state")
