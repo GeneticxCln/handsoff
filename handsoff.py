@@ -3770,12 +3770,37 @@ class Assistant(QObject):
         self._set(gen, THINKING)
         # zero-LLM stop: probe the transcript in parallel; if it is a bare
         # stop command the queued turn is drained before the brain ever runs
+        self._log_utterance_health()
         self._maybe_instant_stop(audio, gen)
         # hand off to the single pipeline worker: two overlapping pipelines
         # would race the shared history, _stream_result and tool belt (the old
         # thread-per-utterance design let an interrupted-but-still-running
         # turn write history concurrently with the new one)
         self._pipeline_q.put((audio, gen, cancel))
+
+    def _log_utterance_health(self) -> None:
+        """One compact journal line per accepted utterance so a post-mortem
+        can correlate a command (gen) with the mic's condition at that exact
+        moment — the answer to "I said X and it ignored me, was the mic
+        already broken?". Never raises into the submit path."""
+        try:
+            ln = self._listener
+            with ln._lock:
+                state = ln._health_state_now_locked()
+                device = (ln._health_open_device
+                          or (str(SETTINGS["mic_device"])
+                              if SETTINGS["mic_device"] else "system default"))
+                rate = getattr(ln, "_capture_rate", None) or "-"
+                frames = ln._frames_seen
+                opens_failed = ln._health_opens_failed
+            log.info(
+                "utterance health: gen=%d src=%s mic=%s device=%s rate=%s "
+                "frames=%d opens_failed=%d heal=%d",
+                self._gen, "handsfree" if self._handsfree else "ptt",
+                state, device, rate, frames, opens_failed,
+                self._heal_attempts)
+        except Exception:
+            log.exception("utterance health line failed")
 
     def _pipeline_worker(self) -> None:
         """Single consumer: runs one _pipeline at a time, in utterance order."""
@@ -4055,7 +4080,7 @@ class Assistant(QObject):
                 text = cached
             else:
                 text = transcribe(audio)
-            log.info("heard: %s", text)
+            log.info("heard (gen=%d): %s", gen, text)
             # -- voice stop: a bare stop command must NEVER reach the brain
             #    (the interrupt already silenced playback; the brain would
             #    think for seconds and then speak again). Check BEFORE snooze:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import inspect
 import threading
 import io
 import json
@@ -4162,3 +4163,75 @@ class TestMicSelfHeal:
         assert ('self.selfheal_chk.setChecked(bool(self.cfg.get('
                 '"mic_selfheal", True)))') in src
         assert 'self.cfg["mic_selfheal"] = self.selfheal_chk.isChecked()' in src
+
+
+class TestUtteranceHealth:
+    """One compact journal line per accepted utterance ('utterance health:')
+    so post-mortems can correlate a command's turn (gen) with the mic state
+    at that exact moment, and 'heard (gen=N):' ties the transcript back."""
+
+    def _mk_assistant(self, H, handsfree=True, heal=0):
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 7
+        a._handsfree = handsfree
+        a._heal_attempts = heal
+        a._listener = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln = a._listener
+        ln._running = True
+        ln._frames_seen = 1234
+        ln._last_nonzero = time.monotonic()
+        ln._health_failing_since = None
+        ln._health_open_device = "hw:TestMic"
+        ln._health_opens_failed = 2
+        ln._health_utt = 0
+        ln._capture_rate = 16000
+        ln._health_state = ""
+        ln._ever_started = True
+        ln._lock = threading.RLock()
+        ln._assistant = a
+        return a
+
+    def test_line_fields(self, H, caplog):
+        a = self._mk_assistant(H)
+        with caplog.at_level("INFO", logger="handsoff"):
+            a._log_utterance_health()
+        line = " ".join(r.getMessage() for r in caplog.records)
+        assert "utterance health: gen=7" in line
+        assert "src=handsfree" in line and "mic=listening" in line
+        assert "device=hw:TestMic" in line and "rate=16000" in line
+        assert "frames=1234" in line and "opens_failed=2" in line
+        assert "heal=0" in line
+
+    def test_degraded_state_shows_through(self, H, caplog):
+        a = self._mk_assistant(H)
+        a._listener._health_failing_since = time.monotonic() - 10
+        with caplog.at_level("INFO", logger="handsoff"):
+            a._log_utterance_health()
+        assert "mic=open-failing" in " ".join(r.getMessage() for r in caplog.records)
+
+    def test_ptt_source_label(self, H, caplog):
+        a = self._mk_assistant(H, handsfree=False)
+        with caplog.at_level("INFO", logger="handsoff"):
+            a._log_utterance_health()
+        assert "src=ptt" in " ".join(r.getMessage() for r in caplog.records)
+
+    def test_never_raises_into_the_submit_path(self, H, caplog):
+        a = self._mk_assistant(H)
+        a._listener = None                       # worst case: broken listener
+        with caplog.at_level("INFO", logger="handsoff"):
+            a._log_utterance_health()            # must not raise
+        assert any("utterance health line failed" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_submit_audio_hook_order(self, H):
+        """The line fires after the discard check and before the stop probe —
+        every accepted utterance gets exactly one health line."""
+        src = inspect.getsource(H.Assistant.submit_audio)
+        assert "self._log_utterance_health()" in src
+        assert src.index('"discarding too-short/quiet capture"')
+        assert src.index("self._log_utterance_health()") \
+            < src.index("self._maybe_instant_stop")
+
+    def test_heard_line_carries_gen(self, H):
+        src = inspect.getsource(H.Assistant._pipeline)
+        assert 'log.info("heard (gen=%d): %s", gen, text)' in src

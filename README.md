@@ -29,7 +29,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All 29 tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 281 tests pin the behavior (`python -m pytest test_handsoff.py`).
+automatically. 295 tests pin the behavior (`python -m pytest test_handsoff.py`).
 
 ## Requirements
 
@@ -288,7 +288,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest test_handsoff.py -q     # 281 tests
+python -m pytest test_handsoff.py -q     # 295 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
