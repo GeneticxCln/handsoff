@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -3999,3 +4000,165 @@ class TestSettingsHealthBar:
         rf = src[src.index("def _refresh_health"):
                  src.index("def _refresh_health") + 900]
         assert "self.run_bg(fetch, done)" in rf
+
+
+class TestMicSelfHeal:
+    """Self-healing mic: a capture that stays degraded (silent / open-failing)
+    while hands-free is on gets its stream restarted automatically after a
+    grace period, with a spoken explanation — and gives up after 3 tries,
+    journaling only until the mic recovers (which re-arms it)."""
+
+    def _mk_listener(self, H):
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._running = False
+        ln._run_id = 0
+        ln._thread = None
+        ln._frames_seen = 0
+        ln._last_nonzero = 0.0
+        ln._health_failing_since = None
+        ln._lock = threading.RLock()
+        ln._discard = False
+        ln._suspended = False
+        ln.gate_open = False
+        ln._spotter = None
+        ln._assistant = types.SimpleNamespace(
+            _maybe_self_heal=lambda degraded: None)
+        return ln
+
+    def _mk_assistant(self, H):
+        """A real Assistant policy object without Qt/loader side effects:
+        bind the class methods onto a bare instance."""
+        a = H.Assistant.__new__(H.Assistant)
+        a._heal_pending_since = None
+        a._heal_attempts = 0
+        a._heal_last = 0.0
+        a._handsfree = True
+        a._state = H.IDLE
+        ln = self._mk_listener(H)
+        ln.SELFHEAL_GRACE_S = H.ContinuousListener.SELFHEAL_GRACE_S
+        ln.SELFHEAL_MAX = H.ContinuousListener.SELFHEAL_MAX
+        a._listener = ln
+        return a
+
+    def test_speaking_does_not_look_silent(self, H):
+        """Regression: while the assistant SPEAKS, frames are dropped before
+        the digital-silence check — the silence clock must stay warm, or a
+        healthy mic misclassifies as 'silent' and self-heal restarts it
+        mid-reply."""
+        import numpy as np
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._frames_seen = 1000
+        ln._last_nonzero = time.monotonic() - H.ContinuousListener.MIC_SILENT_REPORT_S - 5
+        ln._assistant = types.SimpleNamespace(state="speaking",
+                                              _vad_speech=lambda active: None)
+        with ln._lock:
+            before = ln._last_nonzero
+            ln._process_frame(np.zeros((1024, 1), dtype=np.int16), None,
+                              [], 10**9, 1)
+            assert ln._last_nonzero > before      # clock kept warm
+            assert ln._health_state_now_locked() == "listening"
+
+    def test_grace_period_then_restart_and_speak(self, H, monkeypatch):
+        a = self._mk_assistant(H)
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        calls, spoken = [], []
+        monkeypatch.setattr(a._listener, "restart",
+                            lambda: calls.append("restart"))
+        monkeypatch.setattr(H.Assistant, "_say_now",
+                            lambda self, text: spoken.append(text))
+        # tick 1: first sighting — arm the grace clock only
+        a._maybe_self_heal(True)
+        assert a._heal_pending_since is not None and not calls
+        # pretend the grace period has fully elapsed
+        a._heal_pending_since -= H.ContinuousListener.SELFHEAL_GRACE_S + 1.0
+        a._maybe_self_heal(True)
+        assert calls == ["restart"]
+        assert a._heal_attempts == 1
+        assert a._heal_pending_since is None          # clock restarts
+        assert spoken and "microphone" in spoken[0].lower()
+
+    def test_disabled_or_ptt_never_heals(self, H, monkeypatch):
+        a = self._mk_assistant(H)
+        settings = {**H.DEFAULT_SETTINGS, "mic_selfheal": False}
+        monkeypatch.setattr(H, "SETTINGS", settings)
+        calls = []
+        monkeypatch.setattr(a._listener, "restart",
+                            lambda: calls.append("restart"))
+        monkeypatch.setattr(H.Assistant, "_say_now", lambda self, text: None)
+        a._maybe_self_heal(True)
+        # disabled: not even the grace clock may arm
+        assert a._heal_pending_since is None and a._heal_attempts == 0
+        # same with the setting on but hands-free off (push-to-talk session)
+        settings["mic_selfheal"] = True
+        a._handsfree = False
+        a._maybe_self_heal(True)
+        assert a._heal_pending_since is None
+        a._heal_pending_since = time.monotonic() - 999.0   # forced past grace
+        a._maybe_self_heal(True)
+        assert not calls and a._heal_attempts == 0
+
+    def test_speaking_defers_the_restart(self, H, monkeypatch):
+        a = self._mk_assistant(H)
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        calls = []
+        monkeypatch.setattr(a._listener, "restart",
+                            lambda: calls.append("restart"))
+        monkeypatch.setattr(H.Assistant, "_say_now", lambda self, text: None)
+        a._maybe_self_heal(True)
+        a._heal_pending_since -= 999.0
+        a._state = H.SPEAKING                         # mid-reply
+        a._maybe_self_heal(True)
+        assert not calls
+        a._state = H.IDLE                             # reply finished
+        a._maybe_self_heal(True)
+        assert calls == ["restart"]
+
+    def test_gives_up_after_max_then_rearms_on_recovery(self, H, monkeypatch):
+        a = self._mk_assistant(H)
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        calls = []
+        monkeypatch.setattr(a._listener, "restart",
+                            lambda: calls.append("restart"))
+        monkeypatch.setattr(H.Assistant, "_say_now", lambda self, text: None)
+        a._heal_attempts = H.ContinuousListener.SELFHEAL_MAX
+        a._maybe_self_heal(True)
+        a._heal_pending_since -= 999.0
+        a._maybe_self_heal(True)
+        assert not calls                              # stayed degraded: journal only
+        a._maybe_self_heal(False)                     # mic recovered
+        assert a._heal_attempts == 0 and a._heal_pending_since is None
+        a._maybe_self_heal(True)                      # fresh streak: armed again
+        a._heal_pending_since -= 999.0
+        a._maybe_self_heal(True)
+        assert calls == ["restart"]                   # re-armed
+
+    def test_restart_rebuilds_capture_thread(self, H):
+        ln = self._mk_listener(H)
+        ln._running = True
+        monkey_run = types.SimpleNamespace()          # _run must not really run
+        orig_run = H.ContinuousListener._run
+        H.ContinuousListener._run = lambda self, rid: None
+        try:
+            ln.restart()
+            assert ln._run_id == 1 and ln._thread is not None
+            ln._thread.join(timeout=2.0)
+            assert not ln._thread.is_alive()
+        finally:
+            H.ContinuousListener._run = orig_run
+
+    def test_setting_default_and_coercion(self, H):
+        assert H.DEFAULT_SETTINGS["mic_selfheal"] is True   # on by default
+        D = H.DEFAULT_SETTINGS
+        assert H.coerce_settings(dict(D))["mic_selfheal"] is True
+        assert H.coerce_settings({**D, "mic_selfheal": 1})["mic_selfheal"] is True
+        assert H.coerce_settings({**D, "mic_selfheal": ""})["mic_selfheal"] is False
+        assert H.coerce_settings({**D, "mic_selfheal": "yes"})["mic_selfheal"] is True
+
+    def test_settings_checkbox_wiring(self, H):
+        """The Voice-tab checkbox exists and is loaded from / saved to cfg."""
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        assert 'QCheckBox(\n            "Auto-recover the microphone' in src
+        assert ('self.selfheal_chk.setChecked(bool(self.cfg.get('
+                '"mic_selfheal", True)))') in src
+        assert 'self.cfg["mic_selfheal"] = self.selfheal_chk.isChecked()' in src

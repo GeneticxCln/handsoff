@@ -172,6 +172,7 @@ DEFAULT_SETTINGS: dict = {
     "home_place": "",          # weather without naming a place; powers the briefing
     "calendar_ics": [],        # ICS source(s): https URL(s) and/or .ics file paths
     "wake_spotter": False,     # openWakeWord audio spotter (near-zero CPU wake)
+    "mic_selfheal": True,      # auto-restart a wedged mic + spoken explanation
     "spotter_models": ["hey_jarvis"],   # stock: alexa, hey_jarvis, hey_mycroft, timer, weather
     "followup_seconds": 6.0,   # announce-and-listen: no-wake-word window after a reply
     "briefing": False,         # daily briefing on the first wake word
@@ -218,6 +219,7 @@ def coerce_settings(s: dict) -> dict:
         _c = []
     s["calendar_ics"] = _c[:10]
     s["wake_spotter"] = bool(s.get("wake_spotter", False))
+    s["mic_selfheal"] = bool(s.get("mic_selfheal", True))
     _num("followup_seconds", float, 0.0, 120.0)   # 0 = feature off
     _sm = s.get("spotter_models", [])
     s["spotter_models"] = ([str(x).strip() for x in _sm if str(x).strip()]
@@ -3028,6 +3030,8 @@ class ContinuousListener:
     REOPEN_S = 3.0                    # no frames at all → stream is dead
     SILENT_REOPEN_S = 45.0            # frames flowing but all zeros → wedged device
     MIC_SILENT_REPORT_S = 20.0        # report 'silent' BEFORE the 45s reopen resets the clock
+    SELFHEAL_GRACE_S = 60.0           # degraded this long → restart the capture stream
+    SELFHEAL_MAX = 3                  # restarts per streak before journal-only
 
     def __init__(self, assistant: "Assistant") -> None:
         self._assistant = assistant
@@ -3117,6 +3121,11 @@ class ContinuousListener:
             state = self._health_state_now_locked()
             stalled = (self._health_stalled_since is not None
                        and state == "listening")
+            degraded = state in ("silent", "open-failing")
+            try:
+                self._assistant._maybe_self_heal(degraded)   # assistant-level policy
+            except Exception:
+                log.exception("mic self-heal check failed")
             # --- transition detection ---------------------------------
             changed = state != self._health_state
             last = self._health_state
@@ -3183,6 +3192,24 @@ class ContinuousListener:
     def resume(self) -> None:
         self._suspended = False
 
+    def restart(self) -> None:
+        """Tear down the capture stream and reopen it from scratch — the
+        recovery of last resort for a wedged device the watchdog reopen
+        cannot fix (dead engine state, wedged resampler, vanished source).
+        The old capture thread closes its own stream when it sees the new
+        run_id, so joining it is safe."""
+        if not self._running:
+            return
+        self._run_id += 1
+        old = self._thread
+        self._thread = threading.Thread(target=self._run,
+                                        args=(self._run_id,), name="handsfree",
+                                        daemon=True)
+        self._thread.start()
+        if old is not None:
+            old.join(timeout=2.0)         # old thread closes its own stream
+        log.warning("mic self-heal: capture stream restarted")
+
     def reset(self) -> None:
         self._discard = True
         if self._spotter is not None:
@@ -3208,6 +3235,10 @@ class ContinuousListener:
                 gate.reset()
                 self.gate_open = False
                 frames.clear()
+            # the device is clearly alive (frames arrive); keep the silence
+            # clock warm so TTS playback / PTT holds can't misclassify the
+            # mic as 'silent' and trigger self-heal on a healthy device
+            self._last_nonzero = time.monotonic()
             return
         rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
         if rms > 0.5:  # anything above exact digital silence proves the device feeds data
@@ -3416,6 +3447,10 @@ class Assistant(QObject):
         self._empty_streak = 0                   # consecutive empty transcriptions
         self._wake_until = 0.0                   # monotonic: engagement window expiry
         self._followup_until = 0.0               # monotonic: no-wake-word window after a reply
+        # -- mic self-heal (auto-recovery from a wedged capture) -------------
+        self._heal_pending_since = None  # monotonic: first degraded sighting
+        self._heal_attempts = 0          # restarts for the current degraded streak
+        self._heal_last = 0.0            # monotonic: last recovery action (spam guard)
         self._spotter_wake = False               # last utterance woke via audio spotter
         self._briefing_done_date = ""            # last day the briefing was spoken
         self._last_transcript = ("", 0, 0.0)  # (text, gen, monotonic) per-utterance
@@ -3448,6 +3483,55 @@ class Assistant(QObject):
             "whisper_ready": _whisper_model is not None,
         }
         return snap
+
+    # -- mic self-heal -------------------------------------------------------
+
+    def _say_now(self, text: str) -> None:
+        """Standalone announcement: speak text outside any turn pipeline."""
+        self._gen += 1
+        gen, cancel = self._gen, threading.Event()   # fresh: _cancel may be set
+        threading.Thread(
+            target=lambda: (self._speak(text, gen, cancel), self._set(gen, IDLE)),
+            name="selfheal-tts", daemon=True,
+        ).start()
+
+    def _maybe_self_heal(self, degraded: bool) -> None:
+        """Auto-recovery policy, called from the listener's health tick (its
+        own thread): after a grace period of continuous degradation while
+        hands-free is on, restart the capture stream (fixes wedged PortAudio
+        engine state the watchdog reopen can't) and say why; after
+        SELFHEAL_MAX tries, keep journaling only until the mic is healthy
+        again, which re-arms it."""
+        if not degraded:
+            self._heal_pending_since = None
+            self._heal_attempts = 0
+            return
+        if not (self._handsfree and bool(SETTINGS.get("mic_selfheal", True))):
+            return
+        now = time.monotonic()
+        if self._heal_pending_since is None:
+            self._heal_pending_since = now
+            return
+        if now - self._heal_pending_since < self._listener.SELFHEAL_GRACE_S:
+            return
+        if self.state == SPEAKING or now - self._heal_last < 15.0:
+            return                      # never talk over a reply; rate-limit
+        if self._heal_attempts >= self._listener.SELFHEAL_MAX:
+            return                      # stayed degraded: journal lines only
+        self._heal_attempts += 1
+        self._heal_last = now
+        self._heal_pending_since = None
+        log.warning("mic self-heal: degraded for %.0fs, restarting capture "
+                    "(attempt %d/%d)", self._listener.SELFHEAL_GRACE_S,
+                    self._heal_attempts, self._listener.SELFHEAL_MAX)
+        self._listener.restart()
+        self._say_now("I'm having microphone trouble — restarting my "
+                      "listening engine.")
+
+    def _mic_selfheal_rearm(self) -> None:
+        """Called on hands-free toggles: a fresh stream is a clean slate."""
+        self._heal_pending_since = None
+        self._heal_attempts = 0
 
     # -- reminders --------------------------------------------------------------
 
@@ -3825,6 +3909,7 @@ class Assistant(QObject):
         else:
             self._listener.stop()
             self._set(self._gen, IDLE)
+        self._mic_selfheal_rearm()   # a fresh stream is a clean slate
         log.info("hands-free %s", "enabled" if on else "disabled")
         notify(f"hands-free {'enabled' if on else 'disabled'}")
 

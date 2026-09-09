@@ -997,6 +997,15 @@ class SettingsWindow(QMainWindow):
             "empty = all stock models, or e.g. hey jarvis, timer")
         self.spotter_edit.setMaximumWidth(220)
         wake_form.addRow("Spotter keywords", self.spotter_edit)
+        self.selfheal_chk = QCheckBox(
+            "Auto-recover the microphone — restart the audio stream and say so "
+            "when it stays broken", w)
+        self.selfheal_chk.setToolTip(
+            "If the microphone stays silent or unusable for over a minute while "
+            "hands-free is on, restart the capture stream automatically and "
+            "announce it out loud. Gives up after 3 tries (keeps logging until "
+            "the mic recovers, then re-arms).")
+        wake_form.addRow(self.selfheal_chk)
         hfl.addLayout(wake_form)
         lay.addWidget(hf_group)
 
@@ -1546,6 +1555,7 @@ class SettingsWindow(QMainWindow):
         self.cal_edit.setText(", ".join(self.cfg.get("calendar_ics") or []))
         self.spotter_chk.setChecked(bool(self.cfg.get("wake_spotter", False)))
         self.spotter_edit.setText(", ".join(self.cfg.get("spotter_models") or []))
+        self.selfheal_chk.setChecked(bool(self.cfg.get("mic_selfheal", True)))
         self.brief_chk.setChecked(bool(self.cfg.get("briefing", False)))
         aliases = self.cfg.get("workspace_aliases") or {}
         self.alias_edit.setPlainText(
@@ -1581,6 +1591,7 @@ class SettingsWindow(QMainWindow):
         self.cfg["wake_spotter"] = self.spotter_chk.isChecked()
         self.cfg["spotter_models"] = [
             x.strip() for x in self.spotter_edit.text().split(",") if x.strip()]
+        self.cfg["mic_selfheal"] = self.selfheal_chk.isChecked()
         alias_map = {}
         for line in self.alias_edit.toPlainText().splitlines():
             if "=" not in line and ":" not in line:

@@ -224,6 +224,11 @@ instead of starting by hand; it waits for the lock.
   mic problems turn it orange.
 - Pick a specific device in Settings → *Input device*; raise *Recording
   threshold* if it triggers on noise, lower it if speech is missed
+- **Auto-recover** (Settings → Voice, on by default): if the mic stays
+  silent or unusable for over a minute while hands-free is on, the bubble
+  restarts its capture stream automatically and *says so out loud*; after
+  3 failed attempts it keeps journaling until the mic recovers, then
+  re-arms. Toggle it off with *Auto-recover the microphone*.
 - The listener retries forever and never permanently disables hands-free;
   if PortAudio wedges in-process, restarting the service reinitializes it
 - `journalctl --user -u handsoff.service | grep "mic health"` shows a health
