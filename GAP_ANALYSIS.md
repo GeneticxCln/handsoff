@@ -113,7 +113,7 @@ new tests in `tests/test_hardening.py`; total 429):
 ## Addendum — 2026-09-08 external audit closure
 
 Every priority finding and most "remaining gaps" from the external audit are
-now closed (350 tests green):
+now closed (455 tests green):
 
 - Command whitelist bypass via absolute `niri` paths — closed (basename-keyed
   spawn checks; `TestSpawnInterpreterBoundary` extended).
@@ -157,7 +157,7 @@ Notify argument layouts.
 - Ops: niri window rule (round bubble), autostart, keybinds Mod+V / Mod+Shift+V
   / Mod+Shift+H / Mod+Shift+S (settings, works even when the bubble is dead),
   restart script with lock race fixed, faulthandler crash log
-- 350 tests, all green
+- 455 tests, all green
 - Ambient automation: opt-in notification reader, Pomodoro transitions, RAM/VRAM
   threshold crossings, and bounded file/process watchers; all have Settings
   controls or safe tool gates
@@ -215,3 +215,49 @@ Notify argument layouts.
 16. Optional wake word ("hey bubble") to complement hands-free VAD.
 17. Multi-utterance conversations while speaking (queue follow-up questions
     instead of barge-in-only).
+
+## Addendum — 2026-09-09 second full-project audit (concurrent-hardening review)
+
+Scope: independent review of the hardening change set landed concurrently with the
+workspace-index work (settings locking + reload, `run_command` rework,
+`_quarantine_bad`, spawn hardening, installer changes, CI/pre-commit, docs). Audited
+at the settled state; gates re-run on that exact tree.
+
+**Gates:** `py_compile` + `bash -n` clean; **455 tests green**; runtime tool census
+**46, unchanged** (grep over `@tool` over-counts because of the docstring example);
+doctor functional. The README "440+ tests" bump is accurate.
+
+Findings, ranked:
+
+1. **Deployment drift (live, fix before sign-off):** the installed `~/.local/bin`
+   copy predates the combined tree; `--ptt doctor` correctly reports
+   `installed-drift` — the trust feature doing its job, but the deployed code is
+   behind the tested source. → Re-run `./install.sh` once this change set commits.
+2. **Installer default `-Syu` → `-Sy`:** flagged on first read as a silent
+   partial-upgrade regression; on inspection it is a *documented* default
+   (`-Sy` for fast installs, `HANDSOFF_FULL_UPGRADE=1` selects supported `-Syu`)
+   and `test_pacman_python_targets_probed_individually` still pins `-Syu` behind
+   the flag. Accepted consciously — but `-Sy` + `-u`-less installs can leave the
+   system on a partial upgrade; the note in install.sh documents this.
+3. **README hotkey fix verified against the machine:** the live niri config binds
+   `Mod+Shift+H` for hands-free (`Mod+H` is niri's own `focus-column-left`), so the
+   old doc line was actively wrong. Docs now match config.
+4. **Spawn hardening is thorough:** interpreter/terminal-argument bypass routes,
+   absolute-path `niri` lookalikes (basename-keyed checks), and blocked basenames
+   inside arguments are all closed; boundary tests extended accordingly.
+5. **Policy layer survives the rework:** the P1 ALLOW/DENY/CONFIRM
+   `DecisionPolicy`, dry-run reporting, one-turn confirmations, and the
+   id/tool/target/decision/result decision log are all intact after the
+   `run_command`/jobs rewrite.
+6. **Infra fixes real and pinned:** restart script exact-pid wait, curl timeouts in
+   calendar/web fetch paths, `pytest.ini` `testpaths`, installed scripts deployed
+   executable (fixes a real PermissionError), CI rehearse job kept.
+7. **Hygiene:** no secret-shaped strings in the diff (grep hits are concurrency
+   tokens and token-budget state); earlier installer fixes (per-package python
+   probes, restart-if-active) survived the rework; stale "400+ tests" doc counts
+   updated.
+
+Accepted consciously / out of scope here: Settings health-bar pixel verification on
+the dual-monitor setup (data-level verified in `ACCEPTANCE.md`), and the six
+human-only acceptance items. Process note: files churned mid-audit while the other
+agent worked; all findings above were confirmed against the settled tree.

@@ -32,7 +32,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 400+ tests pin the behavior (`python -m pytest tests/`),
+automatically. 440+ tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
 regression, and ops.
 
@@ -102,7 +102,7 @@ in VRAM between questions).
 |---|---|
 | `Mod+V` | talk toggle: start recording / send / interrupt |
 | `Mod+Shift+V` | interrupt immediately (stop talking/thinking) |
-| `Mod+H` | toggle hands-free listening |
+| `Mod+Shift+H` | toggle hands-free listening |
 | `Mod+Shift+S` | open Settings (add manually; works even if the bubble is dead) |
 
 ### Voice
@@ -297,7 +297,7 @@ instead of starting by hand; it waits for the lock.
 
 **Hands-free doesn't react**
 
-- `--ptt status` shows `handsfree=on/off` — toggle with `Mod+H` or the socket
+- `--ptt status` shows `handsfree=on/off` — toggle with `Mod+Shift+H` or the socket
 - The wake gate needs the assistant's name; the audio spotter (if enabled)
   wakes on its stock keywords instead ("hey jarvis"…)
 - Saying "stop" while it speaks intentionally produces no reply
@@ -332,7 +332,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest tests/ -q     # 400+ tests
+python -m pytest tests/ -q     # 440+ tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```

@@ -5,11 +5,10 @@ on:
   pull_request:
 
 jobs:
-  # The full test suite. Dependencies are deliberately minimal: numpy, pytest,
-  # PySide6 and sounddevice are the suite's hard imports — whisper/piper/
-  # openwakeword are lazy-imported and every test that touches them
-  # monkeypatches the call, so they are not installed here (verified: the
-  # suite passes 350/350 in a clean venv with only these four).
+  # The full test suite. Single source of truth: requirements.txt (pinned
+  # floors: numpy<3, PySide6<7). Whisper/piper/openwakeword are lazy-imported
+  # and every test that touches them monkeypatches the call, so installing
+  # the full manifest only costs time, never new failures.
   tests:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -28,9 +27,30 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pytest PySide6 sounddevice
+          pip install -r requirements.txt
       - name: Run the test suite
         run: python -m pytest tests/ -q
+
+  # Coverage floor: TOTAL must stay >= 60% (the suite measures ~75%).
+  # Local `pytest` stays plugin-free; only this job installs pytest-cov.
+  # Omit list + floor live in .coveragerc (tests/ and attic/ excluded).
+  coverage:
+    name: Coverage floor (>= 60%)
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies + pytest-cov
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest-cov
+      - name: pytest with coverage gate
+        run: python -m pytest tests/ -q --cov=. --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=60
 
   # Byte-compile every shipped Python source. py_compile never imports, so no
   # dependencies are needed and syntax rot in any file fails the build.

@@ -44,7 +44,7 @@ if [ "${1:-}" = "--uninstall" ]; then
     # kill only real bubble processes: python executable + EXACT cmdline match.
     # A bare `pkill -f handsoff.py` would kill bystanders whose cmdline merely
     # mentions the path (an editor with the file open, a running pytest run).
-    for pid in $(pgrep -f 'handsoff\.py' 2>/dev/null); do
+    for pid in $(pgrep -f 'handsoff\.py' 2>/dev/null || true); do
         exe="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
         case "$(basename "$exe")" in
             python|python3|python[0-9].*) ;;
@@ -68,9 +68,14 @@ if [ "${1:-}" = "--uninstall" ]; then
 fi
 
 echo "==> [1/8] System packages (pacman)"
-# -Sy alone would create an unsupported partial-upgrade state on Arch:
-# refresh the DB AND upgrade the system in one supported transaction.
-echo "    refreshing databases and upgrading the system (supported Arch policy)"
+# No forced refresh or full-system upgrade by default: `pacman -Sy` without
+# `-u` is a partial upgrade (fresh DB + stale installed packages) that can
+# break the system, and `-Syu` rewrites the whole system on every install
+# run. The default installs missing packages from the local DB without
+# refreshing it (`-S --needed`, no `-y`); refresh explicitly with
+# `sudo pacman -Sy` yourself beforehand if the DB is stale, or opt into the
+# supported full-upgrade policy explicitly:
+#   HANDSOFF_FULL_UPGRADE=1 ./install.sh
 # Feature deps provisioned here so advertised tools work out of the box:
 # ydotool (typing/keys), wl-clipboard (clipboard), grim (screenshots),
 # tesseract (OCR), mpc (music control).
@@ -87,9 +92,17 @@ for p in $PYTHON_PKGS; do
         echo "    note: $p is not in this distro's repos — requirements.txt provides it via pip"
     fi
 done
-sudo pacman -Syu --needed --noconfirm $ARCH_PKGS \
-    alsa-utils ollama curl \
-    ydotool wl-clipboard grim tesseract mpc
+if [ "${HANDSOFF_FULL_UPGRADE:-0}" = "1" ]; then
+    echo "    full system upgrade requested (supported Arch -Syu policy)"
+    sudo pacman -Syu --needed --noconfirm $ARCH_PKGS \
+        alsa-utils ollama curl \
+        ydotool wl-clipboard grim tesseract mpc
+else
+    echo "    installing missing packages from the local DB (no refresh, no full upgrade)"
+    sudo pacman -S --needed --noconfirm $ARCH_PKGS \
+        alsa-utils ollama curl \
+        ydotool wl-clipboard grim tesseract mpc
+fi
 
 echo "==> [2/8] Python packages (pip, user site)"
 # Single source of truth: the manifest. Core deps also come from pacman above;
@@ -102,9 +115,9 @@ echo "==> [3/8] Directories"
 mkdir -p "$BIN_DIR" "$CONF_DIR/whisper-model" "$CONF_DIR/piper-voice" "$STATE_DIR"
 
 echo "==> [4/8] Placing handsoff.py, settings app and restart script"
-install -m 644 "$HERE/handsoff.py" "$BIN_DIR/handsoff.py"
+install -m 755 "$HERE/handsoff.py" "$BIN_DIR/handsoff.py"
 if [ -f "$HERE/handsoff-settings.py" ]; then
-    install -m 644 "$HERE/handsoff-settings.py" "$BIN_DIR/handsoff-settings.py"
+    install -m 755 "$HERE/handsoff-settings.py" "$BIN_DIR/handsoff-settings.py"
 fi
 # Single source of truth: the repo's handsoff-restart is shipped as-is
 # (a heredoc duplicate here silently drifted from it once already).
@@ -141,6 +154,13 @@ from faster_whisper import WhisperModel
 WhisperModel(sys.argv[1], device="cpu", compute_type="int8", download_root=sys.argv[2])
 print("whisper model ready")
 PY_EOF
+# faster-whisper fetches via huggingface_hub (content-hashed blobs, verified
+# on download) — no separate sha256 manifest to check like the piper voice.
+# Fail loudly on an empty cache instead of booting deaf on a partial fetch.
+if [ -z "$(ls -A "$CONF_DIR/whisper-model" 2>/dev/null)" ]; then
+    echo "    FATAL: whisper model download produced no files in $CONF_DIR/whisper-model" >&2
+    exit 1
+fi
 
 echo "==> [6/8] Downloading piper voice (sha256-verified)"
 voice="$(basename "$PIPER_VOICE_URL")"
@@ -159,7 +179,7 @@ download_verified() {  # <url> <dest> <expected-sha256-or-empty>
         rm -f "$dest"
     fi
     local tmp="$dest.part.$$"
-    curl -fL --retry 3 -o "$tmp" "$url"
+    curl -fL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmp" "$url"
     if [ -z "$want" ]; then
         # URL overridden without a SHA256: user's explicit choice — install
         # unverified but say so loudly (default voice stays strictly checked)

@@ -7,15 +7,20 @@ LOG="$STATE/handsoff.log"
 SCRIPT="$HOME/.local/bin/handsoff.py"
 mkdir -p "$STATE"
 
+is_bubble_pid() {  # $1 = pid: python exe + EXACT cmdline match (never editors/pytest)
+    local pid="$1" exe
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null)" || return 1
+    case "$(basename "$exe")" in
+        python|python3|python[0-9].*) ;;
+        *) return 1 ;;
+    esac
+    tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -qxF "$SCRIPT"
+}
+
 stop_instances() {
-    local sig="$1" pid exe
-    for pid in $(pgrep -f 'handsoff\.py' 2>/dev/null); do
-        exe="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
-        case "$(basename "$exe")" in
-            python|python3|python[0-9].*) ;;
-            *) continue ;;   # never touch editors, tails, shells that merely mention the path
-        esac
-        tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | grep -qxF "$SCRIPT" || continue
+    local sig="$1" pid
+    for pid in $(pgrep -f 'handsoff\.py' 2>/dev/null || true); do
+        is_bubble_pid "$pid" || continue
         kill "-$sig" "$pid" 2>/dev/null || true
     done
 }
@@ -36,9 +41,30 @@ sleep 0.4
 stop_instances KILL
 
 # wait for the lock to actually free, or the new instance will hit
-# "already running, exiting" and leave nothing running
-for _ in $(seq 1 40); do
-    pgrep -f 'handsoff\.py' >/dev/null 2>&1 || break
+# "already running, exiting" and leave nothing running.
+# Narrowed match (same as the kill loop): a bare `pgrep -f handsoff.py`
+# would wait on bystanders whose cmdline merely mentions the path
+# (an editor with the file open, a running pytest run).
+bubble_wait() {
+    local pid
+    for pid in $(pgrep -f 'handsoff\.py' 2>/dev/null || true); do
+        # kill -0 + recheck closes the pgrep pid-reuse TOCTOU: a pid that
+        # exited and was recycled between pgrep and the /proc read must not
+        # keep us waiting (or be signalled).
+        kill -0 "$pid" 2>/dev/null || continue
+        is_bubble_pid "$pid" && return 0
+    done
+    # the pid may be gone while the lock/socket still linger; the new
+    # instance needs both free (lock budget is ~10s: 40 x 0.25s in handsoff.py).
+    if [ -e "$STATE/handsoff.lock" ] \
+        && ! flock -n "$STATE/handsoff.lock" true 2>/dev/null; then
+        return 0
+    fi
+    [ -e "$STATE/control.sock" ] && return 0
+    return 1
+}
+for _ in $(seq 1 100); do
+    bubble_wait || break
     sleep 0.1
 done
 

@@ -29,5 +29,5 @@ binds {
     // make the bubble stop talking / thinking immediately
     Mod+Shift+V repeat=false { spawn "sh" "-c" "exec python ~/.local/bin/handsoff.py --ptt interrupt"; }
     // toggle continuous hands-free listening on/off
-    Mod+H repeat=false { spawn "sh" "-c" "exec python ~/.local/bin/handsoff.py --ptt handsfree"; }
+    Mod+Shift+H repeat=false { spawn "sh" "-c" "exec python ~/.local/bin/handsoff.py --ptt handsfree"; }
 }

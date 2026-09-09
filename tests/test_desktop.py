@@ -601,6 +601,116 @@ class TestWorkspaceTool:
     def test_in_prompt(self, H):
         assert "WORKSPACES" in H.SYSTEM_PROMPT
 
+    def test_workspace_idx_map_and_label(self, H, monkeypatch):
+        """niri's window JSON carries a global workspace_id that can differ
+        from the user-facing index (multi-output setups); labels must show
+        the INDEX, resolved through a cached id→idx map."""
+        wss = [{"id": 1, "idx": 2, "output": "DP-3"},
+               {"id": 9, "idx": 1, "output": "DP-3"}]
+        class R:
+            returncode, stdout, stderr = 0, json.dumps(wss), ""
+        monkeypatch.setattr(H.ToolBelt, "_WS_IDX_CACHE", {})
+        monkeypatch.setattr(H.subprocess, "run",
+                            lambda cmd, **k: (lambda m: m)(R()))
+        mapping = H.ToolBelt._workspace_idx_map(refresh=True)
+        assert mapping == {1: 2, 9: 1}
+        win = {"app_id": "foot", "title": "term", "workspace_id": 1}
+        label = H.ToolBelt._win_label(win)
+        assert label == "foot: term (workspace 2)"   # NOT 'workspace 1'
+        assert H.ToolBelt._workspace_idx_of(
+            {"app_id": "x", "workspace_id": 99}) is None
+
+    def test_idx_map_ttl_caches_and_refreshes(self, H, monkeypatch):
+        calls = []
+        class R:
+            returncode, stdout, stderr = 0, json.dumps(
+                [{"id": 1, "idx": 2}]), ""
+        def fake_run(cmd, **k):
+            calls.append(cmd)
+            return R()
+        monkeypatch.setattr(H.ToolBelt, "_WS_IDX_CACHE", {})
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        H.ToolBelt._workspace_idx_map(refresh=True)
+        H.ToolBelt._workspace_idx_map()            # served from cache
+        assert len(calls) == 1
+        H.ToolBelt._workspace_idx_map(refresh=True)  # explicit refresh
+        assert len(calls) == 2
+
+    def test_manifest_exposes_idx_not_raw_ids(self, H, monkeypatch):
+        monkeypatch.setattr(H.ToolBelt, "_WS_IDX_CACHE", {})
+        monkeypatch.setattr(H.ToolBelt, "_niri_windows", classmethod(
+            lambda cls: [{"id": 5, "app_id": "foot", "title": "t",
+                          "workspace_id": 1, "is_focused": True}]))
+        class R:
+            returncode, stdout, stderr = 0, json.dumps(
+                [{"id": 1, "idx": 2}]), ""
+        monkeypatch.setattr(H.subprocess, "run", lambda cmd, **k: R())
+        m = H.ToolBelt._build_manifest()
+        assert m["windows"]["placement"] == {"foot": 2}
+        assert m["workspaces"]["indices"] == [2]
+        assert "workspace_id" not in json.dumps(m["windows"])
+        assert "workspace_id" not in json.dumps(m["workspaces"])
+
+    def test_move_verifies_by_idx(self, H, monkeypatch):
+        """After a move the tool must poll the fresh id→idx map and confirm
+        against the user-facing index — niri accepting is not the window
+        having moved."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(H.ToolBelt, "_WS_IDX_CACHE", {})
+        polls = {"n": 0}
+        moved_win = {"id": 7, "app_id": "foot", "title": "term",
+                     "workspace_id": 9, "is_focused": True}
+
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+
+        def fake_run(cmd, **k):
+            cmd_s = " ".join(cmd)
+            if "move-window-to-workspace" in cmd_s:
+                return R()
+            if "workspaces" in cmd_s:
+                return R.__class__.__new__(R) if False else _R(
+                    json.dumps([{"id": 9, "idx": 3}]))
+            # windows: first poll still shows old placement, then moved
+            polls["n"] += 1
+            return _R(json.dumps([moved_win if polls["n"] > 1 else
+                                  {**moved_win, "workspace_id": 1}]))
+
+        def _R(stdout):
+            r = R(); r.stdout = stdout; return r
+
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        monkeypatch.setattr(H.time, "sleep", lambda s: None)
+        out, err = belt.execute("workspace", {"action": "move",
+                                              "target": "foot to 3"})
+        assert not err
+        assert "moved the window to workspace 3 (verified)" in out
+
+    def test_move_unconfirmed_reported(self, H, monkeypatch):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(H.ToolBelt, "_WS_IDX_CACHE", {})
+        win = {"id": 7, "app_id": "foot", "title": "term",
+               "workspace_id": 1, "is_focused": True}
+
+        class R:
+            returncode, stdout, stderr = 0, "", ""
+
+        def fake_run(cmd, **k):
+            cmd_s = " ".join(cmd)
+            if "workspaces" in cmd_s:
+                r = R(); r.stdout = json.dumps([{"id": 9, "idx": 3}]); return r
+            if "windows" in cmd_s:
+                r = R(); r.stdout = json.dumps([win]); return r
+            return r2
+
+        r2 = R()
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        monkeypatch.setattr(H.time, "sleep", lambda s: None)
+        out, err = belt.execute("workspace", {"action": "move",
+                                              "target": "foot to 3"})
+        assert not err
+        assert "NOT confirmed" in out
+
     def test_no_shadowed_docstrings(self, H):
         import ast
         tree = ast.parse((HERE / "handsoff.py").read_text())

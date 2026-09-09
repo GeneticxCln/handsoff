@@ -4,12 +4,12 @@
 #   CORE   — hard imports; the app and test suite cannot run without them.
 #   EXTRAS — lazy-imported features; the app degrades gracefully without them.
 #
-# Versions below are the ones the suite was verified against (350 tests green
+# Versions below are the ones the suite was verified against (455 tests green
 # on Python 3.12/3.13). They are floors, not exact pins: patch-level drift is
 # fine, but bump majors deliberately and re-run the full suite.
 #
 # Install everything:        pip install --user -r requirements.txt
-# CI / headless tests only:  pip install numpy PySide6 sounddevice pytest
+# CI installs the same manifest (see .github/workflows/ci.yml)
 
 # --- CORE (app + test suite hard requirements) ---
 numpy>=2.0,<3          # audio buffers everywhere
@@ -23,4 +23,4 @@ openwakeword>=0.4      # wake-spotter (lazy import; needs onnxruntime below)
 onnxruntime>=1.17      # backend for openwakeword
 
 # --- TEST ---
-# pytest>=8            # CI installs this separately (see .github/workflows/ci.yml)
+pytest>=8              # test suite (README: Development)

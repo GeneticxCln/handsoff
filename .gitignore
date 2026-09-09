@@ -23,3 +23,14 @@ xkiro_models.json
 .DS_Store
 *.swp
 *~
+
+# --- handsoff self-edit / download / test leftovers ---
+*.bak-*
+.bak-handsoff
+.json.bak-manual/
+.bak-modelswitch/
+*.part
+*.tmp
+voice-test.wav
+voice-test-*.wav
+niri-keybinds.kdl

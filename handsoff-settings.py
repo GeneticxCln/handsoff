@@ -19,6 +19,7 @@ Add `--selftest` to run a headless smoke test (no window is shown).
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import html
 import json
 import math
@@ -95,8 +96,15 @@ VOICE_CATALOG = [          # (label, quality, onnx url on rhasspy/piper-voices)
 ]
 
 NIRI_CONFIG = Path(os.environ.get("NIRI_CONFIG", str(HOME / ".config/niri/config.kdl")))
-AUTOSTART_LINE = f'spawn-at-startup "python" "{HOME}/.local/bin/handsoff.py"'
+AUTOSTART_LINE = f'spawn-at-startup "sh" "-c" "exec python \\"{HOME}/.local/bin/handsoff.py\\""'
+AUTOSTART_LINE_OLD = f'spawn-at-startup "python" "{HOME}/.local/bin/handsoff.py"'
 AUTOSTART_COMMENT = "// handsoff voice assistant bubble"
+
+
+def _autostart_hit(line: str) -> bool:
+    """Either dialect counts: old `spawn "python" ...` installs are
+    recognized (and migrated on enable) but only the new form is written."""
+    return AUTOSTART_LINE in line or AUTOSTART_LINE_OLD in line
 
 
 def merge_settings(data: dict) -> dict:
@@ -125,7 +133,7 @@ def http_json(url: str, payload: dict | None = None, timeout: int = 10):
 
 def autostart_enabled() -> bool:
     try:
-        return any(AUTOSTART_LINE in line for line in NIRI_CONFIG.read_text().splitlines())
+        return any(_autostart_hit(line) for line in NIRI_CONFIG.read_text().splitlines())
     except OSError:
         return False
 
@@ -174,29 +182,102 @@ def set_autostart(enable: bool) -> str:
             NIRI_CONFIG.parent.mkdir(parents=True, exist_ok=True)
             NIRI_CONFIG.write_text("// niri config\n")
         lines = NIRI_CONFIG.read_text().splitlines()
-        has = any(AUTOSTART_LINE in line for line in lines)
+        has_new = any(AUTOSTART_LINE in line for line in lines)
+        has = has_new or any(AUTOSTART_LINE_OLD in line for line in lines)
         bak = NIRI_CONFIG.with_name(NIRI_CONFIG.name + ".bak-handsoff")
-        if enable and not has:
+        if enable:
+            n_new = sum(1 for line in lines if AUTOSTART_LINE in line)
+            n_old = sum(1 for line in lines if AUTOSTART_LINE_OLD in line)
+            if n_new == 1 and n_old == 0:
+                return "autostart unchanged"
             if not bak.exists():
                 shutil.copy2(NIRI_CONFIG, bak)
-            if lines and lines[-1].strip():
-                lines.append("")
-            lines.append(AUTOSTART_COMMENT)
-            lines.append(AUTOSTART_LINE)
-            NIRI_CONFIG.write_text("\n".join(lines) + "\n")
+            stripped = [line for line in lines
+                        if not _autostart_hit(line) and line.strip() != AUTOSTART_COMMENT]
+            if stripped and stripped[-1].strip():
+                stripped.append("")
+            stripped.append(AUTOSTART_COMMENT)
+            stripped.append(AUTOSTART_LINE)  # exactly one NEW line, OLD gone
+            _atomic_text_write(NIRI_CONFIG, "\n".join(stripped) + "\n")
             _reload_niri()
-            return "autostart line added to niri config"
+            return ("autostart line added to niri config" if not has
+                    else "autostart line migrated to sh -c form")
         if not enable and has:
             if not bak.exists():
                 shutil.copy2(NIRI_CONFIG, bak)
             lines = [line for line in lines
-                     if AUTOSTART_LINE not in line and line.strip() != AUTOSTART_COMMENT]
-            NIRI_CONFIG.write_text("\n".join(lines) + "\n")
+                     if not _autostart_hit(line) and line.strip() != AUTOSTART_COMMENT]
+            _atomic_text_write(NIRI_CONFIG, "\n".join(lines) + "\n")
             _reload_niri()
             return "autostart line removed from niri config"
         return "autostart unchanged"
     except OSError as e:
         return f"error editing {NIRI_CONFIG}: {e}"
+
+
+def _atomic_text_write(path: Path, text: str) -> None:
+    """Atomically replace a text file via a unique temp file in the same
+    directory (no predictable .tmp name); existing permissions are kept."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                    dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _backup_keep_n(path: Path, tag: str, keep: int = 5) -> None:
+    """Copy `path` to a unique timestamped `path.<tag>.<stamp>` backup,
+    pruning older ones (by mtime) so at most `keep` remain. The pid+counter
+    suffix keeps concurrent writers from sharing a name — no lock needed."""
+    _backup_keep_n.seq += 1
+    stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
+    bak = path.with_name(
+        f"{path.name}.{tag}.{stamp}-p{os.getpid()}-{_backup_keep_n.seq}")
+    shutil.copy2(path, bak)
+    try:
+        olds = sorted(path.parent.glob(f"{path.name}.{tag}.*"),
+                      key=lambda p: p.stat().st_mtime_ns)
+    except OSError:
+        return
+    for stale in olds[:-keep]:
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_backup_keep_n.seq = 0
+
+
+def _voice_want_sha(name: str) -> str:
+    """Expected sha256 for a voice file, like install.sh's download_verified:
+    the default lessac voice is pinned (env-overridable); anything else has
+    no known checksum."""
+    env, default = {
+        "en_US-lessac-medium.onnx": (
+            "PIPER_VOICE_SHA256",
+            "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f"),
+        "en_US-lessac-medium.onnx.json": (
+            "PIPER_VOICE_JSON_SHA256",
+            "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0"),
+    }.get(name, ("", ""))
+    return os.environ.get(env, default) if env else ""
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class BubblePreview(QWidget):
@@ -320,35 +401,59 @@ class VoiceDownloadDialog(QDialog):
         dest = H.PIPER_VOICE_DIR / name
         prog = {"pct": -1, "msg": "", "done": False, "err": None}
 
-        def fetch(target: Path, src: str) -> None:
-            tmp = target.with_suffix(target.suffix + ".part")
-            req = urllib.request.Request(src, headers={"User-Agent": "handsoff/1.0"})
-            with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
-                total = int(r.headers.get("Content-Length") or 0)
-                got = 0
-                while True:
-                    if self._cancel.is_set():
-                        raise InterruptedError("cancelled")
-                    chunk = r.read(1 << 16)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    got += len(chunk)
-                    prog["pct"] = int(got * 100 / total) if total else -1
-                    prog["msg"] = f"{target.name}: {got // 1024 // 1024} MB"
-            os.replace(tmp, target)
+        def fetch(target: Path, src: str) -> bool:
+            """Download one voice file; True when bytes were fetched. The
+            existing dest is re-verified first (never silently accept a
+            truncated earlier download — a truncated voice crashes piper)."""
+            want = _voice_want_sha(target.name)
+            if target.exists():
+                ok = (_sha256_file(target) == want) if want \
+                    else target.stat().st_size > 0
+                if ok:
+                    prog["msg"] = f"{target.name} already present"
+                    return False
+                target.unlink(missing_ok=True)
+            H.PIPER_VOICE_DIR.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".",
+                                            suffix=".part", dir=str(target.parent))
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    req = urllib.request.Request(src, headers={"User-Agent": "handsoff/1.0"})
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        total = int(r.headers.get("Content-Length") or 0)
+                        got = 0
+                        while True:
+                            if self._cancel.is_set():
+                                raise InterruptedError("cancelled")
+                            chunk = r.read(1 << 16)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            got += len(chunk)
+                            prog["pct"] = int(got * 100 / total) if total else -1
+                            prog["msg"] = f"{target.name}: {got // 1024 // 1024} MB"
+                if want and _sha256_file(Path(tmp_name)) != want:
+                    raise ValueError(f"{target.name} checksum mismatch")
+                os.replace(tmp_name, target)
+            except BaseException:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            return True
 
         def worker() -> None:
             try:
-                if not dest.exists():
-                    fetch(dest, url)
-                else:
-                    prog["msg"] = f"{name} already present"
+                got_onnx = fetch(dest, url)
                 cfg = Path(str(dest) + ".json")
-                if not cfg.exists():
-                    prog["msg"] = f"{cfg.name}: downloading"
-                    fetch(cfg, url + ".json")
-                prog["msg"] = f"saved {name}"
+                got_cfg = fetch(cfg, url + ".json")
+                if not (got_onnx or got_cfg):
+                    prog["msg"] = f"{name} already present"
+                elif not _voice_want_sha(dest.name):
+                    prog["msg"] = f"saved {name} (WITHOUT checksum verification)"
+                else:
+                    prog["msg"] = f"saved {name}"
             except Exception as e:
                 prog["err"] = e
             prog["done"] = True
@@ -405,6 +510,8 @@ class _LiveMicProbe:
         self._frames_seen = 0
         self._last_nonzero = 0.0
         self._transcribe_thread = None
+        self._gen = 0               # run generation: a stale _run exits
+        self._thread = None         # current _run thread (joined on restart)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -419,12 +526,24 @@ class _LiveMicProbe:
                     and threshold == self._threshold:
                 return
             self._running = True
-        threading.Thread(target=self._run, args=(device, threshold),
-                         name="mic-live-test", daemon=True).start()
+            self._gen += 1          # stale the old run so it exits itself
+            my_gen = self._gen
+            old = self._thread
+            self._thread = None
+        if old is not None and old.is_alive():
+            old.join(timeout=2.0)   # best-effort: gen guard covers a lingerer
+        t = threading.Thread(target=self._run, args=(device, threshold),
+                             name="mic-live-test", daemon=True)
+        with self._lock:
+            if my_gen != self._gen or not self._running:
+                return              # stop() (or a newer start) won during join
+            self._thread = t
+        t.start()
 
     def stop(self) -> None:
         with self._lock:
             self._running = False
+            self._gen += 1          # stale any _run, incl. one start() is joining
         self._close_stream()
 
     def _close_stream(self) -> None:
@@ -442,6 +561,7 @@ class _LiveMicProbe:
         # run has taken over (token) or stop() cleared _running
         token = object()
         with self._lock:
+            gen = self._gen
             self._device, self._threshold = device, threshold
             self._gate = H._SpeechGate(threshold)
             self._frames = []
@@ -454,7 +574,7 @@ class _LiveMicProbe:
 
         while True:
             with self._lock:
-                if not self._running or self._device != device \
+                if gen != self._gen or not self._running or self._device != device \
                         or self._threshold != threshold:
                     return
             try:
@@ -478,9 +598,10 @@ class _LiveMicProbe:
             while True:
                 time.sleep(0.5)
                 with self._lock:
-                    if not self._running or self._device != device \
+                    if gen != self._gen or not self._running or self._device != device \
                             or self._threshold != threshold:
-                        self._close_stream()
+                        if self._stream is st:  # close only OUR stream
+                            self._close_stream()
                         return
                     if self._stream is not st:      # replaced by a newer run
                         return
@@ -488,6 +609,8 @@ class _LiveMicProbe:
     # -- audio path (PortAudio callback thread) ---------------------------
 
     def _on_frames(self, indata, token, max_frames: int) -> None:
+        # bookkeeping stays under the lock; the resample + STT handoff run
+        # unlocked (the PortAudio callback must never block on slow work)
         with self._lock:
             if not self._running or self._stream is None:
                 return
@@ -508,16 +631,21 @@ class _LiveMicProbe:
             if gate.in_speech:
                 self._frames.append(indata.copy())
                 self._speech_peak = max(self._speech_peak, rms)
+            utter = None
             if event == "end" or len(self._frames) >= max_frames:
                 if len(self._frames) >= 4:      # ≥ ~0.26 s: real speech
-                    audio = np.concatenate(self._frames).reshape(-1)
-                    audio = H._resample_to_16k(audio, self._capture_rate)
-                    self._start_transcribe(audio)
-                    self._last_event = "speech captured (%.1fs)" % (
-                        len(audio) / H.SAMPLE_RATE)
-                    self._last_event_at = time.monotonic()
+                    utter = (np.concatenate(self._frames).reshape(-1),
+                             self._capture_rate)
                 self._frames = []
                 gate.reset()
+        if utter is not None:
+            audio, rate = utter
+            audio = H._resample_to_16k(audio, rate)
+            with self._lock:
+                self._start_transcribe(audio)
+                self._last_event = "speech captured (%.1fs)" % (
+                    len(audio) / H.SAMPLE_RATE)
+                self._last_event_at = time.monotonic()
 
     def _start_transcribe(self, audio: np.ndarray) -> None:
         """Hand one utterance to the whisper worker (drops an older in-flight
@@ -1272,21 +1400,35 @@ class SettingsWindow(QMainWindow):
         vol = self.vol_slider.value() / 100.0
 
         def worker():
-            global_backup = H.PIPER_VOICE_NAME
+            # load the SELECTED voice directly: the shared H globals
+            # (PIPER_VOICE_NAME / _piper_voice cache) must not be disturbed
+            import piper
+            from piper import SynthesisConfig
+            onnx = (H.PIPER_VOICE_DIR / voice_name
+                    if voice_name
+                    else next(iter(sorted(H.PIPER_VOICE_DIR.glob("*.onnx"))), None))
+            if onnx is None or not onnx.exists():
+                raise FileNotFoundError(
+                    f"no piper voice (*.onnx) in {H.PIPER_VOICE_DIR} — download one first")
             try:
-                H.PIPER_VOICE_NAME = voice_name
-                H._piper_voice = None   # fresh synth for the SELECTED voice,
-                                        # incl. "(first voice file found)"
-                voice = H.get_piper()
-                from piper import SynthesisConfig
-                cfg = SynthesisConfig(length_scale=1.0 / max(0.5, rate), volume=max(0.1, vol))
-                wav = H.STATE_DIR / "voice-test.wav"
-                with __import__("wave").open(str(wav), "wb") as f:
+                voice = piper.PiperVoice.load(str(onnx), config_path=str(onnx) + ".json")
+            except TypeError:  # very old piper builds without config_path
+                voice = piper.PiperVoice.load(str(onnx))
+            cfg = SynthesisConfig(length_scale=1.0 / max(0.5, rate), volume=max(0.1, vol))
+            H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix="voice-test-", suffix=".wav",
+                                            dir=str(H.STATE_DIR))
+            os.close(fd)
+            wav = Path(tmp_name)
+            try:
+                with wave.open(str(wav), "wb") as f:
                     voice.synthesize_wav("Hello, I am your desktop assistant.", f, syn_config=cfg)
                 H.play_wav(wav, threading.Event())
-                wav.unlink(missing_ok=True)
             finally:
-                H.PIPER_VOICE_NAME = global_backup
+                try:
+                    wav.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return "voice test played"
 
         def done(ok, result):
@@ -1350,8 +1492,7 @@ class SettingsWindow(QMainWindow):
     def _clear_memory(self) -> None:
         try:
             if H.HISTORY_FILE.exists():
-                H.HISTORY_FILE.replace(
-                    H.HISTORY_FILE.with_suffix(".json.bak-manual"))
+                _backup_keep_n(H.HISTORY_FILE, "bak-manual")
             self.memory_view.setPlainText("(memory cleared — backup saved)")
             self._status("memory cleared (backup saved). Restart the bubble to apply.")
         except OSError as e:
@@ -1536,24 +1677,33 @@ class SettingsWindow(QMainWindow):
     def _write_keybinds(self) -> None:
         exe = f"{HOME}/.local/bin/handsoff.py"
         path = H.CONFIG_DIR / "niri-keybinds.kdl"
+        # inner shell words, KDL-escaped at write time so the snippet uses
+        # the same sh -c exec dialect as niri-window-rule.kdl
+        kdl = lambda s: s.replace('"', '\\"')  # noqa: E731
+        toggle = f'"{exe}" "--ptt" "toggle"'
+        interrupt = f'"{exe}" "--ptt" "interrupt"'
+        handsfree = f'"{exe}" "--ptt" "handsfree"'
+        status = f'"{exe}" "--ptt" "handsfree-status"'
+        dictation = f'"{exe}" "--ptt" "dictation"'
+        settings = f'"{exe}" "--ptt" "settings"'
         try:
             H.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 "// handsoff — keyboard control. Merge these into the binds { ... } section\n"
                 "// of ~/.config/niri/config.kdl, then reload niri's config.\n\n"
                 "// press once to start talking, press again to send\n"
-                f'    Mod+V repeat=false {{ spawn "python" "{exe}" "--ptt" "toggle"; }}\n'
+                f'    Mod+V repeat=false {{ spawn "sh" "-c" "exec python {kdl(toggle)}"; }}\n'
                 "// make the bubble stop talking / thinking immediately\n"
-                f'    Mod+Shift+V repeat=false {{ spawn "python" "{exe}" "--ptt" "interrupt"; }}\n'
+                f'    Mod+Shift+V repeat=false {{ spawn "sh" "-c" "exec python {kdl(interrupt)}"; }}\n'
                 "// toggle continuous hands-free listening on/off "
                 "(confirms mic health out loud)\n"
-                f'    Mod+Shift+H repeat=false {{ spawn "python" "{exe}" "--ptt" "handsfree"; }}\n'
+                f'    Mod+Shift+H repeat=false {{ spawn "sh" "-c" "exec python {kdl(handsfree)}"; }}\n'
                 "// ask the assistant to speak its hands-free / mic health state\n"
-                f'    Mod+Shift+J repeat=false {{ spawn "python" "{exe}" "--ptt" "handsfree-status"; }}\n'
+                f'    Mod+Shift+J repeat=false {{ spawn "sh" "-c" "exec python {kdl(status)}"; }}\n'
                 f'    // voice dictation: what you say is TYPED into the focused window (no AI turn)\n'
-                f'    Mod+Shift+D repeat=false {{ spawn "python" "{exe}" "--ptt" "dictation"; }}\n'
+                f'    Mod+Shift+D repeat=false {{ spawn "sh" "-c" "exec python {kdl(dictation)}"; }}\n'
                 "// open the settings window (works even when the bubble is dead)\n"
-                f'    Mod+Shift+S repeat=false {{ spawn "python" "{exe}" "--ptt" "settings"; }}\n',
+                f'    Mod+Shift+S repeat=false {{ spawn "sh" "-c" "exec python {kdl(settings)}"; }}\n',
                 encoding="utf-8",
             )
         except OSError as e:
@@ -1563,8 +1713,12 @@ class SettingsWindow(QMainWindow):
 
     def _on_restart_bubble(self) -> None:
         if H.RESTART_SCRIPT.exists():
-            subprocess.Popen([str(H.RESTART_SCRIPT)], start_new_session=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                subprocess.Popen([str(H.RESTART_SCRIPT)], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (FileNotFoundError, OSError) as e:
+                self._status(f"cannot restart bubble: {e}")
+                return
             self._status("bubble restarting …")
         else:
             self._status("restart script missing — run install.sh")
@@ -1585,13 +1739,17 @@ class SettingsWindow(QMainWindow):
             pg = subprocess.run(["pgrep", "-f", r"handsoff\.py"], capture_output=True,
                                 text=True, timeout=10)
             for pid in pg.stdout.split():
-                exe = Path(f"/proc/{pid}/exe").resolve()
-                if exe.name.startswith("python") and Path(f"/proc/{pid}/cmdline").exists() \
-                        and f"{HOME}/.local/bin/handsoff.py" in \
-                        Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace").split("\x00"):
-                    import signal
-                    os.kill(int(pid), signal.SIGTERM)
-                    killed += 1
+                try:
+                    exe = Path(f"/proc/{pid}/exe").resolve()
+                    cmdline = Path(f"/proc/{pid}/cmdline")
+                    if exe.name.startswith("python") and cmdline.exists() \
+                            and f"{HOME}/.local/bin/handsoff.py" in \
+                            cmdline.read_bytes().decode("utf-8", "replace").split("\x00"):
+                        import signal
+                        os.kill(int(pid), signal.SIGTERM)
+                        killed += 1
+                except (OSError, ValueError):
+                    continue  # pid vanished mid-scan
             return f"stopped {killed} bubble process(es)"
 
         def done(ok, result):
@@ -1601,7 +1759,11 @@ class SettingsWindow(QMainWindow):
 
     def _show_log(self) -> None:
         if H.LOG_FILE.exists():
-            subprocess.Popen(["xdg-open", str(H.LOG_FILE)])
+            try:
+                subprocess.Popen(["xdg-open", str(H.LOG_FILE)])
+            except (FileNotFoundError, OSError) as e:
+                self._status(f"cannot open log: {e}")
+                return
             self._status("opening log …")
         else:
             self._status("no log file yet — start the bubble first")
@@ -1672,7 +1834,8 @@ class SettingsWindow(QMainWindow):
         self._colors = dict(self.cfg["colors"])
         self._paint_color_buttons()
 
-    def _collect(self) -> None:
+    def _collect(self) -> list[str]:
+        problems: list[str] = []
         self.cfg["ollama_host"] = self.host_edit.text().strip() or H.DEFAULT_SETTINGS["ollama_host"]
         self.cfg["model"] = self._selected_model() or self.cfg["model"]
         self.cfg["num_ctx"] = self.ctx_spin.value()
@@ -1706,8 +1869,12 @@ class SettingsWindow(QMainWindow):
             x.strip().lower() for x in self.notification_mute_edit.text().split(",") if x.strip()][:32]
         self.cfg["dictation"] = self.dictation_chk.isChecked()
         alias_map = {}
-        for line in self.alias_edit.toPlainText().splitlines():
+        for lineno, line in enumerate(self.alias_edit.toPlainText().splitlines(), 1):
+            if not line.strip() or line.strip().startswith("#"):
+                continue
             if "=" not in line and ":" not in line:
+                problems.append(
+                    f"workspace alias line {lineno} needs 'name = value' — not saved")
                 continue
             k, _, v = line.replace(":", "=").partition("=")
             k, v = k.strip().lower(), v.strip()
@@ -1730,12 +1897,20 @@ class SettingsWindow(QMainWindow):
         self.cfg["extra_allowed_commands"] = [
             line.strip() for line in self.extra_edit.toPlainText().splitlines() if line.strip()]
         self.cfg["autostart"] = self.autostart_chk.isChecked()
+        return problems
 
     def save(self) -> bool:
-        self._collect()
+        problems = self._collect()
         if not self.cfg["model"]:
             self._status("pick a model first (Brain tab)")
             return False
+        blocked_chosen = [c for c in self.cfg["extra_allowed_commands"]
+                          if any(c == bad or c.split("/")[-1] == bad for bad in H.ToolBelt.BLOCKED)]
+        if blocked_chosen:
+            # save everything else: drop the refused entries, report them
+            self.cfg["extra_allowed_commands"] = [
+                c for c in self.cfg["extra_allowed_commands"] if c not in blocked_chosen]
+            problems.append("not saved, always blocked: " + ", ".join(blocked_chosen))
         new_model = str(self.cfg["model"])
         cleared_note = ""
         if new_model != self._model_at_open:
@@ -1743,27 +1918,22 @@ class SettingsWindow(QMainWindow):
             # the old history is the #1 cause of parroting after a model switch
             try:
                 if H.HISTORY_FILE.exists():
-                    H.HISTORY_FILE.replace(
-                        H.HISTORY_FILE.with_suffix(".json.bak-modelswitch"))
+                    _backup_keep_n(H.HISTORY_FILE, "bak-modelswitch")
                 self._model_at_open = new_model
                 cleared_note = "  Memory cleared for the new model (backup saved)."
             except OSError:
                 pass
-        blocked_chosen = [c for c in self.cfg["extra_allowed_commands"]
-                          if any(c == bad or c.split("/")[-1] == bad for bad in H.ToolBelt.BLOCKED)]
         try:
-            H.SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = H.SETTINGS_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-            os.replace(tmp, H.SETTINGS_FILE)
+            H._atomic_private_write(
+                H.SETTINGS_FILE, json.dumps(self.cfg, ensure_ascii=False, indent=1))
         except OSError as e:
             self._status(f"cannot save settings: {e}")
             return False
         # One autostart owner, same rule as the installer: when the systemd
         # user unit manages the bubble, niri spawn-at-startup is NOT added.
         msg = apply_autostart(self.autostart_chk.isChecked())
-        warn = f"  (ignored, always blocked: {', '.join(blocked_chosen)})" if blocked_chosen else ""
-        self._status(f"Saved to {H.SETTINGS_FILE}. {msg}{warn}{cleared_note}")
+        warn = f"  WARNINGS: {'; '.join(problems)}" if problems else ""
+        self._status(f"Saved to {H.SETTINGS_FILE}. {msg}{cleared_note}{warn}")
         return True
 
     def _on_save(self) -> None:

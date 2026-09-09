@@ -16,18 +16,18 @@ fi
 fail=0
 
 # 1. Byte-compile every staged Python source (cheap, catches syntax rot first).
-for f in $(echo "$changed" | grep '\.py$' || true); do
+while IFS= read -r f; do
     if [ -f "$f" ]; then
         python3 -m py_compile "$f" || fail=1
     fi
-done
+done < <(echo "$changed" | grep '\.py$' || true)
 
 # 2. Shell syntax for staged shell scripts.
-for f in $(echo "$changed" | grep -E '(^|/)[^/]+\.sh$|^install\.sh$|^handsoff-restart$' || true); do
+while IFS= read -r f; do
     if [ -f "$f" ]; then
         bash -n "$f" || fail=1
     fi
-done
+done < <(echo "$changed" | grep -E '(^|/)[^/]+\.sh$|^install\.sh$|^handsoff-restart$' || true)
 
 # 3. The full suite whenever shipped sources changed. Deliberately broad:
 # handsoff.py is both app and self-edit target, and the suite pins prompt
