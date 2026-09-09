@@ -3768,10 +3768,52 @@ class Assistant(QObject):
             self._set(self._gen, IDLE)
         elif action == "handsfree-on":
             self.set_handsfree(True)
+            self._confirm_handsfree()
         elif action == "handsfree-off":
             self.set_handsfree(False)
+            self._confirm_handsfree()
         elif action == "handsfree":
             self.set_handsfree(not self._handsfree)
+            self._confirm_handsfree()
+        elif action == "handsfree-status":
+            self._confirm_handsfree()
+
+    def _confirm_handsfree(self) -> None:
+        """Speak a short confirmation after a hands-free toggle, including the
+        current mic health so a silent/dead mic is obvious immediately."""
+        try:
+            snap = self.mic_health()
+        except Exception:
+            log.exception("handsfree confirmation: mic_health failed")
+            snap = {}
+        mic = (snap.get("mic") or {})
+        state = mic.get("state") or "unknown"
+        on = self._handsfree
+        if on and state in ("silent", "open-failing"):
+            spoken = (f"Hands-free on, but I can't hear you — microphone "
+                      f"{state}.")
+        elif on and state == "stopped":
+            # opening race: the capture thread is still bringing the stream up
+            spoken = "Hands-free on, mic starting."
+        elif on:
+            spoken = f"Hands-free on, {state}."
+        elif state == "stopped":
+            spoken = "Hands-free off."
+        else:
+            spoken = (f"Hands-free off, but the microphone is still "
+                      f"{state}.")
+        self._announce_now(spoken)
+
+    def _announce_now(self, text: str) -> None:
+        """Speak `text` outside any turn pipeline (no generation, no cancel):
+        fresh event, IDLE state, background thread so the caller (a Qt slot)
+        returns immediately."""
+        gen = self._gen
+        self._set(gen, IDLE)
+        threading.Thread(
+            target=lambda: self._speak(text, gen, threading.Event()),
+            name="announce", daemon=True,
+        ).start()
 
     # -- pipeline (worker thread) --------------------------------------------------
 
@@ -4687,8 +4729,8 @@ class BubbleWidget(QWidget):
 
 
 PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
-               "handsfree", "handsfree-on", "handsfree-off", "status",
-               "health", "settings"}
+               "handsfree", "handsfree-on", "handsfree-off",
+               "handsfree-status", "status", "health", "settings"}
 
 
 class ControlServer:
@@ -4768,8 +4810,9 @@ commands:
   interrupt      make the bubble stop talking/thinking immediately
   handsfree      toggle continuous hands-free listening
   handsfree-on   enable continuous hands-free listening
-  settings       open the settings window (works even if the bubble is dead)
-  handsfree-off  disable continuous hands-free listening  status         report state, hands-free mode and model
+  settings       open the settings window (works even if the bubble is dead)  handsfree-off  disable continuous hands-free listening
+  handsfree-status  speak the hands-free and microphone health state
+  status         report state, hands-free mode and model
   health         full JSON health: mic, brain (Ollama) and TTS status"""
 
 

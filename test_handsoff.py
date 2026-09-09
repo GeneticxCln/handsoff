@@ -3644,3 +3644,137 @@ class TestHealthCommand:
     def test_health_listed_in_usage_and_actions(self, H):
         assert "health" in H.PTT_ACTIONS
         assert "health" in H.USAGE
+
+
+class TestHandsfreeConfirm:
+    """Mod+Shift+H (handsfree toggle) confirms out loud, including mic health;
+    `handsfree-status` speaks the state without toggling."""
+
+    def _mk(self, H, mic_state="listening"):
+        a = H.Assistant.__new__(H.Assistant)
+        a._state = "idle"
+        a._handsfree = True
+        a._followup_until = 0.0
+        a._gen = 0
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._running = True
+        ln._frames_seen = 900
+        ln._last_nonzero = time.monotonic()
+        ln._capture_rate = 16000
+        ln._health_utt = 1
+        ln._health_opens_ok = 1
+        ln._health_opens_failed = 0
+        ln._health_open_device = "TestMic"
+        ln._health_last_open = "06:40:00"
+        ln._health_failing_since = None
+        ln._health_stalled_since = None
+        ln._lock = threading.RLock()
+        if mic_state == "silent":
+            ln._last_nonzero = time.monotonic() - 25.0
+        elif mic_state == "stopped":
+            ln._running = False
+        elif mic_state == "open-failing":
+            ln._health_opens_failed = 4
+            ln._health_failing_since = time.monotonic() - 40
+            ln._running = True
+            ln._frames_seen = 0
+        a._listener = ln
+        spoken = []
+        a._announce_now = lambda text: spoken.append(text)
+        return a, spoken
+
+    @pytest.fixture()
+    def _no_ollama_probe(self, H, monkeypatch):
+        monkeypatch.setattr(H, "ollama_available", lambda: True)
+
+    @pytest.fixture()
+    def server(self, H, tmp_path):
+        """Local copy of TestControlSocket's server fixture (fixtures don't
+        cross class boundaries): real Assistant + ControlServer on a tmp socket."""
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.instance() or QCoreApplication([])
+        sock_path = tmp_path / "control.sock"
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(H, "CONTROL_SOCK", sock_path)
+        asst = H.Assistant()
+        srv = H.ControlServer(asst)
+        srv.start()
+        deadline, ready = time.time() + 5, False
+        while time.time() < deadline:
+            try:
+                if TestControlSocket._roundtrip(sock_path, "status").startswith("state="):
+                    ready = True
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        assert ready, "control server never answered"
+        try:
+            yield H, None, None
+        finally:
+            monkey.undo()
+            try:
+                sock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def test_healthy_toggle_on_confirms(self, H, _no_ollama_probe):
+        a, spoken = self._mk(H, "listening")
+        a._confirm_handsfree()
+        assert spoken == ["Hands-free on, listening."]
+
+    def test_dead_mic_warns_in_confirmation(self, H, _no_ollama_probe):
+        a, spoken = self._mk(H, "open-failing")
+        a._confirm_handsfree()
+        assert "can't hear you" in spoken[0] and "open-failing" in spoken[0]
+        a2, spoken2 = self._mk(H, "silent")
+        a2._confirm_handsfree()
+        assert "can't hear you" in spoken2[0] and "silent" in spoken2[0]
+
+    def test_toggle_off_confirms_and_flags_active_mic(self, H, _no_ollama_probe):
+        a, spoken = self._mk(H, "listening")
+        a._handsfree = False
+        a._confirm_handsfree()
+        assert spoken == ["Hands-free off, but the microphone is still "
+                          "listening."]
+        a2, spoken2 = self._mk(H, "stopped")
+        a2._handsfree = False
+        a2._confirm_handsfree()
+        assert spoken2 == ["Hands-free off."]
+
+    def test_announce_now_uses_fresh_cancel_and_idle(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 5
+        states, captured = [], {}
+        a._set = lambda gen, st: states.append(st)
+        a._speak = lambda text, gen, cancel, sentence_q=None: captured.update(
+            text=text, cancel_set=cancel.is_set())
+        a._announce_now("check")
+        time.sleep(0.3)
+        assert captured["text"] == "check"
+        assert captured["cancel_set"] is False, \
+            "announcement must never inherit a cancelled turn"
+        assert states[-1] == "idle"
+
+    def test_on_command_routes_through_confirmation(self, H, monkeypatch,
+                                                    tmp_path):
+        monkeypatch.setattr(H, "SETTINGS_FILE", tmp_path / "settings.json")
+        for action, expected_on in (("handsfree", None), ("handsfree-on", True),
+                                    ("handsfree-off", False),
+                                    ("handsfree-status", None)):
+            a, spoken = self._mk(H, "listening")
+            seen = []
+            a._confirm_handsfree = lambda: seen.append(1)
+            a._on_command(action)
+            assert seen, f"{action} must speak a confirmation"
+            if expected_on is not None:
+                assert a._handsfree is expected_on
+
+    def test_handsfree_status_roundtrip(self, server):
+        H, _delivered, _app = server
+        assert H.ptt_client(["handsfree-status"]) == 0
+
+    def test_keybind_snippet_carries_status_bind(self):
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        assert '"--ptt" "handsfree-status"' in src
+        assert "Mod+Shift+J" in src

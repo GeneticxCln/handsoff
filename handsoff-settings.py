@@ -1351,8 +1351,11 @@ class SettingsWindow(QMainWindow):
                 f'    Mod+V repeat=false {{ spawn "python" "{exe}" "--ptt" "toggle"; }}\n'
                 "// make the bubble stop talking / thinking immediately\n"
                 f'    Mod+Shift+V repeat=false {{ spawn "python" "{exe}" "--ptt" "interrupt"; }}\n'
-                "// toggle continuous hands-free listening on/off\n"
+                "// toggle continuous hands-free listening on/off "
+                "(confirms mic health out loud)\n"
                 f'    Mod+Shift+H repeat=false {{ spawn "python" "{exe}" "--ptt" "handsfree"; }}\n'
+                "// ask the assistant to speak its hands-free / mic health state\n"
+                f'    Mod+Shift+J repeat=false {{ spawn "python" "{exe}" "--ptt" "handsfree-status"; }}\n'
                 "// open the settings window (works even when the bubble is dead)\n"
                 f'    Mod+Shift+S repeat=false {{ spawn "python" "{exe}" "--ptt" "settings"; }}\n',
                 encoding="utf-8",
