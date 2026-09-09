@@ -3220,3 +3220,105 @@ class TestMicHealth:
             ln._health_loop()
         assert sleeps and sleeps[0] == 3600.0, "health loop must tick hourly"
         assert len(calls) == 2, "a failing report must not kill the loop"
+
+
+class TestLiveMicProbe:
+    """The settings app's live mic test: GUI-free probe core that meters the
+    selected device and transcribes utterances with the bubble's own stack."""
+
+    def _load_probe_class(self):
+        mod = _load("handsoff_settings_live", HERE / "handsoff-settings.py")
+        return mod, mod._LiveMicProbe
+
+    def test_snapshot_shape_before_start(self):
+        mod, P = self._load_probe_class()
+        p = P()
+        s = p.snapshot()
+        for key in ("running", "device", "rate", "peak", "gate_open",
+                    "transcript", "error", "frames"):
+            assert key in s
+        assert s["running"] is False and s["rate"] == 0 and s["error"] == ""
+
+    def test_start_is_noop_for_identical_params(self):
+        mod, P = self._load_probe_class()
+        p = P()
+        p._running = True
+        p._device, p._threshold = "system default", 300
+        before = threading.active_count()
+        p.start("system default", 300)
+        time.sleep(0.2)
+        assert threading.active_count() == before
+
+    def test_frame_loop_meters_and_captures(self):
+        """Feeding synthetic loud frames through the real _SpeechGate opens
+        the gate, tracks the speech peak, and hands audio to the STT worker."""
+        mod, P = self._load_probe_class()
+        BH = mod.H                      # the bubble module, as loaded by the app
+        p = P()
+        p._running = True
+        p._gate = BH._SpeechGate(300)
+        p._stream = object()            # callback guard: stream "exists"
+        p._capture_rate = BH.SAMPLE_RATE
+        max_frames = int(P.MAX_UTT_S * BH.SAMPLE_RATE / P.FRAME)
+        handed = []
+        p._start_transcribe = lambda audio: handed.append(audio)
+        quiet = np.zeros((P.FRAME, 1), dtype=np.int16)
+        for _ in range(30):
+            p._on_frames(quiet, None, max_frames)
+        assert p.snapshot()["peak"] < 100
+        loud = (np.sin(np.linspace(0, 200, P.FRAME)) * 6000).astype(np.int16)
+        loud = loud.reshape(-1, 1)
+        p._on_frames(loud, None, max_frames)          # 1 loud frame
+        p._on_frames(loud, None, max_frames)          # 2nd: gate starts
+        snap = p.snapshot()
+        assert snap["gate_open"] is True
+        assert snap["speech_peak"] > 3000
+        p._on_frames(loud, None, max_frames)          # payload frame
+        for _ in range(20):                           # hangover → "end"
+            p._on_frames(quiet, None, max_frames)
+        assert len(handed) == 1 and handed[0].dtype == np.int16
+        assert "speech captured" in p.snapshot()["last_event"]
+
+    def test_transcribe_worker_updates_snapshot(self):
+        mod, P = self._load_probe_class()
+        p = P()
+        p._running = True
+        me = threading.current_thread()
+        p._transcribe_thread = me                     # we ARE the worker
+        p._transcribe_worker(np.zeros(1600, dtype=np.int16))
+        s = p.snapshot()
+        assert s["transcript"] == "(unintelligible)"  # silence → empty text
+        assert s["last_event"] == "transcribed"
+        # a superseded worker must not clobber a newer result
+        p._last_transcript = "fresh"
+        other = threading.Thread(target=lambda: None)
+        other.start(); other.join()
+        p._transcribe_thread = other                  # not us anymore
+        p._transcribe_worker(np.zeros(1600, dtype=np.int16))
+        assert p.snapshot()["transcript"] == "fresh"
+
+    def test_transcribe_failure_sets_event(self):
+        mod, P = self._load_probe_class()
+        p = P()
+        p._running = True
+        me = threading.current_thread()
+        p._transcribe_thread = me
+        orig = mod.H.transcribe
+        mod.H.transcribe = lambda audio: (_ for _ in ()).throw(RuntimeError("no model"))
+        try:
+            p._transcribe_worker(np.zeros(1600, dtype=np.int16))
+        finally:
+            mod.H.transcribe = orig
+        assert "transcribe failed" in p.snapshot()["last_event"]
+
+    def test_window_wiring(self):
+        """The Voice tab must own the toggle → probe wiring and stop the
+        probe on window close."""
+        _load("handsoff_settings_live2", HERE / "handsoff-settings.py")  # import check
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        for fragment in ("_toggle_mic_live", "_LiveMicProbe()", "_mic_live_tick",
+                         "mic_live_btn.setCheckable(True)",
+                         "currentIndexChanged.connect", "valueChanged.connect"):
+            assert fragment in src, fragment
+        ce = src[src.index("def closeEvent"):src.index("def closeEvent") + 400]
+        assert "_live_probe.stop()" in ce

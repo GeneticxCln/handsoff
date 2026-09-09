@@ -22,12 +22,16 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
+import wave
+from datetime import datetime as _dt
 from pathlib import Path
 
 HOME = Path.home()
@@ -367,6 +371,204 @@ class VoiceDownloadDialog(QDialog):
         poll()
 
 
+class _LiveMicProbe:
+    """GUI-free core of the settings app's live mic test: continuously opens
+    the selected input device via handsoff's own _open_input (so native-rate
+    fallback behaves exactly like the bubble), gates frames with the bubble's
+    real _SpeechGate, and runs whisper on collected utterances in a worker
+    thread. The GUI only polls `snapshot()` and never blocks the UI thread.
+
+    Everything is created lazily in start(): instantiating this object must
+    not touch audio devices or models (tests construct it freely)."""
+
+    FRAME = 1024
+    MAX_UTT_S = 15.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running = False
+        self._device: str | None = None
+        self._threshold = 300
+        self._stream = None
+        self._capture_rate = 0
+        self._gate = None
+        self._frames: list = []
+        self._spot_peak = 0.0
+        self._speech_peak = 0.0
+        self._last_event = ""
+        self._last_event_at = 0.0
+        self._last_transcript = ""
+        self._last_transcript_at = 0.0
+        self._error = ""
+        self._frames_seen = 0
+        self._last_nonzero = 0.0
+        self._transcribe_thread = None
+
+    # -- lifecycle -------------------------------------------------------
+
+    def start(self, device: str | None, threshold: int) -> None:
+        """Begin capturing from `device` ('' or None = system default).
+        Safe to call repeatedly while running: a changed device or threshold
+        restarts capture, otherwise it is a no-op."""
+        device = device or None
+        threshold = int(threshold)
+        with self._lock:
+            if self._running and device == self._device \
+                    and threshold == self._threshold:
+                return
+            self._running = True
+        threading.Thread(target=self._run, args=(device, threshold),
+                         name="mic-live-test", daemon=True).start()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
+        self._close_stream()
+
+    def _close_stream(self) -> None:
+        st = self._stream
+        self._stream = None
+        if st is not None:
+            try:
+                st.stop()
+                st.close()
+            except Exception:
+                pass
+
+    def _run(self, device: str | None, threshold: int) -> None:
+        # one capture loop per (device, threshold) change; exits when a newer
+        # run has taken over (token) or stop() cleared _running
+        token = object()
+        with self._lock:
+            self._device, self._threshold = device, threshold
+            self._gate = H._SpeechGate(threshold)
+            self._frames = []
+            self._last_event = ""
+        max_frames = int(self.MAX_UTT_S * H.SAMPLE_RATE / self.FRAME)
+        fail_sleep = 2.0
+
+        def cb(indata, nframes, time_info, status) -> None:
+            self._on_frames(indata, token, max_frames)
+
+        while True:
+            with self._lock:
+                if not self._running or self._device != device \
+                        or self._threshold != threshold:
+                    return
+            try:
+                st, rate = H._open_input(device, H.SAMPLE_RATE, self.FRAME, cb)
+                st.start()
+            except Exception as e:
+                with self._lock:
+                    self._error = f"cannot open device: {e}"
+                    self._stream = None
+                    self._capture_rate = 0
+                time.sleep(fail_sleep)
+                fail_sleep = min(10.0, fail_sleep * 1.5)
+                continue
+            fail_sleep = 2.0
+            with self._lock:
+                self._stream = st
+                self._capture_rate = rate
+                self._error = ""
+                self._frames_seen = 0
+                self._last_nonzero = time.monotonic()
+            while True:
+                time.sleep(0.5)
+                with self._lock:
+                    if not self._running or self._device != device \
+                            or self._threshold != threshold:
+                        self._close_stream()
+                        return
+                    if self._stream is not st:      # replaced by a newer run
+                        return
+
+    # -- audio path (PortAudio callback thread) ---------------------------
+
+    def _on_frames(self, indata, token, max_frames: int) -> None:
+        with self._lock:
+            if not self._running or self._stream is None:
+                return
+            gate = self._gate
+            if gate is None:
+                return
+            self._frames_seen += 1
+            rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+            if rms > 0.5:
+                self._last_nonzero = time.monotonic()
+            self._spot_peak = max(self._spot_peak * 0.9, rms)
+            event = gate.feed(rms)
+            if event == "start":
+                self._frames = []
+                self._speech_peak = 0.0
+                self._last_event = "speech started"
+                self._last_event_at = time.monotonic()
+            if gate.in_speech:
+                self._frames.append(indata.copy())
+                self._speech_peak = max(self._speech_peak, rms)
+            if event == "end" or len(self._frames) >= max_frames:
+                if len(self._frames) >= 4:      # ≥ ~0.26 s: real speech
+                    audio = np.concatenate(self._frames).reshape(-1)
+                    audio = H._resample_to_16k(audio, self._capture_rate)
+                    self._start_transcribe(audio)
+                    self._last_event = "speech captured (%.1fs)" % (
+                        len(audio) / H.SAMPLE_RATE)
+                    self._last_event_at = time.monotonic()
+                self._frames = []
+                gate.reset()
+
+    def _start_transcribe(self, audio: np.ndarray) -> None:
+        """Hand one utterance to the whisper worker (drops an older in-flight
+        utterance rather than queueing — a live meter wants fresh results)."""
+        t = threading.Thread(target=self._transcribe_worker, args=(audio,),
+                             name="mic-live-stt", daemon=True)
+        self._transcribe_thread = t
+        t.start()
+
+    def _transcribe_worker(self, audio: np.ndarray) -> None:
+        try:
+            text = H.transcribe(audio)
+        except Exception as e:
+            with self._lock:
+                if self._transcribe_thread is threading.current_thread():
+                    self._last_event = f"transcribe failed: {e}"
+                    self._last_event_at = time.monotonic()
+            return
+        with self._lock:
+            if self._transcribe_thread is not threading.current_thread():
+                return                          # superseded by a newer utterance
+            self._last_transcript = text or "(unintelligible)"
+            self._last_transcript_at = time.monotonic()
+            self._last_event = "transcribed"
+            self._last_event_at = time.monotonic()
+
+    # -- GUI-facing snapshot ----------------------------------------------
+
+    def snapshot(self) -> dict:
+        """Current state for the meter UI; cheap, lock-held, no blocking."""
+        with self._lock:
+            silent_for = max(
+                0.0, time.monotonic() - self._last_nonzero) \
+                if self._frames_seen else None
+            return {
+                "running": self._running,
+                "device": self._device or "system default",
+                "rate": self._capture_rate,
+                "peak": self._spot_peak,
+                "speech_peak": self._speech_peak,
+                "gate_open": bool(self._gate.in_speech) if self._gate else False,
+                "last_event": self._last_event,
+                "last_event_age": (time.monotonic() - self._last_event_at
+                                   if self._last_event_at else None),
+                "transcript": self._last_transcript,
+                "transcript_age": (time.monotonic() - self._last_transcript_at
+                                   if self._last_transcript_at else None),
+                "error": self._error,
+                "frames": self._frames_seen,
+                "silent_for": silent_for,
+            }
+
+
 class SettingsWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -376,6 +578,7 @@ class SettingsWindow(QMainWindow):
         self.cfg = copy.deepcopy(H.SETTINGS)
         self._model_at_open = str(self.cfg.get("model") or "")
         self._state_dir_ready()
+        self._live_probe: _LiveMicProbe | None = None   # live mic test (Voice tab)
 
         tabs = QTabWidget(self)
         tabs.addTab(self._brain_tab(), "Brain")
@@ -426,6 +629,13 @@ class SettingsWindow(QMainWindow):
             H.STATE_DIR.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
+
+    def closeEvent(self, event) -> None:            # noqa: N802 (Qt naming)
+        """Stop the live mic test (and its stream + whisper worker) on close,
+        so the settings app never holds the mic after the window is gone."""
+        if self._live_probe is not None:
+            self._live_probe.stop()
+        super().closeEvent(event)
 
     def run_bg(self, fn, done) -> None:
         box: dict = {}
@@ -598,6 +808,34 @@ class SettingsWindow(QMainWindow):
         mic_test_row.addWidget(self.mic_test_btn)
         mic_test_row.addWidget(self.mic_bar, 1)
         form.addRow(mic_test_row)
+
+        # -- live test mode: continuous meter + last transcript -------------
+        mic_live_row = QHBoxLayout()
+        self.mic_live_btn = QPushButton("Live test", self)
+        self.mic_live_btn.setCheckable(True)
+        self.mic_live_btn.setToolTip(
+            "Open the selected microphone continuously: the meter follows the "
+            "room, and anything that passes the threshold above is transcribed "
+            "with the same whisper model the bubble uses — so you can verify a "
+            "device before switching to it. Runs on its own stream; if the "
+            "bubble's hands-free is also capturing, some mics split levels "
+            "between the two listeners.")
+        self.mic_live_btn.toggled.connect(self._toggle_mic_live)
+        mic_live_row.addWidget(self.mic_live_btn)
+        self.mic_live_state = QLabel("idle", self)
+        mic_live_row.addWidget(self.mic_live_state, 1)
+        form.addRow(mic_live_row)
+        self.mic_live_event = QLabel("", self)
+        self.mic_live_event.setStyleSheet("color: palette(mid);")
+        form.addRow(self.mic_live_event)
+        self.mic_live_transcript = QLabel("", self)
+        self.mic_live_transcript.setWordWrap(True)
+        self.mic_live_transcript.setStyleSheet("font-weight: bold;")
+        form.addRow("Last transcript", self.mic_live_transcript)
+        self.thresh_spin.valueChanged.connect(
+            lambda _v: self._mic_live_restart_if_on())
+        self.mic_combo.currentIndexChanged.connect(
+            lambda _i: self._mic_live_restart_if_on())
         lay.addWidget(mic_group)
 
         hf_group = QGroupBox("Hands-free listening", w)
@@ -798,6 +1036,61 @@ class SettingsWindow(QMainWindow):
             QTimer.singleShot(100, poll)
 
         poll()
+
+    # -- live mic test mode -----------------------------------------------
+
+    def _toggle_mic_live(self, on: bool) -> None:
+        if on:
+            if self._live_probe is None:
+                self._live_probe = _LiveMicProbe()
+            self._live_probe.start(self.mic_combo.currentData(),
+                                   self.thresh_spin.value())
+            self._mic_live_tick()
+        else:
+            if self._live_probe is not None:
+                self._live_probe.stop()
+            self.mic_live_state.setText("idle")
+            self.mic_live_event.setText("")
+            self.mic_live_transcript.setText("")
+
+    def _mic_live_restart_if_on(self) -> None:
+        """Device/threshold changed while live mode is on: restart capture
+        against the new selection."""
+        if getattr(self, "mic_live_btn", None) is not None \
+                and self.mic_live_btn.isChecked() \
+                and self._live_probe is not None:
+            self._live_probe.start(self.mic_combo.currentData(),
+                                   self.thresh_spin.value())
+
+    def _mic_live_tick(self) -> None:
+        """Poll the probe snapshot ~5x/s and refresh meter, state, transcript."""
+        if not self.mic_live_btn.isChecked():
+            return
+        snap = self._live_probe.snapshot()
+        self.mic_bar.setValue(min(100, int(snap["peak"] / 30)))
+        if snap["error"]:
+            state = f"error — {snap['error']}"
+        elif snap["rate"] == 0:
+            state = "opening …"
+        else:
+            state = (f"{snap['device']} @ {snap['rate']} Hz"
+                     + (" — hearing speech" if snap["gate_open"] else ""))
+        self.mic_live_state.setText(state)
+        ev = snap["last_event"]
+        if ev and snap["last_event_age"] is not None \
+                and snap["last_event_age"] < 90:
+            self.mic_live_event.setText(
+                f"{ev} · {int(snap['last_event_age'])}s ago · "
+                f"{snap['frames']} frames")
+        else:
+            self.mic_live_event.setText("")
+        if snap["transcript"] and snap["transcript_age"] is not None \
+                and snap["transcript_age"] < 600:
+            self.mic_live_transcript.setText(
+                f"“{snap['transcript']}”  ({int(snap['transcript_age'])}s ago)")
+        else:
+            self.mic_live_transcript.setText("—")
+        QTimer.singleShot(200, self._mic_live_tick)
 
     def test_voice(self) -> None:
         self.voice_test_btn.setEnabled(False)

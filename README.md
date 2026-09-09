@@ -207,6 +207,11 @@ instead of starting by hand; it waits for the lock.
 **Microphone problems**
 
 - Check the device: `pactl list sources short`
+- **Live mic test** (Settings → Voice): toggle *Live test* to open the
+  selected device continuously — the level meter follows the room, and any
+  speech that passes the threshold is transcribed with the bubble's own
+  whisper model, shown under *Last transcript*. Use it to verify a mic (and
+  tune the threshold) before switching the bubble to it.
 - Pick a specific device in Settings → *Input device*; raise *Recording
   threshold* if it triggers on noise, lower it if speech is missed
 - The listener retries forever and never permanently disables hands-free;
