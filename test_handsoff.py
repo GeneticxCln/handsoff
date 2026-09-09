@@ -3527,3 +3527,120 @@ class TestFollowupWindow:
         assert H.coerce_settings(s)["followup_seconds"] == 6.0
         s2 = {**H.DEFAULT_SETTINGS, "followup_seconds": "15"}
         assert H.coerce_settings(s2)["followup_seconds"] == 15.0
+
+
+class TestHealthCommand:
+    """`health` control-socket command: one JSON snapshot of mic, brain and
+    TTS status — the mic section shares the reporter's state machine."""
+
+    def _mk_assistant(self, H, listener):
+        a = H.Assistant.__new__(H.Assistant)
+        a._state = "idle"
+        a._handsfree = True
+        a._followup_until = 0.0
+        a._listener = listener
+        return a
+
+    def _mk_listener(self, H, **over):
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._running = True
+        ln._frames_seen = 1000
+        ln._last_nonzero = time.monotonic()
+        ln._capture_rate = 16000
+        ln._health_utt = 2
+        ln._health_opens_ok = 1
+        ln._health_opens_failed = 0
+        ln._health_open_device = "TestMic"
+        ln._health_last_open = "06:30:00"
+        ln._health_failing_since = None
+        ln._health_stalled_since = None
+        ln._lock = threading.RLock()
+        for k, v in over.items():
+            setattr(ln, k, v)
+        return ln
+
+    def test_snapshot_shape_and_values(self, H, monkeypatch):
+        monkeypatch.setattr(H, "ollama_available", lambda: True)
+        a = self._mk_assistant(H, self._mk_listener(H))
+        s = a.mic_health()
+        assert s["assistant"] == "idle" and s["handsfree"] is True
+        assert s["mic"]["state"] == "listening"
+        assert s["mic"]["device"] == "TestMic"
+        assert s["mic"]["rate"] == 16000
+        assert s["mic"]["stalled"] is False and s["mic"]["failing_since"] is None
+        assert s["brain"]["reachable"] is True and "model" in s["brain"]
+        assert set(s["tts"]) == {"ready", "whisper_ready"}
+        json.dumps(s)          # must be JSON-serializable, always
+
+    def test_snapshot_reflects_degraded_mic(self, H, monkeypatch):
+        monkeypatch.setattr(H, "ollama_available", lambda: False)
+        ln = self._mk_listener(H, _health_opens_failed=5,
+                               _health_failing_since=time.monotonic() - 30)
+        a = self._mk_assistant(H, ln)
+        s = a.mic_health()
+        assert s["mic"]["state"] == "open-failing"
+        assert s["mic"]["failing_since"] > 25
+        assert s["brain"]["reachable"] is False
+
+    def test_snapshot_silent_state(self, H, monkeypatch):
+        monkeypatch.setattr(H, "ollama_available", lambda: True)
+        ln = self._mk_listener(H, _last_nonzero=time.monotonic() - 25.0)
+        a = self._mk_assistant(H, ln)
+        assert a.mic_health()["mic"]["state"] == "silent"
+
+    def test_state_machine_shared_with_reporter(self, H):
+        """mic_snapshot must use the same classifier as the journal reporter."""
+        import inspect
+        assert "_health_state_now_locked" in inspect.getsource(
+            H.ContinuousListener.mic_snapshot)
+        assert "_health_state_now_locked()" in inspect.getsource(
+            H.ContinuousListener._health_tick)
+
+    @pytest.fixture()
+    def server(self, H, tmp_path):
+        """Local copy of TestControlSocket's server fixture (fixtures don't
+        cross class boundaries): real Assistant + ControlServer on a tmp socket."""
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.instance() or QCoreApplication([])
+        sock_path = tmp_path / "control.sock"
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(H, "CONTROL_SOCK", sock_path)
+        asst = H.Assistant()
+        srv = H.ControlServer(asst)
+        srv.start()
+        deadline, ready = time.time() + 5, False
+        while time.time() < deadline:
+            try:
+                if TestControlSocket._roundtrip(sock_path, "status").startswith("state="):
+                    ready = True
+                    break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        assert ready, "control server never answered"
+        try:
+            yield H, None, None
+        finally:
+            monkey.undo()
+            try:
+                sock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def test_health_roundtrip_over_socket(self, server):
+        H, _delivered, _app = server
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(H, "ollama_available", lambda: True)
+        try:
+            raw = TestControlSocket._roundtrip(H.CONTROL_SOCK, "health")
+        finally:
+            monkey.undo()
+        payload = json.loads(raw)
+        assert payload["mic"]["state"] in ("listening", "silent",
+                                           "open-failing", "stopped")
+        assert payload["brain"]["reachable"] is True
+        assert set(payload["tts"]) == {"ready", "whisper_ready"}
+
+    def test_health_listed_in_usage_and_actions(self, H):
+        assert "health" in H.PTT_ACTIONS
+        assert "health" in H.USAGE

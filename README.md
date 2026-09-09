@@ -123,6 +123,7 @@ Any of these work from a script or keybind, even while the bubble runs:
 
 ```bash
 python ~/.local/bin/handsoff.py --ptt status      # state, handsfree, model
+python ~/.local/bin/handsoff.py --ptt health      # JSON: mic + brain + TTS
 python ~/.local/bin/handsoff.py --ptt toggle      # start/stop/interrupt
 python ~/.local/bin/handsoff.py --ptt interrupt   # silence it now
 python ~/.local/bin/handsoff.py --ptt handsfree   # toggle hands-free

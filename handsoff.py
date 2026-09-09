@@ -2994,20 +2994,47 @@ class ContinuousListener:
             except Exception:
                 log.exception("mic health report failed")
 
+    def mic_snapshot(self) -> dict:
+        """JSON-ready mic health dict (listener-owned fields); shares the
+        state machine with the journal reporter via _health_state_now_locked."""
+        with self._lock:
+            return {
+                "state": self._health_state_now_locked(),
+                "device": (self._health_open_device
+                           or (str(SETTINGS["mic_device"])
+                               if SETTINGS["mic_device"] else "system default")),
+                "rate": getattr(self, "_capture_rate", None) or None,
+                "frames": self._frames_seen,
+                "silent_for": (max(0.0, time.monotonic() - self._last_nonzero)
+                               if self._frames_seen else None),
+                "last_open": self._health_last_open,
+                "opens_ok": self._health_opens_ok,
+                "opens_failed": self._health_opens_failed,
+                "failing_since": (max(0.0, time.monotonic()
+                                      - self._health_failing_since)
+                                  if self._health_failing_since else None),
+                "stalled": self._health_stalled_since is not None,
+                "utterances": self._health_utt,
+            }
+
+    def _health_state_now_locked(self) -> str:
+        """Classify the current mic state. Caller holds self._lock. Shared by
+        the journal reporter and mic_health() so the two can never disagree."""
+        if not self._running:
+            return "stopped"
+        if self._health_failing_since is not None:
+            return "open-failing"
+        if self._frames_seen and (time.monotonic() - self._last_nonzero
+                                  > self.MIC_SILENT_REPORT_S):
+            return "silent"
+        return "listening"
+
     def _health_tick(self) -> None:
         with self._lock:
             device = (self._health_open_device
                       or (str(SETTINGS["mic_device"])
                           if SETTINGS["mic_device"] else "system default"))
-            if not self._running:
-                state = "stopped"
-            elif self._health_failing_since is not None:
-                state = "open-failing"
-            elif time.monotonic() - self._last_nonzero \
-                    > self.MIC_SILENT_REPORT_S and self._frames_seen:
-                state = "silent"
-            else:
-                state = "listening"
+            state = self._health_state_now_locked()
             stalled = (self._health_stalled_since is not None
                        and state == "listening")
             # --- transition detection ---------------------------------
@@ -3310,6 +3337,30 @@ class Assistant(QObject):
                          daemon=True).start()
         self.sigUtterance.connect(self._on_utterance)
         self.sigCommand.connect(self._on_command)
+
+    # -- health snapshot (mic + brain + TTS) --------------------------------
+
+    def mic_health(self) -> dict:
+        """One JSON-ready snapshot of the assistant's vital signs: mic health
+        (same state machine as the journal lines), brain (Ollama + model) and
+        TTS (piper) status. Served over the control socket as `health`; kept
+        free of Qt/logging side effects so it is trivially testable."""
+        snap = {
+            "assistant": self.state,
+            "handsfree": bool(self._handsfree),
+            "followup_armed": _tick_now() < self._followup_until,
+        }
+        snap["mic"] = self._listener.mic_snapshot()
+        snap["brain"] = {
+            "model": OLLAMA_MODEL,
+            "host": OLLAMA_BASE,
+            "reachable": ollama_available(),
+        }
+        snap["tts"] = {
+            "ready": _piper_voice is not None,
+            "whisper_ready": _whisper_model is not None,
+        }
+        return snap
 
     # -- reminders --------------------------------------------------------------
 
@@ -4637,7 +4688,7 @@ class BubbleWidget(QWidget):
 
 PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                "handsfree", "handsfree-on", "handsfree-off", "status",
-               "settings"}
+               "health", "settings"}
 
 
 class ControlServer:
@@ -4678,6 +4729,14 @@ class ControlServer:
                         reply = (f"state={self._assistant.state} "
                                  f"handsfree={'on' if self._assistant._handsfree else 'off'} "
                                  f"model={OLLAMA_MODEL}")
+                    elif action == "health":
+                        try:
+                            reply = json.dumps(
+                                self._assistant.mic_health(),
+                                ensure_ascii=False)
+                        except Exception:
+                            log.exception("health snapshot failed")
+                            reply = "error: health snapshot failed (see log)"
                     elif action == "settings":
                         if SETTINGS_APP.exists():
                             subprocess.Popen(
@@ -4710,9 +4769,8 @@ commands:
   handsfree      toggle continuous hands-free listening
   handsfree-on   enable continuous hands-free listening
   settings       open the settings window (works even if the bubble is dead)
-  handsfree-off  disable continuous hands-free listening
-  status         report state, hands-free mode and model
-"""
+  handsfree-off  disable continuous hands-free listening  status         report state, hands-free mode and model
+  health         full JSON health: mic, brain (Ollama) and TTS status"""
 
 
 def ptt_client(argv: list[str]) -> int:
