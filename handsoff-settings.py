@@ -1339,6 +1339,14 @@ class SettingsWindow(QMainWindow):
                            "focused window via ydotool"),
             "paste_text": ("Read your clipboard", "wl-paste: the AI can read whatever "
                            "you last copied — passwords included"),
+            "copy_text": ("Write your clipboard", "wl-copy: the AI can replace whatever "
+                          "you last copied"),
+            "reminders": ("Reminders", "create, list, cancel and snooze spoken "
+                          "reminders"),
+            "calendar": ("Calendar", "read your ICS calendars and print month "
+                         "grids"),
+            "focus_window": ("Focus windows", "raise any window by (part of its) "
+                             "title — e.g. 'bring up the calculator'"),
             "web_access": ("Internet knowledge", "weather (Open-Meteo), facts (Wikipedia), "
                            "web search (DuckDuckGo) — read-only, fixed endpoints"),
             "screen_access": ("See the screen", "screenshots + OCR of your display; the "

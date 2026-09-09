@@ -159,6 +159,11 @@ DEFAULT_SETTINGS: dict = {
         "media": True,
         "screen_access": True,
         "paste_text": True,   # reading the user's clipboard gets its own switch
+        "copy_text": True,    # writing the user's clipboard
+        "reminders": True,    # create/list/cancel/snooze spoken reminders
+        "calendar": True,     # read ICS calendars, print month grids
+        "focus_window": True,  # raise/focus arbitrary windows by name
+        "get_datetime": True,  # trivially safe; kept gated for uniformity
     },
     "extra_allowed_commands": [],
     "tool_call_times": None,          # filled per-ToolBelt: deque of monotonic times
@@ -2303,7 +2308,7 @@ class ToolBelt:
             return "ERROR: close failed for: " + " | ".join(failed)
         return (f"closed {len(closed)} window(s): " + " | ".join(closed))
 
-    @tool(description="Copy text to the Wayland clipboard.",
+    @tool(gates="copy_text", description="Copy text to the Wayland clipboard.",
           aliases={"text": ("content",)})
     def copy_text(self, text: str) -> str:
         if not text:
@@ -2341,7 +2346,7 @@ class ToolBelt:
         more = f" (+{len(data) - 120} more chars)" if len(data) > 120 else ""
         return f"clipboard holds {len(data)} chars: {head!r}{more}"
 
-    @tool(description=(
+    @tool(gates="reminders", description=(
         "Set a spoken reminder. when_due: 'in 45 minutes', '18:30' (next "
         "occurrence), or 'YYYY-MM-DD HH:MM'. repeat_hours>0 recurs "
         "(24=daily, 168=weekly)."),
@@ -2403,7 +2408,8 @@ class ToolBelt:
         rep = f", repeating every {_fmt_dur(repeat * 3600)}" if repeat else ""
         return f"reminder '{name}' set for {_fmt_when(due)}{rep}"
 
-    @tool(description="List pending reminders, soonest first.")
+    @tool(gates="reminders",
+        description="List pending reminders, soonest first.")
     def list_reminders(self) -> str:
         now = time.time()
         items = [r for r in _load_reminders() if r["due"] > now - 86400]
@@ -2419,7 +2425,8 @@ class ToolBelt:
             out.append(f"{r['name']} {_fmt_when(r['due'])}{rep}")
         return "reminders: " + "; ".join(out)
 
-    @tool(description="Cancel a pending reminder by (part of its) name.")
+    @tool(gates="reminders",
+        description="Cancel a pending reminder by (part of its) name.")
     def cancel_reminder(self, name: str) -> str:
         name = str(name or "").strip().lower()
         if not name:
@@ -2445,7 +2452,8 @@ class ToolBelt:
             return f"ERROR: could not save reminders ({type(e).__name__})"
         return f"cancelled reminder {matches[0]['name']!r} (was {_fmt_when(matches[0]['due'])})"
 
-    @tool(description="Snooze a reminder: re-arm it N minutes from now. "
+    @tool(gates="reminders",
+        description="Snooze a reminder: re-arm it N minutes from now. "
                       "Works while pending or ~90s after it fired.")
     def snooze_reminder(self, name: str, minutes: float = 10) -> str:
         name = str(name or "").strip().lower()
@@ -2616,7 +2624,8 @@ class ToolBelt:
         except RuntimeError as e:
             return f"ERROR: {e}"
 
-    @tool(description="Print a calendar month grid with today marked * — "
+    @tool(gates="calendar",
+          description="Print a calendar month grid with today marked * — "
                       "reason about weekdays/day counts. month: 'YYYY-MM' or empty.")
     def calendar_month(self, month: str = "") -> str:
         arg = str(month or "").strip().lower()
@@ -2648,7 +2657,7 @@ class ToolBelt:
                     f"{_MONTH_NAMES[today.month - 1][:3]} {today.year}")
         return "\n".join(rows)
 
-    @tool(description=(
+    @tool(gates="calendar", description=(
         "Read upcoming events from the configured ICS calendar source(s). "
         "days=1 = today, 2 = today+tomorrow."),
         aliases={"days": ("how_many_days", "range")})

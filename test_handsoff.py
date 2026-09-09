@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import inspect
+from collections import deque
 import threading
 import io
 import json
@@ -4432,3 +4433,31 @@ class TestDictationMode:
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
         assert 'self.cfg["dictation"] = self.dictation_chk.isChecked()' in src
         assert 'Mod+Shift+D' in src and '"dictation"' in src
+
+
+class TestPermissionCoverage:
+    """Every tool gate must have a permissions key (default-allow) so the
+    Settings UI can control it — no invisible gates like the pre-existing
+    copy_text / reminders / focus_window gaps."""
+
+    def test_every_gate_has_a_permissions_key(self, H):
+        gates = {fn._tool_gates for attr in dir(H.ToolBelt)
+                 for fn in [getattr(H.ToolBelt, attr, None)]
+                 if callable(fn) and getattr(fn, "_is_tool", False)
+                 and fn._tool_gates}
+        perms = H.DEFAULT_SETTINGS["permissions"]
+        missing = gates - set(perms)
+        assert not missing, f"gates without settings keys: {missing}"
+
+    def test_reminders_gate_refuses_when_disabled(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {**H.DEFAULT_SETTINGS["permissions"], "reminders": False}
+        tb._tool_times = deque()          # rate-limit deque (execute reads it)
+        r, _err = tb.execute("list_reminders", {})
+        assert "disabled" in r
+
+    def test_settings_rows_cover_the_new_keys(self, H):
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        for key in ("copy_text", "reminders", "calendar", "focus_window"):
+            assert f'"{key}":' in src      # a labelled row exists
