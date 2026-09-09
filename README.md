@@ -220,6 +220,10 @@ instead of starting by hand; it waits for the lock.
   threshold* if it triggers on noise, lower it if speech is missed
 - The listener retries forever and never permanently disables hands-free;
   if PortAudio wedges in-process, restarting the service reinitializes it
+- `journalctl --user -u handsoff.service | grep "mic health"` shows a health
+  summary hourly **and immediately** on any state change (silent, stalled,
+  open-failing, recovery — degraded states log at WARNING, so
+  `journalctl -p warning` filters to just the problems)
 - Known issue on some stacks: a USB mic that can't serve 16 kHz callback
   streams breaks the listener when set as system default — keep the default
   on a device that works and select the other mic in handsoff's Settings

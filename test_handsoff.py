@@ -3133,11 +3133,18 @@ class TestMicHealth:
         ln._running = False
         ln._frames_seen = 0
         ln._last_nonzero = 0.0
+        ln._capture_rate = 0
         ln._health_utt = 0
         ln._health_opens_ok = 0
         ln._health_opens_failed = 0
         ln._health_open_device = ""
         ln._health_last_open = "never"
+        ln._health_state = ""
+        ln._health_next_summary = 0.0
+        ln._health_failing_since = None
+        ln._health_recovered_after = None
+        ln._health_stalled_since = None
+        ln._lock = threading.RLock()
         return ln
 
     def test_health_line_listening(self, H, monkeypatch, caplog):
@@ -3167,6 +3174,7 @@ class TestMicHealth:
         ln._running = True
         ln._health_opens_ok = 0
         ln._health_opens_failed = 7
+        ln._health_failing_since = time.monotonic() - 30
         with caplog.at_level("INFO", logger="handsoff"):
             ln._health_tick()
         line = " ".join(r.getMessage() for r in caplog.records
@@ -3182,7 +3190,8 @@ class TestMicHealth:
         ln._running = True
         ln._capture_rate = 16000
         ln._health_opens_ok = 2
-        ln._last_nonzero = _t.monotonic() - 500.0   # > SILENT_REOPEN_S
+        ln._frames_seen = 100
+        ln._last_nonzero = _t.monotonic() - 500.0   # > MIC_SILENT_REPORT_S
         with caplog.at_level("INFO", logger="handsoff"):
             ln._health_tick()
         line = " ".join(r.getMessage() for r in caplog.records
@@ -3218,8 +3227,107 @@ class TestMicHealth:
         monkeypatch.setattr(H.ContinuousListener, "_health_tick", fake_tick)
         with pytest.raises(StopIteration):
             ln._health_loop()
-        assert sleeps and sleeps[0] == 3600.0, "health loop must tick hourly"
+        assert sleeps and sleeps[0] == 10.0, "health loop must poll frequently"
         assert len(calls) == 2, "a failing report must not kill the loop"
+
+    # -- immediate transition reporting -----------------------------------
+
+    def _records(self, caplog):
+        return [r for r in caplog.records if "mic health" in r.getMessage()]
+
+    def test_degradation_logs_immediately_then_suppressed(self, H, caplog):
+        """First tick on degradation fires at once; an unchanged state stays
+        quiet until the next hourly summary."""
+        import time as _t
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._health_opens_failed = 3
+        ln._health_failing_since = _t.monotonic() - 30
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+            assert any("state=open-failing" in r.getMessage()
+                       for r in self._records(caplog))
+            caplog.clear()
+            ln._health_tick()
+            ln._health_tick()
+            assert self._records(caplog) == [], \
+                "unchanged state must not re-report within the hour"
+
+    def test_recovery_line_carries_failure_duration(self, H, caplog):
+        import time as _t
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._health_opens_failed = 3
+        ln._health_failing_since = _t.monotonic() - 40
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+            # recovered: a successful open cleared the streak
+            ln._capture_rate = 44100
+            ln._health_opens_ok = 1
+            ln._frames_seen = 500
+            ln._last_nonzero = _t.monotonic()
+            ln._health_failing_since = None
+            ln._health_recovered_after = 40.0
+            ln._health_last_open = "06:12:00"
+            caplog.clear()
+            ln._health_tick()
+        msgs = " ".join(r.getMessage() for r in self._records(caplog))
+        assert "open-failing -> listening after 40s failing" in msgs
+
+    def test_log_levels_warn_when_degraded(self, H, caplog):
+        """Degraded states (silent, open-failing) must surface at WARNING so
+        they stand out in journalctl priority filters; listening and a plain
+        'stopped' (hands-free off by choice) stay INFO."""
+        import logging, time as _t
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._health_failing_since = _t.monotonic()
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+        failing = [r for r in self._records(caplog)
+                   if "state=open-failing" in r.getMessage()]
+        assert failing and failing[0].levelno == logging.WARNING
+
+        caplog.clear()
+        ln._capture_rate = 16000
+        ln._health_opens_ok = 1
+        ln._frames_seen = 10
+        ln._last_nonzero = _t.monotonic()
+        ln._health_failing_since = None
+        ln._health_recovered_after = 1.0
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+        listening = [r for r in self._records(caplog)
+                     if "state=listening" in r.getMessage()
+                     and "changed" not in r.getMessage()]
+        assert listening and listening[0].levelno == logging.INFO
+
+        # stopped by choice: NOT a warning
+        caplog.clear()
+        ln._running = False
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+        stopped = [r for r in self._records(caplog)
+                   if "state=stopped" in r.getMessage()]
+        assert stopped and stopped[0].levelno == logging.INFO
+
+    def test_silent_reported_before_reopen_resets_clock(self, H, caplog):
+        """The report threshold must be well below the 45 s reopen threshold,
+        otherwise the reopen resets _last_nonzero and 'silent' is never seen."""
+        assert H.ContinuousListener.MIC_SILENT_REPORT_S \
+            < H.ContinuousListener.SILENT_REOPEN_S
+        # and the state machine actually classifies a mid-range silence
+        import time as _t
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._frames_seen = 400
+        ln._capture_rate = 16000
+        ln._health_opens_ok = 1
+        ln._last_nonzero = _t.monotonic() - 25.0   # between 20 and 45
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+        assert any("state=silent" in r.getMessage()
+                   for r in self._records(caplog))
 
 
 class TestLiveMicProbe:

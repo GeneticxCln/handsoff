@@ -2948,6 +2948,7 @@ class ContinuousListener:
     MIN_UTTERANCE_S = 0.3
     REOPEN_S = 3.0                    # no frames at all → stream is dead
     SILENT_REOPEN_S = 45.0            # frames flowing but all zeros → wedged device
+    MIC_SILENT_REPORT_S = 20.0        # report 'silent' BEFORE the 45s reopen resets the clock
 
     def __init__(self, assistant: "Assistant") -> None:
         self._assistant = assistant
@@ -2966,6 +2967,12 @@ class ContinuousListener:
         self._health_opens_failed = 0    # hourly health line: failed open attempts
         self._health_open_device = ""    # device the last successful open used
         self._health_last_open = "never"  # human time of the last successful open
+        self._health_state = ""          # last reported state (transition detection)
+        self._health_next_summary = 0.0  # monotonic: next unconditional hourly line
+        self._health_failing_since = None  # monotonic: open-failure streak start
+        self._health_recovered_after = None  # seconds the last failure streak lasted
+        self._health_stalled_since = None  # monotonic: zero-frames streak start
+        self._lock = threading.RLock()   # guards the health snapshot above
         # hourly "mic health" journal line — silent mic failures must be
         # visible without debug logging. Spawned ONCE here (never in start(),
         # which runs on every hands-free toggle): one reporter per process,
@@ -2976,39 +2983,64 @@ class ContinuousListener:
     # -- hourly mic health line -------------------------------------------
 
     def _health_loop(self) -> None:
-        """Log one greppable 'mic health' line every hour so silent mic
-        failures (dead device, stalled stream, wrong default) are visible
-        in journalctl without enabling debug logging."""
+        """Greppable 'mic health' journal lines without debug logging: an
+        unconditional summary every hour, PLUS an immediate line the moment
+        the state changes (silent, stalled, open-failing, recovered, stopped).
+        Degraded states log at WARNING, healthy ones at INFO."""
         while True:
-            time.sleep(3600.0)
+            time.sleep(10.0)
             try:
                 self._health_tick()
             except Exception:
                 log.exception("mic health report failed")
 
     def _health_tick(self) -> None:
-        device = (self._health_open_device
-                  or (str(SETTINGS["mic_device"])
-                      if SETTINGS["mic_device"] else "system default"))
-        if self._running:
-            if self._health_opens_ok == 0:
+        with self._lock:
+            device = (self._health_open_device
+                      or (str(SETTINGS["mic_device"])
+                          if SETTINGS["mic_device"] else "system default"))
+            if not self._running:
+                state = "stopped"
+            elif self._health_failing_since is not None:
                 state = "open-failing"
-            elif time.monotonic() - self._last_nonzero > self.SILENT_REOPEN_S:
+            elif time.monotonic() - self._last_nonzero \
+                    > self.MIC_SILENT_REPORT_S and self._frames_seen:
                 state = "silent"
             else:
                 state = "listening"
-        else:
-            state = "stopped"
-        log.info(
-            "mic health: state=%s device=%s rate=%s frames=%d last_nonzero=%.0fs_ago "
-            "last_open=%s opens_ok=%d opens_failed=%d utterances=%d",
-            state, device,
-            getattr(self, "_capture_rate", None) or "-",
-            self._frames_seen,
-            max(0.0, time.monotonic() - self._last_nonzero),
-            self._health_last_open,
-            self._health_opens_ok, self._health_opens_failed,
-            self._health_utt)
+            stalled = (self._health_stalled_since is not None
+                       and state == "listening")
+            # --- transition detection ---------------------------------
+            changed = state != self._health_state
+            last = self._health_state
+            self._health_state = state
+            report = changed or self._health_next_summary <= time.monotonic()
+            if report:
+                self._health_next_summary = time.monotonic() + 3600.0
+                emit = (log.warning if state in ("silent", "open-failing")
+                        else log.info)
+                emit(
+                    "mic health: state=%s%s device=%s rate=%s frames=%d "
+                    "last_nonzero=%.0fs_ago last_open=%s opens_ok=%d "
+                    "opens_failed=%d utterances=%d",
+                    state,
+                    " (stalled — no frames, reopening)" if stalled else "",
+                    device,
+                    getattr(self, "_capture_rate", None) or "-",
+                    self._frames_seen,
+                    max(0.0, time.monotonic() - self._last_nonzero),
+                    self._health_last_open,
+                    self._health_opens_ok, self._health_opens_failed,
+                    self._health_utt)
+            if changed:
+                dur = ""
+                if last == "open-failing" and self._health_recovered_after:
+                    dur = " after %.0fs failing" % self._health_recovered_after
+                emit = (log.warning if state in ("silent", "open-failing")
+                        else log.info)
+                emit(
+                    "mic health: state changed %s -> %s%s",
+                    last or "(start)", state, dur)
 
     def start(self) -> None:
         if self._running:
@@ -3157,6 +3189,8 @@ class ContinuousListener:
             except Exception as e:
                 open_failures += 1
                 self._health_opens_failed += 1
+                if self._health_failing_since is None:
+                    self._health_failing_since = time.monotonic()
                 log.exception("hands-free listener failed to open the microphone")
                 # Never permanently disable over a transient mic problem: USB
                 # mics (e.g. the Yeti) can take over a minute to become usable
@@ -3184,6 +3218,11 @@ class ContinuousListener:
             self._health_opens_ok += 1
             self._health_open_device = device or "system default"
             self._health_last_open = datetime.datetime.now().strftime("%H:%M:%S")
+            if self._health_failing_since is not None:
+                self._health_recovered_after = (
+                    time.monotonic() - self._health_failing_since)
+                self._health_failing_since = None    # recovered
+            self._health_stalled_since = None
             if rate != SAMPLE_RATE:
                 log.info("mic opened at native %d Hz (resampling to %d)",
                          rate, SAMPLE_RATE)
@@ -3203,12 +3242,14 @@ class ContinuousListener:
                 if self._frames_seen == last_seen:
                     if stalled_since is None:
                         stalled_since = now
+                        self._health_stalled_since = stalled_since
                     elif now - stalled_since > self.REOPEN_S:
                         log.warning("hands-free mic stream stalled; reopening")
                         break
                     continue
                 last_seen = self._frames_seen
                 stalled_since = None
+                self._health_stalled_since = None
                 if now - self._last_nonzero > self.SILENT_REOPEN_S:
                     log.warning("hands-free mic delivers only silence; reopening")
                     break
