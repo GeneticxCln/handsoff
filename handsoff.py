@@ -2959,6 +2959,54 @@ class ContinuousListener:
         self._stream: sd.InputStream | None = None
         self._frames_seen = 0            # watchdog: callback counter
         self._last_nonzero = 0.0         # watchdog: last frame above digital silence
+        self._health_utt = 0             # hourly health line: utterances emitted
+        self._health_opens_ok = 0        # hourly health line: successful stream opens
+        self._health_opens_failed = 0    # hourly health line: failed open attempts
+        self._health_open_device = ""    # device the last successful open used
+        self._health_last_open = "never"  # human time of the last successful open
+        # hourly "mic health" journal line — silent mic failures must be
+        # visible without debug logging. Spawned ONCE here (never in start(),
+        # which runs on every hands-free toggle): one reporter per process,
+        # reporting state=stopped while hands-free is off.
+        threading.Thread(target=self._health_loop, name="mic-health",
+                         daemon=True).start()
+
+    # -- hourly mic health line -------------------------------------------
+
+    def _health_loop(self) -> None:
+        """Log one greppable 'mic health' line every hour so silent mic
+        failures (dead device, stalled stream, wrong default) are visible
+        in journalctl without enabling debug logging."""
+        while True:
+            time.sleep(3600.0)
+            try:
+                self._health_tick()
+            except Exception:
+                log.exception("mic health report failed")
+
+    def _health_tick(self) -> None:
+        device = (self._health_open_device
+                  or (str(SETTINGS["mic_device"])
+                      if SETTINGS["mic_device"] else "system default"))
+        if self._running:
+            if self._health_opens_ok == 0:
+                state = "open-failing"
+            elif time.monotonic() - self._last_nonzero > self.SILENT_REOPEN_S:
+                state = "silent"
+            else:
+                state = "listening"
+        else:
+            state = "stopped"
+        log.info(
+            "mic health: state=%s device=%s rate=%s frames=%d last_nonzero=%.0fs_ago "
+            "last_open=%s opens_ok=%d opens_failed=%d utterances=%d",
+            state, device,
+            getattr(self, "_capture_rate", None) or "-",
+            self._frames_seen,
+            max(0.0, time.monotonic() - self._last_nonzero),
+            self._health_last_open,
+            self._health_opens_ok, self._health_opens_failed,
+            self._health_utt)
 
     def start(self) -> None:
         if self._running:
@@ -3049,6 +3097,7 @@ class ContinuousListener:
                     self._assistant._spotter_wake = True
                 self._spotter = WakeSpotter()
                 self._assistant.sigUtterance.emit(audio)
+                self._health_utt += 1
             frames.clear()
         if self._spotter is not None and not self.gate_open:
             fired, pre_audio = self._spotter.feed(indata.reshape(-1))
@@ -3062,6 +3111,7 @@ class ContinuousListener:
                 self._assistant._spotter_wake = True
                 self._assistant.sigUtterance.emit(
                     np.concatenate(pre_audio).reshape(-1))
+                self._health_utt += 1
             if fired:
                 # only reset the VAD gate when the spotter actually fired:
                 # an unconditional reset here zeroed the gate's consecutive-
@@ -3104,6 +3154,7 @@ class ContinuousListener:
                 self._stream.start()
             except Exception as e:
                 open_failures += 1
+                self._health_opens_failed += 1
                 log.exception("hands-free listener failed to open the microphone")
                 # Never permanently disable over a transient mic problem: USB
                 # mics (e.g. the Yeti) can take over a minute to become usable
@@ -3128,6 +3179,9 @@ class ContinuousListener:
                 continue
             open_failures = 0
             self._capture_rate = rate
+            self._health_opens_ok += 1
+            self._health_open_device = device or "system default"
+            self._health_last_open = datetime.datetime.now().strftime("%H:%M:%S")
             if rate != SAMPLE_RATE:
                 log.info("mic opened at native %d Hz (resampling to %d)",
                          rate, SAMPLE_RATE)

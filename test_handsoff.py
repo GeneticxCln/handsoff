@@ -3122,3 +3122,101 @@ class TestNativeRateMicAndFuzzyWake:
             assert H._match_wake("hey bo hello") == "hello"
         finally:
             H._wake_name = old
+
+
+class TestMicHealth:
+    """The hourly 'mic health' journal line must expose silent mic failures:
+    every field has a defined value in every listener state."""
+
+    def _mk_listener(self, H):
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._running = False
+        ln._frames_seen = 0
+        ln._last_nonzero = 0.0
+        ln._health_utt = 0
+        ln._health_opens_ok = 0
+        ln._health_opens_failed = 0
+        ln._health_open_device = ""
+        ln._health_last_open = "never"
+        return ln
+
+    def test_health_line_listening(self, H, monkeypatch, caplog):
+        import time as _t
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._capture_rate = 44100
+        ln._frames_seen = 56_000
+        ln._last_nonzero = _t.monotonic() - 2.0
+        ln._health_open_device = "hw:StreamCam"
+        ln._health_last_open = "09:15:00"
+        ln._health_opens_ok = 1
+        ln._health_utt = 3
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+        line = " ".join(r.getMessage() for r in caplog.records
+                        if "mic health" in r.getMessage())
+        assert "state=listening" in line
+        assert "device=hw:StreamCam" in line
+        assert "rate=44100" in line
+        assert "frames=56000" in line
+        assert "last_open=09:15:00" in line
+        assert "utterances=3" in line
+
+    def test_health_line_open_failing(self, H, caplog):
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._health_opens_ok = 0
+        ln._health_opens_failed = 7
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+        line = " ".join(r.getMessage() for r in caplog.records
+                        if "mic health" in r.getMessage())
+        assert "state=open-failing" in line
+        assert "rate=-" in line
+        assert "last_open=never" in line
+        assert "opens_failed=7" in line
+
+    def test_health_line_silent_and_stopped(self, H, caplog):
+        import time as _t
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._capture_rate = 16000
+        ln._health_opens_ok = 2
+        ln._last_nonzero = _t.monotonic() - 500.0   # > SILENT_REOPEN_S
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+        line = " ".join(r.getMessage() for r in caplog.records
+                        if "mic health" in r.getMessage())
+        assert "state=silent" in line
+
+        ln._running = False
+        caplog.clear()
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._health_tick()
+        line = " ".join(r.getMessage() for r in caplog.records
+                        if "mic health" in r.getMessage())
+        assert "state=stopped" in line
+
+    def test_health_loop_reports_hourly_and_survives_errors(self, H, monkeypatch):
+        ln = self._mk_listener(H)
+        calls = []
+        sleeps = []
+        ticks = iter([RuntimeError("boom"), None, None])   # 1st report raises
+
+        def fake_tick(self):
+            calls.append(1)
+            r = next(ticks)
+            if isinstance(r, Exception):
+                raise r
+
+        def fake_sleep(s):
+            sleeps.append(s)
+            if len(sleeps) >= 3:            # two full hourly cycles, then stop
+                raise StopIteration
+
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        monkeypatch.setattr(H.ContinuousListener, "_health_tick", fake_tick)
+        with pytest.raises(StopIteration):
+            ln._health_loop()
+        assert sleeps and sleeps[0] == 3600.0, "health loop must tick hourly"
+        assert len(calls) == 2, "a failing report must not kill the loop"
