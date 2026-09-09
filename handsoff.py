@@ -133,6 +133,7 @@ CONTROL_SOCK = STATE_DIR / "control.sock"
 MIC_EVENTS_FILE = STATE_DIR / "mic-health.json"   # mic transitions + last briefing
 MIC_EVENTS_MAX = 200                              # hard cap on recorded transitions
 _MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
+_SETTINGS_WRITE_LOCK = threading.Lock()
 SELF_MARKER = "# handsoff-self-marker: this line must be preserved across self-edits"
 
 DEFAULT_SETTINGS: dict = {
@@ -168,6 +169,9 @@ DEFAULT_SETTINGS: dict = {
         "calendar": True,     # read ICS calendars, print month grids
         "focus_window": True,  # raise/focus arbitrary windows by name
         "get_datetime": True,  # trivially safe; kept gated for uniformity
+        "notifications": False,  # desktop notifications are private by default
+        "pomodoro": True,
+        "watchers": True,
     },
     "extra_allowed_commands": [],
     "tool_call_times": None,          # filled per-ToolBelt: deque of monotonic times
@@ -186,6 +190,11 @@ DEFAULT_SETTINGS: dict = {
     "spotter_models": ["hey_jarvis"],   # stock: alexa, hey_jarvis, hey_mycroft, timer, weather
     "followup_seconds": 6.0,   # announce-and-listen: no-wake-word window after a reply
     "briefing": False,         # daily briefing on the first wake word
+    "resource_alerts": False,  # opt-in RAM/VRAM threshold announcements
+    "ram_alert_percent": 90.0,
+    "vram_alert_percent": 90.0,
+    "notification_reader": False,  # desktop notifications are private by default
+    "notification_mute_apps": [],
 }
 
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
@@ -216,6 +225,13 @@ def coerce_settings(s: dict) -> dict:
     _num("tts_rate", float, 0.5, 2.0)
     _num("tts_volume", float, 0.1, 2.0)
     _num("max_tool_calls", int, 0, 10_000)
+    _num("ram_alert_percent", float, 50.0, 99.0)
+    _num("vram_alert_percent", float, 50.0, 99.0)
+    s["resource_alerts"] = bool(s.get("resource_alerts", False))
+    s["notification_reader"] = bool(s.get("notification_reader", False))
+    _nm = s.get("notification_mute_apps", [])
+    s["notification_mute_apps"] = ([str(x).strip().lower() for x in _nm if str(x).strip()]
+                                    if isinstance(_nm, list) else [])[:32]
     s["handsfree"] = bool(s.get("handsfree", False))
     s["streaming_tts"] = bool(s.get("streaming_tts", True))
     s["wake_word_required"] = bool(s.get("wake_word_required", False))
@@ -278,6 +294,23 @@ def _load_settings() -> dict:
             else:
                 s[k] = v
     return coerce_settings(s)
+
+
+def _persist_setting(key: str, value) -> None:
+    """Persist one runtime setting without overwriting unrelated settings."""
+    with _SETTINGS_WRITE_LOCK:
+        data = {}
+        try:
+            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            pass
+        data[key] = value
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, SETTINGS_FILE)
 
 
 SETTINGS = _load_settings()
@@ -511,6 +544,11 @@ CALENDAR — read_calendar
 MUSIC — media_play, media_control, media_volume, now_playing, search_library
 - Music lives in MPD. "play music" → media_play() (resume/shuffle). "play Samira Said" → media_play(query=...). "pause"/"next"/"stop the music" → media_control. "volume 30" → media_volume. "what's this song?" → now_playing.
 - Vague requests: search_library first. MPD down? Report: systemctl --user start mpd.
+
+AMBIENT ASSISTANCE — notification_reader, pomodoro, watch_file, watch_process
+- Notifications are private and OFF by default. Only enable notification_reader when the user explicitly asks; it reads future desktop notifications aloud and supports a comma-separated mute list.
+- pomodoro(action="start", work_minutes=25, break_minutes=5) starts a repeating work/break timer; use action="status" or "stop". Announce each transition briefly.
+- watch_file and watch_process are bounded, stoppable monitors. Start them only when asked, stop them when no longer useful, and never claim a watcher is active unless the tool confirms it.
 
 EYES & APPS — see_screen, read_screen_text, open_app, focus_window
 - see_screen shows the screen as an image; read_screen_text reads text via OCR. Use when the user says "this", "that error", "on my screen".
@@ -1657,10 +1695,20 @@ class ToolBelt:
 
     def __init__(self, on_restart_pending: "callable",
                  permissions: dict | None = None,
-                 on_timer: "callable | None" = None) -> None:
+                 on_timer: "callable | None" = None,
+                 on_notification: "callable | None" = None,
+                 on_announce: "callable | None" = None,
+                 on_pomodoro: "callable | None" = None) -> None:
         self._on_restart_pending = on_restart_pending
         self._on_timer = on_timer
-        self._last_images: list[str] = []   # screenshots attached to the next tool result
+        self._on_notification = on_notification
+        self._on_announce = on_announce
+        self._on_pomodoro = on_pomodoro
+        self._last_images: list[str] = []
+        self._watch_lock = threading.RLock()
+        self._file_watchers: dict[str, tuple[threading.Event, threading.Thread]] = {}
+        self._process_watchers: dict[str, tuple[threading.Event, threading.Thread]] = {}
+        # screenshots are attached to the next tool result via _last_images
         self._tool_times: deque[float] = deque(maxlen=60)   # rate-limit window
         self._perm = {
             "run_command": True, "read_file": True,
@@ -2127,6 +2175,194 @@ class ToolBelt:
         if r == "ok":
             log.info("press_hotkey: %s", c)
         return r
+
+    # -- ambient controls ------------------------------------------------------
+
+    @tool(gates="notifications", description=(
+        "Read future desktop notifications aloud. Actions: start, stop, "
+        "toggle, status, or mute (mute_apps is comma-separated app names). "
+        "Private and disabled by default."))
+    def notification_reader(self, action: str = "status", mute_apps: str = "") -> str:
+        action = str(action or "status").strip().lower()
+        if action == "mute":
+            apps = [x.strip().lower() for x in str(mute_apps or "").split(",")
+                    if x.strip()]
+            SETTINGS["notification_mute_apps"] = apps[:32]
+            _persist_setting("notification_mute_apps", apps[:32])
+            return "notification mute list set to: " + (", ".join(apps) or "(empty)")
+        if action not in ("start", "stop", "toggle", "status"):
+            return "ERROR: action must be start, stop, toggle, status or mute"
+        current = bool(SETTINGS.get("notification_reader", False))
+        if action == "toggle":
+            current = not current
+        elif action == "start":
+            current = True
+        elif action == "stop":
+            current = False
+        if action != "status":
+            SETTINGS["notification_reader"] = current
+            _persist_setting("notification_reader", current)
+            if self._on_notification is not None:
+                result = self._on_notification(current)
+                if result:
+                    return result
+        muted = ", ".join(SETTINGS.get("notification_mute_apps") or []) or "none"
+        return f"notification reader is {'on' if current else 'off'}; muted apps: {muted}"
+
+    @tool(gates="pomodoro", description=(
+        "Start or control a repeating Pomodoro timer. action: start, stop, "
+        "status. work_minutes defaults to 25 and break_minutes to 5."))
+    def pomodoro(self, action: str = "status", work_minutes: float = 25,
+                 break_minutes: float = 5) -> str:
+        action = str(action or "status").strip().lower()
+        if action not in ("start", "stop", "status"):
+            return "ERROR: action must be start, stop or status"
+        callback = self._on_pomodoro
+        if callback is None:
+            return "ERROR: pomodoro controller is unavailable"
+        try:
+            work_minutes = float(work_minutes)
+            break_minutes = float(break_minutes)
+        except (TypeError, ValueError):
+            return "ERROR: work_minutes and break_minutes must be numbers"
+        if not (1 <= work_minutes <= 120 and 1 <= break_minutes <= 60):
+            return "ERROR: work_minutes must be 1-120 and break_minutes 1-60"
+        return callback(action, work_minutes, break_minutes)
+
+    def _watch_emit(self, text: str) -> None:
+        """Send watcher alerts to the configured assistant announcement path,
+        while retaining a desktop notification as a visible fallback."""
+        log.warning("watcher alert: %s", text)
+        notify("handsoff watcher: " + text)
+        if self._on_announce is not None:
+            try:
+                self._on_announce(text)
+            except Exception:
+                log.exception("watcher announcement failed")
+
+    @staticmethod
+    def _file_watch_loop(path: Path, pattern: re.Pattern, stop: threading.Event,
+                         emit) -> None:
+        try:
+            position = path.stat().st_size
+        except OSError:
+            position = 0
+        deadline = time.monotonic() + 24 * 3600
+        while not stop.wait(1.0) and time.monotonic() < deadline:
+            try:
+                size = path.stat().st_size
+                if size < position:       # rotation/truncation: start at zero
+                    position = 0
+                if size == position:
+                    continue
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(position)
+                    chunk = fh.read(min(size - position, 128_000))
+                    position = fh.tell()
+                for line in chunk.splitlines():
+                    if pattern.search(line):
+                        emit(f"{path.name}: {line.strip()[:240]}")
+            except OSError:
+                emit(f"file watcher lost {path}")
+                return
+            except Exception:
+                log.exception("file watcher failed for %s", path)
+                return
+
+    @staticmethod
+    def _process_watch_loop(name: str, stop: threading.Event, emit) -> None:
+        seen = False
+        deadline = time.monotonic() + 24 * 3600
+        while not stop.wait(1.0) and time.monotonic() < deadline:
+            present = any(n.lower() == name.lower() for _, n in ToolBelt._same_user_procs())
+            if seen and not present:
+                emit(f"process {name} exited")
+                return
+            seen = present
+
+    @tool(gates="watchers", description=(
+        "Watch a text file for new lines matching a regular expression. "
+        "action=start/stop/list; start requires path and pattern. Max four "
+        "file watchers, each stops on deletion or after 24 hours."))
+    def watch_file(self, path: str = "", pattern: str = "", action: str = "start") -> str:
+        action = str(action or "start").strip().lower()
+        p = Path(str(path or "")).expanduser().resolve()
+        key = str(p)
+        if action == "list":
+            with self._watch_lock:
+                return "file watchers: " + (", ".join(self._file_watchers) or "none")
+        if action == "stop":
+            with self._watch_lock:
+                item = self._file_watchers.pop(key, None)
+            if item:
+                item[0].set()
+                return f"stopped watching {p}"
+            return f"no file watcher for {p}"
+        if action != "start":
+            return "ERROR: action must be start, stop or list"
+        if not p.is_file():
+            return f"ERROR: no readable file: {p}"
+        try:
+            rx = re.compile(str(pattern or ""))
+        except re.error as e:
+            return f"ERROR: invalid pattern: {e}"
+        if not rx.pattern:
+            return "ERROR: pattern must not be empty"
+        with self._watch_lock:
+            if key not in self._file_watchers and len(self._file_watchers) >= 4:
+                return "ERROR: maximum of four file watchers reached"
+            old = self._file_watchers.pop(key, None)
+            if old:
+                old[0].set()
+            stop = threading.Event()
+            thread = threading.Thread(target=self._file_watch_loop,
+                                      args=(p, rx, stop, self._watch_emit),
+                                      name="watch-file", daemon=True)
+            self._file_watchers[key] = (stop, thread)
+            thread.start()
+        return f"watching {p} for /{rx.pattern}/ (starts at the current end)"
+
+    @tool(gates="watchers", description=(
+        "Watch one exact same-user process name and announce when it exits. "
+        "action=start/stop/list; max four process watchers."))
+    def watch_process(self, name: str = "", action: str = "start") -> str:
+        action = str(action or "start").strip().lower()
+        name = str(name or "").strip()
+        if action == "list":
+            with self._watch_lock:
+                return "process watchers: " + (", ".join(self._process_watchers) or "none")
+        if not name or len(name) > 128 or not re.fullmatch(r"[A-Za-z0-9_.@+-]+", name):
+            return "ERROR: process name must be an exact simple name"
+        if action == "stop":
+            with self._watch_lock:
+                item = self._process_watchers.pop(name.lower(), None)
+            if item:
+                item[0].set()
+                return f"stopped watching process {name}"
+            return f"no process watcher for {name}"
+        if action != "start":
+            return "ERROR: action must be start, stop or list"
+        with self._watch_lock:
+            if name.lower() not in self._process_watchers and len(self._process_watchers) >= 4:
+                return "ERROR: maximum of four process watchers reached"
+            old = self._process_watchers.pop(name.lower(), None)
+            if old:
+                old[0].set()
+            stop = threading.Event()
+            thread = threading.Thread(target=self._process_watch_loop,
+                                      args=(name, stop, self._watch_emit),
+                                      name="watch-process", daemon=True)
+            self._process_watchers[name.lower()] = (stop, thread)
+            thread.start()
+        return f"watching process {name} for exit"
+
+    def stop_watchers(self) -> None:
+        with self._watch_lock:
+            items = list(self._file_watchers.values()) + list(self._process_watchers.values())
+            self._file_watchers.clear()
+            self._process_watchers.clear()
+        for stop, _thread in items:
+            stop.set()
 
     # -- window focus & clipboard ---------------------------------------------
 
@@ -3447,6 +3683,10 @@ class ContinuousListener:
                 self._assistant._maybe_self_heal(degraded)   # assistant-level policy
             except Exception:
                 log.exception("mic self-heal check failed")
+            try:
+                self._assistant._resource_tick()              # RAM/VRAM crossing alerts
+            except Exception:
+                log.exception("resource health check failed")
             # --- transition detection ---------------------------------
             changed = state != self._health_state
             last = self._health_state
@@ -3761,10 +4001,25 @@ class Assistant(QObject):
         self._recently_spoken: list[str] = []   # last TTS lines, for echo rejection
         self._handsfree = bool(SETTINGS.get("handsfree", False))
         self._listener = ContinuousListener(self)
+        self._notification_proc = None
+        self._notification_stop = None
+        self._notification_thread = None
+        self._pomodoro_stop = None
+        self._pomodoro_thread = None
+        self._pomodoro_state = None
         self._tools = ToolBelt(
             on_restart_pending=self._prepare_restart,
             permissions=SETTINGS["permissions"],
+            on_notification=self._set_notification_reader,
+            on_announce=self._announce_now,
+            on_pomodoro=self._set_pomodoro,
         )
+        if bool(SETTINGS.get("notification_reader", False)):
+            # Opt-in persistence means the reader should resume after restart;
+            # a missing dbus-monitor simply reports an error and leaves it off.
+            result = self._set_notification_reader(True)
+            if result and result.startswith("ERROR"):
+                log.error("notification reader startup: %s", result)
         self._empty_streak = 0                   # consecutive empty transcriptions
         self._wake_until = 0.0                   # monotonic: engagement window expiry
         self._followup_until = 0.0               # monotonic: no-wake-word window after a reply
@@ -3777,6 +4032,10 @@ class Assistant(QObject):
         self._spotter_wake = False               # last utterance woke via audio spotter
         self._briefing_done_date = ""            # last day the briefing was spoken
         self._last_transcript = ("", 0, 0.0)  # (text, gen, monotonic) per-utterance
+        # Resource alerts are edge-triggered: one announcement per threshold
+        # crossing, then re-arm only after usage falls below the threshold.
+        self._resource_alerted = {"ram": False, "vram": False}
+        self._resource_last = {"ram": None, "vram": None}
         self._pipeline_q: "queue.Queue" = queue.Queue()
         threading.Thread(target=self._pipeline_worker, name="pipeline",
                          daemon=True).start()
@@ -3855,6 +4114,207 @@ class Assistant(QObject):
         """Called on hands-free toggles: a fresh stream is a clean slate."""
         self._heal_pending_since = None
         self._heal_attempts = 0
+
+    # -- resource health --------------------------------------------------------
+
+    @staticmethod
+    def _resource_usage() -> dict[str, float | None]:
+        """Return RAM and NVIDIA VRAM usage percentages without shelling out
+        through the AI command path. Missing telemetry is None, never an
+        exception: a machine without NVIDIA is a normal configuration."""
+        ram = None
+        try:
+            mem = {}
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                key, _, value = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    mem[key] = float(value.strip().split()[0])
+            total, avail = mem.get("MemTotal"), mem.get("MemAvailable")
+            if total and avail is not None:
+                ram = max(0.0, min(100.0, (1.0 - avail / total) * 100.0))
+        except (OSError, ValueError, ZeroDivisionError):
+            log.warning("could not read /proc/meminfo")
+        vram = None
+        if shutil.which("nvidia-smi"):
+            try:
+                p = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                rows = []
+                for line in p.stdout.splitlines():
+                    parts = [x.strip() for x in line.split(",")]
+                    if len(parts) == 2:
+                        used, total = float(parts[0]), float(parts[1])
+                        if total > 0:
+                            rows.append(used / total * 100.0)
+                if rows:
+                    vram = max(rows)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                log.debug("nvidia-smi telemetry unavailable", exc_info=True)
+        return {"ram": ram, "vram": vram}
+
+    def _resource_tick(self) -> None:
+        """Announce RAM/VRAM threshold *crossings* once, and re-arm after
+        usage drops below each threshold. Opt-in because spoken alerts can
+        interrupt a user's work; health polling remains cheap either way."""
+        if not bool(SETTINGS.get("resource_alerts", False)):
+            return
+        usage = self._resource_usage()
+        limits = {
+            "ram": float(SETTINGS.get("ram_alert_percent", 90.0)),
+            "vram": float(SETTINGS.get("vram_alert_percent", 90.0)),
+        }
+        labels = {"ram": "system memory", "vram": "GPU memory"}
+        for kind, value in usage.items():
+            self._resource_last[kind] = value
+            if value is None:
+                continue
+            high = value >= limits[kind]
+            if not high:
+                self._resource_alerted[kind] = False
+                continue
+            if self._resource_alerted[kind]:
+                continue
+            self._resource_alerted[kind] = True
+            log.warning("resource alert: %s %.1f%% >= %.1f%%",
+                        kind, value, limits[kind])
+            self._announce_now(
+                f"Warning: {labels[kind]} is at {value:.0f} percent.")
+
+    # -- ambient services -------------------------------------------------------
+
+    def _set_notification_reader(self, enabled: bool):
+        """Start/stop a session D-Bus notification monitor. Notification text
+        is never replayed from history; only future notifications are spoken,
+        and muted app names are filtered before TTS."""
+        if enabled:
+            if self._notification_thread is not None and self._notification_thread.is_alive():
+                return "notification reader is already on"
+            try:
+                self._notification_proc = subprocess.Popen(
+                    ["dbus-monitor", "--session",
+                     "interface='org.freedesktop.Notifications',member='Notify'"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, bufsize=1, start_new_session=True)
+            except FileNotFoundError:
+                self._notification_proc = None
+                SETTINGS["notification_reader"] = False
+                return "ERROR: dbus-monitor is not installed"
+            except OSError as e:
+                self._notification_proc = None
+                SETTINGS["notification_reader"] = False
+                return f"ERROR: notification monitor failed: {e}"
+            stop = threading.Event()
+            self._notification_stop = stop
+            self._notification_thread = threading.Thread(
+                target=self._notification_loop, args=(self._notification_proc, stop),
+                name="notification-reader", daemon=True)
+            self._notification_thread.start()
+            log.info("desktop notification reader enabled")
+            return "notification reader enabled"
+        stop = self._notification_stop
+        proc = self._notification_proc
+        self._notification_stop = None
+        self._notification_proc = None
+        if stop is not None:
+            stop.set()
+        if proc is not None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        log.info("desktop notification reader disabled")
+        return "notification reader disabled"
+
+    @staticmethod
+    def _dbus_strings(line: str) -> list[str]:
+        """Extract ordinary quoted D-Bus string values from monitor output."""
+        return re.findall(r'(?<!\\)"((?:\\.|[^"\\])*)"', line)
+
+    def _notification_loop(self, proc, stop: threading.Event) -> None:
+        values: list[str] = []
+        try:
+            for line in proc.stdout or ():
+                if stop.is_set():
+                    return
+                if line.startswith("signal ") and "member=Notify" in line:
+                    values = []
+                    continue
+                if not values and not line.lstrip().startswith("string"):
+                    continue
+                values.extend(self._dbus_strings(line))
+                # Notify's signature is (app, replaces-id, icon, summary,
+                # body, actions, hints, expire-time). dbus-monitor prints the
+                # uint32/arrays separately, so the four strings we need are
+                # app, icon, summary, body — do not wait for a fifth string.
+                if len(values) >= 4:
+                    app, _icon, summary, body = values[:4]
+                    values = []
+                    muted = [str(x).lower() for x in SETTINGS.get("notification_mute_apps", [])]
+                    if any(m and m in app.lower() for m in muted):
+                        log.info("notification muted from %s", app)
+                        continue
+                    text = f"Notification from {app}: {summary}"
+                    if body.strip():
+                        text += f". {body.strip()}"
+                    try:
+                        self._announce_now(text[:500])
+                    except Exception:
+                        log.exception("notification announcement failed")
+        except (OSError, ValueError):
+            if not stop.is_set():
+                log.exception("notification reader stopped unexpectedly")
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except (AttributeError, OSError):
+                    pass
+
+    def _set_pomodoro(self, action: str, work: float, break_minutes: float) -> str:
+        """Own the bounded Pomodoro worker and announce work/break transitions."""
+        if action == "status":
+            state = self._pomodoro_state
+            if not state:
+                return "pomodoro is off"
+            remaining = max(0, int(state["until"] - time.monotonic()))
+            return (f"pomodoro is in {state['phase']} phase with "
+                    f"{remaining // 60} minutes remaining")
+        if action == "stop":
+            if self._pomodoro_stop is not None:
+                self._pomodoro_stop.set()
+            self._pomodoro_stop = None
+            self._pomodoro_state = None
+            return "pomodoro stopped"
+        if self._pomodoro_thread is not None and self._pomodoro_thread.is_alive():
+            return "pomodoro is already running"
+        stop = threading.Event()
+        self._pomodoro_stop = stop
+        self._pomodoro_state = {"phase": "work", "until": time.monotonic() + work * 60,
+                                "work": work, "break": break_minutes}
+        self._pomodoro_thread = threading.Thread(
+            target=self._pomodoro_loop, args=(stop,), name="pomodoro", daemon=True)
+        self._pomodoro_thread.start()
+        self._announce_now(f"Pomodoro started: {work:.0f} minutes of work.")
+        return f"pomodoro started: {work:.0f} minute work and {break_minutes:.0f} minute break"
+
+    def _pomodoro_loop(self, stop: threading.Event) -> None:
+        phase = "work"
+        while not stop.is_set():
+            state = self._pomodoro_state
+            if not state:
+                return
+            if stop.wait(max(0.05, state["until"] - time.monotonic())):
+                return
+            phase = "break" if phase == "work" else "work"
+            minutes = state["break"] if phase == "break" else state["work"]
+            self._pomodoro_state = {**state, "phase": phase,
+                                    "until": time.monotonic() + minutes * 60}
+            self._announce_now(
+                f"Pomodoro: {('break' if phase == 'break' else 'back to work')} "
+                f"for {minutes:.0f} minutes.")
 
     # -- reminders --------------------------------------------------------------
 
@@ -3961,6 +4421,13 @@ class Assistant(QObject):
     def shutdown(self) -> None:
         self._cancel.set()
         self._listener.stop()
+        if getattr(self, "_tools", None) is not None:
+            self._tools.stop_watchers()
+        self._set_notification_reader(False)
+        if self._pomodoro_stop is not None:
+            self._pomodoro_stop.set()
+        self._pomodoro_stop = None
+        self._pomodoro_state = None
         if self._recorder is not None:
             try:
                 self._recorder.stop()

@@ -3934,6 +3934,135 @@ class TestMicHistoryPersistence:
         assert len(doc["events"]) == before + 40   # zero lost updates
 
 
+class TestAmbientCapabilities:
+    def _tb(self, H, **kwargs):
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {**H.DEFAULT_SETTINGS["permissions"], "notifications": True,
+                    "pomodoro": True, "watchers": True}
+        tb._watch_lock = threading.RLock()
+        tb._file_watchers = {}
+        tb._process_watchers = {}
+        tb._on_notification = kwargs.get("on_notification")
+        tb._on_announce = kwargs.get("on_announce")
+        tb._on_pomodoro = kwargs.get("on_pomodoro")
+        return tb
+
+    def test_notification_reader_is_private_by_default(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        assert tb.notification_reader("status").startswith("notification reader is off")
+        assert "started" in tb.notification_reader("start")
+
+    def test_notification_mute_list_is_bounded_and_persisted(self, H, monkeypatch):
+        saved = []
+        monkeypatch.setattr(H, "_persist_setting", lambda k, v: saved.append((k, v)))
+        tb = self._tb(H, on_notification=lambda enabled: None)
+        out = tb.notification_reader("mute", ",".join(f"app{i}" for i in range(40)))
+        assert "app0" in out and len(H.SETTINGS["notification_mute_apps"]) == 32
+        assert saved and saved[-1][0] == "notification_mute_apps"
+
+    def test_notification_parser_filters_mute(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_mute_apps": ["secret"]})
+        tb = self._tb(H, on_announce=lambda text: (_ for _ in ()).throw(AssertionError()))
+        lines = ['signal time=1 interface=org.freedesktop.Notifications member=Notify',
+                 '   string "secret-app"', '   uint32 0', '   string ""',
+                 '   string "title"', '   string "body"']
+        class P:
+            stdout = lines
+            def poll(self): return None
+        tb._announce_now = tb._on_announce
+        tb._dbus_strings = H.Assistant._dbus_strings
+        H.Assistant._notification_loop(tb, P(), threading.Event())
+
+    def test_pomodoro_delegates_and_validates(self, H):
+        calls = []
+        tb = self._tb(H, on_notification=lambda enabled: None,
+                      on_pomodoro=lambda *args: calls.append(args) or "started")
+        assert tb.pomodoro("start", 25, 5) == "started"
+        assert calls == [("start", 25.0, 5.0)]
+        assert tb.pomodoro("start", 0, 5).startswith("ERROR")
+
+    def test_watch_file_starts_and_stops(self, H, tmp_path):
+        p = tmp_path / "x.log"
+        p.write_text("old\n")
+        tb = self._tb(H, on_announce=lambda text: None)
+        assert "watching" in tb.watch_file(str(p), "ERROR", "start")
+        assert "x.log" in tb.watch_file(str(p), action="list")
+        assert "stopped" in tb.watch_file(str(p), action="stop")
+        tb.stop_watchers()
+
+    def test_watch_limits_and_invalid_pattern(self, H, tmp_path):
+        tb = self._tb(H, on_announce=lambda text: None)
+        assert tb.watch_file(str(tmp_path / "missing"), "x", "start").startswith("ERROR")
+        p = tmp_path / "x"; p.write_text("")
+        assert tb.watch_file(str(p), "[", "start").startswith("ERROR")
+
+    def test_process_watch_name_validation(self, H):
+        tb = self._tb(H, on_announce=lambda text: None)
+        assert tb.watch_process("bad/name", "start").startswith("ERROR")
+        assert "watching process" in tb.watch_process("definitely-not-running", "start")
+        assert "stopped" in tb.watch_process("definitely-not-running", "stop")
+        tb.stop_watchers()
+
+
+class TestResourceAlerts:
+    def _assistant(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        a._resource_alerted = {"ram": False, "vram": False}
+        a._resource_last = {"ram": None, "vram": None}
+        a.spoken = []
+        a._announce_now = lambda text: a.spoken.append(text)
+        return a
+
+    def test_disabled_does_not_probe_or_speak(self, H, monkeypatch):
+        a = self._assistant(H)
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS, "resource_alerts": False})
+        monkeypatch.setattr(H.Assistant, "_resource_usage", staticmethod(
+            lambda: (_ for _ in ()).throw(AssertionError("should not probe"))))
+        a._resource_tick()
+        assert a.spoken == []
+
+    def test_threshold_crossing_alerts_once_and_rearms(self, H, monkeypatch):
+        a = self._assistant(H)
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "resource_alerts": True,
+                                             "ram_alert_percent": 90.0,
+                                             "vram_alert_percent": 90.0})
+        readings = iter(({"ram": 91.0, "vram": None},
+                         {"ram": 95.0, "vram": None},
+                         {"ram": 80.0, "vram": None},
+                         {"ram": 92.0, "vram": None}))
+        monkeypatch.setattr(H.Assistant, "_resource_usage", staticmethod(lambda: next(readings)))
+        a._resource_tick(); a._resource_tick(); a._resource_tick(); a._resource_tick()
+        assert len(a.spoken) == 2
+        assert "system memory" in a.spoken[0] and "91" in a.spoken[0]
+        assert "92" in a.spoken[1]
+
+    def test_vram_and_ram_alert_independent(self, H, monkeypatch):
+        a = self._assistant(H)
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS, "resource_alerts": True})
+        monkeypatch.setattr(H.Assistant, "_resource_usage", staticmethod(
+            lambda: {"ram": 91.0, "vram": 93.0}))
+        a._resource_tick()
+        assert len(a.spoken) == 2
+        assert any("system memory" in x for x in a.spoken)
+        assert any("GPU memory" in x for x in a.spoken)
+
+    def test_usage_handles_missing_proc_and_nvidia(self, H, monkeypatch):
+        monkeypatch.setattr(H, "shutil", types.SimpleNamespace(which=lambda _: None))
+        monkeypatch.setattr(H.Path, "read_text", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+        usage = H.Assistant._resource_usage()
+        assert usage == {"ram": None, "vram": None}
+
+    def test_settings_wiring(self, H):
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        for part in ("resource_chk", "ram_alert_spin", "vram_alert_spin",
+                     'resource_alerts', 'ram_alert_percent', 'vram_alert_percent'):
+            assert part in src
+
+
 class TestSettingsHealthBar:
     """The settings app's status bar shows the running bubble's health
     snapshot live: _health_query fetches, _fmt_health renders, the window

@@ -26,10 +26,13 @@ and speaks back with Piper TTS. Everything runs on your machine.
   pets…) across restarts; they survive conversation trimming.
 - **Self-modification** — the assistant can edit its own source, restart into
   the new version, and reports if it crashed.
+- **Ambient automation** — opt-in desktop notification reading, Pomodoro work /
+  break cycles, threshold alerts for RAM/GPU memory, and bounded file/process
+  watchers that announce matching failures or exits.
 
-All 29 tools are declared in one place (`@tool`-decorated methods in
+All 38 tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 298 tests pin the behavior (`python -m pytest test_handsoff.py`).
+automatically. 350 tests pin the behavior (`python -m pytest test_handsoff.py`).
 
 ## Requirements
 
@@ -145,6 +148,8 @@ the bubble → Settings…) has a permission switch for every dangerous tool:
 | **Web access** | weather, search, facts, calendar fetch |
 | **Control your music (MPD)** | media tools |
 | **Screen access** | screenshots + OCR |
+| **Notifications** | future desktop notification reader; off by default |
+| **Pomodoro / Watchers** | work-break timer and bounded file/process monitoring |
 
 Safety boundaries enforced in code (not just the prompt):
 
@@ -175,6 +180,8 @@ Safety boundaries enforced in code (not just the prompt):
 | `handsfree` | false | continuous listening |
 | `mic_device` / `mic_threshold` | system default / 600 | microphone |
 | `home_place` / `calendar_ics` / `briefing` | — | weather place, ICS sources, morning briefing (mentions mic problems since last time) |
+| `resource_alerts` / `ram_alert_percent` / `vram_alert_percent` | false / 90 / 90 | opt-in crossing alerts for system RAM and NVIDIA VRAM |
+| `notification_reader` / `notification_mute_apps` | false / [] | opt-in future desktop notification reader and muted app names |
 | `workspace_aliases` | `{}` | e.g. `{"code": "2"}` → "go to code" |
 | `permissions` | all true | the switches above |
 
@@ -288,7 +295,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest test_handsoff.py -q     # 298 tests
+python -m pytest test_handsoff.py -q     # 350 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```

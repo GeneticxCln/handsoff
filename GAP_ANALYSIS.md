@@ -2,12 +2,13 @@
 
 Date: 2026-09-06 · All items reflect the state after the reliability hardening
 passed in this session (self-mute fix, mic watchdog, echo rejection, streaming
-TTS, keyboard takeover, settings opener `Mod+Shift+S`, autostart, crash log).
+TTS, keyboard takeover, settings opener `Mod+Shift+S`, autostart, crash log,
+resource alerts, notification reader, Pomodoro, and bounded watchers).
 
 ## Addendum — 2026-09-08 external audit closure
 
 Every priority finding and most "remaining gaps" from the external audit are
-now closed (298 tests green):
+now closed (350 tests green):
 
 - Command whitelist bypass via absolute `niri` paths — closed (basename-keyed
   spawn checks; `TestSpawnInterpreterBoundary` extended).
@@ -31,7 +32,9 @@ now closed (298 tests green):
   committed — pinned by `TestPrecommitHook`.
 
 Still open, accepted consciously: real-hardware acceptance session (mic, echo,
-suspend/resume), CI rehearse-runs of the installer, ICS MONTHLY/YEARLY RRULE.
+suspend/resume), CI rehearse-runs of the installer, ICS MONTHLY/YEARLY RRULE,
+and richer D-Bus notification formatting for applications that emit unusual
+Notify argument layouts.
 
 ## What already works (verified live this session)
 
@@ -45,7 +48,10 @@ suspend/resume), CI rehearse-runs of the installer, ICS MONTHLY/YEARLY RRULE.
 - Ops: niri window rule (round bubble), autostart, keybinds Mod+V / Mod+Shift+V
   / Mod+Shift+H / Mod+Shift+S (settings, works even when the bubble is dead),
   restart script with lock race fixed, faulthandler crash log
-- 298 tests, all green
+- 350 tests, all green
+- Ambient automation: opt-in notification reader, Pomodoro transitions, RAM/VRAM
+  threshold crossings, and bounded file/process watchers; all have Settings
+  controls or safe tool gates
 
 ## P0 — reliability gaps (the bubble must never be a zombie again)
 

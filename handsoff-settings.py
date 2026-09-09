@@ -1019,6 +1019,36 @@ class SettingsWindow(QMainWindow):
             "announce it out loud. Gives up after 3 tries (keeps logging until "
             "the mic recovers, then re-arms).")
         wake_form.addRow(self.selfheal_chk)
+        self.resource_chk = QCheckBox(
+            "Resource alerts — warn when RAM or GPU memory is nearly full", w)
+        self.resource_chk.setToolTip(
+            "Opt-in spoken alerts on threshold crossings. Alerts fire once while "
+            "usage is high and re-arm only after it drops below the threshold.")
+        wake_form.addRow(self.resource_chk)
+        resource_row = QHBoxLayout()
+        self.ram_alert_spin = QSpinBox(w)
+        self.ram_alert_spin.setRange(50, 99)
+        self.ram_alert_spin.setSuffix("%")
+        self.vram_alert_spin = QSpinBox(w)
+        self.vram_alert_spin.setRange(50, 99)
+        self.vram_alert_spin.setSuffix("%")
+        resource_row.addWidget(QLabel("RAM", w))
+        resource_row.addWidget(self.ram_alert_spin)
+        resource_row.addWidget(QLabel("GPU", w))
+        resource_row.addWidget(self.vram_alert_spin)
+        resource_row.addStretch(1)
+        wake_form.addRow("Alert thresholds", resource_row)
+        self.notification_chk = QCheckBox(
+            "Read desktop notifications aloud (opt-in)", w)
+        self.notification_chk.setToolTip(
+            "Private by default. When enabled, future notifications are spoken; "
+            "use the assistant's notification_reader mute action for noisy apps.")
+        wake_form.addRow(self.notification_chk)
+        self.notification_mute_edit = QLineEdit(
+            ", ".join(self.cfg.get("notification_mute_apps") or []), w)
+        self.notification_mute_edit.setPlaceholderText("muted app names, comma-separated")
+        self.notification_mute_edit.setMaximumWidth(260)
+        wake_form.addRow("Muted notification apps", self.notification_mute_edit)
         self.dictation_chk = QCheckBox(
             "Voice dictation — 'start dictation' types what you say into the "
             "focused window (no AI turn); Mod+Shift+D toggles", w)
@@ -1356,6 +1386,11 @@ class SettingsWindow(QMainWindow):
                          "for 'operate this app for me'"),
             "media": ("Control your music (MPD)", "play/pause/skip/search your MPD "
                       "library and set the music volume"),
+            "notifications": ("Read desktop notifications", "opt-in future notification "
+                              "reader; muted apps are filtered"),
+            "pomodoro": ("Pomodoro timer", "work/break timer with spoken transitions"),
+            "watchers": ("File/process watchers", "bounded monitors that announce matching "
+                         "lines or process exits"),
         }
         for key, (title, desc) in labels.items():
             chk = QCheckBox(f"{title} — {desc}", self)
@@ -1591,6 +1626,11 @@ class SettingsWindow(QMainWindow):
         self.spotter_chk.setChecked(bool(self.cfg.get("wake_spotter", False)))
         self.spotter_edit.setText(", ".join(self.cfg.get("spotter_models") or []))
         self.selfheal_chk.setChecked(bool(self.cfg.get("mic_selfheal", True)))
+        self.resource_chk.setChecked(bool(self.cfg.get("resource_alerts", False)))
+        self.ram_alert_spin.setValue(int(float(self.cfg.get("ram_alert_percent", 90.0))))
+        self.vram_alert_spin.setValue(int(float(self.cfg.get("vram_alert_percent", 90.0))))
+        self.notification_chk.setChecked(bool(self.cfg.get("notification_reader", False)))
+        self.notification_mute_edit.setText(", ".join(self.cfg.get("notification_mute_apps") or []))
         self.dictation_chk.setChecked(bool(self.cfg.get("dictation", True)))
         self.brief_chk.setChecked(bool(self.cfg.get("briefing", False)))
         aliases = self.cfg.get("workspace_aliases") or {}
@@ -1628,6 +1668,12 @@ class SettingsWindow(QMainWindow):
         self.cfg["spotter_models"] = [
             x.strip() for x in self.spotter_edit.text().split(",") if x.strip()]
         self.cfg["mic_selfheal"] = self.selfheal_chk.isChecked()
+        self.cfg["resource_alerts"] = self.resource_chk.isChecked()
+        self.cfg["ram_alert_percent"] = float(self.ram_alert_spin.value())
+        self.cfg["vram_alert_percent"] = float(self.vram_alert_spin.value())
+        self.cfg["notification_reader"] = self.notification_chk.isChecked()
+        self.cfg["notification_mute_apps"] = [
+            x.strip().lower() for x in self.notification_mute_edit.text().split(",") if x.strip()][:32]
         self.cfg["dictation"] = self.dictation_chk.isChecked()
         alias_map = {}
         for line in self.alias_edit.toPlainText().splitlines():
