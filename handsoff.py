@@ -170,6 +170,7 @@ DEFAULT_SETTINGS: dict = {
     "calendar_ics": [],        # ICS source(s): https URL(s) and/or .ics file paths
     "wake_spotter": False,     # openWakeWord audio spotter (near-zero CPU wake)
     "spotter_models": ["hey_jarvis"],   # stock: alexa, hey_jarvis, hey_mycroft, timer, weather
+    "followup_seconds": 6.0,   # announce-and-listen: no-wake-word window after a reply
     "briefing": False,         # daily briefing on the first wake word
 }
 
@@ -214,6 +215,7 @@ def coerce_settings(s: dict) -> dict:
         _c = []
     s["calendar_ics"] = _c[:10]
     s["wake_spotter"] = bool(s.get("wake_spotter", False))
+    _num("followup_seconds", float, 0.0, 120.0)   # 0 = feature off
     _sm = s.get("spotter_models", [])
     s["spotter_models"] = ([str(x).strip() for x in _sm if str(x).strip()]
                            if isinstance(_sm, list) else [])
@@ -3258,6 +3260,7 @@ class Assistant(QObject):
         )
         self._empty_streak = 0                   # consecutive empty transcriptions
         self._wake_until = 0.0                   # monotonic: engagement window expiry
+        self._followup_until = 0.0               # monotonic: no-wake-word window after a reply
         self._spotter_wake = False               # last utterance woke via audio spotter
         self._briefing_done_date = ""            # last day the briefing was spoken
         self._last_transcript = ("", 0, 0.0)  # (text, gen, monotonic) per-utterance
@@ -3595,6 +3598,7 @@ class Assistant(QObject):
     def interrupt(self) -> None:
         """Barge-in: any press cancels the current pipeline (speech/thought)."""
         self._cancel.set()
+        self._followup_until = 0.0    # barge-in also closes the follow-up window
         self._listener.reset()
 
     # -- hands-free & remote control --------------------------------------------
@@ -3776,6 +3780,13 @@ class Assistant(QObject):
             # -- wake-word gate (hands-free pre-command) -------------------
             if self._spotter_wake:
                 self._spotter_wake = False     # audio spotter already gated this
+            elif self._handsfree and _tick_now() < self._followup_until:
+                # announce-and-listen: a reply just ended; take ONE follow-up
+                # utterance without the wake word. The listener was live while
+                # the assistant spoke and the echo guard already discarded its
+                # own words, so whatever survives to here is the user.
+                self._followup_until = 0.0     # exactly one utterance per reply
+                log.info("follow-up accepted (no wake word): %s", text)
             elif self._handsfree and SETTINGS.get("wake_word_required"):
                 now = _tick_now()
                 if _is_wake_utt(text):
@@ -4026,6 +4037,16 @@ class Assistant(QObject):
                         play_wav(wav, cancel)
             except Exception:
                 log.exception("TTS failed")
+            # announce-and-listen: a full spoken reply opens a short window in
+            # which the NEXT utterance is taken without the wake word. Only
+            # after natural completion — an interrupted (barged-in) reply
+            # opens nothing, or the barge-in speech would arm its own window.
+            if self._turn_spoke and not cancel.is_set() and self._handsfree \
+                    and float(SETTINGS.get("followup_seconds", 0.0)) > 0.0:
+                self._followup_until = _tick_now() + float(
+                    SETTINGS["followup_seconds"])
+                log.info("follow-up window open for %ss",
+                         SETTINGS["followup_seconds"])
             return
         said: list[str] = []
         while True:
@@ -4054,6 +4075,12 @@ class Assistant(QObject):
             except Exception:
                 log.exception("TTS failed (streaming)")
         self._last_spoken = " ".join(said)
+        # announce-and-listen (streaming path): same arming as above
+        if self._turn_spoke and not cancel.is_set() and self._handsfree \
+                and float(SETTINGS.get("followup_seconds", 0.0)) > 0.0:
+            self._followup_until = _tick_now() + float(
+                SETTINGS["followup_seconds"])
+            log.info("follow-up window open for %ss", SETTINGS["followup_seconds"])
 
     # -- restart bookkeeping ---------------------------------------------------
 

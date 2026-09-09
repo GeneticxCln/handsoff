@@ -865,6 +865,17 @@ class SettingsWindow(QMainWindow):
         self.wake_secs.setSuffix(" s")
         self.wake_secs.setValue(int(float(self.cfg.get("engage_seconds", 45.0))))
         wake_form.addRow("Stay engaged after the wake word", self.wake_secs)
+        self.followup_secs = QSpinBox(w)
+        self.followup_secs.setRange(0, 60)
+        self.followup_secs.setSuffix(" s")
+        self.followup_secs.setSpecialValueText("Off")
+        self.followup_secs.setToolTip(
+            "After each spoken reply, listen for one follow-up without the wake "
+            "word for this many seconds (0 = off). Requires hands-free and the "
+            "wake-word gate to be on.")
+        self.followup_secs.setValue(
+            int(float(self.cfg.get("followup_seconds", 0.0))))
+        wake_form.addRow("Follow-up window after a reply", self.followup_secs)
         self.home_edit = QLineEdit(str(self.cfg.get("home_place", "")), w)
         self.home_edit.setPlaceholderText("e.g. Hamburg")
         self.home_edit.setMaximumWidth(220)
@@ -1434,6 +1445,8 @@ class SettingsWindow(QMainWindow):
         self.wake_name_edit.setText(str(self.cfg.get("assistant_name", "assistant")))
         self.wake_chk.setChecked(bool(self.cfg.get("wake_word_required", False)))
         self.wake_secs.setValue(int(float(self.cfg.get("engage_seconds", 45.0))))
+        self.followup_secs.setValue(
+            int(float(self.cfg.get("followup_seconds", 0.0))))
         self.home_edit.setText(str(self.cfg.get("home_place", "")))
         self.cal_edit.setText(", ".join(self.cfg.get("calendar_ics") or []))
         self.spotter_chk.setChecked(bool(self.cfg.get("wake_spotter", False)))
@@ -1465,6 +1478,7 @@ class SettingsWindow(QMainWindow):
             self.wake_name_edit.text().strip() or H.DEFAULT_SETTINGS["assistant_name"])
         self.cfg["wake_word_required"] = self.wake_chk.isChecked()
         self.cfg["engage_seconds"] = float(self.wake_secs.value())
+        self.cfg["followup_seconds"] = float(self.followup_secs.value())
         self.cfg["home_place"] = self.home_edit.text().strip()
         self.cfg["briefing"] = self.brief_chk.isChecked()
         self.cfg["calendar_ics"] = [

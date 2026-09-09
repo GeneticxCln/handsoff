@@ -3322,3 +3322,100 @@ class TestLiveMicProbe:
             assert fragment in src, fragment
         ce = src[src.index("def closeEvent"):src.index("def closeEvent") + 400]
         assert "_live_probe.stop()" in ce
+
+
+class TestFollowupWindow:
+    """Announce-and-listen: after each spoken reply, ONE follow-up utterance
+    is accepted without the wake word. The window arms only on natural reply
+    completion, is consumed by a single use, and never bypasses the gate for
+    hands-free-off or push-to-talk."""
+
+    @pytest.fixture()
+    def _setup(self, H, monkeypatch):
+        monkeypatch.setattr(H, "transcribe", lambda audio: "what is that tower")
+        monkeypatch.setattr(H, "tts_to_wav", lambda text, wav: None)
+        monkeypatch.setattr(H, "play_wav", lambda wav, cancel: None)
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        monkeypatch.setitem(H.SETTINGS, "followup_seconds", 6.0)
+
+    def _mk(self, H, window):
+        a = H.Assistant.__new__(H.Assistant)
+        a._handsfree = True
+        a._followup_until = window
+        a._wake_until = 0.0
+        a._spotter_wake = False
+        a._models_ready = threading.Event(); a._models_ready.set()
+        a._recently_spoken = ["The capital is Paris."]
+        a._last_transcript = ("", 0, 0.0)
+        a._empty_streak = 0
+        a._try_snooze = lambda *a_: False
+        a._set = lambda gen, state: None
+        return a
+
+    def test_window_accepts_one_followup(self, H, _setup):
+        seen = {}
+        a = self._mk(H, time.monotonic() + 5)
+        a._brain_turn = lambda text, gen, cancel: seen.update(text=text)
+        a._pipeline(np.zeros(16000, dtype="int16"), 0, threading.Event())
+        assert seen.get("text") == "what is that tower"
+        assert a._followup_until == 0.0, "window must be consumed after one use"
+
+    def test_expired_window_still_gated(self, H, _setup):
+        seen = {}
+        a = self._mk(H, 0.0)
+        a._brain_turn = lambda text, gen, cancel: seen.update(text=text)
+        a._pipeline(np.zeros(16000, dtype="int16"), 0, threading.Event())
+        assert "text" not in seen, "expired window must not bypass the wake gate"
+
+    def test_armed_on_full_reply(self, H, _setup):
+        """_speak arms the window only after a spoken reply completes."""
+        a = self._mk(H, 0.0)
+        a._turn_spoke = False
+        cancel = threading.Event()
+        a._speak("Here is your answer.", 0, cancel)
+        assert a._turn_spoke is True
+        assert a._followup_until > time.monotonic(), \
+            "a completed reply must arm the window"
+
+    def test_not_armed_when_cancelled(self, H, _setup):
+        """A barged-in reply must not arm the window."""
+        a = self._mk(H, 0.0)
+        a._turn_spoke = False
+        cancel = threading.Event(); cancel.set()
+        a._speak("partial reply", 0, cancel)
+        assert a._followup_until == 0.0, "barged-in reply must not arm"
+
+    def test_not_armed_when_feature_off_or_ptt(self, H, _setup, monkeypatch):
+        a = self._mk(H, 0.0)
+        a._turn_spoke = False
+        cancel = threading.Event()
+        monkeypatch.setitem(H.SETTINGS, "followup_seconds", 0.0)
+        a._speak("A reply.", 0, cancel)
+        assert a._followup_until == 0.0, "feature off must not arm"
+        monkeypatch.setitem(H.SETTINGS, "followup_seconds", 6.0)
+        a._handsfree = False
+        a._speak("Another reply.", 0, cancel)
+        assert a._followup_until == 0.0, "push-to-talk must not arm"
+
+    def test_interrupt_clears_window(self, H, _setup):
+        a = self._mk(H, time.monotonic() + 5)
+        a._cancel = threading.Event()
+        a._listener = type("L", (), {"reset": lambda self: None})()
+        a.interrupt()
+        assert a._followup_until == 0.0
+
+    def test_snooze_fastpath_runs_before_followup(self, H, _setup):
+        """'snooze' after a reminder announcement must hit the snooze
+        handler, not be consumed as a generic follow-up."""
+        import inspect
+        src = inspect.getsource(H.Assistant._pipeline)
+        assert src.index("_try_snooze") < src.index("_followup_until")
+
+    def test_settings_default_and_coercion(self, H):
+        assert H.DEFAULT_SETTINGS["followup_seconds"] == 6.0
+        # coerce_settings expects a fully-merged dict (defaults first),
+        # exactly how _load_settings and the settings app call it
+        s = {**H.DEFAULT_SETTINGS, "followup_seconds": "abc"}
+        assert H.coerce_settings(s)["followup_seconds"] == 6.0
+        s2 = {**H.DEFAULT_SETTINGS, "followup_seconds": "15"}
+        assert H.coerce_settings(s2)["followup_seconds"] == 15.0

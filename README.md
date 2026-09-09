@@ -11,6 +11,9 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 - **Voice loop** — push-to-talk (hold the bubble) or hands-free with a wake
   word, plus an optional openWakeWord audio spotter that reacts in ~80 ms.
+  Announce-and-listen: after each reply it briefly listens again without the
+  wake word (`followup_seconds`, settings → Voice), so "hey assistant, what's
+  the weather? … and tomorrow?" just works.
 - **Desktop control** — volume, brightness, windows, workspaces, app launch,
   screenshots (vision), typing into apps, compositor hotkeys.
 - **Music** — full MPD control: play/pause, search, volume, now-playing.
@@ -26,7 +29,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All 29 tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 232 tests pin the behavior (`python -m pytest test_handsoff.py`).
+automatically. 250 tests pin the behavior (`python -m pytest test_handsoff.py`).
 
 ## Requirements
 
@@ -165,6 +168,7 @@ Safety boundaries enforced in code (not just the prompt):
 | `history_tokens` | 0 (auto) | history budget; auto = ctx − prompt − reserve |
 | `whisper_size` | `tiny` | STT size; `small` is a good speed/accuracy middle |
 | `assistant_name` / `wake_word_required` / `engage_seconds` | assistant / false / 45 | wake word behavior |
+| `followup_seconds` | 6 (0 = off) | announce-and-listen: seconds after a reply it re-listens without the wake word |
 | `wake_spotter` / `spotter_models` | false / `["hey_jarvis"]` | openWakeWord spotter |
 | `handsfree` | false | continuous listening |
 | `mic_device` / `mic_threshold` | system default / 600 | microphone |
@@ -264,7 +268,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest test_handsoff.py -q     # 232 tests
+python -m pytest test_handsoff.py -q     # 250 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
