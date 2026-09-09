@@ -82,6 +82,34 @@ Still open, accepted consciously: real-hardware acceptance run (see
 RRULE, richer D-Bus notification formatting, and Settings UI rows for
 per-tool command_policy (the JSON path and dry-run checkbox exist).
 
+## Addendum — 2026-09-09 hardening audit (post-merge review)
+
+Edge-case audit of `_prepare_runtime` / `_remove_stale_control_socket` (24
+new tests in `tests/test_hardening.py`; total 429):
+
+- **Fixed, was a real wedge**: a stale control socket left permissive
+  (e.g. created under umask 000) made `_secure_file` refuse it — and since
+  `_prepare_runtime` runs at every startup, the bubble could never start
+  again until manual removal. Sockets owned by us are now tightened in
+  place (chmod 0600), like regular files already were.
+- **Fixed, silent failure**: the doctor never looked at the control-socket
+  path; a startup-blocking socket problem (symlink, foreign owner, not a
+  socket) is now reported explicitly (`REFUSES STARTUP …`).
+- **Fixed, short-circuit**: `all(generator)` in `_secure_runtime_files`
+  stopped hardening at the first bad file; now every file is processed and
+  the AND is returned.
+- **Fixed**: `acquire_lock` now chmods `handsoff.lock` to 0600 explicitly
+  (the pid inside is runtime state).
+- **Pinned by tests**: symlink (incl. broken), directory, foreign-owned,
+  regular-file-at-path refusals for dirs, files, and the socket; live
+  socket bind under umask 000 self-heals; `_serve` bails out cleanly
+  without binding when `_prepare_runtime` refuses.
+- **Accepted consciously**: final-component-only symlink checks (parent
+  components are mitigated by the resolved-target uid check); the inherent
+  lstat→unlink TOCTOU window in single-user session space.
+- Removed a dead pre-computed `.json.tmp` path in `_persist_setting` that
+  invited reintroducing the predictable-temp-name race.
+
 ## Addendum — 2026-09-08 external audit closure
 
 Every priority finding and most "remaining gaps" from the external audit are
@@ -94,7 +122,11 @@ now closed (350 tests green):
 - Post-fire spoken snooze — closed (offer cleared only after re-arm).
 - Reminder read-modify-write race — closed (`REMINDERS_LOCK` transaction).
 - Installer: `pacman -Syu`, single autostart owner, checksum-verified existing
-  downloads.
+  downloads, per-package python-target probing (CachyOS ships neither
+  python-pyside6 nor python-sounddevice; pacman aborts the whole transaction
+  on unknown targets — pip fallback), and restart of an already-active
+  service so the live bubble runs the just-installed code (pinned in
+  tests/test_lifecycle.py).
 - Qt teardown emit — guarded; `PytestUnhandledThreadExceptionWarning` fails CI.
 - README.md — written (install, permissions, troubleshooting, recovery).
 - CI — `.github/workflows/ci.yml` + `pytest.ini`.

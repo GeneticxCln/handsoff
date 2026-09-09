@@ -51,10 +51,16 @@ Legend: ☐ pending · ✅ pass · ❌ fail (note why below the line)
 
 ## 5. ydotool / typing (P1)
 
-- ☐ `ydotoold` is running (`systemctl --user status ydotoold`)
-- ☐ Focus a text editor, ask it to type a sentence → text lands in the app
+- ✅ ydotoold is running (Arch user unit: `systemctl --user status ydotool.service`;
+   other distros: `ydotoold.service`). Verified 2026-09-09: daemon reachable at
+   `/run/user/1000/.ydotool_socket`, doctor reports `ydotool: ok (daemon reachable …)`
+- ✅ Type into a focused editor → text lands in the app. Verified 2026-09-09:
+   `type_text "handsoff ydotool e2e 2026-09-09"` into gnome-text-editor →
+   "typed 31 chars into org.gnome.TextEditor", full-screen OCR read the exact
+   string back off the screen
 - ☐ Typing into a *focused terminal* is refused; typing with unknown focus
-  fails closed with an explanation
+  fails closed with an explanation (unit-tested in tests/test_desktop.py;
+  verify once on real hardware with a visible terminal)
 - ☐ `press_keys "ctrl+c"` copies from the focused app
 
 ## 6. niri IPC & desktop actions (P1)

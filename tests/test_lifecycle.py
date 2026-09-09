@@ -329,9 +329,35 @@ class TestRestartResilience:
         text = (HERE / "install.sh").read_text()
         assert "\nRestart=always" in text
 
+    def test_pacman_python_targets_probed_individually(self):
+        """CachyOS has no python-pyside6/python-sounddevice in its repos; pacman
+        aborts the WHOLE transaction on an unknown target, which killed the
+        entire install. Each python target must be probed and skipped, with
+        requirements.txt as the fallback provider."""
+        text = (HERE / "install.sh").read_text()
+        assert 'pacman -Si "$p"' in text, "python targets must be probed per-package"
+        assert "$ARCH_PKGS" in text, "transaction must use the probed package list"
+        assert "-Syu --needed --noconfirm $ARCH_PKGS" in text
+
+    def test_installer_restarts_active_service(self):
+        """An already-running bubble keeps executing the OLD code after a new
+        install until restarted — the manifest would say in-sync while the
+        live process serves stale logic. The installer must restart it."""
+        text = (HERE / "install.sh").read_text()
+        assert "systemctl --user is-active --quiet handsoff.service" in text
+        assert "systemctl --user restart handsoff.service" in text
+
     def test_lock_retry_budget_covers_restart_window(self, H):
         """The lock retry loop must outlast the restart script's kill+wait window."""
         assert H.LOCK_RETRIES * H.LOCK_RETRY_WAIT >= 8.0
+
+    def test_installer_enables_correct_ydotoold_unit(self):
+        """Arch's user unit is ydotool.service (it starts ydotoold); requiring
+        ydotoold.service only made the installer print a WARN while typing
+        tools stayed offline despite a perfectly startable unit."""
+        text = (HERE / "install.sh").read_text()
+        assert "for u in ydotool.service ydotoold.service" in text
+        assert "ydotoold running via" in text
 
     def test_lock_failure_logs_instead_of_silent_exit(self, H, monkeypatch):
         """If the lock can't be acquired, say so in the log (no more silent vanish)."""

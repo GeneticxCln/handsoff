@@ -78,6 +78,98 @@ class TestKeyboardTakeover:
         out, err = belt.execute("type_text", {"text": "x" * (belt._MAX_TYPE + 1)})
         assert err and out.startswith("REFUSED")
 
+
+class TestYdotooldSocket:
+    """The ydotool CLI's compiled-in default is /tmp/.ydotool_socket, but the
+    user-level daemon (Arch: ydotool.service) listens on $XDG_RUNTIME_DIR —
+    and binds SOCK_DGRAM, which a stream probe can never connect to. Every
+    type/click used to die with 'failed to connect' while the daemon ran fine."""
+
+    @pytest.fixture()
+    def belt(self, H):
+        H.ToolBelt._YDOTOOL_SOCK_CACHE.clear()
+        yield H.ToolBelt(on_restart_pending=lambda: None)
+        H.ToolBelt._YDOTOOL_SOCK_CACHE.clear()
+
+    def _bind_dgram(self, path):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        s.bind(str(path))
+        return s
+
+    def test_probe_accepts_dgram_daemon(self, belt, tmp_path):
+        sock = self._bind_dgram(tmp_path / "d")
+        try:
+            assert belt._socket_connectable(str(tmp_path / "d"))
+        finally:
+            sock.close()
+        assert not belt._socket_connectable(str(tmp_path / "d"))  # dead path
+
+    def test_probe_rejects_non_sockets(self, belt, tmp_path):
+        f = tmp_path / "f"
+        f.write_text("not a socket")
+        assert not belt._socket_connectable(str(f))
+        assert not belt._socket_connectable(str(tmp_path / "missing"))
+
+    def test_resolver_prefers_runtime_socket(self, belt, tmp_path, monkeypatch):
+        monkeypatch.setattr(belt, "YDOTOOL_SOCKET", str(tmp_path / "legacy"))
+        runtime = tmp_path / "run"
+        runtime.mkdir()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+        s = self._bind_dgram(runtime / ".ydotool_socket")
+        try:
+            assert belt._ydotool_socket() == str(runtime / ".ydotool_socket")
+        finally:
+            s.close()
+
+    def test_resolver_falls_back_to_legacy_socket(self, belt, tmp_path, monkeypatch):
+        monkeypatch.setattr(belt.__class__, "YDOTOOL_SOCKET", str(tmp_path / "legacy"))
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        s = self._bind_dgram(tmp_path / "legacy")
+        try:
+            assert belt._ydotool_socket() == str(tmp_path / "legacy")
+        finally:
+            s.close()
+
+    def test_resolver_survives_no_daemon(self, belt, tmp_path, monkeypatch):
+        """No daemon anywhere: return the first candidate (the call itself
+        will fail loudly) instead of raising."""
+        monkeypatch.setattr(belt.__class__, "YDOTOOL_SOCKET", str(tmp_path / "none"))
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        assert belt._ydotool_socket() == str(tmp_path / "none")
+
+    def test_ydotool_call_points_env_at_resolved_socket(self, H, belt, tmp_path, monkeypatch):
+        target = str(tmp_path / "legacy")
+        monkeypatch.setattr(belt.__class__, "YDOTOOL_SOCKET", target)
+        monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+        s = self._bind_dgram(tmp_path / "legacy")
+        try:
+            seen = {}
+            class R:
+                returncode, stdout, stderr = 0, "", ""
+            def fake_run(argv, **kw):
+                seen.update(argv=argv, env=kw.get("env"))
+                return R()
+            monkeypatch.setattr(H.subprocess, "run", fake_run)
+            assert belt._ydotool("type", "--", "hi") == "ok"
+            assert seen["argv"] == ["ydotool", "type", "--", "hi"]
+            assert seen["env"]["YDOTOOL_SOCKET"] == target
+        finally:
+            s.close()
+
+    def test_doctor_reports_daemon_reachability(self, H, monkeypatch):
+        """Doctor must distinguish 'binary present but daemon dead' from ok —
+        the binary check alone called a broken setup healthy."""
+        monkeypatch.setattr(H.shutil, "which", lambda n: "/usr/bin/ydotool")
+        monkeypatch.setattr(H.ToolBelt, "_ydotool_socket",
+                            classmethod(lambda cls: "/nonexistent/ydotool"))
+        monkeypatch.setattr(H.ToolBelt, "_socket_connectable", staticmethod(lambda p: False))
+        text = H.run_doctor()
+        assert "UNREACHABLE" in text
+        assert "ydotool.service" in text          # tells the user how to fix it
+        monkeypatch.setattr(H.ToolBelt, "_socket_connectable", staticmethod(lambda p: True))
+        text = H.run_doctor()
+        assert "daemon reachable" in text
+
     def test_press_keys_enter(self, belt, monkeypatch):
         calls = []
         # hermetic: never depend on the live desktop focus (CI has no niri,

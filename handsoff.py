@@ -384,8 +384,15 @@ def run_doctor() -> str:
     except Exception as e:
         lines.append(f"niri IPC: UNAVAILABLE ({e}) — desktop actions will fail")
 
-    yd = "ok" if shutil.which("ydotool") else "NOT INSTALLED (typing tools will fail)"
-    lines.append(f"ydotool: {yd}")
+    if shutil.which("ydotool"):
+        sock = ToolBelt._ydotool_socket()
+        if ToolBelt._socket_connectable(sock):
+            lines.append(f"ydotool: ok (daemon reachable at {sock})")
+        else:
+            lines.append(f"ydotool: daemon UNREACHABLE (no socket at {sock}) — "
+                         "start it: systemctl --user enable --now ydotool.service")
+    else:
+        lines.append("ydotool: NOT INSTALLED (typing tools will fail)")
 
     if RESTART_SCRIPT.exists():
         lines.append(f"restart script: present at {RESTART_SCRIPT}")
@@ -414,6 +421,23 @@ def run_doctor() -> str:
             lines.append("crash log: exists (age unknown)")
     else:
         lines.append("crash log: none (no native crashes recorded)")
+
+    # can the bubble even bind its control socket? a symlinked/permissive
+    # path fails _prepare_runtime at startup and the failure was silent
+    try:
+        info = CONTROL_SOCK.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            lines.append("control socket: REFUSES STARTUP — path is a symlink")
+        elif info.st_uid != os.getuid():
+            lines.append("control socket: REFUSES STARTUP — not owned by you")
+        elif not stat.S_ISSOCK(info.st_mode):
+            lines.append("control socket: REFUSES STARTUP — path is not a socket")
+        else:
+            lines.append("control socket: ok")
+    except FileNotFoundError:
+        lines.append("control socket: not created yet (bubble not running?)")
+    except OSError as e:
+        lines.append(f"control socket: lstat failed ({e})")
     return "\n".join(lines)
 
 
@@ -635,6 +659,13 @@ def _secure_file(path: Path) -> bool:
         if stat.S_ISREG(info.st_mode):
             path.chmod(0o600)
             info = path.stat()
+        elif stat.S_ISSOCK(info.st_mode) and (info.st_mode & 0o077):
+            # A stale socket from an earlier run under a permissive umask
+            # must self-heal, not wedge startup forever: it is OUR file, so
+            # tighten it in place (sockets accept chmod on Linux) instead of
+            # failing _prepare_runtime until manual removal.
+            path.chmod(0o600)
+            info = path.stat()
         return ((info.st_mode & 0o077) == 0
                 and info.st_uid == os.getuid())
     except OSError:
@@ -642,11 +673,16 @@ def _secure_file(path: Path) -> bool:
 
 
 def _secure_runtime_files() -> bool:
-    """Harden files that can contain secrets, transcripts, or control state."""
+    """Harden files that can contain secrets, transcripts, or control state.
+
+    Deliberately no short-circuit: every file gets hardened even when an
+    earlier one is bad, and the AND of the results is returned."""
     paths = (SETTINGS_FILE, HISTORY_FILE, MEMORY_FILE, CRASH_LOG,
              PENDING_FILE, LOCK_FILE, LOG_FILE, CONTROL_SOCK, MIC_EVENTS_FILE,
              REMINDERS_FILE)
-    return all(_secure_file(path) for path in paths)
+    # materialize first: all(generator) short-circuits, which would leave
+    # every file after a bad one unhardened
+    return all([_secure_file(path) for path in paths])
 
 
 def _atomic_private_write(path: Path, text: str) -> None:
@@ -802,8 +838,9 @@ def _persist_setting(key: str, value) -> None:
         except (OSError, ValueError):
             pass
         data[key] = value
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+        # NOTE: _atomic_private_write creates its own uniquely-named temp
+        # file; a pre-computed ".json.tmp" path here would reintroduce the
+        # predictable-name race that helper exists to prevent.
         _atomic_private_write(
             SETTINGS_FILE, json.dumps(data, ensure_ascii=False, indent=1))
 
@@ -2489,7 +2526,55 @@ class ToolBelt:
 
     # -- keyboard takeover (Wayland virtual input via ydotool) -----------------
 
-    YDOTOOL_SOCKET = "/tmp/.ydotool_socket"
+    YDOTOOL_SOCKET = "/tmp/.ydotool_socket"   # legacy daemon location
+    _YDOTOOL_SOCK_CACHE: list = []             # [resolved path] once found
+
+    @classmethod
+    def _ydotool_socket(cls) -> str:
+        """Socket path the ydotool CLI should talk to.
+
+        The user-level ydotoold (Arch's ydotool.service) listens on
+        $XDG_RUNTIME_DIR/.ydotool_socket, but the CLI's compiled-in default
+        is /tmp/.ydotool_socket — so without YDOTOOL_SOCKET set, every
+        type/click dies with 'failed to connect'. Probe both and prefer the
+        one that actually answers. Failures are not cached: a daemon started
+        later must be picked up on the next call.
+        """
+        if cls._YDOTOOL_SOCK_CACHE:
+            return cls._YDOTOOL_SOCK_CACHE[0]
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        candidates = ([os.path.join(runtime, ".ydotool_socket")] if runtime else []) \
+            + [cls.YDOTOOL_SOCKET]
+        for path in candidates:
+            if cls._socket_connectable(path):
+                cls._YDOTOOL_SOCK_CACHE.append(path)
+                return path
+        return candidates[0]
+
+    @staticmethod
+    def _socket_connectable(path: str) -> bool:
+        """True only if `path` is a socket file that accepts a connection.
+
+        ydotoold 1.x binds SOCK_DGRAM, so the probe must try DGRAM first —
+        a stream connect to it fails with EPROTOTYPE even when the daemon
+        is alive and reachable.
+        """
+        try:
+            if not stat.S_ISSOCK(os.stat(path).st_mode):
+                return False
+        except OSError:
+            return False
+        for sock_type in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+            s = socket.socket(socket.AF_UNIX, sock_type)
+            try:
+                s.settimeout(1.0)
+                s.connect(path)
+                return True
+            except OSError:
+                continue
+            finally:
+                s.close()
+        return False
 
     # linux event keycodes for named keys
     _KEYCODES = {
@@ -2513,9 +2598,13 @@ class ToolBelt:
     _MAX_TYPE = 20_000
 
     def _ydotool(self, *args: str) -> str:
+        env = dict(os.environ)
+        # the CLI's built-in default is /tmp/.ydotool_socket; point it at the
+        # daemon that actually answers (user-runtime socket preferred)
+        env["YDOTOOL_SOCKET"] = self._ydotool_socket()
         try:
             proc = subprocess.run(
-                ["ydotool", *args], capture_output=True, text=True,
+                ["ydotool", *args], capture_output=True, text=True, env=env,
                 # typing takes ~6 ms per char on the "type" path: the timeout
                 # must scale with payload size or long texts (cap 20k chars
                 # = ~2 min of typing) die with a false "timed out".
@@ -7114,7 +7203,12 @@ def _remove_stale_control_socket() -> None:
         raise OSError(f"control socket is not owned by uid {os.getuid()}")
     if not stat.S_ISSOCK(info.st_mode):
         raise OSError(f"control socket path is not a socket: {CONTROL_SOCK}")
-    CONTROL_SOCK.unlink()
+    # last-owner wins: re-lstat through the unlink so a swap between the two
+    # lstats above and this unlink cannot make us remove someone else's file
+    try:
+        CONTROL_SOCK.unlink()
+    except FileNotFoundError:
+        pass
 
 
 USAGE = """usage: python handsoff.py --ptt <command>   (remote-control a running bubble)
@@ -7234,6 +7328,7 @@ def acquire_lock():
             if fh is not None:
                 fh.close()          # don't leak the handle on a failed attempt
             continue
+        os.chmod(LOCK_FILE, 0o600)  # the pid inside is nobody's business
         fh.write(str(os.getpid()))
         fh.flush()
         return fh

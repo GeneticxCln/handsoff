@@ -74,8 +74,20 @@ echo "    refreshing databases and upgrading the system (supported Arch policy)"
 # Feature deps provisioned here so advertised tools work out of the box:
 # ydotool (typing/keys), wl-clipboard (clipboard), grim (screenshots),
 # tesseract (OCR), mpc (music control).
-sudo pacman -Syu --needed --noconfirm \
-    python-pyside6 python-sounddevice python-numpy python-pip \
+# Python targets are probed per-package first: CachyOS (and other Arch
+# derivatives) don't ship python-pyside6/python-sounddevice in their repos,
+# and pacman aborts the WHOLE transaction on any unknown target. Whatever
+# pacman can't provide comes from requirements.txt, so a skip is safe.
+PYTHON_PKGS="python-pyside6 python-sounddevice python-numpy python-pip"
+ARCH_PKGS=""
+for p in $PYTHON_PKGS; do
+    if pacman -Si "$p" >/dev/null 2>&1; then
+        ARCH_PKGS="$ARCH_PKGS $p"
+    else
+        echo "    note: $p is not in this distro's repos — requirements.txt provides it via pip"
+    fi
+done
+sudo pacman -Syu --needed --noconfirm $ARCH_PKGS \
     alsa-utils ollama curl \
     ydotool wl-clipboard grim tesseract mpc
 
@@ -200,11 +212,35 @@ TimeoutStartSec=30
 WantedBy=graphical-session.target
 UNIT_EOF
 if systemctl --user daemon-reload 2>/dev/null; then
-    # ydotoold must be running for ydotool (typing/keys) to work at all
-    systemctl --user enable --now ydotoold.service 2>/dev/null \
-        || echo "    WARN: could not enable ydotoold — typing tools will error until it runs"
+    # ydotoold must be running for ydotool (typing/keys) to work at all.
+    # Arch's USER unit is ydotool.service (it starts ydotoold); other distros
+    # ship ydotoold.service — enable whichever exists, warn only if neither.
+    YDOTOOL_UNIT=""
+    for u in ydotool.service ydotoold.service; do
+        if systemctl --user enable --now "$u" 2>/dev/null; then
+            YDOTOOL_UNIT="$u"
+            break
+        fi
+    done
+    if [ -n "$YDOTOOL_UNIT" ]; then
+        echo "    ydotoold running via $YDOTOOL_UNIT — typing tools online"
+    else
+        echo "    WARN: no ydotoold unit found (tried ydotool.service, ydotoold.service) —"
+        echo "    typing tools will error until the daemon runs"
+    fi
     systemctl --user enable handsoff.service 2>/dev/null || true
-    echo "    installed + enabled: systemctl --user start handsoff   (auto-restarts on crash)"
+    # a bubble that is ALREADY running keeps executing the old code until it
+    # is restarted — the manifest would report in-sync while the live process
+    # serves stale logic (exactly the drift the doctor exists to expose).
+    if systemctl --user is-active --quiet handsoff.service; then
+        echo "    bubble is running — restarting to load the new code"
+        systemctl --user restart handsoff.service || true
+    fi
+    if systemctl --user is-active --quiet handsoff.service; then
+        echo "    installed + running with the new code: journalctl --user -u handsoff -f"
+    else
+        echo "    installed + enabled: systemctl --user start handsoff   (auto-restarts on crash)"
+    fi
     echo "    note: systemd now owns autostart — do NOT also add handsoff to niri's spawn-at-startup"
 else
     echo "    WARN: systemd user session not reachable; keeping niri spawn-at-startup as the autostart"
@@ -254,7 +290,11 @@ echo
 echo "handsoff installed."
 echo "  1. Merge $CONF_DIR/niri-window-rule.kdl into ~/.config/niri/config.kdl"
 echo "     then: niri msg action reload-config"
-echo "  2. Start it now with:  systemctl --user start handsoff  (or: python ~/.local/bin/handsoff.py)"
+if systemctl --user is-active --quiet handsoff.service 2>/dev/null; then
+    echo "  2. running with the new code — verify with:  python ~/.local/bin/handsoff.py --ptt doctor"
+else
+    echo "  2. Start it now with:  systemctl --user start handsoff  (or: python ~/.local/bin/handsoff.py)"
+fi
 echo "  3. Verify the deployment:  python ~/.local/bin/handsoff.py --ptt doctor"
 echo "  4. Uninstall anytime with:  $0 --uninstall"
 

@@ -264,13 +264,16 @@ class TestWakeWord:
     def test_prompt_mentions_name(self, H):
         assert "WAKE WORD" in H.SYSTEM_PROMPT
 
-    def test_bulk_typing_single_call(self, H):
+    def test_bulk_typing_single_call(self, H, monkeypatch):
         """type_text issues ONE ydotool call for short text (the old chunk
         loop made ~1 call per 32 chars + sleeps: ~30x slower)."""
         belt = H.ToolBelt(on_restart_pending=lambda: None)
         calls = []
         belt._ydotool = lambda *a: (calls.append(a), "ok")[1]
-        belt._focused_is_terminal = lambda: None
+        # stub the CURRENT seam (a live _typing_guard would consult real niri
+        # focus and fail closed whenever a terminal happens to be focused)
+        monkeypatch.setattr(belt, "_focused_window_info",
+                            lambda: {"app_id": "firefox", "title": "Firefox"})
         out, err = belt.execute("type_text", {"text": "hello beautiful world"})
         assert not err and "typed" in out
         assert len(calls) == 1 and "hello beautiful world" in calls[0]
