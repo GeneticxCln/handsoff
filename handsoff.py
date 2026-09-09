@@ -158,6 +158,9 @@ DEFAULT_SETTINGS: dict = {
         "web_access": True,
         "media": True,
         "screen_access": True,
+        "operator": False,    # mouse control (click_element/click_at) — OFF by
+                              # default; enabling lets the AI move and click
+                              # the real pointer
         "paste_text": True,   # reading the user's clipboard gets its own switch
         "copy_text": True,    # writing the user's clipboard
         "reminders": True,    # create/list/cancel/snooze spoken reminders
@@ -480,6 +483,12 @@ IMPORTANT:
 - Call these tools DIRECTLY — they are NOT shell commands; run_command refuses ydotool by design. Do NOT open the overview or run niri to "find" the window; the user already focused it. Just type and report what you typed.
 - A REFUSED run_command result means 'not whitelisted', NEVER 'not installed'.
 - Never type into a terminal. To replace input: press_keys "ctrl+a" then type_text; to send: type_text then "enter". For a specific app: focus_window first.
+
+OPERATOR — clicking UI elements (only if the 'operator' permission is enabled)
+- To click something on screen: run screen_elements (lists numbered text elements with positions), then click_element with the number or (part of the) text. Prefer this over guessing pixels.
+- click_at(x, y) is the fallback for icon-only UI. Re-run screen_elements after the screen changes — element numbers go stale.
+- You may not have the 'operator' permission; if a click is REFUSED, say so and ask the user to click it themselves — never retry.
+- Max a few clicks per request: act, re-scan, report. If it is not working, say what you see and stop.
 
 REMINDERS — set_reminder, list_reminders, cancel_reminder, snooze_reminder, calendar_month
 - "remind me to X in N minutes" → set_reminder(wake_name="X", when_due="in N minutes").
@@ -2887,6 +2896,121 @@ class ToolBelt:
             return "OCR found no readable text on screen."
         log.info("read_screen_text: %d chars", len(text))
         return f"Text on screen: {text[:4000]}"
+
+    # -- operator: element-grounded clicking (Self-Operating-Computer pattern) --
+
+    @staticmethod
+    def _parse_tsv(tsv: str) -> list[dict]:
+        """Tesseract TSV -> line-level elements with pixel boxes.
+
+        Rows: level page block par line word left top width height conf text.
+        Words are grouped by (block, par, line) into one element per visual
+        line, keeping the union bounding box and the mean confidence."""
+        rows: dict[tuple, list] = {}
+        for line in tsv.splitlines()[1:]:
+            parts = line.split("\t")
+            if len(parts) < 12:
+                continue
+            try:
+                level, blk, par, ln = (int(parts[0]), int(parts[2]),
+                                       int(parts[3]), int(parts[4]))
+                x, y, w, h, conf = (int(parts[6]), int(parts[7]),
+                                    int(parts[8]), int(parts[9]),
+                                    float(parts[10]))
+            except ValueError:
+                continue
+            word = parts[11].strip()
+            if level != 5 or not word or conf < 30:
+                continue
+            rows.setdefault((blk, par, ln), []).append((x, y, w, h, word))
+        out = []
+        for words in rows.values():
+            words.sort(key=lambda t: t[0])
+            x0 = min(w[0] for w in words)
+            y0 = min(w[1] for w in words)
+            x1 = max(w[0] + w[2] for w in words)
+            y1 = max(w[1] + w[3] for w in words)
+            out.append({"text": " ".join(w[4] for w in words),
+                        "x": (x0 + x1) // 2, "y": (y0 + y1) // 2,
+                        "w": x1 - x0, "h": y1 - y0})
+        out.sort(key=lambda e: (e["y"], e["x"]))
+        return out[:80]
+
+    def _screen_elements_fmt(self) -> str:
+        listing = "\n".join(
+            f"{i + 1}. {e['text'][:70]!r} at ({e['x']},{e['y']})"
+            for i, e in enumerate(getattr(self, "_elements", [])[:80]))
+        return listing
+
+    def _operator_click(self, x: int, y: int, what: str) -> str:
+        if not self._perm.get("operator", False):
+            return ("REFUSED: mouse control ('operator') is disabled in "
+                    "handsoff settings")
+        try:
+            x, y = int(x), int(y)
+            assert 0 <= x <= 20000 and 0 <= y <= 20000
+        except (TypeError, ValueError, AssertionError):
+            return f"ERROR: invalid click target ({x}, {y})"
+        r1 = self._ydotool("mousemove", "-a", "-x", str(x), "-y", str(y))
+        if r1 != "ok":
+            return f"ERROR: mouse move failed: {r1}"
+        r2 = self._ydotool("click", "0xC0")
+        if r2 != "ok":
+            return f"ERROR: click failed: {r2}"
+        log.info("operator: clicked %s at (%d,%d)", what, x, y)
+        return f"clicked {what} at ({x},{y})"
+
+    @tool(gates="screen_access", description=(
+        "List clickable text elements on screen with numbers and positions. "
+        "Run this before click_element; re-run after anything changes."))
+    def screen_elements(self) -> str:
+        if not hasattr(self, "_elements"):
+            self._elements = []
+        err = self._take_screenshot("", scale_down=False)
+        if err:
+            return err
+        try:
+            proc = subprocess.run(
+                ["tesseract", str(self.SCREENSHOT_FILE), "stdout", "tsv"],
+                capture_output=True, text=True, timeout=40)
+        except FileNotFoundError:
+            return "ERROR: tesseract is not installed (pacman -S tesseract)"
+        except subprocess.TimeoutExpired:
+            return "ERROR: OCR timed out"
+        self._elements = self._parse_tsv(proc.stdout)
+        if not self._elements:
+            return "No clickable text elements found on screen."
+        log.info("screen_elements: %d lines", len(self._elements))
+        return (f"{len(self._elements)} clickable text elements:\n"
+                + self._screen_elements_fmt())
+
+    @tool(gates="operator", description=(
+        "Click a text element from the last screen_elements scan by its "
+        "number or (part of) its text. Run screen_elements first."),
+        aliases={"ref": ("element", "name", "label", "target")})
+    def click_element(self, ref: str) -> str:
+        els = getattr(self, "_elements", [])
+        if not els:
+            return "ERROR: no element scan yet — run screen_elements first"
+        ref_s = str(ref).strip().lower()
+        pick = None
+        if ref_s.isdigit() and 1 <= int(ref_s) <= len(els):
+            pick = els[int(ref_s) - 1]
+        else:
+            exact = [e for e in els if ref_s == e["text"].strip().lower()]
+            part = [e for e in els if ref_s in e["text"].strip().lower()]
+            pick = (exact or part or [None])[0]
+        if pick is None:
+            return (f"ERROR: no element matching {ref!r} — run screen_elements "
+                    "again and pick from the list")
+        return self._operator_click(pick["x"], pick["y"],
+                                    repr(pick["text"][:40]))
+
+    @tool(gates="operator", description=(
+        "Click at absolute pixel coordinates. Prefer click_element with a "
+        "screen_elements scan."))
+    def click_at(self, x: int, y: int) -> str:
+        return self._operator_click(x, y, "target")
 
     # -- app launching (focused, safe aliases) ---------------------------------
 

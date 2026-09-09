@@ -1351,6 +1351,9 @@ class SettingsWindow(QMainWindow):
                            "web search (DuckDuckGo) — read-only, fixed endpoints"),
             "screen_access": ("See the screen", "screenshots + OCR of your display; the "
                               "AI can look at what you look at"),
+            "operator": ("Mouse control", "move the pointer and click UI elements "
+                         "(click_element by OCR text, click_at by pixel) — needed "
+                         "for 'operate this app for me'"),
             "media": ("Control your music (MPD)", "play/pause/skip/search your MPD "
                       "library and set the music volume"),
         }

@@ -4461,3 +4461,95 @@ class TestPermissionCoverage:
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
         for key in ("copy_text", "reminders", "calendar", "focus_window"):
             assert f'"{key}":' in src      # a labelled row exists
+
+
+class TestOperator:
+    """OCR-grounded clicking (Self-Operating-Computer pattern, Wayland
+    edition): screen_elements scans clickable text lines via tesseract TSV,
+    click_element clicks by number/text, click_at by pixel — all behind the
+    operator permission (default OFF)."""
+
+    TSV = ("level\tpage\tblock\tpar\tline\tword\tleft\ttop\twidth\theight\tconf\ttext\n"
+           "5\t1\t1\t1\t1\t1\t100\t200\t60\t20\t95\tFile\n"
+           "5\t1\t1\t1\t1\t2\t170\t200\t50\t20\t95\tEdit\n"
+           "5\t1\t1\t1\t2\t1\t100\t300\t80\t20\t92\tSettings\n")
+
+    def _tb(self, H, operator=True):
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {**H.DEFAULT_SETTINGS["permissions"], "operator": operator}
+        tb._elements = H.ToolBelt._parse_tsv(self.TSV)
+        calls = []
+        tb._ydotool = lambda *args: calls.append(args) or "ok"
+        return tb, calls
+
+    def test_parse_tsv_groups_lines_and_centers(self, H):
+        els = H.ToolBelt._parse_tsv(self.TSV)
+        assert [e["text"] for e in els] == ["File Edit", "Settings"]
+        assert els[0]["x"] == 160 and els[0]["y"] == 210
+        assert els[1]["x"] == 140 and els[1]["y"] == 310
+
+    def test_parse_tsv_drops_junk_and_low_conf(self, H):
+        tsv = self.TSV + "5\t1\t2\t1\t1\t1\t0\t0\t0\t0\t-1\t~\n"
+        els = H.ToolBelt._parse_tsv(tsv)
+        assert len(els) == 2                      # junk row dropped
+        assert H.ToolBelt._parse_tsv("garbage") == []
+
+    def test_click_element_disabled_by_default(self, H):
+        tb, _ = self._tb(H, operator=False)
+        r = tb.click_element("Settings")
+        assert r.startswith("REFUSED") and "operator" in r
+
+    def test_click_element_by_text_and_number(self, H):
+        tb, calls = self._tb(H)
+        assert "clicked" in tb.click_element("settings")
+        assert calls[0] == ("mousemove", "-a", "-x", "140", "-y", "310")
+        assert calls[1] == ("click", "0xC0")
+        tb.click_element("1")
+        assert calls[2] == ("mousemove", "-a", "-x", "160", "-y", "210")
+
+    def test_click_element_exact_wins_over_partial(self, H):
+        tb, calls = self._tb(H)
+        tb._elements = tb._elements + [{"text": "Settings page",
+                                        "x": 5, "y": 5, "w": 2, "h": 2}]
+        tb.click_element("Settings")
+        assert calls[0][3] == "140"               # exact 'Settings', not partial
+
+    def test_click_element_no_scan(self, H):
+        tb, _ = self._tb(H)
+        tb._elements = []
+        assert "screen_elements" in tb.click_element("File")
+
+    def test_click_element_no_match(self, H):
+        tb, calls = self._tb(H)
+        r = tb.click_element("nonexistent button")
+        assert r.startswith("ERROR") and "screen_elements" in r
+        assert not calls                          # nothing was clicked
+
+    def test_click_at_and_bounds(self, H):
+        tb, calls = self._tb(H)
+        assert "clicked" in tb.click_at(500, 300)
+        assert calls[0] == ("mousemove", "-a", "-x", "500", "-y", "300")
+        assert tb.click_at(-5, 100).startswith("ERROR")
+        assert tb.click_at(999999, 1).startswith("ERROR")
+
+    def test_screen_elements_registers_and_lists(self, H, monkeypatch, tmp_path):
+        tb, _ = self._tb(H)
+        monkeypatch.setattr(tb, "_take_screenshot", lambda *a, **k: "")
+        monkeypatch.setattr(H.ToolBelt, "SCREENSHOT_FILE", tmp_path / "s.png")
+        monkeypatch.setattr(H, "subprocess", types.SimpleNamespace(
+            run=lambda *a, **k: types.SimpleNamespace(
+                stdout=self.TSV, returncode=0),
+            TimeoutExpired=subprocess.TimeoutExpired))
+        out = tb.screen_elements()
+        assert "2 clickable" in out and "1. 'File Edit'" in out
+        assert tb._elements and tb._elements[0]["text"] == "File Edit"
+
+    def test_operator_tool_registered(self, H):
+        reg = H.ToolBelt(on_restart_pending=lambda: None)
+        names = set(reg._tool_methods().keys())
+        assert {"screen_elements", "click_element", "click_at"} <= names
+
+    def test_settings_row_exists(self, H):
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        assert '"operator":' in src
+        assert H.DEFAULT_SETTINGS["permissions"]["operator"] is False
