@@ -452,7 +452,7 @@ VOICE STOP
 - A bare "stop", "quiet", "shut up", "cancel", "nevermind" (alone, not part of a longer request) silences you instantly — playback cuts and no reply is spoken. Never answer those words; they are handled automatically.
 
 DESKTOP CONTROL — run_command
-Only these programs are allowed: pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, and your restart script {RESTART_SCRIPT}.{_EXTRAS_NOTE}
+Only these programs are allowed: pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, read-only system probes (ps, free, uptime, df, ss, nvidia-smi), read-only git (git status, git diff, git log, git show, git branch, git remote, git stash), cargo builds/tests (cargo build, cargo check, cargo test, cargo clippy), and your restart script {RESTART_SCRIPT}.{_EXTRAS_NOTE}
 Useful examples:
 - Volume: pactl set-sink-volume @DEFAULT_SINK@ -10%  (also +10%, 50%, mute)
 - Media: playerctl play-pause, playerctl next, playerctl previous
@@ -1617,12 +1617,20 @@ class ToolBelt:
     ALLOWED = {
         "pactl", "playerctl", "brightnessctl", "niri", "spawn", "echo",
         "cat", "ls", "pwd", "notify-send",
+        # read-only system probes: answer "what's eating my CPU/RAM/disk/GPU"
+        "ps", "free", "uptime", "df", "ss", "nvidia-smi",
     }
+    # git/cargo are allowed ONLY with read-only (or explicitly-safe) verbs —
+    # they stay in BLOCKED for every other use, so a bare 'git' or 'cargo'
+    # (or e.g. 'git push') is still refused.
+    _CARGO_OK = {"build", "check", "test", "clippy"}
+    _GIT_READ = {"status", "diff", "log", "show", "branch", "remote"}
+    _GIT_DELETE_FLAGS = {"d", "D", "delete"}   # 'git branch -D x' mutates
     BLOCKED = (
         "sudo", "rm", "pacman", "yay", "paru", "shutdown", "poweroff", "reboot",
         "halt", "mkfs", "dd", "kill", "chmod", "chown", "mount", "umount",
         "curl", "wget", "bash", "sh", "zsh", "fish", "python", "python3",
-        "pip", "git", "mv", "cp", "tar", "zip", "7z", "make", "gcc",
+        "pip", "mv", "cp", "tar", "zip", "7z", "make", "gcc",
         "systemctl", "journalctl", "tee", "xargs", "env", "eval", "exec",
     )
     MAX_READ = 160_000
@@ -1720,8 +1728,10 @@ class ToolBelt:
 
     @tool(description=(
         "Run one safe whitelisted command (pactl, playerctl, brightnessctl, "
-        "niri, spawn, echo, cat, ls, pwd, notify-send, restart script). "
-        "Single command only — pipes/; /&& are refused."))
+        "niri, spawn, echo, cat, ls, pwd, notify-send, system probes like "
+        "ps/free/uptime/df/ss/nvidia-smi, read-only git (status/diff/log/"
+        "show/branch/remote/stash), cargo build/check/test/clippy, restart "
+        "script). Single command only — pipes/; /&& are refused."))
     def run_command(self, command: str) -> str:
         """Run a whitelisted shell command.
 
@@ -1732,10 +1742,6 @@ class ToolBelt:
             return "REFUSED: empty command"
         if any(c in cmd for c in ";|&`$\n\r<>"):
             return "REFUSED: shell operators (pipes, ;, &&, redirects) are not allowed"
-        low = cmd.lower()
-        for bad in self.BLOCKED:
-            if re.search(rf"(^|\W){re.escape(bad)}(\W|$)", low):
-                return f"REFUSED: '{bad}' is not on the safe whitelist (destructive commands are forbidden)"
         try:
             argv = shlex.split(cmd)
         except ValueError as e:
@@ -1743,6 +1749,32 @@ class ToolBelt:
         if not argv:
             return "REFUSED: empty command"
         argv[0] = os.path.expanduser(argv[0])
+        low = cmd.lower()
+        exe_base = Path(argv[0]).name
+
+        # git/cargo: BLOCKED for everything except curated read-only (git)
+        # or build (cargo) verbs. Determined BEFORE the BLOCKED scan, which
+        # then skips exactly this one word — no un-block regexes, and the
+        # user's extra_allowed_commands must never shadow these binaries.
+        _unblocked = ""
+        if exe_base in ("git", "cargo"):
+            verb = next((a for a in argv[1:] if not a.startswith("-")), "")
+            if (exe_base == "git" and verb in self._GIT_READ) or (
+                    exe_base == "cargo" and verb in self._CARGO_OK):
+                _unblocked = exe_base
+            else:
+                return (f"REFUSED: '{exe_base} {verb or '(no verb)'}' is not "
+                        "allowed — git is read-only (status/diff/log/show/"
+                        "branch/remote), cargo only builds/tests")
+            if _unblocked == "git" and any(
+                    a.lstrip("-") in self._GIT_DELETE_FLAGS
+                    for a in argv[2:] if a.startswith("-")):
+                return "REFUSED: deleting branches (git branch -d/-D) is not allowed"
+        for bad in self.BLOCKED:
+            if bad == _unblocked:
+                continue
+            if re.search(rf"(^|\W){re.escape(bad)}(\W|$)", low):
+                return f"REFUSED: '{bad}' is not on the safe whitelist (destructive commands are forbidden)"
 
         exe = argv[0]
         is_restart = exe == str(RESTART_SCRIPT) or Path(exe).name == RESTART_SCRIPT.name
@@ -1756,11 +1788,11 @@ class ToolBelt:
             c.strip() for c in SETTINGS["extra_allowed_commands"] if c.strip()
         }
         if not is_restart:
-            # consistent identity check: resolve the path (bare names via
-            # PATH, absolute paths as-is) and compare BASENAMES, so
-            # '/usr/bin/niri' and 'niri' are treated identically
-            exe_base = Path(exe).name
-            if exe_base not in allowed:
+            # consistent identity check: bare names and absolute paths are
+            # treated identically (exe_base above). The verb-gated binaries
+            # (git/cargo) pass via _unblocked — the verb gate above already
+            # decided, and it runs BEFORE extras could ever shadow it.
+            if exe_base not in allowed and exe_base != _unblocked:
                 return (
                     f"REFUSED: '{exe}' is not on the safe shell-command whitelist. "
                     "Note: REFUSED does NOT mean the program is missing — it only "
@@ -1793,6 +1825,12 @@ class ToolBelt:
                                                  "fish", "pwsh", "busybox")):
                 return (f"REFUSED: spawning interpreter '{target}' is not allowed — "
                         "launch GUI apps by name instead (or use open_app)")
+            if low_target in ("git", "cargo"):
+                # they left the BLOCKED list so run_command's verb gate could
+                # admit curated subcommands — spawn must not become a route
+                # around that gate (spawn -- git push would run mutations)
+                return (f"REFUSED: spawning '{target}' is not allowed — use "
+                        "run_command, which gates git/cargo by verb")
             if shutil.which(rest[0]) is None:
                 return f"ERROR: no program named '{target}' is installed"
             arg_str = " ".join(shlex.quote(a) for a in rest[1:]).lower()
@@ -1809,13 +1847,14 @@ class ToolBelt:
                 return ("REFUSED: passing script/code flags to spawned programs "
                         "is not allowed")
         try:
+            timeout = 240.0 if exe_base == "cargo" else self.TIMEOUT
             proc = subprocess.run(
-                argv, capture_output=True, text=True, timeout=self.TIMEOUT
+                argv, capture_output=True, text=True, timeout=timeout
             )
         except FileNotFoundError:
             return f"ERROR: program not found: {exe}"
         except subprocess.TimeoutExpired:
-            return f"ERROR: command timed out after {self.TIMEOUT}s"
+            return f"ERROR: command timed out after {timeout:.0f}s"
         out = f"exit code {proc.returncode}\nstdout:\n{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}"
         return out[:2000]
 

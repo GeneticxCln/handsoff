@@ -4270,3 +4270,92 @@ class TestHealthTooltip:
         rf = src[src.index("def _refresh_health"):
                  src.index("def _refresh_health") + 900]
         assert "self.health_label.setToolTip(_health_tooltip(result))" in rf
+
+
+class TestWhitelistWidening:
+    """run_command now admits read-only system probes and a curated git/cargo
+    verb gate — everything else about the safe boundary is unchanged."""
+
+    def _tb(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {"run_command": True, "read_file": True,
+                    "edit_file": True, "self_restart": True}
+        return tb
+
+    # -- probes ---------------------------------------------------------------
+
+    def test_probes_allowed_and_run(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        for cmd in ("uptime", "free -h", "df -h /"):
+            out = tb.run_command(cmd)
+            assert out.startswith("exit code"), out
+
+    def test_abs_path_probe_and_bypass_attempts(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        assert tb.run_command("/usr/bin/uptime").startswith("exit code")
+        # lookalikes ('gitx', 'gitg') are NOT the gated git: they pass the
+        # BLOCKED word-scan but die on the ordinary whitelist refusal
+        r = tb.run_command("gitx --help")
+        assert r.startswith("REFUSED: 'gitx'") and "whitelist" in r
+
+    # -- git verb gate ----------------------------------------------------------
+
+    def test_git_read_verbs_allowed(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        for cmd in ("git status", "git log --oneline -3", "git branch",
+                    "git remote -v", "git show --stat", "git diff"):
+            out = tb.run_command(cmd)
+            assert not out.startswith("REFUSED"), (cmd, out)
+
+    def test_git_mutations_refused(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        for cmd in ("git push origin main", "git pull", "git commit -m x",
+                    "git checkout main", "git reset --hard", "git rebase",
+                    "git merge x", "git add .", "git clean -fd",
+                    "git stash pop", "git stash drop", "git stash",
+                    "git apply patch.diff", "git stash list"):
+            out = tb.run_command(cmd)
+            assert out.startswith("REFUSED") and "read-only" in out, (cmd, out)
+
+    def test_git_branch_delete_refused(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        for cmd in ("git branch -D x", "git branch --delete x"):
+            out = tb.run_command(cmd)
+            assert out.startswith("REFUSED") and "deleting branches" in out, out
+
+    def test_git_flag_only_forms(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        assert tb.run_command("git").startswith("REFUSED")
+        assert tb.run_command("git --version").startswith("REFUSED")
+
+    def test_git_abs_path_gated_too(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        out = tb.run_command("/usr/bin/git push origin main")
+        assert out.startswith("REFUSED") and "read-only" in out
+
+    def test_cargo_gate(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        for cmd in ("cargo build", "cargo check", "cargo test", "cargo clippy",
+                    "cargo build --release"):
+            assert not tb.run_command(cmd).startswith("REFUSED"), cmd
+        for cmd in ("cargo", "cargo run", "cargo install x", "cargo publish",
+                    "cargo clean", "cargo new x", "cargo --version"):
+            out = tb.run_command(cmd)
+            assert out.startswith("REFUSED") and "builds" in out, (cmd, out)
+
+    def test_extras_cannot_shadow_git_or_cargo(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        monkeypatch.setattr(
+            H, "SETTINGS",
+            {**H.DEFAULT_SETTINGS, "extra_allowed_commands": ["git", "cargo"]})
+        assert tb.run_command("git push").startswith("REFUSED")
+        assert tb.run_command("cargo install anything").startswith("REFUSED")
+
+    def test_spawn_cannot_carry_git_or_cargo(self, H, monkeypatch):
+        """git/cargo left the BLOCKED list for the verb gate — niri spawn must
+        not become a route around it ('spawn -- git push' would mutate)."""
+        tb = self._tb(H, monkeypatch)
+        for target in ("git push", "git status", "cargo build"):
+            out = tb.run_command("niri msg action spawn -- " + target)
+            assert out.startswith("REFUSED") and "verb" in out, (target, out)
