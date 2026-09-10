@@ -984,7 +984,10 @@ class TestAuditRoundTwo:
         a._set = lambda *x: None
         a.set_handsfree(False)          # must not raise
         disk = H.json.loads(cfg.read_text(encoding="utf-8"))
-        assert disk == {"handsfree": False}
+        # the persist must have replaced the corrupt file with a clean,
+        # version-stamped dict (split step (a) stamps every on-disk write)
+        assert disk.get("handsfree") is False
+        assert disk.get("version") == H.SETTINGS_VERSION
 
     def test_settings_app_coerces_garbage_values(self, H):
         """Audit #2: a hand-edited settings.json with garbage must not crash

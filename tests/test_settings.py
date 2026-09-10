@@ -48,8 +48,12 @@ class TestSettingsApp:
         assert merged["handsfree"] is False                   # disk wins
         assert merged["permissions"]["run_command"] is False  # dict merges key-wise
         assert merged["permissions"]["edit_file"] is True     # …keeping other keys
-        assert merged["bubble_size"] == mod.H.DEFAULT_SETTINGS["bubble_size"]  # default fills
-        assert mod.merge_settings({}) == mod.H.DEFAULT_SETTINGS  # empty file -> pure defaults
+        assert merged["bubble_size"] == mod.DEFAULT_SETTINGS["bubble_size"]  # default fills
+        # empty file -> pure defaults. Compare against the settings app's own
+        # schema-derived constant, NOT mod.H's: H loads the *installed* copy
+        # first, so cross-module agreement is deployment-sync's job, not this
+        # test's.
+        assert mod.merge_settings({}) == mod.DEFAULT_SETTINGS
 
     def test_settings_app_coerces_garbage_values(self):
         """Audit #2 regression: hand-edited garbage ("abc", "1,5", "32k") must
@@ -141,6 +145,143 @@ class TestSettingsCoercion:
         monkeypatch.setattr(H, "SETTINGS_FILE", f)
         s = H._load_settings()
         assert s["bubble_size"] == 192 and s["tts_rate"] == 2.0
+
+    # ---------------------------------------------------- version + migration
+
+    def test_settings_version_stamped_and_not_a_setting(self, H, tmp_path, monkeypatch):
+        """_load_settings stamps the schema version and never exposes it as an
+        ordinary setting (unknown-key warning would fire every boot)."""
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"mic_threshold": 700}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        s = H._load_settings()
+        assert s["version"] == H.SETTINGS_VERSION
+        assert s["mic_threshold"] == 700
+
+    def test_settings_future_version_warns_but_loads(self, H, tmp_path, monkeypatch):
+        """A settings.json written by a NEWER build must still load (downgrade
+        tolerance) — keep the values, warn, don't quarantine."""
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"version": 99, "mic_threshold": 500}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        s = H._load_settings()
+        assert s["mic_threshold"] == 500
+        assert (f.with_suffix(".quarantined")).exists() is False
+
+    def test_settings_migration_clears_version_zero(self, H, tmp_path, monkeypatch):
+        """Old files without a version get one stamped (the migrate hook's
+        actual job today); unknown keys still warn exactly as before."""
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"version": 0, "no_such_key": 1}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        s = H._load_settings()
+        assert s["version"] == H.SETTINGS_VERSION
+
+    def test_write_settings_dict_stamps_and_backs_up(self, H, tmp_path, monkeypatch):
+        """The shared writer version-stamps settings.json and keeps a one-
+        generation .bak so a bad save can be recovered by hand."""
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"mic_threshold": 111}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        H._write_settings_dict({"mic_threshold": 222})
+        on_disk = json.loads(f.read_text(encoding="utf-8"))
+        assert on_disk["version"] == H.SETTINGS_VERSION
+        assert on_disk["mic_threshold"] == 222
+        bak = json.loads(f.with_suffix(".json.bak").read_text(encoding="utf-8"))
+        assert bak["mic_threshold"] == 111   # previous generation preserved
+
+    def test_runtime_json_backup_keeps_previous_generation(self, H, tmp_path, monkeypatch):
+        """history/memory/reminders writes leave the previous content one
+        .bak step behind — a corrupt or truncated write is recoverable."""
+        hist = tmp_path / "history.json"
+        hist.write_text("[{\"old\": true}]", encoding="utf-8")
+        H._backup_runtime_json(hist)
+        assert hist.with_suffix(".json.bak").read_text(encoding="utf-8") == "[{\"old\": true}]"
+        # overwriting the live file must NOT touch the backup again
+        hist.write_text("[]", encoding="utf-8")
+        H._backup_runtime_json(hist)
+        assert hist.with_suffix(".json.bak").read_text(encoding="utf-8") == "[]"
+        hist.unlink()
+        H._backup_runtime_json(hist)   # missing file: no-op, no raise
+
+
+# ------------------------------------------------- monolith split: step (a)
+
+
+class TestSettingsSplit:
+    """Split step (a): the settings machinery lives in core/settings.py behind
+    an explicit Settings object; handsoff.py re-exports it under the old
+    names. These pins are the refactor's safety net — the H.* contract and
+    the path-redirect pattern must not regress while the code moves."""
+
+    def test_settings_object_loads_and_persists(self, H, tmp_path, monkeypatch):
+        obj = H._core_settings.settings_object(
+            tmp_path / "settings.json", tmp_path)
+        d = obj.load()
+        assert d["version"] == H.SETTINGS_VERSION
+        obj.persist("mic_threshold", 777)
+        assert obj["mic_threshold"] == 777
+        on_disk = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+        assert on_disk["mic_threshold"] == 777
+        assert on_disk["version"] == H.SETTINGS_VERSION
+        # the live dict is the SAME object the object wraps
+        obj["handsfree"] = True
+        assert obj.as_dict()["handsfree"] is True
+
+    def test_wrapper_paths_follow_monkeypatched_globals(self, H, tmp_path, monkeypatch):
+        """The split must NOT have baked paths in: monkeypatching H's path
+        globals (the tests' established pattern) still redirects every
+        wrapper — load, persist, and the full-file writer."""
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"mic_threshold": 555}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        s = H._load_settings()
+        assert s["mic_threshold"] == 555
+        assert H._SETTINGS_OBJ.settings_file == f          # object follows too
+        H._persist_setting("bubble_size", 150)
+        on_disk = json.loads(f.read_text(encoding="utf-8"))
+        assert on_disk["bubble_size"] == 150 and on_disk["mic_threshold"] == 555
+        H._write_settings_dict({"model": "m2"})
+        on_disk = json.loads(f.read_text(encoding="utf-8"))
+        assert on_disk["model"] == "m2" and on_disk["version"] == H.SETTINGS_VERSION
+
+    def test_set_setting_uses_wrapper_seam(self, H, tmp_path, monkeypatch):
+        """test_regression's seam pin, held at the unit level: set_setting must
+        still route through the H._persist_setting wrapper (which adds the
+        in-memory update + derived-global refresh)."""
+        calls = []
+        monkeypatch.setattr(H, "_persist_setting", lambda k, v: calls.append((k, v)))
+        H.set_setting("mic_threshold", 4242)
+        assert calls == [("mic_threshold", 4242)]
+        assert H.SETTINGS["mic_threshold"] == 4242
+
+    def test_core_and_handsoff_defaults_agree(self, H):
+        """One schema instance, two import paths — the dicts must be the same
+        object (else deployment drift between layouts is possible again)."""
+        import core.settings as cs
+        assert cs.DEFAULT_SETTINGS is H.DEFAULT_SETTINGS
+        assert cs.SETTINGS_VERSION == H.SETTINGS_VERSION
+        assert H.coerce_settings is cs.coerce_settings
+
+    def test_wrapper_is_late_bound_for_patch_seam(self, H, monkeypatch):
+        """The H._persist_setting wrapper must look the core function up at
+        CALL time through _core_settings, so patching the core attr (future
+        split steps' seam) works exactly like patching the wrapper."""
+        seen = []
+        monkeypatch.setattr(H._core_settings, "_persist_setting",
+                            lambda k, v, sf, cd: seen.append(k))
+        H._persist_setting("x", 1)
+        assert seen == ["x"]
+
+    def test_settings_object_ensure_loaded_and_contains(self, H, tmp_path):
+        obj = H._core_settings.settings_object(
+            tmp_path / "missing.json", tmp_path, data={"model": "pre-set"})
+        assert obj.ensure_loaded()["model"] == "pre-set"   # data= skips disk
+        assert "model" in obj and "nope" not in obj
+        assert obj.get("nope", "dflt") == "dflt"
+        with pytest.raises(KeyError):
+            obj["nope"]
 
 
 class TestHealthCommand:

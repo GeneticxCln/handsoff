@@ -5,6 +5,8 @@ set -u
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
 LOG="$STATE/handsoff.log"
 SCRIPT="$HOME/.local/bin/handsoff.py"
+# ponytail: resolve once; venv's python3 wins when activated, system fallback otherwise.
+PYBIN="${HANDSOFF_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
 mkdir -p "$STATE"
 
 is_bubble_pid() {  # $1 = pid: python exe + EXACT cmdline match (never editors/pytest)
@@ -74,6 +76,6 @@ if systemctl --user is-enabled --quiet handsoff.service 2>/dev/null; then
     exit 0
 fi
 
-nohup setsid /usr/bin/python "$SCRIPT" >>"$LOG" 2>&1 &
+nohup setsid "$PYBIN" "$SCRIPT" >>"$LOG" 2>&1 &
 disown
 echo "handsoff restarted (pid $!)"

@@ -41,6 +41,7 @@ Files:
 from __future__ import annotations
 
 import base64
+import calendar
 import faulthandler
 import fcntl
 import hashlib
@@ -140,78 +141,113 @@ _MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
 _SETTINGS_WRITE_LOCK = threading.Lock()
 SELF_MARKER = "# handsoff-self-marker: this line must be preserved across self-edits"
 
-DEFAULT_SETTINGS: dict = {
-    "ollama_host": "http://127.0.0.1:11434",
-    "model": "qwen3:8b",
-    "num_ctx": 32768,
-    "history_tokens": 0,       # 0 = auto: ctx − prompt − reply reserve
-    "whisper_size": "tiny",
-    "piper_voice": "",
-    "tts_rate": 1.0,
-    "tts_volume": 1.0,
-    "mic_device": "",
-    "mic_threshold": 600,
-    "handsfree": False,
-    "bubble_size": 128,
-    "colors": {
-        "idle": "#4f8cff", "listening": "#ff4d5e",
-        "thinking": "#ff9e2c", "speaking": "#3ecf6e",
-    },
-    "permissions": {
-        "run_command": True, "read_file": True,
-        "edit_file": True, "self_restart": True,
-        "type_text": True, "press_keys": True,
-        "web_access": True,
-        "media": True,
-        "screen_access": True,
-        "operator": False,    # mouse control (click_element/click_at) — OFF by
-                              # default; enabling lets the AI move and click
-                              # the real pointer
-        "paste_text": True,   # reading the user's clipboard gets its own switch
-        "copy_text": True,    # writing the user's clipboard
-        "reminders": True,    # create/list/cancel/snooze spoken reminders
-        "calendar": True,     # read ICS calendars, print month grids
-        "focus_window": True,  # raise/focus arbitrary windows by name
-        "get_datetime": True,  # trivially safe; kept gated for uniformity
-        "notifications": False,  # desktop notifications are private by default
-        "pomodoro": True,
-        "watchers": True,
-    },
-    "extra_allowed_commands": [],
-    "tool_call_times": None,          # filled per-ToolBelt: deque of monotonic times
-    "max_tool_calls": 0,             # 0 = no limit; set an int to rate-limit tool calls
-    "command_policy": {},            # tool -> ALLOW | DENY | CONFIRM (empty = all ALLOW)
-    "confirm_seconds": 90.0,         # how long a CONFIRM offer stays valid
-    "dry_run": False,                # desktop actions report instead of act
-    "streaming_tts": True,
-    "autostart": False,
-    "assistant_name": "assistant",
-    "wake_word_required": False,
-    "engage_seconds": 45.0,
-    "workspace_aliases": {},   # 'code': '2' → "go to code" just works
-    "home_place": "",          # weather without naming a place; powers the briefing
-    "calendar_ics": [],        # ICS source(s): https URL(s) and/or .ics file paths
-    "wake_spotter": False,     # openWakeWord audio spotter (near-zero CPU wake)
-    "mic_selfheal": True,      # auto-restart a wedged mic + spoken explanation
-    "dictation": True,         # 'start dictation' types transcripts, no LLM turn
-    "spotter_models": ["hey_jarvis"],   # stock: alexa, hey_jarvis, hey_mycroft, timer, weather
-    "followup_seconds": 6.0,   # announce-and-listen: no-wake-word window after a reply
-    "briefing": False,         # daily briefing on the first wake word
-    "world_warnings": False,   # opt-in proactive severe world-event warnings
-    "world_cooldown_min": 60.0,  # min minutes between world warnings
-    "hardware_watch": False,   # opt-in live hardware watch on the health tick
-    "hardware_cooldown_min": 60.0,  # min minutes between hardware urgents
-    "hardware_disk_gb": 5.0,   # disk-free floor (GiB) for the low-disk warning
-    "resource_alerts": False,  # opt-in RAM/VRAM threshold announcements
-    "ram_alert_percent": 90.0,
-    "vram_alert_percent": 90.0,
-    "notification_reader": False,  # desktop notifications are private by default
-    "notification_mute_apps": [],
-}
+# Support-module loading: ONE shared order (beside-this-file -> ~/.local/bin
+# -> origin-checked plain import) and ONE origin rule, owned by
+# core.load_module. This bootstrap only loads the `core` package itself
+# (same rule, same order); settings_schema/hardware then come through the
+# shared loader — never a bare import a foreign sys.path entry could
+# satisfy, and never a half-initialized sys.modules entry left behind.
+def _support_origin_ok(mod: object) -> bool:
+    """Same origin rule as core._origin_ok for the pre-core bootstrap: only
+    a module living beside this file (repo root / deployed dir, incl. its
+    core/ subdir) or in ~/.local/bin counts as ours."""
+    try:
+        parent = Path(getattr(mod, "__file__", "") or "").resolve().parent
+    except OSError:
+        return False
+    try:
+        here = Path(__file__).resolve().parent
+    except OSError:
+        here = Path(__file__).parent
+    roots = [here, here / "core", HOME / ".local" / "bin"]
+    resolved = set()
+    for root in roots:
+        try:
+            resolved.add(root.resolve())
+        except OSError:
+            resolved.add(root)
+    return parent in resolved
+
+
+def _load_core_package():
+    """Import our `core` package (same-origin) or spec-load it from beside
+    this file / ~/.local/bin. A real package spec is required so the
+    relative `from . import load_module` inside core.settings resolves."""
+    try:
+        import core as _cand
+        if _support_origin_ok(_cand):
+            import core.settings as _cs
+            return _cs
+    except ImportError:
+        pass
+    import importlib.util as _ilu
+    here = Path(__file__).resolve().parent
+    last_err: Exception | None = None
+    for init in (here / "core" / "__init__.py",
+                 HOME / ".local" / "bin" / "core" / "__init__.py"):
+        try:
+            if not init.is_file():
+                continue
+        except OSError:
+            continue
+        spec = _ilu.spec_from_file_location(
+            "core", init, submodule_search_locations=[str(init.parent)])
+        if spec is None or spec.loader is None:
+            continue
+        pkg = _ilu.module_from_spec(spec)
+        prev = sys.modules.get("core")
+        sys.modules["core"] = pkg
+        try:
+            spec.loader.exec_module(pkg)
+        except Exception as e:
+            last_err = e
+            if prev is None:
+                sys.modules.pop("core", None)
+            else:
+                sys.modules["core"] = prev
+            continue
+        import core.settings as _cs2
+        return _cs2
+    if last_err is not None:
+        raise last_err
+    raise ImportError("handsoff: cannot load the core package beside this file")
+
+
+_core_settings = _load_core_package()
+from core import load_module as _load_module
+_ss_mod = sys.modules.get("core.settings_schema")  # core/__init__ loads it
+if _ss_mod is None:
+    _ss_mod = _load_module("settings_schema")
+DEFAULT_SETTINGS = _ss_mod.DEFAULT_SETTINGS  # noqa: F811  (single source)
+SETTINGS_VERSION = _ss_mod.SETTINGS_VERSION  # noqa: F811  (single source)
+if sys.modules.get("settings_schema") is None:
+    sys.modules["settings_schema"] = _ss_mod  # alias; never clobber foreign
+
+# Step (a) of the monolith cut plan: the settings machinery lives in
+# core/settings.py (loaded above, beside-file in the deployed ~/.local/bin
+# layout). handsoff.py keeps the OLD module-level names as thin late-bound
+# wrappers — the H.* monkeypatch contract is unchanged. core.settings never
+# reaches back into handsoff globals: every path is a parameter.
+
+_SETTINGS_WRITE_LOCK = _core_settings._SETTINGS_WRITE_LOCK
+
+
+def _load_settings() -> dict:
+    """Defaults <- environment <- settings.json (implemented in core.settings;
+    the paths stay handsoff globals so tests can redirect them)."""
+    s = _core_settings._load_settings(SETTINGS_FILE)
+    _SETTINGS_OBJ.settings_file = SETTINGS_FILE
+    _SETTINGS_OBJ.config_dir = CONFIG_DIR
+    _SETTINGS_OBJ._data = s
+    _SETTINGS_OBJ._loaded = True
+    return s
 
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 DEPLOYMENT_FILE = CONFIG_DIR / "deployment.json"
 SYSTEMD_UNIT_FILE = HOME / ".config/systemd/user/handsoff.service"
+# the explicit settings object (step a): same dict, one owner — wrappers and
+# future split steps route reads/writes through it
+_SETTINGS_OBJ = _core_settings.settings_object(SETTINGS_FILE, CONFIG_DIR)
 
 
 def _sha256_file(path: Path) -> str | None:
@@ -277,11 +313,25 @@ def _repo_source_path() -> Path | None:
     return None
 
 
+_DEPLOY_FILES = (
+    "handsoff.py",
+    "handsoff-settings.py",
+    "settings_schema.py",
+    "hardware.py",
+    "core/__init__.py",
+    "core/settings.py",
+    "handsoff-restart",
+)
+
+
 def _deployment_snapshot() -> dict:
     """Describe the code actually running and whether it matches the checkout.
 
     This is deliberately based on hashes, not mtimes: a stale installed copy
-    can have a newer timestamp after a failed deployment.  No settings values
+    can have a newer timestamp after a failed deployment.  in-sync requires
+    EVERY deployed file (the install.sh manifest set: bubble, settings app,
+    support modules, restart script) to match its checkout source —
+    comparing handsoff.py alone hides a stale sibling.  No settings values
     or calendar secrets are included in this diagnostic payload.
     """
     try:
@@ -305,13 +355,27 @@ def _deployment_snapshot() -> dict:
         pass
     same_current_repo = bool(current_hash and repo_hash and current_hash == repo_hash)
     same_installed_repo = bool(installed_hash and repo_hash and installed_hash == repo_hash)
+    repo_dir = repo.parent if repo else None
+    bin_dir = installed.parent
+    files: dict = {}
+    all_match = True
+    for rel in _DEPLOY_FILES:
+        src = repo_dir / rel if repo_dir is not None else None
+        src_hash = _sha256_file(src) if src is not None else None
+        dst_hash = _sha256_file(bin_dir / rel)
+        match = (bool(dst_hash and dst_hash == src_hash)
+                 if src_hash else None)  # None: no source to compare
+        files[rel] = {"source_sha256": src_hash,
+                      "installed_sha256": dst_hash, "match": match}
+        if match is False:
+            all_match = False
     if not current_hash:
         status = "running-missing"
     elif not repo_hash:
         status = "source-unknown"
     elif not installed_hash:
         status = "installed-missing"
-    elif same_installed_repo:
+    elif all_match:
         status = "in-sync"
     else:
         status = "installed-drift"
@@ -326,6 +390,7 @@ def _deployment_snapshot() -> dict:
         "running_is_installed": current == installed,
         "running_matches_repo": same_current_repo,
         "installed_matches_repo": same_installed_repo,
+        "files": files,
         "manifest": manifest,
     }
 
@@ -333,7 +398,7 @@ def _deployment_snapshot() -> dict:
 # --------------------------------------------------------------- doctor report
 
 try:
-    import hardware as _hardware
+    _hardware = _load_module("hardware")  # shared loader: origin-checked
 except ImportError:  # installed copy without the sibling module (yet)
     _hardware = None
 
@@ -891,17 +956,20 @@ class BoundedJob:
         The buffer keeps the FIRST MAX_OUTPUT bytes of the job's output and
         discards the rest (still draining so the child never blocks) — so
         this is a tail of the head, not of unbounded full output. Callers
-        must join the drain (via poll()) before reading a finished job.
+        must take the explicit reap join (_join_drain with the full budget)
+        before reading a finished job.
         """
         with self._out_lock:
             s = "".join(self._out_parts)
         return s[-limit:] if len(s) > limit else s
 
-    def _join_drain(self) -> None:
-        """Wait (bounded) for the drainer to consume post-exit pipe bytes."""
+    def _join_drain(self, timeout: float = 0.0) -> None:
+        """Join the drainer: status polls use 0 (never stall the status
+        path); the explicit reap before reading a finished job's output
+        passes the full budget so the tail is complete."""
         t = self._drain_thread
         if t is not None and t.is_alive() and not self._drain_done.is_set():
-            t.join(timeout=5.0)
+            t.join(timeout=timeout)
 
     def poll(self) -> tuple[str, bool]:
         """(state, done): 'running' | 'done' | 'timeout-killed'.
@@ -929,8 +997,10 @@ class BoundedJob:
             return "done", True
         return "running", False
 
-    def status_text(self) -> str:
-        state, done = self.poll()
+    def status_text(self, state: str | None = None,
+                      done: bool | None = None) -> str:
+        if state is None or done is None:
+            state, done = self.poll()
         elapsed = time.monotonic() - self.started
         if state == "running":
             return f"job {self.id}: still running ({elapsed:.0f}s) — {self.command}"
@@ -960,40 +1030,7 @@ def _private_dir(path: Path) -> bool:
         return False
 
 
-def _secure_file(path: Path) -> bool:
-    """Make an existing runtime/config file owner-only, without creating it.
-
-    ``Path.exists()`` is not sufficient here: it returns false for a broken
-    symlink, which would let an attacker redirect a later atomic write. Use
-    lstat first and reject every symlink, including broken ones. A live Unix
-    socket is checked for ownership/mode but is not chmod-ed through a regular
-    file path operation on platforms where that is unsupported.
-    """
-    try:
-        if path.is_symlink():
-            return False
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            return True
-        if info.st_uid != os.getuid() or not (
-                stat.S_ISREG(info.st_mode) or stat.S_ISSOCK(info.st_mode)):
-            return False
-        if stat.S_ISREG(info.st_mode):
-            path.chmod(0o600)
-            info = path.stat()
-        elif stat.S_ISSOCK(info.st_mode) and (info.st_mode & 0o077):
-            # A stale socket from an earlier run under a permissive umask
-            # must self-heal, not wedge startup forever: it is OUR file, so
-            # tighten it in place (sockets accept chmod on Linux) instead of
-            # failing _prepare_runtime until manual removal.
-            path.chmod(0o600)
-            info = path.stat()
-        return ((info.st_mode & 0o077) == 0
-                and info.st_uid == os.getuid())
-    except OSError:
-        return False
-
+_secure_file = _core_settings._secure_file
 
 def _secure_runtime_files() -> bool:
     """Harden files that can contain secrets, transcripts, or control state.
@@ -1008,50 +1045,9 @@ def _secure_runtime_files() -> bool:
     return all([_secure_file(path) for path in paths])
 
 
-def _atomic_private_write(path: Path, text: str) -> None:
-    """Write a sensitive text file with mode 0600 and an atomic replacement.
+_atomic_private_write = _core_settings._atomic_private_write
 
-    A unique temporary name prevents unrelated writers from swapping the same
-    ``.tmp`` file, while the mode is set before the file becomes visible at
-    its final path. The caller still owns any higher-level read/modify/write
-    lock needed for its data structure.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.",
-                                    suffix=".tmp", dir=str(path.parent))
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-        if not _secure_file(path):
-            raise OSError(f"refusing insecure runtime file: {path}")
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-
-def _quarantine_bad(path: Path) -> None:
-    """Move a corrupt config/state file aside; never fail-open on garbage."""
-    try:
-        if not path.exists():
-            return
-        # ponytail: pid suffix — %S timestamps collide when two processes
-        # quarantine the same file within one second (second replace would
-        # silently destroy the first bad copy).
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        bad = path.with_name(f"{path.name}.bad-{ts}-{os.getpid()}")
-        path.replace(bad)
-        logging.getLogger("handsoff").warning(
-            "corrupt %s quarantined to %s; using defaults", path, bad)
-    except OSError:
-        logging.getLogger("handsoff").warning(
-            "corrupt %s could not be quarantined", path, exc_info=True)
-
+_quarantine_bad = _core_settings._quarantine_bad
 
 def _prepare_runtime() -> bool:
     """Create the runtime roots privately and harden existing state files."""
@@ -1061,231 +1057,33 @@ def _prepare_runtime() -> bool:
     return _secure_runtime_files()
 
 
-def coerce_settings(s: dict) -> dict:
-    """Coerce/validate raw merged settings IN PLACE. Shared by the bubble's
-    _load_settings AND the settings app (a hand-edited settings.json must
-    never crash either program; the settings app is the recovery tool and
-    must open even when the config is garbage)."""
-    log = logging.getLogger("handsoff")
+coerce_settings = _core_settings.coerce_settings  # shared by bubble + settings app
 
-    def _num(key: str, cast, lo, hi) -> None:
-        """Coerce one numeric setting; on garbage, warn and use the default
-        (a bad value must never kill startup or leak through unvalidated)."""
-        try:
-            s[key] = min(hi, max(lo, cast(s[key])))
-        except (TypeError, ValueError):
-            log.warning(
-                "invalid %s — using default %r",
-                key, DEFAULT_SETTINGS[key])
-            s[key] = DEFAULT_SETTINGS[key]
-
-    _num("num_ctx", int, 1024, 2 ** 20)
-    _num("history_tokens", int, 0, 2 ** 20)     # 0 = auto (3/4 of num_ctx)
-    _num("bubble_size", int, 96, 192)
-    _num("mic_threshold", int, 50, 10_000)
-    _num("tts_rate", float, 0.5, 2.0)
-    _num("tts_volume", float, 0.1, 2.0)
-    _num("max_tool_calls", int, 0, 10_000)
-    _num("ram_alert_percent", float, 50.0, 99.0)
-    _num("vram_alert_percent", float, 50.0, 99.0)
-    _num("confirm_seconds", float, 5.0, 600.0)
-    s["dry_run"] = bool(s.get("dry_run", False))
-    _pol = s.get("command_policy")
-    if isinstance(_pol, dict):
-        s["command_policy"] = {
-            str(k).strip(): str(v).strip().upper()
-            for k, v in _pol.items()
-            if str(k).strip() and str(v).strip().upper() in ("ALLOW", "DENY", "CONFIRM")
-        }
-    else:
-        s["command_policy"] = {}
-    s["resource_alerts"] = bool(s.get("resource_alerts", False))
-    s["notification_reader"] = bool(s.get("notification_reader", False))
-    _nm = s.get("notification_mute_apps", [])
-    s["notification_mute_apps"] = ([str(x).strip().lower() for x in _nm if str(x).strip()]
-                                    if isinstance(_nm, list) else [])[:32]
-    s["handsfree"] = bool(s.get("handsfree", False))
-    s["streaming_tts"] = bool(s.get("streaming_tts", True))
-    s["wake_word_required"] = bool(s.get("wake_word_required", False))
-    s["assistant_name"] = str(s.get("assistant_name", "assistant")).strip() or "assistant"
-    _c = s.get("calendar_ics", [])
-    if isinstance(_c, str):
-        _c = [x.strip() for x in _c.replace(",", "\n").split("\n") if x.strip()]
-    elif isinstance(_c, list):
-        _c = [str(x).strip() for x in _c if str(x).strip()]
-    else:
-        _c = []
-    s["calendar_ics"] = _c[:10]
-    s["wake_spotter"] = bool(s.get("wake_spotter", False))
-    s["mic_selfheal"] = bool(s.get("mic_selfheal", True))
-    s["dictation"] = bool(s.get("dictation", True))
-    _num("followup_seconds", float, 0.0, 120.0)   # 0 = feature off
-    _sm = s.get("spotter_models", [])
-    s["spotter_models"] = ([str(x).strip() for x in _sm if str(x).strip()]
-                           if isinstance(_sm, list) else [])
-    try:
-        v = float(s.get("engage_seconds", 45.0))
-    except (TypeError, ValueError):
-        v = 45.0
-    s["engage_seconds"] = min(600.0, max(5.0, v))
-    aliases = s.get("workspace_aliases")
-    s["workspace_aliases"] = (
-        {str(k).strip().lower(): str(v).strip()
-         for k, v in aliases.items() if str(k).strip() and str(v).strip()}
-        if isinstance(aliases, dict) else {})
-    s["home_place"] = str(s.get("home_place", "")).strip()
-    s["briefing"] = bool(s.get("briefing", False))
-    s["world_warnings"] = bool(s.get("world_warnings", False))
-    _num("world_cooldown_min", float, 5.0, 1440.0)
-    s["hardware_watch"] = bool(s.get("hardware_watch", False))
-    _num("hardware_cooldown_min", float, 5.0, 1440.0)
-    _num("hardware_disk_gb", float, 0.5, 1000.0)
-    # ponytail: permissions fail-closed — garbage must never enable tools
-    _perms = s.get("permissions")
-    if not isinstance(_perms, dict):
-        log.warning("invalid permissions — using defaults (fail-closed)")
-        s["permissions"] = dict(DEFAULT_SETTINGS["permissions"])
-    else:
-        s["permissions"] = {str(k): bool(v) for k, v in _perms.items()
-                            if str(k).strip()}
-        for k, v in DEFAULT_SETTINGS["permissions"].items():
-            s["permissions"].setdefault(k, bool(v))
-    # ponytail: unvalidated enums — garbage must fall back to defaults loudly
-    _host = str(s.get("ollama_host", "")).strip()
-    if not _host:
-        log.warning("invalid ollama_host — using default %r",
-                    DEFAULT_SETTINGS["ollama_host"])
-        _host = str(DEFAULT_SETTINGS["ollama_host"])
-    s["ollama_host"] = _host
-    _model = str(s.get("model", "")).strip()
-    if not _model:
-        log.warning("invalid model — using default %r",
-                    DEFAULT_SETTINGS["model"])
-        _model = str(DEFAULT_SETTINGS["model"])
-    s["model"] = _model
-    _WHISPER_SIZES = {"tiny", "base", "small", "medium", "large",
-                      "large-v1", "large-v2", "large-v3", "turbo"}
-    _ws = str(s.get("whisper_size", "")).strip().lower()
-    if _ws not in _WHISPER_SIZES:
-        log.warning("invalid whisper_size %r — using default %r",
-                    s.get("whisper_size"), DEFAULT_SETTINGS["whisper_size"])
-        _ws = str(DEFAULT_SETTINGS["whisper_size"])
-    s["whisper_size"] = _ws
-    if not isinstance(s.get("piper_voice"), str):
-        log.warning("invalid piper_voice — using default %r",
-                    DEFAULT_SETTINGS["piper_voice"])
-        s["piper_voice"] = str(DEFAULT_SETTINGS["piper_voice"])
-    else:
-        s["piper_voice"] = str(s["piper_voice"]).strip()
-    if not isinstance(s.get("mic_device"), str):
-        log.warning("invalid mic_device — using default %r",
-                    DEFAULT_SETTINGS["mic_device"])
-        s["mic_device"] = str(DEFAULT_SETTINGS["mic_device"])
-    _colors = s.get("colors")
-    if not isinstance(_colors, dict):
-        log.warning("invalid colors — using defaults")
-        s["colors"] = dict(DEFAULT_SETTINGS["colors"])
-    else:
-        s["colors"] = {str(k): str(v) for k, v in _colors.items()
-                       if k in DEFAULT_SETTINGS["colors"]
-                       and isinstance(v, str) and str(v).strip()}
-        for k, v in DEFAULT_SETTINGS["colors"].items():
-            s["colors"].setdefault(k, v)
-    if not isinstance(s["extra_allowed_commands"], list):
-        s["extra_allowed_commands"] = []
-    if not isinstance(s.get("tool_call_times"), (list, type(None))):
-        s["tool_call_times"] = None
-    return s
+def _migrate_settings(data: dict, _slog: "logging.Logger | None" = None) -> dict:
+    """Migrate an older settings.json layout (thin wrapper: real hook in core)."""
+    return _core_settings._migrate_settings(data, _slog)
 
 
-def _load_settings() -> dict:
-    """Built-in defaults <- environment <- settings.json (the settings app wins)."""
-    s = json.loads(json.dumps(DEFAULT_SETTINGS))
-    env_map = {
-        "ollama_host": "OLLAMA_HOST", "model": "HANDSOFF_MODEL",
-        "num_ctx": "HANDSOFF_NUM_CTX", "whisper_size": "HANDSOFF_WHISPER",
-        "piper_voice": "HANDSOFF_VOICE",
-    }
-    for key, var in env_map.items():
-        if os.environ.get(var):
-            s[key] = os.environ[var]
-    try:
-        raw = SETTINGS_FILE.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return coerce_settings(s)
-    except OSError:
-        return coerce_settings(s)
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        _quarantine_bad(SETTINGS_FILE)
-        return coerce_settings(s)
-    if not isinstance(data, dict):
-        _quarantine_bad(SETTINGS_FILE)
-        return coerce_settings(s)
-    _slog = logging.getLogger("handsoff")
-    for k, v in data.items():
-        if k not in s:
-            # ponytail: silent drops hide typos ("models:" never applies) —
-            # warn so the user knows the key was ignored.
-            _slog.warning("unknown settings key %r — ignored", k)
-            continue
-        if isinstance(s[k], dict) and isinstance(v, dict):
-            s[k].update(v)
-        else:
-            s[k] = v
-    return coerce_settings(s)
+def _backup_runtime_json(path: Path) -> None:
+    """One-generation .bak beside a runtime JSON file (thin wrapper: real
+    implementation in core.settings)."""
+    _core_settings._backup_runtime_json(path)
 
 
-def _settings_file_lock():
-    """Cross-process settings lock (flock on a sidecar, not the data file)."""
-    import contextlib
-
-    @contextlib.contextmanager
-    def _lock():
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        fh = open(CONFIG_DIR / "settings.json.lock", "w")
-        try:
-            # ponytail: open() honors umask (often 0644) — force owner-only.
-            try:
-                os.chmod(CONFIG_DIR / "settings.json.lock", 0o600)
-            except OSError:
-                pass
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
-                fcntl.flock(fh, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            fh.close()
-    return _lock()
+def _write_settings_dict(data: dict, *, stamp_version: bool = True) -> None:
+    """Serialize a full settings dict to settings.json: version-stamped,
+    backed up one generation, atomic (thin wrapper: real writer in core)."""
+    _core_settings._write_settings_dict(data, SETTINGS_FILE, CONFIG_DIR,
+                                        stamp_version=stamp_version)
 
 
 def _persist_setting(key: str, value) -> None:
-    """Persist one runtime setting without overwriting unrelated settings."""
-    with _SETTINGS_WRITE_LOCK, _settings_file_lock():
-        data = {}
-        try:
-            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-            else:
-                _quarantine_bad(SETTINGS_FILE)
-        except FileNotFoundError:
-            pass
-        except ValueError:
-            _quarantine_bad(SETTINGS_FILE)
-        except OSError:
-            pass
-        data[key] = value
-        # NOTE: _atomic_private_write creates its own uniquely-named temp
-        # file; a pre-computed ".json.tmp" path here would reintroduce the
-        # predictable-name race that helper exists to prevent.
-        _atomic_private_write(
-            SETTINGS_FILE, json.dumps(data, ensure_ascii=False, indent=1))
-        SETTINGS[key] = value
-        reload_derived_settings()
+    """Persist one runtime setting (implemented in core.settings; this wrapper
+    is the tests' patch seam and adds the derived-global refresh)."""
+    _core_settings._persist_setting(key, value, SETTINGS_FILE, CONFIG_DIR)
+    SETTINGS[key] = value
+    SETTINGS["version"] = SETTINGS_VERSION
+    reload_derived_settings()
 
 
 def set_setting(key: str, value) -> None:
@@ -1337,6 +1135,7 @@ def _history_budget() -> int:
         return explicit
     return max(1024, OLLAMA_NUM_CTX - _fixed_prompt_tokens() - 1024)
 WHISPER_SIZE = SETTINGS["whisper_size"]
+WHISPER_DEVICE = SETTINGS.get("whisper_device", "auto")
 PIPER_VOICE_NAME = SETTINGS["piper_voice"]
 
 
@@ -1348,7 +1147,7 @@ def reload_derived_settings() -> None:
     tool-support probing when the model changes.
     """
     global OLLAMA_BASE, OLLAMA_MODEL, OLLAMA_NUM_CTX
-    global WHISPER_SIZE, PIPER_VOICE_NAME
+    global WHISPER_SIZE, WHISPER_DEVICE, PIPER_VOICE_NAME
     global _FIXED_PROMPT_TOKENS, _TOOLS_SUPPORTED
     host = str(SETTINGS.get("ollama_host", OLLAMA_BASE))
     if not host.startswith(("http://", "https://")):
@@ -1367,6 +1166,7 @@ def reload_derived_settings() -> None:
     OLLAMA_MODEL = new_model
     OLLAMA_NUM_CTX = new_ctx
     WHISPER_SIZE = SETTINGS.get("whisper_size", WHISPER_SIZE)
+    WHISPER_DEVICE = SETTINGS.get("whisper_device", "auto")
     PIPER_VOICE_NAME = SETTINGS.get("piper_voice", PIPER_VOICE_NAME)
 
 def _wake_name() -> str:
@@ -1607,7 +1407,7 @@ Never attempt destructive or unsafe commands (sudo, rm, pacman, shutdown, ...). 
 
 FILES
 - read_file(path): read any text file, including your own source code.
-- edit_file(path, content): replace the whole content of a file. You may only write your own source file and files inside {CONFIG_DIR}/ .
+- edit_file(path, content): replace a file's whole content. Allowed: own source, sibling split modules, files inside {CONFIG_DIR}/ .
 
 TYPING INTO APPS — type_text / press_keys / copy_text / paste_text
 You can type into the FOCUSED window of the desktop (chat boxes, editors, forms).
@@ -1669,12 +1469,12 @@ KNOWLEDGE — get_weather, web_search, lookup_fact, get_datetime
 - Current date/time is provided in the conversation; use get_datetime only when asked for the exact time.
 
 SELF-MODIFICATION
-- You ARE the program: your entire source is the single Python file {SELF_PATH}.
-- When the user asks you to change or extend yourself ("make your bubble pink", "add a mute option", "speak faster"):
-  1) read_file {SELF_PATH},
-  2) edit_file {SELF_PATH} with the complete updated file — valid Python, minimal changes, keeping the marker line '{SELF_MARKER}' exactly as-is,
-  3) reply with one short sentence confirming the change, then run_command "{RESTART_SCRIPT}" to restart into your new self.
-- For simple settings (volume, brightness, window control) just use commands; do not rewrite yourself."""
+- You ARE the program: {SELF_PATH} plus sibling split modules (settings_schema.py, hardware.py, handsoff-settings.py, core/*).
+- To change yourself ("make your bubble pink", "add a mute option", "speak faster"):
+  1) read_file the file,
+  2) edit_file it with the complete new content — valid Python, minimal diff ({SELF_PATH} edits keep '{SELF_MARKER}' exactly),
+  3) confirm briefly, then run_command "{RESTART_SCRIPT}" to restart.
+- Simple tweaks (volume, brightness, windows): use commands, never rewrite yourself."""
 
 def build_tools() -> list[dict]:
     """Generate the Ollama tool schema list from every @tool method.
@@ -1725,14 +1525,13 @@ def ollama_available() -> bool:
         return False
 
 
-_TOOLS_SUPPORTED = True  # flipped off permanently if the model can't do tool calls
+_TOOLS_SUPPORTED = True  # reset on any tools success; a 400 only retries
+# once per call without latching, so a transient error never disables tools
 
 
 def ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> dict:
     """One /api/chat round trip. Raises RuntimeError with a human-readable cause."""
     global _TOOLS_SUPPORTED
-    if tools and not _TOOLS_SUPPORTED:
-        tools = None
     payload: dict = {
         "model": OLLAMA_MODEL,
         "messages": messages,
@@ -1753,6 +1552,8 @@ def ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             body = json.loads(resp.read().decode("utf-8"))
+        if tools:
+            _TOOLS_SUPPORTED = True  # a tools call worked: never stay latched off
         return body.get("message") or {}
     except urllib.error.HTTPError as e:
         try:
@@ -1760,7 +1561,6 @@ def ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> dict:
         except Exception:
             detail = e.reason
         if e.code == 400 and tools and "tool" in detail.lower():
-            _TOOLS_SUPPORTED = False
             log.warning("model %s does not support tools; continuing without", OLLAMA_MODEL)
             return ollama_chat(messages, None)
         if e.code == 404 and "model" in str(detail).lower():
@@ -1791,8 +1591,6 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
     arrives. On a 400 'tools unsupported' error, retries once without tools.
     Any error pushes None after emitting what arrived so far."""
     global _TOOLS_SUPPORTED
-    if tools and not _TOOLS_SUPPORTED:
-        tools = None
     payload = {
         "model": OLLAMA_MODEL,
         "messages": messages,
@@ -1845,7 +1643,6 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
             q.put(tail)
     except urllib.error.HTTPError as e:
         if e.code == 400 and tools and "tool" in _read_http_error(e).lower():
-            _TOOLS_SUPPORTED = False
             log.warning("model %s does not support tools; continuing without", OLLAMA_MODEL)
             return ollama_chat_stream(messages, q, cancel, None)
         # ponytail: never swallow — the caller must speak the failure and
@@ -1858,6 +1655,8 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
         raise
     finally:
         q.put(None)
+    if tools:
+        _TOOLS_SUPPORTED = True  # a tools call worked: never stay latched off
     return {"tool_calls": tool_calls, "content": strip_thinking(full).strip()}
 
 
@@ -1977,6 +1776,41 @@ _whisper_lock = threading.Lock()
 _piper_voice = None
 _piper_lock = threading.Lock()
 
+# GPU inference needs free VRAM: the LLM already owns most of the card, so
+# whisper may only use the GPU when the model comfortably fits what's LEFT.
+# Conservative budgets (MB) including CTranslate2 workspace + activation headroom.
+_WHISPER_VRAM_MB = {
+    "tiny": 600, "base": 800, "small": 1400, "medium": 2600,
+    "large": 3600, "large-v1": 3600, "large-v2": 3600, "large-v3": 3600,
+    "turbo": 3000,
+}
+
+
+def _nvidia_free_vram_mb() -> "int | None":
+    """Free VRAM of the first NVIDIA GPU in MB, or None when there is no
+    detectable GPU (the cheap, dependency-free probe; runs once per load)."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.strip().splitlines()[0].strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _whisper_device_choice(size: str, free_mb: "int | None") -> tuple[str, str]:
+    """(device, compute_type): GPU only when free VRAM fits the model plus a
+    1 GB desktop-usage buffer; CPU otherwise. None means 'no GPU found'."""
+    if free_mb is None:
+        return ("cpu", "int8")
+    need = _WHISPER_VRAM_MB.get(size, 3600)
+    if free_mb >= need + 1024:
+        return ("cuda", "float16")
+    return ("cpu", "int8")
+
 
 def get_whisper():
     global _whisper_model
@@ -1984,12 +1818,31 @@ def get_whisper():
         if _whisper_model is None:
             from faster_whisper import WhisperModel  # lazy: heavy import
 
-            log.info("loading whisper '%s' from %s", WHISPER_SIZE, WHISPER_MODEL_DIR)
-            _whisper_model = WhisperModel(
-                WHISPER_SIZE, device="cpu", compute_type="int8",
-                download_root=str(WHISPER_MODEL_DIR),
-                local_files_only=True,  # model is cached; never block startup on HF network
-            )
+            device, compute = "cpu", "int8"
+            if WHISPER_DEVICE == "cuda":
+                device, compute = "cuda", "float16"
+            elif WHISPER_DEVICE == "auto":
+                device, compute = _whisper_device_choice(
+                    WHISPER_SIZE, _nvidia_free_vram_mb())
+            log.info("loading whisper '%s' on %s (%s) from %s",
+                     WHISPER_SIZE, device, compute, WHISPER_MODEL_DIR)
+            try:
+                _whisper_model = WhisperModel(
+                    WHISPER_SIZE, device=device, compute_type=compute,
+                    download_root=str(WHISPER_MODEL_DIR),
+                    local_files_only=True,  # model is cached; never block startup on HF network
+                )
+            except Exception:
+                if device == "cpu":
+                    raise
+                # a GPU hiccup (driver, OOM race with the LLM) must not take
+                # the bubble down — degrade to CPU, exactly the old behavior
+                log.exception("whisper %s load failed — falling back to cpu", device)
+                _whisper_model = WhisperModel(
+                    WHISPER_SIZE, device="cpu", compute_type="int8",
+                    download_root=str(WHISPER_MODEL_DIR),
+                    local_files_only=True,
+                )
         return _whisper_model
 
 
@@ -2351,15 +2204,18 @@ def _load_reminders() -> list[dict]:
 
 
 def _save_reminders(items: list[dict]) -> None:
-    """Caller MUST hold REMINDERS_LOCK: the tmp filename is fixed, so two
-    concurrent writers would corrupt each other's swap."""
+    """Caller MUST hold REMINDERS_LOCK + the reminders.json sidecar flock:
+    two concurrent writers would corrupt each other's read-modify-write."""
+    _backup_runtime_json(REMINDERS_FILE)
     _atomic_private_write(REMINDERS_FILE, json.dumps(items, indent=1))
 
 
 def _update_reminders(mutate) -> list[dict]:
     """One serialized read-modify-write transaction: load → mutate → save,
-    all under REMINDERS_LOCK. Every reminder mutation goes through this."""
-    with REMINDERS_LOCK:
+    under REMINDERS_LOCK (threads) plus the reminders.json sidecar flock
+    via _settings_file_lock (processes). Every mutation goes through this."""
+    with REMINDERS_LOCK, _core_settings._settings_file_lock()(
+            REMINDERS_FILE.parent, "reminders.json.lock"):
         items = _load_reminders()
         items = mutate(items) or items
         _save_reminders(items)
@@ -2551,12 +2407,58 @@ def _ics_allday(prop: str) -> bool:
     return bool(re.fullmatch(r"\d{8}", value.strip()))
 
 
+def _ics_add_months(dt: "datetime.datetime", months: int) -> "datetime.datetime":
+    """Add calendar months, clamping the day to the month's length
+    (Jan 31 + 1 month -> Feb 28/29). Used for INTERVAL progression."""
+    y = dt.year + (dt.month - 1 + months) // 12
+    m = (dt.month - 1 + months) % 12 + 1
+    return dt.replace(year=y, month=m,
+                      day=min(dt.day, _ics_month_length(y, m)))
+
+
+def _ics_month_length(year: int, month: int) -> int:
+    return calendar.monthrange(year, month)[1]
+
+
+def _ics_month_day(year: int, month: int, n: int,
+                   dtstart: "datetime.datetime") -> "datetime.datetime | None":
+    """Day n of a month (negative = from the end) at DTSTART's time of day;
+    None when the month has no such day (BYMONTHDAY=31 in February)."""
+    length = _ics_month_length(year, month)
+    day = length + 1 + n if n < 0 else n
+    if not 1 <= day <= length:
+        return None
+    return dtstart.replace(year=year, month=month, day=day)
+
+
+def _ics_nth_weekday(year: int, month: int, nth: int, weekday: int,
+                     dtstart: "datetime.datetime") -> "datetime.datetime | None":
+    """The nth (1..5) or nth-from-end (-1..-5) weekday of a month at
+    DTSTART's time; None when that weekday does not occur nth times."""
+    if nth > 0:
+        first = datetime.date(year, month, 1)
+        day = 1 + (weekday - first.weekday()) % 7 + (nth - 1) * 7
+    else:
+        last = _ics_month_length(year, month)
+        last_wd = datetime.date(year, month, last).weekday()
+        day = last - (last_wd - weekday) % 7 + (nth + 1) * 7
+    if not 1 <= day <= _ics_month_length(year, month):
+        return None
+    return dtstart.replace(year=year, month=month, day=day)
+
+
 def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                 win_start: "datetime.datetime", win_end: "datetime.datetime",
                 dur: "datetime.timedelta") -> list["datetime.datetime"]:
-    """Basic RRULE expansion: DAILY and WEEKLY (with INTERVAL/BYDAY/COUNT).
-    Anything else (MONTHLY, YEARLY, BYSETPOS…) falls back to the single
-    occurrence — honest limitation, not silent data loss."""
+    """RRULE expansion: DAILY, WEEKLY, MONTHLY and YEARLY.
+
+    Supported parts: INTERVAL, BYDAY (WEEKLY weekday sets; MONTHLY nth
+    weekdays like 2MO / -1FR), BYMONTHDAY, BYMONTH (YEARLY), UNTIL and
+    COUNT. RFC 5545 semantics: UNTIL is inclusive; COUNT bounds the TOTAL
+    instance count including DTSTART; instances before DTSTART do not
+    exist. BYSETPOS and friends remain an honest single-occurrence
+    fallback, not silent data loss.
+    """
     one = [dtstart] if dtstart < win_end and dtstart + dur > win_start else []
     if not rrule:
         return one
@@ -2567,20 +2469,34 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
         count = int(parts.get("COUNT") or 500)
     except ValueError:
         return one
+    # UNTIL is inclusive; a date-only UNTIL parses to that day's midnight.
+    until: "datetime.datetime | None" = None
+    if parts.get("UNTIL"):
+        until = _ics_parse_dt(f"UNTIL:{parts['UNTIL']}")
+
+    def want(t: "datetime.datetime") -> bool:
+        if t < dtstart or t >= win_end or t + dur <= win_start:
+            return False
+        return until is None or t <= until
+
     out: list = []
+    k = 0                                     # absolute instance counter
     if freq == "DAILY":
-        cur, i = dtstart, 0
-        while cur < win_end and i < count:
-            if cur + dur > win_start:
-                out.append(cur)
-            cur += datetime.timedelta(days=interval)
+        i = 0
+        while i < count:
+            t = dtstart + datetime.timedelta(days=i * interval)
+            if t >= win_end:
+                break
+            if want(t):
+                out.append(t)
             i += 1
     elif freq == "WEEKLY":
         wd = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
-        days = [wd[d] for d in parts.get("BYDAY", "").split(",") if d in wd]             or [dtstart.weekday()]
+        days = [wd[d] for d in parts.get("BYDAY", "").split(",")
+                if d in wd] or [dtstart.weekday()]
         week0 = dtstart - datetime.timedelta(days=dtstart.weekday())
         w = 0
-        while w < 200 and len(out) < count:
+        while w < 200 and k < count:
             base = week0 + datetime.timedelta(weeks=w * interval)
             if base > win_end:
                 break
@@ -2588,9 +2504,93 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                 t = base + datetime.timedelta(
                     days=d, hours=dtstart.hour, minutes=dtstart.minute,
                     seconds=dtstart.second)
-                if t < win_end and t + dur > win_start:
-                    out.append(t)
+                if t >= dtstart:
+                    k += 1
+                    if want(t):
+                        out.append(t)
             w += 1
+    elif freq == "MONTHLY":
+        wd = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+        byday = parts.get("BYDAY", "").strip()
+        monthday = parts.get("BYMONTHDAY", "").strip()
+        nth_days: "list[tuple[int, int]] | None" = None
+        if byday:
+            nth_days = []
+            for d in byday.split(","):
+                m_ = re.fullmatch(r"([+-]?\d+)([A-Z]{2})", d.strip())
+                if not m_ or m_.group(2) not in wd:
+                    return one   # ordinal-less BYDAY in MONTHLY: fallback
+                nth_days.append((int(m_.group(1)), wd[m_.group(2)]))
+        m = 0
+        while m < 240 and k < count:
+            base = _ics_add_months(dtstart, m * interval)
+            if base > win_end:
+                break
+            cands: list = []
+            if nth_days:
+                for nth, day in nth_days:
+                    t = _ics_nth_weekday(base.year, base.month, nth, day,
+                                         dtstart)
+                    if t:
+                        cands.append(t)
+            elif monthday:
+                for s_ in monthday.split(","):
+                    try:
+                        n = int(s_)
+                    except ValueError:
+                        return one
+                    t = _ics_month_day(base.year, base.month, n, dtstart)
+                    if t:
+                        cands.append(t)
+            else:
+                # RFC: no BY* -> repeat DTSTART's day-of-month; months
+                # lacking that day (31st in February) have no occurrence.
+                t = _ics_month_day(base.year, base.month, dtstart.day, dtstart)
+                if t:
+                    cands.append(t)
+            for t in sorted(cands):
+                k += 1
+                if want(t):
+                    out.append(t)
+            m += 1
+    elif freq == "YEARLY":
+        months: list[int] = []
+        for x in parts.get("BYMONTH", "").split(","):
+            x = x.strip()
+            if not x:
+                continue
+            if not x.lstrip("-").isdigit():
+                return one
+            months.append(int(x))
+        monthday = parts.get("BYMONTHDAY", "").strip()
+        y = 0
+        while y < 20 and k < count:
+            year = dtstart.year + y * interval
+            if year > win_end.year:
+                break
+            cands: list = []
+            for mo in months or [dtstart.month]:
+                if not 1 <= mo <= 12:
+                    continue
+                if monthday:
+                    for s_ in monthday.split(","):
+                        try:
+                            n = int(s_)
+                        except ValueError:
+                            return one
+                        t = _ics_month_day(year, mo, n, dtstart)
+                        if t:
+                            cands.append(t)
+                else:
+                    try:
+                        cands.append(dtstart.replace(year=year, month=mo))
+                    except ValueError:
+                        pass   # Feb 29 in a non-leap year: no occurrence
+            for t in sorted(cands):
+                k += 1
+                if want(t):
+                    out.append(t)
+            y += 1
     else:
         return one
     return out
@@ -2877,7 +2877,8 @@ def _due_reminders(items: list[dict], now: float) -> tuple[list[dict], list[dict
 
 def _take_missed_reminders() -> list[dict]:
     """Pop reminders that came due while we were off (startup call)."""
-    with REMINDERS_LOCK:
+    with REMINDERS_LOCK, _core_settings._settings_file_lock()(
+            REMINDERS_FILE.parent, "reminders.json.lock"):
         items = _load_reminders()
         if not items:
             return []
@@ -2917,6 +2918,57 @@ def _mpc(*args: str, timeout: float = 8.0) -> str:
                                "systemctl --user start mpd")
         raise RuntimeError(f"mpc error: {err[:200]}")
     return r.stdout
+
+
+_SPLIT_EDIT_FILES = frozenset(
+    {"settings_schema.py", "hardware.py", "handsoff-settings.py"})
+_SPLIT_EDIT_CORE = frozenset({"__init__.py", "settings.py"})
+
+
+def _editable_roots() -> list[Path]:
+    """Dirs whose split-module files the model may edit: the running copy's
+    dir, the checkout source dir, and ~/.local/bin (deduped, in order)."""
+    roots: list[Path] = []
+    for cand in (SELF_PATH.parent, HOME / ".local" / "bin"):
+        try:
+            roots.append(cand.resolve())
+        except OSError:
+            roots.append(cand)
+    repo = _repo_source_path()
+    if repo is not None:
+        try:
+            roots.append(repo.resolve().parent)
+        except OSError:
+            roots.append(repo.parent)
+    out, seen = [], set()
+    for root in roots:
+        if str(root) not in seen:
+            seen.add(str(root))
+            out.append(root)
+    return out
+
+
+def _classify_edit_path(p: Path) -> str:
+    """'self' | 'split' | 'config' | '' for a resolved edit_file target."""
+    try:
+        self_resolved = SELF_PATH.resolve()
+    except OSError:
+        self_resolved = SELF_PATH
+    if p == SELF_PATH or p == self_resolved:
+        return "self"
+    try:
+        config_root = CONFIG_DIR.resolve()
+    except OSError:
+        config_root = CONFIG_DIR
+    if config_root in p.parents:
+        return "config"
+    for root in _editable_roots():
+        if p.parent == root and p.name in _SPLIT_EDIT_FILES:
+            return "split"
+        if (p.parent.name == "core" and p.parent.parent == root
+                and p.name in _SPLIT_EDIT_CORE):
+            return "split"
+    return ""
 
 
 class ToolBelt:
@@ -2981,6 +3033,52 @@ class ToolBelt:
             "edit_file": True, "self_restart": True, **(permissions or {}),
         }
 
+    # -- self-edit confirmation (prompt-injection hardening) ------------------
+
+    def _is_self_edit(self, args: dict) -> bool:
+        """True when this edit_file call targets handsoff.py itself."""
+        try:
+            p = Path(str(args.get("path") or "")).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return p == SELF_PATH
+
+    def _self_edit_needs_confirm(self, args: dict) -> bool:
+        """True for a self-edit whose payload already passes the tool's static
+        checks (marker + syntax). Those checks stay in edit_file; here they
+        just ensure the CONFIRM offer only gates writes that would otherwise
+        land immediately — invalid payloads fall through to the tool's own
+        refusal with no user round-trip."""
+        if not self._is_self_edit(args):
+            return False
+        content = args.get("content")
+        if not isinstance(content, str) or SELF_MARKER not in content:
+            return False
+        try:
+            compile(content, "self-edit-preview", "exec")
+        except SyntaxError:
+            return False
+        return True
+
+    @staticmethod
+    def _self_edit_preview(args: dict, limit: int = 800) -> str:
+        """Unified diff of the proposed self-edit against the live source,
+        for the spoken-then-shown confirmation offer."""
+        import difflib
+        try:
+            old = SELF_PATH.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return f"(current source unreadable, no diff: {e})"
+        new = str(args.get("content") or "")
+        out = "".join(difflib.unified_diff(
+            old.splitlines(True), new.splitlines(True),
+            fromfile="handsoff.py (running)", tofile="handsoff.py (proposed)"))
+        if not out:
+            return "(proposed content is identical to the running source)"
+        if len(out) > limit:
+            out = out[:limit] + f"\n… (diff truncated, {len(out) - limit} more chars)"
+        return out
+
     # -- public dispatch -----------------------------------------------------
 
     def _announce_job(self, text: str) -> None:
@@ -3036,6 +3134,14 @@ class ToolBelt:
             verdict = "ALLOW"
         else:
             verdict = self._policy.classify(name)
+        # Self-edit floor: an edit to handsoff.py itself is RCE by construction
+        # (the source runs inside the trusted bubble). It ALWAYS takes the
+        # one-turn CONFIRM round-trip with a diff preview — even when the
+        # user's command_policy says ALLOW. DENY still wins outright.
+        if (name == "edit_file" and verdict != "DENY"
+                and getattr(self, "_confirm_running", None) != name
+                and self._self_edit_needs_confirm(args)):
+            verdict = "CONFIRM"
         target = json.dumps(args, sort_keys=True)[:200] if args else ""
         if verdict == "DENY":
             log_decision(name, target, "DENY", "refused: command_policy DENY")
@@ -3055,10 +3161,14 @@ class ToolBelt:
                 log_decision(name, target, "CONFIRM", "offered; awaiting confirm_action")
             else:
                 log_decision(name, target, "CONFIRM", "still awaiting confirm_action")
+            extra = ""
+            if name == "edit_file" and self._is_self_edit(args):
+                extra = "\nDIFF PREVIEW (proposed change to handsoff.py):\n" \
+                        + self._self_edit_preview(args)
             return (f"CONFIRM REQUIRED: about to call '{name}' with {target or 'no arguments'}. "
                     "Nothing happened yet. The user must hear this offer and "
                     "reply; call confirm_action(answer='yes') in the NEXT turn "
-                    "to run it, or confirm_action(answer='no') to cancel."), True
+                    "to run it, or confirm_action(answer='no') to cancel." + extra), True
         # dry-run: desktop actions report instead of act
         dry_run = bool(SETTINGS.get("dry_run")) and DecisionPolicy.is_desktop_action(name)
         if dry_run:
@@ -5294,22 +5404,25 @@ class ToolBelt:
         lines: list[str] = []
         reaped: list[str] = []
         for jid, job in sorted(jobs.items()):
-            state, done = job.poll()
+            state, done = job.poll()   # single poll; status_text reuses it
+            status = job.status_text(state, done)
             if done:
                 if not job._announced:
                     job._announced = True
-                    self._announce_job(job.status_text())
-                # bounded output tail from the drain thread (never read()
-                # the pipe after poll — the child would block at ~64k)
+                    self._announce_job(status)
+                # explicit reap (never read() the pipe after poll — the
+                # child would block at ~64k): full drain budget here so the
+                # tail is complete, while status polls never wait.
+                job._join_drain(timeout=5.0)
                 out = job.output_tail(4096)
                 out = (out or "").strip()
                 if len(out) > BoundedJob.MAX_OUTPUT:
                     out = out[:BoundedJob.MAX_OUTPUT] + " …(truncated)"
-                lines.append(f"{job.status_text()}\noutput:\n{out or '(no output)'}")
+                lines.append(f"{status}\noutput:\n{out or '(no output)'}")
                 if state != "running":
                     reaped.append(jid)
             else:
-                lines.append(job.status_text())
+                lines.append(status)
         with self._job_lock:
             for jid in reaped:
                 self._jobs.pop(jid, None)
@@ -5682,9 +5795,9 @@ class ToolBelt:
     # -- edit_file -------------------------------------------------------------
 
     @tool(description=(
-        f"Replace a file's content. Allowed: your own source "
-        f"{HOME / '.local/bin/handsoff.py'} and files under {CONFIG_DIR}/. "
-        "Writes a .bak backup; self-edits must keep the marker and compile."))
+        f"Replace a file's content. Allowed: own source + sibling split "
+        f"modules, files under {CONFIG_DIR}/. "
+        ".bak backup; Python must compile, self-edits keep the marker."))
     def edit_file(self, path: str, content: str) -> str:
         """Overwrite a text file.
 
@@ -5694,15 +5807,16 @@ class ToolBelt:
         p = Path(path).expanduser().resolve()
         if len(content) > self.MAX_WRITE:
             return "REFUSED: content too large"
-        try:
-            config_root = CONFIG_DIR.resolve()
-        except OSError:
-            config_root = CONFIG_DIR
-        is_self = p == SELF_PATH
-        if not (is_self or config_root in p.parents):
+        kind = _classify_edit_path(p)
+        if not kind:
             return (
-                f"REFUSED: you may only edit {SELF_PATH} or files inside {CONFIG_DIR}/"
+                "REFUSED: you may only edit your own source "
+                f"({SELF_PATH}), the split modules beside it or in "
+                f"{HOME / '.local/bin'} "
+                f"({', '.join(sorted(_SPLIT_EDIT_FILES))}, core/*), "
+                f"or files inside {CONFIG_DIR}/"
             )
+        is_self = kind == "self"
         # capability boundary: settings.json holds the tool permissions; a
         # self-edit could silently re-enable a tool the user turned off.
         # The user changes permissions through the settings app only.
@@ -5712,6 +5826,7 @@ class ToolBelt:
         if is_self:
             if SELF_MARKER not in content:
                 return f"REFUSED: self-edit must keep the marker line '{SELF_MARKER}'"
+        if is_self or (kind == "split" and p.suffix == ".py"):
             try:
                 compile(content, str(p), "exec")
             except SyntaxError as e:
@@ -5749,6 +5864,8 @@ class ToolBelt:
             note += (f" — verify first: python -m py_compile {p} && "
                      f"python -m pytest tests/test_policy.py -q, then "
                      f"run_command '{RESTART_SCRIPT}' to restart into the new version")
+        elif kind == "split":
+            note += (f" — run_command '{RESTART_SCRIPT}' to restart into the new version")
         return note
 
 
@@ -6211,6 +6328,21 @@ class ContinuousListener:
 
 # --------------------------------------------------------------------- assistant
 
+_MONOTONIC_BOOT_FLOOR = time.monotonic() - 1.0
+"""time.monotonic() is uptime-based (zero at boot), NOT epoch-based — so a
+fresh 'never announced' sentinel of 0.0 looks like an announcement made just
+before boot whenever the machine has been up less than one cooldown window.
+That silently suppressed urgent world/hardware warnings after every reboot.
+Announce-cooldown checks go through this floor: a 0.0 sentinel means "never".
+"""
+
+
+def _announce_ok(last: float, cooldown_s: float) -> bool:
+    """True when the announce cooldown has elapsed; 0.0/None = never."""
+    if not last:
+        return True
+    return time.monotonic() - max(last, _MONOTONIC_BOOT_FLOOR) >= cooldown_s
+
 
 class Assistant(QObject):
     """Owns the state machine, the worker pipeline and the conversation."""
@@ -6434,7 +6566,7 @@ class Assistant(QObject):
             cooldown_s = float(SETTINGS.get("world_cooldown_min", 60.0)) * 60.0
         except (TypeError, ValueError):
             cooldown_s = 3600.0
-        if time.monotonic() - self._world_last_announce < cooldown_s:
+        if not _announce_ok(self._world_last_announce, cooldown_s):
             return
         events, _degraded = _world_events("all", 5)
         fresh = [e for e in events
@@ -6598,7 +6730,7 @@ class Assistant(QObject):
                     cd = float(SETTINGS.get("hardware_cooldown_min", 60.0)) * 60.0
                 except (TypeError, ValueError):
                     cd = 3600.0
-                if time.monotonic() - self._hardware_last_urgent >= cd:
+                if _announce_ok(self._hardware_last_urgent, cd):
                     self._hardware_last_urgent = time.monotonic()
                     log.warning("hardware watch: %s", urgent)
                     notify(urgent)
@@ -6754,7 +6886,8 @@ class Assistant(QObject):
         while True:
             time.sleep(2.0)
             try:
-                with REMINDERS_LOCK:
+                with REMINDERS_LOCK, _core_settings._settings_file_lock()(
+                        REMINDERS_FILE.parent, "reminders.json.lock"):
                     items = _load_reminders()
                     fired, kept = [], items
                     if items:
@@ -7766,6 +7899,7 @@ class Assistant(QObject):
 
     def _save_history(self) -> None:
         try:
+            _backup_runtime_json(HISTORY_FILE)
             _atomic_private_write(
                 HISTORY_FILE, json.dumps(self._history, ensure_ascii=False, indent=1))
         except OSError:
@@ -7908,6 +8042,7 @@ def _load_memory() -> list[dict]:
 
 def _save_memory(items: list[dict]) -> None:
     try:
+        _backup_runtime_json(MEMORY_FILE)
         _atomic_private_write(
             MEMORY_FILE, json.dumps(items, ensure_ascii=False, indent=1))
     except OSError:

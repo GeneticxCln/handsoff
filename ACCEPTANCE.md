@@ -12,8 +12,10 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
 ## 1. Deployment trust (P0)
 
 - ✅ [auto] `./install.sh` completes; `~/.config/handsoff/deployment.json`
-  exists with three file rows (`handsoff.py`, `handsoff-settings.py`,
-  `handsoff-restart`), all `source==installed: True`. Re-verified 2026-09-09
+  exists with seven file rows (`handsoff.py`, `handsoff-settings.py`,
+  `handsoff-restart`, `settings_schema.py`, `hardware.py`,
+  `core/__init__.py`, `core/settings.py`), all `source==installed: True`.
+  Re-verified 2026-09-09
   after the ff2f158 run (per-package pacman probe + unit-name loop fired live).
 - ✅ [auto] `--ptt doctor` prints
   `deployment: in-sync — installed copy matches the checkout` (2026-09-09)
@@ -23,7 +25,8 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   layer: the live bubble health snapshot fed through the Settings app's own
   `_fmt_health()` renders
   `mic: … · brain: ok gemma4:latest · tts/stt: ok · deploy: ok`
-  (the string the bar displays verbatim; pixel-OCR of the Qt window was
+  (the string the bar displays verbatim — `gemma4:latest` was the
+  configured value on the test box; the shipped default is `qwen3:8b`; pixel-OCR of the Qt window was
   attempted but multi-output screenshots made OCR unreliable)
 - ✅ [auto] `systemctl --user status handsoff` → active; unit has
   `Restart=always` (2026-09-09)
@@ -32,6 +35,7 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
 
 - ✅ [auto] Fresh start: stop → `systemctl --user start handsoff` → unit
   active, `--ptt status` answers `state=idle handsfree=off model=gemma4:latest`
+  (`gemma4:latest` was the configured value on the test box; default `qwen3:8b`)
   (2026-09-09)
 - ✅ [auto] Restart: `~/.local/bin/handsoff-restart` → exactly one bubble
   after the swap. **Found and fixed a real race today**: against a

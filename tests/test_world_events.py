@@ -217,6 +217,34 @@ def _ticker(H, monkeypatch, state="idle"):
     return a, said, popped
 
 
+class TestBootFloorAnnounce:
+    """time.monotonic() is uptime-based: a 0.0 'never announced' sentinel used
+    to look like an announcement made just before boot, silently suppressing
+    urgent warnings for a whole cooldown window after every reboot (found live
+    when the host had been up 10 minutes). The announce checks must treat
+    0.0 as never — regardless of host uptime."""
+
+    def test_never_sentinel_warns_after_fresh_boot(self, H, net, seenfile, monkeypatch):
+        a, said, popped = _ticker(H, monkeypatch)
+        a._world_last_announce = 0.0        # never announced
+        # simulate a freshly booted host: monotonic() inside its first window
+        monkeypatch.setattr(H, "_MONOTONIC_BOOT_FLOOR",
+                            time.monotonic() - 1.0)
+        a._world_tick()
+        assert len(said) == 1 and len(popped) == 1   # urgent warning survives
+
+    def test_announced_before_boot_is_still_cooled_down(self, H, net, seenfile,
+                                                        monkeypatch):
+        """A sentinel of 0.0 is 'never'; a REAL pre-boot announcement cannot
+        exist (monotonic starts at 0), so no legitimate case may cool down a
+        fresh process for uptime-based reasons."""
+        a, said, popped = _ticker(H, monkeypatch)
+        a._world_last_announce = 0.0
+        monkeypatch.setattr(H, "_MONOTONIC_BOOT_FLOOR", time.monotonic() - 1.0)
+        assert H._announce_ok(0.0, 3600.0) is True
+        assert H._announce_ok(time.monotonic(), 3600.0) is False   # just announced
+
+
 class TestProactive:
     def test_flag_off_no_fetch(self, H, net, seenfile, monkeypatch):
         monkeypatch.setitem(H.SETTINGS, "world_warnings", False)

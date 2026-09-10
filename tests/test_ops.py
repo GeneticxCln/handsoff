@@ -287,10 +287,18 @@ class TestInstalledCopySmoke:
         home = tmp_path / "home"
         bin_dir = home / ".local" / "bin"
         bin_dir.mkdir(parents=True)
-        for name in ("handsoff.py", "handsoff-settings.py", "handsoff-restart"):
+        # the sibling modules handsoff.py imports beside itself (schema =
+        # single-source defaults, hardware = lazy-imported watch, core/ = the
+        # settings package from split step (a))
+        for name in ("handsoff.py", "handsoff-settings.py", "handsoff-restart",
+                     "settings_schema.py", "hardware.py"):
             src = HERE / name
             if src.exists():
                 (bin_dir / name).write_bytes(src.read_bytes())
+        core_dir = bin_dir / "core"
+        core_dir.mkdir(exist_ok=True)
+        for name in ("__init__.py", "settings.py"):
+            (core_dir / name).write_bytes((HERE / "core" / name).read_bytes())
         (bin_dir / "handsoff-restart").chmod(0o755)
         state = home / "state"
         env = dict(os.environ)

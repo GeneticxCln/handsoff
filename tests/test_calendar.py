@@ -387,3 +387,46 @@ class TestICSOverrides:
         for line in out.splitlines():
             if line.strip().startswith(tmr):
                 assert "10:00" not in line, line
+
+
+class TestICSMonthlyYearly:
+    """MONTHLY/YEARLY RRULE expansion (handsoff.py _ics_expand_rrule)."""
+
+    def _events(self, H, dtstart, rrule, win_s, win_e, summary="Ev"):
+        text = "\r\n".join([
+            "BEGIN:VCALENDAR", "VERSION:2.0",
+            "BEGIN:VEVENT", "UID:uid-m@test",
+            f"DTSTART:{dtstart}", f"DTEND:{dtstart[:8]}T110000",
+            f"SUMMARY:{summary}", f"RRULE:{rrule}",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ])
+        ws = H.datetime.datetime(*win_s)
+        we = H.datetime.datetime(*win_e)
+        return H._ics_events_from_text(text, ws, we)
+
+    def test_monthly_nth_weekday(self, H):
+        # 2nd Tuesday: Jan 13 / Feb 10 / Mar 10 / Apr 14 2026
+        ev = self._events(H, "20260113T100000", "FREQ=MONTHLY;BYDAY=2TU",
+                          (2026, 1, 1), (2026, 5, 1))
+        assert [(e["start"].month, e["start"].day) for e in ev] == [
+            (1, 13), (2, 10), (3, 10), (4, 14)]
+
+    def test_monthly_bymonthday(self, H):
+        ev = self._events(H, "20260115T100000", "FREQ=MONTHLY;BYMONTHDAY=15",
+                          (2026, 1, 1), (2026, 4, 16))
+        assert [(e["start"].month, e["start"].day) for e in ev] == [
+            (1, 15), (2, 15), (3, 15), (4, 15)]
+
+    def test_yearly_bymonth(self, H):
+        ev = self._events(H, "20260115T100000", "FREQ=YEARLY;BYMONTH=1,7",
+                          (2026, 1, 1), (2027, 1, 1))
+        assert [(e["start"].month, e["start"].day) for e in ev] == [
+            (1, 15), (7, 15)]
+
+    def test_until_bounds(self, H):
+        # UNTIL is inclusive: Jan 1-3 only, nothing after
+        ev = self._events(H, "20260101T100000",
+                          "FREQ=DAILY;UNTIL=20260103T100000",
+                          (2026, 1, 1), (2026, 1, 10))
+        assert [e["start"].day for e in ev] == [1, 2, 3]

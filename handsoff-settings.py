@@ -41,7 +41,7 @@ HOME = Path.home()
 
 
 def _import_handsoff():
-    """Load the bubble's module for shared paths, defaults and helpers."""
+    """Load the bubble's module for shared paths and helpers."""
     for cand in (HOME / ".local/bin/handsoff.py", Path(__file__).resolve().parent / "handsoff.py"):
         if cand.exists():
             spec = importlib.util.spec_from_file_location("handsoff_core", cand)
@@ -52,7 +52,52 @@ def _import_handsoff():
     sys.exit(1)
 
 
-H = _import_handsoff()
+class _LazyHandsoff:
+    """Defer exec'ing the 8621-line bubble until first attribute use.
+
+    Importing handsoff.py pulls the whole bubble (audio/Qt) just to reach
+    shared paths/helpers; the settings GUI paid that at startup for no
+    reason. Reads behave as before — the first real attribute execs the
+    bubble once and caches it — and monkeypatch.setattr(H, ...) in tests
+    keeps working (instance attrs shadow the bubble until deleted)."""
+    def __init__(self) -> None:
+        self.__dict__["_bubble"] = None
+
+    def _load(self):
+        mod = self.__dict__["_bubble"]
+        if mod is None:
+            mod = _import_handsoff()
+            self.__dict__["_bubble"] = mod
+        return mod
+
+    def __getattr__(self, name: str):
+        return getattr(self._load(), name)
+
+
+def _import_settings_schema():
+    """Load settings_schema.py (the single source of DEFAULT_SETTINGS) directly.
+
+    The settings GUI must not pull its defaults through the bubble module:
+    that forced a full bubble exec (audio imports, Qt globals) just to merge
+    defaults, and duplicated the schema in the pre-2026-09 monolith. The
+    schema is a dependency-free dict.
+    """
+    for cand in (Path(__file__).resolve().parent / "settings_schema.py",
+                 HOME / ".local/bin/settings_schema.py"):
+        if cand.exists():
+            spec = importlib.util.spec_from_file_location("handsoff_settings_schema", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    sys.stderr.write("handsoff-settings: cannot find settings_schema.py — install handsoff first\n")
+    sys.exit(1)
+
+
+SCHEMA = _import_settings_schema()
+DEFAULT_SETTINGS = SCHEMA.DEFAULT_SETTINGS
+SETTINGS_VERSION = SCHEMA.SETTINGS_VERSION
+
+H = _LazyHandsoff()
 
 import numpy as np  # noqa: E402  (after handsoff, which already required it)
 import sounddevice as sd  # noqa: E402
@@ -112,7 +157,7 @@ def merge_settings(data: dict) -> dict:
     does), then run the SHARED coercion from handsoff.py: a hand-edited
     settings.json with garbage values ("1,5", "32k", "abc") must produce a
     working UI, not a crashed recovery tool."""
-    merged = json.loads(json.dumps(H.DEFAULT_SETTINGS))  # deep copy of defaults
+    merged = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy of defaults
     if isinstance(data, dict):
         for k, v in data.items():
             if k not in merged:
@@ -121,7 +166,15 @@ def merge_settings(data: dict) -> dict:
                 merged[k].update(v)
             else:
                 merged[k] = v
-    return H.coerce_settings(merged)
+    # Shared coercion without exec'ing the whole bubble: core.settings is the
+    # module handsoff.py itself re-exports coerce_settings from (same function
+    # object), so prefer it; the lazy bubble is only a fallback (e.g. partial
+    # installs without core/).
+    try:
+        from core.settings import coerce_settings
+    except ImportError:
+        coerce_settings = H.coerce_settings
+    return coerce_settings(merged)
 
 
 def http_json(url: str, payload: dict | None = None, timeout: int = 10):
@@ -280,6 +333,20 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _fsync_dir(path: Path) -> None:
+    """Persist a rename: best-effort directory fsync (no-op where unsupported)."""
+    try:
+        fd = os.open(os.fspath(path), os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 class BubblePreview(QWidget):
     """Four animated orbs previewing the state colours and bubble size."""
 
@@ -388,6 +455,9 @@ class VoiceDownloadDialog(QDialog):
         sel = self.list.currentItem()
         url = self.url_edit.text().strip() if self.url_edit.text().strip() else (
             sel.data(Qt.UserRole) if sel else None)
+        if url and not url.lower().startswith("https://"):
+            self.status.setText("URL must use https://")
+            return None
         if url and not url.endswith(".onnx"):
             self.status.setText("URL must point to a .onnx file")
             return None
@@ -432,9 +502,12 @@ class VoiceDownloadDialog(QDialog):
                             got += len(chunk)
                             prog["pct"] = int(got * 100 / total) if total else -1
                             prog["msg"] = f"{target.name}: {got // 1024 // 1024} MB"
+                        f.flush()
+                        os.fsync(f.fileno())
                 if want and _sha256_file(Path(tmp_name)) != want:
                     raise ValueError(f"{target.name} checksum mismatch")
                 os.replace(tmp_name, target)
+                _fsync_dir(target.parent)
             except BaseException:
                 try:
                     Path(tmp_name).unlink(missing_ok=True)
@@ -451,7 +524,16 @@ class VoiceDownloadDialog(QDialog):
                 if not (got_onnx or got_cfg):
                     prog["msg"] = f"{name} already present"
                 elif not _voice_want_sha(dest.name):
-                    prog["msg"] = f"saved {name} (WITHOUT checksum verification)"
+                    # ponytail: custom URL, no pinned checksum — warn loudly and
+                    # print the pin so the next download (or the bubble's own
+                    # PIPER_VOICE_SHA256 gate) can verify it.
+                    try:
+                        digest = _sha256_file(dest)
+                    except OSError:
+                        digest = ""
+                    prog["msg"] = (f"saved {name} (WARNING: unverified — pin with "
+                                   f"PIPER_VOICE_SHA256={digest})" if digest
+                                   else f"saved {name} (WARNING: unverified)")
                 else:
                     prog["msg"] = f"saved {name}"
             except Exception as e:
@@ -962,7 +1044,7 @@ class SettingsWindow(QMainWindow):
         return it.data(Qt.UserRole) if it else ""
 
     def refresh_models(self) -> None:
-        base = (self.host_edit.text().strip() or H.DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
+        base = (self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
         if not base.startswith(("http://", "https://")):
             base = "http://" + base
         self.model_list.clear()
@@ -1004,7 +1086,7 @@ class SettingsWindow(QMainWindow):
         self.run_bg(fetch, done)
 
     def test_model(self) -> None:
-        base = (self.host_edit.text().strip() or H.DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
+        base = (self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
         model = self._selected_model() or self.cfg["model"]
         self.test_btn.setEnabled(False)
         self._status(f"testing {model} …")
@@ -1667,7 +1749,7 @@ class SettingsWindow(QMainWindow):
             self._paint_color_buttons()
 
     def _reset_colors(self) -> None:
-        self._colors = dict(H.DEFAULT_SETTINGS["colors"])
+        self._colors = dict(DEFAULT_SETTINGS["colors"])
         self._paint_color_buttons()
 
     # ----------------------------------------------------------------- startup
@@ -1873,7 +1955,7 @@ class SettingsWindow(QMainWindow):
 
     def _collect(self) -> list[str]:
         problems: list[str] = []
-        self.cfg["ollama_host"] = self.host_edit.text().strip() or H.DEFAULT_SETTINGS["ollama_host"]
+        self.cfg["ollama_host"] = self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]
         self.cfg["model"] = self._selected_model() or self.cfg["model"]
         self.cfg["num_ctx"] = self.ctx_spin.value()
         self.cfg["history_tokens"] = self.hist_spin.value()
@@ -1886,7 +1968,7 @@ class SettingsWindow(QMainWindow):
         self.cfg["mic_threshold"] = self.thresh_spin.value()
         self.cfg["handsfree"] = self.hf_chk.isChecked()
         self.cfg["assistant_name"] = (
-            self.wake_name_edit.text().strip() or H.DEFAULT_SETTINGS["assistant_name"])
+            self.wake_name_edit.text().strip() or DEFAULT_SETTINGS["assistant_name"])
         self.cfg["wake_word_required"] = self.wake_chk.isChecked()
         self.cfg["engage_seconds"] = float(self.wake_secs.value())
         self.cfg["followup_seconds"] = float(self.followup_secs.value())
@@ -1965,8 +2047,9 @@ class SettingsWindow(QMainWindow):
             except OSError:
                 pass
         try:
-            H._atomic_private_write(
-                H.SETTINGS_FILE, json.dumps(self.cfg, ensure_ascii=False, indent=1))
+            # shared writer: version-stamps settings.json and keeps a one-
+            # generation backup, so the bubble can migrate layouts safely
+            H._write_settings_dict(self.cfg)
         except OSError as e:
             self._status(f"cannot save settings: {e}")
             return False

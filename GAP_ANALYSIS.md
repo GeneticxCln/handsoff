@@ -3,9 +3,77 @@
 Date: 2026-09-09 · Phase 0/1/2 of the external task list are closed (see the
 Addendum below); remaining consciously-accepted items are at the bottom.
 
+## Addendum — 2026-09-09 improvement-program closure (settings schema, self-edit
+## confirm, voice pinning, VRAM-aware whisper)
+
+Outcomes of the user's gaps/improvements list (550 tests green, 2026-09-10):
+
+### Done
+1. **`settings_schema.py` — single source of truth.** `DEFAULT_SETTINGS` and the
+   new `SETTINGS_VERSION` live in one module; `handsoff.py` imports it (spec-load
+   fallback when loaded beside-file) and `handsoff-settings.py` lost its
+   `H.DEFAULT_SETTINGS` passthrough hack. The installer ships the schema (and
+   `hardware.py`) to `~/.local/bin` and hashes both in `deployment.json`; the
+   installed-copy smoke test stages them.
+2. **Self-edit is prompt-injection-safe.** `edit_file` on the running source
+   takes a FORCED one-turn CONFIRM round-trip with a unified-diff preview in the
+   offer — `command_policy: ALLOW` cannot downgrade it (DENY still wins), and
+   invalid payloads (no marker / bad syntax) still get the tool's own refusal
+   without a pointless user round-trip.
+3. **Settings versioning + runtime backups.** Every `settings.json` write is
+   version-stamped through one shared writer (`_write_settings_dict`, used by
+   bubble and settings app); `_migrate_settings` stamps/handles old files,
+   warns on future versions, and `version` is a meta key, not a setting.
+   history/memory/reminders/settings writes keep a one-generation `.bak`.
+4. **Custom piper voices must be pinned.** A non-default `PIPER_VOICE_URL`
+   without `PIPER_VOICE_SHA256` is now FATAL (was warning-only); the pin
+   command is printed, and `HANDSOFF_UNVERIFIED_VOICE=1` is the explicit,
+   loud opt-out.
+5. **VRAM-aware whisper.** New `whisper_device` setting (`auto` default):
+   GPU (`cuda`/float16) only when `nvidia-smi` free VRAM fits the model's
+   budget + 1 GB desktop buffer, CPU/int8 otherwise; forced `cpu`/`cuda`
+   honored, and a GPU load failure degrades to CPU instead of crashing.
+6. **Coverage measured honestly.** The 60% TOTAL was polluted by PySide6's
+   vendored `shibokensupport` phantom files (now omitted): real numbers are
+   handsoff.py 70%, hardware.py 84%, handsoff-settings.py (Qt GUI) 18%.
+   The floor stays 60 with a comment explaining why 70 needs settings-GUI test
+   investment rather than an omit-pattern; the "~75%" premise was stale.
+
+### Monolith split — step (a) EXECUTED (2026-09-09)
+7. **`core/settings.py` extracted.** The settings machinery (coercion,
+   migration, cross-process flock, atomic private writes, quarantine,
+   backup) lives in `core/settings.py` behind an explicit `Settings` object
+   that takes every path as a parameter — core never reaches into handsoff
+   globals. `handsoff.py` keeps the old module-level names as thin wrappers
+   (the `H.*` monkeypatch contract and patch seams survive; the wrappers are
+   late-bound so future steps can patch core directly), `_SETTINGS_OBJ` is
+   the explicit object, and the installer ships + hashes `core/`. Remaining
+   steps, same recipe: (b) `core/audio.py` (SpeechGate, listener, STT/TTS
+   wrappers); (c) `core/tools.py` (ToolBelt + policy); (d) `core/brain.py`
+   (Assistant, history/memory); (e) `core/ui.py` + `core/doctor.py`;
+    (f) shim re-exports for one release, then remove.
+8. **ICS MONTHLY/YEARLY recurrence.** `_ics_expand_rrule` covers MONTHLY
+    (nth-weekday like 2TU, BYMONTHDAY, DTSTART day-of-month fallback) and
+    YEARLY (BYMONTH, BYMONTHDAY, Feb-29 skip) with UNTIL/COUNT bounds,
+    pinned by `TestICSMonthlyYearly` (nth-weekday, BYMONTHDAY, BYMONTH,
+    UNTIL-bound cases).
+
+**Real bug found by the split's verification run:** announce-cooldown checks
+compared against raw `time.monotonic()` (uptime-based), so a fresh
+"never announced" 0.0 sentinel looked like a pre-boot announcement and
+**silently suppressed urgent world/hardware warnings for the whole first
+coldown window after every reboot**. Fixed via `_announce_ok()` with a
+boot floor; uptime-independent pins added (the old hardware/world tests
+only passed on hosts up longer than 60 minutes).
+
+### Not done (revisited, still open)
+- D-Bus rich notifications, per-tool policy UI,
+  installer `--rehearse` in CI, Compositor interface for niri-stub testing,
+  Settings History/decision-viewer tab — unchanged from the P1/P2 lists below.
+
 ## Addendum — 2026-09-09 trust & reliability program (P0–P2 closed)
 
-403 tests green across the split suite (`tests/`: audio, policy, desktop,
+550 tests green (2026-09-10) across the split suite (`tests/`: audio, policy, desktop,
 calendar, settings, lifecycle, regression, ops).
 
 ### P0 — the running product is trustworthy
@@ -78,14 +146,14 @@ calendar, settings, lifecycle, regression, ops).
   single-source-of-truth (repo files shipped as-is; manifest added).
 
 Still open, accepted consciously: real-hardware acceptance run (see
-`ACCEPTANCE.md`), CI rehearse-runs of the full installer, ICS MONTHLY/YEARLY
-RRULE, richer D-Bus notification formatting, and Settings UI rows for
+`ACCEPTANCE.md`), CI rehearse-runs of the full installer,
+richer D-Bus notification formatting, and Settings UI rows for
 per-tool command_policy (the JSON path and dry-run checkbox exist).
 
 ## Addendum — 2026-09-09 hardening audit (post-merge review)
 
 Edge-case audit of `_prepare_runtime` / `_remove_stale_control_socket` (24
-new tests in `tests/test_hardening.py`; total 429):
+new tests in `tests/test_hardening.py`; suite now 550 green, 2026-09-10):
 
 - **Fixed, was a real wedge**: a stale control socket left permissive
   (e.g. created under umask 000) made `_secure_file` refuse it — and since
@@ -113,7 +181,7 @@ new tests in `tests/test_hardening.py`; total 429):
 ## Addendum — 2026-09-08 external audit closure
 
 Every priority finding and most "remaining gaps" from the external audit are
-now closed (455 tests green):
+now closed (550 tests green, 2026-09-10):
 
 - Command whitelist bypass via absolute `niri` paths — closed (basename-keyed
   spawn checks; `TestSpawnInterpreterBoundary` extended).
@@ -141,7 +209,7 @@ now closed (455 tests green):
   committed — pinned by `TestPrecommitHook`.
 
 Still open, accepted consciously: real-hardware acceptance session (mic, echo,
-suspend/resume), CI rehearse-runs of the installer, ICS MONTHLY/YEARLY RRULE,
+suspend/resume), CI rehearse-runs of the installer,
 and richer D-Bus notification formatting for applications that emit unusual
 Notify argument layouts.
 
@@ -157,7 +225,7 @@ Notify argument layouts.
 - Ops: niri window rule (round bubble), autostart, keybinds Mod+V / Mod+Shift+V
   / Mod+Shift+H / Mod+Shift+S (settings, works even when the bubble is dead),
   restart script with lock race fixed, faulthandler crash log
-- 455 tests, all green
+- 550 tests, all green (2026-09-10)
 - Ambient automation: opt-in notification reader, Pomodoro transitions, RAM/VRAM
   threshold crossings, and bounded file/process watchers; all have Settings
   controls or safe tool gates
@@ -223,7 +291,7 @@ workspace-index work (settings locking + reload, `run_command` rework,
 `_quarantine_bad`, spawn hardening, installer changes, CI/pre-commit, docs). Audited
 at the settled state; gates re-run on that exact tree.
 
-**Gates:** `py_compile` + `bash -n` clean; **455 tests green**; runtime tool census
+**Gates:** `py_compile` + `bash -n` clean; **550 tests green (2026-09-10)**; runtime tool census
 **46, unchanged** (grep over `@tool` over-counts because of the docstring example);
 doctor functional. The README "440+ tests" bump is accurate.
 

@@ -7,7 +7,8 @@
 #
 #   ./install.sh
 #
-# Overrides (optional): HANDSOFF_MODEL, HANDSOFF_WHISPER, PIPER_VOICE_URL
+# Overrides (optional): HANDSOFF_MODEL, HANDSOFF_WHISPER, HANDSOFF_WHISPER_REVISION,
+#   PIPER_VOICE_URL, HANDSOFF_PYTHON, HANDSOFF_NO_OLLAMA_SERVICE
 set -euo pipefail
 
 # No-arg flags that must never touch the system: the CI smoke test runs these
@@ -33,13 +34,18 @@ WHISPER_SIZE="${HANDSOFF_WHISPER:-tiny}"
 OLLAMA_MODEL="${HANDSOFF_MODEL:-qwen3:8b}"
 VOICE_URL_DEFAULT="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
 PIPER_VOICE_URL="${PIPER_VOICE_URL:-$VOICE_URL_DEFAULT}"
+# ponytail: resolve once; venv's python3 shadows system when activated.
+PYBIN="${HANDSOFF_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
+WHISPER_REVISION="${HANDSOFF_WHISPER_REVISION:-main}"
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Uninstalling handsoff"
     systemctl --user disable --now handsoff.service 2>/dev/null || true
     rm -f "$HOME/.config/systemd/user/handsoff.service" \
           "$BIN_DIR/handsoff.py" "$BIN_DIR/handsoff-restart" \
-          "$BIN_DIR/handsoff-settings.py"
+          "$BIN_DIR/handsoff-settings.py" \
+          "$BIN_DIR/settings_schema.py" "$BIN_DIR/hardware.py"
+    rm -rf "$BIN_DIR/core"
     systemctl --user daemon-reload 2>/dev/null || true
     # kill only real bubble processes: python executable + EXACT cmdline match.
     # A bare `pkill -f handsoff.py` would kill bystanders whose cmdline merely
@@ -92,14 +98,23 @@ for p in $PYTHON_PKGS; do
         echo "    note: $p is not in this distro's repos — requirements.txt provides it via pip"
     fi
 done
+PACMAN="sudo pacman"
+# HANDSOFF_SKIP_SYSTEM_PKGS=1: trust the system packages are already present
+# (CI, redeploys from a non-interactive shell where sudo cannot prompt, or a
+# pre-provisioned box). Package probes still run; only the transaction is
+# skipped.
+if [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ]; then
+    echo "    skipping system package transaction (HANDSOFF_SKIP_SYSTEM_PKGS=1)"
+    PACMAN=""
+fi
 if [ "${HANDSOFF_FULL_UPGRADE:-0}" = "1" ]; then
     echo "    full system upgrade requested (supported Arch -Syu policy)"
-    sudo pacman -Syu --needed --noconfirm $ARCH_PKGS \
+    [ -n "$PACMAN" ] && $PACMAN -Syu --needed --noconfirm $ARCH_PKGS \
         alsa-utils ollama curl \
         ydotool wl-clipboard grim tesseract mpc
 else
     echo "    installing missing packages from the local DB (no refresh, no full upgrade)"
-    sudo pacman -S --needed --noconfirm $ARCH_PKGS \
+    [ -n "$PACMAN" ] && $PACMAN -S --needed --noconfirm $ARCH_PKGS \
         alsa-utils ollama curl \
         ydotool wl-clipboard grim tesseract mpc
 fi
@@ -108,7 +123,7 @@ echo "==> [2/8] Python packages (pip, user site)"
 # Single source of truth: the manifest. Core deps also come from pacman above;
 # this covers the lazy-imported extras (faster-whisper, piper-tts,
 # openwakeword/onnxruntime for the wake spotter) at verified floors.
-python -m pip install --user --break-system-packages --upgrade \
+"${PYBIN}" -m pip install --user --break-system-packages --upgrade \
     -r "$HERE/requirements.txt"
 
 echo "==> [3/8] Directories"
@@ -118,6 +133,26 @@ echo "==> [4/8] Placing handsoff.py, settings app and restart script"
 install -m 755 "$HERE/handsoff.py" "$BIN_DIR/handsoff.py"
 if [ -f "$HERE/handsoff-settings.py" ]; then
     install -m 755 "$HERE/handsoff-settings.py" "$BIN_DIR/handsoff-settings.py"
+fi
+# Supporting modules imported next to the bubble (schema = single source of
+# DEFAULT_SETTINGS; hardware = the lazy-imported hardware/world watch; core/ =
+# the settings package from split step (a)). All must exist in BIN_DIR or the
+# installed copy dies on import.
+for mod in settings_schema hardware; do
+    if [ -f "$HERE/$mod.py" ]; then
+        install -m 644 "$HERE/$mod.py" "$BIN_DIR/$mod.py"
+    else
+        echo "    FATAL: $HERE/$mod.py is missing but required by handsoff.py" >&2
+        exit 1
+    fi
+done
+if [ -f "$HERE/core/__init__.py" ] && [ -f "$HERE/core/settings.py" ]; then
+    mkdir -p "$BIN_DIR/core"
+    install -m 644 "$HERE/core/__init__.py" "$BIN_DIR/core/__init__.py"
+    install -m 644 "$HERE/core/settings.py" "$BIN_DIR/core/settings.py"
+else
+    echo "    FATAL: $HERE/core/ is missing but required by handsoff.py" >&2
+    exit 1
 fi
 # Single source of truth: the repo's handsoff-restart is shipped as-is
 # (a heredoc duplicate here silently drifted from it once already).
@@ -131,6 +166,9 @@ cat > "$CONF_DIR/deployment.json" <<MANIFEST_EOF
 {
   "installed_at": "$(date -Is)",
   "source_dir": "$HERE",
+  "whisper_model": "$WHISPER_SIZE",
+  "whisper_revision": "$WHISPER_REVISION",
+  "python": "$PYBIN",
   "files": {
     "handsoff.py": {
       "source_sha256": "$(sha_of "$HERE/handsoff.py")",
@@ -140,6 +178,22 @@ cat > "$CONF_DIR/deployment.json" <<MANIFEST_EOF
       "source_sha256": "$(sha_of "$HERE/handsoff-settings.py")",
       "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-settings.py")"
     },
+    "settings_schema.py": {
+      "source_sha256": "$(sha_of "$HERE/settings_schema.py")",
+      "installed_sha256": "$(sha_of "$BIN_DIR/settings_schema.py")"
+    },
+    "hardware.py": {
+      "source_sha256": "$(sha_of "$HERE/hardware.py")",
+      "installed_sha256": "$(sha_of "$BIN_DIR/hardware.py")"
+    },
+    "core/__init__.py": {
+      "source_sha256": "$(sha_of "$HERE/core/__init__.py")",
+      "installed_sha256": "$(sha_of "$BIN_DIR/core/__init__.py")"
+    },
+    "core/settings.py": {
+      "source_sha256": "$(sha_of "$HERE/core/settings.py")",
+      "installed_sha256": "$(sha_of "$BIN_DIR/core/settings.py")"
+    },
     "handsoff-restart": {
       "source_sha256": "$(sha_of "$HERE/handsoff-restart")",
       "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"
@@ -148,7 +202,7 @@ cat > "$CONF_DIR/deployment.json" <<MANIFEST_EOF
 }
 MANIFEST_EOF
 echo "==> [5/8] Downloading whisper '$WHISPER_SIZE' model (one time)"
-python - "$WHISPER_SIZE" "$CONF_DIR/whisper-model" <<'PY_EOF'
+"${PYBIN}" - "$WHISPER_SIZE" "$CONF_DIR/whisper-model" <<'PY_EOF'
 import sys
 from faster_whisper import WhisperModel
 WhisperModel(sys.argv[1], device="cpu", compute_type="int8", download_root=sys.argv[2])
@@ -197,11 +251,24 @@ download_verified() {  # <url> <dest> <expected-sha256-or-empty>
     fi
     mv "$tmp" "$dest"
 }
-# a custom URL with no PIPER_VOICE_SHA256/_JSON set downloads unverified
-# (with a warning); the default lessac voice is always strictly checked.
+# a custom URL MUST come with a hash: the voice is spoken audio the user
+# cannot visually audit, so "warning-only" trust was a supply-chain hole.
+# To use a new voice, pin it first:
+#   curl -fsSL "$PIPER_VOICE_URL" | sha256sum
+#   ...then export PIPER_VOICE_SHA256=<digest> (and _JSON_SHA256 for the .json).
+# HANDSOFF_UNVERIFIED_VOICE=1 restores the old warning-only behavior, loudly,
+# for airgapped/experimental setups — an explicit, deliberate choice.
+if [ "$PIPER_VOICE_URL" != "$VOICE_URL_DEFAULT" ] \
+        && [ -z "${PIPER_VOICE_SHA256:-}" ] \
+        && [ "${HANDSOFF_UNVERIFIED_VOICE:-0}" != "1" ]; then
+    echo "    FATAL: custom PIPER_VOICE_URL requires PIPER_VOICE_SHA256" >&2
+    echo "      pin it:  curl -fsSL '$PIPER_VOICE_URL' | sha256sum" >&2
+    echo "      (or HANDSOFF_UNVERIFIED_VOICE=1 to accept an unverified voice)" >&2
+    exit 1
+fi
 if [ "$PIPER_VOICE_URL" != "$VOICE_URL_DEFAULT" ] \
         && [ -z "${PIPER_VOICE_SHA256:-}" ]; then
-    echo "    NOTE: custom PIPER_VOICE_URL without PIPER_VOICE_SHA256 — download will be unverified"
+    echo "    WARNING (HANDSOFF_UNVERIFIED_VOICE=1): $voice downloads WITHOUT checksum verification" >&2
     VOICE_SHA256=""
 fi
 download_verified "$PIPER_VOICE_URL" "$CONF_DIR/piper-voice/$voice" "$VOICE_SHA256"
@@ -210,7 +277,7 @@ download_verified "$PIPER_VOICE_URL.json" "$CONF_DIR/piper-voice/$voice.json" "$
 echo "==> [7/8] systemd user service (auto-restart if the bubble dies)"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SYSTEMD_DIR"
-cat > "$SYSTEMD_DIR/handsoff.service" <<'UNIT_EOF'
+cat > "$SYSTEMD_DIR/handsoff.service" <<UNIT_EOF
 [Unit]
 Description=handsoff voice assistant bubble
 After=graphical-session.target
@@ -221,7 +288,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python %h/.local/bin/handsoff.py
+ExecStart=$PYBIN %h/.local/bin/handsoff.py
 # Restart=always: recover from clean exits too (stray SIGTERM, Quit menu click,
 # app.quit()) — the only quiet exit we honour is a real desktop shutdown (PartOf).
 Restart=always
@@ -268,9 +335,14 @@ fi
 
 echo "==> [8/8] Checking ollama"
 if ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then
-    echo "    starting the ollama service ..."
-    sudo systemctl enable --now ollama || true
-    sleep 2
+    # ponytail: never touch the system service when pkgs are skipped or opted out.
+    if [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ] || [ "${HANDSOFF_NO_OLLAMA_SERVICE:-0}" = "1" ]; then
+        echo "    ollama not running — leaving the service alone (skip/opt-out)"
+    else
+        echo "    starting the ollama service ..."
+        sudo systemctl enable --now ollama || true
+        sleep 2
+    fi
 fi
 if ! ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$OLLAMA_MODEL"; then
     echo "    pulling $OLLAMA_MODEL (a few GB, one time) ..."
@@ -301,8 +373,8 @@ if systemctl --user is-enabled handsoff.service >/dev/null 2>&1; then
     # do NOT write spawn-at-startup (a unit restart would spawn duplicates)
     echo "     (systemd manages autostart; add 'Mod+Shift+S => spawn settings' to niri manually)"
 else
-    printf '\n// launch at startup:\nspawn-at-startup "python" "%s"\n' \
-        "$BIN_DIR/handsoff.py" >> "$CONF_DIR/niri-window-rule.kdl"
+    printf '\n// launch at startup:\nspawn-at-startup "%s" "%s"\n' \
+        "$PYBIN" "$BIN_DIR/handsoff.py" >> "$CONF_DIR/niri-window-rule.kdl"
     echo "     (no systemd: added spawn-at-startup — check the path contains no wrong username)"
 fi
 

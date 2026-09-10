@@ -31,7 +31,7 @@ jobs:
       - name: Run the test suite
         run: python -m pytest tests/ -q
 
-  # Coverage floor: TOTAL must stay >= 60% (the suite measures ~75%).
+  # Coverage floor: TOTAL must stay >= 60% (matches .coveragerc).
   # Local `pytest` stays plugin-free; only this job installs pytest-cov.
   # Omit list + floor live in .coveragerc (tests/ and attic/ excluded).
   coverage:
@@ -64,7 +64,7 @@ jobs:
           python-version: "3.12"
       - name: python -m py_compile
         run: |
-          python -m py_compile handsoff.py handsoff-settings.py attic/patch_wakeword.py tests/fake_ollama.py
+          python -m py_compile handsoff.py handsoff-settings.py settings_schema.py hardware.py core/__init__.py core/settings.py attic/patch_wakeword.py tests/fake_ollama.py
           python -m py_compile tests/*.py
 
   # Shell syntax checks for every shipped script.

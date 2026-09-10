@@ -86,15 +86,57 @@ class TestToolBelt:
         assert out.startswith("REFUSED") and "compile" in out
 
     def test_self_edit_writes_and_suggests_restart(self, tb, H, tmp_path, monkeypatch):
+        """After confirm_action('yes') the self-edit lands (marker, compile, and
+        restart advice still enforced by the tool itself)."""
         belt, _ = tb
         fake_self = tmp_path / "handsoff.py"
         fake_self.write_text(H.SELF_MARKER + "\nprint('v1')\n", encoding="utf-8")
         monkeypatch.setattr(H, "SELF_PATH", fake_self)
         new_src = H.SELF_MARKER + "\nprint('v2')\n"
         out, err = belt.execute("edit_file", {"path": str(fake_self), "content": new_src})
+        assert err and out.startswith("CONFIRM REQUIRED")   # forced confirm floor
+        assert "DIFF PREVIEW" in out and "handsoff.py (proposed)" in out
+        yes, err = belt.execute("confirm_action", {"answer": "yes"})
         assert not err and fake_self.read_text(encoding="utf-8") == new_src
-        assert "restart" in out
+        assert "restart" in yes
         assert (tmp_path / "handsoff.py.bak").exists()  # backup written
+
+    def test_self_edit_confirm_is_forced_even_when_policy_allows(self, tb, H,
+                                                                 tmp_path, monkeypatch):
+        """Prompt-injection hardening: command_policy ALLOW must NOT downgrade
+        the self-edit round-trip — an edit to the running bubble source is RCE
+        by construction, so the user always gets the one-turn confirm."""
+        belt, _ = tb
+        H.SETTINGS["command_policy"] = {"edit_file": "ALLOW"}
+        fake_self = tmp_path / "handsoff.py"
+        fake_self.write_text(H.SELF_MARKER + "\nprint('v1')\n", encoding="utf-8")
+        monkeypatch.setattr(H, "SELF_PATH", fake_self)
+        out, err = belt.execute("edit_file", {
+            "path": str(fake_self),
+            "content": H.SELF_MARKER + "\nprint('injected?')\n"})
+        assert err and out.startswith("CONFIRM REQUIRED")
+        # and the write did NOT happen while the offer is pending
+        assert fake_self.read_text(encoding="utf-8") == H.SELF_MARKER + "\nprint('v1')\n"
+
+    def test_self_edit_confirm_denied_wins_and_garbage_skips_offer(self, tb, H,
+                                                                   tmp_path, monkeypatch):
+        """DENY beats the confirm floor (no zombie offers), and invalid payloads
+        (no marker / bad syntax) fall through to edit_file's own refusal
+        without a pointless user round-trip."""
+        belt, _ = tb
+        H.SETTINGS["command_policy"] = {"edit_file": "DENY"}
+        fake_self = tmp_path / "handsoff.py"
+        fake_self.write_text(H.SELF_MARKER + "\nprint('v1')\n", encoding="utf-8")
+        monkeypatch.setattr(H, "SELF_PATH", fake_self)
+        out, err = belt.execute("edit_file", {
+            "path": str(fake_self), "content": H.SELF_MARKER + "\nprint('v2')\n"})
+        assert err and "DENIED" in out and not out.startswith("CONFIRM")
+        # garbage payload: no user round-trip, tool's own refusal instead
+        H.SETTINGS["command_policy"] = {}
+        out, err = belt.execute("edit_file", {
+            "path": str(fake_self), "content": "print('no marker')\n"})
+        assert err and out.startswith("REFUSED") and "marker" in out
+        assert belt._pending_confirm is None
 
     def test_permission_switch_disables_tool(self, tb, H):
         belt, _ = tb

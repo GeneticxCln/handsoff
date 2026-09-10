@@ -3,7 +3,15 @@ omit =
     tests/*
     attic/*
     */site-packages/*
+    # PySide6's vendored shibokensupport registers paths inside the project
+    # dir during Qt imports (the source lives in site-packages); without this
+    # omit the coverage TOTAL is polluted with unparseable phantom files.
+    shibokensupport/*
 
 [report]
+# Floor is 60 and that is HONEST: handsoff.py measures 70%, hardware.py 84%,
+# but the Qt settings GUI (handsoff-settings.py) is ~18% — widget wiring that
+# offscreen tests barely reach — and it drags TOTAL to 60%. Raising the floor
+# to 70 requires real settings-GUI test investment, not an omit-pattern.
 fail_under = 60
 show_missing = True
