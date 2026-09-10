@@ -19,6 +19,7 @@ Add `--selftest` to run a headless smoke test (no window is shown).
 from __future__ import annotations
 
 import importlib.util
+import copy
 import hashlib
 import html
 import json
@@ -2016,6 +2017,7 @@ class SettingsWindow(QMainWindow):
         except (OSError, ValueError):
             data = {}
         self.cfg = merge_settings(data)
+        self._loaded_cfg = copy.deepcopy(self.cfg)
         self._load_values()
 
     def _load_values(self) -> None:
@@ -2160,10 +2162,17 @@ class SettingsWindow(QMainWindow):
         try:
             # shared writer: version-stamps settings.json and keeps a one-
             # generation backup, so the bubble can migrate layouts safely
-            H._write_settings_dict(self.cfg)
+            written = H._SETTINGS_OBJ.write_all(
+                self.cfg, expected_data=self._loaded_cfg)
+        except H._core_settings.SettingsConflictError as e:
+            self._status(str(e) + ". Reload before saving.")
+            return False
         except OSError as e:
             self._status(f"cannot save settings: {e}")
             return False
+        self.cfg = written
+        self._loaded_cfg = copy.deepcopy(written)
+        self._disk_mtime = self._settings_mtime()
         # One autostart owner, same rule as the installer: when the systemd
         # user unit manages the bubble, niri spawn-at-startup is NOT added.
         msg = apply_autostart(self.autostart_chk.isChecked())

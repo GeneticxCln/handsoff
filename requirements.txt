@@ -4,12 +4,13 @@
 #   CORE   — hard imports; the app and test suite cannot run without them.
 #   EXTRAS — lazy-imported features; the app degrades gracefully without them.
 #
-# Versions below are the ones the suite was verified against (583 tests green
-# on Python 3.12/3.13). They are floors, not exact pins: patch-level drift is
-# fine, but bump majors deliberately and re-run the full suite.
+# Versions below remain compatibility floors. When requirements-lock.txt is
+# present, install.sh and CI add it as a constraints file for reproducibility.
+# Regenerate that file from a clean supported interpreter after upgrades; do
+# not add hashes for packages that have not been resolved.
 #
 # Install everything:        pip install --user -r requirements.txt
-# CI installs the same manifest (see .github/workflows/ci.yml)
+# CI installs the manifest plus its checked-in constraints.
 
 # --- CORE (app + test suite hard requirements) ---
 numpy>=2.0,<3          # audio buffers everywhere

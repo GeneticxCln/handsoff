@@ -45,8 +45,10 @@ import calendar
 import faulthandler
 import fcntl
 import hashlib
+import ipaddress
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
 import signal
@@ -116,6 +118,7 @@ except ImportError:
 
 VERSION = "1.0.0"
 APP_NAME = "handsoff"
+SHUTDOWN_JOIN_TIMEOUT = 0.25
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "handsoff"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(HOME / ".local/state"))) / APP_NAME
@@ -246,6 +249,138 @@ def _load_core_package():
 
 _core_settings = _load_core_package()
 from core import load_module as _load_module
+
+# Phase 4c compatibility facade: core.tools owns the extracted runtime; this
+# host supplies the existing globals and callbacks so historical monkeypatch
+# seams and public names remain stable.
+
+try:
+    _brain = _load_module("brain")
+except ImportError:
+    # Compatibility with already-installed bundles made before core/brain.py.
+    class _LegacyTurnStream:
+        def __init__(self, generation, cancel, sentence_q):
+            self.generation, self.cancel, self.sentence_q = generation, cancel, sentence_q
+            self.result = None
+            self.done = threading.Event()
+
+    class _LegacyBrain:
+        TurnStream = _LegacyTurnStream
+
+        @staticmethod
+        def strip_thinking(text):
+            text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+            return re.sub(r"^\s*\[TOOL_CALLS\][^\n]*(?:\n|$)", "", text,
+                          flags=re.MULTILINE).strip()
+
+        @staticmethod
+        def _read_http_error(error):
+            try:
+                return str(json.loads(error.read().decode("utf-8")).get("error", ""))
+            except Exception:
+                return str(error.reason)
+
+        _error = _read_http_error
+
+        @staticmethod
+        def ollama_available(*, base, guard, urlopen):
+            try:
+                guard()
+                with urlopen(base + "/api/tags", timeout=3) as response:
+                    json.loads(response.read().decode("utf-8"))
+                return True
+            except Exception:
+                return False
+
+        @classmethod
+        def ollama_chat(cls, messages, tools=None, *, base, model, num_ctx,
+                        guard, logger, state=None, urlopen=urllib.request.urlopen,
+                        keep_alive=None):
+            guard()
+            payload = {"model": model, "messages": messages, "stream": False,
+                       "think": False, "keep_alive": keep_alive or os.environ.get(
+                           "HANDSOFF_KEEP_ALIVE", "1h"),
+                       "options": {"temperature": 0.3, "num_ctx": num_ctx}}
+            if tools:
+                payload["tools"] = tools
+            req = urllib.request.Request(base + "/api/chat",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            try:
+                with urlopen(req, timeout=300) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                return body.get("message") or {}
+            except urllib.error.HTTPError as error:
+                detail = cls._read_http_error(error)
+                if error.code == 400 and tools and "tool" in detail.lower():
+                    logger.warning("model %s does not support tools; continuing without", model)
+                    return cls.ollama_chat(messages, None, base=base, model=model,
+                                           num_ctx=num_ctx, guard=guard, logger=logger,
+                                           state=state, urlopen=urlopen,
+                                           keep_alive=keep_alive)
+                if error.code == 404 and "model" in detail.lower():
+                    detail += f" — run: ollama pull {model}"
+                raise RuntimeError(f"Ollama error {error.code}: {detail}") from None
+            except urllib.error.URLError as error:
+                raise RuntimeError(f"cannot reach Ollama at {base} ({error.reason}). "
+                                   "Start it with: systemctl start ollama") from None
+
+        @classmethod
+        def ollama_chat_stream(cls, messages, q, cancel=None, tools=None, *, base,
+                               model, num_ctx, guard, logger, state=None,
+                               urlopen=urllib.request.urlopen, keep_alive=None):
+            guard()
+            payload = {"model": model, "messages": messages, "stream": True,
+                       "think": False, "keep_alive": keep_alive or os.environ.get(
+                           "HANDSOFF_KEEP_ALIVE", "1h"),
+                       "options": {"temperature": 0.3, "num_ctx": num_ctx}}
+            if tools:
+                payload["tools"] = tools
+            req = urllib.request.Request(base + "/api/chat",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            buf, full, calls, fallback = "", "", [], False
+            try:
+                with urlopen(req, timeout=300) as response:
+                    for raw in response:
+                        if cancel is not None and cancel.is_set():
+                            break
+                        try:
+                            chunk = json.loads(raw.strip().decode("utf-8"))
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        msg = chunk.get("message") or {}
+                        calls.extend(msg.get("tool_calls") or [])
+                        piece = msg.get("content") or ""
+                        buf += piece
+                        full += piece
+                        while True:
+                            match = re.search(r"[.!?…](\s|$)", buf)
+                            if not match:
+                                break
+                            sentence, buf = buf[:match.end()], buf[match.end():]
+                            sentence = cls.strip_thinking(sentence)
+                            if sentence and not sentence.startswith("<"):
+                                q.put(sentence)
+                tail = cls.strip_thinking(buf)
+                if tail and not tail.startswith("<"):
+                    q.put(tail)
+            except urllib.error.HTTPError as error:
+                detail = cls._read_http_error(error)
+                if error.code == 400 and tools and "tool" in detail.lower():
+                    logger.warning("model %s does not support tools; continuing without", model)
+                    fallback = True
+                    return cls.ollama_chat_stream(messages, q, cancel, None,
+                        base=base, model=model, num_ctx=num_ctx, guard=guard,
+                        logger=logger, state=state, urlopen=urlopen,
+                        keep_alive=keep_alive)
+                raise RuntimeError(f"Ollama error {error.code}: {detail}") from None
+            finally:
+                if not fallback:
+                    q.put(None)
+            return {"tool_calls": calls, "content": cls.strip_thinking(full)}
+
+    _brain = _LegacyBrain
 _ss_mod = sys.modules.get("core.settings_schema")  # core/__init__ loads it
 if _ss_mod is None:
     _ss_mod = _load_module("settings_schema")
@@ -852,204 +987,13 @@ _DECISIONS_LOCK = threading.Lock()
 _DECISIONS_MAX = 500
 
 
-def log_decision(tool: str, target: str, decision: str,
-                 result: str = "dispatched") -> None:
-    """Append one JSON line to ~/.local/state/handsoff/decisions.jsonl.
-
-    Every tool decision — ALLOW, DENY, CONFIRM, DRY-RUN — lands here with an
-    action id, so 'why did it do that' always has an answer. Best-effort:
-    a failed log write must never break the tool call itself."""
-    entry = {
-        "id": f"{int(time.time() * 1000):x}-{random.randrange(1 << 16):04x}",
-        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "tool": tool,
-        "target": str(target)[:200],
-        "decision": decision,
-        "result": result,
-    }
-    try:
-        with _DECISIONS_LOCK:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            with DECISIONS_FILE.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            os.chmod(DECISIONS_FILE, 0o600)
-            try:
-                with DECISIONS_FILE.open("r", encoding="utf-8") as fh:
-                    lines = fh.readlines()
-                if len(lines) > _DECISIONS_MAX * 2:
-                    # ponytail: atomic write, not a predictable .tmp swap
-                    _atomic_private_write(
-                        DECISIONS_FILE, "".join(lines[-_DECISIONS_MAX:]))
-            except OSError:
-                pass   # trim is cosmetic; the append already succeeded
-    except Exception:
-        # the decision log must NEVER break the tool call it records
-        log.debug("decision log write failed", exc_info=True)
 
 
-class DecisionPolicy:
-    """Central tool policy: every tool call classifies to ALLOW, DENY or
-    CONFIRM before it runs.
-
-    - ALLOW: run normally (the default; per-tool permission gates still apply).
-    - DENY:  the user disabled this tool in settings['command_policy'] —
-             refused before any code runs, regardless of permission switches.
-    - CONFIRM: the tool self-manages a one-turn-separated spoken confirmation
-             (like kill_process → confirm_kill): the first call only proposes,
-             the second call — a separate model turn after the user heard the
-             offer — executes. Tools classified CONFIRM must be two-step.
-    Dry-run mode (settings['dry_run']) makes desktop actions REPORT what they
-    would do without doing it — for rehearsing a scripted sequence.
-    """
-
-    def __init__(self, settings: "dict | None" = None) -> None:
-        self._settings = settings if settings is not None else SETTINGS
-
-    def classify(self, tool: str) -> str:
-        pol = self._settings.get("command_policy") or {}
-        if not isinstance(pol, dict):
-            return "ALLOW"
-        v = pol.get(tool)
-        if isinstance(v, str) and v.strip().upper() in ("ALLOW", "DENY", "CONFIRM"):
-            return v.strip().upper()
-        return "ALLOW"
-
-    def is_denied(self, tool: str) -> bool:
-        return self.classify(tool) == "DENY"
-
-    def request_confirm(self, tool: str) -> bool:
-        """True when a CONFIRM-classified tool should stop and offer."""
-        return self.classify(tool) == "CONFIRM"
-
-    def confirm_seconds(self) -> float:
-        try:
-            s = float(self._settings.get("confirm_seconds", 90.0))
-        except (TypeError, ValueError):
-            s = 90.0
-        return min(max(s, 5.0), 600.0)
-
-    @staticmethod
-    def is_desktop_action(tool: str) -> bool:
-        """Tools that change the desktop (or spawn work) and thus honour
-        dry-run mode."""
-        return tool in ("run_command", "start_command", "open_app",
-                        "close_window", "focus_window", "workspace",
-                        "type_text", "press_keys", "press_hotkey", "scroll",
-                        "click_element", "click_at", "copy_text",
-                        "paste_text")
 
 
 # ------------------------------------------------------------ bounded jobs
 
 
-class BoundedJob:
-    """A long-running whitelisted command with a hard cap and bounded output.
-
-    `start_command` runs e.g. a test suite in the background, stores the
-    Popen here, and `job_status` polls it. Everything is bounded: max jobs,
-    output bytes, lifetime — so a runaway job cannot eat the machine."""
-
-    MAX_JOBS = 4
-    MAX_OUTPUT = 200_000
-    MAX_LIFETIME_S = 1800.0
-
-    def __init__(self, job_id: str, command: str, proc: subprocess.Popen) -> None:
-        self.id = job_id
-        self.command = command
-        self.proc = proc
-        self.started = time.monotonic()
-        self._announced = False
-        # ponytail: drain thread avoids pipe deadlock (child blocks at ~64k
-        # when nobody reads). Bounded to MAX_OUTPUT; overflow is discarded
-        # but still drained so the child never blocks.
-        self._out_parts: list[str] = []
-        self._out_len = 0
-        self._out_lock = threading.Lock()
-        # ponytail: drain-done event lets poll() join the drainer before a
-        # reap, so job_status never reports a truncated tail for output that
-        # already arrived (the pipe EOF races the process exit).
-        self._drain_done = threading.Event()
-        self._drain_thread: threading.Thread | None = None
-        if proc.stdout is not None:
-            self._drain_thread = threading.Thread(
-                target=self._drain, name=f"drain-{job_id}", daemon=True)
-            self._drain_thread.start()
-
-    def _drain(self) -> None:
-        try:
-            while True:
-                chunk = self.proc.stdout.read(8192)
-                if not chunk:
-                    break
-                with self._out_lock:
-                    if self._out_len < self.MAX_OUTPUT:
-                        keep = chunk[: self.MAX_OUTPUT - self._out_len]
-                        self._out_parts.append(keep)
-                        self._out_len += len(keep)
-        except (OSError, ValueError):
-            pass
-        finally:
-            self._drain_done.set()
-
-    def output_tail(self, limit: int = 4096) -> str:
-        """Last `limit` chars of the RETAINED head (never blocks on the pipe).
-
-        The buffer keeps the FIRST MAX_OUTPUT bytes of the job's output and
-        discards the rest (still draining so the child never blocks) — so
-        this is a tail of the head, not of unbounded full output. Callers
-        must take the explicit reap join (_join_drain with the full budget)
-        before reading a finished job.
-        """
-        with self._out_lock:
-            s = "".join(self._out_parts)
-        return s[-limit:] if len(s) > limit else s
-
-    def _join_drain(self, timeout: float = 0.0) -> None:
-        """Join the drainer: status polls use 0 (never stall the status
-        path); the explicit reap before reading a finished job's output
-        passes the full budget so the tail is complete."""
-        t = self._drain_thread
-        if t is not None and t.is_alive() and not self._drain_done.is_set():
-            t.join(timeout=timeout)
-
-    def poll(self) -> tuple[str, bool]:
-        """(state, done): 'running' | 'done' | 'timeout-killed'.
-
-        Reaping goes through Popen.poll() ONLY: a raw waitpid here would
-        reap the child behind Popen's back and returncode would stay None
-        forever (a job that finished but never reads as finished)."""
-        if self.proc.returncode is not None:
-            self._join_drain()
-            return "done", True
-        if time.monotonic() - self.started > self.MAX_LIFETIME_S:
-            try:
-                self.proc.kill()
-            except OSError:
-                pass
-            try:
-                self.proc.wait(timeout=2)   # finalize returncode
-            except Exception:
-                pass
-            self._join_drain()
-            return "timeout-killed", True
-        self.proc.poll()
-        if self.proc.returncode is not None:
-            self._join_drain()
-            return "done", True
-        return "running", False
-
-    def status_text(self, state: str | None = None,
-                      done: bool | None = None) -> str:
-        if state is None or done is None:
-            state, done = self.poll()
-        elapsed = time.monotonic() - self.started
-        if state == "running":
-            return f"job {self.id}: still running ({elapsed:.0f}s) — {self.command}"
-        if state == "timeout-killed":
-            return (f"job {self.id}: KILLED after {BoundedJob.MAX_LIFETIME_S:.0f}s "
-                    f"(lifetime cap) — {self.command}")
-        rc = self.proc.returncode
-        return f"job {self.id}: finished, exit code {rc} ({elapsed:.0f}s) — {self.command}"
 
 
 def _private_dir(path: Path) -> bool:
@@ -1209,6 +1153,17 @@ def reload_derived_settings() -> None:
     WHISPER_SIZE = SETTINGS.get("whisper_size", WHISPER_SIZE)
     WHISPER_DEVICE = SETTINGS.get("whisper_device", "auto")
     PIPER_VOICE_NAME = SETTINGS.get("piper_voice", PIPER_VOICE_NAME)
+    if "_audio" in globals():
+        _audio.configure(
+            sample_rate=SAMPLE_RATE,
+            whisper_size=WHISPER_SIZE,
+            whisper_device=WHISPER_DEVICE,
+            whisper_model_dir=WHISPER_MODEL_DIR,
+            piper_voice_dir=PIPER_VOICE_DIR,
+            piper_voice_name=PIPER_VOICE_NAME,
+            settings=SETTINGS,
+            logger=log,
+        )
 
 def _wake_name() -> str:
     """The assistant's wake name, lowercased (default: 'assistant')."""
@@ -1303,13 +1258,412 @@ LOCK_RETRY_WAIT = 0.25
 
 log = logging.getLogger("handsoff")
 
+# Audio primitives live independently of this application module.  These
+# adapters preserve the historical monkeypatch/module-global seams while
+# passing settings, paths, and logging explicitly into core.audio.
+try:
+    from core import audio as _audio
+except ImportError:  # compatibility with pre-Phase-4a deployed bundles
+    class _MissingAudio:
+        _TRANSCRIBE_LOCK = threading.Lock()
+        _whisper_lock = threading.Lock()
+        _CUDA_ERR_RE = re.compile(r"cuda|cublas|cudnn", re.IGNORECASE)
+        _WHISPER_VRAM_MB = {}
+        _piper_lock = threading.Lock()
+        _whisper_model = None
+        _whisper_cpu_fallback = False
+        _piper_voice = None
+        _nvidia_free_vram_mb = staticmethod(lambda: None)
+        _whisper_device_choice = staticmethod(lambda *_args: ("cpu", "int8"))
+        _is_cuda_error = staticmethod(lambda *_args: False)
+
+        @staticmethod
+        def _missing(*_args, **_kwargs):
+            raise ImportError("handsoff: core/audio.py is missing from this deployment")
+
+        @staticmethod
+        def configure(*_args, **_kwargs):
+            return None
+
+        _resample_to_16k = _open_input = _stop_recorder_bounded = _missing
+        get_whisper = get_piper = transcribe = tts_to_wav = play_wav = _missing
+
+        class Recorder:
+            def __init__(self, *_args, **_kwargs):
+                self._missing()
+
+    _audio = _MissingAudio()
+
+_audio.configure(
+    sample_rate=SAMPLE_RATE,
+    whisper_size=WHISPER_SIZE,
+    whisper_device=WHISPER_DEVICE,
+    whisper_model_dir=WHISPER_MODEL_DIR,
+    piper_voice_dir=PIPER_VOICE_DIR,
+    piper_voice_name=PIPER_VOICE_NAME,
+    settings=SETTINGS,
+    logger=log,
+)
+# core.audio uses local_files_only=True so model startup never blocks on a download.
+
+_resample_to_16k = _audio._resample_to_16k
+
+# PortAudio is process-global.  In particular, stream.stop() must not overlap
+# another InputStream construction or a close from a different thread.
+_MIC_OPERATION_LOCK = threading.RLock()
+_MIC_OPERATION_STATE_LOCK = threading.Lock()
+_MIC_OPERATION_OWNER = None
+_MIC_LAST_OPEN_DEVICE = threading.local()
+
+
+def _available_input_devices() -> list[dict]:
+    """Return input-capable devices without allowing a failed query to escape."""
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return []
+    if isinstance(devices, dict):
+        devices = [devices]
+    result = []
+    for device in devices or []:
+        if not isinstance(device, dict):
+            continue
+        try:
+            if int(device.get("max_input_channels", 0) or 0) > 0:
+                result.append(device)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _device_is_available(device, devices: list[dict]) -> bool:
+    want = str(device).strip().casefold()
+    for info in devices:
+        name = str(info.get("name", "")).strip().casefold()
+        if want == name or want in name:
+            return True
+    return False
+
+
+def _open_input_unlocked(device, rate: int, blocksize: int, cb) -> tuple:
+    """Open input, handling stale configured names without querying them."""
+    configured = device is not None and str(device).strip()
+    devices = _available_input_devices() if configured else []
+    candidates = [device]
+    if configured and not _device_is_available(device, devices):
+        log.warning("configured microphone %r is unavailable; falling back to "
+                    "system default", device)
+        candidates = [None]
+        candidates.extend(str(info.get("name", "")) for info in devices
+                          if str(info.get("name", "")))
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            stream = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
+                                    blocksize=blocksize, callback=cb,
+                                    device=candidate)
+            _MIC_LAST_OPEN_DEVICE.value = candidate
+            return stream, rate
+        except Exception as exc:
+            last_error = exc
+            try:
+                info = (sd.query_devices(candidate, kind="input")
+                        if candidate is not None else
+                        sd.query_devices(kind="input"))
+                native = int(float(info.get("default_samplerate") or rate))
+            except Exception:
+                native = rate
+            if native != rate:
+                try:
+                    stream = sd.InputStream(samplerate=native, channels=1,
+                                            dtype="int16", blocksize=blocksize,
+                                            callback=cb, device=candidate)
+                    _MIC_LAST_OPEN_DEVICE.value = candidate
+                    return stream, native
+                except Exception as exc2:
+                    last_error = exc2
+    if last_error is not None:
+        raise last_error
+    raise ValueError("no input device available")
+
+
+def _open_input(device, rate: int, blocksize: int, cb) -> tuple:
+    """Serialize InputStream construction with native stream teardown."""
+    if not _MIC_OPERATION_LOCK.acquire(timeout=0.6):
+        raise RuntimeError("microphone operation still in flight")
+    try:
+        return _open_input_unlocked(device, rate, blocksize, cb)
+    finally:
+        _MIC_OPERATION_LOCK.release()
+
+
+def _stop_stream_owned(stream) -> None:
+    """Run stream teardown under the same owner as InputStream construction."""
+    if stream is None:
+        return
+    _MIC_OPERATION_LOCK.acquire()
+    try:
+        stream.stop()
+        stream.close()
+    finally:
+        _MIC_OPERATION_LOCK.release()
+
+
+def _start_stream_owned(stream) -> None:
+    _MIC_OPERATION_LOCK.acquire()
+    try:
+        stream.start()
+    finally:
+        _MIC_OPERATION_LOCK.release()
+
+
+class Recorder(_audio.Recorder):
+    """Recorder using the application-wide PortAudio ownership guard."""
+
+    def start(self) -> None:
+        self._frames = []
+        self._samples = 0
+        self._stream, self._native_rate = _open_input(
+            self._device, SAMPLE_RATE, 1024, self._cb)
+        selected = getattr(_MIC_LAST_OPEN_DEVICE, "value", self._device)
+        if selected is not None:
+            self._device = selected
+        _start_stream_owned(self._stream)
+
+    def stop(self):
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                _stop_stream_owned(stream)
+            except Exception:
+                log.exception("failed to close input stream")
+        if not self._frames:
+            return None
+        audio = np.concatenate(self._frames).reshape(-1)
+        return _resample_to_16k(audio, getattr(self, "_native_rate", SAMPLE_RATE))
+
+
+def _stop_recorder_bounded(rec, timeout: float = 3.0):
+    """Stop without aborting a live native call from a second thread.
+
+    The stop thread owns the process-wide mic lock until rec.stop() returns.
+    A timeout only returns control to the UI worker; it never touches the
+    stream.  The owner thread performs the final state transition.
+    """
+    box: dict = {}
+
+    def _call() -> None:
+        global _MIC_OPERATION_OWNER
+        _MIC_OPERATION_LOCK.acquire()
+        with _MIC_OPERATION_STATE_LOCK:
+            _MIC_OPERATION_OWNER = threading.current_thread()
+            try:
+                rec._handsoff_stop_owner = _MIC_OPERATION_OWNER
+            except Exception:
+                pass
+        try:
+            try:
+                box["audio"] = rec.stop()
+            except Exception:
+                log.exception("recorder stop failed")
+                box["audio"] = None
+        finally:
+            callback = getattr(rec, "_handsoff_stop_done", None)
+            with _MIC_OPERATION_STATE_LOCK:
+                _MIC_OPERATION_OWNER = None
+                try:
+                    rec._handsoff_stop_owner = None
+                except Exception:
+                    pass
+            try:
+                if callable(callback):
+                    callback()
+            except Exception:
+                log.exception("recorder stop finalizer failed")
+            _MIC_OPERATION_LOCK.release()
+
+    th = threading.Thread(target=_call, name="ptt-stop-native", daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        return None, True
+    return box.get("audio"), False
+_whisper_model = None
+_whisper_cpu_fallback = False
+_TRANSCRIBE_LOCK = _audio._TRANSCRIBE_LOCK
+_whisper_lock = _audio._whisper_lock
+_CUDA_ERR_RE = _audio._CUDA_ERR_RE
+_WHISPER_VRAM_MB = _audio._WHISPER_VRAM_MB
+_piper_lock = _audio._piper_lock
+_piper_voice = None
+_nvidia_free_vram_mb = _audio._nvidia_free_vram_mb
+_whisper_device_choice = _audio._whisper_device_choice
+_is_cuda_error = _audio._is_cuda_error
+
+
+def get_whisper():
+    _audio._whisper_model = _whisper_model
+    result = _audio.get_whisper()
+    globals()["_whisper_model"] = _audio._whisper_model
+    return result
+
+
+def get_piper():
+    _audio._piper_voice = _piper_voice
+    result = _audio.get_piper()
+    globals()["_piper_voice"] = _audio._piper_voice
+    return result
+
+
+def transcribe(audio_int16: np.ndarray) -> str:
+    # Keep old H.get_whisper monkeypatches effective without coupling core.audio
+    # back to this module.
+    _audio._whisper_cpu_fallback = _whisper_cpu_fallback
+    _audio._whisper_model = _whisper_model
+    result = _audio.transcribe(audio_int16, model_getter=get_whisper)
+    globals()["_whisper_model"] = _audio._whisper_model
+    globals()["_whisper_cpu_fallback"] = _audio._whisper_cpu_fallback
+    return result
+
+
+def tts_to_wav(text: str, wav_path: Path) -> None:
+    return _audio.tts_to_wav(text, wav_path, voice_getter=get_piper)
+
+
+play_wav = _audio.play_wav
+
+
+def _log_metadata(value, kind: str = "text") -> str:
+    """Keep logs useful for diagnosis without retaining user-provided data."""
+    if kind == "command":
+        try:
+            argv = shlex.split(str(value))
+            return f"command={Path(argv[0]).name if argv else '(empty)'} args={max(0, len(argv) - 1)}"
+        except ValueError:
+            return "command=(unparseable)"
+    if kind == "path":
+        try:
+            return f"path={Path(str(value)).name or '(root)'}"
+        except (TypeError, ValueError):
+            return "path=(invalid)"
+    if isinstance(value, dict):
+        return "keys=" + ",".join(sorted(str(k) for k in value))
+    text = str(value or "")
+    if text.lstrip().startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                parts = ["keys=" + ",".join(sorted(str(k) for k in data))]
+                if "command" in data:
+                    parts.append(_log_metadata(data["command"], "command"))
+                if "path" in data:
+                    parts.append(_log_metadata(data["path"], "path"))
+                if "content" in data:
+                    parts.append(_log_metadata(data["content"], "content"))
+                return " ".join(parts)
+        except (TypeError, ValueError):
+            pass
+    return f"{kind}=<redacted chars={len(text)}>"
+
+
+def _redact_log_text(message: str) -> str:
+    """Remove content-bearing fields while retaining event metadata."""
+    text = str(message)
+    patterns = (
+        (r"(heard \(gen=\d+\):|follow-up accepted \(no wake word\):|"
+         r"ignored \(no wake word\):|dictation typed \d+ chars \()[^)]*", "\\1<redacted>"),
+        (r"(echo-check: heard )[^ ]+( -> (?:True|False))", "\\1<redacted>\\2"),
+        (r"(memory: ).*", "\\1<redacted facts>"),
+        (r"(run_command: |start_command: ).*", "\\1<redacted command>"),
+        (r"(edit_file(?: content)?: ).*", "\\1<redacted file content>"),
+        (r"(watcher alert: |reminder fired: |announcing timer: |"
+         r"snooze window open for ).*", "\\1<redacted>"),
+        (r"(operator: clicked ).*", "\\1<redacted interaction>"),
+        (r"(previous crash detected \([^)]*\): ).*", "\\1<redacted crash details>"),
+    )
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
+class _PrivacyLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = _redact_log_text(record.getMessage())
+        if record.exc_info:
+            message += f" ({record.exc_info[0].__name__})"
+        record.msg = message
+        record.args = ()
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+def _ollama_remote() -> bool:
+    """Whether the configured Ollama endpoint is outside the local machine."""
+    try:
+        host = urllib.parse.urlparse(OLLAMA_BASE).hostname
+        if not host:
+            return True
+        if host.lower() == "localhost":
+            return False
+        return not ipaddress.ip_address(host).is_loopback
+    except (ValueError, TypeError):
+        return True
+
+
+def _ollama_remote_opted_in() -> bool:
+    configured = SETTINGS.get("allow_remote_ollama", False) if "SETTINGS" in globals() else False
+    return bool(configured) or os.environ.get("HANDSOFF_ALLOW_REMOTE_OLLAMA", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+_REMOTE_OLLAMA_WARNED = False
+
+
+def _guard_ollama_endpoint() -> None:
+    """Require an explicit environment opt-in before sending data remotely."""
+    global _REMOTE_OLLAMA_WARNED
+    if not _ollama_remote():
+        return
+    if not _REMOTE_OLLAMA_WARNED:
+        log.warning(
+            "Ollama endpoint %s is remote; privacy is not guaranteed. "
+            "Set HANDSOFF_ALLOW_REMOTE_OLLAMA=1 to explicitly allow it",
+            _log_metadata(OLLAMA_BASE, "endpoint"),
+        )
+        _REMOTE_OLLAMA_WARNED = True
+    if not _ollama_remote_opted_in():
+        raise RuntimeError(
+            "Ollama is configured on a non-loopback host; refusing to send "
+            "private conversation data. Set HANDSOFF_ALLOW_REMOTE_OLLAMA=1 "
+            "to explicitly allow remote Ollama."
+        )
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """Rotating handler whose active and backup files remain owner-only."""
+
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+    def doRollover(self) -> None:
+        super().doRollover()
+        for path in (self.baseFilename, *(f"{self.baseFilename}.{i}" for i in range(1, self.backupCount + 1))):
+            try:
+                os.chmod(path, 0o600)
+            except FileNotFoundError:
+                pass
+
 
 def setup_logging() -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     try:
-        from logging.handlers import RotatingFileHandler
         # 1 MB per file, 2 rotations: the state dir can't grow forever
-        handlers.append(RotatingFileHandler(
+        handlers.append(_PrivateRotatingFileHandler(
             LOG_FILE, maxBytes=1_000_000, backupCount=2, delay=True))
     except OSError:
         pass
@@ -1318,6 +1672,14 @@ def setup_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=handlers,
     )
+    privacy = _PrivacyLogFilter()
+    for handler in handlers:
+        handler.addFilter(privacy)
+    if _ollama_remote():
+        log.warning(
+            "Ollama endpoint is non-loopback; conversation privacy is not "
+            "guaranteed and remote use requires HANDSOFF_ALLOW_REMOTE_OLLAMA=1"
+        )
 
 
 _NOTIFY_DELAY = 0.5        # batch window: repeats inside it fold into one popup
@@ -1521,38 +1883,6 @@ SELF-MODIFICATION
   3) confirm briefly, then run_command "{RESTART_SCRIPT}" to restart.
 - Simple tweaks (volume, brightness, windows): use commands, never rewrite yourself."""
 
-def build_tools() -> list[dict]:
-    """Generate the Ollama tool schema list from every @tool method.
-
-    Single source of truth: the ToolBelt methods themselves. Signature gives
-    names/types/required, the first docstring paragraph is the model-facing
-    description, and `param: text` docstring lines become param descriptions.
-    """
-    out = []
-    belt_attrs = [a for a in vars(ToolBelt).values()
-                  if callable(a) and getattr(a, "_is_tool", False)]
-    for fn in belt_attrs:
-        params = _param_schema(fn)
-        req = fn._tool_required
-        if req is None:
-            # params without defaults are required
-            sig = inspect.signature(fn)
-            req = [p for p, info in params.items()
-                   if sig.parameters[p].default is inspect.Parameter.empty]
-        out.append({
-            "type": "function",
-            "function": {
-                "name": fn._tool_name,
-                "description": (fn._tool_description
-                                or (inspect.getdoc(fn) or "").split("\n\n")[0].strip()),
-                "parameters": {
-                    "type": "object",
-                    "properties": params,
-                    "required": req,
-                },
-            },
-        })
-    return out
 
 
 # TOOLS is instantiated right after the ToolBelt class body (it needs the
@@ -1561,509 +1891,41 @@ def build_tools() -> list[dict]:
 # ------------------------------------------------------------------- ollama client
 
 
+_TOOLS_SUPPORTED = True
+
+
+def _brain_deps() -> dict:
+    return dict(base=OLLAMA_BASE, model=OLLAMA_MODEL, num_ctx=OLLAMA_NUM_CTX,
+                guard=_guard_ollama_endpoint, logger=log,
+                state={"tools_supported": _TOOLS_SUPPORTED},
+                urlopen=urllib.request.urlopen)
+
+
 def ollama_available() -> bool:
-    try:
-        with urllib.request.urlopen(OLLAMA_BASE + "/api/tags", timeout=3) as r:
-            json.loads(r.read().decode("utf-8"))
-        return True
-    except Exception:
-        return False
-
-
-_TOOLS_SUPPORTED = True  # reset on any tools success; a 400 only retries
-# once per call without latching, so a transient error never disables tools
+    return _brain.ollama_available(base=OLLAMA_BASE,
+                                   guard=_guard_ollama_endpoint,
+                                   urlopen=urllib.request.urlopen)
 
 
 def ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> dict:
-    """One /api/chat round trip. Raises RuntimeError with a human-readable cause."""
-    global _TOOLS_SUPPORTED
-    payload: dict = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
-        "stream": False,
-        "think": False,
-        # keep the model resident: without this Ollama unloads it after 5 min
-        # idle and the next question pays a ~90 s reload (measured).
-        "keep_alive": os.environ.get("HANDSOFF_KEEP_ALIVE", "1h"),
-        "options": {"temperature": 0.3, "num_ctx": OLLAMA_NUM_CTX},
-    }
-    if tools:
-        payload["tools"] = tools
-    req = urllib.request.Request(
-        OLLAMA_BASE + "/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        if tools:
-            _TOOLS_SUPPORTED = True  # a tools call worked: never stay latched off
-        return body.get("message") or {}
-    except urllib.error.HTTPError as e:
-        try:
-            detail = json.loads(e.read().decode("utf-8")).get("error", "")
-        except Exception:
-            detail = e.reason
-        if e.code == 400 and tools and "tool" in detail.lower():
-            log.warning("model %s does not support tools; continuing without", OLLAMA_MODEL)
-            return ollama_chat(messages, None)
-        if e.code == 404 and "model" in str(detail).lower():
-            detail += f" — run: ollama pull {OLLAMA_MODEL}"
-        raise RuntimeError(f"Ollama error {e.code}: {detail}") from None
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"cannot reach Ollama at {OLLAMA_BASE} ({e.reason}). "
-            "Start it with: systemctl start ollama"
-        ) from None
+    return _brain.ollama_chat(messages, tools, **_brain_deps())
 
 
-def strip_thinking(text: str) -> str:
-    """Clean model output for speaking: strip <think> blocks and the
-    `[TOOL_CALLS]{...}` template junk some models prepend."""
-    t = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
-    t = re.sub(r"^\s*\[TOOL_CALLS\][^\n]*(?:\n|$)", "", t, flags=re.MULTILINE)
-    return t.strip()
+strip_thinking = _brain.strip_thinking
 
 
 def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                        cancel: threading.Event | None = None,
-                       tools: list[dict] | None = None) -> list[dict]:
-    """Stream /api/chat, pushing cleaned sentence chunks (then None) into `q`.
-
-    Complete tool calls seen in the stream are collected and returned, so
-    the caller can keep the tool loop alive while speaking content as it
-    arrives. On a 400 'tools unsupported' error, retries once without tools.
-    Any error pushes None after emitting what arrived so far."""
-    global _TOOLS_SUPPORTED
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
-        "stream": True,
-        "think": False,
-        "keep_alive": os.environ.get("HANDSOFF_KEEP_ALIVE", "1h"),
-        "options": {"temperature": 0.3, "num_ctx": OLLAMA_NUM_CTX},
-    }
-    if tools:
-        payload["tools"] = tools
-    req = urllib.request.Request(
-        OLLAMA_BASE + "/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    buf = ""
-    full = ""
-    tool_calls: list[dict] = []
-    _fallback = False  # 400-with-tools retry: inner call owns the terminator
-    try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            for raw in resp:
-                if cancel is not None and cancel.is_set():
-                    break
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    chunk = json.loads(line.decode("utf-8"))
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                msg_chunk = chunk.get("message") or {}
-                tc = msg_chunk.get("tool_calls")
-                if tc:
-                    tool_calls.extend(tc)
-                piece = msg_chunk.get("content") or ""
-                if piece:
-                    buf += piece
-                    full += piece
-                    # speak complete sentences as soon as they arrive
-                    while True:
-                        m = re.search(r"[.!?…](\s|$)", buf)
-                        if not m:
-                            break
-                        sentence, buf = buf[: m.end()], buf[m.end():]
-                        sentence = strip_thinking(sentence).strip()
-                        if sentence and not sentence.startswith("<"):
-                            q.put(sentence)
-        tail = strip_thinking(buf).strip()
-        if tail and not tail.startswith("<"):
-            q.put(tail)
-    except urllib.error.HTTPError as e:
-        if e.code == 400 and tools and "tool" in _read_http_error(e).lower():
-            log.warning("model %s does not support tools; continuing without", OLLAMA_MODEL)
-            _fallback = True  # skip the outer terminator below; the inner call puts it
-            return ollama_chat_stream(messages, q, cancel, None)
-        # ponytail: never swallow — the caller must speak the failure and
-        # must not append an empty assistant turn as if the model replied.
-        detail = _read_http_error(e)
-        log.error("streaming chat HTTP error: %s", e)
-        raise RuntimeError(f"Ollama error {e.code}: {detail}") from None
-    except Exception:
-        log.exception("streaming chat failed")
-        raise
-    finally:
-        if not _fallback:
-            q.put(None)
-    if tools:
-        _TOOLS_SUPPORTED = True  # a tools call worked: never stay latched off
-    return {"tool_calls": tool_calls, "content": strip_thinking(full).strip()}
+                       tools: list[dict] | None = None) -> dict:
+    return _brain.ollama_chat_stream(messages, q, cancel, tools, **_brain_deps())
 
 
-def _read_http_error(e: urllib.error.HTTPError) -> str:
-    try:
-        return str(json.loads(e.read().decode("utf-8")).get("error", ""))
-    except Exception:
-        return str(e.reason)
+_read_http_error = _brain._read_http_error
 
 
 # ------------------------------------------------------------------------ audio in
-
-
-def _resample_to_16k(data: np.ndarray, rate: int) -> np.ndarray:
-    """Resample flat int16 audio to SAMPLE_RATE (linear interp, speech-grade).
-
-    Some input devices (e.g. Logitech StreamCam) cannot capture at 16 kHz at
-    all; they are opened at their native rate and every frame is converted
-    here so the pipeline always sees 16 kHz audio."""
-    if rate == SAMPLE_RATE or data.size == 0:
-        return data
-    # ponytail: chunked interp — one giant linspace pair is 2x float64
-    # copies of the whole capture; 480k-sample chunks bound the peak.
-    out: list[np.ndarray] = []
-    _CH = 480_000
-    ratio = SAMPLE_RATE / float(rate)
-    for off in range(0, data.size, _CH):
-        seg = data[off: off + _CH]
-        duration = seg.size / float(rate)
-        target_n = max(1, int(round(seg.size * ratio)))
-        x_old = np.linspace(0.0, duration, num=seg.size, endpoint=False)
-        x_new = np.linspace(0.0, duration, num=target_n, endpoint=False)
-        out.append(np.interp(x_new, x_old, seg.astype(np.float32)).astype(np.int16))
-    return np.concatenate(out) if out else data[:0]
-
-
-def _open_input(device, rate: int, blocksize: int, cb) -> tuple:
-    """Open a mono int16 InputStream at `rate`; if the device rejects that
-    rate (PortAudio 'Invalid sample rate'), retry once at the device's
-    native default rate. Returns (stream, actual_rate)."""
-    try:
-        return sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                              blocksize=blocksize, callback=cb, device=device), rate
-    except Exception:
-        try:
-            info = (sd.query_devices(device, kind="input") if device is not None
-                    else sd.query_devices(kind="input"))
-            native = int(float(info.get("default_samplerate") or rate))
-        except Exception:
-            native = rate
-        if native == rate:
-            raise
-        stream = sd.InputStream(samplerate=native, channels=1, dtype="int16",
-                                blocksize=blocksize, callback=cb, device=device)
-        return stream, native
-
-
-class Recorder:
-    """16 kHz mono int16 microphone capture with live RMS levels."""
-
-    MAX_PTT_S = 60.0  # ponytail: PTT is bounded — a stuck press can't OOM
-
-    def __init__(self, on_level: "callable", device: str | None = None,
-                 threshold: int = 600) -> None:
-        self._on_level = on_level
-        self._device = device or None
-        self._threshold = threshold
-        self._frames: list[np.ndarray] = []
-        self._samples = 0
-        self._level = 0.0
-        self._stream: sd.InputStream | None = None
-
-    def start(self) -> None:
-        self._frames = []
-        self._samples = 0
-        # devices that can't capture at 16 kHz (StreamCam…) are opened at
-        # their native rate; stop() resamples everything to 16 kHz for STT
-        self._stream, self._native_rate = _open_input(
-            self._device, SAMPLE_RATE, 1024, self._cb)
-        self._stream.start()
-
-    def _cb(self, indata, frames, time_info, status) -> None:
-        if status:
-            log.warning("audio input: %s", status)
-        self._frames.append(indata.copy())
-        self._samples += int(indata.size)
-        # ponytail: drop oldest frames past the 60s cap (by native rate)
-        cap = int(self.MAX_PTT_S * float(getattr(self, "_native_rate", SAMPLE_RATE)))
-        while self._frames and self._samples > cap:
-            old = self._frames.pop(0)
-            self._samples -= int(old.size)
-        rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
-        self._level = 0.25 * rms + 0.75 * self._level
-        try:
-            self._on_level(min(1.0, self._level / 2000.0))
-        except Exception:
-            pass
-
-    def stop(self) -> np.ndarray | None:
-        stream, self._stream = self._stream, None
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                log.exception("failed to close input stream")
-        if not self._frames:
-            return None
-        audio = np.concatenate(self._frames).reshape(-1)
-        return _resample_to_16k(audio, getattr(self, "_native_rate", SAMPLE_RATE))
-
-
-def _stop_recorder_bounded(rec, timeout: float = 3.0):
-    """Bounded rec.stop(): a dead Yeti wedges stream.stop()/close() for 51s.
-
-    Runs rec.stop() in an inner daemon and joins `timeout`; on timeout does
-    best-effort stream.abort()+close() (each guarded), drops the audio
-    (None) and reports wedged=True so the caller can suffix its timing
-    line. Returns (audio, wedged). Never raises into the ptt workers."""
-    try:
-        stream = getattr(rec, "_stream", None)
-    except Exception:
-        stream = None
-    box: dict = {}
-
-    def _call() -> None:
-        try:
-            box["audio"] = rec.stop()
-        except Exception:
-            log.exception("recorder stop failed")
-            box["audio"] = None
-
-    try:
-        th = threading.Thread(target=_call, name="ptt-stop-inner",
-                              daemon=True)
-        th.start()
-    except Exception:
-        try:
-            return rec.stop(), False
-        except Exception:
-            log.exception("recorder stop failed")
-            return None, False
-    th.join(timeout)
-    if th.is_alive():
-        for _s in (stream, getattr(rec, "_stream", None)):
-            if _s is None:
-                continue
-            try:
-                fn = getattr(_s, "abort", None)
-                if callable(fn):
-                    try:
-                        fn()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                fn = getattr(_s, "close", None)
-                if callable(fn):
-                    try:
-                        fn()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        try:
-            if getattr(rec, "_stream", None) is not None:
-                try:
-                    rec._stream = None
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return None, True
-    return box.get("audio", None), False
-
-
-# ------------------------------------------------------------------------ STT / TTS
-
-_whisper_model = None
-_whisper_lock = threading.Lock()
-_TRANSCRIBE_LOCK = threading.Lock()  # serialize whisper inference (never overlap)
-_whisper_cpu_fallback = False  # session pin: CUDA proved broken → stay on CPU
-_CUDA_ERR_RE = re.compile(r"cuda|cublas|cudnn", re.IGNORECASE)
-_piper_voice = None
-_piper_lock = threading.Lock()
-
-# GPU inference needs free VRAM: the LLM already owns most of the card, so
-# whisper may only use the GPU when the model comfortably fits what's LEFT.
-# Conservative budgets (MB) including CTranslate2 workspace + activation headroom.
-_WHISPER_VRAM_MB = {
-    "tiny": 600, "base": 800, "small": 1400, "medium": 2600,
-    "large": 3600, "large-v1": 3600, "large-v2": 3600, "large-v3": 3600,
-    "turbo": 3000,
-}
-
-
-def _nvidia_free_vram_mb() -> "int | None":
-    """Free VRAM of the first NVIDIA GPU in MB, or None when there is no
-    detectable GPU (the cheap, dependency-free probe; runs once per load)."""
-    try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5)
-        if r.returncode == 0 and r.stdout.strip():
-            return int(r.stdout.strip().splitlines()[0].strip())
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return None
-
-
-def _whisper_device_choice(size: str, free_mb: "int | None") -> tuple[str, str]:
-    """(device, compute_type): GPU only when free VRAM fits the model plus a
-    1 GB desktop-usage buffer; CPU otherwise. None means 'no GPU found'."""
-    if free_mb is None:
-        return ("cpu", "int8")
-    need = _WHISPER_VRAM_MB.get(size, 3600)
-    if free_mb >= need + 1024:
-        return ("cuda", "float16")
-    return ("cpu", "int8")
-
-
-def get_whisper():
-    global _whisper_model
-    with _whisper_lock:
-        if _whisper_model is None:
-            from faster_whisper import WhisperModel  # lazy: heavy import
-
-            device, compute = "cpu", "int8"
-            if not _whisper_cpu_fallback:
-                if WHISPER_DEVICE == "cuda":
-                    device, compute = "cuda", "float16"
-                elif WHISPER_DEVICE == "auto":
-                    device, compute = _whisper_device_choice(
-                        WHISPER_SIZE, _nvidia_free_vram_mb())
-            log.info("loading whisper '%s' on %s (%s) from %s",
-                     WHISPER_SIZE, device, compute, WHISPER_MODEL_DIR)
-            try:
-                _whisper_model = WhisperModel(
-                    WHISPER_SIZE, device=device, compute_type=compute,
-                    download_root=str(WHISPER_MODEL_DIR),
-                    local_files_only=True,  # model is cached; never block startup on HF network
-                )
-            except Exception:
-                if device == "cpu":
-                    raise
-                # a GPU hiccup (driver, OOM race with the LLM) must not take
-                # the bubble down — degrade to CPU, exactly the old behavior
-                log.exception("whisper %s load failed — falling back to cpu", device)
-                _whisper_model = WhisperModel(
-                    WHISPER_SIZE, device="cpu", compute_type="int8",
-                    download_root=str(WHISPER_MODEL_DIR),
-                    local_files_only=True,
-                )
-        return _whisper_model
-
-
-def get_piper():
-    global _piper_voice
-    with _piper_lock:
-        if _piper_voice is None:
-            import piper  # lazy: heavy import
-
-            onnx = (
-                PIPER_VOICE_DIR / PIPER_VOICE_NAME
-                if PIPER_VOICE_NAME
-                else next(iter(sorted(PIPER_VOICE_DIR.glob("*.onnx"))), None)
-            )
-            if onnx is None or not onnx.exists():
-                raise FileNotFoundError(
-                    f"no piper voice (*.onnx) in {PIPER_VOICE_DIR} — run install.sh"
-                )
-            log.info("loading piper voice %s", onnx.name)
-            try:
-                _piper_voice = piper.PiperVoice.load(str(onnx), config_path=str(onnx) + ".json")
-            except TypeError:  # very old piper builds without config_path
-                _piper_voice = piper.PiperVoice.load(str(onnx))
-        return _piper_voice
-
-
-
-def _is_cuda_error(exc: BaseException) -> bool:
-    """Lazy-CUDA breakage: ctranslate2 resolves CUDA libs at first inference,
-    so the load-time GPU→CPU fallback never sees it."""
-    return isinstance(exc, (RuntimeError, OSError)) and bool(
-        _CUDA_ERR_RE.search(str(exc)))
-
-
-def transcribe(audio_int16: np.ndarray) -> str:
-    global _whisper_model, _whisper_cpu_fallback
-    # ponytail: one inference at a time — stop-probe + pipeline + probe
-    # threads must never overlap whisper (VRAM/GPU races, garbled text).
-    with _TRANSCRIBE_LOCK:
-        model = get_whisper()
-        # ponytail: faster-whisper returns a LAZY generator — the CUDA call
-        # (encode → libcublas) runs during iteration, so consumption must
-        # stay inside the guarded region on both paths.
-        def _read(segments):
-            return " ".join(s.text.strip() for s in segments).strip()
-        try:
-            segments, _info = model.transcribe(
-                audio_int16.astype(np.float32) / 32768.0, vad_filter=True,
-                language="en", beam_size=1,
-            )
-            return _read(segments)
-        except (RuntimeError, OSError) as e:
-            if _whisper_cpu_fallback or not _is_cuda_error(e):
-                raise
-            log.warning("whisper CUDA broken (libcublas…), falling back to CPU "
-                        "for this session: %s", e)
-            with _whisper_lock:
-                _whisper_model = None
-                _whisper_cpu_fallback = True
-            segments, _info = get_whisper().transcribe(
-                audio_int16.astype(np.float32) / 32768.0, vad_filter=True,
-                language="en", beam_size=1,
-            )
-            return _read(segments)
-
-
-def tts_to_wav(text: str, wav_path: Path) -> None:
-    voice = get_piper()
-    with wave.open(str(wav_path), "wb") as w:
-        if hasattr(voice, "synthesize_wav"):      # piper-tts >= 1.2
-            cfg = None
-            try:
-                from piper import SynthesisConfig
-                cfg = SynthesisConfig(
-                    length_scale=1.0 / float(SETTINGS["tts_rate"]),
-                    volume=float(SETTINGS["tts_volume"]),
-                )
-            except Exception:
-                cfg = None
-            voice.synthesize_wav(text, w, syn_config=cfg)
-        else:                                     # older API
-            voice.synthesize(text, w)
-
-
-def play_wav(path: Path, cancel: threading.Event) -> None:
-    """Blocking playback; returns early if `cancel` is set (barge-in)."""
-    with wave.open(str(path), "rb") as w:
-        sr, ch = w.getframerate(), w.getnchannels()
-        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-    if ch > 1:
-        data = data.reshape(-1, ch)[:, 0]
-    stream = sd.OutputStream(samplerate=sr, channels=1, dtype="int16", blocksize=1024)
-    stream.start()
-    try:
-        for i in range(0, len(data), 4096):
-            if cancel.is_set():
-                break
-            stream.write(data[i : i + 4096].reshape(-1, 1))
-    finally:
-        try:
-            stream.stop()
-            stream.close()
-        except Exception:
-            pass
+# Audio ownership ends at these primitives. ContinuousListener remains in this
+# file for now because it owns Assistant/UI lifecycle state and health hooks.
 
 
 # ---------------------------------------------------------------------------- tools
@@ -2264,61 +2126,11 @@ def _world_events(kind: str = "all", limit: int = 5) -> tuple:
     return out, degraded
 
 
-def tool(func=None, *, name=None, gates=None, aliases=None, description=None,
-         required=None):
-    """Mark a ToolBelt method as an AI-callable tool.
-
-    The Ollama JSON schema is generated automatically from the function's
-    signature, type hints and docstring — so one tool is ONE function:
-
-        @tool(gates="press_keys", aliases={"combo": ("keys", "key")})
-        def my_tool(self, combo: str) -> str:
-            # docstring: "Fire a desktop/compositor shortcut like 'Mod+E'."
-            # then 'combo: e.g. Mod+E' lines become param descriptions
-
-    gates:       permission key required (defaults to the tool's own name;
-                 pass "" for no gate)
-    aliases:     {param: (alt names...)} small models sometimes emit
-    description: pinned model-facing description (default: docstring para 1)
-    required:    override required-params list (default: params w/o defaults)
-    """
-    def wrap(f):
-        f._is_tool = True
-        f._tool_name = name or f.__name__
-        f._tool_gates = gates if gates is not None else f._tool_name
-        f._tool_aliases = dict(aliases or {})
-        f._tool_description = description
-        f._tool_required = required
-        return f
-    return wrap(func) if func else wrap
 
 
 _JSON_TYPE = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
 
-def _param_schema(func) -> dict:
-    """{param: {'type': ..., 'description': ...}} from signature + docstring."""
-    sig = inspect.signature(func)
-    doc = inspect.getdoc(func) or ""
-    params = {}
-    for line in doc.splitlines():
-        m = re.match(r"^(\w+):\s+(.+)$", line.strip())
-        if m:
-            params[m.group(1)] = m.group(2).strip()
-    out = {}
-    for pname, p in sig.parameters.items():
-        if pname in ("self",):
-            continue
-        hint = p.annotation if p.annotation is not inspect.Parameter.empty else str
-        if isinstance(hint, str):   # `from __future__ import annotations`
-            hint = {"bool": bool, "int": int, "float": float,
-                    "str": str}.get(hint, str)
-        typ = _JSON_TYPE.get(hint if hint in _JSON_TYPE else str, "string")
-        entry = {"type": typ}
-        if pname in params:
-            entry["description"] = params[pname]
-        out[pname] = entry
-    return out
 
 
 
@@ -3119,2948 +2931,93 @@ def _classify_edit_path(p: Path) -> str:
     return ""
 
 
-class ToolBelt:
-    """The assistant's hands: one safe shell command, file read, file edit."""
 
-    ALLOWED = {
-        "pactl", "playerctl", "brightnessctl", "niri", "spawn", "echo",
-        "cat", "ls", "pwd", "notify-send",
-        # read-only system probes: answer "what's eating my CPU/RAM/disk/GPU"
-        "ps", "free", "uptime", "df", "ss", "nvidia-smi",
-    }
-    # git/cargo are allowed ONLY with read-only (or explicitly-safe) verbs —
-    # they stay in BLOCKED for every other use, so a bare 'git' or 'cargo'
-    # (or e.g. 'git push') is still refused.
-    _CARGO_OK = {"build", "check", "test", "clippy"}
-    _GIT_READ = {"status", "diff", "log", "show", "branch", "remote"}
-    _GIT_DELETE_FLAGS = {"d", "D", "delete"}   # 'git branch -D x' mutates
-    BLOCKED = (
-        "sudo", "rm", "pacman", "yay", "paru", "shutdown", "poweroff", "reboot",
-        "halt", "mkfs", "dd", "kill", "chmod", "chown", "mount", "umount",
-        "curl", "wget", "bash", "sh", "zsh", "fish", "python", "python3",
-        "pip", "mv", "cp", "tar", "zip", "7z", "make", "gcc",
-        "systemctl", "journalctl", "tee", "xargs", "env", "eval", "exec",
-    )
-    MAX_READ = 160_000
-    MAX_WRITE = 2_000_000
-    TIMEOUT = 15
 
-    def __init__(self, on_restart_pending: "callable",
-                 permissions: dict | None = None,
-                 on_timer: "callable | None" = None,
-                 on_notification: "callable | None" = None,
-                 on_announce: "callable | None" = None,
-                 on_pomodoro: "callable | None" = None) -> None:
-        self._on_restart_pending = on_restart_pending
-        self._on_timer = on_timer
-        self._on_notification = on_notification
-        self._on_announce = on_announce
-        self._on_pomodoro = on_pomodoro
-        self._policy = DecisionPolicy()
-        # bounded background jobs (start_command): job_id -> BoundedJob
-        self._jobs: dict[str, BoundedJob] = {}
-        self._job_seq = 0
-        self._job_lock = threading.Lock()
-        # pending CONFIRM offers (confirm_action): {tool, until}
-        self._pending_confirm: dict | None = None
-        self._confirm_running: str | None = None   # bypass while running the confirmed call
-        self._last_images: list[str] = []
-        # operator state: OCR element scan freshness + focused-output pointer
-        # scale (screen pixels / scale = pointer coordinates); refreshed by
-        # every screen_elements scan, invalidated by anything that changes
-        # the screen (_mark_elements_stale)
-        self._elements_ts: float = 0.0
-        self._pointer_scale: float = 1.0
-        self._watch_lock = threading.RLock()
-        self._file_watchers: dict[str, tuple[threading.Event, threading.Thread]] = {}
-        self._process_watchers: dict[str, tuple[threading.Event, threading.Thread]] = {}
-        # screenshots are attached to the next tool result via _last_images
-        self._tool_times: deque[float] = deque(maxlen=60)   # rate-limit window
-        self._perm = {
-            "run_command": True, "read_file": True,
-            "edit_file": True, "self_restart": True, **(permissions or {}),
-        }
-
-    # -- self-edit confirmation (prompt-injection hardening) ------------------
-
-    def _is_self_edit(self, args: dict) -> bool:
-        """True when this edit_file call targets handsoff.py itself."""
-        try:
-            p = Path(str(args.get("path") or "")).expanduser().resolve()
-        except (OSError, RuntimeError, ValueError):
-            return False
-        return p == SELF_PATH
-
-    def _edit_confirm_kind(self, args: dict) -> str:
-        """'self' | 'split' | '' — the CONFIRM floor covers the running bubble
-        AND the split support modules (any editable .py outside CONFIG_DIR);
-        a prompt-injected edit under ALLOW must still round-trip the user."""
-        try:
-            p = Path(str(args.get("path") or "")).expanduser().resolve()
-        except (OSError, RuntimeError, ValueError):
-            return ""
-        kind = _classify_edit_path(p)
-        return kind if kind in ("self", "split") else ""
-
-    def _self_edit_needs_confirm(self, args: dict) -> bool:
-        """True for a self/split edit whose payload already passes the tool's
-        static checks (marker for self-edits + syntax). Those checks stay in
-        edit_file; here they just ensure the CONFIRM offer only gates writes
-        that would otherwise land immediately — invalid payloads fall through
-        to the tool's own refusal with no user round-trip."""
-        content = args.get("content")
-        if not isinstance(content, str):
-            return False
-        kind = self._edit_confirm_kind(args)
-        if not kind:
-            return False
-        if kind == "self" and SELF_MARKER not in content:
-            return False
-        try:
-            compile(content, "self-edit-preview", "exec")
-        except SyntaxError:
-            return False
-        return True
-
-    @staticmethod
-    def _self_edit_preview(args: dict, limit: int = 800) -> str:
-        """Unified diff of the proposed self-edit against the live source,
-        for the spoken-then-shown confirmation offer."""
-        import difflib
-        try:
-            old = SELF_PATH.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            return f"(current source unreadable, no diff: {e})"
-        new = str(args.get("content") or "")
-        out = "".join(difflib.unified_diff(
-            old.splitlines(True), new.splitlines(True),
-            fromfile="handsoff.py (running)", tofile="handsoff.py (proposed)"))
-        if not out:
-            return "(proposed content is identical to the running source)"
-        if len(out) > limit:
-            out = out[:limit] + f"\n… (diff truncated, {len(out) - limit} more chars)"
-        return out
-
-    @staticmethod
-    def _split_edit_preview(args: dict, limit: int = 800) -> str:
-        """Unified diff of a proposed split-module edit against its live file."""
-        import difflib
-        try:
-            target = Path(str(args.get("path") or "")).expanduser().resolve()
-        except (OSError, RuntimeError, ValueError):
-            return "(unresolvable target, no diff)"
-        try:
-            old = target.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            return f"(current file unreadable, no diff: {e})"
-        new = str(args.get("content") or "")
-        out = "".join(difflib.unified_diff(
-            old.splitlines(True), new.splitlines(True),
-            fromfile=f"{target.name} (running)", tofile=f"{target.name} (proposed)"))
-        if not out:
-            return "(proposed content is identical to the running file)"
-        if len(out) > limit:
-            out = out[:limit] + f"\n… (diff truncated, {len(out) - limit} more chars)"
-        return out
-
-    # -- public dispatch -----------------------------------------------------
-
-    def _announce_job(self, text: str) -> None:
-        """Speak a job completion through the assistant's announcement path
-        (same channel as watcher alerts); a bare ToolBelt without one logs."""
-        if self._on_announce is not None:
-            try:
-                self._on_announce(text)
-            except Exception:
-                log.exception("job announcement failed")
-        else:
-            log.info("%s", text)
-
-    def _tool_methods(self) -> dict:
-        """{tool name: bound method} for every @tool-decorated method."""
-        cache = getattr(self, "_tool_cache", None)
-        if cache is None:
-            cache = {}
-            for attr in dir(self):
-                fn = getattr(self, attr, None)
-                if callable(fn) and getattr(fn, "_is_tool", False):
-                    cache[fn._tool_name] = fn
-            self._tool_cache = cache
-        return cache
-
-    def execute(self, name: str, args: dict) -> tuple[str, bool]:
-        self._last_images = []
-        # rate limiting: bounded tool calls per 60s window (runaway-loop guard)
-        limit = int(SETTINGS.get("max_tool_calls") or 0)
-        now = time.monotonic()
-        while self._tool_times and now - self._tool_times[0] > 60:
-            self._tool_times.popleft()
-        if limit > 0:
-            if len(self._tool_times) >= limit:
-                log_decision(name, json.dumps(args)[:120], "RATE-LIMITED",
-                             "refused: rate limit")
-                return (f"REFUSED: tool-call rate limit reached ({limit} calls/60s) — "
-                        "stop calling tools, answer from what you have, or wait"), True
-            self._tool_times.append(now)
-        fn = self._tool_methods().get(name)
-        if fn is None:
-            return f"unknown tool: {name}", True
-        # permission gate declared on the tool itself
-        gate = fn._tool_gates
-        if gate and not self._perm.get(gate, True):
-            log_decision(name, json.dumps(args)[:120], "DENY",
-                         "refused: permission gate disabled")
-            return f"REFUSED: the '{gate}' tool is disabled in handsoff settings", True
-        # centralized policy: ALLOW / DENY / CONFIRM (one-turn separation).
-        # kill_process/confirm_kill manage their own two-step confirm and stay
-        # out of this path.
-        if name in ("kill_process", "confirm_kill"):
-            verdict = "ALLOW"
-        else:
-            verdict = self._policy.classify(name)
-        # Self-edit floor: an edit to handsoff.py itself is RCE by construction
-        # (the source runs inside the trusted bubble). It ALWAYS takes the
-        # one-turn CONFIRM round-trip with a diff preview — even when the
-        # user's command_policy says ALLOW. DENY still wins outright.
-        if (name == "edit_file" and verdict != "DENY"
-                and getattr(self, "_confirm_running", None) != name
-                and self._self_edit_needs_confirm(args)):
-            verdict = "CONFIRM"
-        target = json.dumps(args, sort_keys=True)[:200] if args else ""
-        if verdict == "DENY":
-            log_decision(name, target, "DENY", "refused: command_policy DENY")
-            return (f"REFUSED: '{name}' is DENIED by the user's command policy "
-                    "(handsoff settings) — do not retry this turn"), True
-        if verdict == "CONFIRM" and getattr(self, "_confirm_running", None) != name:
-            # Strict one-turn separation: ONLY confirm_action('yes') runs a
-            # CONFIRM-class call. A repeated direct call never executes — it
-            # just re-surfaces the standing offer (fail-safe: the worst case
-            # is the user hearing the offer twice).
-            if (self._pending_confirm is None
-                    or self._pending_confirm.get("tool") != name):
-                self._pending_confirm = {
-                    "tool": name, "args": dict(args),
-                    "until": time.monotonic() + self._policy.confirm_seconds(),
-                }
-                log_decision(name, target, "CONFIRM", "offered; awaiting confirm_action")
-            else:
-                log_decision(name, target, "CONFIRM", "still awaiting confirm_action")
-            extra = ""
-            if name == "edit_file" and self._is_self_edit(args):
-                extra = "\nDIFF PREVIEW (proposed change to handsoff.py):\n" \
-                        + self._self_edit_preview(args)
-            elif name == "edit_file" and self._edit_confirm_kind(args) == "split":
-                try:
-                    _split_name = Path(str(args.get("path") or "")).expanduser().name
-                except (OSError, RuntimeError, ValueError):
-                    _split_name = "split module"
-                extra = f"\nDIFF PREVIEW (proposed change to {_split_name}):\n" \
-                        + self._split_edit_preview(args)
-            return (f"CONFIRM REQUIRED: about to call '{name}' with {target or 'no arguments'}. "
-                    "Nothing happened yet. The user must hear this offer and "
-                    "reply; call confirm_action(answer='yes') in the NEXT turn "
-                    "to run it, or confirm_action(answer='no') to cancel." + extra), True
-        # dry-run: desktop actions report instead of act
-        dry_run = bool(SETTINGS.get("dry_run")) and DecisionPolicy.is_desktop_action(name)
-        if dry_run:
-            log_decision(name, target, "DRY-RUN", "reported; nothing executed")
-            return (f"DRY-RUN: {name} would run with {target or 'no arguments'}. "
-                    "Nothing was executed (dry_run is enabled in settings). "
-                    "Describe the plan to the user and stop."), True
-        log_decision(name, target, verdict if verdict != "CONFIRM" else "ALLOW",
-                     "dispatched")
-        # accept common argument-name slips local models make
-        alias_map = fn._tool_aliases
-        sig = inspect.signature(fn)
-        kwargs = {}
-        for pname, p in sig.parameters.items():
-            if pname == "self":
-                continue
-            raw = args.get(pname)
-            if raw is None and pname in alias_map:
-                for alt in alias_map[pname]:
-                    if args.get(alt) is not None:
-                        raw = args[alt]
-                        break
-            if raw is None and p.default is inspect.Parameter.empty:
-                raw = ""
-            ann = p.annotation if p.annotation is not inspect.Parameter.empty else str
-            if isinstance(ann, str):   # `from __future__ import annotations`
-                ann = {"bool": bool, "int": int, "float": float,
-                       "str": str}.get(ann, str)
-            if ann is bool:
-                kwargs[pname] = bool(raw) if not isinstance(raw, bool) else raw
-            elif ann is int:
-                try:
-                    kwargs[pname] = int(raw or 0)
-                except (TypeError, ValueError):
-                    kwargs[pname] = 0
-            elif ann is float:
-                try:
-                    kwargs[pname] = float(raw or 0.0)
-                except (TypeError, ValueError):
-                    kwargs[pname] = 0.0
-            else:
-                kwargs[pname] = str(raw) if raw is not None else ""
-        try:
-            out = fn(**kwargs)
-            return out, out.startswith("ERROR") or out.startswith("REFUSED")
-        except TypeError as e:
-            return f"ERROR: bad arguments for {name}: {e}", True
-        except Exception as e:
-            log.exception("tool %s failed", name)
-            return f"ERROR: {e}", True
-
-    # -- run_command ----------------------------------------------------------
-
-    def _validate_command(self, command: str) -> tuple[list | None, str, str | None, bool]:
-        """Validate without executing: shlex.split + policy checks.
-
-        Returns (argv, exe_base, None, is_restart) when allowed, else
-        (None, '', error, False). Never executes anything (start_command must
-        not double-exec via run_command) and never arms the restart hook —
-        the caller arms it ONLY after a successful launch.
-        """
-        cmd = command.strip()
-        if not cmd:
-            return None, "", "REFUSED: empty command", False
-        if any(c in cmd for c in ";|&`$\n\r<>"):
-            return None, "", "REFUSED: shell operators (pipes, ;, &&, redirects) are not allowed", False
-        try:
-            argv = shlex.split(cmd)
-        except ValueError as e:
-            return None, "", f"REFUSED: cannot parse command ({e})", False
-        if not argv:
-            return None, "", "REFUSED: empty command", False
-        argv[0] = os.path.expanduser(argv[0])
-        low = cmd.lower()
-        exe_base = Path(argv[0]).name
-        _unblocked = ""
-        if exe_base in ("git", "cargo"):
-            verb = next((a for a in argv[1:] if not a.startswith("-")), "")
-            if (exe_base == "git" and verb in self._GIT_READ) or (
-                    exe_base == "cargo" and verb in self._CARGO_OK):
-                _unblocked = exe_base
-            else:
-                return None, "", (f"REFUSED: '{exe_base} {verb or '(no verb)'}' is not "
-                        "allowed — git is read-only (status/diff/log/show/"
-                        "branch/remote), cargo only builds/tests"), False
-            if _unblocked == "git" and any(
-                    a.lstrip("-") in self._GIT_DELETE_FLAGS
-                    for a in argv[2:] if a.startswith("-")):
-                return None, "", "REFUSED: deleting branches (git branch -d/-D) is not allowed", False
-        for bad in self.BLOCKED:
-            if bad == _unblocked:
-                continue
-            if re.search(rf"(^|\W){re.escape(bad)}(\W|$)", low):
-                return None, "", f"REFUSED: '{bad}' is not on the safe whitelist (destructive commands are forbidden)", False
-        exe = argv[0]
-        is_restart = exe == str(RESTART_SCRIPT) or Path(exe).name == RESTART_SCRIPT.name
-        if is_restart:
-            if not self._perm.get("self_restart", True):
-                return None, "", "REFUSED: self-restart is disabled in handsoff settings", False
-            if not (RESTART_SCRIPT.exists() and os.access(RESTART_SCRIPT, os.X_OK)):
-                return None, "", f"ERROR: restart script missing at {RESTART_SCRIPT} — run install.sh", False
-        allowed = set(self.ALLOWED) | {
-            c.strip() for c in SETTINGS["extra_allowed_commands"] if c.strip()
-        }
-        if not is_restart:
-            if exe_base not in allowed and exe_base != _unblocked:
-                return None, "", (
-                    f"REFUSED: '{exe}' is not on the safe shell-command whitelist. "
-                    "Note: REFUSED does NOT mean the program is missing — it only "
-                    "means you may not run it via run_command. If it is one of your "
-                    "own tools (like ydotool for typing), use that tool instead. "
-                    "Allowed: " + ", ".join(sorted(allowed)) + f", {RESTART_SCRIPT}"
-                ), False
-        log.info("run_command: %s", cmd)
-        if Path(argv[0]).name == "niri" and "spawn" in argv:
-            err = self._validate_niri_spawn(argv)
-            if err:
-                return None, "", err, False
-        return argv, exe_base, None, is_restart
-
-    _INTERPRETERS = ("python", "python3", "node", "perl", "ruby", "lua",
-                     "php", "bash", "sh", "zsh", "fish", "pwsh", "busybox")
-
-    @staticmethod
-    def _is_interpreter(base: str) -> bool:
-        """Exact-or-versioned interpreter match (no substring overblock).
-
-        Matches `python`, `python3`, `python3.11` — but NOT `shutter`,
-        `bashful`, `shellcheck` or `phosphor`, which merely contain one.
-        """
-        b = (base or "").lower()
-        return any(b == tok or re.fullmatch(rf"{re.escape(tok)}[\d.]+", b)
-                   for tok in ToolBelt._INTERPRETERS)
-
-    def _validate_niri_spawn(self, argv: list) -> str | None:
-        """Spawn-specific capability checks (no execution)."""
-        i = argv.index("spawn")
-        rest = [a for a in argv[i + 1:] if a != "--"]
-        target = os.path.basename(rest[0]) if rest else ""
-        low_target = target.lower()
-        if not target:
-            return "REFUSED: niri spawn needs a program to launch"
-        if any(re.search(rf"(^|\W){re.escape(b)}(\W|$)", low_target)
-               for b in self.BLOCKED):
-            return (f"REFUSED: niri spawn of '{target}' is blocked — spawn "
-                    "must not bypass the blocked-programs list")
-        if self._is_interpreter(low_target):
-            return (f"REFUSED: spawning interpreter '{target}' is not allowed — "
-                    "launch GUI apps by name instead (or use open_app)")
-        if low_target in ("git", "cargo"):
-            return (f"REFUSED: spawning '{target}' is not allowed — use "
-                    "run_command, which gates git/cargo by verb")
-        # ponytail: any extra arg whose basename is blocked/an interpreter is
-        # a spawn bypass (e.g. `spawn -- alacritty bash`, `spawn -- foo -- python x`)
-        for extra in rest[1:]:
-            eb = os.path.basename(extra).lower()
-            if not eb or eb.startswith("-"):
-                continue
-            if any(re.search(rf"(^|\W){re.escape(b)}(\W|$)", eb) for b in self.BLOCKED):
-                return (f"REFUSED: niri spawn arg '{extra}' is blocked — spawn "
-                        "must not bypass the blocked-programs list")
-            if self._is_interpreter(eb) or eb in ("git", "cargo"):
-                return (f"REFUSED: niri spawn arg '{extra}' is not allowed")
-        # ponytail: terminal emulators with args are shell-exec by another name
-        _terms = ("alacritty", "kitty", "foot", "konsole", "xterm", "urxvt",
-                  "wezterm", "warp", "ghostty", "tilix", "terminator",
-                  "qterminal", "gnome-terminal", "xfce4-terminal", "ptyxis",
-                  "stterm", "terminology", "console", "terminal")
-        if low_target in _terms and len(rest) > 1:
-            return ("REFUSED: spawning a terminal with arguments is not allowed")
-        if shutil.which(rest[0]) is None:
-            return f"ERROR: no program named '{target}' is installed"
-        arg_str = " ".join(shlex.quote(a) for a in rest[1:]).lower()
-        if (" -e " in f" {arg_str} " or "--command" in arg_str
-                or "--eval" in arg_str or "--print" in arg_str
-                or "--script" in arg_str or "-x" == arg_str.strip()
-                or " -x " in f" {arg_str} " or "-c" == arg_str.strip()
-                or "source " in arg_str or ".lua" in arg_str
-                or ".js" in arg_str or ".py" in arg_str):
-            return ("REFUSED: passing script/code flags to spawned programs "
-                    "is not allowed")
-        return None
-
-    @tool(description=(
-        "Run one safe whitelisted command (pactl, playerctl, brightnessctl, "
-        "niri, spawn, echo, cat, ls, pwd, notify-send, system probes like "
-        "ps/free/uptime/df/ss/nvidia-smi, read-only git (status/diff/log/"
-        "show/branch/remote/stash), cargo build/check/test/clippy, restart "
-        "script). Single command only — pipes/; /&& are refused."))
-    def run_command(self, command: str) -> str:
-        """Run a whitelisted shell command.
-
-        command: e.g. 'pactl set-sink-volume @DEFAULT_SINK@ -10%'
-        """
-        argv, exe_base, err, is_restart = self._validate_command(command)
-        if err:
-            return err
-        exe = argv[0]
-        try:
-            timeout = 240.0 if exe_base == "cargo" else self.TIMEOUT
-            proc = subprocess.run(
-                argv, capture_output=True, text=True, timeout=timeout
-            )
-        except FileNotFoundError:
-            return f"ERROR: program not found: {exe}"
-        except subprocess.TimeoutExpired:
-            return f"ERROR: command timed out after {timeout:.0f}s"
-        if is_restart:
-            # ponytail: arm only after the restart actually launched — a
-            # refused/missing/failed restart must not set pending state.
-            self._on_restart_pending()
-        out = f"exit code {proc.returncode}\nstdout:\n{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}"
-        return out[:2000]
-
-    # -- keyboard takeover (Wayland virtual input via ydotool) -----------------
-
-    YDOTOOL_SOCKET = "/tmp/.ydotool_socket"   # legacy daemon location
-    _YDOTOOL_SOCK_CACHE: list = []             # [resolved path] once found
-
-    @classmethod
-    def _ydotool_socket(cls) -> str:
-        """Socket path the ydotool CLI should talk to.
-
-        The user-level ydotoold (Arch's ydotool.service) listens on
-        $XDG_RUNTIME_DIR/.ydotool_socket, but the CLI's compiled-in default
-        is /tmp/.ydotool_socket — so without YDOTOOL_SOCKET set, every
-        type/click dies with 'failed to connect'. Probe both and prefer the
-        one that actually answers. Failures are not cached: a daemon started
-        later must be picked up on the next call.
-        """
-        if cls._YDOTOOL_SOCK_CACHE:
-            return cls._YDOTOOL_SOCK_CACHE[0]
-        runtime = os.environ.get("XDG_RUNTIME_DIR")
-        candidates = ([os.path.join(runtime, ".ydotool_socket")] if runtime else []) \
-            + [cls.YDOTOOL_SOCKET]
-        for path in candidates:
-            if cls._socket_connectable(path):
-                cls._YDOTOOL_SOCK_CACHE.append(path)
-                return path
-        return candidates[0]
-
-    @staticmethod
-    def _socket_connectable(path: str) -> bool:
-        """True only if `path` is a socket file that accepts a connection.
-
-        ydotoold 1.x binds SOCK_DGRAM, so the probe must try DGRAM first —
-        a stream connect to it fails with EPROTOTYPE even when the daemon
-        is alive and reachable.
-        """
-        try:
-            if not stat.S_ISSOCK(os.stat(path).st_mode):
-                return False
-        except OSError:
-            return False
-        for sock_type in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
-            s = socket.socket(socket.AF_UNIX, sock_type)
-            try:
-                s.settimeout(1.0)
-                s.connect(path)
-                return True
-            except OSError:
-                continue
-            finally:
-                s.close()
-        return False
-
-    # linux event keycodes for named keys
-    _KEYCODES = {
-        "enter": 28, "return": 28, "esc": 1, "escape": 1, "tab": 15,
-        "space": 57, "backspace": 14, "delete": 111, "insert": 110,
-        "home": 102, "end": 107, "pageup": 104, "pagedown": 109,
-        "up": 103, "down": 108, "left": 105, "right": 106,
-        "capslock": 58, "printscreen": 99,
-        "f1": 59, "f2": 60, "f3": 61, "f4": 62, "f5": 63, "f6": 64,
-        "f7": 65, "f8": 66, "f9": 67, "f10": 68, "f11": 87, "f12": 88,
-    }
-    _MOD_CODES = {"ctrl": 29, "alt": 56, "shift": 42, "meta": 125, "super": 125}
-    # US-QWERTY keycodes for single characters (press_keys only; type_text
-    # handles arbitrary text itself)
-    _CHAR_CODES = {
-        **{c: 16 + i for i, c in enumerate("qwertyuiop")},
-        **{c: 30 + i for i, c in enumerate("asdfghjkl")},
-        **{c: 44 + i for i, c in enumerate("zxcvbnm")},
-        **{str(n): n + 1 for n in range(1, 10)}, "0": 11,
-    }
-    _MAX_TYPE = 20_000
-
-    def _ydotool(self, *args: str) -> str:
-        env = dict(os.environ)
-        # the CLI's built-in default is /tmp/.ydotool_socket; point it at the
-        # daemon that actually answers (user-runtime socket preferred)
-        env["YDOTOOL_SOCKET"] = self._ydotool_socket()
-        try:
-            proc = subprocess.run(
-                ["ydotool", *args], capture_output=True, text=True, env=env,
-                # typing takes ~6 ms per char on the "type" path: the timeout
-                # must scale with payload size or long texts (cap 20k chars
-                # = ~2 min of typing) die with a false "timed out".
-                timeout=20 + 0.01 * sum(len(a) for a in args),
-            )
-        except FileNotFoundError:
-            return "ERROR: ydotool not installed (pacman -S ydotool)"
-        except subprocess.TimeoutExpired:
-            return "ERROR: ydotool timed out"
-        if proc.returncode != 0:
-            msg = (proc.stderr or proc.stdout or "unknown error").strip()
-            return f"ERROR: ydotool failed: {msg}"
-        return "ok"
-
-    # -- niri IPC plumbing (one place for every window query) -----------------
-
-    @staticmethod
-    def _niri_msg(*args: str, timeout: float = 8.0) -> subprocess.CompletedProcess:
-        return subprocess.run(["niri", *args], capture_output=True, text=True,
-                              timeout=timeout)
-
-    @classmethod
-    def _niri_windows(cls) -> list[dict]:
-        """One live window-list poll. Raises RuntimeError when the niri IPC
-        is unreachable or answers garbage — callers decide whether that is
-        fatal or ignorable."""
-        try:
-            r = cls._niri_msg("msg", "--json", "windows")
-            if r.returncode != 0:
-                raise RuntimeError(
-                    (r.stderr or r.stdout or "niri refused").strip()[:160])
-            return json.loads(r.stdout or "[]")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"niri IPC unavailable ({e})") from e
-
-    # workspace id → user-facing idx: niri's windows JSON carries a global
-    # id (multi-output values look arbitrary, e.g. id 1 = idx 2 on DP-3),
-    # while users and the workspace tool speak INDEX. Resolve through the
-    # live workspace list, cached briefly.
-    _WS_IDX_TTL = 10.0
-    _WS_IDX_LOCK = threading.Lock()
-    _WS_IDX_CACHE: dict = {}          # {"at": monotonic, "map": {id: idx}}
-
-    @classmethod
-    def _workspace_idx_map(cls, refresh: bool = False) -> dict:
-        """{workspace_id: idx} from the live workspace list (TTL-cached)."""
-        with cls._WS_IDX_LOCK:
-            c = cls._WS_IDX_CACHE
-            if not refresh and c and time.monotonic() - c["at"] < cls._WS_IDX_TTL:
-                return c["map"]
-            mapping: dict = {}
-            try:
-                r = cls._niri_msg("msg", "--json", "workspaces")
-                if r.returncode == 0:
-                    for ws in json.loads(r.stdout or "[]"):
-                        if ws.get("id") is not None and ws.get("idx") is not None:
-                            mapping[ws["id"]] = ws["idx"]
-            except Exception:
-                pass
-            cls._WS_IDX_CACHE = {"at": time.monotonic(), "map": mapping}
-            return mapping
-
-    @classmethod
-    def _workspace_idx_of(cls, win: dict) -> int | None:
-        """The user-facing workspace index of window `win` (None if unknown)."""
-        wid = win.get("workspace_id")
-        if wid is None:
-            return None
-        return cls._workspace_idx_map().get(wid)
-
-    @classmethod
-    def _win_label(cls, w: dict) -> str:
-        """Compact human label: 'app_id: title (workspace N)'. The workspace
-        number is the user-facing INDEX — the raw workspace_id is a global id
-        that can differ from what the user sees (multi-output setups)."""
-        label = f"{w.get('app_id') or '?'}: {(w.get('title') or '')[:60]}"
-        idx = cls._workspace_idx_of(w)
-        if idx is not None:
-            label += f" (workspace {idx})"
-        return label
-
-    @staticmethod
-    def _win_matches(w: dict, q: str) -> bool:
-        """Case-insensitive substring match on app-id or title."""
-        return (q in str(w.get("app_id", "")).lower()
-                or q in str(w.get("title", "")).lower())
-
-    @staticmethod
-    def _win_listing(wins: list[dict], limit: int = 12) -> str:
-        return " | ".join(ToolBelt._win_label(w) for w in wins[:limit])
-
-    def _focused_window_info(self) -> dict | None:
-        """Best-effort info about the focused window (niri)."""
-        try:
-            for w in self._niri_windows():
-                if w.get("is_focused"):
-                    return w
-        except Exception:
-            pass
-        return None
-
-    _TERMINAL_MARKERS = ("terminal", "konsole", "alacritty", "kitty", "foot",
-                         "xterm", "urxvt", "wezterm", "warp", "ghostty",
-                         "stterm", "st-", "tilix", "terminator", "qterminal",
-                         "gnome-terminal", "xfce4-terminal", "ptyxis", "console")
-    # ponytail: editors are NOT terminals — typing into code/zed/emacs/vim
-    # is the normal case. Only refuse when the TITLE shows a terminal
-    # panel (integrated Terminal / Output / REPL view would execute text).
-    _TERMINAL_PANEL_MARKERS = ("terminal", "output", "repl")
-
-    def _focused_is_terminal(self) -> str | None:
-        """App-id/title of the focused window if it looks like a terminal, else None.
-
-        Raises RuntimeError when focus CANNOT be determined (niri IPC dead or
-        no focused window): keyboard injection must FAIL CLOSED — typing into
-        an unidentified window could execute text in a terminal."""
-        return self._terminal_marker(self._typing_guard())
-
-    def _typing_guard(self) -> dict:
-        """The verified focused window for a keyboard-injection operation.
-
-        EVERY typing operation calls this immediately before injecting keys:
-        focus may have moved since the model decided what to type (the user
-        clicked elsewhere, a dialog opened). Raises RuntimeError when focus
-        cannot be verified (fail-closed, as _focused_is_terminal)."""
-        w = self._focused_window_info()
-        if w is None:
-            raise RuntimeError("cannot verify the focused window (niri IPC "
-                               "unavailable) — refusing to inject keys")
-        return w
-
-    @classmethod
-    def _terminal_marker(cls, w: dict) -> str | None:
-        """App-id/title of window `w` if it looks like a terminal, else None."""
-        app_id = str(w.get("app_id", "") or "").lower()
-        title = str(w.get("title", "") or "").lower()
-        if any(t in app_id for t in cls._TERMINAL_MARKERS):
-            return app_id or title
-        # ponytail: an editor (or anything else) showing a terminal panel
-        # in its title would still execute typed text — refuse on that.
-        if any(t in title for t in cls._TERMINAL_PANEL_MARKERS):
-            return (app_id or title or "unknown-window") + " (terminal panel)"
-        # ponytail: empty app_id with a known-safe title is an IPC glitch,
-        # not a terminal — allow with a warning instead of a hard refuse.
-        if not app_id.strip():
-            if title.strip():
-                log.warning("typing target has empty app_id but safe title %r — allowing",
-                            title)
-                return None
-            return "unknown-window (unidentified — fail-closed)"
-        return None
-
-    @tool(description=(
-        "Type text into the focused window via virtual keyboard. Newlines "
-        "allowed. Never type into a terminal."),
-        aliases={"text": ("content", "string", "body")})
-    def type_text(self, text: str) -> str:
-        """Type text into the focused window.
-
-        text: The exact text to type.
-        """
-        if not text:
-            return "REFUSED: nothing to type"
-        if len(text) > self._MAX_TYPE:
-            return f"REFUSED: text too long (>{self._MAX_TYPE} chars)"
-        # capability boundary: terminals must never receive injected text
-        # (they would execute it). FAIL CLOSED: if focus can't be verified,
-        # refuse — an unidentified window might be a terminal.
-        try:
-            target = self._typing_guard()
-        except RuntimeError as e:
-            return f"REFUSED: {e}"
-        if (term := self._terminal_marker(target)) is not None:
-            return (f"REFUSED: the focused window is a terminal ({term}); "
-                    "typing into terminals is forbidden")
-        # ponytail: chunked typing (512 chars) with focus re-verified per
-        # chunk — a long burst can outlive a focus change; abort on move.
-        typed = 0
-        skipped = 0
-        _CHUNK = 512
-        for off in range(0, len(text), _CHUNK):
-            if off:
-                try:
-                    target = self._typing_guard()
-                except RuntimeError as e:
-                    return (f"REFUSED: {e} (typed {typed}/{len(text)} chars "
-                            "before focus became unverifiable)")
-                if (term := self._terminal_marker(target)) is not None:
-                    return (f"REFUSED: focus moved to a terminal ({term}) "
-                            f"after {typed} chars — typing aborted")
-            piece = text[off: off + _CHUNK]
-            r = self._ydotool("type", "--key-delay", "6", "--", piece)
-            if r != "ok":
-                break
-            typed += len(piece)
-        else:
-            r = "ok"
-        if r == "ok":
-            pass  # typed already counts completed chunks
-        elif typed == 0:
-            # retry once: uinput is unreliable for non-ASCII in ydotool 1.x.
-            # Focus is RE-VERIFIED first — the failed attempt may have taken
-            # long enough for focus to move (same fail-closed rules).
-            try:
-                target = self._typing_guard()
-            except RuntimeError as e:
-                return f"REFUSED: {e}"
-            if (term := self._terminal_marker(target)) is not None:
-                return (f"REFUSED: focus moved to a terminal ({term}) "
-                        "before the retry — typing aborted")
-            ascii_text = (text.replace("\u2014", "-").replace("\u2013", "-")
-                          .replace("\u201c", '"').replace("\u201d", '"')
-                          .replace("\u2018", "'").replace("\u2019", "'")
-                          .replace("\u2026", "..."))
-            ascii_text = unicodedata.normalize(
-                "NFKD", ascii_text).encode("ascii", "ignore").decode("ascii")
-            r = self._ydotool("type", "--key-delay", "6", "--", ascii_text)
-            if r != "ok":
-                return "ERROR: typing failed entirely"
-            typed = len(ascii_text)
-            skipped = max(0, len(text) - len(ascii_text))
-        else:
-            return f"ERROR: typing failed after {typed}/{len(text)} chars: {r}"
-        if typed == 0:
-            return "ERROR: typing failed entirely"
-        # post-action verification: a long burst can outlive a focus change
-        # (the user clicked elsewhere mid-type) — report where the text may
-        # have landed instead of silently claiming success.
-        note = f"typed {typed} chars into {self._win_label(target)}"
-        if skipped:
-            note += f" ({skipped} chars skipped: unsupported characters)"
-        end_focus = self._focused_window_info()
-        if end_focus is not None and end_focus.get("id") != target.get("id"):
-            note += (f" — WARNING: focus moved to {self._win_label(end_focus)} "
-                     "during typing; some text may have landed there")
-        self._mark_elements_stale()          # screen content changed
-        log.info("type_text: %d chars into %s (skipped %d)",
-                 typed, self._win_label(target), skipped)
-        return note
-
-    @tool(description=(
-        "Press a key combo in the focused window: 'enter', 'ctrl+c', "
-        "'ctrl+a', 'alt+tab'."),
-        aliases={"combo": ("keys", "key", "combination")})
-    def press_keys(self, combo: str) -> str:
-        """Press an in-app key combination.
-
-        combo: e.g. 'ctrl+enter', 'ctrl+a', 'escape'
-        """
-        c = combo.strip().lower()
-        if not c:
-            return "REFUSED: empty combo"
-        # same fail-closed verified-focus guard as type_text
-        try:
-            term = self._focused_is_terminal()
-        except RuntimeError as e:
-            return f"REFUSED: {e}"
-        if term:
-            return (f"REFUSED: the focused window is a terminal ({term}); "
-                    "sending keys to terminals is forbidden")
-        if len(c) > 64:
-            return "REFUSED: combo too long"
-        parts = [p.strip() for p in c.split("+") if p.strip()]
-        if not parts:
-            return "REFUSED: empty combo"
-        mods = []
-        keys = []
-        for p in parts:
-            if p in self._MOD_CODES:
-                mods.append(self._MOD_CODES[p])
-            elif p in self._KEYCODES:
-                keys.append(self._KEYCODES[p])
-            elif len(p) == 1 and p in self._CHAR_CODES:
-                keys.append(self._CHAR_CODES[p])
-            else:
-                return f"REFUSED: unknown key '{p}'"
-        if not keys:
-            return "REFUSED: combo needs a non-modifier key"
-        argv = ["key"]
-        for m in mods:
-            argv += [f"{m}:1"]
-        for k in keys:
-            argv += [f"{k}:1", f"{k}:0"]
-        for m in reversed(mods):
-            argv += [f"{m}:0"]
-        r = self._ydotool(*argv)
-        if r == "ok":
-            self._mark_elements_stale()      # e.g. enter submits, screen changed
-        return r
-
-    # niri named keys for press_hotkey (evdev codes beyond letters/digits)
-    _HOTKEY_NAMES = {
-        "return": 28, "enter": 28, "space": 57, "tab": 15,
-        "esc": 1, "escape": 1, "backspace": 14, "delete": 111, "del": 111,
-        "up": 103, "down": 108, "left": 105, "right": 106,
-        "home": 102, "end": 107, "pageup": 104, "pagedown": 109,
-        "print": 99, "insert": 110, "minus": 12, "equal": 13,
-        "comma": 51, "period": 52, "slash": 53, "semicolon": 39,
-    }
-
-    @staticmethod
-    def _super_binding_known(combo: str) -> bool:
-        """Best-effort check that a Super chord is bound in niri config.
-
-        Follows `include "..."` lines from config.kdl (binds live in
-        cfg/keybinds.kdl). True when found OR the config is unreadable
-        (legacy allow). False only when readable config lacks the chord
-        (it would reach the focused app).
-        """
-        try:
-            base = HOME / ".config/niri"
-            texts: list[str] = [(base / "config.kdl").read_text(encoding="utf-8").lower()]
-        except OSError:
-            return True
-        # ponytail: one-level include follow, bounded (no glob, no recursion bomb)
-        try:
-            seen: set[str] = set()
-            for m in re.findall(r'include\s+"([^"]+)"', texts[0]):
-                if len(seen) >= 20:
-                    break
-                inc = (base / m).resolve() if not m.startswith("/") else Path(m)
-                try:
-                    if str(inc) in seen or not str(inc).startswith(str(base)):
-                        continue
-                    seen.add(str(inc))
-                    if inc.is_file() and inc.stat().st_size < 500_000:
-                        texts.append(inc.read_text(encoding="utf-8").lower())
-                except OSError:
-                    continue
-        except Exception:
-            pass
-        # ponytail: match real bind lines only — a chord mentioned in a
-        # `// comment` is not bound, and must not lift the terminal guard.
-        def _code(text: str) -> str:
-            return "\n".join(ln.split("//", 1)[0] for ln in text.splitlines())
-        norm = combo.strip().lower().replace(" ", "")
-        norm = norm.replace("meta+", "mod+").replace("super+", "mod+").replace("win+", "mod+").replace("logo+", "mod+")
-        blob = "\n".join(_code(t) for t in texts)
-        return norm in blob
-
-    @tool(description=(
-        "Fire a desktop/compositor shortcut: 'Mod+E' (files), 'Mod+Return' "
-        "(terminal), 'Mod+F' (fullscreen), 'Mod+Shift+S' (settings). "
-        "System-wide actions; for in-app chords use press_keys."),
-        gates="press_keys",
-        aliases={"combo": ("keys", "key")})
-    def press_hotkey(self, combo: str) -> str:
-        """Fire a compositor hotkey.
-
-        combo: e.g. 'Mod+E', 'Mod+Return', 'Mod+Shift+V'
-
-        Mod maps to Super.
-        """
-        c = combo.strip().lower().replace(" ", "")
-        if not c:
-            return "REFUSED: empty combo"
-        if len(c) > 64:
-            return "REFUSED: combo too long"
-        parts = [p for p in c.split("+") if p]
-        if not parts:
-            return "REFUSED: empty combo"
-        mods = []
-        keys = []
-        has_super = False
-        for p in parts:
-            if p in ("mod", "meta", "super", "win", "logo"):
-                mods.append(125)  # Super — compositor sees this first
-                has_super = True
-            elif p in ("ctrl", "control"):
-                mods.append(29)
-            elif p == "alt":
-                mods.append(56)
-            elif p == "shift":
-                mods.append(42)
-            elif p in self._KEYCODES:
-                keys.append(self._KEYCODES[p])
-            elif p in self._HOTKEY_NAMES:
-                keys.append(self._HOTKEY_NAMES[p])
-            elif len(p) == 1 and p in self._CHAR_CODES:
-                keys.append(self._CHAR_CODES[p])
-            else:
-                return f"REFUSED: unknown key '{p}'"
-        if not keys:
-            return "REFUSED: combo needs a non-modifier key (e.g. Mod+E)"
-        # ponytail: Super-bypass only when the chord is actually bound in the
-        # compositor (else the focused app receives it). Binding check is
-        # best-effort: unreadable config keeps the legacy allow.
-        if not (has_super and self._super_binding_known(c)):
-            try:
-                term = self._focused_is_terminal()
-            except RuntimeError as e:
-                return f"REFUSED: {e}"
-            if term:
-                return (f"REFUSED: the focused window is a terminal ({term}); "
-                        "only bound compositor hotkeys (Mod/Super) may be sent to terminals")
-        argv = ["key"]
-        for m in mods:
-            argv += [f"{m}:1"]
-        for k in keys:
-            argv += [f"{k}:1", f"{k}:0"]
-        for m in reversed(mods):
-            argv += [f"{m}:0"]
-        r = self._ydotool(*argv)
-        if r == "ok":
-            self._mark_elements_stale()      # compositor shortcuts change the screen
-            log.info("press_hotkey: %s", c)
-        return r
-
-    # -- ambient controls ------------------------------------------------------
-
-    @tool(gates="notifications", description=(
-        "Read future desktop notifications aloud. Actions: start, stop, "
-        "toggle, status, or mute (mute_apps is comma-separated app names). "
-        "Private and disabled by default."))
-    def notification_reader(self, action: str = "status", mute_apps: str = "") -> str:
-        action = str(action or "status").strip().lower()
-        if action == "mute":
-            apps = [x.strip().lower() for x in str(mute_apps or "").split(",")
-                    if x.strip()]
-            set_setting("notification_mute_apps", apps[:32])
-            return "notification mute list set to: " + (", ".join(apps) or "(empty)")
-        if action not in ("start", "stop", "toggle", "status"):
-            return "ERROR: action must be start, stop, toggle, status or mute"
-        current = bool(SETTINGS.get("notification_reader", False))
-        if action == "toggle":
-            current = not current
-        elif action == "start":
-            current = True
-        elif action == "stop":
-            current = False
-        if action != "status":
-            set_setting("notification_reader", current)
-            if self._on_notification is not None:
-                result = self._on_notification(current)
-                if result:
-                    return result
-        muted = ", ".join(SETTINGS.get("notification_mute_apps") or []) or "none"
-        return f"notification reader is {'on' if current else 'off'}; muted apps: {muted}"
-
-    @tool(gates="pomodoro", description=(
-        "Start or control a repeating Pomodoro timer. action: start, stop, "
-        "status. work_minutes defaults to 25 and break_minutes to 5."))
-    def pomodoro(self, action: str = "status", work_minutes: float = 25,
-                 break_minutes: float = 5) -> str:
-        action = str(action or "status").strip().lower()
-        if action not in ("start", "stop", "status"):
-            return "ERROR: action must be start, stop or status"
-        callback = self._on_pomodoro
-        if callback is None:
-            return "ERROR: pomodoro controller is unavailable"
-        try:
-            work_minutes = float(work_minutes)
-            break_minutes = float(break_minutes)
-        except (TypeError, ValueError):
-            return "ERROR: work_minutes and break_minutes must be numbers"
-        if not (1 <= work_minutes <= 120 and 1 <= break_minutes <= 60):
-            return "ERROR: work_minutes must be 1-120 and break_minutes 1-60"
-        return callback(action, work_minutes, break_minutes)
-
-    def _watch_emit(self, text: str) -> None:
-        """Send watcher alerts to the configured assistant announcement path,
-        while retaining a desktop notification as a visible fallback."""
-        log.warning("watcher alert: %s", text)
-        notify("handsoff watcher: " + text)
-        if self._on_announce is not None:
-            try:
-                self._on_announce(text)
-            except Exception:
-                log.exception("watcher announcement failed")
-
-    @staticmethod
-    def _file_watch_loop(path: Path, pattern: re.Pattern, stop: threading.Event,
-                         emit) -> None:
-        try:
-            position = path.stat().st_size
-        except OSError:
-            position = 0
-        deadline = time.monotonic() + 24 * 3600
-        while not stop.wait(1.0) and time.monotonic() < deadline:
-            try:
-                size = path.stat().st_size
-                if size < position:       # rotation/truncation: start at zero
-                    position = 0
-                if size == position:
-                    continue
-                with path.open("r", encoding="utf-8", errors="replace") as fh:
-                    fh.seek(position)
-                    chunk = fh.read(min(size - position, 128_000))
-                    position = fh.tell()
-                for line in chunk.splitlines():
-                    if pattern.search(line):
-                        emit(f"{path.name}: {line.strip()[:240]}")
-            except OSError:
-                emit(f"file watcher lost {path}")
-                return
-            except Exception:
-                log.exception("file watcher failed for %s", path)
-                return
-
-    @staticmethod
-    def _process_watch_loop(name: str, stop: threading.Event, emit) -> None:
-        seen = False
-        deadline = time.monotonic() + 24 * 3600
-        while not stop.wait(1.0) and time.monotonic() < deadline:
-            present = any(n.lower() == name.lower() for _, n in ToolBelt._same_user_procs())
-            if seen and not present:
-                emit(f"process {name} exited")
-                return
-            seen = present
-
-    @tool(gates="watchers", description=(
-        "Watch a text file for new lines matching a regular expression. "
-        "action=start/stop/list; start requires path and pattern. Max four "
-        "file watchers, each stops on deletion or after 24 hours."))
-    def watch_file(self, path: str = "", pattern: str = "", action: str = "start") -> str:
-        action = str(action or "start").strip().lower()
-        p = Path(str(path or "")).expanduser().resolve()
-        key = str(p)
-        if action == "list":
-            with self._watch_lock:
-                return "file watchers: " + (", ".join(self._file_watchers) or "none")
-        if action == "stop":
-            with self._watch_lock:
-                item = self._file_watchers.pop(key, None)
-            if item:
-                item[0].set()
-                return f"stopped watching {p}"
-            return f"no file watcher for {p}"
-        if action != "start":
-            return "ERROR: action must be start, stop or list"
-        if not p.is_file():
-            return f"ERROR: no readable file: {p}"
-        try:
-            rx = re.compile(str(pattern or ""))
-        except re.error as e:
-            return f"ERROR: invalid pattern: {e}"
-        if not rx.pattern:
-            return "ERROR: pattern must not be empty"
-        with self._watch_lock:
-            if key not in self._file_watchers and len(self._file_watchers) >= 4:
-                return "ERROR: maximum of four file watchers reached"
-            old = self._file_watchers.pop(key, None)
-            if old:
-                old[0].set()
-            stop = threading.Event()
-            thread = threading.Thread(target=self._file_watch_loop,
-                                      args=(p, rx, stop, self._watch_emit),
-                                      name="watch-file", daemon=True)
-            self._file_watchers[key] = (stop, thread)
-            thread.start()
-        return f"watching {p} for /{rx.pattern}/ (starts at the current end)"
-
-    @tool(gates="watchers", description=(
-        "Watch one exact same-user process name and announce when it exits. "
-        "action=start/stop/list; max four process watchers."))
-    def watch_process(self, name: str = "", action: str = "start") -> str:
-        action = str(action or "start").strip().lower()
-        name = str(name or "").strip()
-        if action == "list":
-            with self._watch_lock:
-                return "process watchers: " + (", ".join(self._process_watchers) or "none")
-        if not name or len(name) > 128 or not re.fullmatch(r"[A-Za-z0-9_.@+-]+", name):
-            return "ERROR: process name must be an exact simple name"
-        if action == "stop":
-            with self._watch_lock:
-                item = self._process_watchers.pop(name.lower(), None)
-            if item:
-                item[0].set()
-                return f"stopped watching process {name}"
-            return f"no process watcher for {name}"
-        if action != "start":
-            return "ERROR: action must be start, stop or list"
-        with self._watch_lock:
-            if name.lower() not in self._process_watchers and len(self._process_watchers) >= 4:
-                return "ERROR: maximum of four process watchers reached"
-            old = self._process_watchers.pop(name.lower(), None)
-            if old:
-                old[0].set()
-            stop = threading.Event()
-            thread = threading.Thread(target=self._process_watch_loop,
-                                      args=(name, stop, self._watch_emit),
-                                      name="watch-process", daemon=True)
-            self._process_watchers[name.lower()] = (stop, thread)
-            thread.start()
-        return f"watching process {name} for exit"
-
-    def stop_watchers(self) -> None:
-        with self._watch_lock:
-            items = list(self._file_watchers.values()) + list(self._process_watchers.values())
-            self._file_watchers.clear()
-            self._process_watchers.clear()
-        for stop, _thread in items:
-            stop.set()
-
-    # -- window focus & clipboard ---------------------------------------------
-
-    @tool(description=(
-        "Control niri workspaces: 'go' (switch), 'move' (send window), "
-        "'next'/'prev' (one workspace), 'list' (overview)."),
-        gates="run_command",
-        aliases={"action": ("cmd", "command", "op"), "target": ("arg", "value", "ref")})
-    def workspace(self, action: str, target: str = "") -> str:
-        """Control workspaces.
-
-        action: 'go', 'move', 'next', 'prev' or 'list'
-        target: workspace number/name, or '<app> to <workspace>' for 'move'
-        """
-        act = action.strip().lower()
-
-        def _resolve(ref: str) -> str:
-            """Personal alias → number/name ('go to code'); otherwise pass
-            through (niri accepts numbers and its own workspace names)."""
-            r = re.sub(r"^\s*(the\s+)?(workspace|ws)\s+", "", ref.strip(),
-                       flags=re.IGNORECASE)
-            aliases = SETTINGS.get("workspace_aliases") or {}
-            return aliases.get(r.strip().lower(), r)
-
-        t = _resolve(target)
-
-        def _niri(*args: str, timeout: float = 8) -> subprocess.CompletedProcess:
-            return subprocess.run(
-                ["niri", *args], capture_output=True, text=True, timeout=timeout)
-
-        if act in ("go", "goto", "switch", "focus", "jump"):
-            if not t:
-                return "ERROR: name a workspace (number or name)"
-            r = _niri("msg", "action", "focus-workspace", t)
-            if r.returncode != 0:
-                return f"ERROR: niri refused ({(r.stderr or r.stdout).strip()})"
-            log.info("workspace: focus %s", t)
-            return f"switched to workspace {t}"
-
-        if act in ("next", "down"):
-            r = _niri("msg", "action", "focus-workspace-down")
-            return "moved to the workspace below" if r.returncode == 0 else \
-                f"ERROR: niri refused ({(r.stderr or r.stdout).strip()})"
-
-        if act in ("prev", "previous", "up"):
-            r = _niri("msg", "action", "focus-workspace-up")
-            return "moved to the workspace above" if r.returncode == 0 else \
-                f"ERROR: niri refused ({(r.stderr or r.stdout).strip()})"
-
-        if act in ("move", "send"):
-            if not t:
-                return "ERROR: name the target workspace (or '<app> to <workspace>')"
-            m = re.split(r"\s+to\s+", t, maxsplit=1, flags=re.IGNORECASE)
-            if len(m) == 2:
-                app, ref = m[0].strip(), _resolve(m[1])
-                try:
-                    raw = _niri("msg", "--json", "windows").stdout
-                    wins = json.loads(raw or "[]")
-                except Exception as e:
-                    return f"ERROR: cannot list windows ({e})"
-                cands = [w for w in wins if app.lower() in
-                         (str(w.get("app_id", "")) + " " + str(w.get("title", ""))).lower()]
-                if not cands:
-                    return f"ERROR: no window matching '{app}'"
-                wid = cands[0].get("id")
-            else:
-                ref = t
-                # focused window: niri moves the FOCUSED window when only a
-                # target is given
-                focused = next((w for w in json.loads(
-                    (_niri("msg", "--json", "windows").stdout or "[]"))
-                    if w.get("is_focused")), None)
-                if focused is None:
-                    return "ERROR: no focused window to move"
-                wid = focused.get("id")
-            r = _niri("msg", "action", "move-window-to-workspace",
-                      "--window-id", str(wid), ref)
-            if r.returncode != 0:
-                return f"ERROR: niri refused ({(r.stderr or r.stdout).strip()})"
-            # verify by user-facing idx: niri accepting the command is not
-            # the window having moved (and idx, not the global id, is what
-            # the user means by 'workspace N')
-            want = int(ref) if str(ref).strip().isdigit() else None
-            moved = None
-            if want is not None:
-                try:
-                    # ponytail: bounded verify (5 x 0.15s polls, 3s IPC cap) —
-                    # a hung niri must not block the turn for ~2min.
-                    for _ in range(5):
-                        time.sleep(0.15)
-                        cur = next((w for w in json.loads(
-                            _niri("msg", "--json", "windows", timeout=3).stdout or "[]")
-                            if w.get("id") == wid), None)
-                        # refresh the id→idx cache every poll: the cached map
-                        # predates the move and would read the OLD workspace
-                        if cur and self._workspace_idx_map(
-                                refresh=True).get(
-                                cur.get("workspace_id")) == want:
-                            moved = True
-                            break
-                except Exception:
-                    pass
-            if moved:
-                log.info("workspace: move → %s (verified)", ref)
-                return f"moved the window to workspace {ref} (verified)"
-            log.info("workspace: move → %s (unconfirmed)", ref)
-            return (f"moved the window to workspace {ref}, but the move is "
-                    "NOT confirmed yet — re-check with 'list my workspaces' "
-                    "before typing there")
-
-        if act in ("list", "show", "status"):
-            try:
-                wss = json.loads(_niri("msg", "--json", "workspaces").stdout or "[]")
-                wins = json.loads(_niri("msg", "--json", "windows").stdout or "[]")
-            except Exception as e:
-                return f"ERROR: cannot read workspaces ({e})"
-            out = []
-            for ws in sorted(wss, key=lambda x: x.get("idx", 0)):
-                label = f"ws{ws.get('idx')}"
-                aliases = SETTINGS.get("workspace_aliases") or {}
-                aka = [k for k, v in aliases.items() if v == str(ws.get("idx"))]
-                if ws.get("name"):
-                    label += f" ({ws['name']})"
-                if aka:
-                    label += f" [{', '.join(aka)}]"
-                if ws.get("is_focused"):
-                    label += " [current]"
-                here = [str(w.get("title") or w.get("app_id") or "?")[:28]
-                        for w in wins if w.get("workspace_id") == ws.get("id")]
-                out.append(f"{label}: " + (" | ".join(here[:6]) or "(empty)"))
-            return "workspaces: " + " ;; ".join(out) if out else "no workspaces"
-
-        return (f"ERROR: unknown workspace action '{act}' — "
-                "use go / move / next / prev / list")
-
-    # polling cadence for window waits: niri maps windows instantly on spawn,
-    # but apps take 0.5-3 s to map their first window; 0.25 s is invisible to
-    # the user yet catches fast launchers on the very first poll
-    _WIN_POLL_S = 0.25
-
-    def _wait_window_match(self, q: str, timeout: float,
-                           ids_before: set | None = None) -> dict | None:
-        """Poll the live window list until a window matching `q` appears.
-
-        With ids_before, only windows NOT in that set are considered (used by
-        open_app to identify the freshly launched window). Returns the window
-        dict or None on timeout."""
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                wins = self._niri_windows()
-            except RuntimeError:
-                wins = []
-            for w in wins:
-                if ids_before is not None and w.get("id") in ids_before:
-                    continue
-                if self._win_matches(w, q):
-                    return w
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(self._WIN_POLL_S)
-
-    @tool(description=(
-        "Focus a desktop window by app name or title substring "
-        "('firefox', 'slack', 'alacritty'). Confirms the window really got "
-        "focus before returning."),
-        aliases={"app": ("window",)})
-    def focus_window(self, app: str) -> str:
-        """Focus a window by name.
-
-        app: app-id or title substring, e.g. 'firefox'
-        """
-        q = app.strip().lower()
-        if not q:
-            return "REFUSED: name the app or window title to focus"
-        try:
-            wins = self._niri_windows()
-        except RuntimeError as e:
-            return f"ERROR: cannot list windows ({e})"
-        cands = [w for w in wins if self._win_matches(w, q)]
-        if not cands:
-            return ("ERROR: no window matching " + q + ". Open windows: "
-                    + self._win_listing(wins))
-        w = cands[0]
-        try:
-            r = self._niri_msg("msg", "action", "focus-window",
-                               "--id", str(w.get("id")))
-        except Exception as e:
-            return f"ERROR: focus failed: {e}"
-        if r.returncode != 0:
-            return f"ERROR: focus failed: {(r.stderr or 'unknown').strip()}"
-        # post-action verification: 'niri accepted the command' is not
-        # 'the window has focus'. Poll until it is (or admit we can't tell).
-        note = f"focused {self._win_label(w)}"
-        confirmed = self._wait_focus_id(w.get("id"), 2.0)
-        if confirmed:
-            note += " (focus confirmed)"
-        else:
-            note += " (focus NOT confirmed yet — it may still be switching)"
-        log.info("focus_window: %s", note)
-        return note
-
-    def _wait_focus_id(self, win_id, timeout: float) -> bool:
-        """True when window `win_id` reports is_focused within `timeout`."""
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                wins = self._niri_windows()
-            except RuntimeError:
-                return False
-            if any(w.get("id") == win_id and w.get("is_focused") for w in wins):
-                return True
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(self._WIN_POLL_S)
-
-    @tool(description=(
-        "Wait until a window matching the name exists (apps take a moment to "
-        "appear after launch). Returns the window and whether it is focused. "
-        "Use after open_app, or when a window is slow to appear."),
-        gates="focus_window",
-        aliases={"app": ("window", "name")})
-    def wait_for_window(self, app: str, timeout: float = 10.0) -> str:
-        """Wait for a window to exist.
-
-        app: app-id or title substring to wait for
-        timeout: seconds to wait before giving up (max 30)
-        """
-        q = app.strip().lower()
-        if not q:
-            return "REFUSED: name the app or window title to wait for"
-        timeout = min(max(float(timeout or 10.0), 0.5), 30.0)
-        w = self._wait_window_match(q, timeout)
-        if w is None:
-            try:
-                listing = self._win_listing(self._niri_windows())
-            except RuntimeError:
-                listing = "window list unavailable (niri IPC down?)"
-            return (f"ERROR: no window matching '{q}' appeared within "
-                    f"{timeout:g}s. Open windows: {listing}")
-        focus = ("and focused" if w.get("is_focused")
-                 else "but NOT focused — call focus_window before typing")
-        log.info("wait_for_window: %s %s", self._win_label(w), focus)
-        return f"window ready: {self._win_label(w)} ({focus})"
-
-    @tool(description=(
-        "Sleep for `seconds` (0.5-30, default 1) before the next action: "
-        "lets an app finish drawing, an animation settle, or a dialog "
-        "appear. Prefer wait_for_window when waiting for an app window."),
-        gates="",
-        aliases={"seconds": ("secs", "delay", "duration")})
-    def wait(self, seconds: float = 1.0) -> str:
-        """Wait a moment.
-
-        seconds: how long to sleep (0.5 to 30)
-        """
-        try:
-            s = float(seconds)
-        except (TypeError, ValueError):
-            s = 1.0
-        s = min(max(s, 0.5), 30.0)
-        time.sleep(s)
-        log.info("wait: %.1fs", s)
-        return f"waited {s:.1f}s"
-
-    # -- live capability manifest (what THIS compositor can do right now) ------
-    # The AI must not guess niri's surface: actions differ across versions, so
-    # the manifest is polled live (cached briefly) instead of hardcoded.
-
-    _MANIFEST_TTL = 30.0
-    _MANIFEST_LOCK = threading.Lock()
-    _MANIFEST_CACHE: dict | None = None   # {"at": monotonic, "data": dict}
-
-    @classmethod
-    def _niri_manifest(cls, refresh: bool = False) -> dict:
-        """The live capability manifest, cached for _MANIFEST_TTL seconds."""
-        with cls._MANIFEST_LOCK:
-            c = cls._MANIFEST_CACHE
-            if (not refresh and c is not None
-                    and time.monotonic() - c["at"] < cls._MANIFEST_TTL):
-                return c["data"]
-            data = cls._build_manifest()
-            cls._MANIFEST_CACHE = {"at": time.monotonic(), "data": data}
-            return data
-
-    @staticmethod
-    def _niri_help_names(argv: list[str], section: str) -> list[str]:
-        """Enum names from a niri help text: the lines indented exactly two
-        spaces under `section:` ('Actions:', …), until the next left-flush
-        section. Tolerates missing niri (returns [])."""
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=8)
-            text = (r.stdout or "") + "\n" + (r.stderr or "")
-        except Exception:
-            return []
-        names: list[str] = []
-        inside = False
-        for line in text.splitlines():
-            if not inside:
-                if line.strip() == section + ":":
-                    inside = True
-                continue
-            if not line.startswith("  "):
-                if line.strip():
-                    break                     # next left-flush section
-                continue
-            m = re.fullmatch(r"  ([a-z0-9][a-z0-9-]*)\s*", line)
-            if m:
-                names.append(m.group(1))
-        return names
-
-    @classmethod
-    def _build_manifest(cls) -> dict:
-        """Poll niri for everything the desktop-action tools depend on.
-        Every piece is optional: a dead IPC just leaves that piece absent."""
-        m: dict = {}
-
-        def _json_cli(*args: str):
-            r = cls._niri_msg(*args)
-            if r.returncode != 0:
-                raise RuntimeError((r.stderr or "niri refused").strip()[:120])
-            return json.loads(r.stdout or "null")
-
-        try:
-            v = _json_cli("msg", "--json", "version")
-            m["version"] = str(v.get("compositor") or v.get("cli") or "?")
-        except Exception:
-            m["version_error"] = "niri IPC unavailable"
-        try:
-            wins = cls._niri_windows()
-            m["windows"] = {
-                "count": len(wins),
-                "focused": next((cls._win_label(w) for w in wins
-                                 if w.get("is_focused")), None),
-                # user-facing placement: app_id -> workspace INDEX (never the
-                # raw workspace_id, which is a global id, not what users see)
-                "placement": {str(w.get("app_id") or "?"): cls._workspace_idx_of(w)
-                              for w in wins if w.get("app_id")},
-            }
-        except Exception:
-            pass
-        try:
-            wss = _json_cli("msg", "--json", "workspaces")
-            m["workspaces"] = {
-                "count": len(wss),
-                # sorted user-facing indices so the model can reason about
-                # 'workspace 2' correctly on multi-output setups
-                "indices": sorted(ws.get("idx") for ws in (wss or [])
-                                  if ws.get("idx") is not None),
-            }
-        except Exception:
-            pass
-        try:
-            outs = _json_cli("msg", "--json", "outputs")
-            try:
-                focused = _json_cli("msg", "--json", "focused-output").get("name")
-            except Exception:
-                focused = None
-            m["outputs"] = [
-                {"name": name,
-                 "make": str((o or {}).get("make") or "?")[:24],
-                 "model": str((o or {}).get("model") or "?")[:24],
-                 "scale": ((o or {}).get("logical") or {}).get("scale", 1.0),
-                 "focused": name == focused}
-                for name, o in (outs or {}).items()]
-        except Exception:
-            pass
-        try:
-            kl = _json_cli("msg", "--json", "keyboard-layouts")
-            names = [str(n) for n in (kl or {}).get("names") or []]
-            m["keyboard_layouts"] = {
-                "names": names,
-                "current": (names[(kl or {}).get("current_idx") or 0]
-                            if names else None),
-            }
-        except Exception:
-            pass
-        acts = cls._niri_help_names(["niri", "msg", "action", "--help"],
-                                    "Actions")
-        if acts:
-            m["actions"] = acts
-        return m
-
-    @tool(description=(
-        "Live capability manifest of the niri compositor: version, open "
-        "windows, workspaces, outputs (name and scale — needed to convert "
-        "screenshot pixels to pointer coordinates), keyboard layouts, and "
-        "every supported action on THIS version. Cached ~30s; refresh=true "
-        "forces a fresh poll."),
-        gates="",
-        aliases={"refresh": ("force",)})
-    def niri_capabilities(self, refresh: bool = False) -> str:
-        """Report what the running compositor supports right now.
-
-        refresh: true to bypass the 30s cache
-        """
-        m = self._niri_manifest(refresh=bool(refresh))
-        out: list[str] = []
-        if "version" in m:
-            out.append(f"niri {m['version']}")
-        elif "version_error" in m:
-            out.append(f"niri: {m['version_error']}")
-        w = m.get("windows")
-        if w:
-            out.append(f"windows: {w['count']}"
-                       + (f", focused: {w['focused']}" if w.get("focused") else ""))
-        if "workspaces" in m:
-            out.append(f"workspaces: {m['workspaces']['count']}")
-        outs = m.get("outputs")
-        if outs:
-            out.append("outputs: " + " ;; ".join(
-                f"{o['name']} {o['model']} scale {o.get('scale', 1.0)}"
-                + (" (focused)" if o.get("focused") else "")
-                for o in outs))
-        kl = m.get("keyboard_layouts")
-        if kl and kl.get("names"):
-            out.append("keyboard layouts: " + ", ".join(kl["names"])
-                       + (f" [current: {kl['current']}]" if kl.get("current") else ""))
-        acts = m.get("actions")
-        if acts:
-            shown = ", ".join(acts[:60])
-            more = f" … (+{len(acts) - 60} more)" if len(acts) > 60 else ""
-            out.append(f"actions ({len(acts)}): {shown}{more}")
-        return "\n".join(out) or "niri capability manifest unavailable"
-
-    @tool(description=(
-        "Close an app's windows by name ('firefox', 'spotify') or 'this' for "
-        "the focused one. Polite close (like Alt+F4): unsaved work prompts "
-        "the user. Never force-kills."),
-        gates="run_command",
-        aliases={"app": ("window", "name")})
-    def close_window(self, app: str) -> str:
-        """Close window(s) politely.
-
-        app: app name or title fragment, e.g. 'firefox'; 'this' = focused window
-        """
-        q = app.strip().lower()
-        if not q:
-            return ("REFUSED: name the app or window to close "
-                    "(or pass 'this' for the focused window)")
-        try:
-            raw = subprocess.run(
-                ["niri", "msg", "--json", "windows"],
-                capture_output=True, text=True, timeout=8,
-            )
-            wins = json.loads(raw.stdout or "[]")
-        except Exception as e:
-            return f"ERROR: cannot list windows ({e})"
-        if q in ("this", "focused", "current"):
-            targets = [w for w in wins if w.get("is_focused")]
-            if not targets:
-                return "ERROR: no focused window"
-        else:
-            targets = [w for w in wins if self._win_matches(w, q)]
-            if not targets:
-                return ("ERROR: no window matching " + q + ". Open windows: "
-                        + self._win_listing(wins))
-        targets = [w for w in targets
-                   if "handsoff" not in str(w.get("app_id", "")).lower()]
-        if not targets:
-            return ("REFUSED: I will not close my own bubble — "
-                    "if a restart is needed, use self_restart")
-        closed, failed = [], []
-        for w in targets:
-            try:
-                r = self._niri_msg("msg", "action", "close-window",
-                                   "--id", str(w.get("id")))
-            except Exception as e:
-                failed.append(f"{self._win_label(w)} ({e})")
-                continue
-            label = self._win_label(w)
-            (closed if r.returncode == 0 else failed).append(label)
-        if failed:
-            return "ERROR: close failed for: " + " | ".join(failed)
-        # post-action verification: a polite close can be declined (unsaved
-        # work opens a dialog) — check the windows are really gone.
-        lingering = list(closed)
-        if closed:
-            ids = {self._win_label(t): t.get("id") for t in targets}
-            deadline = time.monotonic() + 2.0
-            while lingering and time.monotonic() < deadline:
-                try:
-                    wins = self._niri_windows()
-                except RuntimeError:
-                    break
-                live_ids = {w.get("id") for w in wins}
-                lingering = [lbl for lbl in closed if ids.get(lbl) in live_ids]
-                if lingering:
-                    time.sleep(self._WIN_POLL_S)
-        gone = [lbl for lbl in closed if lbl not in lingering]
-        if gone:
-            log.info("close_window: %s", "; ".join(gone))
-        note = ""
-        if gone:
-            note += f"closed {len(gone)} window(s): " + " | ".join(gone)
-            note += " (confirmed gone)"
-        if lingering:
-            note += ("; still open: " + " | ".join(lingering)
-                     + " — the app may be asking about unsaved work")
-        return note or "ERROR: nothing was closed"
-
-    @tool(gates="copy_text", description="Copy text to the Wayland clipboard.",
-          aliases={"text": ("content",)})
-    def copy_text(self, text: str) -> str:
-        if not text:
-            return "REFUSED: nothing to copy"
-        try:
-            # DEVNULL, not capture_output: wl-copy forks a background child
-            # that SERVES the clipboard and inherits our stdout pipe — with
-            # capture_output, communicate() blocks on that inherited pipe
-            # until the timeout and a SUCCESSFUL copy reports a false
-            # "wl-copy timed out". No pipe, no false wait.
-            subprocess.run(["wl-copy", "--", text],
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=8)
-        except FileNotFoundError:
-            return "ERROR: wl-clipboard is not installed (pacman -S wl-clipboard)"
-        except subprocess.TimeoutExpired:
-            return "ERROR: wl-copy timed out"
-        return f"copied {len(text)} chars to the clipboard"
-
-    @tool(description=(
-        "Read the clipboard content (wayland). Use to check what the user "
-        "copied or to inspect before pasting."))
-    def paste_text(self) -> str:
-        try:
-            r = subprocess.run(["wl-paste", "--no-newline"],
-                               capture_output=True, text=True, timeout=8)
-        except FileNotFoundError:
-            return "ERROR: wl-clipboard is not installed (pacman -S wl-clipboard)"
-        except subprocess.TimeoutExpired:
-            return "ERROR: wl-paste timed out"
-        data = r.stdout or ""
-        if not data:
-            return "clipboard is empty"
-        head = data[:120].replace("\n", " ")
-        more = f" (+{len(data) - 120} more chars)" if len(data) > 120 else ""
-        return f"clipboard holds {len(data)} chars: {head!r}{more}"
-
-    @tool(gates="reminders", description=(
-        "Set a spoken reminder. when_due: 'in 45 minutes', '18:30' (next "
-        "occurrence), or 'YYYY-MM-DD HH:MM'. repeat_hours>0 recurs "
-        "(24=daily, 168=weekly)."),
-        aliases={"when_due": ("when", "due", "at", "time", "in", "seconds"),
-                 "wake_name": ("name", "label", "what", "text"),
-                 "repeat_hours": ("repeat", "every")})
-    def set_reminder(self, wake_name: str, when_due: str, repeat_hours: float = 0) -> str:
-        name = str(wake_name or "").strip()
-        arg = str(when_due or "").strip()
-        if not name or not arg:
-            return ("ERROR: need a reminder name and a due time "
-                    "('in 45 minutes', '18:30', or 'YYYY-MM-DD HH:MM')")
-        now = time.time()
-        due: float | None = None
-        if re.fullmatch(r"\d+(\.\d+)?", arg):                          # bare number = seconds
-            due = now + float(arg)
-        elif (m := re.fullmatch(r"(\d{1,2}):(\d{2})(:\d{2})?", arg)):  # 18:30 / 09:05:00
-            h, mi = int(m.group(1)), int(m.group(2))
-            se = int(m.group(3)[1:]) if m.group(3) else 0
-            if h < 24 and mi < 60 and se < 60:
-                due = _next_occurrence(h, mi, se, now)
-        elif (m := re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?", arg)):
-            h = int(m.group(4)) if m.group(4) else 9
-            mi = int(m.group(5)) if m.group(5) else 0
-            try:
-                due = datetime.datetime(int(m.group(1)), int(m.group(2)),
-                                        int(m.group(3)), h, mi).timestamp()
-            except ValueError:
-                due = None
-        if due is None:                                      # 'in 2 hours 5 minutes'
-            tot = _parse_duration(arg)
-            if tot is not None:
-                due = now + tot
-        if due is None:
-            return ("ERROR: could not understand when_due. Use 'in N minutes/hours/"
-                    "days/weeks', 'HH:MM' (next occurrence), or 'YYYY-MM-DD HH:MM'")
-        if due <= now - 5:
-            return "ERROR: that time is already in the past"
-        if due - now > MAX_REMIND_DAYS * 86400:
-            return "ERROR: reminders can be at most a year ahead"
-        try:
-            repeat = float(repeat_hours)
-        except (TypeError, ValueError):
-            return "ERROR: repeat_hours must be a number of hours"
-        if repeat and (repeat < 1 / 60 or repeat > 24 * 31):
-            return "ERROR: repeat_hours must be between ~1 minute and a month"
-        name = name[:200]
-        try:
-            def _set(items: list[dict]) -> list[dict]:
-                items = [r for r in items if r["name"].lower() != name.lower()]
-                items.append({"name": name, "due": round(due, 3),
-                              "repeat_hours": repeat})
-                items.sort(key=lambda r: r["due"])
-                del items[MAX_REMINDERS:]
-                return items
-            _update_reminders(_set)
-        except OSError as e:
-            return f"ERROR: could not save reminder ({type(e).__name__})"
-        rep = f", repeating every {_fmt_dur(repeat * 3600)}" if repeat else ""
-        return f"reminder '{name}' set for {_fmt_when(due)}{rep}"
-
-    @tool(gates="reminders",
-        description="List pending reminders, soonest first.")
-    def list_reminders(self) -> str:
-        now = time.time()
-        items = [r for r in _load_reminders() if r["due"] > now - 86400]
-        if not items:
-            return "no pending reminders"
-        out = []
-        for r in items[:16]:
-            try:
-                rep_h = float(r.get("repeat_hours") or 0)
-            except (TypeError, ValueError):
-                rep_h = 0.0
-            rep = (f" (repeats every {_fmt_dur(rep_h * 3600)})" if rep_h else "")
-            out.append(f"{r['name']} {_fmt_when(r['due'])}{rep}")
-        return "reminders: " + "; ".join(out)
-
-    @tool(gates="reminders",
-        description="Cancel a pending reminder by (part of its) name.")
-    def cancel_reminder(self, name: str) -> str:
-        name = str(name or "").strip().lower()
-        if not name:
-            return "ERROR: which reminder? (see list_reminders)"
-        items = _load_reminders()
-        matches = [r for r in items if r["name"].lower() == name
-                   or (len(name) >= 3 and r["name"].lower().startswith(name))]
-        if not matches:
-            return f"no reminder matching {name!r}"
-        if len(matches) > 1:
-            listing = ", ".join(f"{m['name']} ({_fmt_when(m['due'])})"
-                                for m in matches[:6])
-            return f"several match: {listing} — cancel_reminder the exact name"
-        victim = matches[0]["name"].lower()
-        try:
-            # match by NAME inside the transaction: the pre-lock snapshot's
-            # objects are not the ones _update_reminders loads (identity
-            # matching silently cancelled nothing)
-            _update_reminders(
-                lambda items: [r for r in items
-                               if r["name"].lower() != victim])
-        except OSError as e:
-            return f"ERROR: could not save reminders ({type(e).__name__})"
-        return f"cancelled reminder {matches[0]['name']!r} (was {_fmt_when(matches[0]['due'])})"
-
-    @tool(gates="reminders",
-        description="Snooze a reminder: re-arm it N minutes from now. "
-                      "Works while pending or ~90s after it fired.")
-    def snooze_reminder(self, name: str, minutes: float = 10) -> str:
-        name = str(name or "").strip().lower()
-        try:
-            minutes = float(minutes)
-        except (TypeError, ValueError):
-            return "ERROR: minutes must be a number"
-        if not (0.1 <= minutes <= 24 * 60):
-            return "ERROR: minutes must be between 0.1 and 1440"
-        items = _load_reminders()
-        matches = [r for r in items if r["name"].lower() == name
-                   or (len(name) >= 3 and r["name"].lower().startswith(name))]
-        if not matches:
-            # the reminder may have JUST fired (it was pruned from the file):
-            # within the offer window it can still be re-armed by name
-            with _SNOOZE_LOCK:
-                offer = dict(_snooze_offer) if _snooze_offer else None
-            if offer and time.monotonic() < offer["until"] and (
-                    name == offer["name"].lower()
-                    or offer["name"].lower().startswith(name)):
-                return self._snooze(offer["name"], minutes, 0)
-            return (f"no reminder matching {name!r} — if it already fired, say "
-                    f"'snooze' within 90 seconds of the announcement")
-        if len(matches) > 1:
-            listing = ", ".join(f"{m['name']} ({_fmt_when(m['due'])})"
-                                for m in matches[:6])
-            return f"several match: {listing} — snooze_reminder the exact name"
-        return self._snooze(matches[0]["name"], minutes,
-                            float(matches[0].get("repeat_hours") or 0))
-
-    def _snooze(self, name: str, minutes: float, repeat_hours: float) -> str:
-        due = time.time() + minutes * 60
-        try:
-            def _rearm(items: list[dict]) -> list[dict]:
-                items = [r for r in items if r["name"].lower() != name.lower()]
-                items.append({"name": name, "due": round(due, 3),
-                              "repeat_hours": repeat_hours})
-                items.sort(key=lambda r: r["due"])
-                del items[MAX_REMINDERS:]
-                return items
-            _update_reminders(_rearm)
-        except OSError as e:
-            return f"ERROR: could not save reminder ({type(e).__name__})"
-        return f"reminder '{name}' snoozed until {_fmt_when(due)}"
-
-    # -- media (MPD) ---------------------------------------------------------
-
-    @tool(gates="media",
-          description="Play music from MPD. No query: resume or shuffle "
-                      "something random. With query: replace queue with "
-                      "matching songs and play.")
-    def media_play(self, query: str = "") -> str:
-        query = str(query or "").strip()
-        try:
-            if not query:
-                queue = _mpc("playlist").splitlines()
-                if queue:
-                    _mpc("play")
-                    return f"playing (queue had {len(queue)} songs)"
-                paths = _mpc("search", "filename", "").splitlines()
-                if not paths:
-                    return "ERROR: the MPD library is empty — nothing to play"
-                picks = random.sample(paths, min(20, len(paths)))
-                _mpc("clear")
-                _mpc("add", *picks)
-                _mpc("play")
-                return f"shuffled {len(picks)} random songs from your library and started playing"
-            paths: list[str] = []
-            for field in ("title", "artist", "album", "filename"):
-                found = _mpc("search", field, query).splitlines()
-                for p in found:
-                    if p not in paths:
-                        paths.append(p)
-                if paths:
-                    break          # most specific field that matched
-            if not paths:
-                return (f"ERROR: nothing in the library matches {query!r} — "
-                        "try search_library to see what's available")
-            picks = paths[:100]
-            _mpc("clear")
-            _mpc("add", *picks)
-            _mpc("play")
-            extra = f" (and {len(paths) - 1} more matches queued)" if len(paths) > 1 else ""
-            return f"now playing {picks[0]}{extra}"
-        except RuntimeError as e:
-            return f"ERROR: {e}"
-
-    @tool(gates="media",
-          description="Control the music player: action is one of 'play' "
-                      "(resume), 'pause', 'toggle', 'stop', 'next', 'previous'.")
-    def media_control(self, action: str) -> str:
-        a = str(action or "").strip().lower()
-        mapped = {"play": ["play"], "pause": ["pause"], "stop": ["stop"],
-                  "next": ["next"], "skip": ["next"],
-                  "previous": ["prev"], "prev": ["prev"], "back": ["prev"]}
-        # this mpc build: bare 'pause' is a PURE pause (idempotent, never
-        # resumes) and 'pause 1' is rejected — so toggle checks state itself
-        if a == "toggle":
-            try:
-                paused = "[paused]" in _mpc("status")
-                _mpc("play" if paused else "pause")
-                return f"music player: {'play' if paused else 'pause'}"
-            except RuntimeError as e:
-                return f"ERROR: {e}"
-        if a not in mapped:
-            return ("ERROR: action must be one of play, pause, toggle, stop, "
-                    "next, previous")
-        try:
-            _mpc(*mapped[a])
-            return f"music player: {a}"
-        except RuntimeError as e:
-            return f"ERROR: {e}"
-
-    @tool(gates="media",
-          description="Set the music player's volume (0-100). This is the music "
-                      "output volume, not the whole system volume.")
-    def media_volume(self, level: str) -> str:
-        # str param + own parse: the int schema coercion would silently turn
-        # garbage into 0 and blast the volume down
-        s = str(level or "").strip().rstrip("%")
-        if not re.fullmatch(r"[+-]?\d+", s):
-            return "ERROR: level must be a number 0-100"
-        level = max(0, min(100, int(s)))
-        try:
-            _mpc("volume", str(level))
-            return f"music volume set to {level}%"
-        except RuntimeError as e:
-            return f"ERROR: {e}"
-
-    @tool(gates="media",
-          description="What is currently playing: song, playing/paused state, "
-                      "position, volume, queue length. Use for 'what's this song?'.")
-    def now_playing(self) -> str:
-        try:
-            cur = _mpc("current").strip()
-            status = _mpc("status")
-        except RuntimeError as e:
-            return f"ERROR: {e}"
-        if not cur:
-            return "nothing is playing (the music queue is empty)"
-        state = "playing" if "[playing]" in status else "paused"
-        vol = re.search(r"volume:\s*(\d+)%", status)
-        queue = re.search(r"\[\w+\]\s+#(\d+)/(\d+)", status)
-        pos = ""
-        if queue:
-            pos = f", song {queue.group(1)} of {queue.group(2)} in the queue"
-        return f"{cur} [{state}{pos}{', volume ' + vol.group(1) + '%' if vol else ''}]"
-
-    @tool(gates="media",
-          description="Search the music library (artist/title/album/filename). "
-                      "Use before playing vague requests. Returns up to 15 paths.")
-    def search_library(self, query: str) -> str:
-        query = str(query or "").strip()
-        if not query:
-            return "ERROR: what should I search for?"
-        try:
-            paths: list[str] = []
-            for field in ("title", "artist", "album", "filename"):
-                for p in _mpc("search", field, query).splitlines():
-                    if p not in paths:
-                        paths.append(p)
-            if not paths:
-                return f"no songs in the library match {query!r}"
-            head = paths[:15]
-            extra = f" — and {len(paths) - 15} more" if len(paths) > 15 else ""
-            return (f"{len(paths)} match(es): " + "; ".join(head) + extra
-                    + " — play one with media_play")
-        except RuntimeError as e:
-            return f"ERROR: {e}"
-
-    @tool(gates="calendar",
-          description="Print a calendar month grid with today marked * — "
-                      "reason about weekdays/day counts. month: 'YYYY-MM' or empty.")
-    def calendar_month(self, month: str = "") -> str:
-        arg = str(month or "").strip().lower()
-        today = datetime.date.today()
-        if not arg or arg in ("this", "current", "now"):
-            y, mo = today.year, today.month
-        elif (m := re.fullmatch(r"(\d{4})-(\d{1,2})", arg)):
-            y, mo = int(m.group(1)), int(m.group(2))
-        else:
-            return "ERROR: month must look like 'YYYY-MM' (or empty for this month)"
-        try:
-            first = datetime.date(y, mo, 1)
-        except ValueError:
-            return f"ERROR: no such month {y}-{mo:02d}"
-        nxt_y, nxt_mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
-        ndays = (datetime.date(nxt_y, nxt_mo, 1) - first).days
-        head = f"{_MONTH_NAMES[mo - 1]} {y}".center(21).rstrip()
-        rows = [head, "Mo Tu We Th Fr Sa Su"]
-        row = "   " * first.weekday()
-        for d in range(1, ndays + 1):
-            mark = "*" if (d == today.day and y == today.year and mo == today.month) else " "
-            row += f"{d:2d}{mark}"
-            if (first.weekday() + d) % 7 == 0:
-                rows.append(row.rstrip())
-                row = ""
-        if row.strip():
-            rows.append(row.rstrip())
-        rows.append(f"today is {_DAY_NAMES[today.weekday()]} {today.day:02d} "
-                    f"{_MONTH_NAMES[today.month - 1][:3]} {today.year}")
-        return "\n".join(rows)
-
-    @tool(gates="calendar", description=(
-        "Read upcoming events from the configured ICS calendar source(s). "
-        "days=1 = today, 2 = today+tomorrow."),
-        aliases={"days": ("how_many_days", "range")})
-    def read_calendar(self, days: int = 1) -> str:
-        sources = SETTINGS.get("calendar_ics") or []
-        if not sources:
-            return ("no calendar is configured — add an ICS source in handsoff "
-                    "Settings (a Google Calendar 'secret iCal address' URL or a "
-                    "local .ics file path)")
-        try:
-            days = max(1, min(14, int(days)))
-        except (TypeError, ValueError):
-            return "ERROR: days must be a number (1-14)"
-        now = datetime.datetime.now()
-        win_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        win_end = win_start + datetime.timedelta(days=days)
-        events: list[dict] = []
-        bad: list[str] = []
-        for src in sources:
-            if re.match(r"^https?://", src, re.I) \
-                    and not self._perm.get("web_access", True):
-                return ("REFUSED: fetching calendar URLs needs the 'web_access' "
-                        "permission, disabled in handsoff settings")
-            try:
-                events.extend(_ics_events_from_text(_ics_fetch(src),
-                                                    win_start, win_end))
-            except Exception as e:
-                bad.append(f"{src} ({type(e).__name__})")
-        if bad and not events:
-            return "ERROR: could not read calendar source(s): " + "; ".join(bad)
-        if not events:
-            return f"no events in the next {days} day(s)"
-        label = "Today" if days == 1 else f"Next {days} days"
-        out = _fmt_events(events)
-        if bad:
-            out += f"  [unreadable: {'; '.join(bad)}]"
-        return f"{label}: {out}"
-
-    # -- knowledge (read-only internet, fixed safe endpoints) ------------------
-
-    @tool(description=(
-        "Current weather + today/tomorrow forecast for a place, e.g. "
-        "'Berlin', 'New York', 'Tokyo'. Omit the place to use the user's "
-        "home place."),
-        gates="web_access",
-        aliases={"place": ("city",)})
-    def get_weather(self, place: str = "") -> str:
-        place = (place or str(SETTINGS.get("home_place", ""))).strip()
-        if not place:
-            return "ERROR: name a place, e.g. 'Hamburg'"
-        try:
-            geo = _geocode(place)
-            if not geo:
-                return f"ERROR: unknown place: {place}"
-            lat, lon, where = geo
-            data = json.loads(_http_get(
-                f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-                "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
-                "weather_code,wind_speed_10m"
-                "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,"
-                "weather_code&forecast_days=2&timezone=auto"))
-            cur = data["current"]
-            desc = _WMO.get(int(cur["weather_code"]), "changeable sky")
-            d = data["daily"]
-            lines = [
-                f"Weather in {where} (local time {cur['time'][-5:]}):",
-                f"now: {cur['temperature_2m']}°C, feels like {cur['apparent_temperature']}°C, "
-                f"{desc}, humidity {cur['relative_humidity_2m']}%, wind {cur['wind_speed_10m']} km/h",
-                f"today: {d['temperature_2m_min'][0]}–{d['temperature_2m_max'][0]}°C, "
-                f"{_WMO.get(int(d['weather_code'][0]), 'changeable')}, "
-                f"precip {d['precipitation_sum'][0]} mm",
-                f"tomorrow: {d['temperature_2m_min'][1]}–{d['temperature_2m_max'][1]}°C, "
-                f"{_WMO.get(int(d['weather_code'][1]), 'changeable')}, "
-                f"precip {d['precipitation_sum'][1]} mm",
-            ]
-            return "\n".join(lines)
-        except Exception as e:
-            log.warning("get_weather failed: %s", e)
-            return f"ERROR: weather lookup failed ({type(e).__name__})"
-
-    @tool(description=(
-        "Search the public web for current information (news, prices, "
-        "scores, facts that may have changed recently). Returns result "
-        "titles with snippets."),
-        gates="web_access",
-        aliases={"query": ("q",)})
-    def web_search(self, query: str) -> str:
-        if not query:
-            return "REFUSED: empty query"
-        try:
-            results = _ddg_lite(query)
-            source = "web"
-            if not results:
-                results = _wiki_search(query)
-                source = "wikipedia"
-            if not results:
-                return f"ERROR: no results for {query!r}"
-            lines = [f"Results for '{query}' ({source}):"]
-            for t, s in results[:4]:
-                lines.append(f"- {t}: {s[:220]}")
-            return "\n".join(lines)
-        except Exception as e:
-            log.warning("web_search failed: %s", e)
-            return f"ERROR: web search failed ({type(e).__name__})"
-
-    @tool(description=("World news headlines."),
-        gates="web_access",
-        aliases={"count": ("n", "limit")})
-    def world_events(self, count: int = 4) -> str:
-        """Show current world headlines."""
-        try:
-            n = int(count)
-        except (TypeError, ValueError):
-            n = 4
-        n = max(1, min(n, 5))
-        events, degraded = _world_events("all", n)
-        if not events:
-            return ("ERROR: world news unavailable (offline?)"
-                    if degraded else "no world headlines right now")
-        lines = ["World headlines:"]
-        for e in events:
-            mark = "⚠ " if e.get("urgent") else ""
-            lines.append(f"- {mark}{e['title']}")
-        # ponytail: read-only — reading headlines must never consume warnings
-        return "\n".join(lines)
-
-    @tool(description=(
-        "Look up an encyclopedia summary about a person, place, thing or "
-        "concept (Wikipedia). Better than web_search for stable facts."),
-        gates="web_access",
-        aliases={"topic": ("subject", "query")})
-    def lookup_fact(self, topic: str) -> str:
-        if not topic:
-            return "REFUSED: name a topic"
-        try:
-            t = urllib.parse.quote(topic.strip().replace(" ", "_"))
-            data = json.loads(_http_get(
-                "https://en.wikipedia.org/api/rest_v1/page/summary/" + t))
-            if data.get("type") == "standard" and data.get("extract"):
-                return f"{data.get('title')}: {data['extract'][:1200]}"
-            # no direct article: fall back to search
-            hits = _wiki_search(topic)
-            if hits:
-                return "Top matches: " + "; ".join(f"{a} — {b[:120]}" for a, b in hits[:3])
-            return f"ERROR: nothing found on {topic!r}"
-        except Exception as e:
-            log.warning("lookup_fact failed: %s", e)
-            return f"ERROR: fact lookup failed ({type(e).__name__})"
-
-    @tool(description="Current local date, weekday and time.")
-    def get_datetime(self) -> str:
-        now = datetime.datetime.now()
-        return (f"Local date and time: {_DAY_NAMES[now.weekday()]}, "
-                f"{now.day:02d} {_MONTH_NAMES[now.month - 1]} {now.year}, "
-                f"{now.hour:02d}:{now.minute:02d} "
-                f"(timezone {now.astimezone().tzname()}). "
-                f"Unix epoch: {int(now.timestamp())}")
-
-    # -- eyes: screen vision (screenshot attached as an image to the result) ---
-
-    SCREENSHOT_FILE = STATE_DIR / "screen.png"
-
-    @staticmethod
-    def _shot_path(region: str):
-        """Build a safe grim argv. Returns (argv_tail, path) or None."""
-        path = ToolBelt.SCREENSHOT_FILE
-        if not region:
-            return [], path
-        try:
-            g = re.fullmatch(
-                r"(\d{1,5})[ ,xX]+(\d{1,5})[ ,xX]+(\d{1,5})[ ,xX]+(\d{1,5})",
-                region.strip())
-            if not g:
-                return None
-            x, y, w, hgt = (int(v) for v in g.groups())
-            if not (0 <= x <= 20000 and 0 <= y <= 20000
-                    and 0 < w <= 20000 and 0 < hgt <= 20000):
-                return None
-            return ["-g", f"{x},{y} {w}x{hgt}"], path
-        except Exception:
-            return None
-
-    def _take_screenshot(self, region: str = "", scale_down: bool = True) -> str:
-        """Capture the screen (or a region) to SCREENSHOT_FILE. Returns error or ''."""
-        built = self._shot_path(region)
-        if built is None:
-            return "ERROR: region must be 'x y width height' in pixels"
-        tail, path = built
-        try:
-            path.unlink(missing_ok=True)
-            argv = ["grim"]
-            if scale_down:
-                argv += ["-s", "0.6"]
-            proc = subprocess.run(argv + tail + [str(path)],
-                                  capture_output=True, text=True, timeout=15)
-            if proc.returncode != 0 or not path.exists():
-                return "ERROR: screenshot failed: " + (proc.stderr or "unknown").strip()[:200]
-        except FileNotFoundError:
-            return "ERROR: grim is not installed (pacman -S grim)"
-        except subprocess.TimeoutExpired:
-            return "ERROR: screenshot timed out"
-        return ""
-
-    @tool(description=(
-        "Take a screenshot and see it as an image. Use for 'what's on my "
-        "screen', non-text UI, verifying what you typed."),
-        gates="screen_access")
-    def see_screen(self, question: str = "", region: str = "") -> str:
-        """Look at the screen with vision.
-
-        question: what you want to find out from the screen
-        region: optional 'x y width height' in pixels
-        """
-        err = self._take_screenshot(region)
-        if err:
-            return err
-        try:
-            b64 = base64.b64encode(self.SCREENSHOT_FILE.read_bytes()).decode("ascii")
-        except OSError as e:
-            return f"ERROR: cannot read screenshot: {e}"
-        self._last_images = [b64]
-        hint = f" (user asks: {question[:200]})" if question else ""
-        return f"Screenshot captured and attached as an image{hint}."
-
-    @tool(description=(
-        "Read all visible text on screen via OCR (fast, no vision model). "
-        "Best for reading articles, chats, code or error messages on "
-        "screen."),
-        gates="screen_access")
-    def read_screen_text(self, region: str = "") -> str:
-        """Read screen text via OCR.
-
-        region: optional 'x y width height' in pixels
-        """
-        err = self._take_screenshot(region, scale_down=False)
-        if err:
-            return err
-        try:
-            proc = subprocess.run(
-                ["tesseract", str(self.SCREENSHOT_FILE), "stdout", "--psm", "3"],
-                capture_output=True, text=True, timeout=40)
-        except FileNotFoundError:
-            return "ERROR: tesseract is not installed (pacman -S tesseract)"
-        except subprocess.TimeoutExpired:
-            return "ERROR: OCR timed out"
-        text = " ".join(proc.stdout.split())
-        if not text:
-            return "OCR found no readable text on screen."
-        log.info("read_screen_text: %d chars", len(text))
-        return f"Text on screen: {text[:4000]}"
-
-    # -- process management (scoped: same-user, exact match, confirmed) --------
-
-    KILL_CONFIRM_S = 60.0          # how long a spoken 'confirm kill' stays valid
-
-    @staticmethod
-    def _same_user_procs() -> list[tuple[int, str]]:
-        """[(pid, name)] for every process owned by the CURRENT user — the
-        AI can never see (or kill) other users' processes, including root."""
-        out = []
-        me = os.getuid() if hasattr(os, "getuid") else -1
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry}/status", encoding="ascii",
-                          errors="replace") as fh:
-                    fields = dict(line.split(":", 1)
-                                  for line in fh if ":" in line)
-                if int(fields.get("Uid", "-1\t-1").split()[0]) != me:
-                    continue
-                name = fields.get("Name", "").strip()
-                if name:
-                    out.append((int(entry), name))
-            except (OSError, ValueError, KeyError, IndexError):
-                continue
-        return out
-
-    @staticmethod
-    def _port_owner(port: int) -> list[int]:
-        """PIDs of same-user processes with a LISTEN socket on this port
-        (parsed from /proc/net/tcp{,6}; no external tools)."""
-        inodes: set[str] = set()
-        for path in ("/proc/net/tcp", "/proc/net/tcp6"):
-            try:
-                with open(path, encoding="ascii") as fh:
-                    next(fh)                       # header
-                    for line in fh:
-                        f = line.split()
-                        if len(f) < 10 or f[3] != "0A":   # 0A = LISTEN
-                            continue
-                        try:
-                            if int(f[1].split(":")[1], 16) == port:
-                                inodes.add(f[9])
-                        except (ValueError, IndexError):
-                            continue
-            except OSError:
-                continue
-        pids = []
-        me = os.getuid() if hasattr(os, "getuid") else -1
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry}/status", encoding="ascii",
-                          errors="replace") as fh:
-                    fields = dict(line.split(":", 1)
-                                  for line in fh if ":" in line)
-                if int(fields.get("Uid", "-1\t-1").split()[0]) != me:
-                    continue
-                for fd in os.listdir(f"/proc/{entry}/fd"):
-                    try:
-                        link = os.readlink(f"/proc/{entry}/fd/{fd}")
-                    except OSError:
-                        continue
-                    if link.startswith("socket:["):
-                        ino = link[8:-1]
-                        if ino in inodes:
-                            pids.append(int(entry))
-                            break
-            except (OSError, ValueError, KeyError, IndexError):
-                continue
-        return pids
-
-    @tool(gates="run_command", description=(
-        "Stop (SIGTERM) one of the user's own processes by EXACT name or by "
-        "the port it listens on. Two steps: kill_process first shows the match "
-        "and asks to confirm; then confirm_kill('yes') actually stops it."))
-    def kill_process(self, target: str) -> str:
-        target = str(target or "").strip()
-        if not target:
-            return "ERROR: name the process or the port it listens on"
-        cands: list[tuple[int, str]] = []
-        if target.isdigit() and 0 < int(target) <= 65535:
-            port = int(target)
-            for pid in self._port_owner(port):
-                name = next((n for p, n in self._same_user_procs()
-                             if p == pid), str(pid))
-                cands.append((pid, name))
-        else:
-            low = target.lower()
-            cands = [(p, n) for p, n in self._same_user_procs()
-                     if n.lower() == low]
-        if not cands:
-            return (f"ERROR: no process of yours matches {target!r} "
-                    "(exact name or listening port; other users' processes "
-                    "are invisible)")
-        if len(cands) > 1:
-            listing = ", ".join(f"{n} (pid {p})" for p, n in cands[:6])
-            return (f"ERROR: {len(cands)} processes match — kill_process needs "
-                    f"an EXACT single match, these all match: {listing}")
-        pid, name = cands[0]
-        if pid == os.getpid():
-            return ("REFUSED: that is me — for a restart of the assistant, "
-                    "ask me to restart myself instead")
-        if name == "systemd":
-            # the user's own systemd --user manager: killing it would end
-            # every user service (including this bubble) at once
-            return ("REFUSED: systemd --user manages your whole session — "
-                    "killing it would stop every user service, including me")
-        _kill_offer.clear()
-        _kill_offer.update({"pid": pid, "name": name,
-                            "until": time.monotonic() + self.KILL_CONFIRM_S})
-        log.info("kill_process: offered pid %d (%s), awaiting confirm", pid, name)
-        return (f"About to stop {name} (pid {pid}). Nothing happened yet — "
-                "call confirm_kill('yes') to stop it, or confirm_kill('no') "
-                "to cancel.")
-
-    @tool(gates="run_command", description=(
-        "Second step of kill_process: confirm_kill('yes') stops the offered "
-        "process; confirm_kill('no') cancels the offer."))
-    def confirm_kill(self, answer: str = "yes") -> str:
-        offer = dict(_kill_offer) if _kill_offer else None
-        if not offer:
-            return "ERROR: nothing to confirm — call kill_process first"
-        if time.monotonic() >= offer["until"]:
-            _kill_offer.clear()
-            return "ERROR: the kill offer expired — run kill_process again"
-        ans = str(answer or "yes").strip().lower()
-        if ans not in ("yes", "no", "y", "n"):
-            return "ERROR: answer with yes or no"
-        if ans in ("no", "n"):
-            _kill_offer.clear()
-            log.info("kill_process: cancelled by user/model")
-            return "Cancelled — nothing was stopped."
-        pid, name = offer["pid"], offer["name"]
-        _kill_offer.clear()
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return f"{name} (pid {pid}) already exited."
-        except PermissionError:
-            return f"ERROR: not allowed to stop {name} (pid {pid})"
-        log.warning("kill_process: SIGTERM pid %d (%s) confirmed", pid, name)
-        return f"Stopped {name} (pid {pid}) (SIGTERM sent)."
-
-    # -- centralized confirm (one-turn separation for CONFIRM-class tools) ----
-
-    @tool(description=(
-        "Second step for a CONFIRM-offered tool: 'yes' runs, 'no' cancels."),
-        gates="", aliases={"answer": ("confirm", "reply")})
-    def confirm_action(self, answer: str = "yes") -> str:
-        offer = self._pending_confirm
-        if not offer:
-            return "ERROR: nothing to confirm — no CONFIRM-class tool call is pending"
-        if time.monotonic() >= offer["until"]:
-            self._pending_confirm = None
-            return "ERROR: the confirmation offer expired — make the request again"
-        ans = str(answer or "yes").strip().lower()
-        if ans not in ("yes", "no", "y", "n"):
-            return "ERROR: answer with yes or no"
-        if ans in ("no", "n"):
-            tool = offer["tool"]
-            self._pending_confirm = None
-            log_decision(tool, "", "CONFIRM", "cancelled by user")
-            log.info("confirm_action: %s cancelled", tool)
-            return f"Cancelled — {tool} was not run."
-        # yes: run the offered call now with the ORIGINAL arguments. The
-        # _confirm_running bypass stops the inner execute() from making a
-        # fresh offer (which would loop offers forever).
-        self._pending_confirm = None
-        tool, args = offer["tool"], offer["args"]
-        log_decision(tool, json.dumps(args)[:120], "CONFIRM", "confirmed; running")
-        self._confirm_running = tool
-        try:
-            out, err = self.execute(tool, args)
-        finally:
-            self._confirm_running = None
-        log_decision(tool, json.dumps(args)[:120], "EXECUTED",
-                     "refused/errored" if err else "ok")
-        return out
-
-    # -- bounded background jobs (long-running whitelisted commands) ----------
-
-    JOB_ANNOUNCE_S = 20.0   # first job_status poll that fast announces on finish
-
-    @tool(description=(
-        "Run a whitelisted command as a background job."),
-        gates="run_command")
-    def start_command(self, command: str) -> str:
-        """Run a whitelisted command as a bounded background job.
-
-        command: same single whitelisted command run_command accepts
-        """
-        with self._job_lock:
-            if len(self._jobs) >= BoundedJob.MAX_JOBS:
-                return (f"ERROR: job limit reached ({BoundedJob.MAX_JOBS}) — "
-                        f"check or reap with job_status first: "
-                        f"{', '.join(sorted(self._jobs))}")
-        # identical gate text as run_command on refusal: the policy is the
-        # whitelist, not the execution mode. Validate WITHOUT executing —
-        # run_command() would run the command synchronously first (double-exec).
-        argv, _exe, err, is_restart = self._validate_command(command)
-        if err:
-            return err
-        log.info("start_command: %s", command.strip())
-        try:
-            proc = subprocess.Popen(
-                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, start_new_session=True,
-            )
-        except OSError as e:
-            return f"ERROR: launch failed: {e}"
-        if is_restart:
-            self._on_restart_pending()
-        with self._job_lock:
-            self._job_seq += 1
-            job_id = f"job-{self._job_seq}"
-            self._jobs[job_id] = BoundedJob(job_id, command.strip(), proc)
-        return (f"started {job_id}: {command.strip()} — it runs in the "
-                "background; call job_status to check it. I will announce "
-                "when it finishes.")
-
-    @tool(description=(
-        "State/output of start_command jobs; finished announced"),
-        gates="run_command", aliases={"job_id": ("id", "job")})
-    def job_status(self, job_id: str = "") -> str:
-        """Report state/output of background jobs.
-
-        job_id: a specific job id, or empty for all jobs
-        """
-        with self._job_lock:
-            jobs = dict(self._jobs)
-        if job_id:
-            job = jobs.get(job_id.strip())
-            if job is None:
-                known = ", ".join(sorted(jobs)) or "none"
-                return f"ERROR: no job {job_id!r} (jobs: {known})"
-            jobs = {job_id.strip(): job}
-        if not jobs:
-            return "no background jobs"
-        lines: list[str] = []
-        reaped: list[str] = []
-        for jid, job in sorted(jobs.items()):
-            state, done = job.poll()   # single poll; status_text reuses it
-            status = job.status_text(state, done)
-            if done:
-                if not job._announced:
-                    job._announced = True
-                    self._announce_job(status)
-                # explicit reap (never read() the pipe after poll — the
-                # child would block at ~64k): full drain budget here so the
-                # tail is complete, while status polls never wait.
-                job._join_drain(timeout=5.0)
-                out = job.output_tail(4096)
-                out = (out or "").strip()
-                if len(out) > BoundedJob.MAX_OUTPUT:
-                    out = out[:BoundedJob.MAX_OUTPUT] + " …(truncated)"
-                lines.append(f"{status}\noutput:\n{out or '(no output)'}")
-                if state != "running":
-                    reaped.append(jid)
-            else:
-                lines.append(status)
-        with self._job_lock:
-            for jid in reaped:
-                self._jobs.pop(jid, None)
-        return "\n\n".join(lines)
-
-    # -- doctor (deployment + dependency diagnostics) --------------------------
-
-    @tool(description=(
-        "Self-diagnostic: deployment hashes, Ollama, TTS/STT, mic, niri, "
-        "systemd. Read-only"),
-        gates="")
-    def handsoff_doctor(self) -> str:
-        """Run the doctor diagnostic and return the report."""
-        return run_doctor()
-
-    # -- operator: element-grounded clicking (Self-Operating-Computer pattern) --
-
-    @staticmethod
-    def _parse_tsv(tsv: str) -> list[dict]:
-        """Tesseract TSV -> line-level elements with pixel boxes.
-
-        Rows: level page block par line word left top width height conf text.
-        Words are grouped by (block, par, line) into one element per visual
-        line, keeping the union bounding box and the mean confidence."""
-        rows: dict[tuple, list] = {}
-        for line in tsv.splitlines()[1:]:
-            parts = line.split("\t")
-            if len(parts) < 12:
-                continue
-            try:
-                level, blk, par, ln = (int(parts[0]), int(parts[2]),
-                                       int(parts[3]), int(parts[4]))
-                x, y, w, h, conf = (int(parts[6]), int(parts[7]),
-                                    int(parts[8]), int(parts[9]),
-                                    float(parts[10]))
-            except ValueError:
-                continue
-            word = parts[11].strip()
-            if level != 5 or not word or conf < 30:
-                continue
-            rows.setdefault((blk, par, ln), []).append((x, y, w, h, word))
-        out = []
-        for words in rows.values():
-            words.sort(key=lambda t: t[0])
-            x0 = min(w[0] for w in words)
-            y0 = min(w[1] for w in words)
-            x1 = max(w[0] + w[2] for w in words)
-            y1 = max(w[1] + w[3] for w in words)
-            out.append({"text": " ".join(w[4] for w in words),
-                        "x": (x0 + x1) // 2, "y": (y0 + y1) // 2,
-                        "w": x1 - x0, "h": y1 - y0})
-        out.sort(key=lambda e: (e["y"], e["x"]))
-        return out[:80]
-
-    def _screen_elements_fmt(self) -> str:
-        listing = "\n".join(
-            f"{i + 1}. {e['text'][:70]!r} at ({e['x']},{e['y']})"
-            for i, e in enumerate(getattr(self, "_elements", [])[:80]))
-        return listing
-
-    def _operator_click(self, x: int, y: int, what: str) -> str:
-        if not self._perm.get("operator", False):
-            return ("REFUSED: mouse control ('operator') is disabled in "
-                    "handsoff settings")
-        try:
-            x, y = int(x), int(y)
-            assert 0 <= x <= 20000 and 0 <= y <= 20000
-        except (TypeError, ValueError, AssertionError):
-            return f"ERROR: invalid click target ({x}, {y})"
-        pre_note = self._stale_scan_note()
-        # screen pixels (grim/OCR) → pointer space (logical): divide by the
-        # focused output's scale; 1.0 when unknown = plain pass-through
-        scale = getattr(self, "_pointer_scale", 1.0) or 1.0
-        px = max(0, int(round(x / scale)))
-        py = max(0, int(round(y / scale)))
-        r1 = self._ydotool("mousemove", "-a", "-x", str(px), "-y", str(py))
-        if r1 != "ok":
-            return f"ERROR: mouse move failed: {r1}"
-        r2 = self._ydotool("click", "0xC0")
-        if r2 != "ok":
-            return f"ERROR: click failed: {r2}"
-        self._mark_elements_stale()
-        conv = "" if scale == 1.0 else f" → pointer ({px},{py})"
-        log.info("operator: clicked %s at (%d,%d)%s", what, x, y, conv)
-        return f"clicked {what} at ({x},{y}){conv}{pre_note}"
-
-    def _detect_pointer_scale(self) -> float:
-        """Pointer-space scale of the focused output.
-
-        grim screenshots and tesseract coordinates are PHYSICAL pixels while
-        ydotool mousemove -a moves the LOGICAL pointer — clicks must divide
-        by this scale. Falls back to 1.0 when niri cannot be asked (CI, IPC
-        down): on scale-1 setups the no-op is exactly right."""
-        try:
-            r = self._niri_msg("msg", "--json", "focused-output")
-            out = json.loads(r.stdout or "null")
-            scale = float((out.get("logical") or {}).get("scale") or 1.0)
-            if scale > 0:
-                return scale
-        except Exception:
-            pass
-        return 1.0
-
-    def _mark_elements_stale(self) -> None:
-        """Forget the freshness of the last screen_elements scan — the
-        screen just changed (typing, keys, click, scroll, launch…)."""
-        self._elements_ts = 0.0
-
-    def _stale_scan_note(self) -> str:
-        """Warning suffix when the cached element scan may be outdated."""
-        ts = getattr(self, "_elements_ts", 0.0)
-        if not ts:
-            return ""
-        age = time.monotonic() - ts
-        if age > 90:
-            return (f" (element scan is {age:.0f}s old — the screen may "
-                    "have changed; run screen_elements again)")
-        return ""
-
-    @tool(gates="screen_access", description=(
-        "List clickable text elements on screen with numbers and positions. "
-        "Run this before click_element; re-run after anything changes — "
-        "clicks, typing, scrolling and launches all make the last scan "
-        "stale, and click_element will warn when it is."))
-    def screen_elements(self) -> str:
-        if not hasattr(self, "_elements"):
-            self._elements = []
-        err = self._take_screenshot("", scale_down=False)
-        if err:
-            return err
-        try:
-            proc = subprocess.run(
-                ["tesseract", str(self.SCREENSHOT_FILE), "stdout", "tsv"],
-                capture_output=True, text=True, timeout=40)
-        except FileNotFoundError:
-            return "ERROR: tesseract is not installed (pacman -S tesseract)"
-        except subprocess.TimeoutExpired:
-            return "ERROR: OCR timed out"
-        self._elements = self._parse_tsv(proc.stdout)
-        if not self._elements:
-            self._mark_elements_stale()
-            return "No clickable text elements found on screen."
-        # refresh the pointer scale alongside the scan it will be applied to
-        self._pointer_scale = self._detect_pointer_scale()
-        self._elements_ts = time.monotonic()
-        log.info("screen_elements: %d lines (pointer scale %.2f)",
-                 len(self._elements), self._pointer_scale)
-        return (f"{len(self._elements)} clickable text elements "
-                f"(coordinates are screen pixels; pointer scale "
-                f"{self._pointer_scale:g}):\n" + self._screen_elements_fmt())
-
-    @tool(gates="operator", description=(
-        "Click a text element from the last screen_elements scan by its "
-        "number or (part of) its text. Run screen_elements first."),
-        aliases={"ref": ("element", "name", "label", "target")})
-    def click_element(self, ref: str) -> str:
-        els = getattr(self, "_elements", [])
-        if not els:
-            return "ERROR: no element scan yet — run screen_elements first"
-        ref_s = str(ref).strip().lower()
-        pick = None
-        if ref_s.isdigit() and 1 <= int(ref_s) <= len(els):
-            pick = els[int(ref_s) - 1]
-        else:
-            exact = [e for e in els if ref_s == e["text"].strip().lower()]
-            part = [e for e in els if ref_s in e["text"].strip().lower()]
-            pick = (exact or part or [None])[0]
-        if pick is None:
-            return (f"ERROR: no element matching {ref!r} — run screen_elements "
-                    "again and pick from the list")
-        return self._operator_click(pick["x"], pick["y"],
-                                    repr(pick["text"][:40]))
-
-    @tool(gates="operator", description=(
-        "Click at absolute pixel coordinates. Prefer click_element with a "
-        "screen_elements scan."))
-    def click_at(self, x: int, y: int) -> str:
-        return self._operator_click(x, y, "target")
-
-    # ydotool wheel mode passes -y straight to REL_WHEEL with no sign flip,
-    # and libinput defines REL_WHEEL +1 as wheel-up; horizontal REL_HWHEEL
-    # +1 is tilt-right. Flip these signs if a ydotool update inverts them.
-    _SCROLL_SIGNS = {"up": 1, "down": -1, "right": 1, "left": -1}
-
-    @tool(gates="operator", description=(
-        "Scroll the mouse wheel by `amount` notches (default 3): direction "
-        "up / down / left / right. Affects whatever window is under the "
-        "pointer — click_element or click_at first to aim it. Content "
-        "moves, so re-run screen_elements before clicking anything after."),
-        aliases={"direction": ("dir", "way"),
-                 "amount": ("notches", "clicks", "lines")})
-    def scroll(self, direction: str = "down", amount: int = 3) -> str:
-        """Scroll the mouse wheel.
-
-        direction: 'up', 'down', 'left' or 'right'
-        amount: wheel notches (1-25)
-        """
-        # Keep the capability boundary inside the method as well as in the
-        # dispatcher.  Unit callers and any future internal route must not be
-        # able to bypass the operator permission by invoking scroll directly.
-        if not getattr(self, "_perm", {}).get("operator", False):
-            return ("REFUSED: mouse control ('operator') is disabled in "
-                    "handsoff settings")
-        d = str(direction or "down").strip().lower()
-        if d not in self._SCROLL_SIGNS:
-            return "REFUSED: direction must be up, down, left or right"
-        try:
-            n = int(amount)
-        except (TypeError, ValueError):
-            n = 3
-        n = max(1, min(n, 25))
-        pre_note = self._stale_scan_note()
-        sign = self._SCROLL_SIGNS[d]
-        if d in ("up", "down"):
-            argv = ("mousemove", "-w", "-x", "0", "-y", str(sign * n))
-        else:
-            argv = ("mousemove", "-w", "-x", str(sign * n), "-y", "0")
-        r = self._ydotool(*argv)
-        if r != "ok":
-            return f"ERROR: scroll failed: {r}"
-        self._mark_elements_stale()
-        log.info("scroll: %s x%d", d, n)
-        return f"scrolled {d} {n} notch(es){pre_note}"
-
-    # -- app launching (focused, safe aliases) ---------------------------------
-
-    APP_ALIASES = {
-        "browser": ("firefox", "chromium", "google-chrome-stable"),
-        "web": ("firefox", "chromium", "google-chrome-stable"),
-        "internet": ("firefox", "chromium"),
-        "files": ("nautilus", "dolphin", "thunar", "nemo"),
-        "file manager": ("nautilus", "dolphin", "thunar"),
-        "calculator": ("kcalc", "qalculate-gtk", "gnome-calculator", "xcalc"),
-        "music": ("spotify", "lollypop", "rhythmbox", "elisa"),
-        "settings": ("gnome-control-center", "systemsettings", "xfce4-settings"),
-        "text editor": ("gedit", "kate", "mousepad", "gnome-text-editor"),
-        "editor": ("gedit", "kate", "mousepad"),
-        "terminal": ("foot", "alacritty", "kitty"),
-    }
-
-    # how long open_app waits for the launched app to map a window before
-    # giving up on identification (browsers/IDEs take 2-8 s on a cold start)
-    OPEN_APP_WAIT_S = 12.0
-    # how long open_app trusts "any new window" / "already open" fallbacks
-    # before them: within the grace period a name-matched window may still
-    # appear, which beats both
-    _WIN_GRACE_S = 3.0
-
-    @tool(description=(
-        "Launch a desktop app by name ('firefox', 'spotify', 'files'…), "
-        "wait for its window to appear and report which window it is. "
-        "Then focus_window to aim typing at it."),
-        gates="run_command",
-        aliases={"app": ("name",)})
-    def open_app(self, app: str) -> str:
-        a = app.strip().lower()
-        if not a:
-            return "REFUSED: name the app to open"
-        candidates = self.APP_ALIASES.get(a, (a,))
-        resolved = None
-        chosen = a
-        for cand in candidates:
-            cand = re.sub(r"[^a-z0-9._-]", "", cand)   # strict binary-name charset
-            if not cand or cand in ("sudo", "bash", "sh", "python", "python3", "xterm"):
-                return f"REFUSED: won't open '{app}'"
-            resolved = shutil.which(cand)
-            if resolved:
-                chosen = cand
-                break
-        if resolved is None:
-            return f"ERROR: no program matching '{app}' is installed"
-        # snapshot BEFORE spawning: the launched window is identified as the
-        # new one that appears (spawn alone says nothing — the app may fail,
-        # fork, or already be running)
-        try:
-            ids_before = {w.get("id") for w in self._niri_windows()}
-        except RuntimeError:
-            ids_before = None
-        try:
-            subprocess.Popen(
-                ["niri", "msg", "action", "spawn", "--", resolved],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except Exception as e:
-            return f"ERROR: launch failed: {e}"
-        log.info("open_app: %s", chosen)
-        if ids_before is None:
-            return (f"launched {chosen} (could not verify the window — "
-                    "niri window list unavailable)")
-        w, already = self._wait_new_window(ids_before, chosen,
-                                           self.OPEN_APP_WAIT_S)
-        if w is None:
-            return (f"launched {chosen}, but no new window appeared within "
-                    f"{self.OPEN_APP_WAIT_S:.0f}s — it may still be starting "
-                    "(or failed to launch); try wait_for_window or focus_window")
-        if already:
-            log.info("open_app: %s was already open", chosen)
-            return (f"{chosen} is already open — window: {self._win_label(w)} "
-                    "(NOT focused — call focus_window to raise it)")
-        note = f"launched {chosen} — window ready: {self._win_label(w)}"
-        note += (" (focused)" if w.get("is_focused")
-                 else " (NOT focused — call focus_window before typing)")
-        self._mark_elements_stale()
-        return note
-
-    def _wait_new_window(self, ids_before: set, name: str,
-                         timeout: float) -> tuple[dict | None, bool]:
-        """Wait for the launched app's window after spawn.
-
-        Priority: (1) a NEW window matching `name`; (2) after a short grace
-        period, any NEW window; (3) an EXISTING window matching `name` — the
-        app was likely already running and mapped nothing. Returns
-        (window, already_open); (None, False) when nothing appeared."""
-        start = time.monotonic()
-        deadline = start + timeout
-        fallback: dict | None = None
-        while True:
-            try:
-                wins = self._niri_windows()
-            except RuntimeError:
-                wins = []
-            fresh = [w for w in wins if w.get("id") not in ids_before]
-            for w in fresh:
-                if name and self._win_matches(w, name):
-                    return w, False
-            if fallback is None and fresh:
-                fallback = fresh[0]
-            now = time.monotonic()
-            if now - start >= self._WIN_GRACE_S:
-                if fallback is not None:
-                    return fallback, False
-                for w in wins:
-                    if name and self._win_matches(w, name):
-                        return w, True
-            if now >= deadline:
-                return None, False
-            time.sleep(self._WIN_POLL_S)
-
-    # -- read_file -------------------------------------------------------------
-
-    @tool(description=(
-        "Read a UTF-8 text file (any path, including your own source). "
-        "May be truncated for very large files."))
-    def read_file(self, path: str) -> str:
-        """Read a text file.
-
-        path: File path, ~ expanded.
-        """
-        p = Path(path).expanduser()
-        try:
-            p = p.resolve()
-        except OSError:
-            pass
-        if not p.exists():
-            return f"ERROR: no such file: {p}"
-        if p.is_dir():
-            return "ERROR: path is a directory, not a file"
-        try:
-            data = p.read_bytes()
-        except OSError as e:
-            return f"ERROR: cannot read {p}: {e}"
-        if b"\x00" in data[:4096]:
-            return f"ERROR: {p} looks like a binary file"
-        text = data.decode("utf-8", errors="replace")
-        if len(text) > self.MAX_READ:
-            text = text[: self.MAX_READ] + f"\n...[truncated, file is larger than {self.MAX_READ} chars]"
-        return text
-
-    # -- edit_file -------------------------------------------------------------
-
-    @tool(description=(
-        f"Replace a file's content. Allowed: own source + sibling split "
-        f"modules, files under {CONFIG_DIR}/. "
-        ".bak backup; Python must compile, self-edits keep the marker."))
-    def edit_file(self, path: str, content: str) -> str:
-        """Overwrite a text file.
-
-        path: File path, ~ expanded.
-        content: The complete new file content.
-        """
-        p = Path(path).expanduser().resolve()
-        if len(content) > self.MAX_WRITE:
-            return "REFUSED: content too large"
-        kind = _classify_edit_path(p)
-        if not kind:
-            return (
-                "REFUSED: you may only edit your own source "
-                f"({SELF_PATH}), the split modules beside it or in "
-                f"{HOME / '.local/bin'} "
-                f"({', '.join(sorted(_SPLIT_EDIT_FILES))}, core/*), "
-                f"or files inside {CONFIG_DIR}/"
-            )
-        is_self = kind == "self"
-        # capability boundary: settings.json holds the tool permissions; a
-        # self-edit could silently re-enable a tool the user turned off.
-        # The user changes permissions through the settings app only.
-        if p in (SETTINGS_FILE, SETTINGS_FILE.with_suffix(".json")) or \
-                p.name.startswith("settings.json"):
-            return "REFUSED: settings.json controls your own permissions — the user manages it via the settings app"
-        if is_self:
-            if SELF_MARKER not in content:
-                return f"REFUSED: self-edit must keep the marker line '{SELF_MARKER}'"
-        if is_self or (kind == "split" and p.suffix == ".py"):
-            try:
-                compile(content, str(p), "exec")
-            except SyntaxError as e:
-                return f"REFUSED: new source does not compile: {e}"
-            # ponytail: stdlib py_compile gate (no new deps) — compile()
-            # checks syntax; py_compile proves the artifact byte-compiles
-            # exactly as the restart will load it.
-            try:
-                import py_compile as _py_compile
-                with tempfile.NamedTemporaryFile(
-                        "w", suffix=".py", delete=False,
-                        encoding="utf-8") as tf:
-                    tf.write(content)
-                    _tmp_self = tf.name
-                try:
-                    _py_compile.compile(_tmp_self, doraise=True)
-                finally:
-                    try:
-                        os.unlink(_tmp_self)
-                    except OSError:
-                        pass
-            except Exception as e:
-                return f"REFUSED: new source fails py_compile: {e}"
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            if p.exists():
-                shutil.copy2(p, str(p) + ".bak")
-            # ponytail: atomic write via mkstemp, not predictable .tmp
-            _atomic_private_write(p, content)
-        except OSError as e:
-            return f"ERROR: cannot write {p}: {e}"
-        log.info("edit_file wrote %d bytes to %s", len(content), p)
-        note = f"wrote {len(content)} bytes to {p}"
-        if is_self:
-            note += (f" — verify first: python -m py_compile {p} && "
-                     f"python -m pytest tests/test_policy.py -q, then "
-                     f"run_command '{RESTART_SCRIPT}' to restart into the new version")
-        elif kind == "split":
-            note += (f" — run_command '{RESTART_SCRIPT}' to restart into the new version")
-        return note
-
-
-TOOLS = build_tools()
+# Phase 4c compatibility facade.  The extracted module receives a late-bound
+# host proxy so existing module globals and monkeypatch seams stay live.
+from types import SimpleNamespace as _SimpleNamespace
+try:
+    from core import tools as _core_tools
+except ImportError:
+    # Compatibility with pre-Phase-4c installed bundles that do not yet carry
+    # core/tools.py.  A fresh install always ships the extracted module.
+    _core_tools = None
+
+
+class _ToolDependencies:
+    def __getattr__(self, name):
+        if name == "DECISIONS_FILE":
+            return DECISIONS_FILE
+        if name == "CONFIG_DIR":
+            return CONFIG_DIR
+        if name == "subprocess":
+            return subprocess
+        try:
+            return globals()[name]
+        except KeyError as e:
+            raise AttributeError(name) from e
+
+
+_tool_dependencies = _ToolDependencies()
+if _core_tools is not None:
+    _core_tools.time = time
+    _core_tools.json = json
+    _core_tools.shutil = shutil
+    _core_tools.os = os
+    _core_tools.Path = Path
+    _core_tools.log = log
+    _core_tools._DEFAULT_DEPS = _tool_dependencies
+    _core_tools._CURRENT.set(_tool_dependencies)
+    class ToolBelt(_core_tools.ToolBelt):
+        """Compatibility constructor that injects live host dependencies."""
+
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("dependencies", _tool_dependencies)
+            super().__init__(*args, **kwargs)
+
+    _core_tools.ToolBelt = ToolBelt
+    DecisionPolicy = _core_tools.DecisionPolicy
+    BoundedJob = _core_tools.BoundedJob
+    tool = _core_tools.tool
+    _param_schema = _core_tools._param_schema
+    build_tools = _core_tools.build_tools
+    log_decision = _core_tools.log_decision
+else:
+    class DecisionPolicy:
+        def __init__(self, settings=None): self._settings = settings or SETTINGS
+        def classify(self, tool):
+            value = (self._settings.get("command_policy") or {}).get(tool, "ALLOW")
+            return value.strip().upper() if isinstance(value, str) and value.strip().upper() in {"ALLOW", "DENY", "CONFIRM"} else "ALLOW"
+        def is_denied(self, tool): return self.classify(tool) == "DENY"
+        def request_confirm(self, tool): return self.classify(tool) == "CONFIRM"
+        def confirm_seconds(self): return 90.0
+        @staticmethod
+        def is_desktop_action(tool): return False
+
+    class BoundedJob: pass
+    def tool(func=None, **kwargs):
+        def wrap(fn): return fn
+        return wrap(func) if func else wrap
+    def _param_schema(func): return {}
+    def build_tools(): return []
+    def log_decision(*args, **kwargs): return None
+    class ToolBelt:
+        _last_images = []
+        _last_confirmation_offer = False
+        def __init__(self, *args, **kwargs): pass
+        def execute(self, name, args): return f"ERROR: tool runtime unavailable in this old install; reinstall handsoff", True
+        def _set_user_turn(self, marker): pass
+        def _tool_methods(self): return {}
+        @staticmethod
+        def _niri_msg(*args, **kwargs): return subprocess.run(["niri", *args], capture_output=True, text=True, timeout=kwargs.get("timeout", 8))
+        @classmethod
+        def _ydotool_socket(cls): return "/tmp/.ydotool_socket"
+        @staticmethod
+        def _socket_connectable(path): return False
+    TOOLS = build_tools()
+
+if _core_tools is not None:
+    TOOLS = build_tools()
 
 
 class _SpeechGate:
@@ -6166,7 +3123,19 @@ class ContinuousListener:
             try:
                 self._health_tick()
             except Exception:
-                log.exception("mic health report failed")
+                reporter = getattr(log, "exception", None)
+                if not callable(reporter):
+                    reporter = (getattr(log, "error", None)
+                                or getattr(log, "warning", None))
+                if not callable(reporter):
+                    raise
+                try:
+                    reporter("mic health report failed", exc_info=True)
+                except TypeError:
+                    # Minimal test/runtime logger seams may not accept logging
+                    # kwargs; still report the failure instead of killing the
+                    # long-lived health thread in the error handler.
+                    reporter("mic health report failed")
 
     def mic_snapshot(self) -> dict:
         """JSON-ready mic health dict (listener-owned fields); shares the
@@ -6212,59 +3181,77 @@ class ContinuousListener:
             stalled = (self._health_stalled_since is not None
                        and state == "listening")
             degraded = state in ("silent", "open-failing")
-            try:
-                self._assistant._maybe_self_heal(degraded)   # assistant-level policy
-            except Exception:
-                log.exception("mic self-heal check failed")
-            try:
-                self._assistant._resource_tick()              # RAM/VRAM crossing alerts
-            except Exception:
-                log.exception("resource health check failed")
-            try:
-                self._assistant._world_tick()                 # world warnings (opt-in)
-            except Exception:
-                log.exception("world warnings check failed")
-            try:
-                self._assistant._hardware_tick()              # live hardware watch (opt-in)
-            except Exception:
-                log.exception("hardware watch check failed")
-            # --- transition detection ---------------------------------
             changed = state != self._health_state
             last = self._health_state
+            capture_rate = getattr(self, "_capture_rate", None) or "-"
+            frames = self._frames_seen
+            last_nonzero = self._last_nonzero
+            last_open = self._health_last_open
+            opens_ok = self._health_opens_ok
+            opens_failed = self._health_opens_failed
+            utterances = self._health_utt
+            recovered_after = self._health_recovered_after
+            ever_started = self._ever_started
+
+        # Assistant health/resource/world/hardware work may perform I/O and
+        # must not make mic_snapshot wait for it.
+        try:
+            self._assistant._maybe_self_heal(degraded)   # assistant-level policy
+        except Exception:
+            log.exception("mic self-heal check failed")
+        try:
+            self._assistant._resource_tick()              # RAM/VRAM crossing alerts
+        except Exception:
+            log.exception("resource health check failed")
+        try:
+            self._assistant._world_tick()                 # world warnings (opt-in)
+        except Exception:
+            log.exception("world warnings check failed")
+        try:
+            self._assistant._hardware_tick()              # live hardware watch (opt-in)
+        except Exception:
+            log.exception("hardware watch check failed")
+
+        now = time.monotonic()
+        with self._lock:
+            # --- transition detection ---------------------------------
             self._health_state = state
-            report = changed or self._health_next_summary <= time.monotonic()
+            report = changed or self._health_next_summary <= now
             if report:
-                self._health_next_summary = time.monotonic() + 3600.0
-                emit = (log.warning if state in ("silent", "open-failing")
-                        else log.info)
-                emit(
-                    "mic health: state=%s%s device=%s rate=%s frames=%d "
-                    "last_nonzero=%.0fs_ago last_open=%s opens_ok=%d "
-                    "opens_failed=%d utterances=%d",
-                    state,
-                    " (stalled — no frames, reopening)" if stalled else "",
-                    device,
-                    getattr(self, "_capture_rate", None) or "-",
-                    self._frames_seen,
-                    max(0.0, time.monotonic() - self._last_nonzero),
-                    self._health_last_open,
-                    self._health_opens_ok, self._health_opens_failed,
-                    self._health_utt)
-            if changed:
-                # persist only listeners that really captured (or degraded
-                # while trying): a never-started listener (hands-free off
-                # since boot, or a bare test instance) has no mic story and
-                # must not pollute the state file
-                if self._ever_started or state != "stopped":
-                    _record_mic_event(last or "boot", state)
-                dur = ""
-                if last == "open-failing" and self._health_recovered_after:
-                    dur = " after %.0fs failing" % self._health_recovered_after
-                emit = (log.warning if state in ("silent", "open-failing")
-                        else log.info)
-                emit(
-                    "mic health: state changed %s -> %s%s",
-                    last or "(start)", state, dur)
+                self._health_next_summary = now + 3600.0
+            persist = changed and (ever_started or state != "stopped")
+            dur = (" after %.0fs failing" % recovered_after
+                   if last == "open-failing" and recovered_after else "")
+
+        # Journal/state-file work also stays outside the listener lock.
+        if report:
+            emit = (log.warning if state in ("silent", "open-failing")
+                    else log.info)
+            emit(
+                "mic health: state=%s%s device=%s rate=%s frames=%d "
+                "last_nonzero=%.0fs_ago last_open=%s opens_ok=%d "
+                "opens_failed=%d utterances=%d",
+                state,
+                " (stalled — no frames, reopening)" if stalled else "",
+                device,
+                capture_rate,
+                frames,
+                max(0.0, now - last_nonzero),
+                last_open,
+                opens_ok, opens_failed,
+                utterances)
+        if changed:
+            # persist only listeners that really captured (or degraded
+            # while trying): a never-started listener (hands-free off
+            # since boot, or a bare test instance) has no mic story and
+            # must not pollute the state file
+            if persist:
+                _record_mic_event(last or "boot", state)
+            emit = (log.warning if state in ("silent", "open-failing")
+                    else log.info)
+            emit(
+                "mic health: state changed %s -> %s%s",
+                last or "(start)", state, dur)
 
     def start(self) -> None:
         if self._running:
@@ -6446,7 +3433,7 @@ class ContinuousListener:
                 # 16 kHz at ingestion so the pipeline is rate-agnostic
                 self._stream, rate = _open_input(
                     device, SAMPLE_RATE, self.FRAME, cb)
-                self._stream.start()
+                _start_stream_owned(self._stream)
             except Exception as e:
                 open_failures += 1
                 self._health_opens_failed += 1
@@ -6488,6 +3475,7 @@ class ContinuousListener:
                 min_frames = int(self.MIN_UTTERANCE_S * SAMPLE_RATE / self.FRAME * _scale)
                 # cb closes over these names, so the reassignment applies live.
             self._health_opens_ok += 1
+            device = getattr(_MIC_LAST_OPEN_DEVICE, "value", device)
             self._health_open_device = device or "system default"
             self._health_last_open = datetime.datetime.now().strftime("%H:%M:%S")
             if self._health_failing_since is not None:
@@ -6527,11 +3515,12 @@ class ContinuousListener:
                     break
 
             try:
-                self._stream.stop()
-                self._stream.close()
+                _stop_stream_owned(self._stream)
             except Exception:
                 pass
             self._stream = None
+            opened = getattr(_MIC_LAST_OPEN_DEVICE, "value", device)
+            device = opened or "system default"
             frames.clear()
             gate.reset()
             self.gate_open = False
@@ -6560,6 +3549,9 @@ def _announce_ok(last: float, cooldown_s: float) -> bool:
     return time.monotonic() - max(last, _MONOTONIC_BOOT_FLOOR) >= cooldown_s
 
 
+_TurnStream = _brain.TurnStream
+
+
 class Assistant(QObject):
     """Owns the state machine, the worker pipeline and the conversation."""
 
@@ -6570,6 +3562,7 @@ class Assistant(QObject):
 
     def __init__(self) -> None:
         super().__init__()
+        self._lifecycle_ensure()
         self._state = IDLE
         self._gen = 0                     # increments per interaction; stale
         self._cancel = threading.Event()  # workers check their own event
@@ -6625,13 +3618,42 @@ class Assistant(QObject):
         self._hardware_last = {}       # change-detection state (in-memory only)
         self._hardware_last_urgent = 0.0  # monotonic: last hardware urgent
         self._hardware_tick_n = 0      # tick parity: GPU util at most every 2nd
-        self._pipeline_q: "queue.Queue" = queue.Queue()
-        threading.Thread(target=self._pipeline_worker, name="pipeline",
-                         daemon=True).start()
+        self._pipeline_q: "queue.Queue" = queue.Queue(maxsize=1)
+        self._pipeline_submit_lock = threading.Lock()
+        self._start_worker(self._pipeline_worker, name="pipeline")
         self.sigUtterance.connect(self._on_utterance)
         self.sigCommand.connect(self._on_command)
 
     # -- health snapshot (mic + brain + TTS) --------------------------------
+
+    def _lifecycle_ensure(self) -> None:
+        """Lazily provide lifecycle state for real and __new__ test objects."""
+        if not hasattr(self, "_shutdown_event"):
+            self._shutdown_event = threading.Event()
+        if not hasattr(self, "_closed"):
+            self._closed = False
+        if not hasattr(self, "_workers"):
+            self._workers = set()
+        if not hasattr(self, "_workers_lock"):
+            self._workers_lock = threading.Lock()
+
+    def _start_worker(self, target, args=(), name: str = "assistant-worker", **_kwargs):
+        self._lifecycle_ensure()
+        if self._closed:
+            return None
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                with self._workers_lock:
+                    self._workers.discard(threading.current_thread())
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        with self._workers_lock:
+            if self._closed:
+                return None
+            self._workers.add(thread)
+        thread.start()
+        return thread
 
     def mic_health(self) -> dict:
         """One JSON-ready snapshot of the assistant's vital signs: mic health
@@ -6660,12 +3682,18 @@ class Assistant(QObject):
 
     def _say_now(self, text: str) -> None:
         """Standalone announcement: speak text outside any turn pipeline."""
+        if self._is_closed():
+            return
         self._gen += 1
         gen, cancel = self._gen, threading.Event()   # fresh: _cancel may be set
-        threading.Thread(
+        self._start_worker(
             target=lambda: (self._speak(text, gen, cancel), self._set(gen, IDLE)),
             name="selfheal-tts", daemon=True,
         ).start()
+
+    def _is_closed(self) -> bool:
+        self._lifecycle_ensure()
+        return bool(self._closed or self._shutdown_event.is_set())
 
     def _maybe_self_heal(self, degraded: bool) -> None:
         """Auto-recovery policy, called from the listener's health tick (its
@@ -6795,7 +3823,7 @@ class Assistant(QObject):
         self._world_last_announce = time.monotonic()
         _world_mark_seen([e["title"] for e in fresh])
         text = "World warning: " + "; ".join(e["title"][:140] for e in fresh[:2])
-        log.warning("world warning: %s", text)
+        log.warning("world warning received")
         notify(text)
         if self.state != SPEAKING:
             self._announce_now(text)
@@ -6965,6 +3993,8 @@ class Assistant(QObject):
         is never replayed from history; only future notifications are spoken,
         and muted app names are filtered before TTS."""
         if enabled:
+            if self._is_closed():
+                return "ERROR: assistant is shut down"
             if self._notification_thread is not None and self._notification_thread.is_alive():
                 return "notification reader is already on"
             try:
@@ -6983,10 +4013,9 @@ class Assistant(QObject):
                 return f"ERROR: notification monitor failed: {e}"
             stop = threading.Event()
             self._notification_stop = stop
-            self._notification_thread = threading.Thread(
-                target=self._notification_reader_run, args=(stop,),
-                name="notification-reader", daemon=True)
-            self._notification_thread.start()
+            self._notification_thread = self._start_worker(
+                self._notification_reader_run, args=(stop,),
+                name="notification-reader")
             log.info("desktop notification reader enabled")
             return "notification reader enabled"
         stop = self._notification_stop
@@ -7152,15 +4181,16 @@ class Assistant(QObject):
             self._pomodoro_stop = None
             self._pomodoro_state = None
             return "pomodoro stopped"
+        if self._is_closed():
+            return "ERROR: assistant is shut down"
         if self._pomodoro_thread is not None and self._pomodoro_thread.is_alive():
             return "pomodoro is already running"
         stop = threading.Event()
         self._pomodoro_stop = stop
         self._pomodoro_state = {"phase": "work", "until": time.monotonic() + work * 60,
                                 "work": work, "break": break_minutes}
-        self._pomodoro_thread = threading.Thread(
-            target=self._pomodoro_loop, args=(stop,), name="pomodoro", daemon=True)
-        self._pomodoro_thread.start()
+        self._pomodoro_thread = self._start_worker(
+            self._pomodoro_loop, args=(stop,), name="pomodoro")
         self._announce_now(f"Pomodoro started: {work:.0f} minutes of work.")
         return f"pomodoro started: {work:.0f} minute work and {break_minutes:.0f} minute break"
 
@@ -7183,8 +4213,7 @@ class Assistant(QObject):
     # -- reminders --------------------------------------------------------------
 
     def _reminder_worker(self) -> None:
-        while True:
-            time.sleep(2.0)
+        while not self._shutdown_event.wait(2.0):
             try:
                 # non-reentrant flock sidecars: never nest two
                 # _settings_file_lock() guards on the same lock file in one
@@ -7201,13 +4230,15 @@ class Assistant(QObject):
                 if not fired:
                     continue
                 for r in fired:
-                    log.info("reminder fired: %s", r["name"])
+                    log.info("reminder fired")
                     self.sigCommand.emit("__timer:%s\x1f%s" % (
                         r["name"], float(r.get("repeat_hours") or 0)))
             except Exception:
                 log.exception("reminder worker pass failed")
 
     def _announce_missed(self, missed: list[dict]) -> None:
+        if self._is_closed():
+            return
         names = "; ".join(r["name"] for r in missed[:4])
         extra = f" and {len(missed) - 4} more" if len(missed) > 4 else ""
         msg = f"While I was off, these reminders came due: {names}{extra}."
@@ -7215,25 +4246,25 @@ class Assistant(QObject):
         notify(f"handsoff missed reminders: {names}")
         self._gen += 1
         gen, cancel = self._gen, threading.Event()   # fresh: _cancel may be stale
-        threading.Thread(
-            target=lambda: (self._speak(msg, gen, cancel), self._set(gen, IDLE)),
-            name="missed-rem-tts", daemon=True,
-        ).start()
+        self._start_worker(
+            lambda: (self._speak(msg, gen, cancel), self._set(gen, IDLE)),
+            name="missed-rem-tts")
 
     def _fire_timer(self, name: str, repeat_hours: float = 0) -> None:
+        if self._is_closed():
+            return
         msg = (f"Reminder: {name}. Say snooze for more time." if not repeat_hours
                else f"Reminder: {name}.")
-        log.info("announcing timer: %s", name)
+        log.info("announcing timer")
         notify(f"handsoff timer: {name}")
         self.interrupt()
         self._gen += 1
         # a FRESH cancel event: interrupt() just set self._cancel, and _speak
         # returns immediately on a set event — the reminder would never be spoken
         gen, cancel = self._gen, threading.Event()
-        threading.Thread(
-            target=lambda: (self._speak(msg, gen, cancel), self._set(gen, IDLE)),
-            name="timer-tts", daemon=True,
-        ).start()
+        self._start_worker(
+            lambda: (self._speak(msg, gen, cancel), self._set(gen, IDLE)),
+            name="timer-tts")
         if not repeat_hours:
             # one-off: open the snooze window — a bare "snooze" within 90 s
             # re-arms it from now, no brain round-trip
@@ -7241,7 +4272,7 @@ class Assistant(QObject):
                 _snooze_offer.clear()
                 _snooze_offer.update(name=name,
                                      until=time.monotonic() + SNOOZE_WINDOW_S)
-            log.info("snooze window open for %r (%.0fs)", name, SNOOZE_WINDOW_S)
+            log.info("snooze window open for %.0fs", SNOOZE_WINDOW_S)
 
     # -- crash report & recovery -------------------------------------------------
 
@@ -7259,12 +4290,11 @@ class Assistant(QObject):
                 log.warning("previous crash detected (%.0fs ago): %s", age, head)
                 self._gen += 1
                 gen, cancel = self._gen, threading.Event()
-                threading.Thread(
-                    target=lambda: (self._speak(
+                self._start_worker(
+                    lambda: (self._speak(
                         "Heads up: I crashed earlier. It was logged, and I'm running again.",
                         gen, cancel), self._set(gen, IDLE)),
-                    name="crash-report", daemon=True,
-                ).start()
+                    name="crash-report")
                 # truncate (do NOT unlink): faulthandler still holds the fd
                 # opened at startup. Unlinking orphans it — a LATER crash
                 # would write to a deleted inode and never be reported again.
@@ -7277,18 +4307,32 @@ class Assistant(QObject):
     # -- lifecycle -------------------------------------------------------------
 
     def start(self) -> None:
-        threading.Thread(target=self._loader, name="loader", daemon=True).start()
+        if self._is_closed():
+            return
+        self._start_worker(self._loader, name="loader")
         if self._handsfree:
             self._listener.start()
         missed = _take_missed_reminders()
         if missed:
-            threading.Thread(target=self._announce_missed, args=(missed,),
-                             name="missed-reminders", daemon=True).start()
-        threading.Thread(target=self._reminder_worker, name="reminders", daemon=True).start()
+            self._start_worker(self._announce_missed, args=(missed,),
+                               name="missed-reminders")
+        self._start_worker(self._reminder_worker, name="reminders")
 
     def shutdown(self) -> None:
+        self._lifecycle_ensure()
+        if self._closed:
+            return
+        self._closed = True
+        self._shutdown_event.set()
         self._cancel.set()
-        self._listener.stop()
+        with _ANNOUNCE_CANCEL_LOCK:
+            try:
+                _ANNOUNCE_CANCEL.set()
+            except Exception:
+                pass
+        listener = getattr(self, "_listener", None)
+        if listener is not None:
+            listener.stop()
         if getattr(self, "_tools", None) is not None:
             self._tools.stop_watchers()
         self._set_notification_reader(False)
@@ -7301,8 +4345,42 @@ class Assistant(QObject):
                 self._recorder.stop()
             except Exception:
                 pass
+        q = getattr(self, "_pipeline_q", None)
+        if q is not None:
+            lock = getattr(self, "_pipeline_submit_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._pipeline_submit_lock = lock
+            with lock:
+                try:
+                    pending = q.get_nowait()
+                except queue.Empty:
+                    pending = None
+                if pending is not None:
+                    pending[2].set()
+                    q.task_done()
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    pass
+        deadline = time.monotonic() + SHUTDOWN_JOIN_TIMEOUT
+        with self._workers_lock:
+            workers = list(self._workers)
+        for worker in workers:
+            if worker is threading.current_thread():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+        with self._workers_lock:
+            alive = [w.name for w in self._workers if w.is_alive()]
+        if alive:
+            log.warning("workers still running at shutdown: %s", alive)
 
     def _loader(self) -> None:
+        if self._is_closed():
+            return
         errors: list[str] = []
         try:
             get_whisper()
@@ -7317,6 +4395,8 @@ class Assistant(QObject):
         else:
             log.info("ollama ok at %s, model %s", OLLAMA_BASE, OLLAMA_MODEL)
         self._models_ready.set()
+        if self._is_closed():
+            return
         for e in errors:
             log.error("startup: %s", e)
         if errors:
@@ -7356,7 +4436,7 @@ class Assistant(QObject):
         """Update state and emit. Guarded: background threads (crash-report,
         snooze-TTS) can outlive the Qt object during teardown — a late emit
         raised 'Signal source has been deleted' (test suite warning, #9)."""
-        if gen != self._gen:
+        if self._is_closed() or gen != self._gen:
             return
         self._state = state
         try:
@@ -7393,6 +4473,12 @@ class Assistant(QObject):
         """Bounded rec.stop() for the ptt workers (delegates to the shared
         module helper so bare test instances and real ones share one path)."""
         return _stop_recorder_bounded(rec, timeout=timeout)
+
+    def _ptt_stop_owner_finished(self, rec) -> None:
+        """Clear PTT ownership only from the thread that finished rec.stop()."""
+        if getattr(self, "_ptt_stop_recorder", None) is rec:
+            self._ptt_stopping = False
+            self._ptt_stop_recorder = None
 
     def begin_listening(self) -> None:
         self.interrupt()
@@ -7447,11 +4533,8 @@ class Assistant(QObject):
         # no orphan stream: a previous recorder left behind is closed here.
         old = getattr(self, "_recorder", None)
         if old is not None:
-            try:
-                self._recorder = None
-                old.stop()
-            except Exception:
-                pass
+            log.warning("begin_listening refused: recorder still owns microphone")
+            return
         self._gen += 1
         self._cancel = threading.Event()
         gen, cancel = self._gen, self._cancel
@@ -7470,9 +4553,12 @@ class Assistant(QObject):
         except Exception as e:
             log.exception("cannot open microphone")
             self._set(gen, IDLE)
+            message = ("I can't open the microphone."
+                       if not isinstance(e, ValueError)
+                       else "I can't find the configured microphone.")
             threading.Thread(
                 target=lambda: (self._models_ready.wait(30), self._speak(
-                    "I can't open the microphone.", gen, cancel), self._set(gen, IDLE)),
+                    message, gen, cancel), self._set(gen, IDLE)),
                 daemon=True,
             ).start()
             return
@@ -7504,6 +4590,8 @@ class Assistant(QObject):
             ptt_epoch = 0
         try:
             self._ptt_stopping = True
+            self._ptt_stop_recorder = rec
+            rec._handsoff_stop_done = lambda _rec=rec: self._ptt_stop_owner_finished(_rec)
         except Exception:
             pass
 
@@ -7557,15 +4645,14 @@ class Assistant(QObject):
                         except Exception:
                             pass
             finally:
-                try:
-                    self._ptt_stopping = False
-                except Exception:
-                    pass
+                pass
 
         threading.Thread(target=_work, name="ptt-stop", daemon=True).start()
 
     def submit_audio(self, audio: np.ndarray | None) -> None:
         """Shared entry point: push-to-talk releases and hands-free utterances."""
+        if self._is_closed():
+            return
         if audio is None:
             self._set(self._gen, IDLE)
             return
@@ -7587,10 +4674,44 @@ class Assistant(QObject):
         self._log_utterance_health()
         self._maybe_instant_stop(audio, gen)
         # hand off to the single pipeline worker: two overlapping pipelines
-        # would race the shared history, _stream_result and tool belt (the old
+        # would race the shared history, per-turn stream state and tool belt (the old
         # thread-per-utterance design let an interrupted-but-still-running
         # turn write history concurrently with the new one)
-        self._pipeline_q.put((audio, gen, cancel))
+        if not self._enqueue_pipeline_turn((audio, gen, cancel)):
+            self._set(gen, IDLE)
+
+    def _enqueue_pipeline_turn(self, item: tuple) -> bool:
+        """Queue one turn without blocking the UI; newest pending work wins."""
+        self._lifecycle_ensure()
+        if self._is_closed():
+            log.info("pipeline submit rejected after shutdown")
+            return False
+        lock = getattr(self, "_pipeline_submit_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._pipeline_submit_lock = lock
+        q = self._pipeline_q
+        with lock:
+            if self._is_closed():
+                log.info("pipeline submit rejected after shutdown")
+                return False
+            try:
+                q.put_nowait(item)
+                return True
+            except queue.Full:
+                try:
+                    stale = q.get_nowait()
+                except queue.Empty:
+                    log.warning("pipeline submit rejected: queue busy")
+                    return False
+                stale[2].set()
+                q.task_done()
+                try:
+                    q.put_nowait(item)
+                    return True
+                except queue.Full:
+                    log.warning("pipeline submit rejected: queue busy")
+                    return False
 
     def _log_utterance_health(self) -> None:
         """One compact journal line per accepted utterance so a post-mortem
@@ -7644,7 +4765,7 @@ class Assistant(QObject):
         # guard and the permission switch apply unchanged
         self._set(gen, THINKING)
         out = self._tools.type_text(text)
-        log.info("dictation: typed %d chars (%s...)", len(text), text[:40])
+        log.info("dictation: typed %d chars", len(text))
         if out.startswith("REFUSED"):
             log.warning("dictation refused: %s", out[:120])
             self._set_dictation(False, gen, cancel)
@@ -7665,8 +4786,12 @@ class Assistant(QObject):
 
     def _pipeline_worker(self) -> None:
         """Single consumer: runs one _pipeline at a time, in utterance order."""
+        self._lifecycle_ensure()
         while True:
             audio, gen, cancel = self._pipeline_q.get()
+            if audio is None:
+                self._pipeline_q.task_done()
+                return
             try:
                 self._pipeline(audio, gen, cancel)
             except Exception:
@@ -7712,7 +4837,7 @@ class Assistant(QObject):
                 return
             self._last_transcript = (text, gen, _tick_now())
             if self._is_stop_utt(text):
-                log.info("voice stop: draining pipeline for %r", text)
+                log.info("voice stop: draining pipeline")
                 # no lock here: get_nowait() takes the queue's own (non-
                 # reentrant) mutex — holding it would deadlock. If the worker
                 # dequeues first, _pipeline's stop check still drops it.
@@ -7741,6 +4866,8 @@ class Assistant(QObject):
             try:
                 self._ptt_ensure()
                 self._ptt_stopping = True
+                self._ptt_stop_recorder = rec
+                rec._handsoff_stop_done = lambda _rec=rec: self._ptt_stop_owner_finished(_rec)
             except Exception:
                 pass
 
@@ -7753,10 +4880,7 @@ class Assistant(QObject):
                 except Exception:
                     pass
                 finally:
-                    try:
-                        self._ptt_stopping = False
-                    except Exception:
-                        pass
+                    pass
 
             threading.Thread(target=_abort, name="ptt-abort", daemon=True).start()
         if self._handsfree:
@@ -7898,6 +5022,8 @@ class Assistant(QObject):
         _ANNOUNCE_LOCK (no overlap) and each call cancels the previous
         playback first."""
         global _ANNOUNCE_CANCEL
+        if self._is_closed():
+            return
         gen = self._gen
         self._set(gen, IDLE)
         # ponytail: atomic cancel-swap under its own lock — no rebind-over-live
@@ -7912,8 +5038,10 @@ class Assistant(QObject):
 
         def _run(t=text, g=gen, c=cancel):
             self._speak(t, g, c)
+            if not c.is_set() and g == self._gen and not self._is_closed():
+                self._set(g, IDLE)
 
-        threading.Thread(target=_run, name="announce", daemon=True).start()
+        self._start_worker(_run, name="announce")
 
     # -- pipeline (worker thread) --------------------------------------------------
 
@@ -7926,7 +5054,7 @@ class Assistant(QObject):
             return False
         try:
             hit = _is_echo(text, self._recently_spoken)
-            log.info("echo-check: heard %r -> %s", text, hit)
+            log.info("echo-check: heard <redacted> -> %s", hit)
             return hit
         except Exception:
             log.exception("echo-check failed")
@@ -7969,6 +5097,8 @@ class Assistant(QObject):
 
     def _pipeline(self, audio: np.ndarray, gen: int, cancel: threading.Event) -> None:
         try:
+            if self._is_closed():
+                return
             if not self._models_ready.wait(90):
                 self._speak("I'm still loading my models, try again in a moment.", gen, cancel)
                 return
@@ -8025,7 +5155,7 @@ class Assistant(QObject):
                 # the assistant spoke and the echo guard already discarded its
                 # own words, so whatever survives to here is the user.
                 self._followup_until = 0.0     # exactly one utterance per reply
-                log.info("follow-up accepted (no wake word): %s", text)
+                log.info("follow-up accepted (no wake word)")
             elif self._handsfree and SETTINGS.get("wake_word_required"):
                 now = _tick_now()
                 if _is_wake_utt(text):
@@ -8046,7 +5176,7 @@ class Assistant(QObject):
                     log.info("wake word — engaged for %ss", SETTINGS.get("engage_seconds"))
                     text = rest
                 elif now >= self._wake_until:
-                    log.info("ignored (no wake word): %s", text)
+                    log.info("ignored (no wake word)")
                     self._set(gen, IDLE)
                     return
             if not text:
@@ -8073,7 +5203,7 @@ class Assistant(QObject):
             if facts:
                 self._memory = _merge_memories(self._memory, facts)
                 _save_memory(self._memory)
-                log.info("memory: %s", [f[1] for f in facts])
+                log.info("memory updated (%d fact(s))", len(facts))
             self._brain_turn(text, gen, cancel)
         except Exception:
             log.exception("pipeline failed")
@@ -8170,6 +5300,9 @@ class Assistant(QObject):
         return conversation
 
     def _brain_turn(self, text: str, gen: int, cancel: threading.Event) -> None:
+        set_turn = getattr(self._tools, "_set_user_turn", None)
+        if set_turn is not None:
+            set_turn(gen)
         conversation = self._conversation_for(text)
         self._turn_spoke = False
         for _round in range(MAX_TOOL_ROUNDS):
@@ -8180,21 +5313,20 @@ class Assistant(QObject):
             if stream_enabled:
                 # speak sentences while the model is still generating; tool
                 # calls still collected from the stream so the loop keeps working
-                q: "queue.Queue[str | None]" = queue.Queue()
-                self._stream_result = None
+                turn = _TurnStream(gen, cancel, queue.Queue())
 
                 def _run_stream() -> None:
-                    # local clear: a stale leftover from a previous turn must
-                    # never be mistaken for THIS turn's result
-                    self._stream_result = None
                     try:
-                        self._stream_result = ollama_chat_stream(conversation, q, cancel, tools)
+                        turn.result = ollama_chat_stream(
+                            conversation, turn.sentence_q, turn.cancel, tools)
                     except RuntimeError as e:
-                        self._stream_result = {"tool_calls": [], "content": "", "error": str(e)}
+                        turn.result = {"tool_calls": [], "content": "", "error": str(e)}
+                    finally:
+                        turn.done.set()
 
                 streamer = threading.Thread(target=_run_stream, daemon=True)
                 streamer.start()
-                self._speak(None, gen, cancel, sentence_q=q)
+                self._speak(None, gen, cancel, sentence_q=turn.sentence_q)
                 streamer.join(timeout=2.0)
                 if streamer.is_alive():
                     # the model may still be finishing (slow tokens, big
@@ -8202,22 +5334,22 @@ class Assistant(QObject):
                     # answer and every tool call
                     log.warning("stream worker slow to finish; waiting")
                     streamer.join(timeout=30.0)
-                if self._stream_result is None:
+                if turn.result is None:
                     if cancel.is_set():
                         return
                     log.error("stream finished without a result")
                     self._speak("Sorry, my brain gave me an empty answer.", gen, cancel)
                     return
-                if self._stream_result.get("error"):
+                if turn.result.get("error"):
                     # ponytail: speak the HTTP failure; no empty turn appended
                     if cancel.is_set():
                         return
-                    log.error("ollama stream: %s", self._stream_result["error"])
-                    self._speak(f"Sorry, my brain is offline. {self._stream_result['error']}",
+                    log.error("ollama stream: %s", turn.result["error"])
+                    self._speak(f"Sorry, my brain is offline. {turn.result['error']}",
                                 gen, cancel)
                     return
-                tool_calls = self._stream_result.get("tool_calls") or []
-                content = self._stream_result.get("content", "")
+                tool_calls = turn.result.get("tool_calls") or []
+                content = turn.result.get("content", "")
             else:
                 # non-streaming fallback: run the blocking call in a helper
                 # thread and watch `cancel` — barge-in must not leave the
@@ -8263,6 +5395,7 @@ class Assistant(QObject):
             conversation.append(
                 {"role": "assistant", "content": content, "tool_calls": tool_calls}
             )
+            stop_tool_loop = False
             for tc in tool_calls:
                 if cancel.is_set():
                     return
@@ -8274,13 +5407,18 @@ class Assistant(QObject):
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {}
-                log.info("tool call: %s(%s)", name, list(args))
+                log.info("tool call: %s (argument names=%s)", name, sorted(args))
                 result, _err = self._tools.execute(name, args if isinstance(args, dict) else {})
                 entry = {"role": "tool", "tool_name": name, "content": result}
                 if self._tools._last_images:
                     entry["images"] = self._tools._last_images
                     log.info("attaching %d screenshot(s) to tool result", len(entry["images"]))
                 conversation.append(entry)
+                if getattr(self._tools, "_last_confirmation_offer", False):
+                    stop_tool_loop = True
+                    break
+            if stop_tool_loop:
+                break
         # only THIS turn may publish history: a newer utterance owns the
         # assistant's memory once it has started (its own pipeline will write)
         if gen == self._gen:
@@ -8325,7 +5463,7 @@ class Assistant(QObject):
                     tts_to_wav(text, wav)
                     with _ANNOUNCE_LOCK:
                         if not cancel.is_set():
-                            log.info("saying: %s", text)
+                            log.info("saying response (%d chars)", len(text))
                             play_wav(wav, cancel)
             except Exception:
                 log.exception("TTS failed")

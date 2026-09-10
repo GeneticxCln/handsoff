@@ -24,6 +24,7 @@ import stat
 import tempfile
 import threading
 import time
+import copy
 from pathlib import Path
 
 from . import load_module
@@ -305,6 +306,10 @@ def _migrate_settings(data: dict, _slog: "logging.Logger | None" = None) -> dict
 _SETTINGS_WRITE_LOCK = threading.Lock()   # in-process settings write lock
 
 
+class SettingsConflictError(RuntimeError):
+    """A full save would overwrite a newer value written by another actor."""
+
+
 def _settings_file_lock():
     """Cross-process file lock (flock on a sidecar, not the data file).
 
@@ -397,37 +402,80 @@ def _load_settings(settings_file: Path) -> dict:
     return coerce_settings(s)
 
 
+_MISSING = object()
+
+
+def _three_way_merge(expected, current, candidate, path: str):
+    """Merge GUI changes onto current data, returning (value, conflict-key)."""
+    if candidate == expected:
+        return copy.deepcopy(current), None
+    if current == expected or candidate == current:
+        return copy.deepcopy(candidate), None
+    if (isinstance(expected, dict) and isinstance(current, dict)
+            and isinstance(candidate, dict)):
+        merged = {}
+        for key in set(expected) | set(current) | set(candidate):
+            value, conflict = _three_way_merge(
+                expected.get(key, _MISSING), current.get(key, _MISSING),
+                candidate.get(key, _MISSING),
+                f"{path}.{key}" if path else str(key))
+            if conflict:
+                return None, conflict
+            if value is not _MISSING:
+                merged[key] = value
+        return merged, None
+    return None, path or "settings"
+
+
+def _read_settings_for_write(settings_file: Path) -> dict:
+    try:
+        loaded = json.loads(settings_file.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return loaded
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        _quarantine_bad(settings_file)
+    except OSError:
+        pass
+    return {}
+
+
 def _write_settings_dict(data: dict, settings_file: Path, config_dir: Path,
-                         *, stamp_version: bool = True) -> None:
+                         *, stamp_version: bool = True,
+                         expected_data: dict | None = None) -> dict:
     """Serialize a full settings dict to settings.json: version-stamped,
     backed up one generation, atomic. The single writer both the bubble and
     the settings app use, so every settings.json on disk carries a version."""
-    if stamp_version:
-        data = dict(data)
-        data["version"] = SETTINGS_VERSION
     with _SETTINGS_WRITE_LOCK, _settings_file_lock()(config_dir):
+        if expected_data is not None:
+            # Compare normalized snapshots so an old sparse settings file is
+            # compatible with the full dict held by the GUI.
+            current = _load_settings(settings_file)
+            expected = dict(expected_data)
+            candidate = dict(data)
+            expected.pop("version", None)
+            current.pop("version", None)
+            candidate.pop("version", None)
+            data, conflict = _three_way_merge(expected, current, candidate, "")
+            if conflict:
+                raise SettingsConflictError(
+                    f"settings changed outside this window: {conflict}")
+        else:
+            data = dict(data)
+        if stamp_version:
+            data["version"] = SETTINGS_VERSION
         _backup_runtime_json(settings_file)
         _atomic_private_write(
             settings_file, json.dumps(data, ensure_ascii=False, indent=1))
+        return data
 
 
 def _persist_setting(key: str, value, settings_file: Path,
                      config_dir: Path) -> None:
     """Persist one runtime setting without overwriting unrelated settings."""
     with _SETTINGS_WRITE_LOCK, _settings_file_lock()(config_dir):
-        data = {}
-        try:
-            loaded = json.loads(settings_file.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data = loaded
-            else:
-                _quarantine_bad(settings_file)
-        except FileNotFoundError:
-            pass
-        except ValueError:
-            _quarantine_bad(settings_file)
-        except OSError:
-            pass
+        data = _read_settings_for_write(settings_file)
         data[key] = value
         data["version"] = SETTINGS_VERSION   # every on-disk write is stamped
         # NOTE: _atomic_private_write creates its own uniquely-named temp
@@ -457,7 +505,8 @@ class Settings:
         return self._data[key]
 
     def __setitem__(self, key: str, value) -> None:
-        self._data[key] = value
+        """Persist one setting; use :meth:`as_dict` for an in-memory view."""
+        self.persist(key, value)
 
     def __contains__(self, key: str) -> bool:
         return key in self._data
@@ -486,11 +535,16 @@ class Settings:
         _persist_setting(key, value, self.settings_file, self.config_dir)
         self._data[key] = value
 
-    def write_all(self, data: dict) -> None:
+    def write_all(self, data: dict, *, expected_data: dict | None = None) -> dict:
         """Version-stamped, backed-up full-file write (the settings app's
-        save path)."""
-        _write_settings_dict(data, self.settings_file, self.config_dir)
-        self._data = data
+        save path). ``expected_data`` is the snapshot read by the editor;
+        changed keys are merged and conflicting keys are rejected."""
+        written = _write_settings_dict(
+            data, self.settings_file, self.config_dir,
+            expected_data=expected_data)
+        self._data = written
+        self._loaded = True
+        return written
 
     def backup_runtime_json(self, path: Path) -> None:
         _backup_runtime_json(path)

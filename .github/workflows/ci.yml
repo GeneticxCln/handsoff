@@ -20,6 +20,8 @@ jobs:
       # The offscreen-launch test spawns the real bubble without a display.
       QT_QPA_PLATFORM: offscreen
     steps:
+      # Action refs stay on tags until exact current SHAs are safely resolved;
+      # the check below documents and surfaces that remaining pinning work.
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -27,7 +29,12 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt -c requirements-lock.txt
+      - name: Document unpinned action refs
+        run: |
+          if grep -nE 'uses: [^ ]+@v[0-9]+' .github/workflows/ci.yml; then
+            echo '::warning::Action refs are version tags; replace with reviewed immutable SHAs when resolved.'
+          fi
       - name: Run the test suite
         run: python -m pytest tests/ -q
 
@@ -47,7 +54,7 @@ jobs:
       - name: Install test dependencies + pytest-cov
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt -c requirements-lock.txt
           pip install pytest-cov
       - name: pytest with coverage gate
         run: python -m pytest tests/ -q --cov=. --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=60

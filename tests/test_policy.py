@@ -22,6 +22,28 @@ import pytest
 
 from conftest import HERE as ROOT, _load, _user_site
 
+
+def test_core_tools_is_importable_without_application_module():
+    """The extracted policy/tool surface is independently importable."""
+    import subprocess, sys
+    code = ("from core import tools; assert tools.ToolBelt and "
+            "tools.DecisionPolicy and tools.tool; "
+            "assert 'handsoff' not in tools.__dict__")
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                            text=True, cwd=HERE)
+    assert result.returncode == 0, result.stderr
+
+
+def test_core_tools_policy_boundary_is_deny_before_dispatch():
+    import subprocess, sys
+    code = ("from core import tools; p=tools.DecisionPolicy({"
+            "'command_policy': {'run_command': 'DENY'}}); "
+            "assert p.classify('run_command') == 'DENY' and "
+            "p.is_denied('run_command')")
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                            text=True, cwd=HERE)
+    assert result.returncode == 0, result.stderr
+
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
 
@@ -93,9 +115,11 @@ class TestToolBelt:
         fake_self.write_text(H.SELF_MARKER + "\nprint('v1')\n", encoding="utf-8")
         monkeypatch.setattr(H, "SELF_PATH", fake_self)
         new_src = H.SELF_MARKER + "\nprint('v2')\n"
+        belt._set_user_turn(1)
         out, err = belt.execute("edit_file", {"path": str(fake_self), "content": new_src})
         assert err and out.startswith("CONFIRM REQUIRED")   # forced confirm floor
         assert "DIFF PREVIEW" in out and "handsoff.py (proposed)" in out
+        belt._set_user_turn(2)
         yes, err = belt.execute("confirm_action", {"answer": "yes"})
         assert not err and fake_self.read_text(encoding="utf-8") == new_src
         assert "restart" in yes
@@ -409,6 +433,16 @@ class TestWhitelistWidening:
             out = tb.run_command(cmd)
             assert out.startswith("REFUSED") and "builds" in out, (cmd, out)
 
+    def test_cargo_requires_confirmation_when_model_dispatches(self, H, monkeypatch):
+        tb = self._tb(H, monkeypatch)
+        tb._tool_times = deque()
+        tb._pending_confirm = None
+        tb._confirm_running = None
+        tb._user_turn_marker = 0
+        tb._policy = H.DecisionPolicy({"command_policy": {}})
+        out, err = tb.execute("run_command", {"command": "cargo build"})
+        assert err and out.startswith("CONFIRM REQUIRED"), out
+
     def test_extras_cannot_shadow_git_or_cargo(self, H, monkeypatch):
         tb = self._tb(H, monkeypatch)
         monkeypatch.setattr(
@@ -570,6 +604,7 @@ class TestDecisionPolicy:
         tb._policy = H.DecisionPolicy(H.SETTINGS)
         tb._pending_confirm = None
         tb._confirm_running = None
+        tb._user_turn_marker = 0
         tb._jobs = {}
         tb._job_seq = 0
         tb._job_lock = threading.Lock()
@@ -598,7 +633,9 @@ class TestDecisionPolicy:
 
     def test_confirm_second_call_executes(self, H, monkeypatch, _fast_wait):
         tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        tb._set_user_turn(1)
         tb.execute("wait", {"seconds": 1})
+        tb._set_user_turn(2)
         out, err = tb.execute("confirm_action", {"answer": "yes"})
         assert not err, out
         assert "waited" in out
@@ -606,15 +643,19 @@ class TestDecisionPolicy:
 
     def test_confirm_cancelled(self, H, monkeypatch, _fast_wait):
         tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        tb._set_user_turn(1)
         tb.execute("wait", {"seconds": 1})
+        tb._set_user_turn(2)
         out = tb.confirm_action("no")     # plain string return (direct call)
         assert "Cancelled" in out
         assert tb._pending_confirm is None
 
     def test_confirm_expired(self, H, monkeypatch, _fast_wait):
         tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        tb._set_user_turn(1)
         tb.execute("wait", {"seconds": 1})
         tb._pending_confirm["until"] = time.monotonic() - 1
+        tb._set_user_turn(2)
         out = tb.confirm_action("yes")
         assert "expired" in out
 
@@ -641,11 +682,50 @@ class TestDecisionPolicy:
         """Strict one-turn separation: retrying the tool directly must not
         sneak past the confirmation; only confirm_action('yes') runs it."""
         tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        tb._set_user_turn(1)
         tb.execute("wait", {"seconds": 1})
         out, err = tb.execute("wait", {"seconds": 1})
         assert err and "CONFIRM REQUIRED" in out   # re-offered, not run
+        tb._set_user_turn(2)
         out, err = tb.execute("confirm_action", {"answer": "yes"})
         assert not err and "waited" in out, out
+
+    def test_confirm_same_turn_rejected_later_turn_accepted(self, H, monkeypatch,
+                                                             _fast_wait):
+        tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        tb._set_user_turn(7)
+        tb.execute("wait", {"seconds": 1})
+        out = tb.confirm_action("yes")
+        assert "same turn" in out.lower()
+        assert tb._pending_confirm is not None
+        tb._set_user_turn(8)
+        out, err = tb.execute("confirm_action", {"answer": "yes"})
+        assert not err and "waited" in out
+
+    def test_confirm_replacement_uses_newer_pending_action(self, H, monkeypatch,
+                                                            _fast_wait):
+        tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        tb._set_user_turn(1)
+        tb.execute("wait", {"seconds": 1})
+        tb._set_user_turn(2)
+        tb.execute("wait", {"seconds": 2})
+        assert tb._pending_confirm["args"] == {"seconds": 2}
+        assert tb._pending_confirm["turn"] == 2
+        tb._set_user_turn(3)
+        out, err = tb.execute("confirm_action", {"answer": "yes"})
+        assert not err and "waited" in out
+
+    def test_deny_does_not_create_or_replace_confirmation(self, H, monkeypatch,
+                                                          _fast_wait):
+        tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        tb._set_user_turn(1)
+        tb.execute("wait", {"seconds": 1})
+        pending = tb._pending_confirm
+        tb._policy = H.DecisionPolicy({"command_policy": {"wait": "DENY"}})
+        tb._set_user_turn(2)
+        out, err = tb.execute("wait", {"seconds": 2})
+        assert err and "DENIED" in out
+        assert tb._pending_confirm is pending
 
     def test_dry_run_does_not_touch_non_desktop_tools(self, H, monkeypatch):
         tb = self._belt(H, monkeypatch, dry_run=True)

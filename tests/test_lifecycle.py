@@ -9,6 +9,7 @@ import threading
 import io
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
@@ -39,6 +40,43 @@ class TestSourceIntegrity:
     def test_ptt_actions_documented_in_usage(self, H):
         for word in H.PTT_ACTIONS:
             assert word in H.USAGE
+
+    def test_shutdown_is_bounded_and_rejects_new_work(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        a._shutdown_event = threading.Event()
+        a._closed = False
+        a._workers = set()
+        a._cancel = threading.Event()
+        a._listener = types.SimpleNamespace(stop=lambda: None)
+        a._tools = None
+        a._notification_thread = None
+        a._notification_stop = None
+        a._notification_proc = None
+        a._pomodoro_stop = None
+        a._pomodoro_state = None
+        a._recorder = None
+        a._pipeline_q = __import__("queue").Queue(maxsize=1)
+        a._state = H.IDLE
+        a._gen = 0
+        spoken = []
+        a._speak = lambda *args, **kwargs: spoken.append(args[0])
+        started = threading.Event()
+        release = threading.Event()
+        worker = a._start_worker(
+            lambda: (started.set(), release.wait(5)), name="stuck-test-worker")
+        assert started.wait(1)
+        began = time.monotonic()
+        a.shutdown()
+        assert time.monotonic() - began < 1.0
+        release.set()
+        worker.join(1)
+        assert a._closed is True
+        assert a._shutdown_event.is_set()
+        a._announce_now("late")
+        assert spoken == []
+        queued = a._pipeline_q.qsize()
+        a.submit_audio(np.zeros(16000, dtype=np.int16))
+        assert a._pipeline_q.qsize() == queued
 
 
 # ------------------------------------------------------------------ control socket
@@ -246,6 +284,19 @@ class TestOffscreenLaunch:
 class TestStreamingChat:
     """ollama_chat_stream against a fake local ollama NDJSON server."""
 
+    def test_core_brain_public_names_and_turn_isolation(self):
+        from core import brain
+
+        assert callable(brain.ollama_chat)
+        assert callable(brain.ollama_chat_stream)
+        assert callable(brain.strip_thinking)
+        old = brain.TurnStream(1, threading.Event(), queue.Queue())
+        new = brain.TurnStream(2, threading.Event(), queue.Queue())
+        old.result = {"content": "old"}
+        new.result = {"content": "new"}
+        assert old.result != new.result
+        assert old.generation == 1 and new.generation == 2
+
     @pytest.fixture  # function-scoped: class-scope-on-instance-method is deprecated (removed in pytest 10)
     def fake_ollama(self):
         import subprocess as sp, socket, time
@@ -288,6 +339,104 @@ class TestStreamingChat:
             assert res2["content"] == "One. Two. Three."
         finally:
             H.OLLAMA_BASE = old_base
+
+    def test_old_stream_cannot_overwrite_new_turn_result(self, H, monkeypatch):
+        """A late canceled stream owns its result and cannot replace turn B's."""
+        asst = H.Assistant.__new__(H.Assistant)
+        asst._tools = types.SimpleNamespace()
+        asst._gen = 1
+        asst._history = []
+        asst._turn_spoke = False
+        asst._conversation_for = lambda text: [{"role": "system"},
+                                                {"role": "user", "content": text}]
+        asst._save_history = lambda: None
+        asst._set = lambda *_args: None
+        old_started = threading.Event()
+        release_old = threading.Event()
+        old_cancel = threading.Event()
+        new_started = threading.Event()
+        new_speaking = threading.Event()
+        release_new = threading.Event()
+        calls = []
+
+        def fake_stream(_conversation, _q, _cancel, _tools):
+            calls.append(len(calls) + 1)
+            if calls[-1] == 1:
+                old_started.set()
+                release_old.wait(2)
+                return {"content": "old", "tool_calls": []}
+            new_started.set()
+            return {"content": "new", "tool_calls": []}
+
+        def fake_speak(_text, gen, _cancel, sentence_q=None):
+            if gen == 2:
+                new_speaking.set()
+                release_new.wait(2)
+
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", True)
+        monkeypatch.setattr(H, "ollama_chat_stream", fake_stream)
+        asst._speak = fake_speak
+        old = threading.Thread(target=H.Assistant._brain_turn,
+                               args=(asst, "old", 1, old_cancel))
+        old.start()
+        assert old_started.wait(1)
+        asst._gen = 2
+        new_cancel = threading.Event()
+        new = threading.Thread(target=H.Assistant._brain_turn,
+                               args=(asst, "new", 2, new_cancel))
+        new.start()
+        assert new_started.wait(1)
+        assert new_speaking.wait(1)
+        old_cancel.set()
+        release_old.set()
+        time.sleep(0.05)
+        old_cancel.set()
+        release_new.set()
+        old.join(2)
+        new.join(2)
+        assert not old.is_alive() and not new.is_alive()
+        assert asst._history[-1]["content"] == "new"
+
+
+class TestConfirmationLoop:
+    def test_confirmation_offer_stops_same_model_tool_loop(self, H, monkeypatch):
+        """A confirmation offer must not let a later tool call in the same
+        model response confirm and execute it."""
+        class Belt:
+            _last_images = []
+
+            def __init__(self):
+                self.calls = []
+                self._last_confirmation_offer = False
+
+            def execute(self, name, args):
+                self.calls.append(name)
+                self._last_confirmation_offer = name == "wait"
+                if name == "wait":
+                    return "CONFIRM REQUIRED: pending", True
+                return "unexpected", True
+
+        asst = H.Assistant.__new__(H.Assistant)
+        asst._tools = Belt()
+        asst._gen = 1
+        asst._history = []
+        asst._turn_spoke = False
+        asst._conversation_for = lambda text: [{"role": "system"},
+                                                {"role": "user", "content": text}]
+        asst._save_history = lambda: None
+        asst._speak = lambda *args, **kwargs: None
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", False)
+        monkeypatch.setattr(H, "ollama_chat", lambda conversation, tools: {
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "wait", "arguments": {"seconds": 1}}},
+                {"function": {"name": "confirm_action", "arguments": {"answer": "yes"}}},
+            ],
+        })
+
+        H.Assistant._brain_turn(asst, "do it", 1, threading.Event())
+
+        assert asst._tools.calls == ["wait"]
 
 
 # -------------------------------------------------------------------- audit fixes

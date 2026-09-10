@@ -25,6 +25,15 @@ from conftest import HERE as ROOT, _load, _user_site
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
 
+def test_core_audio_imports_independently():
+    """The extracted primitives must not require the Qt/application module."""
+    mod = _load("core_audio_compat", HERE / "core" / "audio.py")
+    for name in ("_resample_to_16k", "_open_input", "Recorder",
+                 "get_whisper", "get_piper", "transcribe", "tts_to_wav",
+                 "play_wav"):
+        assert hasattr(mod, name), name
+
+
 class FakeSig:
     """Mimics a Qt signal: collect emitted values."""
 
@@ -194,6 +203,62 @@ class TestListenerSelfMute:
 
 
 class TestSpeechPlaybackSerialization:
+    def test_announce_returns_to_idle_after_normal_completion(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 1
+        a._state = H.SPEAKING
+        a.sigState = FakeSig()
+        done = threading.Event()
+
+        def speak(*_args, **_kwargs):
+            a._state = H.SPEAKING
+            done.set()
+
+        a._speak = speak
+        H.Assistant._announce_now(a, "hello")
+        assert done.wait(1)
+        deadline = time.time() + 1
+        while a.state != H.IDLE and time.time() < deadline:
+            time.sleep(0.01)
+        assert a.state == H.IDLE
+        listener_asst = FakeAssistant(state=a.state)
+        listener = H.ContinuousListener(listener_asst)
+        gate = H._SpeechGate(threshold=600)
+        frames = []
+        for _ in range(5):
+            frame = (np.ones(1024, dtype=np.int16) * 3000).reshape(1, 1024)
+            listener._process_frame(frame, gate, frames, 100, 4)
+        assert frames, "a completed announcement must leave the listener unmuted"
+
+    def test_cancelled_stale_announcement_cannot_reset_newer_state(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 1
+        a._state = H.IDLE
+        a.sigState = FakeSig()
+        started = threading.Event()
+        release = threading.Event()
+        cancel_ref = {}
+
+        def speak(*args, **_kwargs):
+            cancel_ref["event"] = args[2]
+            started.set()
+            release.wait(1)
+
+        a._speak = speak
+        H.Assistant._announce_now(a, "old")
+        assert started.wait(1)
+        cancel_ref["event"].set()
+        a._gen = 2
+        a._set(2, H.THINKING)
+        release.set()
+        time.sleep(0.05)
+        assert a.state == H.THINKING
+
+    def test_listener_can_hear_after_announcement_completion(self, H):
+        asst = FakeAssistant(state=H.IDLE)
+        asst._vad_speech(True)
+        assert asst.state == "listening"
+
     def test_synthesis_can_overlap_but_playback_cannot_and_cancel_skips_stale(
             self, H, monkeypatch, tmp_path):
         a = H.Assistant.__new__(H.Assistant)
@@ -598,6 +663,28 @@ class TestMicHealth:
         assert sleeps and sleeps[0] == 10.0, "health loop must poll frequently"
         assert len(calls) == 2, "a failing report must not kill the loop"
 
+    def test_health_loop_minimal_logger_survives_error(self, H, monkeypatch):
+        calls = []
+        sleeps = iter([None, StopIteration])
+
+        class MinimalLog:
+            def error(self, message):
+                calls.append(message)
+
+        ln = self._mk_listener(H)
+        monkeypatch.setattr(H, "log", MinimalLog())
+        def sleep(_seconds):
+            value = next(sleeps)
+            if value is not None:
+                raise value
+        monkeypatch.setattr(H.time, "sleep", sleep)
+        def tick():
+            raise RuntimeError("missing optional hook")
+        monkeypatch.setattr(H.ContinuousListener, "_health_tick", tick)
+        with pytest.raises(StopIteration):
+            ln._health_loop()
+        assert calls == ["mic health report failed"]
+
     # -- immediate transition reporting -----------------------------------
 
     def _records(self, caplog):
@@ -696,6 +783,44 @@ class TestMicHealth:
             ln._health_tick()
         assert any("state=silent" in r.getMessage()
                    for r in self._records(caplog))
+
+    def test_snapshot_does_not_wait_for_slow_health_hook(self, H, monkeypatch):
+        """A slow assistant health check must not block the mic snapshot."""
+        ln = self._mk_listener(H)
+        ln._running = True
+        ln._frames_seen = 1
+        ln._last_nonzero = time.monotonic()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_self_heal(_degraded):
+            entered.set()
+            assert release.wait(2.0)
+
+        ln._assistant = types.SimpleNamespace(
+            _maybe_self_heal=slow_self_heal,
+            _resource_tick=lambda: None,
+            _world_tick=lambda: None,
+            _hardware_tick=lambda: None,
+        )
+        monkeypatch.setattr(H, "_record_mic_event", lambda *_: None)
+        worker = threading.Thread(target=ln._health_tick)
+        worker.start()
+        assert entered.wait(1.0), "health hook did not start"
+
+        snapshot_done = threading.Event()
+
+        def read_snapshot():
+            ln.mic_snapshot()
+            snapshot_done.set()
+
+        reader = threading.Thread(target=read_snapshot)
+        reader.start()
+        assert snapshot_done.wait(0.25), "mic snapshot blocked behind health hook"
+        release.set()
+        worker.join(timeout=2.0)
+        reader.join(timeout=2.0)
+        assert not worker.is_alive()
 
 
 class TestLiveMicProbe:
@@ -1513,6 +1638,7 @@ class TestPttReleaseNonBlocking:
             assert "stop_ms=" in line and "submit_ms=" in line
             assert "frames=" in line and "rate=" in line
             assert a._state in (H.THINKING, H.IDLE)
+            gate.set()  # let the owning native-stop thread release the guard
 
     def test_fast_path_submits_to_pipeline(self, H, monkeypatch, caplog):
         """Non-blocking stream: begin -> inject loud frames -> finish queues
@@ -1558,6 +1684,70 @@ class TestPttReleaseNonBlocking:
             assert any("ptt timing:" in r.getMessage()
                        for r in caplog.records)
             assert a._state in (H.THINKING, H.IDLE)
+
+    def test_stop_timeout_keeps_native_owner_until_stop_returns(self, H):
+        """A timed-out native stop must own the mic until its call returns."""
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        class _Stream:
+            def abort(self):
+                calls.append("abort")
+
+            def close(self):
+                calls.append("close")
+
+        class _BlockingRecorder:
+            _stream = _Stream()
+
+            def stop(self):
+                entered.set()
+                release.wait(2.0)
+                return None
+
+        rec = _BlockingRecorder()
+        audio, wedged = H._stop_recorder_bounded(rec, timeout=0.05)
+        assert audio is None and wedged is True
+        assert entered.wait(1.0)
+        assert calls == [], "timeout must not abort/close from another thread"
+        release.set()
+        deadline = time.monotonic() + 2.0
+        while getattr(rec, "_handsoff_stop_owner", None) is not None \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert getattr(rec, "_handsoff_stop_owner", None) is None
+        assert calls == [], "the owning recorder.stop performed cleanup"
+
+    def test_stale_configured_mic_falls_back(self, H, monkeypatch, caplog):
+        opened = []
+
+        class _Stream:
+            pass
+
+        def _open(**kwargs):
+            opened.append(kwargs.get("device"))
+            if kwargs.get("device") == "Blue Microphones: USB Audio (hw:4,0)":
+                raise ValueError("No input device matching")
+            return _Stream()
+
+        devices = [
+            {"name": "SB Omni", "max_input_channels": 1,
+             "default_samplerate": 48000},
+            {"name": "Logitech StreamCam", "max_input_channels": 1,
+             "default_samplerate": 48000},
+        ]
+        monkeypatch.setattr(H.sd, "InputStream", _open)
+        monkeypatch.setattr(H.sd, "query_devices", lambda *a, **k: devices)
+        with caplog.at_level("WARNING", logger="handsoff"):
+            stream, rate = H._open_input(
+                "Blue Microphones: USB Audio (hw:4,0)", 16000, 1024, lambda *_: None)
+        assert isinstance(stream, _Stream)
+        assert rate == 16000
+        assert opened[-1] is None, "stale configured mic should use system default"
+        assert any("Blue Microphones: USB Audio (hw:4,0)" in r.getMessage()
+                   and "falling back" in r.getMessage().lower()
+                   for r in caplog.records)
 
 
 class TestPttStopWorkerEdges:
@@ -1767,11 +1957,11 @@ class TestPttStopWorkerEdges:
         assert a._recorder is None
         assert not any("ptt timing:" in r.getMessage() for r in caplog.records)
 
-    def test_wedged_stop_bounded_recovers_and_repress_succeeds(
+    def test_wedged_stop_refuses_repress_until_owner_returns(
             self, H, monkeypatch, caplog):
         """Dead-Yeti wedge (stop() never returns): the ptt-stop worker must
-        emit its timing line in <=4s with wedged=1, clear _ptt_stopping, and
-        a subsequent press must open the mic instead of refusing."""
+        emit its timing line in <=4s with wedged=1, retain ownership, and
+        refuse a subsequent press instead of racing a second open."""
         never = threading.Event()  # never set: the 51s journal wedge
 
         class _WedgedRec:
@@ -1799,35 +1989,24 @@ class TestPttStopWorkerEdges:
             assert "ptt timing: stop_ms=" in line
             assert "submit_ms=" in line and "frames=" in line \
                 and "rate=" in line
-            deadline = time.monotonic() + 4.0
-            while getattr(a, "_ptt_stopping", False) \
-                    and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert getattr(a, "_ptt_stopping", False) is False, \
-                "_ptt_stopping stuck after wedge"
-            # the wedge is bounded: a second press opens the mic cleanly
+            assert getattr(a, "_ptt_stopping", False) is True, \
+                "native stop owner must remain marked while alive"
 
-            class _FastStream:
+            class _NoOpen:
                 def __init__(self, *a_, **k_):
-                    pass
+                    raise AssertionError("wedged stop must prevent a new open")
 
-                def start(self):
-                    pass
-
-                def stop(self):
-                    pass
-
-                def close(self):
-                    pass
-
-            monkeypatch.setattr(H.sd, "InputStream", _FastStream)
+            monkeypatch.setattr(H.sd, "InputStream", _NoOpen)
             caplog.clear()
             a.begin_listening()
-            assert a._recorder is not None, \
-                "press after a bounded wedge must not refuse"
-            assert a._state == H.LISTENING
-            assert not any("refused" in r.getMessage()
-                           for r in caplog.records)
+            assert a._recorder is None
+            assert any("refused" in r.getMessage() for r in caplog.records)
+            never.set()
+            deadline = time.monotonic() + 2.0
+            while getattr(a, "_ptt_stopping", False) \
+                    and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert getattr(a, "_ptt_stopping", False) is False
 
     def test_refusal_speaks_busy(self, H, monkeypatch, caplog):
         """Press while a stop is in flight: refuse AND speak the busy line

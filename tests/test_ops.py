@@ -352,7 +352,7 @@ class TestInstalledCopySmoke:
                 (bin_dir / name).write_bytes(src.read_bytes())
         core_dir = bin_dir / "core"
         core_dir.mkdir(exist_ok=True)
-        for name in ("__init__.py", "settings.py"):
+        for name in ("__init__.py", "settings.py", "audio.py", "brain.py", "tools.py"):
             (core_dir / name).write_bytes((HERE / "core" / name).read_bytes())
         (bin_dir / "handsoff-restart").chmod(0o755)
         state = home / "state"
@@ -397,3 +397,178 @@ class TestInstalledCopySmoke:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+
+class TestInstallerPurgeBackup:
+    """Purge must prove its backup is usable before removing user data."""
+
+    @staticmethod
+    def _run_purge(tmp_path, tar_script=None):
+        home = tmp_path / "home"
+        conf = home / ".config" / "handsoff"
+        state = home / ".local" / "state" / "handsoff"
+        conf.mkdir(parents=True)
+        state.mkdir(parents=True)
+        (conf / "settings.json").write_text("config")
+        (state / "history.json").write_text("state")
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+        (fake_bin / "systemctl").chmod(0o755)
+        if tar_script is not None:
+            tar = fake_bin / "tar"
+            tar.write_text(tar_script)
+            tar.chmod(0o755)
+        env = dict(os.environ)
+        env.update({
+            "HOME": str(home),
+            "XDG_STATE_HOME": str(home / ".local" / "state"),
+            "PATH": str(fake_bin) + os.pathsep + env["PATH"],
+        })
+        return subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--uninstall", "--purge"],
+            env=env, capture_output=True, text=True,
+        ), home, conf, state
+
+    def test_purge_refuses_to_delete_after_tar_failure(self, tmp_path):
+        result, _, conf, state = self._run_purge(
+            tmp_path, "#!/bin/sh\nexit 1\n")
+        assert result.returncode != 0
+        assert conf.exists() and state.exists()
+        assert "backup" in result.stderr.lower()
+
+    def test_purge_verifies_secure_unique_backup(self, tmp_path):
+        result, home, conf, state = self._run_purge(tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert not conf.exists() and not state.exists()
+        archives = sorted(home.glob("handsoff-backup-*.tar.gz"))
+        assert len(archives) == 1
+        assert archives[0].stat().st_mode & 0o777 == 0o600
+        listing = subprocess.run(
+            ["tar", "tzf", str(archives[0])], capture_output=True,
+            text=True, check=True,
+        ).stdout
+        assert ".config/handsoff/settings.json" in listing
+        assert ".local/state/handsoff/history.json" in listing
+
+        # A second purge must not overwrite the first day's backup.
+        conf.mkdir(parents=True)
+        state.mkdir(parents=True)
+        (conf / "settings.json").write_text("new config")
+        (state / "history.json").write_text("new state")
+        result = subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--uninstall", "--purge"],
+            env={**os.environ, "HOME": str(home),
+                 "XDG_STATE_HOME": str(home / ".local" / "state"),
+                 "PATH": str(home.parent / "bin") + os.pathsep + os.environ["PATH"]},
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert len(list(home.glob("handsoff-backup-*.tar.gz"))) == 2
+
+    def test_purge_refuses_invalid_tar_listing(self, tmp_path):
+        result, home, conf, state = self._run_purge(
+            tmp_path,
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  czf) printf bad > \"$2\"; exit 0 ;;\n"
+            "  tzf) exit 1 ;;\n"
+            "esac\n"
+            "exit 2\n",
+        )
+        assert result.returncode != 0
+        assert conf.exists() and state.exists()
+        assert not list(home.glob("handsoff-backup-*.tar.gz"))
+
+
+class TestInstallerRehearsal:
+    """The installer can exercise deployment without touching the host."""
+
+    def _run(self, tmp_path, extra_env=None):
+        rehearsal = tmp_path / "rehearsal"
+        sentinel = tmp_path / "real-home"
+        sentinel.mkdir()
+        env = dict(os.environ)
+        env.update({
+            "HOME": str(sentinel),
+            "XDG_STATE_HOME": str(sentinel / ".local" / "state"),
+            "HANDSOFF_REHEARSAL_ROOT": str(rehearsal),
+            "HANDSOFF_SKIP_SYSTEM_PKGS": "1",
+            "HANDSOFF_NO_OLLAMA_SERVICE": "1",
+            "HANDSOFF_PYTHON": sys.executable,
+        })
+        env.update(extra_env or {})
+        result = subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--rehearsal"],
+            env=env, capture_output=True, text=True,
+        )
+        return result, rehearsal, sentinel
+
+    def test_rehearsal_generates_and_validates_deployment(self, tmp_path):
+        result, root, sentinel = self._run(tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "rehearsal complete" in result.stdout
+        assert not any(sentinel.iterdir())
+
+        manifest_path = root / ".config" / "handsoff" / "deployment.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert set(manifest["files"]) >= {
+            "handsoff.py", "settings_schema.py", "hardware.py",
+            "core/__init__.py", "core/settings.py", "handsoff-restart",
+        }
+        assert (root / ".config" / "systemd" / "user" / "handsoff.service").exists()
+        snippet = root / ".config" / "handsoff" / "niri-window-rule.kdl"
+        assert "window-rule" in snippet.read_text()
+
+    def test_manifest_write_failure_preserves_previous_file(self, tmp_path):
+        root = tmp_path / "rehearsal"
+        manifest = root / ".config" / "handsoff" / "deployment.json"
+        manifest.parent.mkdir(parents=True)
+        original = '{"old": true}\n'
+        manifest.write_text(original)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        mv = fake_bin / "mv"
+        mv.write_text(
+            "#!/bin/sh\n"
+            "case \"$3\" in\n"
+            "  *deployment.json) exit 1 ;;\n"
+            "esac\n"
+            "exec /usr/bin/mv \"$@\"\n"
+        )
+        mv.chmod(0o755)
+        result, _root, _sentinel = self._run(
+            tmp_path,
+            {"HANDSOFF_REHEARSAL_ROOT": str(root),
+             "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]},
+        )
+        assert result.returncode != 0
+        assert manifest.read_text() == original
+
+    def test_unit_write_failure_preserves_previous_file(self, tmp_path):
+        root = tmp_path / "rehearsal"
+        unit = root / ".config" / "systemd" / "user" / "handsoff.service"
+        unit.parent.mkdir(parents=True)
+        original = "old unit\n"
+        unit.write_text(original)
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        mv = fake_bin / "mv"
+        mv.write_text(
+            "#!/bin/sh\n"
+            "case \"$3\" in\n"
+            "  *handsoff.service) exit 1 ;;\n"
+            "esac\n"
+            "exec /usr/bin/mv \"$@\"\n"
+        )
+        mv.chmod(0o755)
+        result, _root, _sentinel = self._run(
+            tmp_path,
+            {"HANDSOFF_REHEARSAL_ROOT": str(root),
+             "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]},
+        )
+        assert result.returncode != 0
+        assert unit.read_text() == original

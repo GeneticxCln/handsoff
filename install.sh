@@ -19,6 +19,7 @@ case "${1:-}" in
         echo ""
         echo "Options:"
         echo "  --help            show this help"
+        echo "  --rehearsal       install into HANDSOFF_REHEARSAL_ROOT without host changes"
         echo "  --uninstall       remove binaries, unit and snippet"
         echo "  --uninstall --purge  also wipe config/state (backs up first)"
         exit 0
@@ -26,6 +27,15 @@ case "${1:-}" in
 esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REHEARSAL=0
+if [ "${1:-}" = "--rehearsal" ]; then
+    REHEARSAL=1
+    : "${HANDSOFF_REHEARSAL_ROOT:?HANDSOFF_REHEARSAL_ROOT is required for --rehearsal}"
+    HOME="$HANDSOFF_REHEARSAL_ROOT"
+    XDG_STATE_HOME="$HOME/.local/state"
+    export HOME XDG_STATE_HOME
+    echo "==> rehearsal mode: target HOME=$HOME"
+fi
 BIN_DIR="$HOME/.local/bin"
 CONF_DIR="$HOME/.config/handsoff"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
@@ -40,6 +50,30 @@ WHISPER_REVISION="${HANDSOFF_WHISPER_REVISION:-main}"
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Uninstalling handsoff"
+    if [ "${2:-}" = "--purge" ]; then
+        # Never remove user data until a private, independently readable
+        # archive has been created and validated.
+        umask 077
+        backup=""
+        if ! backup="$(mktemp "$HOME/handsoff-backup-$(date +%Y%m%d-%H%M%S)-XXXXXX.tar.gz")"; then
+            echo "FATAL: could not create the handsoff backup archive; nothing removed" >&2
+            exit 1
+        fi
+        if ! tar czf "$backup" -C "$HOME" \
+                .config/handsoff .local/state/handsoff; then
+            rm -f -- "$backup"
+            echo "FATAL: handsoff backup archive failed; nothing removed" >&2
+            exit 1
+        fi
+        if ! chmod 600 "$backup" \
+                || [ ! -f "$backup" ] || [ ! -r "$backup" ] || [ ! -s "$backup" ] \
+                || ! backup_listing="$(tar tzf "$backup" 2>/dev/null)" \
+                || [ -z "$backup_listing" ]; then
+            rm -f -- "$backup"
+            echo "FATAL: handsoff backup archive failed verification; nothing removed" >&2
+            exit 1
+        fi
+    fi
     systemctl --user disable --now handsoff.service 2>/dev/null || true
     rm -f "$HOME/.config/systemd/user/handsoff.service" \
           "$BIN_DIR/handsoff.py" "$BIN_DIR/handsoff-restart" \
@@ -61,10 +95,8 @@ if [ "${1:-}" = "--uninstall" ]; then
         kill -TERM "$pid" 2>/dev/null || true
     done
     if [ "${2:-}" = "--purge" ]; then
-        tar czf "$HOME/handsoff-backup-$(date +%Y%m%d).tar.gz" \
-            -C "$HOME" .config/handsoff .local/state/handsoff 2>/dev/null || true
         rm -rf "$CONF_DIR" "$STATE_DIR"
-        echo "    config + models removed (backup: ~/handsoff-backup-*.tar.gz)"
+        echo "    config + models removed (backup: $backup)"
     else
         echo "    kept $CONF_DIR and $STATE_DIR (history, models)."
         echo "    full wipe:  $0 --uninstall --purge"
@@ -91,18 +123,23 @@ echo "==> [1/8] System packages (pacman)"
 # pacman can't provide comes from requirements.txt, so a skip is safe.
 PYTHON_PKGS="python-pyside6 python-sounddevice python-numpy python-pip"
 ARCH_PKGS=""
-for p in $PYTHON_PKGS; do
-    if pacman -Si "$p" >/dev/null 2>&1; then
-        ARCH_PKGS="$ARCH_PKGS $p"
-    else
-        echo "    note: $p is not in this distro's repos — requirements.txt provides it via pip"
-    fi
-done
 PACMAN="sudo pacman"
 # HANDSOFF_SKIP_SYSTEM_PKGS=1: trust the system packages are already present
 # (CI, redeploys from a non-interactive shell where sudo cannot prompt, or a
 # pre-provisioned box). Package probes still run; only the transaction is
 # skipped.
+if [ "$REHEARSAL" = "1" ]; then
+    echo "    skipping system package probes and transaction (rehearsal)"
+    PACMAN=""
+else
+    for p in $PYTHON_PKGS; do
+        if pacman -Si "$p" >/dev/null 2>&1; then
+            ARCH_PKGS="$ARCH_PKGS $p"
+        else
+            echo "    note: $p is not in this distro's repos — requirements.txt provides it via pip"
+        fi
+    done
+fi
 if [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ]; then
     echo "    skipping system package transaction (HANDSOFF_SKIP_SYSTEM_PKGS=1)"
     PACMAN=""
@@ -123,8 +160,46 @@ echo "==> [2/8] Python packages (pip, user site)"
 # Single source of truth: the manifest. Core deps also come from pacman above;
 # this covers the lazy-imported extras (faster-whisper, piper-tts,
 # openwakeword/onnxruntime for the wake spotter) at verified floors.
-"${PYBIN}" -m pip install --user --break-system-packages --upgrade \
-    -r "$HERE/requirements.txt"
+PIP_REQUIREMENTS=("-r" "$HERE/requirements.txt")
+if [ -f "$HERE/requirements-lock.txt" ]; then
+    if ! "${PYBIN}" - "$HERE/requirements.txt" "$HERE/requirements-lock.txt" <<'PY_EOF'
+import re
+import sys
+from pathlib import Path
+
+def names(path):
+    result = {}
+    for raw in Path(path).read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        match = re.match(r"^([A-Za-z0-9_.-]+)\s*(.*)$", line)
+        if not match or line.startswith(("-", "--")):
+            continue
+        result[match.group(1).lower().replace("_", "-")] = match.group(2).strip()
+    return result
+
+requirements = names(sys.argv[1])
+lock = names(sys.argv[2])
+missing = [name for name in requirements if name not in lock]
+unpinned = [name for name in requirements if not lock.get(name, "").startswith("==")]
+if missing or unpinned:
+    print("lock is inconsistent: "
+          + ("missing " + ", ".join(missing) if missing else "")
+          + ("; not exact-pinned " + ", ".join(unpinned) if unpinned else ""),
+          file=sys.stderr)
+    raise SystemExit(1)
+PY_EOF
+    then
+        echo "FATAL: requirements-lock.txt is inconsistent with requirements.txt" >&2
+        exit 1
+    fi
+    PIP_REQUIREMENTS+=("-c" "$HERE/requirements-lock.txt")
+fi
+if [ "$REHEARSAL" = "1" ]; then
+    echo "    skipping pip transaction (rehearsal)"
+else
+    "${PYBIN}" -m pip install --user --break-system-packages --upgrade \
+        "${PIP_REQUIREMENTS[@]}"
+fi
 
 echo "==> [3/8] Directories"
 mkdir -p "$BIN_DIR" "$CONF_DIR/whisper-model" "$CONF_DIR/piper-voice" "$STATE_DIR"
@@ -146,10 +221,15 @@ for mod in settings_schema hardware; do
         exit 1
     fi
 done
-if [ -f "$HERE/core/__init__.py" ] && [ -f "$HERE/core/settings.py" ]; then
+if [ -f "$HERE/core/__init__.py" ] && [ -f "$HERE/core/settings.py" ] \
+        && [ -f "$HERE/core/audio.py" ] && [ -f "$HERE/core/brain.py" ] \
+        && [ -f "$HERE/core/tools.py" ]; then
     mkdir -p "$BIN_DIR/core"
     install -m 644 "$HERE/core/__init__.py" "$BIN_DIR/core/__init__.py"
     install -m 644 "$HERE/core/settings.py" "$BIN_DIR/core/settings.py"
+    install -m 644 "$HERE/core/audio.py" "$BIN_DIR/core/audio.py"
+    install -m 644 "$HERE/core/brain.py" "$BIN_DIR/core/brain.py"
+    install -m 644 "$HERE/core/tools.py" "$BIN_DIR/core/tools.py"
 else
     echo "    FATAL: $HERE/core/ is missing but required by handsoff.py" >&2
     exit 1
@@ -158,7 +238,11 @@ fi
 # (a heredoc duplicate here silently drifted from it once already).
 install -m 755 "$HERE/handsoff-restart" "$BIN_DIR/handsoff-restart"
 echo "==> [5/8] Downloading whisper '$WHISPER_SIZE' model (one time)"
-WHISPER_RESOLVED_REVISION="$(${PYBIN} - "$WHISPER_SIZE" "$CONF_DIR/whisper-model" "$WHISPER_REVISION" <<'PY_EOF'
+if [ "$REHEARSAL" = "1" ]; then
+    printf 'rehearsal placeholder\n' > "$CONF_DIR/whisper-model/rehearsal.txt"
+    WHISPER_RESOLVED_REVISION="$WHISPER_REVISION"
+else
+    WHISPER_RESOLVED_REVISION="$(${PYBIN} - "$WHISPER_SIZE" "$CONF_DIR/whisper-model" "$WHISPER_REVISION" <<'PY_EOF'
 import sys
 from faster_whisper import utils
 from faster_whisper import WhisperModel
@@ -176,8 +260,9 @@ except Exception:
 print(resolved)
 PY_EOF
 )"
-if [ -z "$WHISPER_RESOLVED_REVISION" ]; then
-    WHISPER_RESOLVED_REVISION="$WHISPER_REVISION"
+    if [ -z "$WHISPER_RESOLVED_REVISION" ]; then
+        WHISPER_RESOLVED_REVISION="$WHISPER_REVISION"
+    fi
 fi
 echo "whisper model ready"
 # faster-whisper fetches via huggingface_hub (content-hashed blobs, verified
@@ -193,6 +278,18 @@ fi
 # downloader cannot expose a resolved revision or a file cannot be read.
 mkdir -p "$CONF_DIR"
 sha_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}' || echo null; }
+atomic_write() {
+    local dest="$1" mode="$2" tmp
+    tmp="$(mktemp "${dest}.tmp.XXXXXX")" || {
+        echo "FATAL: could not stage $dest" >&2
+        return 1
+    }
+    if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        echo "FATAL: could not atomically install $dest" >&2
+        return 1
+    fi
+}
 whisper_sha256=""
 if whisper_sha256="$(${PYBIN} - "$CONF_DIR/whisper-model" <<'PY_EOF'
 import hashlib
@@ -218,7 +315,7 @@ PY_EOF
 )"; then :; else whisper_sha256=""; fi
 manifest_whisper_sha256=""
 [ -n "$whisper_sha256" ] && manifest_whisper_sha256="  \"whisper_sha256\": \"$whisper_sha256\","
-cat > "$CONF_DIR/deployment.json" <<MANIFEST_EOF
+atomic_write "$CONF_DIR/deployment.json" 600 <<MANIFEST_EOF
 {
   "installed_at": "$(date -Is)",
   "source_dir": "$HERE",
@@ -233,12 +330,18 @@ $manifest_whisper_sha256
     "hardware.py": {"source_sha256": "$(sha_of "$HERE/hardware.py")", "installed_sha256": "$(sha_of "$BIN_DIR/hardware.py")"},
     "core/__init__.py": {"source_sha256": "$(sha_of "$HERE/core/__init__.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/__init__.py")"},
     "core/settings.py": {"source_sha256": "$(sha_of "$HERE/core/settings.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/settings.py")"},
+    "core/audio.py": {"source_sha256": "$(sha_of "$HERE/core/audio.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/audio.py")"},
+    "core/brain.py": {"source_sha256": "$(sha_of "$HERE/core/brain.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/brain.py")"},
+    "core/tools.py": {"source_sha256": "$(sha_of "$HERE/core/tools.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/tools.py")"},
     "handsoff-restart": {"source_sha256": "$(sha_of "$HERE/handsoff-restart")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"}
   }
 }
 MANIFEST_EOF
 
 echo "==> [6/8] Downloading piper voice (sha256-verified)"
+if [ "$REHEARSAL" = "1" ]; then
+    echo "    skipping voice download (rehearsal)"
+else
 voice="$(basename "$PIPER_VOICE_URL")"
 VOICE_SHA256="${PIPER_VOICE_SHA256:-5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f}"
 VOICE_JSON_SHA256="${PIPER_VOICE_JSON_SHA256:-efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0}"
@@ -295,11 +398,12 @@ if [ "$PIPER_VOICE_URL" != "$VOICE_URL_DEFAULT" ] \
 fi
 download_verified "$PIPER_VOICE_URL" "$CONF_DIR/piper-voice/$voice" "$VOICE_SHA256"
 download_verified "$PIPER_VOICE_URL.json" "$CONF_DIR/piper-voice/$voice.json" "$VOICE_JSON_SHA256"
+fi
 
 echo "==> [7/8] systemd user service (auto-restart if the bubble dies)"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SYSTEMD_DIR"
-cat > "$SYSTEMD_DIR/handsoff.service" <<UNIT_EOF
+atomic_write "$SYSTEMD_DIR/handsoff.service" 644 <<UNIT_EOF
 [Unit]
 Description=handsoff voice assistant bubble
 After=graphical-session.target
@@ -320,7 +424,9 @@ TimeoutStartSec=30
 [Install]
 WantedBy=graphical-session.target
 UNIT_EOF
-if systemctl --user daemon-reload 2>/dev/null; then
+if [ "$REHEARSAL" = "1" ]; then
+    echo "    skipping systemd activation (rehearsal)"
+elif systemctl --user daemon-reload 2>/dev/null; then
     # ydotoold must be running for ydotool (typing/keys) to work at all.
     # Arch's USER unit is ydotool.service (it starts ydotoold); other distros
     # ship ydotoold.service — enable whichever exists, warn only if neither.
@@ -356,7 +462,9 @@ else
 fi
 
 echo "==> [8/8] Checking ollama"
-if ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then
+if [ "$REHEARSAL" = "1" ]; then
+    echo "    skipping ollama checks (rehearsal)"
+elif ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then
     # ponytail: never touch the system service when pkgs are skipped or opted out.
     if [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ] || [ "${HANDSOFF_NO_OLLAMA_SERVICE:-0}" = "1" ]; then
         echo "    ollama not running — leaving the service alone (skip/opt-out)"
@@ -366,17 +474,17 @@ if ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then
         sleep 2
     fi
 fi
-if ! ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$OLLAMA_MODEL"; then
+if [ "$REHEARSAL" != "1" ] && ! ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$OLLAMA_MODEL"; then
     echo "    pulling $OLLAMA_MODEL (a few GB, one time) ..."
     ollama pull "$OLLAMA_MODEL" || echo "    WARN: pull failed — run 'ollama pull $OLLAMA_MODEL' later"
 fi
-if ! ollama show "$OLLAMA_MODEL" 2>/dev/null | grep -qi 'tools'; then
+if [ "$REHEARSAL" != "1" ] && ! ollama show "$OLLAMA_MODEL" 2>/dev/null | grep -qi 'tools'; then
     echo "    WARN: $OLLAMA_MODEL may not support tool calling — desktop control and"
     echo "    self-modification need a tools-capable model (e.g. qwen3:8b, llama3.1:8b)."
     echo "    handsoff will still chat, but set HANDSOFF_MODEL to enable tools."
 fi
 
-cat > "$CONF_DIR/niri-window-rule.kdl" <<'NIRI_EOF'
+atomic_write "$CONF_DIR/niri-window-rule.kdl" 644 <<'NIRI_EOF'
 // handsoff voice-assistant bubble — merge into ~/.config/niri/config.kdl
 window-rule {
     match app-id=r#"^handsoff$"#
@@ -390,7 +498,7 @@ NIRI_EOF
 # ONE autostart owner: systemd (if the user unit is actually enabled) OR
 # niri spawn-at-startup — never both. SYSTEMD_EDITOR says nothing about
 # whether systemd manages the app; check the real unit state instead.
-if systemctl --user is-enabled handsoff.service >/dev/null 2>&1; then
+if [ "$REHEARSAL" = "1" ] || systemctl --user is-enabled handsoff.service >/dev/null 2>&1; then
     # systemd owns the bubble — print the manual keybind for settings,
     # do NOT write spawn-at-startup (a unit restart would spawn duplicates)
     echo "     (systemd manages autostart; add 'Mod+Shift+S => spawn settings' to niri manually)"
@@ -398,6 +506,25 @@ else
     printf '\n// launch at startup:\nspawn-at-startup "%s" "%s"\n' \
         "$PYBIN" "$BIN_DIR/handsoff.py" >> "$CONF_DIR/niri-window-rule.kdl"
     echo "     (no systemd: added spawn-at-startup — check the path contains no wrong username)"
+fi
+
+if [ "$REHEARSAL" = "1" ]; then
+    "${PYBIN}" - "$CONF_DIR/deployment.json" <<'PY_EOF'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+assert manifest["files"]
+PY_EOF
+    for required in \
+        "$BIN_DIR/handsoff.py" "$BIN_DIR/settings_schema.py" "$BIN_DIR/hardware.py" \
+        "$BIN_DIR/core/__init__.py" "$BIN_DIR/core/settings.py" "$BIN_DIR/handsoff-restart" \
+        "$SYSTEMD_DIR/handsoff.service" "$CONF_DIR/niri-window-rule.kdl"; do
+        [ -f "$required" ] || { echo "FATAL: rehearsal missing $required" >&2; exit 1; }
+    done
+    echo "rehearsal complete: copied files, manifest, unit, and niri snippet verified"
+    exit 0
 fi
 
 echo

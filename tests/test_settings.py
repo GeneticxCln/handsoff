@@ -349,6 +349,85 @@ class TestSettingsSplit:
         with pytest.raises(KeyError):
             obj["nope"]
 
+    def test_full_save_merges_runtime_key_changed_after_gui_load(self, H, tmp_path):
+        """A GUI save must retain a newer, non-conflicting runtime update."""
+        cs = H._core_settings
+        path = tmp_path / "settings.json"
+        gui = cs.settings_object(path, tmp_path)
+        base = dict(gui.load())
+        runtime = cs.settings_object(path, tmp_path)
+        runtime.persist("handsfree", True)
+
+        candidate = dict(base)
+        candidate["bubble_size"] = 150
+        gui.write_all(candidate, expected_data=base)
+
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["handsfree"] is True
+        assert on_disk["bubble_size"] == 150
+
+    def test_full_save_rejects_conflicting_runtime_update(self, H, tmp_path):
+        """A GUI save must not overwrite a newer change to the same key."""
+        cs = H._core_settings
+        path = tmp_path / "settings.json"
+        gui = cs.settings_object(path, tmp_path)
+        base = dict(gui.load())
+        cs.settings_object(path, tmp_path).persist("bubble_size", 160)
+
+        candidate = dict(base)
+        candidate["bubble_size"] = 150
+        with pytest.raises(cs.SettingsConflictError):
+            gui.write_all(candidate, expected_data=base)
+
+        assert json.loads(path.read_text(encoding="utf-8"))["bubble_size"] == 160
+
+    def test_settings_writes_serialize_through_shared_lock(self, H, tmp_path, monkeypatch):
+        """The common writer lock prevents overlapping full writes."""
+        cs = H._core_settings
+        path = tmp_path / "settings.json"
+        entered = threading.Event()
+        release = threading.Event()
+        active = 0
+        maximum = 0
+        state_lock = threading.Lock()
+        real_write = cs._atomic_private_write
+
+        def slow_write(*args, **kwargs):
+            nonlocal active, maximum
+            with state_lock:
+                active += 1
+                maximum = max(maximum, active)
+            entered.set()
+            release.wait(timeout=5)
+            try:
+                return real_write(*args, **kwargs)
+            finally:
+                with state_lock:
+                    active -= 1
+
+        monkeypatch.setattr(cs, "_atomic_private_write", slow_write)
+        errors = []
+
+        def write(value):
+            try:
+                cs._write_settings_dict({"bubble_size": value}, path, tmp_path)
+            except BaseException as exc:  # surface worker failures below
+                errors.append(exc)
+
+        first = threading.Thread(target=write, args=(150,))
+        second = threading.Thread(target=write, args=(151,))
+        first.start()
+        assert entered.wait(timeout=5)
+        second.start()
+        time.sleep(0.05)
+        with state_lock:
+            assert active == 1
+        release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        assert not errors
+        assert maximum == 1
+
 
 class TestHealthCommand:
     """`health` control-socket command: one JSON snapshot of mic, brain and

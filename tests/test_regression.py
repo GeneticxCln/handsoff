@@ -8,6 +8,7 @@ from collections import deque
 import threading
 import io
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -45,6 +46,46 @@ class TestAuditFixes:
         time.sleep(0.2)
         assert captured.get("cancel_set") is False, "cancel was pre-set — reminder would be silent"
         assert "tea" in captured.get("text", "")
+
+    def test_logs_are_private_and_redacted(self, H, tmp_path):
+        path = tmp_path / "handsoff.log"
+        handler = H._PrivateRotatingFileHandler(path, maxBytes=1, backupCount=1)
+        handler.addFilter(H._PrivacyLogFilter())
+        logger = logging.getLogger("handsoff-test-private")
+        logger.handlers[:] = [handler]
+        logger.setLevel(logging.INFO)
+        try:
+            logger.info("heard (gen=1): secret transcript")
+            logger.info("run_command: %s", "cat /secret/password")
+            logger.info("edit_file content: secret file edit")
+            handler.flush()
+            assert path.stat().st_mode & 0o777 == 0o600
+            assert "secret transcript" not in path.read_text()
+            assert "password" not in path.read_text()
+            handler.doRollover()
+            assert (tmp_path / "handsoff.log.1").stat().st_mode & 0o777 == 0o600
+        finally:
+            logger.handlers.clear()
+            handler.close()
+
+    def test_remote_ollama_requires_explicit_opt_in(self, H, monkeypatch, caplog):
+        monkeypatch.setattr(H, "OLLAMA_BASE", "http://192.0.2.10:11434")
+        monkeypatch.delenv("HANDSOFF_ALLOW_REMOTE_OLLAMA", raising=False)
+        monkeypatch.setattr(H, "_REMOTE_OLLAMA_WARNED", False)
+        with pytest.raises(RuntimeError, match="non-loopback"):
+            H._guard_ollama_endpoint()
+        assert "privacy is not guaranteed" in caplog.text
+        monkeypatch.setenv("HANDSOFF_ALLOW_REMOTE_OLLAMA", "1")
+        H._guard_ollama_endpoint()
+
+    def test_late_worker_cannot_change_state_after_shutdown(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 3
+        a._state = H.THINKING
+        a._closed = True
+        a.sigState = types.SimpleNamespace(emit=lambda *_: None)
+        H.Assistant._set(a, 3, H.IDLE)
+        assert a.state == H.THINKING
 
     def test_announce_missed_uses_fresh_cancel(self, H):
         a = H.Assistant.__new__(H.Assistant)
@@ -620,6 +661,34 @@ class TestDeepAuditFixes:
         a._pipeline_q.join()
         assert sorted(ran) == [1, 2]
 
+    def test_pipeline_queue_latest_turn_replaces_pending_and_marks_done(self, H):
+        """Only pending work is replaceable; dropped work still balances join()."""
+        a = H.Assistant.__new__(H.Assistant)
+        a._pipeline_q = H.queue.Queue(maxsize=1)
+        a._pipeline_submit_lock = H.threading.Lock()
+        a._closed = False
+        a._shutdown_event = H.threading.Event()
+        old_cancel = H.threading.Event()
+        new_cancel = H.threading.Event()
+        old = (b"old", 1, old_cancel)
+        new = (b"new", 2, new_cancel)
+
+        assert a._enqueue_pipeline_turn(old) is True
+        assert a._enqueue_pipeline_turn(new) is True
+        assert old_cancel.is_set()
+        assert a._pipeline_q.get_nowait() is new
+        a._pipeline_q.task_done()
+        a._pipeline_q.join()
+
+    def test_pipeline_queue_rejects_after_shutdown(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        a._pipeline_q = H.queue.Queue(maxsize=1)
+        a._pipeline_submit_lock = H.threading.Lock()
+        a._closed = True
+        a._shutdown_event = H.threading.Event()
+        assert a._enqueue_pipeline_turn((b"late", 1, H.threading.Event())) is False
+        assert a._pipeline_q.empty()
+
     def test_history_write_respects_generation(self, H, monkeypatch):
         """A turn superseded by a newer utterance must not publish history."""
         a = H.Assistant.__new__(H.Assistant)
@@ -931,6 +1000,27 @@ class TestAuditNineFindings:
         assert not errors, errors
         names = {r["name"] for r in H._load_reminders()}
         assert len(names) == 20, f"lost updates: {len(names)}/20"
+
+    def test_toolbelt_dependencies_follow_worker_thread(self, H, monkeypatch,
+                                                         tmp_path):
+        """A belt made in the main thread keeps DI when execute runs in a worker."""
+        monkeypatch.setattr(H, "REMINDERS_FILE", tmp_path / "reminders.json")
+        monkeypatch.setattr(H, "REMINDERS_LOCK", H.threading.RLock())
+        H.REMINDERS_FILE.write_text("[]")
+        # Force the failure mode: an empty worker ContextVar must not replace
+        # the dependencies captured by this belt.
+        monkeypatch.setattr(H._core_tools, "_DEFAULT_DEPS", types.SimpleNamespace())
+        belt = H._core_tools.ToolBelt(
+            on_restart_pending=lambda: None, dependencies=H._tool_dependencies)
+        result = []
+        worker = H.threading.Thread(
+            target=lambda: result.append(belt.execute(
+                "set_reminder", {"wake_name": "worker", "when_due": "in 2 hours"})))
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert result and result[0][1] is False, result
+        assert H._load_reminders()[0]["name"] == "worker"
 
     def test_9_set_survives_deleted_qt_object(self, H):
         """A late emit after Qt teardown must not raise (background threads
