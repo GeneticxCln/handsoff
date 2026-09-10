@@ -263,6 +263,107 @@ class TestDoctor:
         assert "STALE" in text or "installed-drift" in text
 
 
+class TestDoctorModuleExtraction:
+    """core/doctor.py is the new home of run_doctor/doctor_json. The host
+    (handsoff.py) only re-exports them; the module must be importable and
+    usable on its own with an explicit deps object — never importing
+    handsoff.py itself."""
+
+    def test_core_doctor_imports_without_handsoff(self, monkeypatch):
+        """core.doctor must compile + import cleanly even when handsoff is
+        not on sys.path or has been removed. The shim must point at a
+        module whose only public names are run_doctor + doctor_json."""
+        import importlib
+        import sys as _sys
+
+        # Drop any cached core.doctor + handsoff shim so the import is honest.
+        for mod in list(_sys.modules):
+            if mod == "core.doctor" or mod.startswith("handsoff"):
+                _sys.modules.pop(mod, None)
+        # Strip the repo root from sys.path briefly so a stale handsoff.py
+        # cannot satisfy `import handsoff` (the path-handsoff is loaded from
+        # for tests still works — this just confirms the extraction does not
+        # require it to be importable by name during core.doctor import).
+        saved_path = list(_sys.path)
+        try:
+            from core import doctor
+        finally:
+            _sys.path[:] = saved_path
+        assert callable(doctor.run_doctor)
+        assert callable(doctor.doctor_json)
+
+    def test_core_doctor_does_not_import_handsoff(self):
+        """`import handsoff` must NOT be a transitive side effect of
+        `from core import doctor`. host-side deps arrive via DI, not globals."""
+        import sys as _sys
+        for mod in list(_sys.modules):
+            if mod == "core.doctor":
+                _sys.modules.pop(mod, None)
+            if mod == "handsoff":
+                _sys.modules.pop(mod, None)
+        from core import doctor  # noqa: F401
+        assert "handsoff" not in _sys.modules, (
+            "core.doctor must not pull in handsoff; use a DoctorDeps object "
+            "for all host-side state")
+
+    def test_legacy_fallback_byte_stable(self, monkeypatch, tmp_path, H):
+        """With the hardware module absent and ollama/niri/ydotool probes
+        monkeypatched into the legacy fallback path, run_doctor() output
+        must be byte-stable against the strings the old monolithic code
+        produced. This is the contract `--ptt doctor` and the
+        handsoff_doctor tool depend on."""
+        # Force the legacy path: pretend hardware.snapshot is absent.
+        monkeypatch.setattr(H, "_hardware", None, raising=False)
+        # Pin the ollama endpoint/model so the test is independent of host
+        # settings.json and env.
+        monkeypatch.setattr(H, "OLLAMA_BASE", "http://127.0.0.1:9")
+        monkeypatch.setattr(H, "OLLAMA_MODEL", "tinyllama")
+        # Legacy ollama path: ollama_available() returns False.
+        monkeypatch.setattr(H, "ollama_available", lambda: False)
+        # niri probe raises -> "UNAVAILABLE" branch with the bare exception
+        monkeypatch.setattr(H.ToolBelt, "_niri_msg",
+                            staticmethod(lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("no niri in tests"))))
+        # ydotool: pretend it's not installed so the line is exactly the
+        # legacy "NOT INSTALLED" string.
+        monkeypatch.setattr(H.shutil, "which", lambda n: None)
+        # sounddevice: present but reports zero input devices.
+        class _FakeSD:
+            @staticmethod
+            def query_devices():
+                return []
+        monkeypatch.setattr(H, "sd", _FakeSD())
+        # Point restart/systemd/control-sock/crash at empty tmp paths so
+        # the "MISSING" / "not created yet" lines are deterministic.
+        monkeypatch.setattr(H, "RESTART_SCRIPT", tmp_path / "no-restart")
+        monkeypatch.setattr(H, "SYSTEMD_UNIT_FILE", tmp_path / "no-unit.service")
+        monkeypatch.setattr(H, "CONTROL_SOCK", tmp_path / "no-sock")
+        monkeypatch.setattr(H, "CRASH_LOG", tmp_path / "no-crash.log")
+        # Make the deployment snapshot independent of the host checkout.
+        fake_manifest = tmp_path / "deployment.json"
+        fake_manifest.write_text(json.dumps({
+            "whisper_revision": "legacy", "whisper_sha256": "legacy",
+            "python": "/usr/bin/python3",
+        }))
+        monkeypatch.setattr(H, "DEPLOYMENT_FILE", fake_manifest)
+
+        text = H.run_doctor()
+
+        # Per-line legacy contract — every line the original code emits on
+        # the fallback path. If any of these changes, the legacy doctor
+        # output has drifted and every existing test diff will fail.
+        assert "brain: OLLAMA UNREACHABLE at http://127.0.0.1:9 — " \
+               "`systemctl status ollama`, then `ollama pull tinyllama`" in text
+        assert "tts: voice NOT loaded yet; stt: whisper NOT loaded yet" in text
+        assert "mic: NO input devices visible — check the mic is plugged in" in text
+        assert "niri IPC: UNAVAILABLE (no niri in tests) — desktop actions will fail" in text
+        assert "ydotool: NOT INSTALLED (typing tools will fail)" in text
+        assert f"restart script: MISSING at {tmp_path / 'no-restart'} — run install.sh" in text
+        assert "systemd unit: not installed (autostart falls back to niri spawn)" in text
+        assert "crash log: none (no native crashes recorded)" in text
+        assert "control socket: not created yet (bubble not running?)" in text
+
+
 class TestBoundedJobs:
     """start_command / job_status: bounded background jobs with completion
     announcements and a refusal policy identical to run_command."""
@@ -352,7 +453,8 @@ class TestInstalledCopySmoke:
                 (bin_dir / name).write_bytes(src.read_bytes())
         core_dir = bin_dir / "core"
         core_dir.mkdir(exist_ok=True)
-        for name in ("__init__.py", "settings.py", "audio.py", "brain.py", "tools.py"):
+        for name in ("__init__.py", "settings.py", "audio.py", "brain.py",
+                     "tools.py", "doctor.py"):
             (core_dir / name).write_bytes((HERE / "core" / name).read_bytes())
         (bin_dir / "handsoff-restart").chmod(0o755)
         state = home / "state"

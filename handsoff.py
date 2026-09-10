@@ -486,6 +486,7 @@ _DEPLOY_FILES = (
     "hardware.py",
     "core/__init__.py",
     "core/settings.py",
+    "core/doctor.py",
     "handsoff-restart",
 )
 
@@ -565,11 +566,24 @@ def _deployment_snapshot() -> dict:
 
 
 # --------------------------------------------------------------- doctor report
+# Phase 4d: doctor diagnostics moved to core/doctor.py. This file re-exports
+# the public names and wires every host-side dependency through the
+# core/doctor.Deps seam so the existing monkeypatch contract (H.OLLAMA_BASE,
+# H.ToolBelt._niri_msg, etc.) keeps working untouched.
 
 try:
     _hardware = _load_module("hardware")  # shared loader: origin-checked
 except ImportError:  # installed copy without the sibling module (yet)
     _hardware = None
+
+try:
+    _core_doctor = _load_module("doctor")
+except ImportError:
+    # Compatibility with already-installed bundles made before core/doctor.py:
+    # fall back to the original in-process implementation so the bubble keeps
+    # running while the user has not yet redeployed.
+    from core import doctor as _core_doctor  # type: ignore[no-redef]
+
 
 _DOCTOR_TTL: dict = {}  # shared TTL cache for prompt-context snapshots
 
@@ -621,6 +635,35 @@ def _hardware_prompt_context() -> str:
         return ""
 
 
+def _build_doctor_deps() -> _core_doctor.DoctorDeps:
+    """Late-bound deps so monkeypatch on H.OLLAMA_BASE / H.ToolBelt._niri_msg
+    / H.ollama_available / etc. keeps affecting the doctor output. The deps
+    object is rebuilt on every call (cheap; no I/O) so live host globals
+    always win."""
+    return _core_doctor.DoctorDeps(
+        ollama_base=OLLAMA_BASE,
+        ollama_model=OLLAMA_MODEL,
+        ollama_available=ollama_available,
+        piper_voice=_piper_voice,
+        whisper_model=_whisper_model,
+        deployment_snapshot=_deployment_snapshot,
+        hardware_snapshot=_doctor_snapshot,
+        hardware_prompt_context=_hardware_prompt_context,
+        doctor_ttl=_DOCTOR_TTL,
+        niri_msg=ToolBelt._niri_msg,
+        ydotool_socket=ToolBelt._ydotool_socket,
+        socket_connectable=ToolBelt._socket_connectable,
+        sys_version_info=sys.version_info,
+        restart_script=RESTART_SCRIPT,
+        systemd_unit_file=SYSTEMD_UNIT_FILE,
+        control_sock=CONTROL_SOCK,
+        crash_log=CRASH_LOG,
+        shutil=shutil,
+        sounddevice=sd,
+        log=log,
+    )
+
+
 def run_doctor() -> str:
     """One human-readable diagnostic pass over everything the bubble needs.
 
@@ -628,188 +671,20 @@ def run_doctor() -> str:
     `--ptt doctor` and the `handsoff_doctor` tool; the AI reads it to fix
     itself instead of guessing.
     """
-    lines: list[str] = []
-
-    d = _deployment_snapshot()
-    status = d["status"]
-    deploy_note = {
-        "in-sync": "installed copy matches the checkout",
-        "installed-drift": (
-            "INSTALLED COPY IS STALE — the running code is not the checkout. "
-            "Re-run install.sh to deploy the tested source."),
-        "source-unknown": "no checkout found (nothing to compare against)",
-        "installed-missing": "no copy at ~/.local/bin/handsoff.py — run install.sh",
-        "running-missing": "running source unreadable",
-    }.get(status, status)
-    lines.append(f"deployment: {status} — {deploy_note}")
-    manifest = d.get("manifest") if isinstance(d.get("manifest"), dict) else {}
-    revision = manifest.get("whisper_revision") or "unknown"
-    digest = manifest.get("whisper_sha256") or "unknown"
-    lines.append(f"whisper: revision {revision}; sha256 {digest}")
-    python_exe = manifest.get("python") or sys.executable
-    python_version = ".".join(str(part) for part in sys.version_info[:3])
-    lines.append(f"python: {python_exe} ({python_version})")
-    lines.append(f"  running: {d['running_path']}")
-    if d["running_sha256"]:
-        lines.append(f"  running sha256: {d['running_sha256'][:16]}…")
-    if d["repo_path"]:
-        lines.append(f"  checkout: {d['repo_path']}")
-
-    # ponytail: probe once via hardware.snapshot(); format the same strings
-    # so --ptt doctor output stays byte-stable. Fresh cache: doctor must see
-    # live state, never a TTL entry. Legacy probes below run only when the
-    # sibling module is absent.
-    snap = _doctor_snapshot({})
-    if snap is not None:
-        if snap["ollama"].get("ok"):
-            lines.append(f"brain: Ollama reachable at {OLLAMA_BASE} (model {OLLAMA_MODEL})")
-        else:
-            lines.append(
-                f"brain: OLLAMA UNREACHABLE at {OLLAMA_BASE} — "
-                "`systemctl status ollama`, then `ollama pull " + OLLAMA_MODEL + "`")
-
-        lines.append(f"tts: {'voice loaded' if _piper_voice is not None else 'voice NOT loaded yet'}; "
-                     f"stt: {'whisper loaded' if _whisper_model is not None else 'whisper NOT loaded yet'}")
-
-        audio = snap["audio"]
-        if audio.get("ok") and audio.get("count"):
-            lines.append(f"mic: {audio['count']} input device(s) visible")
-        elif audio.get("ok"):
-            lines.append("mic: NO input devices visible — check the mic is plugged in")
-        else:
-            lines.append(f"mic: audio subsystem error: {audio.get('error', 'unknown')}")
-
-        comp = snap["compositor"]
-        if comp.get("ok"):
-            lines.append(f"niri IPC: ok ({comp.get('windows', 0)} window(s))")
-        elif comp.get("error"):
-            lines.append(f"niri IPC: UNAVAILABLE ({comp['error']}) — desktop actions will fail")
-        else:
-            lines.append("niri IPC: refused — desktop actions will fail")
-
-        ydo = snap["ydotool"]
-        if not ydo.get("installed", True):
-            lines.append("ydotool: NOT INSTALLED (typing tools will fail)")
-        elif ydo.get("reachable"):
-            lines.append(f"ydotool: ok (daemon reachable at {ydo.get('socket')})")
-        else:
-            lines.append(f"ydotool: daemon UNREACHABLE (no socket at {ydo.get('socket')}) — "
-                         "start it: systemctl --user enable --now ydotool.service")
-    else:
-        if ollama_available():
-            lines.append(f"brain: Ollama reachable at {OLLAMA_BASE} (model {OLLAMA_MODEL})")
-        else:
-            lines.append(
-                f"brain: OLLAMA UNREACHABLE at {OLLAMA_BASE} — "
-                "`systemctl status ollama`, then `ollama pull " + OLLAMA_MODEL + "`")
-
-        lines.append(f"tts: {'voice loaded' if _piper_voice is not None else 'voice NOT loaded yet'}; "
-                     f"stt: {'whisper loaded' if _whisper_model is not None else 'whisper NOT loaded yet'}")
-
-        try:
-            import sounddevice as _sd
-            devs = [dd for dd in _sd.query_devices() if dd.get("max_input_channels", 0) > 0]
-            if devs:
-                lines.append(f"mic: {len(devs)} input device(s) visible")
-            else:
-                lines.append("mic: NO input devices visible — check the mic is plugged in")
-        except Exception as e:
-            lines.append(f"mic: audio subsystem error: {e}")
-
-        try:
-            r = ToolBelt._niri_msg("msg", "--json", "windows")
-            if r.returncode == 0:
-                n = len(json.loads(r.stdout or "[]"))
-                lines.append(f"niri IPC: ok ({n} window(s))")
-            else:
-                lines.append("niri IPC: refused — desktop actions will fail")
-        except Exception as e:
-            lines.append(f"niri IPC: UNAVAILABLE ({e}) — desktop actions will fail")
-
-        if shutil.which("ydotool"):
-            sock = ToolBelt._ydotool_socket()
-            if ToolBelt._socket_connectable(sock):
-                lines.append(f"ydotool: ok (daemon reachable at {sock})")
-            else:
-                lines.append(f"ydotool: daemon UNREACHABLE (no socket at {sock}) — "
-                             "start it: systemctl --user enable --now ydotool.service")
-        else:
-            lines.append("ydotool: NOT INSTALLED (typing tools will fail)")
-
-    if RESTART_SCRIPT.exists():
-        lines.append(f"restart script: present at {RESTART_SCRIPT}")
-    else:
-        lines.append(f"restart script: MISSING at {RESTART_SCRIPT} — run install.sh")
-
-    unit = SYSTEMD_UNIT_FILE
-    if unit.exists():
-        txt = ""
-        try:
-            txt = unit.read_text(encoding="utf-8")
-        except OSError:
-            pass
-        if "Restart=always" in txt or "Restart=on-failure" in txt:
-            lines.append("systemd unit: present, auto-restart configured")
-        else:
-            lines.append("systemd unit: present but has NO Restart= — crashes stay dead")
-    else:
-        lines.append("systemd unit: not installed (autostart falls back to niri spawn)")
-
-    if CRASH_LOG.exists():
-        try:
-            age = time.time() - CRASH_LOG.stat().st_mtime
-            lines.append(f"crash log: exists, last modified {age / 3600:.1f}h ago")
-        except OSError:
-            lines.append("crash log: exists (age unknown)")
-    else:
-        lines.append("crash log: none (no native crashes recorded)")
-
-    # can the bubble even bind its control socket? a symlinked/permissive
-    # path fails _prepare_runtime at startup and the failure was silent
+    token = _core_doctor.set_dependencies(_build_doctor_deps())
     try:
-        info = CONTROL_SOCK.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            lines.append("control socket: REFUSES STARTUP — path is a symlink")
-        elif info.st_uid != os.getuid():
-            lines.append("control socket: REFUSES STARTUP — not owned by you")
-        elif not stat.S_ISSOCK(info.st_mode):
-            lines.append("control socket: REFUSES STARTUP — path is not a socket")
-        else:
-            lines.append("control socket: ok")
-    except FileNotFoundError:
-        lines.append("control socket: not created yet (bubble not running?)")
-    except OSError as e:
-        lines.append(f"control socket: lstat failed ({e})")
-    return "\n".join(lines)
+        return _core_doctor.run_doctor()
+    finally:
+        _core_doctor.reset_dependencies(token)
 
 
 def doctor_json() -> dict:
     """Machine-readable doctor output for the control socket."""
-    d = _deployment_snapshot()
-    out: dict = {"deployment": d}
-    if CRASH_LOG.exists():
-        try:
-            out["crash_log_age_hours"] = round(
-                (time.time() - CRASH_LOG.stat().st_mtime) / 3600.0, 2)
-        except OSError:
-            pass
-    out["restart_script"] = RESTART_SCRIPT.exists()
-    out["systemd_unit"] = {
-        "present": SYSTEMD_UNIT_FILE.exists(),
-        "auto_restart": False,
-    }
-    if SYSTEMD_UNIT_FILE.exists():
-        try:
-            txt = SYSTEMD_UNIT_FILE.read_text(encoding="utf-8")
-            out["systemd_unit"]["auto_restart"] = bool(
-                re.search(r"^Restart=(always|on-failure|on-abnormal)$", txt, re.M))
-        except OSError:
-            pass
-    snap = _doctor_snapshot(_DOCTOR_TTL)
-    if snap is not None:
-        out["hardware"] = snap
-        out["prompt_context"] = _hardware_prompt_context()
-    return out
+    token = _core_doctor.set_dependencies(_build_doctor_deps())
+    try:
+        return _core_doctor.doctor_json()
+    finally:
+        _core_doctor.reset_dependencies(token)
 
 
 # ------------------------------------------------------------ typing selftest

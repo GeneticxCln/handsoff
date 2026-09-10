@@ -223,13 +223,14 @@ for mod in settings_schema hardware; do
 done
 if [ -f "$HERE/core/__init__.py" ] && [ -f "$HERE/core/settings.py" ] \
         && [ -f "$HERE/core/audio.py" ] && [ -f "$HERE/core/brain.py" ] \
-        && [ -f "$HERE/core/tools.py" ]; then
+        && [ -f "$HERE/core/tools.py" ] && [ -f "$HERE/core/doctor.py" ]; then
     mkdir -p "$BIN_DIR/core"
     install -m 644 "$HERE/core/__init__.py" "$BIN_DIR/core/__init__.py"
     install -m 644 "$HERE/core/settings.py" "$BIN_DIR/core/settings.py"
     install -m 644 "$HERE/core/audio.py" "$BIN_DIR/core/audio.py"
     install -m 644 "$HERE/core/brain.py" "$BIN_DIR/core/brain.py"
     install -m 644 "$HERE/core/tools.py" "$BIN_DIR/core/tools.py"
+    install -m 644 "$HERE/core/doctor.py" "$BIN_DIR/core/doctor.py"
 else
     echo "    FATAL: $HERE/core/ is missing but required by handsoff.py" >&2
     exit 1
@@ -333,6 +334,7 @@ $manifest_whisper_sha256
     "core/audio.py": {"source_sha256": "$(sha_of "$HERE/core/audio.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/audio.py")"},
     "core/brain.py": {"source_sha256": "$(sha_of "$HERE/core/brain.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/brain.py")"},
     "core/tools.py": {"source_sha256": "$(sha_of "$HERE/core/tools.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/tools.py")"},
+    "core/doctor.py": {"source_sha256": "$(sha_of "$HERE/core/doctor.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/doctor.py")"},
     "handsoff-restart": {"source_sha256": "$(sha_of "$HERE/handsoff-restart")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"}
   }
 }
@@ -519,7 +521,8 @@ assert manifest["files"]
 PY_EOF
     for required in \
         "$BIN_DIR/handsoff.py" "$BIN_DIR/settings_schema.py" "$BIN_DIR/hardware.py" \
-        "$BIN_DIR/core/__init__.py" "$BIN_DIR/core/settings.py" "$BIN_DIR/handsoff-restart" \
+        "$BIN_DIR/core/__init__.py" "$BIN_DIR/core/settings.py" "$BIN_DIR/core/doctor.py" \
+        "$BIN_DIR/handsoff-restart" \
         "$SYSTEMD_DIR/handsoff.service" "$CONF_DIR/niri-window-rule.kdl"; do
         [ -f "$required" ] || { echo "FATAL: rehearsal missing $required" >&2; exit 1; }
     done

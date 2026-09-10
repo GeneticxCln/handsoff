@@ -564,6 +564,27 @@ class TestRestartResilience:
         assert "for u in ydotool.service ydotoold.service" in text
         assert "ydotoold running via" in text
 
+    def test_installer_ships_core_doctor(self):
+        """core/doctor.py is the new home of the doctor diagnostic; the
+        installer must copy it into the deployed set and the deployment
+        manifest must hash it (so drift detection still works after the
+        monolith cut)."""
+        text = (HERE / "install.sh").read_text()
+        assert "core/doctor.py" in text, (
+            "install.sh must add core/doctor.py to the deployed file set")
+        # Manifest must hash it too — the deployment manifest stanza lives
+        # inside a `<<MANIFEST_EOF ... MANIFEST_EOF` heredoc and is what
+        # _deployment_snapshot() in handsoff.py diffs against. Slice out
+        # that body and look for the line.
+        open_tag = "<<MANIFEST_EOF"
+        close_tag = "MANIFEST_EOF"
+        start = text.find(open_tag)
+        end = text.find(close_tag, start + len(open_tag))
+        assert start != -1 and end != -1, "MANIFEST_EOF heredoc not found"
+        manifest_body = text[start + len(open_tag):end]
+        assert '"core/doctor.py"' in manifest_body, (
+            "core/doctor.py must appear in the deployment manifest hash check")
+
     def test_lock_failure_logs_instead_of_silent_exit(self, H, monkeypatch):
         """If the lock can't be acquired, say so in the log (no more silent vanish)."""
         import builtins
