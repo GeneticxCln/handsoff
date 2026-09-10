@@ -52,7 +52,14 @@ jobs:
           pip install -r requirements.txt -c requirements-lock.txt
           pip install pytest-cov
       - name: pytest with coverage gate
-        run: python -m pytest tests/ -q --cov=. --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=60
+        # COVERAGE_PROCESS_START makes the offscreen-GUI test drivers engage
+        # subprocess coverage (pytest-cov 7 has no automatic .pth hook), and
+        # the absolute COVERAGE_FILE keeps their parallel data files inside
+        # the workspace so pytest-cov's combine picks them up.
+        env:
+          COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc
+          COVERAGE_FILE: ${{ github.workspace }}/.coverage
+        run: python -m pytest tests/ -q --cov=. --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=70
 
   # Byte-compile every shipped Python source. py_compile never imports, so no
   # dependencies are needed and syntax rot in any file fails the build.

@@ -93,8 +93,8 @@
 Tasks 1–4 are fully closed (all their checkboxes verified against the code:
 `_menu_open` guard, `_ANNOUNCE_LOCK` playback-only serialization,
 `whisper_sha256` manifest digest, doctor provenance lines, branch tests, doc
-counts). Task 5's local gates pass (637 tests green, py_compile + bash -n
-clean, coverage 63.2% ≥ 60 floor); the live-host items above remain open
+counts). Task 5's local gates pass (659 tests green, py_compile + bash -n
+clean, coverage 71% ≥ 70 floor after the settings-GUI subprocess tests); the live-host items above remain open
 until the next real install run. On top of this plan, the 2026-09-10 audit
 also closed: CI action-SHA pinning, staged-release install with rollback,
 the `allow_remote_ollama` Settings/schema formalization, and the per-tool

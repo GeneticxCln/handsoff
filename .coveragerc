@@ -1,4 +1,11 @@
 [run]
+# Subprocess measurement: the offscreen-GUI scenarios (tests/test_settings_gui.py)
+# drive handsoff-settings.py in child processes. With COVERAGE_PROCESS_START set
+# (the CI coverage job exports it), those children start coverage via
+# coverage.process_startup(); parallel suffixes keep their data files from
+# clobbering the parent's, and pytest-cov combines them at session end.
+parallel = True
+
 omit =
     tests/*
     attic/*
@@ -11,9 +18,10 @@ omit =
     */signature_bootstrap.py
 
 [report]
-# Floor is 60 and that is HONEST: handsoff.py measures 70%, hardware.py 84%,
-# but the Qt settings GUI (handsoff-settings.py) is ~18% — widget wiring that
-# offscreen tests barely reach — and it drags TOTAL to 60%. Raising the floor
-# to 70 requires real settings-GUI test investment, not an omit-pattern.
-fail_under = 60
+# Floor tracks measured reality, not aspiration: handsoff.py 67%, hardware.py
+# 84%, core/* 64-100%, and the Qt settings GUI (handsoff-settings.py) went from
+# ~19% to 67% once tests/test_settings_gui.py began driving it in offscreen
+# subprocesses (TOTAL 71%). Raise further only with new tests, not
+# omit-patterns.
+fail_under = 70
 show_missing = True

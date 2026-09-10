@@ -6,9 +6,9 @@ Addendum below); remaining consciously-accepted items are at the bottom.
 ## Addendum — 2026-09-10 full-project audit closure (trust gaps, release
 ## safety, policy UI, supply-chain pins)
 
-Independent audit of the settled tree; every gate re-run on it: **637 tests
-green (2026-09-10)**, `py_compile` clean, `bash -n` clean, coverage 63.2%
-(≥ 60 floor). Findings → work landed the same day:
+Independent audit of the settled tree; every gate re-run on it: **659 tests
+green (2026-09-10)**, `py_compile` clean, `bash -n` clean, coverage 71%
+(≥ 70 floor). Findings → work landed the same day:
 
 1. **Remote-brain opt-in formalized.** The runtime guard (`_guard_ollama_endpoint`,
    fail-closed) already existed but its settings key was a ghost — accepted
@@ -38,12 +38,30 @@ green (2026-09-10)**, `py_compile` clean, `bash -n` clean, coverage 63.2%
 5. **Docs reconciled.** Test counts updated 583 → 637; the monolith-split
    status below reflects the executed Phase 4; the hygiene-hardening plan's
    checkboxes are closed against the code.
+6. **Settings History tab rebuilt as a transparency view** (same day): the
+   old Memory tab — which actually displayed history.json again — is folded
+   away, and History now has three panes: **Conversation** (history.json,
+   with the pre-existing clear-with-backup), **Durable facts** (the real
+   `memory.json` store, listed deduped-by-key like the model sees it, with a
+   confirmed Forget action that backs up and atomically rewrites the file),
+   and **Decision log** (decisions.jsonl rendered one line per tool-policy
+   decision, tolerant of garbage lines). The long-standing "Settings
+   History/decision-viewer tab" open item is closed by this.
+7. **GitLab CI mirror added.** The remote (gitlab.com/GeneticxClm/handsoff)
+   is GitLab, so `.gitlab-ci.yml` now reproduces every GH gate: the test
+   matrix (3.12/3.13), the ≥70 coverage job (same subprocess-coverage env),
+   byte-compile, shell checks, installer smoke. Supply-chain parity: CI
+   images are digest-pinned (tags in comments), and the `shell` job fails on
+   any tag-only image ref — the GitLab-side analogue of the GH SHA-pin
+   guard. The GH workflow stays the authoritative definition; keep the two
+   files in lockstep.
 
 Still open after this pass: the live-host redeploy (the running bubble
 predates this tree, so its doctor correctly reports `installed-drift` until
 `./install.sh` runs again), the six human acceptance items in
-`ACCEPTANCE.md`, unsupported D-Bus Notify layouts, settings-GUI coverage
-(~19%), and the consciously-accepted Phase-3 leftovers (staged release
+`ACCEPTANCE.md`, unsupported D-Bus Notify layouts, further settings-GUI
+coverage depth (67% now; the remaining gaps are heavy widget-interaction
+flows), and the consciously-accepted Phase-3 leftovers (staged release
 directory *inside* the runtime + remote-transport policy doc are done; the
 full provenance/rollback story for the *manifest* itself remains as-is).
 
@@ -77,11 +95,12 @@ Outcomes of the user's gaps/improvements list (583 tests green, 2026-09-10):
    GPU (`cuda`/float16) only when `nvidia-smi` free VRAM fits the model's
    budget + 1 GB desktop buffer, CPU/int8 otherwise; forced `cpu`/`cuda`
    honored, and a GPU load failure degrades to CPU instead of crashing.
-6. **Coverage measured honestly.** The 60% TOTAL was polluted by PySide6's
-   vendored `shibokensupport` phantom files (now omitted): real numbers are
-   handsoff.py 70%, hardware.py 84%, handsoff-settings.py (Qt GUI) 18%.
-   The floor stays 60 with a comment explaining why 70 needs settings-GUI test
-   investment rather than an omit-pattern; the "~75%" premise was stale.
+6. **Coverage measured honestly — then raised.** The 60% TOTAL had been
+   polluted by PySide6's vendored `shibokensupport` phantom files (now
+   omitted). Once `tests/test_settings_gui.py` drove the Qt GUI in offscreen
+   subprocesses (with `COVERAGE_PROCESS_START` + `parallel = True` engaging
+   subprocess measurement), handsoff-settings.py went 18% → 67%, TOTAL → 71%+ (659 tests),
+   and the floor moved to 70.
 
 ### Monolith split — step (a) EXECUTED (2026-09-09)
 7. **`core/settings.py` extracted.** The settings machinery (coercion,
@@ -115,11 +134,12 @@ only passed on hosts up longer than 60 minutes).
 
 ### Not done (revisited, still open)
 - Unsupported/unusual Notify layouts beyond actions/hints trailers,
-  Compositor interface for niri-stub testing,
-  Settings History/decision-viewer tab — unchanged from the P1/P2 lists
-  below. (Per-tool policy UI and installer `--rehearse` coverage are DONE —
-  see the 2026-09-10 addendum above: dropdown policy rows in Settings, and
-  the rehearsal e2e runs inside the suite as `TestStagedRelease`.)
+  Compositor interface for niri-stub testing.
+  (Per-tool policy UI, installer `--rehearse` coverage, and the Settings
+  History/decision-viewer tab are DONE — see the 2026-09-10 addendum above:
+  dropdown policy rows in Settings, the rehearsal e2e running inside the
+  suite as `TestStagedRelease`, and the History tab's Conversation /
+  Durable facts / Decision log panes.)
 
 ## Addendum — 2026-09-09 trust & reliability program (P0–P2 closed)
 
@@ -196,9 +216,9 @@ calendar, settings, lifecycle, regression, ops).
   single-source-of-truth (repo files shipped as-is; manifest added).
 
 Still open, accepted consciously: real-hardware acceptance run (see
-`ACCEPTANCE.md`), richer D-Bus notification formatting, and the
-Settings History/decision-viewer tab. (Per-tool `command_policy` rows and
-CI rehearse-style installer coverage closed 2026-09-10 — see the top
+`ACCEPTANCE.md`) and richer D-Bus notification formatting. (Per-tool
+`command_policy` rows, CI rehearse-style installer coverage, and the
+Settings History/decision-viewer tab closed 2026-09-10 — see the top
 addendum.)
 
 ## Addendum — 2026-09-09 hardening audit (post-merge review)
@@ -276,7 +296,7 @@ emit unusual Notify argument layouts. (Installer rehearsal coverage closed
 - Ops: niri window rule (round bubble), autostart, keybinds Mod+V / Mod+Shift+V
   / Mod+Shift+H / Mod+Shift+S (settings, works even when the bubble is dead),
   restart script with lock race fixed, faulthandler crash log
-- 637 tests, all green (2026-09-10)
+- 659 tests, all green (2026-09-10)
 - Ambient automation: opt-in notification reader, Pomodoro transitions, RAM/VRAM
   threshold crossings, and bounded file/process watchers; all have Settings
   controls or safe tool gates

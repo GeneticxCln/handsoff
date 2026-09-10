@@ -908,7 +908,6 @@ class SettingsWindow(QMainWindow):
         tabs.addTab(self._brain_tab(), "Brain")
         tabs.addTab(self._voice_tab(), "Voice")
         tabs.addTab(self._permissions_tab(), "Permissions")
-        tabs.addTab(self._memory_tab(), "Memory")
         tabs.addTab(self._appearance_tab(), "Appearance")
         tabs.addTab(self._startup_tab(), "Startup")
         self._history_page = self._history_tab()
@@ -1599,90 +1598,185 @@ class SettingsWindow(QMainWindow):
 
     # ------------------------------------------------------------------ memory
 
-    def _memory_tab(self) -> QWidget:
-        """Show what the AI currently remembers — demystifies 'why did it say
-        that' (stale/poisoned history was the root cause of the parrot bug)."""
-        w = QWidget(self)
-        lay = QVBoxLayout(w)
-        info = QLabel(
-            "The bubble's conversation memory. New messages are added here; "
-            "clearing it makes the assistant forget everything and start fresh.", w)
-        info.setWordWrap(True)
-        lay.addWidget(info)
-        self.memory_view = QPlainTextEdit(self)
-        self.memory_view.setReadOnly(True)
-        lay.addWidget(self.memory_view)
-        row = QHBoxLayout()
-        refresh = QPushButton("Refresh", self)
-        refresh.clicked.connect(self._refresh_memory)
-        clear = QPushButton("Clear memory (fresh start)", self)
-        clear.clicked.connect(self._clear_memory)
-        row.addWidget(refresh)
-        row.addWidget(clear, 1)
-        lay.addLayout(row)
-        self._refresh_memory()
-        return w
-
-    def _refresh_memory(self) -> None:
-        try:
-            data = json.loads(H.HISTORY_FILE.read_text(encoding="utf-8"))
-            msgs = [m for m in data if isinstance(m, dict) and m.get("role")]
-        except Exception:
-            msgs = []
-        if not msgs:
-            self.memory_view.setPlainText("(memory is empty — fresh start)")
-            return
-        lines = [f"{len(msgs)} messages — newest last:", ""]
-        for m in msgs:
-            role = m.get("role")
-            if m.get("tool_calls"):
-                names = ", ".join(
-                    (tc.get("function") or {}).get("name", "?")
-                    for tc in m["tool_calls"])
-                lines.append(f"[assistant] calls tool: {names}")
-                continue
-            if role == "tool":
-                content = str(m.get("content"))[:150].replace("\n", " ")
-                lines.append(f"[tool result] {content}")
-                continue
-            content = str(m.get("content"))[:150].replace("\n", " ")
-            lines.append(f"[{role}] {content}")
-        self.memory_view.setPlainText("\n".join(lines))
-
-    def _clear_memory(self) -> None:
-        try:
-            if H.HISTORY_FILE.exists():
-                _backup_keep_n(H.HISTORY_FILE, "bak-manual")
-            self.memory_view.setPlainText("(memory cleared — backup saved)")
-            self._status("memory cleared (backup saved). Restart the bubble to apply.")
-        except OSError as e:
-            self._status(f"cannot clear memory: {e}")
-
     # ------------------------------------------------------------------ history
 
     def _history_tab(self) -> QWidget:
-        """Recent conversation history — same history.json store the bubble
-        persists (and the Memory tab reads)."""
+        """Transparency tab: the three stores the bubble reasons from.
+
+        - Conversation: the rolling history.json the model sees each turn.
+        - Durable facts: memory.json facts extracted from conversation that
+          survive trimming and restarts.
+        - Decision log: decisions.jsonl, one line per tool-policy decision
+          (ALLOW / DENY / CONFIRM / DRY-RUN) — the 'why did it do that'
+          record."""
         w = QWidget(self)
         lay = QVBoxLayout(w)
+        sub = QTabWidget(w)
+        sub.addTab(self._conversation_pane(), "Conversation")
+        sub.addTab(self._facts_pane(), "Durable facts")
+        sub.addTab(self._decisions_pane(), "Decision log")
+        lay.addWidget(sub, 1)
+        self._refresh_history()
+        self._refresh_facts()
+        self._refresh_decisions()
+        return w
+
+    def _conversation_pane(self) -> QWidget:
+        w = QWidget(self)
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
         info = QLabel(
             "Recent conversation history. New messages are added here; "
             "clearing it makes the assistant forget everything and start fresh.", w)
         info.setWordWrap(True)
         lay.addWidget(info)
-        self.history_view = QPlainTextEdit(self)
+        self.history_view = QPlainTextEdit(w)
         self.history_view.setReadOnly(True)
         lay.addWidget(self.history_view)
         row = QHBoxLayout()
-        refresh = QPushButton("Refresh", self)
+        refresh = QPushButton("Refresh", w)
         refresh.clicked.connect(self._refresh_history)
-        clear = QPushButton("Clear history", self)
+        clear = QPushButton("Clear history", w)
         clear.clicked.connect(self._clear_history)
         row.addWidget(refresh)
         row.addWidget(clear, 1)
         lay.addLayout(row)
-        self._refresh_history()
         return w
+
+    def _facts_pane(self) -> QWidget:
+        w = QWidget(self)
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        info = QLabel(
+            "Durable facts the assistant extracted from conversation (name, "
+            "family, likes, home\u2026). They survive restarts and trimming. "
+            "Forgetting one lets it be re-learned the next time you say it.", w)
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.facts_list = QListWidget(w)
+        self.facts_list.setAlternatingRowColors(True)
+        lay.addWidget(self.facts_list, 1)
+        row = QHBoxLayout()
+        refresh = QPushButton("Refresh", w)
+        refresh.clicked.connect(self._refresh_facts)
+        forget = QPushButton("Forget selected fact", w)
+        forget.clicked.connect(self._forget_fact)
+        row.addWidget(refresh)
+        row.addWidget(forget, 1)
+        lay.addLayout(row)
+        return w
+
+    def _refresh_facts(self) -> None:
+        """Re-render the facts pane from memory.json. Facts are stored as
+        {k: replaceable key, v: sentence} — a new 'my name is X' replaces the
+        old name fact — so the viewer shows the same deduped view the model
+        sees, not raw file history."""
+        try:
+            data = json.loads(H.MEMORY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = []
+        facts: dict[str, str] = {}
+        if isinstance(data, list):
+            for m in data:
+                if (isinstance(m, dict) and str(m.get("k", ""))
+                        and str(m.get("v", ""))):
+                    facts[str(m["k"])] = str(m["v"])
+        self.facts_list.clear()
+        if not facts:
+            empty = QListWidgetItem("(no durable facts yet)")
+            empty.setFlags(Qt.NoItemFlags)
+            self.facts_list.addItem(empty)
+            return
+        for k, v in facts.items():
+            it = QListWidgetItem(f"{v}   [{k}]")
+            it.setData(Qt.UserRole, v)
+            self.facts_list.addItem(it)
+
+    def _forget_fact(self) -> None:
+        item = self.facts_list.currentItem()
+        if item is None or item.data(Qt.UserRole) is None:
+            return
+        ok = QMessageBox.question(
+            self, "Forget fact",
+            f"Make the assistant forget:\n{item.text()}\n\n"
+            "It is re-learned if you state it again.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ok != QMessageBox.Yes:
+            return
+        fact = item.data(Qt.UserRole)
+        try:
+            data = json.loads(H.MEMORY_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            self._status(f"cannot read memory.json: {e}")
+            return
+        kept = [m for m in data if isinstance(m, dict)
+                and str(m.get("v", "")) != fact]
+        try:
+            from core.settings import _atomic_private_write
+            _backup_keep_n(H.MEMORY_FILE, "bak-facts")
+            _atomic_private_write(
+                H.MEMORY_FILE, json.dumps(kept, ensure_ascii=False, indent=1))
+        except OSError as e:
+            self._status(f"cannot update memory.json: {e}")
+            return
+        self._status("fact forgotten. The running bubble keeps its in-memory "
+                     "copy until it restarts.")
+        self._refresh_facts()
+
+    def _decisions_pane(self) -> QWidget:
+        w = QWidget(self)
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        info = QLabel(
+            "One line per tool decision (ALLOW / DENY / CONFIRM / DRY-RUN), "
+            "kept in decisions.jsonl — the 'why did it do that' record. "
+            "Read-only here; the bubble prunes the file itself.", w)
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.decisions_view = QPlainTextEdit(w)
+        self.decisions_view.setReadOnly(True)
+        self.decisions_view.setMaximumBlockCount(20000)
+        lay.addWidget(self.decisions_view, 1)
+        row = QHBoxLayout()
+        refresh = QPushButton("Refresh", w)
+        refresh.clicked.connect(self._refresh_decisions)
+        row.addWidget(refresh, 1)
+        lay.addLayout(row)
+        return w
+
+    def _refresh_decisions(self) -> None:
+        try:
+            raw = H.DECISIONS_FILE.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            self.decisions_view.setPlainText(
+                "(no decisions logged yet — the bubble writes one line per "
+                "tool call once it runs)")
+            return
+        except OSError as e:
+            self.decisions_view.setPlainText(f"(cannot read decision log: {e})")
+            return
+        out: list[str] = []
+        for line in raw:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            out.append(
+                "{ts}  {dec:<8} {tool} \u2192 {target}   ({result})   #{id}".format(
+                    ts=str(d.get("ts", "?")), dec=str(d.get("decision", "?")),
+                    tool=str(d.get("tool", "?")), target=str(d.get("target", "")),
+                    result=str(d.get("result", "")), id=str(d.get("id", ""))))
+        if not out:
+            self.decisions_view.setPlainText(
+                "(decision log has no readable entries)")
+            return
+        self.decisions_view.setPlainText(
+            f"{len(out)} decisions — newest last:\n\n" + "\n".join(out))
 
     def _refresh_history(self) -> None:
         try:
@@ -1730,6 +1824,8 @@ class SettingsWindow(QMainWindow):
             if getattr(self, "tabs", None) is not None and self.tabs.widget(index) is getattr(
                     self, "_history_page", None):
                 self._refresh_history()
+                self._refresh_facts()
+                self._refresh_decisions()
         except Exception:
             pass
 

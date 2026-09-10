@@ -32,9 +32,10 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 637 tests pin the behavior (`python -m pytest tests/`),
+automatically. 659 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
-regression, and ops.
+regression, and ops — including offscreen-Qt scenarios that drive the
+settings GUI itself.
 
 ## Requirements
 
@@ -345,15 +346,17 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest tests/ -q     # 637 tests
+python -m pytest tests/ -q     # 659 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly these gates on every push: the
-suite on Python 3.12 and 3.13 (offscreen Qt, no audio hardware needed),
-byte-compilation of every source file, and shell syntax checks. Background-
-thread exceptions fail the run via `pytest.ini` rather than passing silently.
+CI (`.github/workflows/ci.yml`, mirrored gate-for-gate in `.gitlab-ci.yml` for
+the GitLab remote) runs exactly these gates on every push: the suite on
+Python 3.12 and 3.13 (offscreen Qt, no audio hardware needed), a coverage
+floor job, byte-compilation of every source file, shell syntax checks with
+supply-chain pin guards, and an installer smoke test. Background-thread
+exceptions fail the run via `pytest.ini` rather than passing silently.
 The suite includes an **installed-copy smoke test**: a fake `~/.local/bin`
 deployment is booted offscreen and poked over the control socket, so a
 checkout that works but deploys broken cannot slip through.
@@ -371,8 +374,11 @@ deliberately with `git commit --no-verify`.
 
 Layout of `handsoff.py`: config → system prompt → Ollama client → audio
 (STT/TTS) → tools → Assistant state machine → Bubble UI → main(). The
-settings app is separate (`handsoff-settings.py`); `tests/fake_ollama.py`
-fakes the Ollama API for the streaming tests.
+settings app is separate (`handsoff-settings.py`); its **History** tab
+shows the conversation memory, the durable facts (`memory.json`) with a
+forget action, and the tool-decision log (`decisions.jsonl`) — so "why did
+it say/do that" has a GUI answer. `tests/fake_ollama.py` fakes the Ollama
+API for the streaming tests.
 
 Known limitations: the ICS parser handles DAILY/WEEKLY recurrence plus
 EXDATE and RECURRENCE-ID (canceled/moved instances of recurring events are

@@ -1,0 +1,124 @@
+# GitLab CI — mirrors .github/workflows/ci.yml gate-for-gate for this repo's
+# GitLab remote (origin: gitlab.com/GeneticxClm/handsoff). The GitHub
+# workflow stays the authoritative definition: when a gate changes there,
+# change it here too.
+#
+# Supply-chain parity with the GH pins: every image below is pinned by
+# *digest* (tag kept in a trailing comment), and the `shell` job fails CI if
+# a mutable tag-only image ref ever sneaks back in — same policy as the
+# SHA-pinned GH actions.
+#
+# Debian slim + PySide6: the wheels bundle Qt, but offscreen rendering still
+# needs a few runtime libraries (glib/GL/EGL/xkbcommon/dbus/fontconfig). The
+# GitHub runners get these from the shared ubuntu image; Debian slim needs
+# them explicitly. Digests are frozen, so the Debian base (trixie, hence the
+# t64 package names) cannot drift under us.
+
+stages: [test, static, smoke]
+
+default:
+  interruptible: true
+
+# Pip download cache, keyed on the constraints file (same on every job).
+.pip_cache: &pip_cache
+  cache:
+    key:
+      files:
+        - requirements-lock.txt
+    paths:
+      - .pip-cache
+
+# One shell line: offscreen-Qt runtime libraries + bash (Debian slim ships
+# no bash). tests/ and coverage/ keep this in sync.
+.qt_deps: &qt_deps
+  "apt-get update -qq
+  && apt-get install -yqq --no-install-recommends bash libglib2.0-0t64
+     libgl1 libegl1 libxkbcommon0 libdbus-1-3t64 libfontconfig1
+  && rm -rf /var/lib/apt/lists/*"
+
+# --- The full test suite (GH: `tests` matrix job) ---------------------------
+# Single source of truth: requirements.txt (pinned floors) installed with the
+# checked-in constraints file for reproducibility — same as GH.
+.tests_base:
+  stage: test
+  variables:
+    # The offscreen-launch test spawns the real bubble without a display.
+    QT_QPA_PLATFORM: offscreen
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  <<: *pip_cache
+  script:
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt -c requirements-lock.txt
+    - python -m pytest tests/ -q
+
+tests:3.12:
+  extends: .tests_base
+  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+
+tests:3.13:
+  extends: .tests_base
+  image: "python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285" # 3.13-slim
+
+# --- Coverage floor (GH: `coverage` job) ------------------------------------
+coverage:
+  stage: test
+  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  variables:
+    QT_QPA_PLATFORM: offscreen
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+    # Subprocess coverage: the offscreen-GUI drivers engage measurement when
+    # COVERAGE_PROCESS_START is set, and the absolute COVERAGE_FILE keeps
+    # their parallel data files in the workspace for the combine.
+    COVERAGE_PROCESS_START: "$CI_PROJECT_DIR/.coveragerc"
+    COVERAGE_FILE: "$CI_PROJECT_DIR/.coverage"
+  <<: *pip_cache
+  script:
+    - *qt_deps
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt -c requirements-lock.txt
+    - pip install pytest-cov
+    - python -m pytest tests/ -q --cov=. --cov-config=.coveragerc
+      --cov-report=term-missing --cov-fail-under=70
+
+# --- Byte-compile every shipped source (GH: `compile` job) ------------------
+# py_compile never imports: no Qt libs or dependencies needed at all.
+compile:
+  stage: static
+  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  script:
+    - python -m py_compile handsoff.py handsoff-settings.py settings_schema.py
+      hardware.py core/__init__.py core/settings.py attic/patch_wakeword.py
+      tests/fake_ollama.py
+    - python -m py_compile tests/*.py
+
+# --- Shell checks + pin guards (GH: `shell` job) ----------------------------
+shell:
+  stage: static
+  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  script:
+    # GitHub side: action refs must stay immutable SHAs.
+    - |
+      if grep -nE 'uses: [^ ]+@v[0-9]+' .github/workflows/ci.yml; then
+        echo "ERROR: GH action refs must be pinned to immutable SHAs."
+        exit 1
+      fi
+    # GitLab side: image refs must stay digest-pinned (variable refs OK).
+    - |
+      bad=$(grep -nE '^[[:space:]]*image:' .gitlab-ci.yml | grep -v '@' || true)
+      if [ -n "$bad" ]; then
+        echo "ERROR: CI image refs must be digest-pinned (tag in a comment):"
+        echo "$bad"
+        exit 1
+      fi
+    - bash -n install.sh
+    - bash -n handsoff-restart
+
+# --- Installer smoke (GH: `smoke` job) --------------------------------------
+# --help must parse and print usage without touching the system.
+smoke:
+  stage: smoke
+  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  script:
+    - out=$(bash install.sh --help)
+    - echo "$out" | grep -q "Options:"
+    - echo "$out" | grep -q -- "--uninstall"
