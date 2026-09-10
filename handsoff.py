@@ -2808,6 +2808,42 @@ def _classify_edit_path(p: Path) -> str:
 
 
 
+# Phase 4e compatibility facade: core.lifecycle provides minimal turn primitives.
+try:
+    from core import lifecycle as _core_lifecycle
+except ImportError:
+    _core_lifecycle = None
+
+if _core_lifecycle is not None:
+    TurnState = _core_lifecycle.TurnState
+    next_turn = _core_lifecycle.next_turn
+else:
+    # Fallback inline definitions for pre-Phase-4e installed bundles.
+    import threading
+    from dataclasses import dataclass
+    from typing import Any
+
+    @dataclass(slots=True)
+    class TurnState:
+        generation: int
+        cancel: threading.Event
+        done: threading.Event
+        result: Any = None
+
+    def next_turn(counter: list[int] | dict) -> TurnState:
+        if isinstance(counter, list):
+            counter[0] += 1
+            gen = counter[0]
+        else:
+            counter["gen"] = counter.get("gen", 0) + 1
+            gen = counter["gen"]
+        return TurnState(
+            generation=gen,
+            cancel=threading.Event(),
+            done=threading.Event(),
+            result=None,
+        )
+
 # Phase 4c compatibility facade.  The extracted module receives a late-bound
 # host proxy so existing module globals and monkeypatch seams stay live.
 from types import SimpleNamespace as _SimpleNamespace

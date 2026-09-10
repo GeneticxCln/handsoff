@@ -26,6 +26,69 @@ from conftest import HERE as ROOT, _load, _user_site
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
 
+class TestCoreLifecycle:
+    """core.lifecycle imports independently and provides minimal turn primitives."""
+
+    def test_core_lifecycle_imports_independently(self):
+        """core.lifecycle must not import handsoff.py, Qt, or Assistant."""
+        import core.lifecycle as lifecycle
+
+        # Verify the module loads without pulling in heavy deps
+        assert hasattr(lifecycle, "TurnState")
+        assert hasattr(lifecycle, "next_turn")
+
+    def test_turnstate_is_dataclass_with_four_fields(self):
+        """TurnState is a small dataclass with generation, cancel, done, result."""
+        import core.lifecycle as lifecycle
+        from dataclasses import fields
+
+        fs = {f.name for f in fields(lifecycle.TurnState)}
+        assert fs == {"generation", "cancel", "done", "result"}
+
+        # Can construct with all fields
+        cancel = threading.Event()
+        done = threading.Event()
+        ts = lifecycle.TurnState(generation=42, cancel=cancel, done=done, result="ok")
+        assert ts.generation == 42
+        assert ts.cancel is cancel
+        assert ts.done is done
+        assert ts.result == "ok"
+
+    def test_next_turn_advances_counter_and_returns_fresh_turnstate(self):
+        """next_turn increments the mutable counter and returns a fresh TurnState."""
+        import core.lifecycle as lifecycle
+
+        counter = [0]
+        ts1 = lifecycle.next_turn(counter)
+        assert ts1.generation == 1
+        assert counter[0] == 1
+        assert isinstance(ts1.cancel, threading.Event)
+        assert isinstance(ts1.done, threading.Event)
+        assert not ts1.cancel.is_set()
+        assert not ts1.done.is_set()
+        assert ts1.result is None
+
+        ts2 = lifecycle.next_turn(counter)
+        assert ts2.generation == 2
+        assert counter[0] == 2
+        # Fresh events each call
+        assert ts2.cancel is not ts1.cancel
+        assert ts2.done is not ts1.done
+
+    def test_next_turn_works_with_dict_counter(self):
+        """next_turn also accepts a dict as the mutable counter container."""
+        import core.lifecycle as lifecycle
+
+        counter = {"gen": 0}
+        ts1 = lifecycle.next_turn(counter)
+        assert ts1.generation == 1
+        assert counter["gen"] == 1
+
+        ts2 = lifecycle.next_turn(counter)
+        assert ts2.generation == 2
+        assert counter["gen"] == 2
+
+
 class TestSourceIntegrity:
     @pytest.mark.parametrize("name", ["handsoff.py", "handsoff-settings.py"])
     def test_compiles(self, name):
