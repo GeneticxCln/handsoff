@@ -32,7 +32,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 583 tests pin the behavior (`python -m pytest tests/`),
+automatically. 637 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
 regression, and ops.
 
@@ -157,6 +157,13 @@ bubble is dead.
 target, decision (`ALLOW`/`DENY`/`CONFIRM`/`DRY-RUN`) and result, so "why did
 it do that" always has an answer.
 
+**Remote brain guard** — pointing `ollama_host` at a non-loopback server sends
+your conversation history, voice transcripts, screenshots, and tool schemas
+off this machine. The bubble refuses every brain request until you check
+*Allow a remote server* in Settings → Brain (`allow_remote_ollama: true`) or
+set `HANDSOFF_ALLOW_REMOTE_OLLAMA=1`; a warning is logged either way, and
+`--ptt doctor` shows the status (`brain privacy: REMOTE …`).
+
 ## Permissions
 
 The Settings app (`python ~/.local/bin/handsoff-settings.py`, or right-click
@@ -187,7 +194,8 @@ Safety boundaries enforced in code (not just the prompt):
   dir; self-edits must keep the marker line and compile
 - Tool-call rate limiting is available in Settings (default: unlimited)
 - **Centralized policy** — per-tool `ALLOW` / `DENY` / `CONFIRM`
-  (`command_policy` in settings.json or the Permissions tab). `DENY` refuses
+  (`command_policy` in settings.json or the Permissions tab, one dropdown row
+  per declared tool). `DENY` refuses
   before anything runs, regardless of permission switches; `CONFIRM` offers
   out loud and runs only after a separate next-turn `confirm_action('yes')`
   — one-turn separation, the same two-step pattern as `kill_process`.
@@ -203,6 +211,7 @@ Safety boundaries enforced in code (not just the prompt):
 | Key | Default | Meaning |
 |---|---|---|
 | `model` | `qwen3:8b` | any Ollama model tag |
+| `allow_remote_ollama` | false | explicit opt-in for a non-loopback Ollama server (see *Remote brain guard*) |
 | `num_ctx` | 32768 | context window |
 | `history_tokens` | 0 (auto) | history budget; auto = ctx − prompt − reserve |
 | `whisper_size` | `tiny` | STT size; `small` is a good speed/accuracy middle |
@@ -309,6 +318,10 @@ instead of starting by hand; it waits for the lock.
 
 ## Recovery
 
+- **Bad deploy?** The installer gates every release through a staged copy
+  (byte-compile + schema-import smoke) before switching `~/.local/bin`, and
+  keeps the previous set at `~/.config/handsoff/releases/prev`:
+  `./install.sh --rollback` restores it (a failed switch auto-restores).
 - **Bad self-edit?** Every `edit_file` writes a `.bak` next to the file. The
   bubble also refuses to restart into a source that doesn't compile or lost
   its self-marker; restore the `.bak` and run `~/.local/bin/handsoff-restart`.
@@ -332,7 +345,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest tests/ -q     # 583 tests
+python -m pytest tests/ -q     # 637 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```

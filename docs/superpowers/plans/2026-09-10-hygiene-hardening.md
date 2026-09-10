@@ -28,11 +28,11 @@
 - Preserve `_speak(text, gen, cancel)` and `BubbleWidget._hold_fired()` signatures.
 - Add only a small menu-open guard and keep `_ANNOUNCE_LOCK` around playback, not synthesis.
 
-- [ ] Add a regression test that starts the hold timer, opens the right-click menu, and verifies `_hold_fired()` does not call `begin_listening()` while the menu is open.
-- [ ] Add a speech test proving synthesis may overlap but `play_wav()` calls are serialized and a later cancel prevents stale playback.
-- [ ] Add `self._menu_open` state, stop the hold timer on right-click, and guard `_hold_fired()`.
-- [ ] Move `tts_to_wav()` outside `_ANNOUNCE_LOCK`; retain the lock only around `play_wav()` and cancellation state.
-- [ ] Run the focused tests, then the full suite.
+- [x] Add a regression test that starts the hold timer, opens the right-click menu, and verifies `_hold_fired()` does not call `begin_listening()` while the menu is open.
+- [x] Add a speech test proving synthesis may overlap but `play_wav()` calls are serialized and a later cancel prevents stale playback.
+- [x] Add `self._menu_open` state, stop the hold timer on right-click, and guard `_hold_fired()`.
+- [x] Move `tts_to_wav()` outside `_ANNOUNCE_LOCK`; retain the lock only around `play_wav()` and cancellation state.
+- [x] Run the focused tests, then the full suite.
 
 ### Task 2: Deployment provenance
 
@@ -44,11 +44,11 @@
 - Preserve `deployment.json` compatibility with existing `files`, `whisper_model`, `whisper_revision`, and `python` fields.
 - Add `whisper_sha256` only when the resolved model directory can be hashed.
 
-- [ ] Add a helper that hashes the whisper model files deterministically and records the digest in `deployment.json`.
-- [ ] Keep revision override support while recording the resolved revision returned by the downloader when available; never fail install solely because metadata is unavailable.
-- [ ] Extend doctor output with whisper revision/digest and Python executable/version.
-- [ ] Add manifest and doctor assertions to `tests/test_ops.py`.
-- [ ] Run installer syntax checks and focused tests.
+- [x] Add a helper that hashes the whisper model files deterministically and records the digest in `deployment.json`.
+- [x] Keep revision override support while recording the resolved revision returned by the downloader when available; never fail install solely because metadata is unavailable.
+- [x] Extend doctor output with whisper revision/digest and Python executable/version.
+- [x] Add manifest and doctor assertions to `tests/test_ops.py`.
+- [x] Run installer syntax checks and focused tests.
 
 ### Task 3: Coverage and documentation drift
 
@@ -56,29 +56,46 @@
 - Modify: `.coveragerc`, `pytest.ini`, `requirements.txt`, `README.md`, `GAP_ANALYSIS.md`, `ACCEPTANCE.md`, `docs/superpowers/specs/*.md`
 - Test: existing suite only; no production behavior change
 
-- [ ] Keep the measured coverage comment at approximately 61% and omit only known generated bootstrap files.
-- [ ] Update test counts to the current collected count after the final suite run.
-- [ ] Record the current audit/deployment sign-off without deleting prior history.
-- [ ] Mark shipped design specs as implemented and narrow the remaining D-Bus gap to unsupported layouts.
-- [ ] Verify no stale `440+`, `550 tests`, or `approved — implement` strings remain.
+- [x] Keep the measured coverage comment at approximately 61% and omit only known generated bootstrap files.
+- [x] Update test counts to the current collected count after the final suite run.
+- [x] Record the current audit/deployment sign-off without deleting prior history.
+- [x] Mark shipped design specs as implemented and narrow the remaining D-Bus gap to unsupported layouts.
+- [x] Verify no stale `440+`, `550 tests`, or `approved — implement` strings remain.
 
 ### Task 4: Missing branch tests
 
 **Files:**
 - Test: `tests/test_ops.py`, `tests/test_policy.py`, `tests/test_notify_coalesce.py`, `tests/test_audio.py`, `tests/test_settings.py`
 
-- [ ] Cover split-module CONFIRM floor, partial deployment source, streaming fallback terminator, preview unreadable/identical/truncated cases, notify back-to-back messages, and unverified voice URL opt-in.
-- [ ] Cover PTT stale epoch, stop exception, submit exception, and bounded stop branches.
-- [ ] Run coverage and ensure total remains at least 60%.
+- [x] Cover split-module CONFIRM floor, partial deployment source, streaming fallback terminator, preview unreadable/identical/truncated cases, notify back-to-back messages, and unverified voice URL opt-in.
+- [x] Cover PTT stale epoch, stop exception, submit exception, and bounded stop branches.
+- [x] Run coverage and ensure total remains at least 60%.
 
 ### Task 5: Verification and delivery
 
 **Files:**
 - No additional source files.
 
-- [ ] Run `python3 -m py_compile` on every changed Python file.
-- [ ] Run `python3 -m pytest tests/ -q` and record the exact count.
-- [ ] Run `bash -n install.sh handsoff-restart`.
+- [x] Run `python3 -m py_compile` on every changed Python file.
+- [x] Run `python3 -m pytest tests/ -q` and record the exact count.
+- [x] Run `bash -n install.sh handsoff-restart`.
 - [ ] Run `HANDSOFF_SKIP_SYSTEM_PKGS=1 HANDSOFF_NO_OLLAMA_SERVICE=1 bash install.sh`.
+  (The rehearsal-mode e2e (`install.sh --rehearsal`) passes inside the test
+  suite, `TestStagedRelease`; a live redeploy of this host's bubble is
+  pending — see the 2026-09-10 audit addendum in GAP_ANALYSIS.md.)
 - [ ] Verify `--ptt status`, `--ptt doctor`, systemd active state, and deployment manifest in-sync.
+  (Requires the live redeploy above; the running bubble predates these
+  changes and the doctor will correctly report `installed-drift` until then.)
 - [ ] Inspect `git diff`, `git status`, and recent log; commit only intended files and push only after explicit approval.
+
+## Status (2026-09-10)
+
+Tasks 1–4 are fully closed (all their checkboxes verified against the code:
+`_menu_open` guard, `_ANNOUNCE_LOCK` playback-only serialization,
+`whisper_sha256` manifest digest, doctor provenance lines, branch tests, doc
+counts). Task 5's local gates pass (637 tests green, py_compile + bash -n
+clean, coverage 63.2% ≥ 60 floor); the live-host items above remain open
+until the next real install run. On top of this plan, the 2026-09-10 audit
+also closed: CI action-SHA pinning, staged-release install with rollback,
+the `allow_remote_ollama` Settings/schema formalization, and the per-tool
+ALLOW/DENY/CONFIRM policy rows (see GAP_ANALYSIS.md addendum).

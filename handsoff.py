@@ -658,6 +658,7 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         systemd_unit_file=SYSTEMD_UNIT_FILE,
         control_sock=CONTROL_SOCK,
         crash_log=CRASH_LOG,
+        remote_ollama_allowed=_ollama_remote_opted_in,
         shutil=shutil,
         sounddevice=sd,
         log=log,
@@ -1488,8 +1489,11 @@ def _ollama_remote() -> bool:
 
 
 def _ollama_remote_opted_in() -> bool:
-    configured = SETTINGS.get("allow_remote_ollama", False) if "SETTINGS" in globals() else False
-    return bool(configured) or os.environ.get("HANDSOFF_ALLOW_REMOTE_OLLAMA", "").strip().lower() in {
+    settings = globals().get("SETTINGS") or {}
+    configured = bool(settings.get(
+        "allow_remote_ollama",
+        DEFAULT_SETTINGS.get("allow_remote_ollama", False)))
+    return configured or os.environ.get("HANDSOFF_ALLOW_REMOTE_OLLAMA", "").strip().lower() in {
         "1", "true", "yes", "on"
     }
 

@@ -13,6 +13,7 @@ SETTINGS_VERSION: int = 1   # bumped on incompatible settings.json layout change
 
 DEFAULT_SETTINGS: dict = {
     "ollama_host": "http://127.0.0.1:11434",
+    "allow_remote_ollama": False,  # explicit opt-in for a non-loopback server
     "model": "qwen3:8b",
     "num_ctx": 32768,
     "history_tokens": 0,       # 0 = auto: ctx − prompt − reply reserve

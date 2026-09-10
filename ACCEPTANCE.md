@@ -145,3 +145,4 @@ clipboard. First live run 2026-09-09: `verdict: PASS (5/5 checks)`.
 | 2026-09-09 | Buffy (automated run) | ff2f158 + uncommitted handsoff-restart race fix | All automatable items PASS; human items: Yeti selection, live audio, barge-in, sliders, session teardown, reboot |
 | 2026-09-10 | Buffy (automated run) | 38a0764 + PTT/notify/split set | All automatable items PASS (live doctor in-sync); human items unchanged |
 | 2026-09-10 | Fixer (repository validation) | uncommitted hygiene hardening | 583 tests passed; deployment and human-only checks not run |
+| 2026-09-10 | Buffy (audit closure) | 96bac4b + uncommitted trust set (remote-brain formalization, staged release + rollback, policy rows, CI SHA pins) | 637 tests green, coverage 63.2% ≥ 60, py_compile + bash -n clean; deployment not re-run — installed-drift expected until next `./install.sh`; human-only items unchanged |

@@ -653,6 +653,57 @@ class TestHealthTooltip:
         assert "self.health_label.setToolTip(_health_tooltip(result))" in rf
 
 
+class TestPerToolPolicyUI:
+    """Permissions tab: one ALLOW/DENY/CONFIRM row per declared tool, built
+    from the live H.TOOLS registry (no raw 'tool = POLICY' text editing)."""
+
+    def test_policy_rows_built_from_registry_and_roundtrip(self):
+        """Offscreen construct, flip a policy, collect, reload: the GUI must
+        persist per-tool policy without hand-editing settings.json."""
+        env = dict(os.environ)
+        env.update({
+            "QT_QPA_PLATFORM": "offscreen",
+            "QT_QPA_PLATFORMTHEME": "",
+            "NO_AT_BRIDGE": "1",
+            "QT_ACCESSIBILITY": "0",
+        })
+        code = (
+            "import importlib.util;"
+            "spec = importlib.util.spec_from_file_location("
+            "'s', 'handsoff-settings.py');"
+            "mod = importlib.util.module_from_spec(spec);"
+            "spec.loader.exec_module(mod);"
+            "from PySide6.QtWidgets import QApplication;"
+            "app = QApplication([]);"
+            "win = mod.SettingsWindow();"
+            "rows = win.policy_rows;"
+            "assert 'run_command' in rows, sorted(rows)[:5];"
+            "rows['run_command'].setCurrentIndex(1);"   # DENY
+            "win._collect();"
+            "assert win.cfg['command_policy'].get('run_command') == 'DENY', win.cfg['command_policy'];"
+            "rows['run_command'].setCurrentIndex(0);"   # back to ALLOW
+            "win._collect();"
+            "assert 'run_command' not in win.cfg['command_policy'], 'ALLOW must stay out of the map';"
+            "win.cfg['command_policy'] = {'open_app': 'CONFIRM'};"
+            "win._load_values();"
+            "assert rows['open_app'].currentData() == 'CONFIRM';"
+            "print('policy rows:', len(rows))"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env, capture_output=True, text=True, timeout=120, cwd=str(HERE),
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert "policy rows:" in out.stdout
+
+    def test_policy_rows_come_from_the_live_registry(self):
+        """Row names must be the real tool census from H.TOOLS, so a newly
+        declared tool gets a policy row with no GUI change."""
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        assert "self.policy_rows" in src
+        assert 't["function"]["name"] for t in (getattr(H, "TOOLS", None) or [])' in src
+
+
 class TestSettingsHistoryTab:
     """Regression: SettingsWindow must open with a History tab."""
 

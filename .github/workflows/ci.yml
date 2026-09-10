@@ -20,21 +20,16 @@ jobs:
       # The offscreen-launch test spawns the real bubble without a display.
       QT_QPA_PLATFORM: offscreen
     steps:
-      # Action refs stay on tags until exact current SHAs are safely resolved;
-      # the check below documents and surfaces that remaining pinning work.
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Action refs are pinned to reviewed immutable SHAs (tag in comment).
+      # The shell job below fails CI if a mutable tag ref ever sneaks back in.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt -c requirements-lock.txt
-      - name: Document unpinned action refs
-        run: |
-          if grep -nE 'uses: [^ ]+@v[0-9]+' .github/workflows/ci.yml; then
-            echo '::warning::Action refs are version tags; replace with reviewed immutable SHAs when resolved.'
-          fi
       - name: Run the test suite
         run: python -m pytest tests/ -q
 
@@ -47,8 +42,8 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Install test dependencies + pytest-cov
@@ -65,8 +60,8 @@ jobs:
     name: Byte-compile sources
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: python -m py_compile
@@ -79,7 +74,14 @@ jobs:
     name: Shell syntax checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify actions are SHA-pinned
+        run: |
+          if grep -nE 'uses: [^ ]+@v[0-9]+' .github/workflows/ci.yml; then
+            echo '::error::Action refs must be pinned to immutable SHAs (keep the version in a trailing comment).'
+            exit 1
+          fi
+          echo 'all action refs are immutable SHAs'
       - name: bash -n
         run: |
           bash -n install.sh
@@ -92,7 +94,7 @@ jobs:
     name: Installer smoke (--help)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: bash install.sh --help
         run: |
           out=$(bash install.sh --help)

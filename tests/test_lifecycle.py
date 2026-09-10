@@ -716,3 +716,106 @@ class TestPrecommitHook:
             assert r.returncode != 0, "py_compile must fail on broken syntax"
         finally:
             broken.unlink(missing_ok=True)
+
+
+class TestStagedRelease:
+    """install.sh stages + gates a release before touching ~/.local/bin,
+    keeps the previous set for rollback, and auto-restores on switch failure.
+    """
+
+    REHEARSAL_HOME_NAME = "rehearsal-home"
+
+    def _fake_home(self, tmp_path, bin_py="# deployed handsoff\n"):
+        """Rehearsal mode re-roots HOME at HANDSOFF_REHEARSAL_ROOT, so the
+        pre-existing deployment must live inside that same tree."""
+        home = tmp_path / self.REHEARSAL_HOME_NAME
+        (home / ".local" / "state").mkdir(parents=True)
+        conf = home / ".config" / "handsoff"
+        conf.mkdir(parents=True)
+        if bin_py is not None:
+            bin_dir = home / ".local" / "bin"
+            (bin_dir / "core").mkdir(parents=True)
+            for f in ("handsoff.py", "settings_schema.py", "hardware.py",
+                      "handsoff-restart"):
+                (bin_dir / f).write_text(bin_py)
+            (bin_dir / "core" / "__init__.py").write_text(bin_py)
+        return home, conf
+
+    def _run_rehearsal(self, tmp_path, home):
+        env = dict(os.environ)
+        env.update({
+            "HOME": str(home),
+            "XDG_STATE_HOME": str(home / ".local" / "state"),
+            "HANDSOFF_REHEARSAL_ROOT": str(home),
+            "HANDSOFF_SKIP_SYSTEM_PKGS": "1",
+            "HANDSOFF_NO_OLLAMA_SERVICE": "1",
+        })
+        return subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--rehearsal"],
+            env=env, capture_output=True, text=True, timeout=300,
+        )
+
+    def test_rehearsal_switches_and_saves_previous_release(self, tmp_path):
+        """A rehearsal install must gate through the stage and keep the old
+        deployed set at releases/prev for --rollback."""
+        home, conf = self._fake_home(tmp_path, bin_py="# OLD deployed bytes\n")
+        r = self._run_rehearsal(tmp_path, home)
+        assert r.returncode == 0, r.stderr[-3000:]
+        assert "previous release kept" in r.stdout
+        prev = conf / "releases" / "prev"
+        assert (prev / "handsoff.py").read_text() == "# OLD deployed bytes\n"
+        assert (prev / "core" / "__init__.py").exists()
+        # live bin now serves the CHECKOUT bytes, not the old ones
+        assert (home / ".local" / "bin" / "handsoff.py").read_text() != "# OLD deployed bytes\n"
+        # the stage is cleaned up
+        assert not list((conf / "releases").glob("staged.*"))
+
+    def test_rollback_restores_previous_bytes(self, tmp_path):
+        """install.sh --rollback must put the saved previous release back."""
+        home, conf = self._fake_home(tmp_path, bin_py="# OLD deployed bytes\n")
+        r = self._run_rehearsal(tmp_path, home)
+        assert r.returncode == 0, r.stderr[-3000:]
+        bin_handsoff = home / ".local" / "bin" / "handsoff.py"
+        assert bin_handsoff.read_text() != "# OLD deployed bytes\n"
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["XDG_STATE_HOME"] = str(home / ".local" / "state")
+        rb = subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--rollback"],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert rb.returncode == 0, rb.stderr
+        assert bin_handsoff.read_text() == "# OLD deployed bytes\n"
+
+    def test_rollback_without_previous_release_fails_cleanly(self, tmp_path):
+        home, conf = self._fake_home(tmp_path, bin_py=None)
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        env["XDG_STATE_HOME"] = str(home / ".local" / "state")
+        rb = subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--rollback"],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert rb.returncode != 0
+        assert "no previous release" in rb.stderr
+
+    def test_switch_gates_on_staged_compile(self):
+        """A staged set that cannot byte-compile must never reach the live
+        bin — the gate must run before any install into BIN_DIR."""
+        text = (HERE / "install.sh").read_text()
+        assert 'STAGED_PY=("$STAGE_DIR/handsoff.py"' in text
+        assert 'py_compile "${STAGED_PY[@]}"' in text
+        compile_line = text.index('py_compile "${STAGED_PY[@]}"')
+        first_install = text.index('install -m 755 "$STAGE_DIR/$f" "$BIN_DIR/$f"')
+        assert compile_line < first_install, "compile gate must precede the switch"
+
+    def test_switch_failure_restores_previous_release(self):
+        """switch_fail must reinstall the saved prev set, never leave the bin
+        half-old half-new."""
+        text = (HERE / "install.sh").read_text()
+        assert "switch_fail()" in text
+        assert 'previous release restored' in text
+        # switch_fail must reference the prev dir and reinstall from it
+        sf = text[text.index("switch_fail()"):text.index("switch_fail()") + 2000]
+        assert "$PREV_DIR/$f" in sf
+        assert "install -m" in sf

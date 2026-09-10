@@ -78,6 +78,59 @@ class TestAuditFixes:
         monkeypatch.setenv("HANDSOFF_ALLOW_REMOTE_OLLAMA", "1")
         H._guard_ollama_endpoint()
 
+    def test_allow_remote_ollama_is_schema_default(self, H):
+        """The remote-brain opt-in is a first-class setting, not a ghost key:
+        it must exist in the shipped schema so Settings and migration see it."""
+        assert H.DEFAULT_SETTINGS["allow_remote_ollama"] is False
+
+    def test_allow_remote_ollama_opt_in_via_settings(self, H, monkeypatch):
+        """allow_remote_ollama: true must satisfy the guard without the env var
+        (Settings → Brain checkbox path), while env var alone also works."""
+        monkeypatch.setattr(H, "OLLAMA_BASE", "http://192.0.2.10:11434")
+        monkeypatch.delenv("HANDSOFF_ALLOW_REMOTE_OLLAMA", raising=False)
+        monkeypatch.setattr(H, "_REMOTE_OLLAMA_WARNED", False)
+        settings = {**H.DEFAULT_SETTINGS, "allow_remote_ollama": True}
+        monkeypatch.setattr(H, "SETTINGS", settings)
+        H._guard_ollama_endpoint()          # must NOT raise
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                            "allow_remote_ollama": False})
+        with pytest.raises(RuntimeError, match="non-loopback"):
+            H._guard_ollama_endpoint()
+
+    def test_coerce_rejects_remote_opt_in_garbage(self, H):
+        """Fail-closed: any junk in allow_remote_ollama coerces to False."""
+        from core.settings import coerce_settings
+        for junk in ("yes", 1, ["x"], {"a": 1}):
+            s = coerce_settings({**H.DEFAULT_SETTINGS, "allow_remote_ollama": junk})
+            assert s["allow_remote_ollama"] is False, junk
+        s = coerce_settings({**H.DEFAULT_SETTINGS, "allow_remote_ollama": True})
+        assert s["allow_remote_ollama"] is True
+
+    def test_doctor_flags_remote_brain_unless_allowed(self, H, monkeypatch):
+        """--ptt doctor must surface the remote-brain trust warning, and must
+        show the explicitly-allowed state once opted in."""
+        monkeypatch.setattr(H, "OLLAMA_BASE", "http://192.0.2.10:11434")
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        text = H.run_doctor()
+        assert "brain privacy: REMOTE" in text
+        assert "NOT allowed" in text and "FAILS CLOSED" in text
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                            "allow_remote_ollama": True})
+        text = H.run_doctor()
+        assert "explicitly allowed" in text
+
+    def test_doctor_silent_for_loopback_brain(self, H):
+        """Local Ollama must not grow a privacy line (byte-stable report)."""
+        text = H.run_doctor()
+        assert "brain privacy" not in text
+
+    def test_settings_gui_wires_remote_opt_in(self):
+        """The Settings Brain tab must carry the checkbox and persist it."""
+        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
+        assert "remote_ollama_chk" in src
+        assert 'self.cfg["allow_remote_ollama"]' in src
+        assert 'self.cfg.get("allow_remote_ollama"' in src
+
     def test_late_worker_cannot_change_state_after_shutdown(self, H):
         a = H.Assistant.__new__(H.Assistant)
         a._gen = 3

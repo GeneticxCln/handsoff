@@ -1033,6 +1033,14 @@ class SettingsWindow(QMainWindow):
         form = QFormLayout(host_group)
         self.host_edit = QLineEdit(self.cfg["ollama_host"], self)
         form.addRow("Server URL", self.host_edit)
+        self.remote_ollama_chk = QCheckBox(
+            "Allow a remote server (send history, screenshots & schemas off this machine)", self)
+        self.remote_ollama_chk.setToolTip(
+            "handsoff refuses to talk to a non-loopback Ollama server until this is "
+            "checked (or HANDSOFF_ALLOW_REMOTE_OLLAMA=1 is set). The bubble's "
+            "conversation history, voice transcripts, and tool schemas leave your "
+            "machine when the server is remote.")
+        form.addRow("", self.remote_ollama_chk)
         self.model_list = QListWidget(self)
         self.model_list.setMinimumHeight(180)
         form.addRow("Models (🔧 tools = can control the desktop & self-modify)", self.model_list)
@@ -1790,14 +1798,34 @@ class SettingsWindow(QMainWindow):
         # centralized ALLOW/DENY/CONFIRM policy + dry-run rehearsal mode
         pol_group = QGroupBox("Command policy (ALLOW / DENY / CONFIRM per tool)", w)
         pl = QVBoxLayout(pol_group)
-        self.policy_edit = QPlainTextEdit(self)
-        self.policy_edit.setMaximumHeight(96)
-        self.policy_edit.setPlaceholderText(
-            "one per line:  tool = POLICY\n"
-            "e.g.\nrun_command = DENY\nopen_app = CONFIRM\n"
-            "CONFIRM asks the user out loud and runs only after a separate "
-            "'yes' reply")
-        pl.addWidget(self.policy_edit)
+        # one row per declared tool, straight from the live registry — a tool
+        # added in core/tools.py shows up here with no GUI change
+        policy_form = QFormLayout()
+        self.policy_rows: dict[str, QComboBox] = {}
+        try:
+            tool_names = sorted(
+                t["function"]["name"] for t in (getattr(H, "TOOLS", None) or []))
+        except (KeyError, TypeError, AttributeError):
+            tool_names = []
+        for name in tool_names:
+            combo = QComboBox(self)
+            combo.addItem("ALLOW", "ALLOW")
+            combo.addItem("DENY", "DENY")
+            combo.addItem("CONFIRM", "CONFIRM")
+            policy_form.addRow(QLabel(name, self), combo)
+            self.policy_rows[name] = combo
+        pl.addLayout(policy_form)
+        if not self.policy_rows:
+            # registry unavailable (e.g. H degenerate in recovery mode): keep
+            # the raw text path so policy editing still works
+            self.policy_edit = QPlainTextEdit(self)
+            self.policy_edit.setMaximumHeight(96)
+            self.policy_edit.setPlaceholderText(
+                "one per line:  tool = POLICY\n"
+                "e.g.\nrun_command = DENY\nopen_app = CONFIRM\n"
+                "CONFIRM asks the user out loud and runs only after a separate "
+                "'yes' reply")
+            pl.addWidget(self.policy_edit)
         self.dryrun_chk = QCheckBox(
             "Dry-run mode — desktop actions report what they would do, "
             "without doing it", self)
@@ -2022,10 +2050,16 @@ class SettingsWindow(QMainWindow):
 
     def _load_values(self) -> None:
         self.ctx_spin.setValue(int(self.cfg["num_ctx"]))
+        self.remote_ollama_chk.setChecked(
+            bool(self.cfg.get("allow_remote_ollama", False)))
         self.hist_spin.setValue(int(self.cfg.get("history_tokens", 0)))
         self.toolrate_spin.setValue(int(self.cfg.get("max_tool_calls", 0)))
         pol = self.cfg.get("command_policy") or {}
-        if isinstance(pol, dict) and pol:
+        if isinstance(pol, dict) and self.policy_rows:
+            for name, combo in self.policy_rows.items():
+                idx = combo.findData(str(pol.get(name, "ALLOW")).upper())
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+        elif isinstance(pol, dict) and pol and getattr(self, "policy_edit", None) is not None:
             self.policy_edit.setPlainText(
                 "\n".join(f"{k} = {v}" for k, v in sorted(pol.items())))
         self.dryrun_chk.setChecked(bool(self.cfg.get("dry_run", False)))
@@ -2069,6 +2103,7 @@ class SettingsWindow(QMainWindow):
     def _collect(self) -> list[str]:
         problems: list[str] = []
         self.cfg["ollama_host"] = self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]
+        self.cfg["allow_remote_ollama"] = self.remote_ollama_chk.isChecked()
         self.cfg["model"] = self._selected_model() or self.cfg["model"]
         self.cfg["num_ctx"] = self.ctx_spin.value()
         self.cfg["history_tokens"] = self.hist_spin.value()
@@ -2120,14 +2155,20 @@ class SettingsWindow(QMainWindow):
         self.cfg["bubble_size"] = self.size_slider.value()
         self.cfg["colors"] = dict(self._colors)
         self.cfg["permissions"] = {k: chk.isChecked() for k, chk in self.perm_checks.items()}
-        policy_map = {}
-        for line in self.policy_edit.toPlainText().splitlines():
-            if "=" not in line or line.strip().startswith("#"):
-                continue
-            k, _, v = line.partition("=")
-            k, v = k.strip(), v.strip().upper()
-            if k and v in ("ALLOW", "DENY", "CONFIRM"):
-                policy_map[k] = v
+        policy_map: dict[str, str] = {}
+        if self.policy_rows:
+            # minimal map: ALLOW is the default, keep settings.json clean
+            for name, combo in self.policy_rows.items():
+                if combo.currentData() != "ALLOW":
+                    policy_map[name] = combo.currentData()
+        elif getattr(self, "policy_edit", None) is not None:
+            for line in self.policy_edit.toPlainText().splitlines():
+                if "=" not in line or line.strip().startswith("#"):
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().upper()
+                if k and v in ("ALLOW", "DENY", "CONFIRM"):
+                    policy_map[k] = v
         self.cfg["command_policy"] = policy_map
         self.cfg["dry_run"] = self.dryrun_chk.isChecked()
         self.cfg["extra_allowed_commands"] = [

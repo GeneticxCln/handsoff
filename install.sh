@@ -20,6 +20,7 @@ case "${1:-}" in
         echo "Options:"
         echo "  --help            show this help"
         echo "  --rehearsal       install into HANDSOFF_REHEARSAL_ROOT without host changes"
+        echo "  --rollback        restore the previous release saved by the last install"
         echo "  --uninstall       remove binaries, unit and snippet"
         echo "  --uninstall --purge  also wipe config/state (backs up first)"
         exit 0
@@ -39,6 +40,34 @@ fi
 BIN_DIR="$HOME/.local/bin"
 CONF_DIR="$HOME/.config/handsoff"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
+
+case "${1:-}" in
+    --rollback)
+        # Manual rollback path: the switch itself auto-restores on failure;
+        # this is for a release that INSTALLED fine but turns out to be bad.
+        PREV="$CONF_DIR/releases/prev"
+        if [ ! -f "$PREV/handsoff.py" ]; then
+            echo "FATAL: no previous release saved at $PREV — nothing to roll back to" >&2
+            exit 1
+        fi
+        echo "==> Rolling back to the previous release ($PREV)"
+        mkdir -p "$BIN_DIR/core"
+        for f in handsoff.py handsoff-restart handsoff-settings.py \
+                 settings_schema.py hardware.py \
+                 core/__init__.py core/settings.py core/audio.py \
+                 core/brain.py core/tools.py core/doctor.py core/lifecycle.py; do
+            [ -f "$PREV/$f" ] || continue
+            case "$f" in
+                handsoff.py|handsoff-restart|handsoff-settings.py) m=755 ;;
+                *) m=644 ;;
+            esac
+            install -m "$m" "$PREV/$f" "$BIN_DIR/$f"
+        done
+        echo "    previous release restored — restart the bubble to load it:"
+        echo "      systemctl --user restart handsoff   (or: ~/.local/bin/handsoff-restart)"
+        exit 0
+        ;;
+esac
 
 WHISPER_SIZE="${HANDSOFF_WHISPER:-tiny}"
 OLLAMA_MODEL="${HANDSOFF_MODEL:-qwen3:8b}"
@@ -204,42 +233,111 @@ fi
 echo "==> [3/8] Directories"
 mkdir -p "$BIN_DIR" "$CONF_DIR/whisper-model" "$CONF_DIR/piper-voice" "$STATE_DIR"
 
-echo "==> [4/8] Placing handsoff.py, settings app and restart script"
-install -m 755 "$HERE/handsoff.py" "$BIN_DIR/handsoff.py"
+echo "==> [4/8] Staging the release (compile-gated, rollback-able)"
+# Nothing is installed until a complete staged copy has passed the compile
+# and import gates; the currently-deployed set is kept at
+# $CONF_DIR/releases/prev so `install.sh --rollback` can restore it.
+RELEASES_DIR="$CONF_DIR/releases"
+STAGE_DIR="$RELEASES_DIR/staged.$$"
+PREV_DIR="$RELEASES_DIR/prev"
+mkdir -p "$STAGE_DIR/core"
+stage_fail() {
+    echo "    FATAL: $1" >&2
+    rm -rf "$STAGE_DIR"
+    exit 1
+}
+# --- collect the shipped set into the stage (live files untouched yet)
+install -m 755 "$HERE/handsoff.py" "$STAGE_DIR/handsoff.py" \
+    || stage_fail "could not stage handsoff.py"
 if [ -f "$HERE/handsoff-settings.py" ]; then
-    install -m 755 "$HERE/handsoff-settings.py" "$BIN_DIR/handsoff-settings.py"
+    install -m 755 "$HERE/handsoff-settings.py" "$STAGE_DIR/handsoff-settings.py" \
+        || stage_fail "could not stage handsoff-settings.py"
 fi
 # Supporting modules imported next to the bubble (schema = single source of
 # DEFAULT_SETTINGS; hardware = the lazy-imported hardware/world watch; core/ =
-# the settings package from split step (a)). All must exist in BIN_DIR or the
-# installed copy dies on import.
+# the extracted runtime). All must exist or the installed copy dies on import.
 for mod in settings_schema hardware; do
     if [ -f "$HERE/$mod.py" ]; then
-        install -m 644 "$HERE/$mod.py" "$BIN_DIR/$mod.py"
+        install -m 644 "$HERE/$mod.py" "$STAGE_DIR/$mod.py" \
+            || stage_fail "could not stage $mod.py"
     else
-        echo "    FATAL: $HERE/$mod.py is missing but required by handsoff.py" >&2
-        exit 1
+        stage_fail "$HERE/$mod.py is missing but required by handsoff.py"
     fi
 done
 if [ -f "$HERE/core/__init__.py" ] && [ -f "$HERE/core/settings.py" ] \
         && [ -f "$HERE/core/audio.py" ] && [ -f "$HERE/core/brain.py" ] \
         && [ -f "$HERE/core/tools.py" ] && [ -f "$HERE/core/doctor.py" ] \
         && [ -f "$HERE/core/lifecycle.py" ]; then
-    mkdir -p "$BIN_DIR/core"
-    install -m 644 "$HERE/core/__init__.py" "$BIN_DIR/core/__init__.py"
-    install -m 644 "$HERE/core/settings.py" "$BIN_DIR/core/settings.py"
-    install -m 644 "$HERE/core/audio.py" "$BIN_DIR/core/audio.py"
-    install -m 644 "$HERE/core/brain.py" "$BIN_DIR/core/brain.py"
-    install -m 644 "$HERE/core/tools.py" "$BIN_DIR/core/tools.py"
-    install -m 644 "$HERE/core/doctor.py" "$BIN_DIR/core/doctor.py"
-    install -m 644 "$HERE/core/lifecycle.py" "$BIN_DIR/core/lifecycle.py"
+    for m in __init__ settings audio brain tools doctor lifecycle; do
+        install -m 644 "$HERE/core/$m.py" "$STAGE_DIR/core/$m.py" \
+            || stage_fail "could not stage core/$m.py"
+    done
 else
-    echo "    FATAL: $HERE/core/ is missing but required by handsoff.py" >&2
-    exit 1
+    stage_fail "$HERE/core/ is missing but required by handsoff.py"
 fi
-# Single source of truth: the repo's handsoff-restart is shipped as-is
-# (a heredoc duplicate here silently drifted from it once already).
-install -m 755 "$HERE/handsoff-restart" "$BIN_DIR/handsoff-restart"
+install -m 755 "$HERE/handsoff-restart" "$STAGE_DIR/handsoff-restart" \
+    || stage_fail "could not stage handsoff-restart"
+# --- gate 1: every staged Python file must byte-compile before it can ship
+STAGED_PY=("$STAGE_DIR/handsoff.py" "$STAGE_DIR/settings_schema.py" "$STAGE_DIR/hardware.py")
+[ -f "$STAGE_DIR/handsoff-settings.py" ] && STAGED_PY+=("$STAGE_DIR/handsoff-settings.py")
+STAGED_PY+=("$STAGE_DIR"/core/*.py)
+"${PYBIN}" -m py_compile "${STAGED_PY[@]}" \
+    || stage_fail "staged sources failed to byte-compile — refusing to deploy"
+# --- gate 2: the dependency-free trust modules must import from the stage
+( cd "$STAGE_DIR" && "${PYBIN}" -c 'import settings_schema, core.settings' ) \
+    || stage_fail "staged settings schema failed the import smoke — refusing to deploy"
+# --- save the currently-deployed set as the rollback target
+HAD_PREV=0
+if [ -f "$BIN_DIR/handsoff.py" ]; then
+    rm -rf "$PREV_DIR.staging" "$PREV_DIR"
+    mkdir -p "$PREV_DIR.staging/core"
+    for f in handsoff.py handsoff-settings.py settings_schema.py hardware.py handsoff-restart; do
+        [ -f "$BIN_DIR/$f" ] && cp -p "$BIN_DIR/$f" "$PREV_DIR.staging/$f"
+    done
+    for f in "$BIN_DIR"/core/*.py; do
+        [ -f "$f" ] && cp -p "$f" "$PREV_DIR.staging/core/"
+    done
+    mv "$PREV_DIR.staging" "$PREV_DIR"
+    HAD_PREV=1
+fi
+# --- the switch: install staged files; any failure restores the previous set
+SWITCH_FILES_755="handsoff.py handsoff-restart"
+[ -f "$STAGE_DIR/handsoff-settings.py" ] \
+    && SWITCH_FILES_755="$SWITCH_FILES_755 handsoff-settings.py"
+SWITCH_FILES_644="settings_schema.py hardware.py core/__init__.py core/settings.py core/audio.py core/brain.py core/tools.py core/doctor.py core/lifecycle.py"
+switch_fail() {
+    echo "    FATAL: $1 — restoring the previous release" >&2
+    if [ "$HAD_PREV" = "1" ]; then
+        mkdir -p "$BIN_DIR/core"
+        for f in $SWITCH_FILES_755 $SWITCH_FILES_644; do
+            [ -f "$PREV_DIR/$f" ] || continue
+            case "$f" in
+                handsoff.py|handsoff-restart|handsoff-settings.py) m=755 ;;
+                *) m=644 ;;
+            esac
+            install -m "$m" "$PREV_DIR/$f" "$BIN_DIR/$f" 2>/dev/null || true
+        done
+        echo "    previous release restored; deployment unchanged (retry or report)" >&2
+    else
+        echo "    no previous release existed — ~/.local/bin may be partially populated" >&2
+    fi
+    rm -rf "$STAGE_DIR"
+    exit 1
+}
+mkdir -p "$BIN_DIR/core"
+for f in $SWITCH_FILES_755; do
+    install -m 755 "$STAGE_DIR/$f" "$BIN_DIR/$f" || switch_fail "switch failed at $f"
+done
+for f in $SWITCH_FILES_644; do
+    install -m 644 "$STAGE_DIR/$f" "$BIN_DIR/$f" || switch_fail "switch failed at $f"
+done
+rm -rf "$STAGE_DIR"
+if [ "$HAD_PREV" = "1" ]; then
+    echo "    staged release verified (compile + schema import) and switched"
+    echo "    previous release kept at $PREV_DIR — 'install.sh --rollback' restores it"
+else
+    echo "    staged release verified (compile + schema import) and switched (first install)"
+fi
 echo "==> [5/8] Downloading whisper '$WHISPER_SIZE' model (one time)"
 if [ "$REHEARSAL" = "1" ]; then
     printf 'rehearsal placeholder\n' > "$CONF_DIR/whisper-model/rehearsal.txt"

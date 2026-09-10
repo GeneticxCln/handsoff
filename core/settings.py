@@ -228,6 +228,17 @@ def coerce_settings(s: dict) -> dict:
                     DEFAULT_SETTINGS["ollama_host"])
         _host = str(DEFAULT_SETTINGS["ollama_host"])
     s["ollama_host"] = _host
+    # remote-brain opt-in: must be exactly true to enable (fail-closed —
+    # truthy junk like "yes" or 1 must NOT silently allow remote sending)
+    raw_allow = s.get("allow_remote_ollama", False)
+    if raw_allow is True:
+        s["allow_remote_ollama"] = True
+    else:
+        if raw_allow not in (False, None):
+            log.warning(
+                "invalid allow_remote_ollama %r — using False (fail-closed: "
+                "the opt-in must be exactly true)", raw_allow)
+        s["allow_remote_ollama"] = False
     _model = str(s.get("model", "")).strip()
     if not _model:
         log.warning("invalid model — using default %r",

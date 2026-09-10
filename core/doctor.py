@@ -80,7 +80,7 @@ class DoctorDeps:
         "hardware_snapshot", "hardware_prompt_context", "doctor_ttl",
         "niri_msg", "ydotool_socket", "socket_connectable",
         "sys_version_info", "restart_script", "systemd_unit_file",
-        "control_sock", "crash_log",
+        "control_sock", "crash_log", "remote_ollama_allowed",
         "shutil", "sounddevice", "log",
     )
 
@@ -108,6 +108,7 @@ class DoctorDeps:
         self.systemd_unit_file: Path = Path("/nonexistent/handsoff.service")
         self.control_sock: Path = Path("/nonexistent/control.sock")
         self.crash_log: Path = Path("/nonexistent/crash.log")
+        self.remote_ollama_allowed: Callable[[], bool] | None = None
         self.shutil = shutil
         self.sounddevice = None
         self.log = log
@@ -131,6 +132,50 @@ def reset_dependencies(token: Any) -> None:
 
 
 # --------------------------------------------------------------- report
+
+
+def _is_remote_base(base: str) -> bool:
+    """True when the Ollama base URL is empty-host or non-loopback.
+
+    Mirrors handsoff's ``_ollama_remote`` classification so the doctor can
+    flag a remote brain even when the bubble is dead (module import avoided:
+    keep this dependency-free rather than importing the app).
+    """
+    import ipaddress
+    import urllib.parse
+    try:
+        host = urllib.parse.urlparse(str(base or "")).hostname
+        if not host:
+            return True
+        if host.lower() == "localhost":
+            return False
+        return not ipaddress.ip_address(host).is_loopback
+    except (ValueError, TypeError):
+        return True
+
+
+def _remote_brain_lines(deps: "DoctorDeps") -> list[str]:
+    """Trust warning appended after the brain line when the endpoint is not
+    on this machine: conversation history, screenshots, and tool schemas
+    leave the device, and the guard fails closed until explicitly allowed."""
+    if not _is_remote_base(deps.ollama_base):
+        return []
+    opted = False
+    getter = getattr(deps, "remote_ollama_allowed", None)
+    if getter is not None:
+        try:
+            opted = bool(getter())
+        except Exception:
+            opted = False
+    if opted:
+        return ["brain privacy: REMOTE — explicitly allowed (allow_remote_ollama)"]
+    return [
+        "brain privacy: REMOTE and NOT allowed — history, screenshots, and "
+        "schemas leave this machine; every request FAILS CLOSED until "
+        "allow_remote_ollama (Settings) or HANDSOFF_ALLOW_REMOTE_OLLAMA=1 "
+        "opts in",
+    ]
+
 
 def _lines(deps: DoctorDeps) -> list[str]:
     lines: list[str] = []
@@ -175,6 +220,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
                 f"brain: OLLAMA UNREACHABLE at {deps.ollama_base} — "
                 "`systemctl status ollama`, then `ollama pull "
                 + deps.ollama_model + "`")
+        lines.extend(_remote_brain_lines(deps))
 
         lines.append(
             f"tts: {'voice loaded' if deps.piper_voice is not None else 'voice NOT loaded yet'}; "
@@ -215,6 +261,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
                 f"brain: OLLAMA UNREACHABLE at {deps.ollama_base} — "
                 "`systemctl status ollama`, then `ollama pull "
                 + deps.ollama_model + "`")
+        lines.extend(_remote_brain_lines(deps))
 
         lines.append(
             f"tts: {'voice loaded' if deps.piper_voice is not None else 'voice NOT loaded yet'}; "

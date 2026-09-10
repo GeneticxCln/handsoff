@@ -3,6 +3,50 @@
 Date: 2026-09-09 · Phase 0/1/2 of the external task list are closed (see the
 Addendum below); remaining consciously-accepted items are at the bottom.
 
+## Addendum — 2026-09-10 full-project audit closure (trust gaps, release
+## safety, policy UI, supply-chain pins)
+
+Independent audit of the settled tree; every gate re-run on it: **637 tests
+green (2026-09-10)**, `py_compile` clean, `bash -n` clean, coverage 63.2%
+(≥ 60 floor). Findings → work landed the same day:
+
+1. **Remote-brain opt-in formalized.** The runtime guard (`_guard_ollama_endpoint`,
+   fail-closed) already existed but its settings key was a ghost — accepted
+   from hand-edited JSON only, invisible to Settings and the schema. Now
+   first-class: `allow_remote_ollama` in `settings_schema.py`, coerced
+   fail-closed (only exactly `true` enables), a Brain-tab checkbox in
+   Settings, a doctor line (`brain privacy: REMOTE …`) that works even when
+   the bubble is dead, and README documentation under *Remote brain guard*.
+2. **Staged-release deployment with rollback.** install.sh no longer copies
+   straight into `~/.local/bin`: it stages the complete shipped set, gates it
+   (byte-compile of every staged file + schema/core-settings import smoke),
+   saves the currently-deployed set to `~/.config/handsoff/releases/prev`,
+   then switches — auto-restoring the previous release if any switch step
+   fails. `./install.sh --rollback` manually restores a release that
+   installed fine but turned out bad. Pinned by `TestStagedRelease` (real
+   installer subprocess in rehearsal mode).
+3. **Per-tool policy rows in Settings.** The Permissions tab's raw
+   `tool = POLICY` text editor is replaced by one ALLOW/DENY/CONFIRM dropdown
+   per declared tool, built from the live `H.TOOLS` registry (new tools get
+   rows with no GUI change; the text path remains as fallback when the
+   registry is unavailable). Only non-ALLOW entries are persisted, matching
+   `command_policy`'s empty-map-means-allow semantics.
+4. **CI actions pinned to immutable SHAs** (`actions/checkout@3d3c42e5…`
+   v7.0.1, `actions/setup-python@5fda3b95…` v7.0.0, resolved via the GitHub
+   API), and the shell job now FAILS if a mutable tag ref sneaks back in —
+   the old warning-only grep is a regression gate.
+5. **Docs reconciled.** Test counts updated 583 → 637; the monolith-split
+   status below reflects the executed Phase 4; the hygiene-hardening plan's
+   checkboxes are closed against the code.
+
+Still open after this pass: the live-host redeploy (the running bubble
+predates this tree, so its doctor correctly reports `installed-drift` until
+`./install.sh` runs again), the six human acceptance items in
+`ACCEPTANCE.md`, unsupported D-Bus Notify layouts, settings-GUI coverage
+(~19%), and the consciously-accepted Phase-3 leftovers (staged release
+directory *inside* the runtime + remote-transport policy doc are done; the
+full provenance/rollback story for the *manifest* itself remains as-is).
+
 ## Addendum — 2026-09-09 improvement-program closure (settings schema, self-edit
 ## confirm, voice pinning, VRAM-aware whisper)
 
@@ -47,11 +91,14 @@ Outcomes of the user's gaps/improvements list (583 tests green, 2026-09-10):
    globals. `handsoff.py` keeps the old module-level names as thin wrappers
    (the `H.*` monkeypatch contract and patch seams survive; the wrappers are
    late-bound so future steps can patch core directly), `_SETTINGS_OBJ` is
-   the explicit object, and the installer ships + hashes `core/`. Remaining
-   steps, same recipe: (b) `core/audio.py` (SpeechGate, listener, STT/TTS
-   wrappers); (c) `core/tools.py` (ToolBelt + policy); (d) `core/brain.py`
-   (Assistant, history/memory); (e) `core/ui.py` + `core/doctor.py`;
-    (f) shim re-exports for one release, then remove.
+   the explicit object, and the installer ships + hashes `core/`. **Steps
+   (b)–(e) are now EXECUTED** (2026-09-10): `core/audio.py` (343 lines),
+   `core/brain.py` (174), `core/tools.py` (2661 — every one of the 49
+   `@tool` declarations moved out of the monolith, which now has zero),
+   `core/doctor.py` (352) and `core/lifecycle.py` (51) exist behind
+   "Phase 4" compatibility facades in handsoff.py; the installer ships and
+   hashes all of them. Remaining: (f) removing the shim re-exports after a
+   release window, per the Phase-4 plan.
 8. **ICS MONTHLY/YEARLY recurrence.** `_ics_expand_rrule` covers MONTHLY
     (nth-weekday like 2TU, BYMONTHDAY, DTSTART day-of-month fallback) and
     YEARLY (BYMONTH, BYMONTHDAY, Feb-29 skip) with UNTIL/COUNT bounds,
@@ -67,9 +114,12 @@ boot floor; uptime-independent pins added (the old hardware/world tests
 only passed on hosts up longer than 60 minutes).
 
 ### Not done (revisited, still open)
-- Unsupported/unusual Notify layouts beyond actions/hints trailers, per-tool policy UI,
-  installer `--rehearse` in CI, Compositor interface for niri-stub testing,
-  Settings History/decision-viewer tab — unchanged from the P1/P2 lists below.
+- Unsupported/unusual Notify layouts beyond actions/hints trailers,
+  Compositor interface for niri-stub testing,
+  Settings History/decision-viewer tab — unchanged from the P1/P2 lists
+  below. (Per-tool policy UI and installer `--rehearse` coverage are DONE —
+  see the 2026-09-10 addendum above: dropdown policy rows in Settings, and
+  the rehearsal e2e runs inside the suite as `TestStagedRelease`.)
 
 ## Addendum — 2026-09-09 trust & reliability program (P0–P2 closed)
 
@@ -146,9 +196,10 @@ calendar, settings, lifecycle, regression, ops).
   single-source-of-truth (repo files shipped as-is; manifest added).
 
 Still open, accepted consciously: real-hardware acceptance run (see
-`ACCEPTANCE.md`), CI rehearse-runs of the full installer,
-richer D-Bus notification formatting, and Settings UI rows for
-per-tool command_policy (the JSON path and dry-run checkbox exist).
+`ACCEPTANCE.md`), richer D-Bus notification formatting, and the
+Settings History/decision-viewer tab. (Per-tool `command_policy` rows and
+CI rehearse-style installer coverage closed 2026-09-10 — see the top
+addendum.)
 
 ## Addendum — 2026-09-09 hardening audit (post-merge review)
 
@@ -209,9 +260,9 @@ now closed (583 tests green, 2026-09-10):
   committed — pinned by `TestPrecommitHook`.
 
 Still open, accepted consciously: real-hardware acceptance session (mic, echo,
-suspend/resume), CI rehearse-runs of the installer,
-and richer D-Bus notification formatting for applications that emit unusual
-Notify argument layouts.
+suspend/resume), and richer D-Bus notification formatting for applications that
+emit unusual Notify argument layouts. (Installer rehearsal coverage closed
+2026-09-10: `install.sh --rehearsal` runs end-to-end inside the suite.)
 
 ## What already works (verified live this session)
 
@@ -225,7 +276,7 @@ Notify argument layouts.
 - Ops: niri window rule (round bubble), autostart, keybinds Mod+V / Mod+Shift+V
   / Mod+Shift+H / Mod+Shift+S (settings, works even when the bubble is dead),
   restart script with lock race fixed, faulthandler crash log
-- 583 tests, all green (2026-09-10)
+- 637 tests, all green (2026-09-10)
 - Ambient automation: opt-in notification reader, Pomodoro transitions, RAM/VRAM
   threshold crossings, and bounded file/process watchers; all have Settings
   controls or safe tool gates
