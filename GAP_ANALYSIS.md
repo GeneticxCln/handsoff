@@ -6,7 +6,7 @@ Addendum below); remaining consciously-accepted items are at the bottom.
 ## Addendum — 2026-09-09 improvement-program closure (settings schema, self-edit
 ## confirm, voice pinning, VRAM-aware whisper)
 
-Outcomes of the user's gaps/improvements list (550 tests green, 2026-09-10):
+Outcomes of the user's gaps/improvements list (583 tests green, 2026-09-10):
 
 ### Done
 1. **`settings_schema.py` — single source of truth.** `DEFAULT_SETTINGS` and the
@@ -67,13 +67,13 @@ boot floor; uptime-independent pins added (the old hardware/world tests
 only passed on hosts up longer than 60 minutes).
 
 ### Not done (revisited, still open)
-- D-Bus rich notifications, per-tool policy UI,
+- Unsupported/unusual Notify layouts beyond actions/hints trailers, per-tool policy UI,
   installer `--rehearse` in CI, Compositor interface for niri-stub testing,
   Settings History/decision-viewer tab — unchanged from the P1/P2 lists below.
 
 ## Addendum — 2026-09-09 trust & reliability program (P0–P2 closed)
 
-550 tests green (2026-09-10) across the split suite (`tests/`: audio, policy, desktop,
+583 tests green (2026-09-10) across the split suite (`tests/`: audio, policy, desktop,
 calendar, settings, lifecycle, regression, ops).
 
 ### P0 — the running product is trustworthy
@@ -153,7 +153,7 @@ per-tool command_policy (the JSON path and dry-run checkbox exist).
 ## Addendum — 2026-09-09 hardening audit (post-merge review)
 
 Edge-case audit of `_prepare_runtime` / `_remove_stale_control_socket` (24
-new tests in `tests/test_hardening.py`; suite now 550 green, 2026-09-10):
+new tests in `tests/test_hardening.py`; suite now 583 green, 2026-09-10):
 
 - **Fixed, was a real wedge**: a stale control socket left permissive
   (e.g. created under umask 000) made `_secure_file` refuse it — and since
@@ -181,7 +181,7 @@ new tests in `tests/test_hardening.py`; suite now 550 green, 2026-09-10):
 ## Addendum — 2026-09-08 external audit closure
 
 Every priority finding and most "remaining gaps" from the external audit are
-now closed (550 tests green, 2026-09-10):
+now closed (583 tests green, 2026-09-10):
 
 - Command whitelist bypass via absolute `niri` paths — closed (basename-keyed
   spawn checks; `TestSpawnInterpreterBoundary` extended).
@@ -225,7 +225,7 @@ Notify argument layouts.
 - Ops: niri window rule (round bubble), autostart, keybinds Mod+V / Mod+Shift+V
   / Mod+Shift+H / Mod+Shift+S (settings, works even when the bubble is dead),
   restart script with lock race fixed, faulthandler crash log
-- 550 tests, all green (2026-09-10)
+- 583 tests, all green (2026-09-10)
 - Ambient automation: opt-in notification reader, Pomodoro transitions, RAM/VRAM
   threshold crossings, and bounded file/process watchers; all have Settings
   controls or safe tool gates
@@ -291,16 +291,18 @@ workspace-index work (settings locking + reload, `run_command` rework,
 `_quarantine_bad`, spawn hardening, installer changes, CI/pre-commit, docs). Audited
 at the settled state; gates re-run on that exact tree.
 
-**Gates:** `py_compile` + `bash -n` clean; **550 tests green (2026-09-10)**; runtime tool census
+**Gates:** `py_compile` + `bash -n` clean; **583 tests green (2026-09-10)**; runtime tool census
 **46, unchanged** (grep over `@tool` over-counts because of the docstring example);
-doctor functional. The README "440+ tests" bump is accurate.
+doctor functional. The README test count matches the final collected suite.
 
 Findings, ranked:
 
-1. **Deployment drift (live, fix before sign-off):** the installed `~/.local/bin`
+1. ~~**Deployment drift (live, fix before sign-off):** the installed `~/.local/bin`
    copy predates the combined tree; `--ptt doctor` correctly reports
    `installed-drift` — the trust feature doing its job, but the deployed code is
-   behind the tested source. → Re-run `./install.sh` once this change set commits.
+   behind the tested source. → Re-run `./install.sh` once this change set commits.~~
+   **Done 2026-09-10** — live doctor reports in-sync; the deployed copy matches
+   the checkout.
 2. **Installer default `-Syu` → `-Sy`:** flagged on first read as a silent
    partial-upgrade regression; on inspection it is a *documented* default
    (`-Sy` for fast installs, `HANDSOFF_FULL_UPGRADE=1` selects supported `-Syu`)
@@ -326,6 +328,7 @@ Findings, ranked:
    updated.
 
 Accepted consciously / out of scope here: Settings health-bar pixel verification on
-the dual-monitor setup (data-level verified in `ACCEPTANCE.md`), and the six
-human-only acceptance items. Process note: files churned mid-audit while the other
-agent worked; all findings above were confirmed against the settled tree.
+the dual-monitor setup (data-level verified in `ACCEPTANCE.md`), unsupported/unusual
+D-Bus Notify layouts, and the six human-only acceptance items. Process note: files
+churned mid-audit while the other agent worked; all findings above were confirmed
+against the settled tree.

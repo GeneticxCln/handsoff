@@ -128,6 +128,62 @@ class TestControlSocket:
         assert H.ptt_client(["status"]) == 1
 
 
+class TestBubbleMenuHoldGuard:
+    def test_right_click_menu_stops_and_guards_hold_timer(self, H, monkeypatch):
+        """Opening the modal menu must not let a queued hold start PTT."""
+        class Hold:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        class Assistant:
+            _handsfree = False
+
+            def __init__(self):
+                self.begin_calls = 0
+
+            def begin_listening(self):
+                self.begin_calls += 1
+
+        assistant = Assistant()
+        widget = H.BubbleWidget.__new__(H.BubbleWidget)
+        widget._assistant = assistant
+        widget._hold = Hold()
+        widget._pressing = True
+        widget._dragging = False
+        widget._listening = False
+
+        class Menu:
+            def __init__(self, owner):
+                self.owner = owner
+
+            def addAction(self, _text):
+                return object()
+
+            def addSeparator(self):
+                pass
+
+            def exec(self, _pos):
+                assert self.owner._menu_open is True
+                self.owner._hold_fired()  # simulate the queued timeout
+                return None
+
+        monkeypatch.setattr(H, "QMenu", Menu)
+
+        class Event:
+            def button(self):
+                return H.Qt.RightButton
+
+            def globalPosition(self):
+                return types.SimpleNamespace(toPoint=lambda: None)
+
+        widget.mousePressEvent(Event())
+        assert widget._hold.stopped is True
+        assert assistant.begin_calls == 0
+
+
 # ------------------------------------------------------------------ offscreen launch
 
 

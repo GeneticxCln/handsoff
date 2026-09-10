@@ -671,3 +671,99 @@ class TestDecisionPolicy:
         tb = self._belt(H, monkeypatch)
         out, err = tb.execute("handsoff_doctor", {})
         assert not err and "deployment" in out
+
+
+class TestSplitConfirm:
+    """Pins handsoff.py:_edit_confirm_kind floor: split-module edits
+    (hardware.py / settings_schema.py / core/*) still CONFIRM under ALLOW,
+    DENY wins, garbage .py outside roots is refused, unresolvable → ''."""
+
+    def _belt(self, H, monkeypatch, policy=None):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        if policy is not None:
+            H.SETTINGS["command_policy"] = policy
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
+        tb._tool_times = deque()
+        tb._policy = H.DecisionPolicy(H.SETTINGS)
+        tb._pending_confirm = None
+        tb._confirm_running = None
+        tb._jobs = {}
+        tb._job_seq = 0
+        tb._job_lock = threading.Lock()
+        tb._on_announce = None
+        return tb
+
+    def _split_env(self, H, tmp_path, monkeypatch):
+        fake_self = tmp_path / "handsoff.py"
+        fake_self.write_text(H.SELF_MARKER + "\nprint('v1')\n", encoding="utf-8")
+        monkeypatch.setattr(H, "SELF_PATH", fake_self)
+        hw = tmp_path / "hardware.py"
+        hw.write_text("X = 1\n", encoding="utf-8")
+        schema = tmp_path / "settings_schema.py"
+        schema.write_text("Y = 2\n", encoding="utf-8")
+        core_dir = tmp_path / "core"
+        core_dir.mkdir(exist_ok=True)
+        core_init = core_dir / "__init__.py"
+        core_init.write_text("Z = 3\n", encoding="utf-8")
+        return fake_self, hw, schema, core_init
+
+    def test_allow_still_confirms_split(self, H, tmp_path, monkeypatch):
+        tb = self._belt(H, monkeypatch, policy={"edit_file": "ALLOW"})
+        _, hw, schema, core_init = self._split_env(H, tmp_path, monkeypatch)
+        for target in (hw, schema, core_init):
+            old = target.read_text(encoding="utf-8")
+            out, err = tb.execute("edit_file", {
+                "path": str(target), "content": old + "# tweak\n"})
+            assert err and out.startswith("CONFIRM REQUIRED"), (target, out)
+            assert "DIFF PREVIEW" in out
+            # no write until confirmed
+            assert target.read_text(encoding="utf-8") == old
+            tb._pending_confirm = None  # reset for next target
+
+    def test_deny_wins_over_split_floor(self, H, tmp_path, monkeypatch):
+        tb = self._belt(H, monkeypatch, policy={"edit_file": "DENY"})
+        _, hw, _, _ = self._split_env(H, tmp_path, monkeypatch)
+        old = hw.read_text(encoding="utf-8")
+        out, err = tb.execute("edit_file", {
+            "path": str(hw), "content": old + "# tweak\n"})
+        assert err and "DENIED" in out and not out.startswith("CONFIRM"), out
+        assert tb._pending_confirm is None
+        assert hw.read_text(encoding="utf-8") == old
+
+    def test_garbage_py_outside_roots_refused(self, H, tmp_path, monkeypatch):
+        tb = self._belt(H, monkeypatch, policy={"edit_file": "ALLOW"})
+        self._split_env(H, tmp_path, monkeypatch)
+        evil = tmp_path.parent / "evil-outside-roots-xyz.py"
+        try:
+            out, err = tb.execute("edit_file", {
+                "path": str(evil), "content": "print('x')\n"})
+            assert err and out.startswith("REFUSED"), out
+            assert tb._pending_confirm is None
+            # direct kind pin
+            assert tb._edit_confirm_kind(
+                {"path": str(evil), "content": "x"}) == ""
+        finally:
+            try:
+                evil.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def test_unresolvable_path_is_empty(self, H, tmp_path, monkeypatch):
+        tb = self._belt(H, monkeypatch)
+        self._split_env(H, tmp_path, monkeypatch)
+        assert tb._edit_confirm_kind(
+            {"path": "/tmp/\x00bad", "content": "x"}) == ""
+        assert tb._edit_confirm_kind({"path": "", "content": "x"}) == ""
+        assert tb._edit_confirm_kind({"content": "x"}) == ""
+
+    def test_split_preview_unreadable_identical_and_truncated(self, H, tmp_path):
+        target = tmp_path / "module.py"
+        target.write_text("same\n", encoding="utf-8")
+        assert "identical" in H.ToolBelt._split_edit_preview(
+            {"path": str(target), "content": "same\n"})
+        assert "unreadable" in H.ToolBelt._split_edit_preview(
+            {"path": str(tmp_path), "content": "new\n"})
+        preview = H.ToolBelt._split_edit_preview(
+            {"path": str(target), "content": "x\n" * 100}, limit=20)
+        assert "diff truncated" in preview

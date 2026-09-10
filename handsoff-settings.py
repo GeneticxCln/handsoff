@@ -41,8 +41,13 @@ HOME = Path.home()
 
 
 def _import_handsoff():
-    """Load the bubble's module for shared paths and helpers."""
-    for cand in (HOME / ".local/bin/handsoff.py", Path(__file__).resolve().parent / "handsoff.py"):
+    """Load the bubble's module for shared paths and helpers.
+
+    ONE shared order everywhere: beside-this-file first, then the installed
+    copy — so a repo checkout never silently runs installed code (or vice
+    versa) when both exist."""
+    for cand in (Path(__file__).resolve().parent / "handsoff.py",
+                 HOME / ".local/bin/handsoff.py"):
         if cand.exists():
             spec = importlib.util.spec_from_file_location("handsoff_core", cand)
             mod = importlib.util.module_from_spec(spec)
@@ -59,19 +64,44 @@ class _LazyHandsoff:
     shared paths/helpers; the settings GUI paid that at startup for no
     reason. Reads behave as before — the first real attribute execs the
     bubble once and caches it — and monkeypatch.setattr(H, ...) in tests
-    keeps working (instance attrs shadow the bubble until deleted)."""
+    keeps working (instance attrs shadow the bubble until deleted).
+
+    Hardening: a load lock so concurrent first uses exec exactly once;
+    dunder probes (copy/hasattr/pickle) fail fast without exec'ing the
+    bubble, and missing plain attrs raise from the cached bubble without
+    re-exec; instance-attr shadowing via __setattr__/__delattr__ below is
+    deliberate shadowing (never a write-through to the bubble module)."""
     def __init__(self) -> None:
         self.__dict__["_bubble"] = None
+        self.__dict__["_lock"] = threading.Lock()
 
     def _load(self):
         mod = self.__dict__["_bubble"]
         if mod is None:
-            mod = _import_handsoff()
-            self.__dict__["_bubble"] = mod
+            with self.__dict__["_lock"]:
+                mod = self.__dict__["_bubble"]
+                if mod is None:
+                    mod = _import_handsoff()
+                    self.__dict__["_bubble"] = mod
         return mod
 
     def __getattr__(self, name: str):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)  # probe: never exec the bubble for dunders
         return getattr(self._load(), name)
+
+    def __setattr__(self, name: str, value) -> None:
+        # Explicit shadow: e.g. tests' monkeypatch.setattr lands here and
+        # wins over the bubble attr until deleted; the bubble itself is
+        # never written through.
+        self.__dict__[name] = value
+
+    def __delattr__(self, name: str) -> None:
+        # Unshadow: deleting the instance attr re-exposes the bubble attr.
+        del self.__dict__[name]
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(dir(self._load())))
 
 
 def _import_settings_schema():
@@ -107,7 +137,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QRadialGradient, QBrush, QPen
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -456,8 +486,14 @@ class VoiceDownloadDialog(QDialog):
         url = self.url_edit.text().strip() if self.url_edit.text().strip() else (
             sel.data(Qt.UserRole) if sel else None)
         if url and not url.lower().startswith("https://"):
-            self.status.setText("URL must use https://")
-            return None
+            # mirror the installer's HANDSOFF_UNVERIFIED_VOICE=1 escape: an
+            # explicit operator opt-in, never the default.
+            if os.environ.get("HANDSOFF_UNVERIFIED_VOICE") != "1":
+                self.status.setText("URL must use https://")
+                return None
+            self.status.setText(
+                "WARNING: non-https voice URL allowed "
+                "(HANDSOFF_UNVERIFIED_VOICE=1)")
         if url and not url.endswith(".onnx"):
             self.status.setText("URL must point to a .onnx file")
             return None
@@ -1612,6 +1648,81 @@ class SettingsWindow(QMainWindow):
             self._status("memory cleared (backup saved). Restart the bubble to apply.")
         except OSError as e:
             self._status(f"cannot clear memory: {e}")
+
+    # ------------------------------------------------------------------ history
+
+    def _history_tab(self) -> QWidget:
+        """Recent conversation history — same history.json store the bubble
+        persists (and the Memory tab reads)."""
+        w = QWidget(self)
+        lay = QVBoxLayout(w)
+        info = QLabel(
+            "Recent conversation history. New messages are added here; "
+            "clearing it makes the assistant forget everything and start fresh.", w)
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.history_view = QPlainTextEdit(self)
+        self.history_view.setReadOnly(True)
+        lay.addWidget(self.history_view)
+        row = QHBoxLayout()
+        refresh = QPushButton("Refresh", self)
+        refresh.clicked.connect(self._refresh_history)
+        clear = QPushButton("Clear history", self)
+        clear.clicked.connect(self._clear_history)
+        row.addWidget(refresh)
+        row.addWidget(clear, 1)
+        lay.addLayout(row)
+        self._refresh_history()
+        return w
+
+    def _refresh_history(self) -> None:
+        try:
+            data = json.loads(H.HISTORY_FILE.read_text(encoding="utf-8"))
+            msgs = [m for m in data if isinstance(m, dict) and m.get("role")]
+        except Exception:
+            msgs = []
+        if not msgs:
+            self.history_view.setPlainText("(history is empty — fresh start)")
+            return
+        lines = [f"{len(msgs)} messages — newest last:", ""]
+        for m in msgs:
+            role = m.get("role")
+            if m.get("tool_calls"):
+                names = ", ".join(
+                    (tc.get("function") or {}).get("name", "?")
+                    for tc in m["tool_calls"])
+                lines.append(f"[assistant] calls tool: {names}")
+                continue
+            if role == "tool":
+                content = str(m.get("content"))[:150].replace("\n", " ")
+                lines.append(f"[tool result] {content}")
+                continue
+            content = str(m.get("content"))[:150].replace("\n", " ")
+            lines.append(f"[{role}] {content}")
+        self.history_view.setPlainText("\n".join(lines))
+
+    def _clear_history(self) -> None:
+        ok = QMessageBox.question(
+            self, "Clear history",
+            "Forget the recent conversation history? A backup is kept.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ok != QMessageBox.Yes:
+            return
+        try:
+            if H.HISTORY_FILE.exists():
+                _backup_keep_n(H.HISTORY_FILE, "bak-manual")
+            self.history_view.setPlainText("(history cleared — backup saved)")
+            self._status("history cleared (backup saved). Restart the bubble to apply.")
+        except OSError as e:
+            self._status(f"cannot clear history: {e}")
+
+    def _on_tab_changed(self, index: int) -> None:
+        try:
+            if getattr(self, "tabs", None) is not None and self.tabs.widget(index) is getattr(
+                    self, "_history_page", None):
+                self._refresh_history()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------- permissions
 

@@ -78,12 +78,40 @@ class TestNotifyCoalesce:
 
 
 def _notify_lines(app, summary="hi", body="there"):
+    """One realistic production dbus-monitor message: a `method call ...
+    member=Notify` header (NOT a signal), the four payload strings, then the
+    actions + hints trailers (action labels, sender-pid/desktop-entry/urgency
+    hint strings, byte/uint32 variants) exactly as the session bus prints
+    them. The trailers carry plenty of quoted strings that must NEVER fire
+    their own announcements."""
     return [
-        'signal sender=:1.2 member=Notify string=""',
+        ("method call time=1725631234.123456 sender=:1.45 -> destination=:1.46 "
+         "serial=42 path=/org/freedesktop/Notifications; "
+         "interface=org.freedesktop.Notifications; member=Notify"),
         f'   string "{app}"',
+        "   uint32 0",
         '   string ""',
         f'   string "{summary}"',
         f'   string "{body}"',
+        "   array [",
+        '      string "default"',
+        '      string "Open"',
+        "   ]",
+        "   array [",
+        "      dict entry(",
+        '         string "desktop-entry"',
+        '         variant             string "firefox"',
+        "      )",
+        "      dict entry(",
+        '         string "sender-pid"',
+        "         variant             uint32 1234",
+        "      )",
+        "      dict entry(",
+        '         string "urgency"',
+        "         variant             byte 1",
+        "      )",
+        "   ]",
+        "   int32 5000",
     ]
 
 
@@ -125,3 +153,79 @@ class TestReaderCooldown:
             stdout=iter(_notify_lines("NoisyApp")), poll=lambda: 0)
         a._notification_loop(proc, threading.Event())
         assert said == [], said
+
+    def test_one_message_yields_one_announcement_despite_trailers(self, H, monkeypatch):
+        """The actions/hints trailer strings (default, sender-pid,
+        desktop-entry, urgency) must not fire their own announcements."""
+        said = self._run_loop(H, monkeypatch, ["Firefox"])
+        assert len(said) == 1, said
+        assert "Firefox" in said[0] and "hi" in said[0]
+
+    def test_urgency_hint_neither_mutes_nor_multiplies(self, H, monkeypatch):
+        """Urgency travels as a byte variant in hints: an unrelated app is
+        still announced exactly once."""
+        said = self._run_loop(H, monkeypatch, ["Firefox"])
+        assert len(said) == 1, said
+
+    def test_handsoff_word_in_summary_or_body_is_self_muted(self, H, monkeypatch):
+        """New contract: SELF-mute when app==handsoff or 'handsoff' in
+        summary/body (our own popups echo the name); user mute list matches
+        app (+summary word-ish) and never body alone."""
+        H._notify_reset()
+        monkeypatch.setitem(H.SETTINGS, "notification_mute_apps", [])
+        said: list = []
+        a = H.Assistant.__new__(H.Assistant)
+        a._announce_now = said.append
+        proc = types.SimpleNamespace(
+            stdout=iter(_notify_lines("Something", summary="timer",
+                                      body="handsoff snoozed it")),
+            poll=lambda: 0)
+        a._notification_loop(proc, threading.Event())
+        assert said == [], said
+        # summary mention also self-mutes
+        said.clear()
+        proc2 = types.SimpleNamespace(
+            stdout=iter(_notify_lines("Something", summary="handsoff timer",
+                                      body="done")),
+            poll=lambda: 0)
+        a._notification_loop(proc2, threading.Event())
+        assert said == [], said
+
+    def test_user_mute_matches_app_and_summary_word_not_body(self, H, monkeypatch):
+        """User list: app substring ('noisy'→'NoisyApp') and summary whole-word
+        mute; a body-only mention must still announce."""
+        H._notify_reset()
+        monkeypatch.setitem(H.SETTINGS, "notification_mute_apps", ["noisy"])
+        said: list = []
+        a = H.Assistant.__new__(H.Assistant)
+        a._announce_now = said.append
+        # body-only 'noisy' still announces (mute never looks at body)
+        proc = types.SimpleNamespace(
+            stdout=iter(_notify_lines("Firefox", summary="hi",
+                                      body="noisy background chatter")),
+            poll=lambda: 0)
+        a._notification_loop(proc, threading.Event())
+        assert len(said) == 1, said
+        # summary whole-word mutes
+        H._notify_reset()
+        said.clear()
+        proc2 = types.SimpleNamespace(
+            stdout=iter(_notify_lines("Firefox", summary="noisy build",
+                                      body="done")),
+            poll=lambda: 0)
+        a._notification_loop(proc2, threading.Event())
+        assert said == [], said
+
+    def test_stray_lines_and_back_to_back_messages(self, H, monkeypatch):
+        H._notify_reset()
+        monkeypatch.setitem(H.SETTINGS, "notification_mute_apps", [])
+        said: list = []
+        a = H.Assistant.__new__(H.Assistant)
+        a._announce_now = said.append
+        lines = ["stray quoted string before any Notify"]
+        lines += _notify_lines("Slack", summary="one", body="first")
+        lines += _notify_lines("Mail", summary="two", body="second")
+        proc = types.SimpleNamespace(stdout=iter(lines), poll=lambda: 0)
+        a._notification_loop(proc, threading.Event())
+        assert len(said) == 2, said
+        assert "Slack" in said[0] and "Mail" in said[1]

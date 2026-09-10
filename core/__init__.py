@@ -10,28 +10,52 @@ are unchanged; later steps peel audio/brain/tools/ui/doctor the same way.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 
 
+def _repo_root() -> Path | None:
+    """The source checkout dir, if discoverable (explicit env or a handsoff.py
+    beside this package's parent) — part of the union origin with ~/.local/bin."""
+    explicit = os.environ.get("HANDSOFF_SOURCE_PATH")
+    if explicit:
+        cand = Path(explicit).expanduser()
+        cand = cand / "handsoff.py" if cand.is_dir() else cand
+        if cand.name == "handsoff.py":
+            return cand.parent
+    if (_HERE.parent / "handsoff.py").is_file():
+        return _HERE.parent
+    return None
+
+
 def _allowed_dirs() -> set[Path]:
     """Dirs a handsoff support module may load from (one origin rule,
-    shared with handsoff.py's bootstrap): beside this package (repo root
-    or the deployed dir) and ~/.local/bin."""
+    shared with handsoff.py's bootstrap): the union of the source checkout
+    (beside this package, i.e. the repo root, or HANDSOFF_SOURCE_PATH) and
+    ~/.local/bin — each incl. its core/ subdir."""
     dirs: set[Path] = set()
     for cand in (_HERE, _HERE.parent):
         try:
             dirs.add(cand.resolve())
         except OSError:
             dirs.add(cand)
+    repo = _repo_root()
+    if repo is not None:
+        for cand in (repo, repo / "core"):
+            try:
+                dirs.add(cand.resolve())
+            except OSError:
+                dirs.add(cand)
     try:
         bin_dir = Path.home() / ".local" / "bin"
-        try:
-            dirs.add(bin_dir.resolve())
-        except OSError:
-            dirs.add(bin_dir.absolute())
+        for cand in (bin_dir, bin_dir / "core"):
+            try:
+                dirs.add(cand.resolve())
+            except OSError:
+                dirs.add(cand.absolute())
     except Exception:
         pass
     return dirs
@@ -53,15 +77,20 @@ def load_module(mod_name: str):
     (repo checkouts/tests, where the repo root is on sys.path), all under
     one origin rule — only a module living in an allowed dir is accepted,
     so a foreign module planted in sys.modules or on sys.path can never
-    satisfy us. The bare sys.modules name is only filled when absent or
-    same-origin (never clobbering a foreign entry), and a failed exec
-    restores whatever was there (no half-initialized squat).
+    satisfy us. The sys.modules names are only filled when absent or
+    same-origin (never clobbering a foreign entry, never swapping under a
+    live foreign submodule), and a failed exec restores whatever was there
+    (no half-initialized squat).
 
     Registered as 'core.<name>' so reimports are cached.
     """
     cached = sys.modules.get(f"core.{mod_name}")
     if cached is not None and _origin_ok(cached):
         return cached
+    if cached is not None:
+        raise ImportError(
+            f"handsoff core: refusing to swap foreign live submodule "
+            f"core.{mod_name} ({getattr(cached, '__file__', '?')})")
     cached_own = sys.modules.get(mod_name)
     if cached_own is not None and _origin_ok(cached_own):
         sys.modules[f"core.{mod_name}"] = cached_own
@@ -90,6 +119,10 @@ def load_module(mod_name: str):
         mod = importlib.util.module_from_spec(spec)
         prev_bare = sys.modules.get(mod_name)
         prev_core = sys.modules.get(f"core.{mod_name}")
+        if prev_core is not None and not _origin_ok(prev_core):
+            raise ImportError(
+                f"handsoff core: refusing to swap foreign live submodule "
+                f"core.{mod_name} ({getattr(prev_core, '__file__', '?')})")
         if prev_bare is None or _origin_ok(prev_bare):
             sys.modules[mod_name] = mod          # canonical name
         sys.modules[f"core.{mod_name}"] = mod

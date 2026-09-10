@@ -143,3 +143,5 @@ clipboard. First live run 2026-09-09: `verdict: PASS (5/5 checks)`.
 | Date | Tester | Commit / deployment sha | Result |
 |---|---|---|---|
 | 2026-09-09 | Buffy (automated run) | ff2f158 + uncommitted handsoff-restart race fix | All automatable items PASS; human items: Yeti selection, live audio, barge-in, sliders, session teardown, reboot |
+| 2026-09-10 | Buffy (automated run) | 38a0764 + PTT/notify/split set | All automatable items PASS (live doctor in-sync); human items unchanged |
+| 2026-09-10 | Fixer (repository validation) | uncommitted hygiene hardening | 583 tests passed; deployment and human-only checks not run |

@@ -310,6 +310,12 @@ def _settings_file_lock():
 
     Shared by settings writes AND reminders.json: pass lock_name to reuse
     the same sidecar-flock pattern for another runtime file in the dir.
+
+    Non-reentrant by construction: flock locks live on the open file
+    description, so a second LOCK_EX on the SAME sidecar from the same
+    thread (nesting two of these guards) blocks forever instead of
+    succeeding — serialize in-process with a threading lock (e.g.
+    REMINDERS_LOCK) and never nest this guard with itself.
     """
     import contextlib
 

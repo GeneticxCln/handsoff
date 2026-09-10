@@ -1,7 +1,7 @@
 # World-events warnings design (2026-09-09)
 
 Morning-briefing world headlines + opt-in proactive severe-event warnings.
-Status: **approved — implement as below.**
+Status: **implemented 2026-09-09, pinned by test_hardware/watch/world_events.**
 
 ## Problem
 

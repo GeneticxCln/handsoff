@@ -1,7 +1,7 @@
 # Hardware detector design (2026-09-09)
 
 How `run_doctor` / `doctor_json` learn about the machine without rotting into
-a second, parallel probing stack. Status: **approved — implement as below.**
+a second, parallel probing stack. Status: **implemented 2026-09-09, pinned by test_hardware/watch/world_events.**
 
 ## Problem
 

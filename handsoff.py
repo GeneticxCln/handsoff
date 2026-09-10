@@ -170,32 +170,55 @@ def _support_origin_ok(mod: object) -> bool:
 
 
 def _load_core_package():
-    """Import our `core` package (same-origin) or spec-load it from beside
-    this file / ~/.local/bin. A real package spec is required so the
+    """Import our `core` package (same-origin) or spec-load it beside this
+    file / from ~/.local/bin. ONE shared order everywhere: beside-this-file
+    first, then the installed copy, then a plain import — all under ONE
+    origin rule (this file's dir incl. its core/ subdir, or ~/.local/bin),
+    so a foreign module planted in sys.modules or on sys.path can never
+    satisfy us. The `core` entry in sys.modules is only filled when absent
+    or same-origin, and NEVER swapped under live core.* submodules (that
+    would orphan them); a failed exec restores whatever was there (no
+    half-initialized squat). A real package spec is required so the
     relative `from . import load_module` inside core.settings resolves."""
-    try:
-        import core as _cand
-        if _support_origin_ok(_cand):
+    prev = sys.modules.get("core")
+    if prev is not None and _support_origin_ok(prev):
+        try:
             import core.settings as _cs
             return _cs
-    except ImportError:
-        pass
+        except ImportError:
+            pass
     import importlib.util as _ilu
     here = Path(__file__).resolve().parent
     last_err: Exception | None = None
-    for init in (here / "core" / "__init__.py",
-                 HOME / ".local" / "bin" / "core" / "__init__.py"):
+    cands = [here / "core" / "__init__.py",
+             HOME / ".local" / "bin" / "core" / "__init__.py"]
+    seen: set[str] = set()
+    for init in cands:
+        try:
+            key = str(init.resolve())
+        except OSError:
+            key = str(init)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             if not init.is_file():
                 continue
         except OSError:
             continue
+        if prev is not None and not _support_origin_ok(prev):
+            live = [k for k in sys.modules
+                    if k == "core" or k.startswith("core.")]
+            if live:
+                raise ImportError(
+                    "handsoff: refusing to swap a foreign 'core' module "
+                    f"({getattr(prev, '__file__', '?')}) under live "
+                    f"submodules {live}")
         spec = _ilu.spec_from_file_location(
             "core", init, submodule_search_locations=[str(init.parent)])
         if spec is None or spec.loader is None:
             continue
         pkg = _ilu.module_from_spec(spec)
-        prev = sys.modules.get("core")
         sys.modules["core"] = pkg
         try:
             spec.loader.exec_module(pkg)
@@ -208,6 +231,14 @@ def _load_core_package():
             continue
         import core.settings as _cs2
         return _cs2
+    # last resort: a plain import, accepted only when same-origin
+    try:
+        import core as _cand
+        if _support_origin_ok(_cand):
+            import core.settings as _cs3
+            return _cs3
+    except ImportError as e:
+        last_err = e
     if last_err is not None:
         raise last_err
     raise ImportError("handsoff: cannot load the core package beside this file")
@@ -359,6 +390,7 @@ def _deployment_snapshot() -> dict:
     bin_dir = installed.parent
     files: dict = {}
     all_match = True
+    partial_source = False  # installed file exists but its source is missing
     for rel in _DEPLOY_FILES:
         src = repo_dir / rel if repo_dir is not None else None
         src_hash = _sha256_file(src) if src is not None else None
@@ -369,13 +401,15 @@ def _deployment_snapshot() -> dict:
                       "installed_sha256": dst_hash, "match": match}
         if match is False:
             all_match = False
+        elif match is None and dst_hash:
+            partial_source = True
     if not current_hash:
         status = "running-missing"
     elif not repo_hash:
         status = "source-unknown"
     elif not installed_hash:
         status = "installed-missing"
-    elif all_match:
+    elif all_match and not partial_source:
         status = "in-sync"
     else:
         status = "installed-drift"
@@ -473,6 +507,13 @@ def run_doctor() -> str:
         "running-missing": "running source unreadable",
     }.get(status, status)
     lines.append(f"deployment: {status} — {deploy_note}")
+    manifest = d.get("manifest") if isinstance(d.get("manifest"), dict) else {}
+    revision = manifest.get("whisper_revision") or "unknown"
+    digest = manifest.get("whisper_sha256") or "unknown"
+    lines.append(f"whisper: revision {revision}; sha256 {digest}")
+    python_exe = manifest.get("python") or sys.executable
+    python_version = ".".join(str(part) for part in sys.version_info[:3])
+    lines.append(f"python: {python_exe} ({python_version})")
     lines.append(f"  running: {d['running_path']}")
     if d["running_sha256"]:
         lines.append(f"  running sha256: {d['running_sha256'][:16]}…")
@@ -1289,6 +1330,10 @@ _READER_APP_COOLDOWN = 60.0  # one spoken digest per app per minute, max
 _READER_COOLDOWN_LOCK = threading.Lock()
 _READER_APP_LAST: dict[str, float] = {}
 
+_ANNOUNCE_LOCK = threading.Lock()  # serialize ALL _speak playback (no overlap)
+_ANNOUNCE_CANCEL = threading.Event()  # cancels the previous announcement's playback
+_ANNOUNCE_CANCEL_LOCK = threading.Lock()  # guards _ANNOUNCE_CANCEL rebind (no live race)
+
 
 def _notify_send(text: str) -> None:
     """One notify-send popup; best-effort, never raises."""
@@ -1609,6 +1654,7 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
     buf = ""
     full = ""
     tool_calls: list[dict] = []
+    _fallback = False  # 400-with-tools retry: inner call owns the terminator
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             for raw in resp:
@@ -1644,6 +1690,7 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
     except urllib.error.HTTPError as e:
         if e.code == 400 and tools and "tool" in _read_http_error(e).lower():
             log.warning("model %s does not support tools; continuing without", OLLAMA_MODEL)
+            _fallback = True  # skip the outer terminator below; the inner call puts it
             return ollama_chat_stream(messages, q, cancel, None)
         # ponytail: never swallow — the caller must speak the failure and
         # must not append an empty assistant turn as if the model replied.
@@ -1654,7 +1701,8 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
         log.exception("streaming chat failed")
         raise
     finally:
-        q.put(None)
+        if not _fallback:
+            q.put(None)
     if tools:
         _TOOLS_SUPPORTED = True  # a tools call worked: never stay latched off
     return {"tool_calls": tool_calls, "content": strip_thinking(full).strip()}
@@ -1769,10 +1817,78 @@ class Recorder:
         return _resample_to_16k(audio, getattr(self, "_native_rate", SAMPLE_RATE))
 
 
+def _stop_recorder_bounded(rec, timeout: float = 3.0):
+    """Bounded rec.stop(): a dead Yeti wedges stream.stop()/close() for 51s.
+
+    Runs rec.stop() in an inner daemon and joins `timeout`; on timeout does
+    best-effort stream.abort()+close() (each guarded), drops the audio
+    (None) and reports wedged=True so the caller can suffix its timing
+    line. Returns (audio, wedged). Never raises into the ptt workers."""
+    try:
+        stream = getattr(rec, "_stream", None)
+    except Exception:
+        stream = None
+    box: dict = {}
+
+    def _call() -> None:
+        try:
+            box["audio"] = rec.stop()
+        except Exception:
+            log.exception("recorder stop failed")
+            box["audio"] = None
+
+    try:
+        th = threading.Thread(target=_call, name="ptt-stop-inner",
+                              daemon=True)
+        th.start()
+    except Exception:
+        try:
+            return rec.stop(), False
+        except Exception:
+            log.exception("recorder stop failed")
+            return None, False
+    th.join(timeout)
+    if th.is_alive():
+        for _s in (stream, getattr(rec, "_stream", None)):
+            if _s is None:
+                continue
+            try:
+                fn = getattr(_s, "abort", None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                fn = getattr(_s, "close", None)
+                if callable(fn):
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            if getattr(rec, "_stream", None) is not None:
+                try:
+                    rec._stream = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None, True
+    return box.get("audio", None), False
+
+
 # ------------------------------------------------------------------------ STT / TTS
 
 _whisper_model = None
 _whisper_lock = threading.Lock()
+_TRANSCRIBE_LOCK = threading.Lock()  # serialize whisper inference (never overlap)
+_whisper_cpu_fallback = False  # session pin: CUDA proved broken → stay on CPU
+_CUDA_ERR_RE = re.compile(r"cuda|cublas|cudnn", re.IGNORECASE)
 _piper_voice = None
 _piper_lock = threading.Lock()
 
@@ -1819,11 +1935,12 @@ def get_whisper():
             from faster_whisper import WhisperModel  # lazy: heavy import
 
             device, compute = "cpu", "int8"
-            if WHISPER_DEVICE == "cuda":
-                device, compute = "cuda", "float16"
-            elif WHISPER_DEVICE == "auto":
-                device, compute = _whisper_device_choice(
-                    WHISPER_SIZE, _nvidia_free_vram_mb())
+            if not _whisper_cpu_fallback:
+                if WHISPER_DEVICE == "cuda":
+                    device, compute = "cuda", "float16"
+                elif WHISPER_DEVICE == "auto":
+                    device, compute = _whisper_device_choice(
+                        WHISPER_SIZE, _nvidia_free_vram_mb())
             log.info("loading whisper '%s' on %s (%s) from %s",
                      WHISPER_SIZE, device, compute, WHISPER_MODEL_DIR)
             try:
@@ -1870,12 +1987,43 @@ def get_piper():
 
 
 
+def _is_cuda_error(exc: BaseException) -> bool:
+    """Lazy-CUDA breakage: ctranslate2 resolves CUDA libs at first inference,
+    so the load-time GPU→CPU fallback never sees it."""
+    return isinstance(exc, (RuntimeError, OSError)) and bool(
+        _CUDA_ERR_RE.search(str(exc)))
+
+
 def transcribe(audio_int16: np.ndarray) -> str:
-    segments, _info = get_whisper().transcribe(
-        audio_int16.astype(np.float32) / 32768.0, vad_filter=True,
-        language="en", beam_size=1,
-    )
-    return " ".join(s.text.strip() for s in segments).strip()
+    global _whisper_model, _whisper_cpu_fallback
+    # ponytail: one inference at a time — stop-probe + pipeline + probe
+    # threads must never overlap whisper (VRAM/GPU races, garbled text).
+    with _TRANSCRIBE_LOCK:
+        model = get_whisper()
+        # ponytail: faster-whisper returns a LAZY generator — the CUDA call
+        # (encode → libcublas) runs during iteration, so consumption must
+        # stay inside the guarded region on both paths.
+        def _read(segments):
+            return " ".join(s.text.strip() for s in segments).strip()
+        try:
+            segments, _info = model.transcribe(
+                audio_int16.astype(np.float32) / 32768.0, vad_filter=True,
+                language="en", beam_size=1,
+            )
+            return _read(segments)
+        except (RuntimeError, OSError) as e:
+            if _whisper_cpu_fallback or not _is_cuda_error(e):
+                raise
+            log.warning("whisper CUDA broken (libcublas…), falling back to CPU "
+                        "for this session: %s", e)
+            with _whisper_lock:
+                _whisper_model = None
+                _whisper_cpu_fallback = True
+            segments, _info = get_whisper().transcribe(
+                audio_int16.astype(np.float32) / 32768.0, vad_filter=True,
+                language="en", beam_size=1,
+            )
+            return _read(segments)
 
 
 def tts_to_wav(text: str, wav_path: Path) -> None:
@@ -3043,16 +3191,30 @@ class ToolBelt:
             return False
         return p == SELF_PATH
 
+    def _edit_confirm_kind(self, args: dict) -> str:
+        """'self' | 'split' | '' — the CONFIRM floor covers the running bubble
+        AND the split support modules (any editable .py outside CONFIG_DIR);
+        a prompt-injected edit under ALLOW must still round-trip the user."""
+        try:
+            p = Path(str(args.get("path") or "")).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return ""
+        kind = _classify_edit_path(p)
+        return kind if kind in ("self", "split") else ""
+
     def _self_edit_needs_confirm(self, args: dict) -> bool:
-        """True for a self-edit whose payload already passes the tool's static
-        checks (marker + syntax). Those checks stay in edit_file; here they
-        just ensure the CONFIRM offer only gates writes that would otherwise
-        land immediately — invalid payloads fall through to the tool's own
-        refusal with no user round-trip."""
-        if not self._is_self_edit(args):
-            return False
+        """True for a self/split edit whose payload already passes the tool's
+        static checks (marker for self-edits + syntax). Those checks stay in
+        edit_file; here they just ensure the CONFIRM offer only gates writes
+        that would otherwise land immediately — invalid payloads fall through
+        to the tool's own refusal with no user round-trip."""
         content = args.get("content")
-        if not isinstance(content, str) or SELF_MARKER not in content:
+        if not isinstance(content, str):
+            return False
+        kind = self._edit_confirm_kind(args)
+        if not kind:
+            return False
+        if kind == "self" and SELF_MARKER not in content:
             return False
         try:
             compile(content, "self-edit-preview", "exec")
@@ -3075,6 +3237,28 @@ class ToolBelt:
             fromfile="handsoff.py (running)", tofile="handsoff.py (proposed)"))
         if not out:
             return "(proposed content is identical to the running source)"
+        if len(out) > limit:
+            out = out[:limit] + f"\n… (diff truncated, {len(out) - limit} more chars)"
+        return out
+
+    @staticmethod
+    def _split_edit_preview(args: dict, limit: int = 800) -> str:
+        """Unified diff of a proposed split-module edit against its live file."""
+        import difflib
+        try:
+            target = Path(str(args.get("path") or "")).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return "(unresolvable target, no diff)"
+        try:
+            old = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return f"(current file unreadable, no diff: {e})"
+        new = str(args.get("content") or "")
+        out = "".join(difflib.unified_diff(
+            old.splitlines(True), new.splitlines(True),
+            fromfile=f"{target.name} (running)", tofile=f"{target.name} (proposed)"))
+        if not out:
+            return "(proposed content is identical to the running file)"
         if len(out) > limit:
             out = out[:limit] + f"\n… (diff truncated, {len(out) - limit} more chars)"
         return out
@@ -3165,6 +3349,13 @@ class ToolBelt:
             if name == "edit_file" and self._is_self_edit(args):
                 extra = "\nDIFF PREVIEW (proposed change to handsoff.py):\n" \
                         + self._self_edit_preview(args)
+            elif name == "edit_file" and self._edit_confirm_kind(args) == "split":
+                try:
+                    _split_name = Path(str(args.get("path") or "")).expanduser().name
+                except (OSError, RuntimeError, ValueError):
+                    _split_name = "split module"
+                extra = f"\nDIFF PREVIEW (proposed change to {_split_name}):\n" \
+                        + self._split_edit_preview(args)
             return (f"CONFIRM REQUIRED: about to call '{name}' with {target or 'no arguments'}. "
                     "Nothing happened yet. The user must hear this offer and "
                     "reply; call confirm_action(answer='yes') in the NEXT turn "
@@ -6190,7 +6381,21 @@ class ContinuousListener:
                 self._health_utt += 1
             frames.clear()
         if self._spotter is not None and not self.gate_open:
-            fired, pre_audio = self._spotter.feed(indata.reshape(-1))
+            # native-rate mics (StreamCam 48 kHz…) must be resampled to the
+            # spotter's 16 kHz domain first — feeding 48 kHz frames makes the
+            # 1280-sample model window 3x too short and it never fires.
+            feed_data = indata.reshape(-1)
+            try:
+                _rate = int(getattr(self, "_capture_rate", SAMPLE_RATE) or SAMPLE_RATE)
+            except Exception:
+                _rate = SAMPLE_RATE
+            if _rate != SAMPLE_RATE:
+                try:
+                    feed_data = _resample_to_16k(feed_data, _rate)
+                except Exception:
+                    log.exception("wake spotter resample failed — skipping frame")
+                    return
+            fired, pre_audio = self._spotter.feed(feed_data)
             n_samples = sum(len(c) for c in pre_audio)
             if fired and n_samples >= SAMPLE_RATE // 2:
                 # the spotter IS the wake gate: emit directly, bypass the
@@ -6271,6 +6476,17 @@ class ContinuousListener:
                 continue
             open_failures = 0
             self._capture_rate = rate
+            # ponytail: VAD frame budgets scale with the native rate — 1024
+            # samples at 48 kHz is 3x shorter than at 16 kHz, so unscaled
+            # budgets cut utterances 3x too early on StreamCam-class devices.
+            try:
+                _scale = float(rate) / float(SAMPLE_RATE) if rate else 1.0
+            except Exception:
+                _scale = 1.0
+            if _scale != 1.0:
+                max_frames = int(self.MAX_UTTERANCE_S * SAMPLE_RATE / self.FRAME * _scale)
+                min_frames = int(self.MIN_UTTERANCE_S * SAMPLE_RATE / self.FRAME * _scale)
+                # cb closes over these names, so the reassignment applies live.
             self._health_opens_ok += 1
             self._health_open_device = device or "system default"
             self._health_last_open = datetime.datetime.now().strftime("%H:%M:%S")
@@ -6358,6 +6574,9 @@ class Assistant(QObject):
         self._gen = 0                     # increments per interaction; stale
         self._cancel = threading.Event()  # workers check their own event
         self._recorder: Recorder | None = None
+        self._ptt_lock = threading.RLock()  # guards PTT epoch + staleness+submit
+        self._ptt_epoch = 0  # PTT-scoped generation: background timers must not kill utterances
+        self._ptt_stopping = False  # True while a ptt-stop worker owns stream.stop()
         self._models_ready = threading.Event()
         self._history = self._load_history()
         self._memory = _load_memory()
@@ -6765,7 +6984,7 @@ class Assistant(QObject):
             stop = threading.Event()
             self._notification_stop = stop
             self._notification_thread = threading.Thread(
-                target=self._notification_loop, args=(self._notification_proc, stop),
+                target=self._notification_reader_run, args=(stop,),
                 name="notification-reader", daemon=True)
             self._notification_thread.start()
             log.info("desktop notification reader enabled")
@@ -6789,14 +7008,48 @@ class Assistant(QObject):
         """Extract ordinary quoted D-Bus string values from monitor output."""
         return re.findall(r'(?<!\\)"((?:\\.|[^"\\])*)"', line)
 
+    @staticmethod
+    def _notification_muted(app: str, summary: str, body: str) -> bool:
+        """New mute contract: user list matches app (+summary) with word-ish
+        semantics (app substring to keep 'Noisy'→'NoisyApp', summary whole
+        word, never body); self-mute when app==handsoff or 'handsoff' in
+        summary/body."""
+        try:
+            a = (app or "").lower()
+            s = (summary or "").lower()
+            b = (body or "").lower()
+            # SELF first: our own popups echo the app name in summary/body.
+            if a.strip() == APP_NAME.lower():
+                return True
+            if APP_NAME.lower() in s or APP_NAME.lower() in b:
+                return True
+            for raw in (SETTINGS.get("notification_mute_apps") or []):
+                m = str(raw or "").strip().lower()
+                if not m:
+                    continue
+                if m in a:
+                    return True
+                try:
+                    if re.search(r"\b" + re.escape(m) + r"\b", s):
+                        return True
+                except re.error:
+                    if m in s:
+                        return True
+            return False
+        except Exception:
+            return False
+
     def _notification_loop(self, proc, stop: threading.Event) -> None:
-        values: list[str] = []
+        values: list[str] | None = None  # None: between messages, ignore trailers
         try:
             for line in proc.stdout or ():
                 if stop.is_set():
                     return
-                if line.startswith("signal ") and "member=Notify" in line:
+                if "member=Notify" in line and (
+                        line.startswith("signal ") or line.startswith("method call ")):
                     values = []
+                    continue
+                if values is None:
                     continue
                 if not values and not line.lstrip().startswith("string"):
                     continue
@@ -6804,15 +7057,18 @@ class Assistant(QObject):
                 # Notify's signature is (app, replaces-id, icon, summary,
                 # body, actions, hints, expire-time). dbus-monitor prints the
                 # uint32/arrays separately, so the four strings we need are
-                # app, icon, summary, body — do not wait for a fifth string.
+                # app, icon, summary, body — consume once per message and
+                # ignore the actions/hints trailers (sender-pid, urgency…),
+                # which must never fire their own announcements.
                 if len(values) >= 4:
                     app, _icon, summary, body = values[:4]
-                    values = []
-                    muted = [str(x).lower() for x in SETTINGS.get("notification_mute_apps", [])]
-                    muted.append(APP_NAME.lower())  # never echo our own popups
-                    if any(m and m in app.lower() for m in muted):
-                        log.info("notification muted from %s", app)
-                        continue
+                    values = None  # consumed: one utterance per message
+                    try:
+                        if self._notification_muted(app, summary, body):
+                            log.info("notification muted from %s", app)
+                            continue
+                    except Exception:
+                        pass
                     now = time.monotonic()
                     with _READER_COOLDOWN_LOCK:
                         last = _READER_APP_LAST.get(app.lower())
@@ -6827,6 +7083,12 @@ class Assistant(QObject):
                         self._announce_now(text[:500])
                     except Exception:
                         log.exception("notification announcement failed")
+            # stdout exhaustion (dbus-monitor died/restarted): log it so a
+            # silent reader is visible; the reconnect wrapper below respawns
+            # with bounded backoff. Direct _notification_loop callers (tests)
+            # simply return here.
+            if not stop.is_set():
+                log.warning("notification reader stdout exhausted — monitor exited")
         except (OSError, ValueError):
             if not stop.is_set():
                 log.exception("notification reader stopped unexpectedly")
@@ -6836,6 +7098,44 @@ class Assistant(QObject):
                     proc.terminate()
                 except (AttributeError, OSError):
                     pass
+
+    def _notification_reader_run(self, stop: threading.Event) -> None:
+        """Production wrapper: run _notification_loop, respawning dbus-monitor
+        with bounded backoff when its stdout is exhausted. At most 5 respawns,
+        1s→30s exponential backoff; gives up quietly when disabled."""
+        backoff = 1.0
+        attempts = 0
+        while not stop.is_set() and attempts < 5:
+            proc = getattr(self, "_notification_proc", None)
+            if proc is None or (hasattr(proc, "poll") and proc.poll() is not None):
+                # previous monitor died — respawn it under backoff
+                if stop.wait(backoff):
+                    return
+                try:
+                    proc = subprocess.Popen(
+                        ["dbus-monitor", "--session",
+                         "interface='org.freedesktop.Notifications',member='Notify'"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True, bufsize=1, start_new_session=True)
+                    self._notification_proc = proc
+                    log.warning("notification reader respawned (attempt %d)", attempts + 1)
+                except Exception:
+                    log.exception("notification reader respawn failed")
+                    backoff = min(backoff * 2.0, 30.0)
+                    attempts += 1
+                    continue
+                backoff = min(backoff * 2.0, 30.0)
+                attempts += 1
+            try:
+                self._notification_loop(proc, stop)
+            except Exception:
+                log.exception("notification reader pass failed")
+            if stop.is_set():
+                return
+            # _notification_loop returned via exhaustion: loop to respawn.
+            # If proc is a test fake (no real dbus), its poll() is 0 (dead)
+            # but Popen would succeed in prod — in tests this wrapper is never
+            # used (tests call _notification_loop directly), so no hang.
 
     def _set_pomodoro(self, action: str, work: float, break_minutes: float) -> str:
         """Own the bounded Pomodoro worker and announce work/break transitions."""
@@ -6886,6 +7186,10 @@ class Assistant(QObject):
         while True:
             time.sleep(2.0)
             try:
+                # non-reentrant flock sidecars: never nest two
+                # _settings_file_lock() guards on the same lock file in one
+                # thread (the second LOCK_EX would block forever) — the
+                # in-process REMINDERS_LOCK serializes us here instead.
                 with REMINDERS_LOCK, _core_settings._settings_file_lock()(
                         REMINDERS_FILE.parent, "reminders.json.lock"):
                     items = _load_reminders()
@@ -7062,15 +7366,100 @@ class Assistant(QObject):
 
     # -- UI entry points (main thread) -------------------------------------------
 
+    def _ptt_ensure(self) -> "threading.RLock":
+        """Lazy PTT state for bare (__new__) test instances: real __init__
+        already created these; tests that bypass it get them here so the
+        same lock/epoch path always runs."""
+        lock = getattr(self, "_ptt_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            try:
+                self._ptt_lock = lock
+            except Exception:
+                pass
+        if getattr(self, "_ptt_epoch", None) is None:
+            try:
+                self._ptt_epoch = 0
+            except Exception:
+                pass
+        if getattr(self, "_ptt_stopping", None) is None:
+            try:
+                self._ptt_stopping = False
+            except Exception:
+                pass
+        return lock
+
+    def _stop_recorder_bounded(self, rec, timeout: float = 3.0):
+        """Bounded rec.stop() for the ptt workers (delegates to the shared
+        module helper so bare test instances and real ones share one path)."""
+        return _stop_recorder_bounded(rec, timeout=timeout)
+
     def begin_listening(self) -> None:
         self.interrupt()
         if self._handsfree:
             # the continuous listener owns the mic; a press just barges in
             self._listener.suspend()
             return
+        lock = self._ptt_ensure()
+        # press#2 during a wedged stop: wait briefly for the in-flight
+        # stop worker, else refuse cleanly instead of a doomed second open.
+        if getattr(self, "_ptt_stopping", False):
+            deadline = time.monotonic() + 0.6
+            while getattr(self, "_ptt_stopping", False) \
+                    and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if getattr(self, "_ptt_stopping", False):
+                log.warning("begin_listening refused: stop still in flight")
+                try:
+                    try:
+                        _gr = int(getattr(self, "_gen", 0) or 0)
+                    except Exception:
+                        _gr = 0
+                    _cr = threading.Event()
+                    try:
+                        _mr = getattr(self, "_models_ready", None)
+                    except Exception:
+                        _mr = None
+
+                    def _speak_busy(_g=_gr, _c=_cr, _m=_mr) -> None:
+                        try:
+                            if _m is not None:
+                                try:
+                                    _m.wait(30)
+                                except Exception:
+                                    pass
+                            try:
+                                self._speak("Microphone is busy, try again.",
+                                            _g, _c)
+                            except Exception:
+                                pass
+                            try:
+                                self._set(_g, IDLE)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
+                    threading.Thread(target=_speak_busy, daemon=True).start()
+                except Exception:
+                    pass
+                return
+        # no orphan stream: a previous recorder left behind is closed here.
+        old = getattr(self, "_recorder", None)
+        if old is not None:
+            try:
+                self._recorder = None
+                old.stop()
+            except Exception:
+                pass
         self._gen += 1
         self._cancel = threading.Event()
         gen, cancel = self._gen, self._cancel
+        with lock:
+            try:
+                self._ptt_epoch = int(getattr(self, "_ptt_epoch", 0) or 0) + 1
+            except Exception:
+                pass
         rec = Recorder(
             on_level=self.sigLevel.emit,
             device=str(SETTINGS["mic_device"]) if SETTINGS["mic_device"] else None,
@@ -7097,12 +7486,83 @@ class Assistant(QObject):
         rec, self._recorder = self._recorder, None
         if rec is None:
             return
+        # PTT release must never block the Qt thread: stream.stop()/close()
+        # on the flaky Yeti wedges for seconds, and submit's health line can
+        # wait on the mic-health lock. Interrupt synchronously FIRST (old
+        # pipeline must not keep running behind the new turn), claim the
+        # next gen now (a second press invalidates this release), paint
+        # THINKING immediately, stop->submit off-thread.
+        self.interrupt()
+        self._gen += 1
+        gen = self._gen
+        self._cancel = threading.Event()
+        self._set(gen, THINKING)
+        lock = self._ptt_ensure()
         try:
-            audio = rec.stop()
+            ptt_epoch = int(getattr(self, "_ptt_epoch", 0) or 0)
         except Exception:
-            log.exception("recorder stop failed")
-            audio = None
-        self.submit_audio(audio)
+            ptt_epoch = 0
+        try:
+            self._ptt_stopping = True
+        except Exception:
+            pass
+
+        def _work(_rec=rec, _gen=gen, _epoch=ptt_epoch) -> None:
+            t0 = time.monotonic()
+            try:
+                audio, wedged = self._stop_recorder_bounded(_rec, timeout=3.0)
+            except Exception:
+                log.exception("recorder stop failed")
+                audio, wedged = None, False
+            t1 = time.monotonic()
+
+            def _timing(submit_ms: int) -> None:
+                try:
+                    n = 0 if audio is None else len(audio)
+                    rate = getattr(_rec, "_native_rate", SAMPLE_RATE)
+                except Exception:
+                    n, rate = 0, SAMPLE_RATE
+                fmt = "ptt timing: stop_ms=%d submit_ms=%d frames=%d rate=%s"
+                if wedged:
+                    fmt += " wedged=1"
+                log.info(fmt,
+                         int((t1 - t0) * 1000), int(submit_ms), n, rate)
+
+            try:
+                # PTT-scoped staleness (not global gen): background timer
+                # bumps must never discard a valid utterance; only a newer
+                # PTT press (epoch bump) invalidates this release. The
+                # check+submit hold one lock to close the ghost-turn window.
+                with lock:
+                    try:
+                        cur_epoch = int(getattr(self, "_ptt_epoch", 0) or 0)
+                    except Exception:
+                        cur_epoch = _epoch
+                    if _epoch != cur_epoch:
+                        _timing(0)
+                        return
+                    try:
+                        self.submit_audio(audio)
+                    except Exception:
+                        log.exception("ptt submit failed")
+                        try:
+                            if _gen == self._gen:
+                                self._set(_gen, IDLE)
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            t2 = time.monotonic()
+                            _timing(int((t2 - t1) * 1000))
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    self._ptt_stopping = False
+                except Exception:
+                    pass
+
+        threading.Thread(target=_work, name="ptt-stop", daemon=True).start()
 
     def submit_audio(self, audio: np.ndarray | None) -> None:
         """Shared entry point: push-to-talk releases and hands-free utterances."""
@@ -7274,21 +7734,55 @@ class Assistant(QObject):
         threading.Thread(target=_probe, name="stop-probe", daemon=True).start()
 
     def abort_listening(self) -> None:
+        # drag-path cancel: never block the Qt thread on stream.stop()/close()
+        # — same off-thread stop worker as finish_listening, audio discarded.
         rec, self._recorder = self._recorder, None
         if rec is not None:
             try:
-                rec.stop()
+                self._ptt_ensure()
+                self._ptt_stopping = True
             except Exception:
                 pass
+
+            def _abort(_rec=rec) -> None:
+                try:
+                    try:
+                        self._stop_recorder_bounded(_rec, timeout=3.0)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self._ptt_stopping = False
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_abort, name="ptt-abort", daemon=True).start()
         if self._handsfree:
-            self._listener.resume()
-        self._set(self._gen, IDLE)
+            try:
+                self._listener.resume()
+            except Exception:
+                pass
+        try:
+            self._set(self._gen, IDLE)
+        except Exception:
+            pass
 
     def interrupt(self) -> None:
-        """Barge-in: any press cancels the current pipeline (speech/thought)."""
+        """Barge-in: any press cancels the current pipeline (speech/thought)
+        AND any in-flight announcement (bubble-press silences TTS)."""
         self._cancel.set()
+        try:
+            with _ANNOUNCE_CANCEL_LOCK:
+                _ANNOUNCE_CANCEL.set()
+        except Exception:
+            pass
         self._followup_until = 0.0    # barge-in also closes the follow-up window
-        self._listener.reset()
+        try:
+            self._listener.reset()
+        except Exception:
+            pass
 
     # -- hands-free & remote control --------------------------------------------
 
@@ -7400,13 +7894,26 @@ class Assistant(QObject):
     def _announce_now(self, text: str) -> None:
         """Speak `text` outside any turn pipeline (no generation, no cancel):
         fresh event, IDLE state, background thread so the caller (a Qt slot)
-        returns immediately."""
+        returns immediately. Playback itself serializes inside _speak on
+        _ANNOUNCE_LOCK (no overlap) and each call cancels the previous
+        playback first."""
+        global _ANNOUNCE_CANCEL
         gen = self._gen
         self._set(gen, IDLE)
-        threading.Thread(
-            target=lambda: self._speak(text, gen, threading.Event()),
-            name="announce", daemon=True,
-        ).start()
+        # ponytail: atomic cancel-swap under its own lock — no rebind-over-live
+        # race, and never blocked behind a long _speak holding _ANNOUNCE_LOCK.
+        with _ANNOUNCE_CANCEL_LOCK:
+            try:
+                _ANNOUNCE_CANCEL.set()  # play_wav honors cancel: stop the old one
+            except Exception:
+                pass
+            cancel = threading.Event()
+            _ANNOUNCE_CANCEL = cancel
+
+        def _run(t=text, g=gen, c=cancel):
+            self._speak(t, g, c)
+
+        threading.Thread(target=_run, name="announce", daemon=True).start()
 
     # -- pipeline (worker thread) --------------------------------------------------
 
@@ -7794,7 +8301,13 @@ class Assistant(QObject):
     def _speak(self, text: str, gen: int, cancel: threading.Event,
                sentence_q: "queue.Queue[str | None] | None" = None) -> None:
         """Speak `text` now. With a sentence queue: speak each sentence as it
-        arrives (streaming TTS — playback starts while the model still writes)."""
+        arrives (streaming TTS — playback starts while the model still writes).
+
+        ONE speech serializer: every playback (brain streaming/non-streaming,
+        timers, snooze, say_now, crash/missed) funnels through _ANNOUNCE_LOCK
+        around playback so two OutputStreams can never overlap. Synthesis is
+        intentionally outside the lock so slow TTS does not block other speech
+        from reaching its cancellation/playback check."""
         if _piper_voice is None and not self._models_ready.is_set():
             self._models_ready.wait(30)
         if sentence_q is None:
@@ -7810,9 +8323,10 @@ class Assistant(QObject):
                 with tempfile.TemporaryDirectory(dir=str(STATE_DIR)) as td:
                     wav = Path(td) / "tts.wav"
                     tts_to_wav(text, wav)
-                    if not cancel.is_set():
-                        log.info("saying: %s", text)
-                        play_wav(wav, cancel)
+                    with _ANNOUNCE_LOCK:
+                        if not cancel.is_set():
+                            log.info("saying: %s", text)
+                            play_wav(wav, cancel)
             except Exception:
                 log.exception("TTS failed")
             # announce-and-listen: a full spoken reply opens a short window in
@@ -7846,10 +8360,11 @@ class Assistant(QObject):
                 with tempfile.TemporaryDirectory(dir=str(STATE_DIR)) as td:
                     wav = Path(td) / "tts.wav"
                     tts_to_wav(sentence, wav)
-                    if cancel.is_set():
-                        return
-                    log.info("saying: %s", sentence)
-                    play_wav(wav, cancel)
+                    with _ANNOUNCE_LOCK:
+                        if cancel.is_set():
+                            return
+                        log.info("saying: %s", sentence)
+                        play_wav(wav, cancel)
             except Exception:
                 log.exception("TTS failed (streaming)")
         self._last_spoken = " ".join(said)
@@ -8133,6 +8648,7 @@ class BubbleWidget(QWidget):
         self._dragging = False
         self._manual_drag = False
         self._listening = False
+        self._menu_open = False
         self._press_pos = None
         self._drag_last = None
 
@@ -8292,6 +8808,7 @@ class BubbleWidget(QWidget):
             self._assistant.interrupt()  # barge-in: silence current speech/thought
             self._hold.start()
         elif e.button() == Qt.RightButton:
+            self._hold.stop()
             self._menu(e.globalPosition().toPoint())
 
     def mouseMoveEvent(self, e) -> None:
@@ -8324,7 +8841,7 @@ class BubbleWidget(QWidget):
             self._assistant.finish_listening()
 
     def _hold_fired(self) -> None:
-        if self._pressing and not self._dragging:
+        if self._pressing and not self._dragging and not self._menu_open:
             self._listening = True
             self._assistant.begin_listening()
 
@@ -8342,16 +8859,20 @@ class BubbleWidget(QWidget):
     # -- menu ------------------------------------------------------------------
 
     def _menu(self, gpos) -> None:
-        m = QMenu(self)
-        act_settings = m.addAction("Settings…")
-        m.addSeparator()
-        act_hf = m.addAction("Hands-free: on" if self._assistant._handsfree
-                             else "Hands-free: off")
-        act_interrupt = m.addAction("Interrupt (stop talking)")
-        m.addSeparator()
-        act_restart = m.addAction("Restart (reload code)")
-        act_quit = m.addAction("Quit")
-        chosen = m.exec(gpos)
+        self._menu_open = True
+        try:
+            m = QMenu(self)
+            act_settings = m.addAction("Settings…")
+            m.addSeparator()
+            act_hf = m.addAction("Hands-free: on" if self._assistant._handsfree
+                                 else "Hands-free: off")
+            act_interrupt = m.addAction("Interrupt (stop talking)")
+            m.addSeparator()
+            act_restart = m.addAction("Restart (reload code)")
+            act_quit = m.addAction("Quit")
+            chosen = m.exec(gpos)
+        finally:
+            self._menu_open = False
         if chosen == act_quit:
             # under systemd, plain quit would be resurrected by Restart=always:
             # stop the unit first, then exit quietly
@@ -8474,6 +8995,28 @@ class ControlServer:
                 try:
                     conn.settimeout(5.0)
                     action = conn.recv(1024).decode("utf-8", "replace").strip().lower()
+
+                    def _with_timeout(fn, timeout_s: float):
+                        """Run slow diagnostics off the accept thread: the
+                        accept loop must stay responsive (1s accept timeout)
+                        even when Ollama/nvidia-smi wedge."""
+                        box: dict = {}
+
+                        def _run() -> None:
+                            try:
+                                box["out"] = fn()
+                            except Exception as e:  # noqa: BLE001
+                                box["err"] = e
+
+                        t = threading.Thread(target=_run, daemon=True)
+                        t.start()
+                        t.join(timeout_s)
+                        if t.is_alive():
+                            raise TimeoutError(f"timed out after {timeout_s:.1f}s")
+                        if "err" in box:
+                            raise box["err"]
+                        return box.get("out")
+
                     if action in PTT_ACTIONS:
                         if action == "status":
                             reply = (f"state={self._assistant.state} "
@@ -8481,15 +9024,15 @@ class ControlServer:
                                      f"model={OLLAMA_MODEL}")
                         elif action == "health":
                             try:
-                                reply = json.dumps(
-                                    self._assistant.mic_health(),
-                                    ensure_ascii=False)
+                                snap = _with_timeout(
+                                    self._assistant.mic_health, 4.0)
+                                reply = json.dumps(snap, ensure_ascii=False)
                             except Exception:
                                 log.exception("health snapshot failed")
                                 reply = "error: health snapshot failed (see log)"
                         elif action == "doctor":
                             try:
-                                reply = run_doctor()
+                                reply = _with_timeout(run_doctor, 4.5)
                             except Exception:
                                 log.exception("doctor report failed")
                                 reply = "error: doctor report failed (see log)"

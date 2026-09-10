@@ -193,6 +193,85 @@ class TestListenerSelfMute:
         assert len(asst.sigUtterance.values) == 1
 
 
+class TestSpeechPlaybackSerialization:
+    def test_synthesis_can_overlap_but_playback_cannot_and_cancel_skips_stale(
+            self, H, monkeypatch, tmp_path):
+        a = H.Assistant.__new__(H.Assistant)
+        a._models_ready = threading.Event()
+        a._models_ready.set()
+        a._last_spoken = ""
+        a._turn_spoke = False
+        a._recently_spoken = []
+        a._handsfree = False
+        a._followup_until = 0.0
+        a._set = lambda *_args: None
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path)
+
+        synth_barrier = threading.Barrier(2, timeout=2.0)
+        synth_active = playback_active = 0
+        max_synth = max_playback = 0
+        counts_lock = threading.Lock()
+        played = []
+
+        def fake_tts(text, wav):
+            nonlocal synth_active, max_synth
+            with counts_lock:
+                synth_active += 1
+                max_synth = max(max_synth, synth_active)
+            try:
+                synth_barrier.wait()
+                wav.write_text(text)
+            finally:
+                with counts_lock:
+                    synth_active -= 1
+
+        def fake_play(wav, _cancel):
+            nonlocal playback_active, max_playback
+            with counts_lock:
+                playback_active += 1
+                max_playback = max(max_playback, playback_active)
+                played.append(wav.read_text())
+            time.sleep(0.05)
+            with counts_lock:
+                playback_active -= 1
+
+        monkeypatch.setattr(H, "tts_to_wav", fake_tts)
+        monkeypatch.setattr(H, "play_wav", fake_play)
+
+        cancels = [threading.Event(), threading.Event()]
+        threads = [threading.Thread(target=a._speak, args=(text, 0, cancel))
+                   for text, cancel in zip(("one", "two"), cancels)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+        assert max_synth == 2
+        assert max_playback == 1
+        assert sorted(played) == ["one", "two"]
+
+        played.clear()
+        stale_cancel = threading.Event()
+        stale_ready = threading.Event()
+        release_stale = threading.Event()
+
+        def stale_tts(_text, wav):
+            stale_ready.set()
+            release_stale.wait(2)
+            wav.write_text("stale")
+
+        monkeypatch.setattr(H, "tts_to_wav", stale_tts)
+        stale_thread = threading.Thread(
+            target=a._speak, args=("stale", 0, stale_cancel))
+        stale_thread.start()
+        assert stale_ready.wait(2)
+        stale_cancel.set()
+        release_stale.set()
+        stale_thread.join(timeout=3)
+        assert not stale_thread.is_alive()
+        assert played == []
+
+
 class TestEchoRejection:
     """The mic hears the bubble's own TTS through the speakers; those echo
     captures must be rejected before they reach the LLM (the root cause of
@@ -1335,3 +1414,610 @@ class TestUtteranceHealth:
     def test_heard_line_carries_gen(self, H):
         src = inspect.getsource(H.Assistant._pipeline)
         assert 'log.info("heard (gen=%d): %s", gen, text)' in src
+
+
+class TestPttReleaseNonBlocking:
+    """Regression: a wedged ALSA stream must never freeze the Qt UI thread.
+
+    Press-hold turns the bubble red (LISTENING); release calls
+    finish_listening -> rec.stop() (stream.stop()/close()) -> submit_audio.
+    stream.stop() on the flaky Yeti blocks for seconds, freezing the UI
+    (no journal lines, repeated restarts). Release must return fast with
+    THINKING painted immediately; stop->submit runs off-thread."""
+
+    def _mk_ptt(self, H, monkeypatch):
+        monkeypatch.setattr(H, "transcribe", lambda audio: "hello world")
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 0
+        a._state = H.IDLE
+        states: list = []
+        a._states = states
+
+        def _set(gen, state):
+            if gen != a._gen:
+                return
+            a._state = state
+            states.append(state)
+
+        a._set = _set
+        a._handsfree = False
+        a._cancel = threading.Event()
+        a._followup_until = 0.0
+        a._heal_attempts = 0
+        a._last_transcript = ("", 0, 0.0)
+        a._pipeline_q = __import__("queue").Queue()
+        a._recorder = None
+        a.sigLevel = FakeSig()
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._running = False
+        ln._frames_seen = 0
+        ln._last_nonzero = time.monotonic()
+        ln._capture_rate = 16000
+        ln._health_open_device = ""
+        ln._health_opens_failed = 0
+        ln._health_opens_ok = 0
+        ln._health_utt = 0
+        ln._health_last_open = "never"
+        ln._health_state = ""
+        ln._health_next_summary = 0.0
+        ln._health_failing_since = None
+        ln._health_recovered_after = None
+        ln._health_stalled_since = None
+        ln._ever_started = False
+        ln._lock = threading.RLock()
+        ln._suspended = False
+        ln._discard = False
+        ln._spotter = None
+        a._listener = ln
+        return a
+
+    def test_release_returns_fast_when_stop_blocks(self, H, monkeypatch,
+                                                   caplog):
+        """stop() wedged 5s: the UI-thread call must return in <2s, paint
+        THINKING, and still emit the single 'ptt timing:' line."""
+        gate = threading.Event()
+
+        class _BlockingStream:
+            def __init__(self, *a_, **k_):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                gate.wait(5.0)      # wedged ALSA: blocks the caller 5s
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(H.sd, "InputStream", _BlockingStream)
+        a = self._mk_ptt(H, monkeypatch)
+        with caplog.at_level("INFO", logger="handsoff"):
+            a.begin_listening()
+            assert a._state == H.LISTENING
+            assert a._recorder is not None
+            t0 = time.monotonic()
+            a.finish_listening()
+            dt = time.monotonic() - t0
+            assert dt < 2.0, f"finish_listening blocked UI {dt:.1f}s"
+            assert a._state == H.THINKING, \
+                "release must paint THINKING immediately"
+            deadline = time.monotonic() + 7.0
+            line = ""
+            while time.monotonic() < deadline:
+                line = " ".join(r.getMessage() for r in caplog.records)
+                if "ptt timing:" in line:
+                    break
+                time.sleep(0.05)
+            assert "ptt timing:" in line, "missing 'ptt timing:' journal line"
+            assert "stop_ms=" in line and "submit_ms=" in line
+            assert "frames=" in line and "rate=" in line
+            assert a._state in (H.THINKING, H.IDLE)
+
+    def test_fast_path_submits_to_pipeline(self, H, monkeypatch, caplog):
+        """Non-blocking stream: begin -> inject loud frames -> finish queues
+        exactly one turn and emits the timing line."""
+
+        class _FastStream:
+            def __init__(self, *a_, **k_):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(H.sd, "InputStream", _FastStream)
+        a = self._mk_ptt(H, monkeypatch)
+        with caplog.at_level("INFO", logger="handsoff"):
+            a.begin_listening()
+            audio = np.zeros(H.SAMPLE_RATE, dtype=np.int16)
+            audio[:1000] = 900          # loud enough to pass the gate
+            a._recorder._frames = [audio]
+            a._recorder._samples = len(audio)
+            a._recorder._native_rate = H.SAMPLE_RATE
+            t0 = time.monotonic()
+            a.finish_listening()
+            assert time.monotonic() - t0 < 2.0
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if not a._pipeline_q.empty():
+                    break
+                time.sleep(0.02)
+            assert a._pipeline_q.qsize() == 1, "release must queue one turn"
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if any("ptt timing:" in r.getMessage()
+                       for r in caplog.records):
+                    break
+                time.sleep(0.02)
+            assert any("ptt timing:" in r.getMessage()
+                       for r in caplog.records)
+            assert a._state in (H.THINKING, H.IDLE)
+
+
+class TestPttStopWorkerEdges:
+    """PTT-stop worker edges: stale drop, stop exception, submit exception,
+    double-finish early-return. Pins the off-thread stop->submit contract."""
+
+    def _mk_ptt(self, H, monkeypatch):
+        monkeypatch.setattr(H, "transcribe", lambda audio: "hello world")
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 0
+        a._state = H.IDLE
+        states: list = []
+        a._states = states
+
+        def _set(gen, state):
+            if gen != a._gen:
+                return
+            a._state = state
+            states.append(state)
+
+        a._set = _set
+        a._handsfree = False
+        a._cancel = threading.Event()
+        a._followup_until = 0.0
+        a._heal_attempts = 0
+        a._last_transcript = ("", 0, 0.0)
+        a._pipeline_q = __import__("queue").Queue()
+        a._recorder = None
+        try:
+            a._ptt_lock = threading.RLock()
+        except Exception:
+            pass
+        try:
+            a._ptt_epoch = 0
+        except Exception:
+            pass
+        try:
+            a._ptt_stopping = False
+        except Exception:
+            pass
+        # interrupt() touches the listener + global announce cancel
+        a._listener = types.SimpleNamespace(reset=lambda: None)
+        a.sigLevel = FakeSig()
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._running = False
+        ln._frames_seen = 0
+        ln._last_nonzero = time.monotonic()
+        ln._capture_rate = 16000
+        ln._health_open_device = ""
+        ln._health_opens_failed = 0
+        ln._health_opens_ok = 0
+        ln._health_utt = 0
+        ln._health_last_open = "never"
+        ln._health_state = ""
+        ln._health_next_summary = 0.0
+        ln._health_failing_since = None
+        ln._health_recovered_after = None
+        ln._health_stalled_since = None
+        ln._ever_started = False
+        ln._lock = threading.RLock()
+        ln._suspended = False
+        ln._discard = False
+        ln._spotter = None
+        # keep a real listener ref for health lines; _log_utterance_health
+        # tolerates the minimal fields above
+        a._listener_health = ln
+        # submit path calls these; keep them cheap and real
+        orig_log_health = H.Assistant._log_utterance_health
+        a._log_utterance_health = lambda: None
+        a._maybe_instant_stop = lambda audio, gen: None
+        return a
+
+    def _loud(self, H, val=900):
+        audio = np.zeros(H.SAMPLE_RATE, dtype=np.int16)
+        audio[:1000] = val
+        return audio
+
+    def _wait_timing(self, caplog, count=1, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            n = sum(1 for r in caplog.records if "ptt timing:" in r.getMessage())
+            if n >= count:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_stale_drop_second_press_invalidates(self, H, monkeypatch, caplog):
+        """Second press bumps the PTT epoch: the first release's worker must
+        drop (submit skipped) and still emit the stale timing line."""
+        gate = threading.Event()
+
+        class _BlockingRec:
+            _native_rate = H.SAMPLE_RATE
+
+            def stop(self):
+                gate.wait(5.0)
+                return self._audio
+
+        a = self._mk_ptt(H, monkeypatch)
+        rec = _BlockingRec()
+        rec._audio = self._loud(H)
+        a._recorder = rec
+        with caplog.at_level("INFO", logger="handsoff"):
+            a.finish_listening()  # worker blocks in stop()
+            assert a._state == H.THINKING
+            # second press: new epoch invalidates the in-flight release
+            try:
+                a._ptt_epoch = int(getattr(a, "_ptt_epoch", 0) or 0) + 1
+            except Exception:
+                pass
+            a._gen += 1  # keep global gen in sync with a real second press
+            gate.set()
+            assert self._wait_timing(caplog, 1, 5.0), "missing stale timing line"
+            time.sleep(0.2)
+            assert a._pipeline_q.empty(), "stale release must not submit"
+            line = " ".join(r.getMessage() for r in caplog.records
+                            if "ptt timing:" in r.getMessage())
+            assert "submit_ms=0" in line
+
+    def test_timer_bump_does_not_discard_valid_utterance(self, H, monkeypatch, caplog):
+        """Background timer bumps global gen but not the PTT epoch: a valid
+        release must still submit (global-gen check would wrongly drop it)."""
+
+        class _FastRec:
+            _native_rate = H.SAMPLE_RATE
+
+            def __init__(self, audio):
+                self._audio = audio
+
+            def stop(self):
+                return self._audio
+
+        a = self._mk_ptt(H, monkeypatch)
+        a._recorder = _FastRec(self._loud(H))
+        with caplog.at_level("INFO", logger="handsoff"):
+            a.finish_listening()
+            # simulate _fire_timer bumping the global gen mid-stop
+            a._gen += 1
+            assert self._wait_timing(caplog, 1, 5.0)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and a._pipeline_q.empty():
+                time.sleep(0.02)
+            assert not a._pipeline_q.empty(), \
+                "timer bump must not discard a valid PTT utterance"
+
+    def test_rec_stop_exception_goes_idle_with_timing(self, H, monkeypatch, caplog):
+        """rec.stop() raising → audio None, gen-guarded IDLE, timing line."""
+
+        class _BoomRec:
+            _native_rate = H.SAMPLE_RATE
+
+            def stop(self):
+                raise OSError("wedged stream")
+
+        a = self._mk_ptt(H, monkeypatch)
+        a._recorder = _BoomRec()
+        with caplog.at_level("INFO", logger="handsoff"):
+            a.finish_listening()
+            assert self._wait_timing(caplog, 1, 5.0), "missing timing after stop boom"
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and a._state != H.IDLE:
+                time.sleep(0.02)
+            assert a._state == H.IDLE, "stop exception must end IDLE, not THINKING"
+
+    def test_submit_raising_never_sticks_thinking(self, H, monkeypatch, caplog):
+        """submit_audio raising inside the worker → gen-guarded IDLE, second
+        timing line, never an unhandled thread exception / stuck THINKING."""
+        errors: list = []
+        orig_hook = threading.excepthook
+        threading.excepthook = lambda args: errors.append(args)
+        try:
+            loud = self._loud(H)
+
+            class _FastRec:
+                _native_rate = H.SAMPLE_RATE
+
+                def stop(self):
+                    return loud
+
+            a = self._mk_ptt(H, monkeypatch)
+            a._recorder = _FastRec()
+
+            def _boom(audio):
+                raise RuntimeError("submit boom")
+
+            a.submit_audio = _boom
+            with caplog.at_level("INFO", logger="handsoff"):
+                a.finish_listening()
+                assert a._state == H.THINKING
+                assert self._wait_timing(caplog, 1, 5.0), "missing timing after submit boom"
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and a._state != H.IDLE:
+                    time.sleep(0.02)
+                assert a._state == H.IDLE, "submit boom must fall back to IDLE"
+        finally:
+            threading.excepthook = orig_hook
+        assert not errors, f"worker thread raised unhandled: {errors}"
+
+    def test_double_finish_with_rec_none_early_returns(self, H, monkeypatch, caplog):
+        a = self._mk_ptt(H, monkeypatch)
+        a._recorder = None
+        gen0 = a._gen
+        with caplog.at_level("INFO", logger="handsoff"):
+            a.finish_listening()
+            a.finish_listening()
+        assert a._gen == gen0, "double finish must not bump gen"
+        assert a._recorder is None
+        assert not any("ptt timing:" in r.getMessage() for r in caplog.records)
+
+    def test_wedged_stop_bounded_recovers_and_repress_succeeds(
+            self, H, monkeypatch, caplog):
+        """Dead-Yeti wedge (stop() never returns): the ptt-stop worker must
+        emit its timing line in <=4s with wedged=1, clear _ptt_stopping, and
+        a subsequent press must open the mic instead of refusing."""
+        never = threading.Event()  # never set: the 51s journal wedge
+
+        class _WedgedRec:
+            _native_rate = H.SAMPLE_RATE
+
+            def __init__(self):
+                self._stream = None
+
+            def stop(self):
+                never.wait(30.0)
+                return None
+
+        a = self._mk_ptt(H, monkeypatch)
+        a._recorder = _WedgedRec()
+        with caplog.at_level("INFO", logger="handsoff"):
+            t0 = time.monotonic()
+            a.finish_listening()
+            assert time.monotonic() - t0 < 2.0, "finish must not block the UI"
+            assert a._state == H.THINKING
+            assert self._wait_timing(caplog, 1, 4.0), \
+                "wedged worker never emitted timing within 4s"
+            line = " ".join(r.getMessage() for r in caplog.records
+                            if "ptt timing:" in r.getMessage())
+            assert "wedged=1" in line, f"missing wedged=1 in {line!r}"
+            assert "ptt timing: stop_ms=" in line
+            assert "submit_ms=" in line and "frames=" in line \
+                and "rate=" in line
+            deadline = time.monotonic() + 4.0
+            while getattr(a, "_ptt_stopping", False) \
+                    and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert getattr(a, "_ptt_stopping", False) is False, \
+                "_ptt_stopping stuck after wedge"
+            # the wedge is bounded: a second press opens the mic cleanly
+
+            class _FastStream:
+                def __init__(self, *a_, **k_):
+                    pass
+
+                def start(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+                def close(self):
+                    pass
+
+            monkeypatch.setattr(H.sd, "InputStream", _FastStream)
+            caplog.clear()
+            a.begin_listening()
+            assert a._recorder is not None, \
+                "press after a bounded wedge must not refuse"
+            assert a._state == H.LISTENING
+            assert not any("refused" in r.getMessage()
+                           for r in caplog.records)
+
+    def test_refusal_speaks_busy(self, H, monkeypatch, caplog):
+        """Press while a stop is in flight: refuse AND speak the busy line
+        (the old log-only refusal left the bubble blue with no voice)."""
+        a = self._mk_ptt(H, monkeypatch)
+        a._models_ready = threading.Event()
+        a._models_ready.set()
+        spoken: list = []
+
+        def _fake_speak(self, text, gen, cancel, sentence_q=None):
+            spoken.append(text)
+
+        monkeypatch.setattr(H.Assistant, "_speak", _fake_speak)
+        a._ptt_stopping = True
+        opened: list = []
+
+        class _NoOpen:
+            def __init__(self, *a_, **k_):
+                opened.append(1)
+                raise AssertionError("refusal must not open the mic")
+
+        monkeypatch.setattr(H.sd, "InputStream", _NoOpen)
+        with caplog.at_level("INFO", logger="handsoff"):
+            t0 = time.monotonic()
+            a.begin_listening()
+            dt = time.monotonic() - t0
+            assert 0.5 <= dt < 2.5, f"refusal must keep the 0.6s wait ({dt:.2f}s)"
+            assert a._recorder is None, "refusal must not open the mic"
+            assert not opened, "refusal must not open the mic"
+        assert any("refused" in r.getMessage()
+                   and "stop still in flight" in r.getMessage()
+                   for r in caplog.records), "missing refusal warning"
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not spoken:
+            time.sleep(0.02)
+        assert spoken, "busy refusal never spoke"
+        assert any("Microphone is busy, try again." in s for s in spoken), \
+            f"wrong busy message: {spoken!r}"
+        a._ptt_stopping = False
+
+
+class TestWhisperCudaFallback:
+    """Lazy-CUDA breakage: ctranslate2 resolves CUDA libs at FIRST INFERENCE,
+    so a CUDA whisper load succeeds and encode() raises libcublas. transcribe()
+    must fall back to CPU once per session and retry (covers pipeline + stop
+    probe — both call transcribe())."""
+
+    @staticmethod
+    def _audio(H):
+        return H.np.zeros(1600, dtype=H.np.int16)
+
+    def test_cuda_error_falls_back_to_cpu_once(self, H, monkeypatch, caplog):
+        cuda_calls: list = []
+        cpu_calls: list = []
+
+        class _CudaBoom:
+            def transcribe(self, *a, **k):
+                cuda_calls.append(1)
+                # LAZY like faster-whisper's generate_segments: the CUDA
+                # encode (libcublas) raises during iteration, not here.
+                def _gen():
+                    raise RuntimeError(
+                        "Library libcublas.so.12 is not found or cannot be loaded")
+                    yield  # pragma: no cover — generator body, never reached
+                return (_gen(), None)
+
+        class _CpuOk:
+            def transcribe(self, *a, **k):
+                cpu_calls.append(1)
+                def _gen():
+                    yield types.SimpleNamespace(text="hello world")
+                return (_gen(), None)
+
+        get_calls: list = []
+
+        def _fake_get():
+            get_calls.append(1)
+            return _CudaBoom() if len(get_calls) == 1 else _CpuOk()
+
+        monkeypatch.setattr(H, "get_whisper", _fake_get)
+        monkeypatch.setattr(H, "_whisper_model", None, raising=False)
+        if hasattr(H, "_whisper_cpu_fallback"):
+            monkeypatch.setattr(H, "_whisper_cpu_fallback", False)
+
+        with caplog.at_level("WARNING", logger="handsoff"):
+            out = H.transcribe(self._audio(H))
+        assert out == "hello world"
+        assert cuda_calls == [1] and cpu_calls == [1], \
+            "must retry the same audio once on CPU"
+        assert any("falling back to CPU" in r.getMessage()
+                   for r in caplog.records), "must log a loud warning"
+        assert getattr(H, "_whisper_cpu_fallback", False) is True, \
+            "session must pin to CPU"
+
+        caplog.clear()
+        out2 = H.transcribe(self._audio(H))
+        assert out2 == "hello world"
+        assert len(cuda_calls) == 1, "second call must go straight to CPU"
+        assert len(cpu_calls) == 2
+
+    def test_non_cuda_error_no_retry(self, H, monkeypatch):
+        calls: list = []
+        get_calls: list = []
+
+        class _Boom:
+            def transcribe(self, *a, **k):
+                calls.append(1)
+                raise RuntimeError("boom")
+
+        def _fake_get():
+            get_calls.append(1)
+            return _Boom()
+
+        monkeypatch.setattr(H, "get_whisper", _fake_get)
+        monkeypatch.setattr(H, "_whisper_model", None, raising=False)
+        if hasattr(H, "_whisper_cpu_fallback"):
+            monkeypatch.setattr(H, "_whisper_cpu_fallback", False)
+        with pytest.raises(RuntimeError, match="boom"):
+            H.transcribe(self._audio(H))
+        assert len(calls) == 1 and len(get_calls) == 1, \
+            "non-CUDA errors must propagate immediately, no reload/retry"
+
+    def test_cpu_retry_failure_raises(self, H, monkeypatch):
+        cuda_calls: list = []
+        cpu_calls: list = []
+
+        class _CudaBoom:
+            def transcribe(self, *a, **k):
+                cuda_calls.append(1)
+                # LAZY like faster-whisper's generate_segments (see above).
+                def _gen():
+                    raise RuntimeError(
+                        "Library libcublas.so.12 is not found or cannot be loaded")
+                    yield  # pragma: no cover — generator body, never reached
+                return (_gen(), None)
+
+        class _CpuBoom:
+            def transcribe(self, *a, **k):
+                cpu_calls.append(1)
+                def _gen():
+                    raise RuntimeError("cpu boom")
+                    yield  # pragma: no cover — generator body, never reached
+                return (_gen(), None)
+
+        get_calls: list = []
+
+        def _fake_get():
+            get_calls.append(1)
+            return _CudaBoom() if len(get_calls) == 1 else _CpuBoom()
+
+        monkeypatch.setattr(H, "get_whisper", _fake_get)
+        monkeypatch.setattr(H, "_whisper_model", None, raising=False)
+        if hasattr(H, "_whisper_cpu_fallback"):
+            monkeypatch.setattr(H, "_whisper_cpu_fallback", False)
+        with pytest.raises(RuntimeError, match="cpu boom"):
+            H.transcribe(self._audio(H))
+        assert len(cuda_calls) == 1 and len(cpu_calls) == 1, \
+            "must attempt CPU once, then raise (apology path preserved)"
+
+
+class TestStreamingFallback:
+    def test_tools_fallback_emits_one_terminator(self, H, monkeypatch):
+        """A tools-unsupported retry must not enqueue duplicate sentinels."""
+        import urllib.error
+        import queue
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __iter__(self):
+                yield b'{"message":{"content":"Fallback."}}\n'
+
+        calls = []
+
+        def fake_urlopen(request, timeout=0):
+            calls.append(request)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url, 400, "bad request", {},
+                    io.BytesIO(b'{"error":"tools unsupported"}'))
+            return _Response()
+
+        monkeypatch.setattr(H.urllib.request, "urlopen", fake_urlopen)
+        q = queue.Queue()
+        result = H.ollama_chat_stream([{"role": "user", "content": "hi"}],
+                                      q, tools=[{"type": "function"}])
+        assert result["content"] == "Fallback."
+        assert [q.get(timeout=1), q.get(timeout=1)] == ["Fallback.", None]
+        assert q.empty()

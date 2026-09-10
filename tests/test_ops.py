@@ -120,6 +120,19 @@ class TestDeploymentReporting:
                              "installed_sha256", "manifest"}
         json.dumps(snap)
 
+    def test_manifest_preserves_optional_whisper_provenance(self, H, monkeypatch,
+                                                            tmp_path):
+        manifest = tmp_path / "deployment.json"
+        manifest.write_text(json.dumps({
+            "files": {}, "whisper_model": "tiny", "whisper_revision": "abc123",
+            "whisper_sha256": "digest", "python": "/venv/bin/python",
+        }))
+        monkeypatch.setattr(H, "DEPLOYMENT_FILE", manifest)
+        snap = H._deployment_snapshot()
+        assert snap["manifest"]["whisper_revision"] == "abc123"
+        assert snap["manifest"]["whisper_sha256"] == "digest"
+        assert snap["manifest"]["python"] == "/venv/bin/python"
+
     def test_repo_source_prefers_checkout_over_installed(self, H, monkeypatch, tmp_path):
         """The known false-in-sync bug: an installed copy must not compare
         against itself."""
@@ -138,6 +151,28 @@ class TestDeploymentReporting:
         assert snap["repo_path"] == str(checkout)
         assert snap["installed_path"] == str(src)
         assert snap["running_sha256"] != snap["installed_sha256"]
+
+    def test_partial_deployment_source_is_drift(self, H, monkeypatch, tmp_path):
+        """An installed sibling without a checkout source is not in-sync."""
+        checkout = tmp_path / "checkout"
+        installed = tmp_path / "home" / ".local" / "bin"
+        checkout.mkdir()
+        installed.mkdir(parents=True)
+        (checkout / ".git").mkdir()
+        (checkout / "handsoff.py").write_text("# checkout\n")
+        monkeypatch.setattr(H, "SELF_PATH", checkout / "handsoff.py")
+        monkeypatch.setattr(H, "HOME", tmp_path / "home")
+        monkeypatch.setattr(H, "DEPLOYMENT_FILE", tmp_path / "deployment.json")
+        for rel in H._DEPLOY_FILES:
+            dst = installed / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text("# installed\n")
+        # The main source matches; this sibling exists only in the deployment.
+        (installed / "handsoff.py").write_text("# checkout\n")
+        snap = H._deployment_snapshot()
+        assert snap["status"] == "installed-drift"
+        assert snap["files"]["hardware.py"]["source_sha256"] is None
+        assert snap["files"]["hardware.py"]["match"] is None
 
     def test_health_includes_deployment(self, H, monkeypatch):
         """`--ptt health` must answer 'is the running code the tested code?'"""
@@ -178,6 +213,26 @@ class TestDoctor:
         assert "systemd unit:" in text
         assert "restart script:" in text
         assert "ydotool:" in text
+
+    def test_report_mentions_whisper_and_python_provenance(self, H, monkeypatch,
+                                                            tmp_path):
+        manifest = tmp_path / "deployment.json"
+        manifest.write_text(json.dumps({
+            "whisper_revision": "abc123", "whisper_sha256": "digest",
+            "python": "/venv/bin/python",
+        }))
+        monkeypatch.setattr(H, "DEPLOYMENT_FILE", manifest)
+        text = H.run_doctor()
+        assert "whisper: revision abc123; sha256 digest" in text
+        assert "python: /venv/bin/python (" in text
+
+    def test_report_tolerates_old_manifest(self, H, monkeypatch, tmp_path):
+        manifest = tmp_path / "deployment.json"
+        manifest.write_text(json.dumps({"files": {}}))
+        monkeypatch.setattr(H, "DEPLOYMENT_FILE", manifest)
+        text = H.run_doctor()
+        assert "whisper: revision unknown; sha256 unknown" in text
+        assert "python: " in text
 
     def test_doctor_json_shape(self, H):
         d = H.doctor_json()

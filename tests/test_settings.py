@@ -116,6 +116,35 @@ class TestSettingsApp:
         assert "apply_autostart(" in src
         assert "set_autostart(" not in src.replace("apply_autostart(", "")
 
+    def test_unverified_voice_url_requires_explicit_opt_in(self, monkeypatch):
+        mod = _load("handsoff_settings_voice_optin", HERE / "handsoff-settings.py")
+
+        class _Text:
+            def __init__(self, value):
+                self.value = value
+
+            def text(self):
+                return self.value
+
+        class _Status:
+            def __init__(self):
+                self.messages = []
+
+            def setText(self, text):
+                self.messages.append(text)
+
+        dialog = mod.VoiceDownloadDialog.__new__(mod.VoiceDownloadDialog)
+        dialog.url_edit = _Text("http://example.test/voice.onnx")
+        dialog.list = type("List", (), {"currentItem": lambda self: None})()
+        dialog.status = _Status()
+        monkeypatch.delenv("HANDSOFF_UNVERIFIED_VOICE", raising=False)
+        assert dialog._pick_url() is None
+        assert "https://" in dialog.status.messages[-1]
+
+        monkeypatch.setenv("HANDSOFF_UNVERIFIED_VOICE", "1")
+        assert dialog._pick_url() == "http://example.test/voice.onnx"
+        assert "WARNING" in dialog.status.messages[-1]
+
 
 # ---------------------------------------------------------------- keyboard takeover
 
@@ -252,17 +281,54 @@ class TestSettingsSplit:
         in-memory update + derived-global refresh)."""
         calls = []
         monkeypatch.setattr(H, "_persist_setting", lambda k, v: calls.append((k, v)))
+        # H is session-scoped: snapshot the key so the in-memory mutation
+        # below is restored at teardown instead of leaking into other tests.
+        monkeypatch.setitem(H.SETTINGS, "mic_threshold", H.SETTINGS["mic_threshold"])
         H.set_setting("mic_threshold", 4242)
         assert calls == [("mic_threshold", 4242)]
         assert H.SETTINGS["mic_threshold"] == 4242
 
     def test_core_and_handsoff_defaults_agree(self, H):
-        """One schema instance, two import paths — the dicts must be the same
-        object (else deployment drift between layouts is possible again)."""
+        """One schema instance, two import paths — the SAME objects in a
+        healthy tree. Pass on identity, else equality PLUS an identical
+        module origin; distinct-but-equal from dual-origin skew (repo vs
+        installed core) fails loudly instead of being masked."""
         import core.settings as cs
-        assert cs.DEFAULT_SETTINGS is H.DEFAULT_SETTINGS
-        assert cs.SETTINGS_VERSION == H.SETTINGS_VERSION
-        assert H.coerce_settings is cs.coerce_settings
+        core_file = getattr(cs, "__file__", None)
+        bubble_file = getattr(getattr(H, "_core_settings", None), "__file__", None)
+        same_origin = core_file is not None and core_file == bubble_file
+        dbg = ("origin debug: core.settings=%r handsoff=%r bubble-core=%r" % (
+            getattr(cs, "__file__", None), getattr(H, "__file__", None),
+            bubble_file))
+        assert (cs.DEFAULT_SETTINGS is H.DEFAULT_SETTINGS
+                or (same_origin and cs.DEFAULT_SETTINGS == H.DEFAULT_SETTINGS)), dbg
+        assert same_origin and cs.SETTINGS_VERSION == H.SETTINGS_VERSION, dbg
+        assert (H.coerce_settings is cs.coerce_settings
+                or (same_origin and H.coerce_settings == cs.coerce_settings)), dbg
+
+    def test_loader_refuses_foreign_live_core_settings(self, H, monkeypatch):
+        """A foreign module squatting on core.settings must make the shared
+        loader refuse (ImportError), never silently satisfy us."""
+        import sys
+        import types
+        import core
+        foreign = types.ModuleType("core.settings")
+        foreign.__file__ = "/tmp/foreign/core/settings.py"
+        monkeypatch.setitem(sys.modules, "core.settings", foreign)
+        with pytest.raises(ImportError):
+            core.load_module("settings")
+
+    def test_loader_refuses_foreign_live_core_settings_schema(self, H, monkeypatch):
+        """Same refusal for core.settings_schema: a live foreign submodule
+        blocks the load instead of being swapped under."""
+        import sys
+        import types
+        import core
+        foreign = types.ModuleType("core.settings_schema")
+        foreign.__file__ = "/tmp/foreign/core/settings_schema.py"
+        monkeypatch.setitem(sys.modules, "core.settings_schema", foreign)
+        with pytest.raises(ImportError):
+            core.load_module("settings_schema")
 
     def test_wrapper_is_late_bound_for_patch_seam(self, H, monkeypatch):
         """The H._persist_setting wrapper must look the core function up at
@@ -506,3 +572,37 @@ class TestHealthTooltip:
         rf = src[src.index("def _refresh_health"):
                  src.index("def _refresh_health") + 900]
         assert "self.health_label.setToolTip(_health_tooltip(result))" in rf
+
+
+class TestSettingsHistoryTab:
+    """Regression: SettingsWindow must open with a History tab."""
+
+    def test_window_constructs_with_history_tab_offscreen(self):
+        """Build the window in a subprocess under offscreen Qt (in-process
+        construction aborts when earlier tests already hold a QCoreApplication)."""
+        env = dict(os.environ)
+        env.update({
+            "QT_QPA_PLATFORM": "offscreen",
+            "QT_QPA_PLATFORMTHEME": "",
+            "NO_AT_BRIDGE": "1",
+            "QT_ACCESSIBILITY": "0",
+        })
+        code = (
+            "import importlib.util;"
+            "spec = importlib.util.spec_from_file_location("
+            "'s', 'handsoff-settings.py');"
+            "mod = importlib.util.module_from_spec(spec);"
+            "spec.loader.exec_module(mod);"
+            "from PySide6.QtWidgets import QApplication;"
+            "app = QApplication([]);"
+            "win = mod.SettingsWindow();"
+            "texts = [win.tabs.tabText(i) for i in range(win.tabs.count())];"
+            "assert 'History' in texts, texts;"
+            "print('tabs:', ','.join(texts))"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            env=env, capture_output=True, text=True, timeout=60, cwd=str(HERE),
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        assert "History" in out.stdout

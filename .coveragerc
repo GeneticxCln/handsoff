@@ -3,10 +3,12 @@ omit =
     tests/*
     attic/*
     */site-packages/*
-    # PySide6's vendored shibokensupport registers paths inside the project
-    # dir during Qt imports (the source lives in site-packages); without this
-    # omit the coverage TOTAL is polluted with unparseable phantom files.
+    # PySide6's vendored shibokensupport/signature_bootstrap register paths
+    # inside the project dir during Qt imports (the source lives in
+    # site-packages); without this omit the coverage TOTAL is polluted with
+    # unparseable phantom files.
     shibokensupport/*
+    */signature_bootstrap.py
 
 [report]
 # Floor is 60 and that is HONEST: handsoff.py measures 70%, hardware.py 84%,

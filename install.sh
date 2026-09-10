@@ -157,57 +157,29 @@ fi
 # Single source of truth: the repo's handsoff-restart is shipped as-is
 # (a heredoc duplicate here silently drifted from it once already).
 install -m 755 "$HERE/handsoff-restart" "$BIN_DIR/handsoff-restart"
-# Deployment manifest: which checkout state produced the installed copy, per
-# file. The bubble reads this in its health/doctor reports, so a stale
-# ~/.local/bin copy is visible from inside the bubble and from --ptt doctor.
-mkdir -p "$CONF_DIR"
-sha_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}' || echo null; }
-cat > "$CONF_DIR/deployment.json" <<MANIFEST_EOF
-{
-  "installed_at": "$(date -Is)",
-  "source_dir": "$HERE",
-  "whisper_model": "$WHISPER_SIZE",
-  "whisper_revision": "$WHISPER_REVISION",
-  "python": "$PYBIN",
-  "files": {
-    "handsoff.py": {
-      "source_sha256": "$(sha_of "$HERE/handsoff.py")",
-      "installed_sha256": "$(sha_of "$BIN_DIR/handsoff.py")"
-    },
-    "handsoff-settings.py": {
-      "source_sha256": "$(sha_of "$HERE/handsoff-settings.py")",
-      "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-settings.py")"
-    },
-    "settings_schema.py": {
-      "source_sha256": "$(sha_of "$HERE/settings_schema.py")",
-      "installed_sha256": "$(sha_of "$BIN_DIR/settings_schema.py")"
-    },
-    "hardware.py": {
-      "source_sha256": "$(sha_of "$HERE/hardware.py")",
-      "installed_sha256": "$(sha_of "$BIN_DIR/hardware.py")"
-    },
-    "core/__init__.py": {
-      "source_sha256": "$(sha_of "$HERE/core/__init__.py")",
-      "installed_sha256": "$(sha_of "$BIN_DIR/core/__init__.py")"
-    },
-    "core/settings.py": {
-      "source_sha256": "$(sha_of "$HERE/core/settings.py")",
-      "installed_sha256": "$(sha_of "$BIN_DIR/core/settings.py")"
-    },
-    "handsoff-restart": {
-      "source_sha256": "$(sha_of "$HERE/handsoff-restart")",
-      "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"
-    }
-  }
-}
-MANIFEST_EOF
 echo "==> [5/8] Downloading whisper '$WHISPER_SIZE' model (one time)"
-"${PYBIN}" - "$WHISPER_SIZE" "$CONF_DIR/whisper-model" <<'PY_EOF'
+WHISPER_RESOLVED_REVISION="$(${PYBIN} - "$WHISPER_SIZE" "$CONF_DIR/whisper-model" "$WHISPER_REVISION" <<'PY_EOF'
 import sys
+from faster_whisper import utils
 from faster_whisper import WhisperModel
-WhisperModel(sys.argv[1], device="cpu", compute_type="int8", download_root=sys.argv[2])
-print("whisper model ready")
+
+size, output_dir, revision = sys.argv[1:]
+WhisperModel(size, device="cpu", compute_type="int8", download_root=output_dir,
+             revision=revision)
+resolved = ""
+try:
+    from huggingface_hub import HfApi
+    repo_id = getattr(utils, "_MODELS", {}).get(size, size)
+    resolved = HfApi().model_info(repo_id, revision=revision).sha or ""
+except Exception:
+    pass
+print(resolved)
 PY_EOF
+)"
+if [ -z "$WHISPER_RESOLVED_REVISION" ]; then
+    WHISPER_RESOLVED_REVISION="$WHISPER_REVISION"
+fi
+echo "whisper model ready"
 # faster-whisper fetches via huggingface_hub (content-hashed blobs, verified
 # on download) — no separate sha256 manifest to check like the piper voice.
 # Fail loudly on an empty cache instead of booting deaf on a partial fetch.
@@ -215,6 +187,56 @@ if [ -z "$(ls -A "$CONF_DIR/whisper-model" 2>/dev/null)" ]; then
     echo "    FATAL: whisper model download produced no files in $CONF_DIR/whisper-model" >&2
     exit 1
 fi
+
+# Deployment manifest: which checkout state produced the installed copy, per
+# file. Model metadata is best-effort: the model is usable even when the
+# downloader cannot expose a resolved revision or a file cannot be read.
+mkdir -p "$CONF_DIR"
+sha_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}' || echo null; }
+whisper_sha256=""
+if whisper_sha256="$(${PYBIN} - "$CONF_DIR/whisper-model" <<'PY_EOF'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+try:
+    files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+    for path in files:
+        rel = path.relative_to(root).as_posix().encode()
+        digest.update(len(rel).to_bytes(8, "big"))
+        digest.update(rel)
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    print(digest.hexdigest())
+except (OSError, ValueError):
+    pass
+PY_EOF
+)"; then :; else whisper_sha256=""; fi
+manifest_whisper_sha256=""
+[ -n "$whisper_sha256" ] && manifest_whisper_sha256="  \"whisper_sha256\": \"$whisper_sha256\","
+cat > "$CONF_DIR/deployment.json" <<MANIFEST_EOF
+{
+  "installed_at": "$(date -Is)",
+  "source_dir": "$HERE",
+  "whisper_model": "$WHISPER_SIZE",
+  "whisper_revision": "$WHISPER_RESOLVED_REVISION",
+$manifest_whisper_sha256
+  "python": "$PYBIN",
+  "files": {
+    "handsoff.py": {"source_sha256": "$(sha_of "$HERE/handsoff.py")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff.py")"},
+    "handsoff-settings.py": {"source_sha256": "$(sha_of "$HERE/handsoff-settings.py")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-settings.py")"},
+    "settings_schema.py": {"source_sha256": "$(sha_of "$HERE/settings_schema.py")", "installed_sha256": "$(sha_of "$BIN_DIR/settings_schema.py")"},
+    "hardware.py": {"source_sha256": "$(sha_of "$HERE/hardware.py")", "installed_sha256": "$(sha_of "$BIN_DIR/hardware.py")"},
+    "core/__init__.py": {"source_sha256": "$(sha_of "$HERE/core/__init__.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/__init__.py")"},
+    "core/settings.py": {"source_sha256": "$(sha_of "$HERE/core/settings.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/settings.py")"},
+    "handsoff-restart": {"source_sha256": "$(sha_of "$HERE/handsoff-restart")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"}
+  }
+}
+MANIFEST_EOF
 
 echo "==> [6/8] Downloading piper voice (sha256-verified)"
 voice="$(basename "$PIPER_VOICE_URL")"
@@ -389,4 +411,3 @@ else
 fi
 echo "  3. Verify the deployment:  python ~/.local/bin/handsoff.py --ptt doctor"
 echo "  4. Uninstall anytime with:  $0 --uninstall"
-

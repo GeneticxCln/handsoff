@@ -1,7 +1,7 @@
 # Live hardware watch design (2026-09-09)
 
 Per-tick hardware awareness so the assistant notices the machine changing
-under it. Status: **approved — implement as below.**
+under it. Status: **implemented 2026-09-09, pinned by test_hardware/watch/world_events.**
 
 ## Problem
 
