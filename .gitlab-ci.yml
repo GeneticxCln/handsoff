@@ -8,11 +8,14 @@
 # a mutable tag-only image ref ever sneaks back in — same policy as the
 # SHA-pinned GH actions.
 #
-# Debian slim + PySide6: the wheels bundle Qt, but offscreen rendering still
-# needs a few runtime libraries (glib/GL/EGL/xkbcommon/dbus/fontconfig). The
-# GitHub runners get these from the shared ubuntu image; Debian slim needs
-# them explicitly. Digests are frozen, so the Debian base (trixie, hence the
-# t64 package names) cannot drift under us.
+# Debian slim + PySide6 + sounddevice: the PySide6 wheels bundle Qt but
+# offscreen rendering still needs runtime libraries (glib/GL/EGL/xkbcommon/
+# dbus/fontconfig), and sounddevice's bundled PortAudio dlopens the ALSA
+# runtime (libasound.so.2 — without it every job importing sounddevice dies
+# with an OSError, which is exactly what failed the first pipeline's tests
+# jobs). The GitHub runners get all of these from the shared ubuntu image;
+# Debian slim needs them explicitly. Digests are frozen, so the Debian base
+# (trixie, hence the t64 package names) cannot drift under us.
 
 stages: [test, static, smoke]
 
@@ -28,12 +31,16 @@ default:
     paths:
       - .pip-cache
 
-# One shell line: offscreen-Qt runtime libraries + bash (Debian slim ships
-# no bash). tests/ and coverage/ keep this in sync.
+# One shell line: offscreen-Qt runtime libraries, the ALSA runtime
+# (sounddevice's bundled PortAudio needs libasound.so.2), OpenMP
+# (onnxruntime imports in-process during test_audio and needs libgomp), and
+# bash (Debian slim ships none of these). Every job that runs the suite
+# keeps this in sync.
 .qt_deps: &qt_deps
   "apt-get update -qq
   && apt-get install -yqq --no-install-recommends bash libglib2.0-0t64
-     libgl1 libegl1 libxkbcommon0 libdbus-1-3t64 libfontconfig1
+     libgl1 libegl1 libxkbcommon0 libdbus-1-3t64 libfontconfig1 libasound2t64
+     libgomp1
   && rm -rf /var/lib/apt/lists/*"
 
 # --- The full test suite (GH: `tests` matrix job) ---------------------------
@@ -47,6 +54,7 @@ default:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
   <<: *pip_cache
   script:
+    - *qt_deps
     - python -m pip install --upgrade pip
     - pip install -r requirements.txt -c requirements-lock.txt
     - python -m pytest tests/ -q
