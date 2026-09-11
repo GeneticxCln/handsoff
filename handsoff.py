@@ -4836,6 +4836,67 @@ class Assistant(QObject):
         log.info("hands-free %s", "enabled" if on else "disabled")
         notify(f"hands-free {'enabled' if on else 'disabled'}")
 
+    def _reload_settings_live(self) -> None:
+        """Re-read settings.json and apply without a restart.
+
+        Runs on the Qt thread (via sigCommand): widget resizes are only
+        legal there. Covers the settings dict, derived Ollama/model/audio
+        globals, stale STT/TTS model caches, geometry, state colours and
+        hands-free — everything the Appearance tab changes."""
+        try:
+            new = _load_settings()
+        except Exception:
+            log.exception("live settings reload: cannot load settings.json")
+            return
+        old_whisper = (SETTINGS.get("whisper_size"), SETTINGS.get("whisper_device"))
+        old_voice = SETTINGS.get("piper_voice")
+        SETTINGS.clear()
+        SETTINGS.update(new)
+        reload_derived_settings()
+        if (SETTINGS.get("whisper_size"), SETTINGS.get("whisper_device")) != old_whisper:
+            globals()["_whisper_model"] = None
+            try:
+                _audio._whisper_model = None
+            except AttributeError:
+                pass
+            log.info("live settings reload: whisper cache dropped (loads on next turn)")
+        if SETTINGS.get("piper_voice") != old_voice:
+            globals()["_piper_voice"] = None
+            try:
+                _audio._piper_voice = None
+            except AttributeError:
+                pass
+            log.info("live settings reload: piper cache dropped (loads on next turn)")
+        global WINDOW_PX, BUBBLE_R0, GLOW_PAD, GEOM_K
+        try:
+            WINDOW_PX = min(192, max(96, int(SETTINGS.get("bubble_size", WINDOW_PX))))
+        except (TypeError, ValueError):
+            pass
+        BUBBLE_R0 = WINDOW_PX * 44.0 / 128.0
+        GLOW_PAD = WINDOW_PX * 7.0 / 128.0
+        GEOM_K = WINDOW_PX / 128.0
+        for _key, _fb in (("idle", "#2f6fed"), ("listening", "#e0435c"),
+                          ("thinking", "#c8781f"), ("speaking", "#1fae62")):
+            STATE_COLORS[_key] = _state_color(_key, _fb)
+        hf = bool(SETTINGS.get("handsfree", False))
+        if hf != self._handsfree:
+            self._handsfree = hf
+            if hf:
+                self._listener.start()
+            else:
+                self._listener.stop()
+                self._set(self._gen, IDLE)
+            self._mic_selfheal_rearm()
+            log.info("live settings reload: hands-free %s", "on" if hf else "off")
+        bw = getattr(self, "_bubble_widget", None)
+        if bw is not None:
+            try:
+                bw.setFixedSize(WINDOW_PX, WINDOW_PX)
+                bw.update()
+            except RuntimeError:
+                pass  # widget deleted during shutdown
+        log.info("settings reloaded live (no restart)")
+
     def _on_command(self, action: str) -> None:
         if action.startswith("__timer:"):
             name, _, rep = action[len("__timer:"):].partition("\x1f")
@@ -4879,6 +4940,8 @@ class Assistant(QObject):
             self._gen += 1
             gen, cancel = self._gen, threading.Event()
             self._set_dictation(on, gen, cancel)
+        elif action == "reload-settings":
+            self._reload_settings_live()
 
     def _confirm_handsfree(self) -> None:
         """Speak a short confirmation after a hands-free toggle, including the
@@ -5718,6 +5781,10 @@ class BubbleWidget(QWidget):
 
         assistant.sigState.connect(self.set_state)
         assistant.sigLevel.connect(self.set_level)
+        try:
+            assistant._bubble_widget = self  # live settings reload resizes us
+        except AttributeError:
+            pass
 
     # -- slots -----------------------------------------------------------------
 
@@ -6210,7 +6277,7 @@ class BubbleWidget(QWidget):
 PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                "handsfree", "handsfree-on", "handsfree-off",
                "handsfree-status", "dictation", "dictation-on", "dictation-off",
-               "status", "health", "doctor", "settings", "selftest"}
+               "status", "health", "doctor", "settings", "selftest", "reload-settings"}
 
 
 class ControlServer:
@@ -6397,6 +6464,7 @@ commands:
   dictation      toggle voice dictation (type what you say, no AI turn)
   dictation-on   enable voice dictation
   dictation-off  disable voice dictation
+  reload-settings  re-read settings.json and apply without restart
   status         report state, hands-free mode and model
   health         full JSON health: mic, brain (Ollama) and TTS status
   doctor         human-readable diagnostic: deployment hashes, Ollama, mic, niri, systemd

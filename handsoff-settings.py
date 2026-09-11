@@ -2326,8 +2326,40 @@ class SettingsWindow(QMainWindow):
         # user unit manages the bubble, niri spawn-at-startup is NOT added.
         msg = apply_autostart(self.autostart_chk.isChecked())
         warn = f"  WARNINGS: {'; '.join(problems)}" if problems else ""
-        self._status(f"Saved to {H.SETTINGS_FILE}. {msg}{cleared_note}{warn}")
+        live = self._notify_bubble_reloaded()
+        live_note = " Applied live." if live else " Bubble unreachable — restart to apply."
+        self._status(f"Saved to {H.SETTINGS_FILE}. {msg}{cleared_note}{warn}{live_note}")
         return True
+
+    @staticmethod
+    def _notify_bubble_reloaded() -> bool:
+        """Ask the running bubble to apply settings.json without restart.
+
+        Best-effort: False when the bubble is dead (its restart path covers
+        that case) — a notify failure must never fail the save itself."""
+        sock = None
+        try:
+            import socket as _socket
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect(str(H.CONTROL_SOCK))
+            sock.sendall(b"reload-settings\n")
+            sock.settimeout(5.0)
+            reply = b""
+            while not reply.endswith(b"\n"):
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                reply += chunk
+            return reply.decode("utf-8", "replace").startswith("ok")
+        except Exception:
+            return False
+        finally:
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
 
     def _on_save(self) -> None:
         self.save()

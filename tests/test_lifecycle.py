@@ -285,6 +285,67 @@ class TestBubbleMenuHoldGuard:
         assert assistant.begin_calls == 0
 
 
+class TestLiveSettingsReload:
+    def test_reload_applies_size_colors_design_without_restart(self, H, tmp_path, monkeypatch):
+        """reload-settings picks up settings.json: dict, geometry, colours,
+        design and widget size — no restart, no new Assistant.
+
+        H is session-scoped: snapshot every touched global and restore it,
+        or later tests inherit our values (order-dependent failures)."""
+        snap_settings = dict(H.SETTINGS)
+        snap_geom = (H.WINDOW_PX, H.BUBBLE_R0, H.GLOW_PAD, H.GEOM_K)
+        snap_colors = dict(H.STATE_COLORS)
+        cfg = dict(H.DEFAULT_SETTINGS)
+        cfg.update(snap_settings)  # keep model/whisper/voice: no cache drops
+        cfg.update({
+            "bubble_size": 160, "bubble_design": "halo",
+            "colors": {"idle": "#111111", "listening": "#222222",
+                       "thinking": "#333333", "speaking": "#444444"},
+            "handsfree": False,
+        })
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(cfg))
+        monkeypatch.setattr(H, "SETTINGS_FILE", settings_file)
+        a = H.Assistant.__new__(H.Assistant)
+        a._shutdown_event = threading.Event()
+        a._closed = False
+        a._gen = 0
+        a._handsfree = False
+        a._listener = types.SimpleNamespace(
+            start=lambda: (_ for _ in ()).throw(AssertionError("must not start")),
+            stop=lambda: (_ for _ in ()).throw(AssertionError("must not stop")),
+        )
+        a._mic_selfheal_rearm = lambda: (_ for _ in ()).throw(
+            AssertionError("must not rearm when handsfree unchanged"))
+        a._set = lambda *args, **kwargs: None
+        sizes: dict = {}
+
+        class Widget:
+            def setFixedSize(self, w, h):
+                sizes["size"] = (w, h)
+
+            def update(self):
+                sizes["updated"] = True
+
+        a._bubble_widget = Widget()
+        try:
+            a._on_command("reload-settings")
+            assert H.SETTINGS["bubble_size"] == 160
+            assert H.SETTINGS["bubble_design"] == "halo"
+            assert H.WINDOW_PX == 160
+            assert H.BUBBLE_R0 == pytest.approx(160 * 44.0 / 128.0)
+            assert H.GEOM_K == pytest.approx(160 / 128.0)
+            assert H.STATE_COLORS["idle"].name() == "#111111"
+            assert H.STATE_COLORS["speaking"].name() == "#444444"
+            assert sizes["size"] == (160, 160) and sizes.get("updated") is True
+        finally:
+            H.SETTINGS.clear()
+            H.SETTINGS.update(snap_settings)
+            (H.WINDOW_PX, H.BUBBLE_R0, H.GLOW_PAD, H.GEOM_K) = snap_geom
+            H.STATE_COLORS.clear()
+            H.STATE_COLORS.update(snap_colors)
+
+
 # ------------------------------------------------------------------ offscreen launch
 
 
