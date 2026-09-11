@@ -11,7 +11,7 @@ from __future__ import annotations
 
 SETTINGS_VERSION: int = 1   # bumped on incompatible settings.json layout changes
 
-BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom")
+BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void")
 
 DEFAULT_SETTINGS: dict = {
     "ollama_host": "http://127.0.0.1:11434",
@@ -28,7 +28,7 @@ DEFAULT_SETTINGS: dict = {
     "mic_threshold": 600,
     "handsfree": False,
     "bubble_size": 128,
-    "bubble_design": "orb",  # orb | halo | reactor | bloom (Appearance tab)
+    "bubble_design": "orb",  # Appearance tab: orb|halo|reactor|bloom|droplet|cube|equalizer|crystal|saturn|void
     "colors": {
         "idle": "#4f8cff", "listening": "#ff4d5e",
         "thinking": "#ff9e2c", "speaking": "#3ecf6e",

@@ -104,6 +104,7 @@ try:
     QColor,
     QConicalGradient,
     QGuiApplication,
+    QLinearGradient,
         QPainter,
         QPainterPath,
         QPen,
@@ -5844,6 +5845,18 @@ class BubbleWidget(QWidget):
             self._paint_reactor(p, f)
         elif design == "bloom":
             self._paint_bloom(p, f)
+        elif design == "droplet":
+            self._paint_droplet(p, f)
+        elif design == "cube":
+            self._paint_cube(p, f)
+        elif design == "equalizer":
+            self._paint_equalizer(p, f)
+        elif design == "crystal":
+            self._paint_crystal(p, f)
+        elif design == "saturn":
+            self._paint_saturn(p, f)
+        elif design == "void":
+            self._paint_void(p, f)
         else:
             self._paint_orb(p, f)
         p.end()
@@ -6138,6 +6151,262 @@ class BubbleWidget(QWidget):
             s = QColor(255, 255, 255, 70)
             p.setBrush(QBrush(s))
             p.drawEllipse(QPointF(cx + math.cos(a) * r, cy - math.sin(a) * r), 1.6, 1.6)
+
+    def _paint_droplet(self, p: QPainter, f: dict) -> None:
+        """Teardrop that stretches with voice level and drips while listening."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy, level = f["radius"], f["energy"], f["level"]
+        R = radius * 0.92
+        stretch = 1.0 + 0.28 * level + (0.08 if self._state == LISTENING else 0.0)
+        drop = QPainterPath()
+        for i in range(73):
+            ang = i * 2 * math.pi / 72
+            tip = math.exp(-((ang - math.pi / 2) / 0.55) ** 2)
+            r = R * (1.0 + 0.45 * tip + 0.04 * math.sin(3 * ang + 3.0 * t))
+            x, y = cx + r * math.cos(ang) * 0.92, cy - r * math.sin(ang) * stretch
+            drop.moveTo(x, y) if i == 0 else drop.lineTo(x, y)
+        drop.closeSubpath()
+        p.setPen(Qt.NoPen)
+        body = QLinearGradient(cx, cy - R * stretch, cx, cy + R)
+        hi = QColor(color).lighter(165)
+        hi.setAlpha(235)
+        body.setColorAt(0.0, hi)
+        mid = QColor(color)
+        mid.setAlpha(220)
+        body.setColorAt(0.55, mid)
+        lo = QColor(color).darker(180)
+        lo.setAlpha(235)
+        body.setColorAt(1.0, lo)
+        p.setBrush(QBrush(body))
+        p.drawPath(drop)
+        # specular streak down the lit side
+        p.setBrush(QColor(255, 255, 255, int(50 + 20 * energy)))
+        p.drawEllipse(QPointF(cx - R * 0.28, cy - R * 0.35 * stretch), R * 0.13, R * 0.22 * stretch)
+        # detaching drip while listening
+        if self._state == LISTENING:
+            ph = (t * 0.7) % 1.0
+            drip = QColor(color)
+            drip.setAlpha(int((1.0 - ph) * 200))
+            p.setBrush(QBrush(drip))
+            p.drawEllipse(QPointF(cx, cy + R * stretch + ph * R * 0.9),
+                          R * 0.10 * (1.0 - ph * 0.5), R * 0.13 * (1.0 - ph * 0.5))
+        rim = QColor(color).lighter(140)
+        rim.setAlpha(int(120 + 80 * energy))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(rim, max(1.2, R * 0.045)))
+        p.drawPath(drop)
+
+    def _paint_cube(self, p: QPainter, f: dict) -> None:
+        """Tumbling isometric glass cube catching the orbiting light."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy, la = f["radius"], f["energy"], f["la"]
+        R = radius * 0.95
+        bob = math.sin(2 * math.pi * t / 3.0) * R * 0.04
+        cy += bob
+        rot = t * 2 * math.pi * 0.08
+        verts = [(cx + R * math.cos(rot + i * math.pi / 3),
+                  cy - R * math.sin(rot + i * math.pi / 3)) for i in range(6)]
+        p.setPen(Qt.NoPen)
+        halo = QRadialGradient(QPointF(cx, cy), R * 1.3)
+        hc = QColor(color)
+        hc.setAlpha(int(25 + 35 * energy))
+        halo.setColorAt(0.7, hc)
+        hc.setAlpha(0)
+        halo.setColorAt(0.0, hc)
+        halo.setColorAt(1.0, hc)
+        p.setBrush(QBrush(halo))
+        p.drawEllipse(QPointF(cx, cy), R * 1.3, R * 1.3)
+        for i in range(6):
+            x1, y1 = verts[i]
+            ang = rot + (i + 0.5) * math.pi / 3
+            facing = 0.55 + 0.45 * math.cos(ang - la)
+            tri = QPainterPath()
+            tri.moveTo(cx, cy)
+            tri.lineTo(x1, y1)
+            tri.lineTo(*verts[(i + 1) % 6])
+            tri.closeSubpath()
+            fill = QColor(color).darker(int(170 - 90 * facing))
+            fill.setAlpha(int(150 + 60 * facing))
+            p.setBrush(QBrush(fill))
+            p.drawPath(tri)
+        edge = QColor(color).lighter(150)
+        edge.setAlpha(int(140 + 80 * energy))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(edge, max(1.2, R * 0.04)))
+        hex_path = QPainterPath()
+        for i, (vx, vy) in enumerate(verts):
+            hex_path.moveTo(vx, vy) if i == 0 else hex_path.lineTo(vx, vy)
+        hex_path.closeSubpath()
+        p.drawPath(hex_path)
+        p.setPen(QPen(QColor(255, 255, 255, 90), 1.0))
+        for vx, vy in verts:
+            p.drawLine(QPointF(cx, cy), QPointF(vx, vy))
+
+    def _paint_equalizer(self, p: QPainter, f: dict) -> None:
+        """Ring of 28 audio bars driven by mic level; flatline at idle."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy, level = f["radius"], f["energy"], f["level"]
+        n = 28
+        r_in = radius * 0.42
+        p.setBrush(Qt.NoBrush)
+        for i in range(n):
+            a = i * 2 * math.pi / n
+            if self._state == IDLE:
+                length = radius * 0.06 * (1.0 + 0.5 * math.sin(t * 2.2 + i * 0.7))
+            else:
+                pulse = max(0.0, math.sin(t * 6.0 + i * 1.3)) ** 1.5
+                length = radius * (0.05 + 0.45 * level * pulse + 0.08 * energy * (0.5 + 0.5 * math.sin(t * 3.0 + i)))
+            x1, y1 = cx + math.cos(a) * r_in, cy - math.sin(a) * r_in
+            x2, y2 = cx + math.cos(a) * (r_in + length), cy - math.sin(a) * (r_in + length)
+            c = QColor(color)
+            c.setAlpha(int(90 + 130 * min(1.0, length / (radius * 0.5))))
+            p.setPen(QPen(c, max(1.5, 2 * math.pi * radius / n * 0.32), Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        dot_r = radius * 0.10 * (1.0 + 0.4 * level)
+        dot = QColor(color)
+        dot.setAlpha(220)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(dot))
+        p.drawEllipse(QPointF(cx, cy), dot_r, dot_r)
+        p.setBrush(QColor(255, 255, 255, 170))
+        p.drawEllipse(QPointF(cx, cy), dot_r * 0.4, dot_r * 0.4)
+
+    def _paint_crystal(self, p: QPainter, f: dict) -> None:
+        """Rotating faceted gem with glinting edges."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy, la = f["radius"], f["energy"], f["la"]
+        R = radius * 0.95
+        rot = t * 2 * math.pi * 0.06
+        p.setPen(Qt.NoPen)
+        halo = QRadialGradient(QPointF(cx, cy), R * 1.3)
+        hc = QColor(color)
+        hc.setAlpha(int(30 + 40 * energy))
+        halo.setColorAt(0.75, hc)
+        hc.setAlpha(0)
+        halo.setColorAt(0.0, hc)
+        halo.setColorAt(1.0, hc)
+        p.setBrush(QBrush(halo))
+        p.drawEllipse(QPointF(cx, cy), R * 1.3, R * 1.3)
+        gem = QColor(color)
+        gem.setAlpha(70)
+        p.setBrush(QBrush(gem))
+        gem_path = QPainterPath()
+        verts = []
+        for i in range(6):
+            vx, vy = cx + R * math.cos(rot + i * math.pi / 3), cy - R * math.sin(rot + i * math.pi / 3)
+            verts.append((vx, vy))
+            gem_path.moveTo(vx, vy) if i == 0 else gem_path.lineTo(vx, vy)
+        gem_path.closeSubpath()
+        p.drawPath(gem_path)
+        # facet spokes + counter-rotating inner hex
+        p.setPen(QPen(QColor(255, 255, 255, 70), 1.0))
+        for vx, vy in verts:
+            p.drawLine(QPointF(cx, cy), QPointF(vx, vy))
+        in_path = QPainterPath()
+        for i in range(6):
+            vx = cx + R * 0.55 * math.cos(-rot * 1.5 + i * math.pi / 3)
+            vy = cy - R * 0.55 * math.sin(-rot * 1.5 + i * math.pi / 3)
+            in_path.moveTo(vx, vy) if i == 0 else in_path.lineTo(vx, vy)
+        in_path.closeSubpath()
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 90), 1.2))
+        p.drawPath(in_path)
+        # glints on the two edges nearest the light
+        best = sorted(range(6), key=lambda i: abs(((rot + i * math.pi / 3) - la + math.pi) % (2 * math.pi) - math.pi))[:2]
+        for i in best:
+            self._arc(p, cx, cy, R * 0.99, rot + i * math.pi / 3 + math.pi / 6, 0.5,
+                      QColor(255, 255, 255, int(150 + 70 * energy)), max(1.5, R * 0.05))
+        edge = QColor(color).lighter(150)
+        edge.setAlpha(int(150 + 70 * energy))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(edge, max(1.2, R * 0.035)))
+        p.drawPath(gem_path)
+
+    def _paint_saturn(self, p: QPainter, f: dict) -> None:
+        """Ringed planet with an orbiting moon."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy, lx, ly = f["radius"], f["energy"], f["lx"], f["ly"]
+        tilt, flat = -0.35, 0.32
+
+        def _ring_pt(rr: float, a: float) -> tuple:
+            ex, ey = math.cos(a) * rr, math.sin(a) * rr * flat
+            rx = ex * math.cos(tilt) - ey * math.sin(tilt)
+            ry = ex * math.sin(tilt) + ey * math.cos(tilt)
+            return cx + rx, cy + ry
+
+        p.setPen(Qt.NoPen)
+        pr = radius * 0.52
+        # back half of the ring (behind the planet)
+        back = QPainterPath()
+        for i in range(37):
+            a = math.pi + i * (math.pi / 36)
+            x, y = _ring_pt(radius * 1.02, a)
+            back.moveTo(x, y) if i == 0 else back.lineTo(x, y)
+        rc = QColor(color)
+        rc.setAlpha(int(110 + 70 * energy))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(rc, max(1.5, radius * 0.06), Qt.SolidLine, Qt.RoundCap))
+        p.drawPath(back)
+        # glass planet
+        globe = QRadialGradient(QPointF(cx + lx * pr * 0.5, cy + ly * pr * 0.5), pr * 1.6)
+        globe.setColorAt(0.0, QColor(120, 128, 150))
+        mid = QColor(color)
+        mid.setAlpha(235)
+        globe.setColorAt(0.4, mid)
+        globe.setColorAt(1.0, QColor(8, 9, 13))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(globe))
+        p.drawEllipse(QPointF(cx, cy), pr, pr)
+        p.setBrush(QColor(255, 255, 255, 70))
+        p.drawEllipse(QPointF(cx + lx * pr * 0.45, cy + ly * pr * 0.45), pr * 0.22, pr * 0.15)
+        # front half of the ring (in front of the planet)
+        front = QPainterPath()
+        for i in range(37):
+            a = i * (math.pi / 36)
+            x, y = _ring_pt(radius * 1.02, a)
+            front.moveTo(x, y) if i == 0 else front.lineTo(x, y)
+        rc.setAlpha(int(170 + 60 * energy))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(rc, max(2.0, radius * 0.075), Qt.SolidLine, Qt.RoundCap))
+        p.drawPath(front)
+        # moon on a wider orbit
+        ma = t * 0.9
+        mx, my = _ring_pt(radius * 1.30, ma)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 200))
+        p.drawEllipse(QPointF(mx, my), 2.2, 2.2)
+
+    def _paint_void(self, p: QPainter, f: dict) -> None:
+        """Voice void: black disc with a level-flared event horizon."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy, level = f["radius"], f["energy"], f["level"]
+        R = radius * 0.9
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(3, 3, 5)))
+        p.drawEllipse(QPointF(cx, cy), R, R)
+        # infalling spiral streaks
+        for k, (rr, spd, span) in enumerate(((0.80, 1.2, 1.2), (0.66, -0.9, 1.0), (0.52, 1.6, 0.8))):
+            c = QColor(color).lighter(160)
+            c.setAlpha(int(22 + 45 * energy))
+            self._arc(p, cx, cy, R * rr, t * 2 * math.pi * spd * 0.25 + k * 2.1, span, c,
+                      max(1.0, R * 0.03))
+        # spiralling infall sparks
+        for i in range(8):
+            ph = (t * 0.22 + i / 8) % 0.75
+            rr = R * (0.88 - ph)
+            a = i * 2.4 + t * (1.0 + i * 0.1)
+            s = QColor(color).lighter(170)
+            s.setAlpha(int((1.0 - ph) * (60 + 80 * energy)))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(s))
+            p.drawEllipse(QPointF(cx + math.cos(a) * rr, cy - math.sin(a) * rr), 1.6, 1.6)
+        # event horizon: hairline at idle, flaring with voice
+        flicker = 0.7 + 0.3 * math.sin(t * 13.0)
+        rim_c = QColor(color).lighter(180)
+        rim_c.setAlpha(int(40 + 15 * math.sin(t * 0.8) + 190 * min(1.0, level * flicker + energy * 0.15)))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(rim_c, max(1.0, R * (0.02 + 0.10 * level * flicker)), Qt.SolidLine, Qt.RoundCap))
+        p.drawEllipse(QPointF(cx, cy), R, R)
 
     @staticmethod
     def _wobble_path(cx: float, cy: float, r0: float, t: float, amt: float = 1.0) -> QPainterPath:

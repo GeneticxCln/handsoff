@@ -175,6 +175,20 @@ class TestSettingsCoercion:
         s = H._load_settings()
         assert s["bubble_size"] == 192 and s["tts_rate"] == 2.0
 
+    def test_bubble_design_accepted_and_garbage_falls_back(self, H, tmp_path, monkeypatch):
+        """Every shipped design loads; garbage coerces to orb (never a crash)."""
+        for name in ("orb", "halo", "reactor", "bloom", "droplet", "cube",
+                     "equalizer", "crystal", "saturn", "void"):
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"bubble_design": name}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["bubble_design"] == name
+        for bad in (" Death Star ", "", None, 123):
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"bubble_design": bad}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["bubble_design"] == "orb"
+
     # ---------------------------------------------------- version + migration
 
     def test_settings_version_stamped_and_not_a_setting(self, H, tmp_path, monkeypatch):
