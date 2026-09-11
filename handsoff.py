@@ -1125,6 +1125,15 @@ STATE_COLORS = {
     THINKING: _state_color("thinking", "#c8781f"),
     SPEAKING: _state_color("speaking", "#1fae62"),
 }
+
+# Per-state animation recipe: swirl speed (turns/s), glow boost, hue sweep
+# (deg) and target energy driving halo/specular intensity.
+_BUBBLE_FX = {
+    IDLE: (0.18, 0.10, 25.0, 0.12),
+    LISTENING: (0.55, 0.30, 50.0, 0.55),
+    SPEAKING: (0.50, 0.32, 90.0, 0.60),
+    THINKING: (0.85, 0.40, 140.0, 0.78),
+}
 WINDOW_PX = SETTINGS["bubble_size"]   # transparent window; bubble is ~69% of it
 BUBBLE_R0 = WINDOW_PX * 44.0 / 128.0  # idle bubble radius
 GLOW_PAD = WINDOW_PX * 7.0 / 128.0    # glow ring thickness; fits inside the mask
@@ -1146,6 +1155,9 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
         _CUDA_ERR_RE = re.compile(r"cuda|cublas|cudnn", re.IGNORECASE)
         _WHISPER_VRAM_MB = {}
         _piper_lock = threading.Lock()
+        _MIC_OPERATION_LOCK = threading.RLock()
+        _MIC_OPERATION_STATE_LOCK = threading.Lock()
+        _MIC_OPERATION_OWNER = None
         _whisper_model = None
         _whisper_cpu_fallback = False
         _piper_voice = None
@@ -1186,9 +1198,10 @@ _resample_to_16k = _audio._resample_to_16k
 
 # PortAudio is process-global.  In particular, stream.stop() must not overlap
 # another InputStream construction or a close from a different thread.
-_MIC_OPERATION_LOCK = threading.RLock()
-_MIC_OPERATION_STATE_LOCK = threading.Lock()
-_MIC_OPERATION_OWNER = None
+# The lock lives in core.audio (single owner); these are aliases so the
+# historical H._MIC_OPERATION_* seams keep working.
+_MIC_OPERATION_LOCK = _audio._MIC_OPERATION_LOCK
+_MIC_OPERATION_STATE_LOCK = _audio._MIC_OPERATION_STATE_LOCK
 _MIC_LAST_OPEN_DEVICE = threading.local()
 
 
@@ -1323,48 +1336,11 @@ class Recorder(_audio.Recorder):
 def _stop_recorder_bounded(rec, timeout: float = 3.0):
     """Stop without aborting a live native call from a second thread.
 
-    The stop thread owns the process-wide mic lock until rec.stop() returns.
-    A timeout only returns control to the UI worker; it never touches the
-    stream.  The owner thread performs the final state transition.
+    Thin seam over core.audio: the owner protocol (mic lock, _handsoff_stop_*
+    recorder attributes) is implemented once in core.audio so the abort-based
+    duplicate cannot diverge again.
     """
-    box: dict = {}
-
-    def _call() -> None:
-        global _MIC_OPERATION_OWNER
-        _MIC_OPERATION_LOCK.acquire()
-        with _MIC_OPERATION_STATE_LOCK:
-            _MIC_OPERATION_OWNER = threading.current_thread()
-            try:
-                rec._handsoff_stop_owner = _MIC_OPERATION_OWNER
-            except Exception:
-                pass
-        try:
-            try:
-                box["audio"] = rec.stop()
-            except Exception:
-                log.exception("recorder stop failed")
-                box["audio"] = None
-        finally:
-            callback = getattr(rec, "_handsoff_stop_done", None)
-            with _MIC_OPERATION_STATE_LOCK:
-                _MIC_OPERATION_OWNER = None
-                try:
-                    rec._handsoff_stop_owner = None
-                except Exception:
-                    pass
-            try:
-                if callable(callback):
-                    callback()
-            except Exception:
-                log.exception("recorder stop finalizer failed")
-            _MIC_OPERATION_LOCK.release()
-
-    th = threading.Thread(target=_call, name="ptt-stop-native", daemon=True)
-    th.start()
-    th.join(timeout)
-    if th.is_alive():
-        return None, True
-    return box.get("audio"), False
+    return _audio._stop_recorder_bounded(rec, timeout=timeout)
 _whisper_model = None
 _whisper_cpu_fallback = False
 _TRANSCRIBE_LOCK = _audio._TRANSCRIBE_LOCK
@@ -1680,7 +1656,7 @@ VOICE STOP
 - A bare "stop", "quiet", "shut up", "cancel", "nevermind" (alone, not part of a longer request) silences you instantly — playback cuts and no reply is spoken. Never answer those words; they are handled automatically.
 
 DESKTOP CONTROL — run_command
-Only these programs are allowed: pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, read-only system probes (ps, free, uptime, df, ss, nvidia-smi), read-only git (git status, git diff, git log, git show, git branch, git remote, git stash), cargo builds/tests (cargo build, cargo check, cargo test, cargo clippy), and your restart script {RESTART_SCRIPT}.{_EXTRAS_NOTE}
+Only these programs are allowed: pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, read-only system probes (ps, free, uptime, df, ss, nvidia-smi), read-only git (git status, git diff, git log, git show, git branch, git remote), cargo builds/tests (cargo build, cargo check, cargo test, cargo clippy), and your restart script {RESTART_SCRIPT}.{_EXTRAS_NOTE}
 Useful examples:
 - Volume: pactl set-sink-volume @DEFAULT_SINK@ -10%  (also +10%, 50%, mute)
 - Media: playerctl play-pause, playerctl next, playerctl previous
@@ -1755,11 +1731,11 @@ KNOWLEDGE — get_weather, web_search, lookup_fact, get_datetime
 - Current date/time is provided in the conversation; use get_datetime only when asked for the exact time.
 
 SELF-MODIFICATION
-- You ARE the program: {SELF_PATH} plus sibling split modules (settings_schema.py, hardware.py, handsoff-settings.py, core/*).
+- You ARE the program: {SELF_PATH} plus sibling split modules (settings_schema.py, hardware.py, handsoff-settings.py, core/settings.py, core/__init__.py).
 - To change yourself ("make your bubble pink", "add a mute option", "speak faster"):
   1) read_file the file,
-  2) edit_file it with the complete new content — valid Python, minimal diff ({SELF_PATH} edits keep '{SELF_MARKER}' exactly),
-  3) confirm briefly, then run_command "{RESTART_SCRIPT}" to restart.
+  2) edit_file it with the complete new content — valid Python, minimal diff (under 500KB; {SELF_PATH} edits keep '{SELF_MARKER}' exactly),
+  3) verify: python -m py_compile on the file and pytest tests/test_policy.py -q, then confirm briefly and run_command "{RESTART_SCRIPT}" to restart.
 - Simple tweaks (volume, brightness, windows): use commands, never rewrite yourself."""
 
 
@@ -3604,7 +3580,7 @@ class Assistant(QObject):
         self._start_worker(
             target=lambda: (self._speak(text, gen, cancel), self._set(gen, IDLE)),
             name="selfheal-tts", daemon=True,
-        ).start()
+        )
 
     def _is_closed(self) -> bool:
         self._lifecycle_ensure()
@@ -5663,26 +5639,31 @@ def _trim_history(msgs: list[dict]) -> list[dict]:
     """Trim from the front until the estimated token count fits the budget,
     never splitting an assistant-tool_calls/tool sequence, and always keeping
     the most recent message. The 40-message cap still applies as a hard
-    backstop."""
+    backstop. Token counts are computed once (O(n)), not re-summed per pop."""
     out = list(msgs)
-    while len(out) > MAX_HISTORY_MESSAGES:
-        out.pop(0)
-        while out and out[0].get("role") != "user":
-            out.pop(0)
-        if not out:
-            break
+    n = len(out)
+    start = 0
+    while n - start > MAX_HISTORY_MESSAGES:
+        start += (n - start - MAX_HISTORY_MESSAGES)
+        while start < n and out[start].get("role") != "user":
+            start += 1
+    out = out[start:]
+    if not out:
+        return out
     budget = max(0, _history_budget())
-
-    def _total(seq: list[dict]) -> int:
-        return sum(_msg_tokens(m) for m in seq)
-
-    while out and _total(out) > budget and len(out) > 1:
-        out.pop(0)
-        while out and out[0].get("role") != "user" and len(out) > 1:
-            out.pop(0)               # don't orphan tool results / assistant turns
-        if out and out[0].get("role") != "user" and _total(out) > budget:
+    toks = [_msg_tokens(m) for m in out]
+    total = sum(toks)
+    n = len(out)
+    start = 0
+    while n - start > 1 and total > budget:
+        total -= toks[start]
+        start += 1
+        while n - start > 1 and out[start].get("role") != "user":
+            total -= toks[start]  # don't orphan tool results / assistant turns
+            start += 1
+        if out[start].get("role") != "user" and total > budget:
             break                    # single over-budget message: keep it
-    return out
+    return out[start:]
 
 
 # -------------------------------------------------------------------------- bubble UI
@@ -5704,6 +5685,12 @@ class BubbleWidget(QWidget):
         self._menu_open = False
         self._press_pos = None
         self._drag_last = None
+        self._last_tick = 0.0
+        _c0 = STATE_COLORS[IDLE]
+        self._color_ui = [_c0.redF(), _c0.greenF(), _c0.blueF()]
+        self._radius_ui = None
+        self._radius_vel = 0.0
+        self._energy_ui = _BUBBLE_FX[IDLE][3]
 
         self.setWindowFlags(
             Qt.Window
@@ -5742,8 +5729,40 @@ class BubbleWidget(QWidget):
         self._level_target = level
 
     def _on_tick(self) -> None:
-        self._level_ui += (self._level_target - self._level_ui) * 0.35
+        now = self._clock.elapsed() / 1000.0
+        dt = min(0.05, max(0.001, now - self._last_tick))
+        self._last_tick = now
+        # voice level: fast attack, gentle release (frame-rate independent)
+        k = 1.0 - math.exp(-dt * (24.0 if self._level_target > self._level_ui else 7.0))
+        self._level_ui += (self._level_target - self._level_ui) * k
+        # state color crossfade — no hard pops on state change
+        tgt = STATE_COLORS.get(self._state, STATE_COLORS[IDLE])
+        kc = 1.0 - math.exp(-dt * 5.0)
+        cu = self._color_ui
+        cu[0] += (tgt.redF() - cu[0]) * kc
+        cu[1] += (tgt.greenF() - cu[1]) * kc
+        cu[2] += (tgt.blueF() - cu[2]) * kc
+        # animation energy follows the state (halo/specular intensity)
+        ke = 1.0 - math.exp(-dt * 4.0)
+        self._energy_ui += (_BUBBLE_FX.get(self._state, _BUBBLE_FX[IDLE])[3] - self._energy_ui) * ke
+        # radius spring: critically-damped-ish chase, settles without overshoot
+        want = self._radius_target(now)
+        if self._radius_ui is None:
+            self._radius_ui, self._radius_vel = want, 0.0
+        else:
+            acc = (want - self._radius_ui) * 110.0 - self._radius_vel * 15.0
+            self._radius_vel += acc * dt
+            self._radius_ui += self._radius_vel * dt
         self.update()
+
+    def _radius_target(self, t: float) -> float:
+        if self._state == LISTENING:
+            return BUBBLE_R0 + (3 + 9 * self._level_ui) * GEOM_K
+        if self._state == SPEAKING:
+            return BUBBLE_R0 + 7 * GEOM_K * (0.5 - 0.5 * math.cos(2 * math.pi * t / 0.6))
+        if self._state == THINKING:
+            return BUBBLE_R0
+        return BUBBLE_R0 + 3.5 * GEOM_K * math.sin(2 * math.pi * t / 3.8)
 
     # -- painting ----------------------------------------------------------------
 
@@ -5752,96 +5771,132 @@ class BubbleWidget(QWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
         cx, cy = self.width() / 2, self.height() / 2
         t = self._clock.elapsed() / 1000.0
-        color = STATE_COLORS.get(self._state, STATE_COLORS[IDLE])
+        color = QColor.fromRgbF(*self._color_ui)
+        swirl_speed, swirl_boost, hue_speed, _fx_e = _BUBBLE_FX.get(self._state, _BUBBLE_FX[IDLE])
+        radius = self._radius_ui if self._radius_ui is not None else self._radius_target(t)
+        energy = min(1.0, max(0.0, self._energy_ui))
+        # fixed key-light direction (top-left), unit-ish vector
+        lx, ly = -0.682, -0.731
 
-        if self._state == LISTENING:
-            radius = BUBBLE_R0 + (3 + 9 * self._level_ui) * GEOM_K
-            swirl_speed, swirl_boost, hue_speed = 0.55, 0.30, 50.0
-        elif self._state == SPEAKING:
-            radius = BUBBLE_R0 + 7 * GEOM_K * (0.5 - 0.5 * math.cos(2 * math.pi * t / 0.6))
-            swirl_speed, swirl_boost, hue_speed = 0.50, 0.32, 90.0
-        elif self._state == THINKING:
-            radius = BUBBLE_R0
-            swirl_speed, swirl_boost, hue_speed = 0.85, 0.40, 140.0
-        else:  # idle: slow breathing
-            radius = BUBBLE_R0 + 3.5 * GEOM_K * math.sin(2 * math.pi * t / 3.8)
-            swirl_speed, swirl_boost, hue_speed = 0.18, 0.10, 25.0
-
-        base_hue = max(0.0, color.hueF())
+        base_hue = max(0.0, QColor.fromRgbF(*self._color_ui).hueF())
         inner = radius * (1.0 - 0.34 - 0.10 * swirl_boost)   # dark core
 
-        # --- Siri-style rotating swirl: conic hue sweep clipped to the rim ring ---
-        conic = QConicalGradient(cx, cy, -t * 360.0 * swirl_speed)
-        first_stop = None
-        for i in range(6):
-            pos = i / 5.0
-            shifted = QColor.fromHslF(
-                (base_hue + (0.5 - abs(0.5 - pos)) * hue_speed / 360.0) % 1.0,
-                min(1.0, color.hslSaturationF() * 1.15),
-                0.60 + 0.10 * swirl_boost,
-                1.0,
-            )
-            if first_stop is None:
-                first_stop = QColor(shifted)
-            conic.setColorAt(pos, shifted)
-        conic.setColorAt(1.0, first_stop)
+        def _swirl_conic(angle_deg: float, alpha: int) -> QConicalGradient:
+            g = QConicalGradient(cx, cy, angle_deg)
+            first = None
+            for i in range(6):
+                pos = i / 5.0
+                c = QColor.fromHslF(
+                    (base_hue + (0.5 - abs(0.5 - pos)) * hue_speed / 360.0) % 1.0,
+                    min(1.0, color.hslSaturationF() * 1.15),
+                    0.60 + 0.10 * swirl_boost,
+                    alpha / 255.0,
+                )
+                if first is None:
+                    first = QColor(c)
+                g.setColorAt(pos, c)
+            g.setColorAt(1.0, first)
+            return g
+
+        # organic silhouette: thinking wobbles, speaking ripples, rest stay round
+        wob_amt = 1.0 if self._state == THINKING else (0.45 if self._state == SPEAKING else 0.0)
+        outer_path = QPainterPath()
+        if wob_amt > 0.0:
+            outer_path = self._wobble_path(cx, cy, radius, t, wob_amt)
+        else:
+            outer_path.addEllipse(QPointF(cx, cy), radius, radius)
         p.setPen(Qt.NoPen)
 
         # faint state-colored halo so the dark orb reads on dark wallpapers
         halo = QRadialGradient(QPointF(cx, cy), radius + GLOW_PAD)
         halo_color = QColor(color)
-        halo_color.setAlpha(55 if self._state != IDLE else 35)
+        halo_color.setAlpha(int(30 + 45 * energy))
         halo.setColorAt(radius / (radius + GLOW_PAD), halo_color)
         halo_color.setAlpha(0)
         halo.setColorAt(1.0, halo_color)
         p.setBrush(QBrush(halo))
         p.drawEllipse(QPointF(cx, cy), radius + GLOW_PAD, radius + GLOW_PAD)
 
-        p.save()
-        path = QPainterPath()
-        path.addEllipse(QPointF(cx, cy), radius, radius)
+        # --- Siri-style rotating swirl, two counter-rotating layers ---
         inner_path = QPainterPath()
         inner_path.addEllipse(QPointF(cx, cy), inner, inner)
-        ring_path = path.subtracted(inner_path)
+        ring_path = outer_path.subtracted(inner_path)
+        p.save()
         p.setClipPath(ring_path)
-        p.setBrush(QBrush(conic))
+        p.setBrush(QBrush(_swirl_conic(-t * 360.0 * swirl_speed, 255)))
+        p.drawEllipse(QPointF(cx, cy), radius, radius)
+        thin = QPainterPath()
+        thin.addEllipse(QPointF(cx, cy), radius, radius)
+        thin_inner = QPainterPath()
+        thin_inner.addEllipse(QPointF(cx, cy), inner * 1.12, inner * 1.12)
+        p.setClipPath(thin.subtracted(thin_inner))
+        p.setBrush(QBrush(_swirl_conic(t * 360.0 * swirl_speed * 0.6 + 40.0, int(60 + 90 * energy))))
         p.drawEllipse(QPointF(cx, cy), radius, radius)
         # radial falloff: darken toward the core with translucent black over the ring
         shade = QRadialGradient(QPointF(cx, cy), radius)
         shade.setColorAt(inner / radius, QColor(10, 12, 18, 235))
         shade.setColorAt(1.0, QColor(10, 12, 18, 0))
+        p.setClipPath(ring_path)
         p.setBrush(QBrush(shade))
         p.drawEllipse(QPointF(cx, cy), radius, radius)
         p.restore()
 
-        # --- dark glass core ---
-        core = QRadialGradient(QPointF(cx, cy - inner * 0.3), inner * 1.35)
-        core.setColorAt(0.0, QColor(40, 44, 54))
-        core.setColorAt(0.7, QColor(24, 26, 33))
-        core.setColorAt(1.0, QColor(14, 15, 20))
+        # --- 3D glass core: lit hemisphere facing the key light ---
+        tint = QColor(
+            int(26 * 0.88 + color.red() * 0.12),
+            int(28 * 0.88 + color.green() * 0.12),
+            int(36 * 0.88 + color.blue() * 0.12),
+        )
+        core = QRadialGradient(
+            QPointF(cx + lx * inner * 0.55, cy + ly * inner * 0.55), inner * 1.6)
+        core.setColorAt(0.0, QColor(64, 69, 86))
+        core.setColorAt(0.35, tint)
+        core.setColorAt(0.75, QColor(20, 22, 29))
+        core.setColorAt(1.0, QColor(10, 11, 15))
         p.setBrush(QBrush(core))
         p.setPen(QPen(QColor(255, 255, 255, 26), 1))
         p.drawEllipse(QPointF(cx, cy), inner, inner)
-
-        # --- specular highlight + rim light ---
+        # contact depth: soft shadow pooled opposite the light + floor bounce
+        depth = QRadialGradient(
+            QPointF(cx - lx * inner * 0.45, cy - ly * inner * 0.45), inner * 1.1)
+        depth.setColorAt(0.55, QColor(0, 0, 0, 0))
+        depth.setColorAt(1.0, QColor(0, 0, 0, int(60 + 50 * energy)))
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(255, 255, 255, 34))
+        p.setBrush(QBrush(depth))
+        p.drawEllipse(QPointF(cx, cy), inner, inner)
+        bounce = QColor(color)
+        bounce.setAlpha(int(14 + 26 * energy))
+        p.setBrush(bounce)
+        p.drawEllipse(QPointF(cx, cy + inner * 0.52), inner * 0.55, inner * 0.26)
+
+        # --- specular life: breathing hotspot + slow-drifting crescent ---
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, int(40 + 10 * math.sin(2 * math.pi * t / 2.3))))
         p.drawEllipse(
-            QPointF(cx - inner * 0.30, cy - inner * 0.42), inner * 0.30, inner * 0.20
+            QPointF(cx + lx * inner * 0.52, cy + ly * inner * 0.52), inner * 0.28, inner * 0.19
         )
+        crescent = QPainterPath()
+        crescent.addEllipse(QPointF(cx, cy), inner * 0.86, inner * 0.86)
+        crescent_inner = QPainterPath()
+        crescent_inner.addEllipse(QPointF(cx, cy), inner * 0.78, inner * 0.78)
+        p.save()
+        p.setClipPath(crescent.subtracted(crescent_inner))
+        p.setBrush(QBrush(_swirl_conic(-t * 360.0 * 0.05 + 135.0, 70)))
+        p.drawEllipse(QPointF(cx, cy), inner, inner)
+        p.restore()
         # thin colored rim light between core and swirl
         rim = QColor(color)
-        rim.setAlpha(80)
+        rim.setAlpha(int(70 + 60 * energy))
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(rim, max(1.0, inner * 0.05)))
         p.drawEllipse(QPointF(cx, cy), inner * 0.97, inner * 0.97)
         p.end()
 
     @staticmethod
-    def _wobble_path(cx: float, cy: float, r0: float, t: float) -> QPainterPath:
+    def _wobble_path(cx: float, cy: float, r0: float, t: float, amt: float = 1.0) -> QPainterPath:
         path = QPainterPath()
         n = 72
-        a1, a2 = r0 * 0.115, r0 * 0.08
+        a1, a2 = r0 * 0.115 * amt, r0 * 0.08 * amt
         for i in range(n + 1):
             ang = i * 2 * math.pi / n
             r = r0 + a1 * math.sin(3 * ang + 4.2 * t) + a2 * math.sin(5 * ang - 3.1 * t)

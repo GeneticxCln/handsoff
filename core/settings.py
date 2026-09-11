@@ -447,8 +447,12 @@ def _read_settings_for_write(settings_file: Path) -> dict:
         return {}
     except ValueError:
         _quarantine_bad(settings_file)
-    except OSError:
-        pass
+        return {}
+    if not isinstance(loaded, dict):
+        _quarantine_bad(settings_file)  # valid JSON, wrong shape: never wipe blind
+        return {}
+    # OSError (permissions, transient I/O) propagates: the caller must abort
+    # the write rather than persist a near-empty dict over good data.
     return {}
 
 
@@ -486,7 +490,12 @@ def _persist_setting(key: str, value, settings_file: Path,
                      config_dir: Path) -> None:
     """Persist one runtime setting without overwriting unrelated settings."""
     with _SETTINGS_WRITE_LOCK, _settings_file_lock()(config_dir):
-        data = _read_settings_for_write(settings_file)
+        try:
+            data = _read_settings_for_write(settings_file)
+        except OSError:
+            logging.getLogger("handsoff").warning(
+                "persist_setting %r aborted: settings file unreadable", key)
+            return
         data[key] = value
         data["version"] = SETTINGS_VERSION   # every on-disk write is stamped
         # NOTE: _atomic_private_write creates its own uniquely-named temp

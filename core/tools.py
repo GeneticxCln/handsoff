@@ -121,6 +121,22 @@ def build_tools():
 
 _JSON_TYPE = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
+_LOG_REDACT_KEYS = frozenset({"content", "text"})
+
+
+def _log_target(args: dict, limit: int = 200) -> str:
+    """Compact log target with secret-bearing values redacted.
+
+    `content` (edit_file whole-file replace) and `text` (type_text clipboard
+    pastes) must not land verbatim in decisions.jsonl — keep a length marker
+    so 'why did it do that' stays answerable without the payload."""
+    try:
+        red = {k: (f"<{len(v)} chars>" if k in _LOG_REDACT_KEYS and isinstance(v, str) and len(v) > 50 else v) for k, v in args.items()}
+        return json.dumps(red, sort_keys=True)[:limit]
+    except (TypeError, ValueError):
+        return ""
+
+
 def log_decision(tool: str, target: str, decision: str, result: str='dispatched') -> None:
     """Append one JSON line to ~/.local/state/handsoff/decisions.jsonl.
 
@@ -136,10 +152,13 @@ def log_decision(tool: str, target: str, decision: str, result: str='dispatched'
                 fh.write(json.dumps(entry, ensure_ascii=False) + '\n')
             os.chmod(decision_file, 384)
             try:
-                with decision_file.open('r', encoding='utf-8') as fh:
-                    lines = fh.readlines()
-                if len(lines) > _DECISIONS_MAX * 2:
-                    _dep()._atomic_private_write(decision_file, ''.join(lines[-_DECISIONS_MAX:]))
+                # Size gate: the read-trim path runs only once past ~2x the
+                # line cap, not on every tool call in the hot path.
+                if decision_file.stat().st_size > 262144:
+                    with decision_file.open('r', encoding='utf-8') as fh:
+                        lines = fh.readlines()
+                    if len(lines) > _DECISIONS_MAX * 2:
+                        _dep()._atomic_private_write(decision_file, ''.join(lines[-_DECISIONS_MAX:]))
             except OSError:
                 pass
     except Exception:
@@ -351,6 +370,7 @@ class ToolBelt:
     BLOCKED = ('sudo', 'rm', 'pacman', 'yay', 'paru', 'shutdown', 'poweroff', 'reboot', 'halt', 'mkfs', 'dd', 'kill', 'chmod', 'chown', 'mount', 'umount', 'curl', 'wget', 'bash', 'sh', 'zsh', 'fish', 'python', 'python3', 'pip', 'mv', 'cp', 'tar', 'zip', '7z', 'make', 'gcc', 'systemctl', 'journalctl', 'tee', 'xargs', 'env', 'eval', 'exec')
     MAX_READ = 160000
     MAX_WRITE = 2000000
+    MAX_SELF_EDIT = 500000  # self/split whole-file replace cap (handsoff.py ~270KB)
     TIMEOUT = 15
 
     def __init__(self, on_restart_pending: 'callable', permissions: dict | None=None, on_timer: 'callable | None'=None, on_notification: 'callable | None'=None, on_announce: 'callable | None'=None, on_pomodoro: 'callable | None'=None, dependencies=None) -> None:
@@ -393,11 +413,7 @@ class ToolBelt:
 
     def _is_self_edit(self, args: dict) -> bool:
         """True when this edit_file call targets handsoff.py itself."""
-        try:
-            p = Path(str(args.get('path') or '')).expanduser().resolve()
-        except (OSError, RuntimeError, ValueError):
-            return False
-        return p == _dep().SELF_PATH
+        return self._edit_confirm_kind(args) == "self"
 
     def _edit_confirm_kind(self, args: dict) -> str:
         """'self' | 'split' | '' — the CONFIRM floor covers the running bubble
@@ -506,7 +522,7 @@ class ToolBelt:
             self._tool_times.popleft()
         if limit > 0:
             if len(self._tool_times) >= limit:
-                log_decision(name, json.dumps(args)[:120], 'RATE-LIMITED', 'refused: rate limit')
+                log_decision(name, _log_target(args, 120), 'RATE-LIMITED', 'refused: rate limit')
                 return (f'REFUSED: tool-call rate limit reached ({limit} calls/60s) — stop calling tools, answer from what you have, or wait', True)
             self._tool_times.append(now)
         fn = self._tool_methods().get(name)
@@ -514,7 +530,7 @@ class ToolBelt:
             return (f'unknown tool: {name}', True)
         gate = fn._tool_gates
         if gate and (not self._perm.get(gate, True)):
-            log_decision(name, json.dumps(args)[:120], 'DENY', 'refused: permission gate disabled')
+            log_decision(name, _log_target(args, 120), 'DENY', 'refused: permission gate disabled')
             return (f"REFUSED: the '{gate}' tool is disabled in handsoff settings", True)
         if name in ('kill_process', 'confirm_kill'):
             verdict = 'ALLOW'
@@ -524,7 +540,7 @@ class ToolBelt:
             verdict = 'CONFIRM'
         if name == 'edit_file' and verdict != 'DENY' and (getattr(self, '_confirm_running', None) != name) and self._self_edit_needs_confirm(args):
             verdict = 'CONFIRM'
-        target = json.dumps(args, sort_keys=True)[:200] if args else ''
+        target = _log_target(args) if args else ''
         if verdict == 'DENY':
             log_decision(name, target, 'DENY', 'refused: command_policy DENY')
             return (f"REFUSED: '{name}' is DENIED by the user's command policy (handsoff settings) — do not retry this turn", True)
@@ -635,7 +651,7 @@ class ToolBelt:
                 return (None, '', 'REFUSED: self-restart is disabled in handsoff settings', False)
             if not (_dep().RESTART_SCRIPT.exists() and os.access(_dep().RESTART_SCRIPT, os.X_OK)):
                 return (None, '', f'ERROR: restart script missing at {_dep().RESTART_SCRIPT} — run install.sh', False)
-        allowed = set(self.ALLOWED) | {c.strip() for c in _dep().SETTINGS['extra_allowed_commands'] if c.strip()}
+        allowed = set(self.ALLOWED) | {Path(c.strip().split()[0]).name for c in _dep().SETTINGS.get("extra_allowed_commands") or [] if c.strip()}
         if not is_restart:
             if exe_base not in allowed and exe_base != _unblocked:
                 return (None, '', f"REFUSED: '{exe}' is not on the safe shell-command whitelist. Note: REFUSED does NOT mean the program is missing — it only means you may not run it via run_command. If it is one of your own tools (like ydotool for typing), use that tool instead. Allowed: " + ', '.join(sorted(allowed)) + f', {_dep().RESTART_SCRIPT}', False)
@@ -689,7 +705,7 @@ class ToolBelt:
             return 'REFUSED: passing script/code flags to spawned programs is not allowed'
         return None
 
-    @tool(description='Run one safe whitelisted command (pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, system probes like ps/free/uptime/df/ss/nvidia-smi, read-only git (status/diff/log/show/branch/remote/stash), cargo build/check/test/clippy, restart script). Single command only — pipes/; /&& are refused.')
+    @tool(description='Run one safe whitelisted command (pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, system probes like ps/free/uptime/df/ss/nvidia-smi, read-only git (status/diff/log/show/branch/remote), cargo build/check/test/clippy, restart script). Single command only — pipes/; /&& are refused.')
     def run_command(self, command: str) -> str:
         """Run a whitelisted shell command.
 
@@ -2261,13 +2277,13 @@ class ToolBelt:
                 return f'Cancelled — {tool} was not run.'
             self._pending_confirm = None
             tool, args = (offer['tool'], offer['args'])
-        _dep().log_decision(tool, json.dumps(args)[:120], 'CONFIRM', 'confirmed; running')
+        _dep().log_decision(tool, _log_target(args, 120), 'CONFIRM', 'confirmed; running')
         self._confirm_running = tool
         try:
             out, err = self.execute(tool, args)
         finally:
             self._confirm_running = None
-        _dep().log_decision(tool, json.dumps(args)[:120], 'EXECUTED', 'refused/errored' if err else 'ok')
+        _dep().log_decision(tool, _log_target(args, 120), 'EXECUTED', 'refused/errored' if err else 'ok')
         return out
     JOB_ANNOUNCE_S = 20.0
 
@@ -2618,8 +2634,10 @@ class ToolBelt:
         if len(content) > self.MAX_WRITE:
             return 'REFUSED: content too large'
         kind = _dep()._classify_edit_path(p)
+        if kind in ("self", "split") and len(content) > self.MAX_SELF_EDIT:
+            return f'REFUSED: self/split edit too large ({len(content)} > {self.MAX_SELF_EDIT} bytes) — keep the diff minimal'
         if not kind:
-            return f"REFUSED: you may only edit your own source ({_dep().SELF_PATH}), the split modules beside it or in {_dep().HOME / '.local/bin'} ({', '.join(sorted(_dep()._SPLIT_EDIT_FILES))}, core/*), or files inside {_dep().CONFIG_DIR}/"
+            return f"REFUSED: you may only edit your own source ({_dep().SELF_PATH}), the split modules beside it or in {_dep().HOME / '.local/bin'} ({', '.join(sorted(_dep()._SPLIT_EDIT_FILES))}, core/settings.py, core/__init__.py), or files inside {_dep().CONFIG_DIR}/"
         is_self = kind == 'self'
         if p in (_dep().SETTINGS_FILE, _dep().SETTINGS_FILE.with_suffix('.json')) or p.name.startswith('settings.json'):
             return 'REFUSED: settings.json controls your own permissions — the user manages it via the settings app'

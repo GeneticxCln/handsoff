@@ -73,7 +73,7 @@ jobs:
           python-version: "3.12"
       - name: python -m py_compile
         run: |
-          python -m py_compile handsoff.py handsoff-settings.py settings_schema.py hardware.py core/__init__.py core/settings.py attic/patch_wakeword.py tests/fake_ollama.py
+          python -m py_compile handsoff.py handsoff-settings.py settings_schema.py hardware.py core/*.py attic/patch_wakeword.py tests/fake_ollama.py
           python -m py_compile tests/*.py
 
   # Shell syntax checks for every shipped script.

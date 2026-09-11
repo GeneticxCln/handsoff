@@ -26,6 +26,16 @@ PIPER_VOICE_NAME = ""
 SETTINGS: dict = {"tts_rate": 1.0, "tts_volume": 1.0}
 log = logging.getLogger("handsoff")
 
+# Process-wide mic-operation ownership: InputStream construction and teardown
+# serialize on _MIC_OPERATION_LOCK. A bounded stop runs rec.stop() on an owner
+# thread holding the lock; a timeout returns control WITHOUT touching the
+# stream — the owner finishes the state transition and fires the recorder's
+# _handsoff_stop_done finalizer (never abort a live native call from a second
+# thread).
+_MIC_OPERATION_LOCK = threading.RLock()
+_MIC_OPERATION_STATE_LOCK = threading.Lock()
+_MIC_OPERATION_OWNER = None
+
 
 def configure(*, sample_rate: int = 16_000, whisper_size: str = "base",
               whisper_device: str = "auto", whisper_model_dir: Path | None = None,
@@ -139,48 +149,51 @@ class Recorder:
 
 
 def _stop_recorder_bounded(rec, timeout: float = 3.0):
-    """Run recorder stop with a bounded join and best-effort stream abort."""
-    try:
-        stream = getattr(rec, "_stream", None)
-    except Exception:
-        stream = None
+    """Stop without aborting a live native call from a second thread.
+
+    The stop thread owns the process-wide mic lock until rec.stop() returns.
+    A timeout only returns control to the caller; it never touches the
+    stream. The owner thread performs the final state transition.
+    """
+    global _MIC_OPERATION_OWNER
     box: dict = {}
 
     def _call() -> None:
+        global _MIC_OPERATION_OWNER
+        _MIC_OPERATION_LOCK.acquire()
+        with _MIC_OPERATION_STATE_LOCK:
+            _MIC_OPERATION_OWNER = threading.current_thread()
+            try:
+                rec._handsoff_stop_owner = _MIC_OPERATION_OWNER
+            except Exception:
+                pass
         try:
-            box["audio"] = rec.stop()
-        except Exception:
-            log.exception("recorder stop failed")
-            box["audio"] = None
-
-    try:
-        th = threading.Thread(target=_call, name="ptt-stop-inner", daemon=True)
-        th.start()
-    except Exception:
-        try:
-            return rec.stop(), False
-        except Exception:
-            log.exception("recorder stop failed")
-            return None, False
-    th.join(timeout)
-    if th.is_alive():
-        for current in (stream, getattr(rec, "_stream", None)):
-            if current is None:
-                continue
-            for name in ("abort", "close"):
+            try:
+                box["audio"] = rec.stop()
+            except Exception:
+                log.exception("recorder stop failed")
+                box["audio"] = None
+        finally:
+            callback = getattr(rec, "_handsoff_stop_done", None)
+            with _MIC_OPERATION_STATE_LOCK:
+                _MIC_OPERATION_OWNER = None
                 try:
-                    fn = getattr(current, name, None)
-                    if callable(fn):
-                        fn()
+                    rec._handsoff_stop_owner = None
                 except Exception:
                     pass
-        try:
-            if getattr(rec, "_stream", None) is not None:
-                rec._stream = None
-        except Exception:
-            pass
+            try:
+                if callable(callback):
+                    callback()
+            except Exception:
+                log.exception("recorder stop finalizer failed")
+            _MIC_OPERATION_LOCK.release()
+
+    th = threading.Thread(target=_call, name="ptt-stop-native", daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
         return None, True
-    return box.get("audio", None), False
+    return box.get("audio"), False
 
 
 _whisper_model = None
