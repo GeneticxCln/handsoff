@@ -256,6 +256,46 @@ def appearance_energy_and_accent_roundtrip():
 
 
 @scenario
+def appearance_changes_apply_without_save():
+    # The Appearance tab promises live application and the bubble watches
+    # settings.json, so picking a shape must reach disk — and the bubble — with
+    # no Save click. The old code wrote nothing until Save: the preview updated
+    # (it reads the widgets directly) while the bubble never changed, which the
+    # user experiences as "no matter what shape I choose, it never saves".
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    notified = []
+    win._notify_bubble_reloaded = lambda: (notified.append(1), True)[1]
+
+    current = win.design_combo.currentData()
+    designs = list(getattr(settings_app.SCHEMA, "BUBBLE_DESIGNS", ("orb",)))
+    target = next(d for d in designs if d != current)
+    win.design_combo.setCurrentIndex(win.design_combo.findData(target))
+    win._apply_appearance_live()          # what the debounce timer calls
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["bubble_design"] == target, (
+        "a picked shape must persist without pressing Save, got "
+        f"{on_disk.get('bubble_design')!r}")
+    assert notified, "the live apply must tell the running bubble to repaint"
+
+    # a slider drag writes too, so the sliders are not decoration
+    win.energy_slider.setValue(160)
+    win._apply_appearance_live()
+    assert json.loads(settings_file.read_text())["animation_energy"] == 1.6
+
+    # ...but loading the form is NOT an edit: no write, no bubble poke. This is
+    # the guard that keeps a window open (and the 2 s disk poll reloading it)
+    # from rewriting settings.json on its own.
+    writes = []
+    real_save = win.save
+    win.save = lambda: (writes.append(1), real_save())[1]
+    win.reload_from_disk()
+    win._apply_appearance_live()
+    assert writes == [], "loading the form must not trigger a live save"
+    win.save = real_save
+
+
+@scenario
 def wallpaper_tuning_buttons_retune_palette():
     # offline: detection fails cleanly and must not touch the palette, while the
     # explicit Dark/Light buttons still retune it without a wallpaper or magick
@@ -324,14 +364,29 @@ def bubble_designs_render_at_energy_extremes():
                     assert not widget.grab().isNull()
                     painted += 1
     assert painted == len(designs) * len(states) * 3 * 2
-    # the neutral defaults must reproduce the historical framing exactly
+    # the neutral defaults must reproduce the historical framing exactly.
+    # _energy_ui is a smoothed chase (it converges during _on_tick), so pin it
+    # to the target rather than hoping the event loop got there: the frame's
+    # job is to report the converged value, which is what is asserted here.
     bubble.ANIM_ENERGY = 1.0
     bubble.BUBBLE_ACCENT = 0.5
     widget._state = "idle"
+    widget._energy_ui = bubble._fx_energy("idle")
     frame = widget._frame()
     assert frame["anim"] == 1.0
     assert frame["accent"] == 0.5
     assert abs(frame["energy"] - bubble._fx_energy("idle")) < 1e-9
+
+    # ...and the slider really moves the target every design reads: monotonic
+    # in animation energy, clamped to a sane glow range. (Deliberately stated
+    # as a property rather than exact numbers, so a retuned curve is fine.)
+    energies = []
+    for knob in (0.2, 1.0, 2.0):
+        bubble.ANIM_ENERGY = knob
+        energies.append(bubble._fx_energy("idle"))
+    assert energies == sorted(energies), "more energy must never dim the glow"
+    assert all(0.0 <= e <= 1.0 for e in energies), "glow energy must stay bounded"
+    bubble.ANIM_ENERGY = 1.0
 
 
 @scenario
@@ -717,6 +772,7 @@ SCENARIO_NAMES = [
     "design_change_applies_on_sparse_settings",
     "disk_change_does_not_reset_unsaved_edits",
     "appearance_energy_and_accent_roundtrip",
+    "appearance_changes_apply_without_save",
     "wallpaper_tuning_buttons_retune_palette",
     "bubble_designs_render_at_energy_extremes",
     "external_change_reloads_and_reports",

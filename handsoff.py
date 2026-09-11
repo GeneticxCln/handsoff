@@ -1203,6 +1203,27 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
         def configure(*_args, **_kwargs):
             return None
 
+        # The PortAudio teardown guard must exist here too: the hands-free
+        # listener's recovery path calls _audio.portaudio_busy() while handling
+        # a mic failure, so a partial install must report "not busy" (nothing
+        # is open) rather than raise AttributeError out of the except block.
+        # (Defined inside each method: a class-body lambda cannot see _NoBusy,
+        # for the same reason a nested class cannot see _missing above.)
+        @staticmethod
+        def portaudio_in_use():
+            class _Inert:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_exc):
+                    return False
+
+            return _Inert()
+
+        @staticmethod
+        def portaudio_busy():
+            return False
+
         _resample_to_16k = _open_input = _stop_recorder_bounded = _missing
         get_whisper = get_piper = transcribe = tts_to_wav = play_wav = _missing
 
@@ -3009,14 +3030,26 @@ class ContinuousListener:
                 if open_failures % 6 == 0:
                     # PortAudio can wedge for the whole process when its
                     # first open races PipeWire startup — fresh devices only
-                    # appear after a full terminate/reinitialize
-                    try:
-                        sd._terminate()
-                        sd._initialize()
-                        log.warning("PortAudio reinitialized after %d failed "
-                                    "mic opens", open_failures)
-                    except Exception:
-                        log.exception("PortAudio reinit failed")
+                    # appear after a full terminate/reinitialize.
+                    #
+                    # But PortAudio is process-global, so this tears down any
+                    # stream we are still using: doing it while the bubble is
+                    # speaking aborts the interpreter (the recorded crash is
+                    # "Fatal Python error: Aborted" inside sounddevice's
+                    # OutputStream.__init__ on the _speak thread). Defer while
+                    # audio is in use rather than kill the process.
+                    if _audio.portaudio_busy():
+                        log.warning("PortAudio reinit deferred — a stream is "
+                                    "still open after %d failed mic opens",
+                                    open_failures)
+                    else:
+                        try:
+                            sd._terminate()
+                            sd._initialize()
+                            log.warning("PortAudio reinitialized after %d failed "
+                                        "mic opens", open_failures)
+                        except Exception:
+                            log.exception("PortAudio reinit failed")
                 time.sleep(2.0 if open_failures < 30 else 10.0)
                 continue
             open_failures = 0

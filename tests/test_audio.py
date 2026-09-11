@@ -34,6 +34,74 @@ def test_core_audio_imports_independently():
         assert hasattr(mod, name), name
 
 
+def test_portaudio_reinit_is_guarded_while_streams_are_open(H):
+    """sd._terminate() is process-global: the listener's recovery path must not
+    tear down streams this process is still using.
+
+    The recorded crash is "Fatal Python error: Aborted" inside sounddevice's
+    OutputStream.__init__ on the _speak thread — i.e. the hands-free listener
+    reinitializing PortAudio mid-playback. play_wav marks the stretch busy and
+    the listener defers instead.
+    """
+    mod = _load("core_audio_guard", HERE / "core" / "audio.py")
+    assert mod.portaudio_busy() is False
+    with mod.portaudio_in_use():
+        assert mod.portaudio_busy() is True
+        with mod.portaudio_in_use():
+            assert mod.portaudio_busy() is True      # nesting is safe
+        assert mod.portaudio_busy() is True
+    assert mod.portaudio_busy() is False
+    try:                                             # an error must still clear it
+        with mod.portaudio_in_use():
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert mod.portaudio_busy() is False
+
+    # ...and the guard is actually wired into the reinit path, not just defined
+    text = (HERE / "handsoff.py").read_text(encoding="utf-8")
+    idx = text.index("PortAudio reinit deferred")
+    assert "_audio.portaudio_busy()" in text[max(0, idx - 400):idx]
+
+
+def test_play_wav_holds_the_portaudio_mark(H, tmp_path):
+    """Playback is exactly the window the listener must not reinit inside."""
+    import threading, wave as _wave
+    mod = _load("core_audio_guard2", HERE / "core" / "audio.py")
+    seen = []
+    real = mod.sd.OutputStream
+
+    class _Stream:
+        def __init__(self, **kw):
+            seen.append(mod.portaudio_busy())
+
+        def start(self):
+            seen.append(mod.portaudio_busy())
+
+        def write(self, data):
+            seen.append(mod.portaudio_busy())
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    mod.sd.OutputStream = _Stream
+    try:
+        path = tmp_path / "tone.wav"
+        with _wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 4096)
+        mod.play_wav(path, threading.Event())
+    finally:
+        mod.sd.OutputStream = real
+    assert seen and all(seen), "every step of playback must hold the mark"
+    assert mod.portaudio_busy() is False, "the mark must be released afterwards"
+
+
 class FakeSig:
     """Mimics a Qt signal: collect emitted values."""
 

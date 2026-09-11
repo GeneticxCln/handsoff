@@ -23,6 +23,7 @@ import copy
 import hashlib
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -129,6 +130,10 @@ DEFAULT_SETTINGS = SCHEMA.DEFAULT_SETTINGS
 SETTINGS_VERSION = SCHEMA.SETTINGS_VERSION
 
 H = _LazyHandsoff()
+
+# Same logger name as the bubble, so a live-apply failure lands in handsoff.log
+# next to everything else rather than vanishing into the GUI process's stderr.
+log = logging.getLogger("handsoff")
 
 try:                                  # core.theme ships with the app's core/ dir;
     from core import theme as _THEME  # a partial install just disables wallpaper
@@ -1000,6 +1005,9 @@ def _health_tooltip(snap: dict | None) -> str:
 
 
 class SettingsWindow(QMainWindow):
+    # The Appearance tab owns these; a change to any of them applies live.
+    APPEARANCE_KEYS = ("bubble_design", "animation_energy", "bubble_accent")
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("handsoff settings")
@@ -1009,6 +1017,16 @@ class SettingsWindow(QMainWindow):
         self._model_at_open = str(self.cfg.get("model") or "")
         self._state_dir_ready()
         self._live_probe: _LiveMicProbe | None = None   # live mic test (Voice tab)
+
+        # The Appearance tab applies live: picking a shape (or moving a slider)
+        # is a real save 400 ms later, so the bubble repaints without anyone
+        # pressing Save. That is what the tab always claimed to do — the
+        # separate Save button is for the rest of the form. The timer is
+        # debounced so dragging a slider writes once, not per pixel.
+        self._live_timer = QTimer(self)
+        self._live_timer.setSingleShot(True)
+        self._live_timer.setInterval(400)
+        self._live_timer.timeout.connect(self._apply_appearance_live)
 
         tabs = QTabWidget(self)
         self.tabs = tabs
@@ -2074,7 +2092,10 @@ class SettingsWindow(QMainWindow):
         self.design_combo = QComboBox(self)
         for name in getattr(SCHEMA, "BUBBLE_DESIGNS", ("orb",)):
             self.design_combo.addItem(name.capitalize(), name)
-        self.design_combo.setToolTip("Bubble shape — applies live; the bubble repaints within seconds")
+        self.design_combo.setToolTip(
+            "Bubble shape — applies immediately; the bubble repaints within "
+            "seconds. No Save needed.")
+        self.design_combo.currentIndexChanged.connect(self._schedule_appearance_live)
         design_row.addWidget(QLabel("Bubble design", self))
         design_row.addWidget(self.design_combo, 1)
         lay.addLayout(design_row)
@@ -2090,6 +2111,7 @@ class SettingsWindow(QMainWindow):
         self.energy_label = QLabel("", self)
         self.energy_slider.valueChanged.connect(
             lambda v: self.energy_label.setText(f"{v / 100:.1f}×"))
+        self.energy_slider.valueChanged.connect(self._schedule_appearance_live)
         energy_row.addWidget(QLabel("Animation energy", self))
         energy_row.addWidget(self.energy_slider, 1)
         energy_row.addWidget(self.energy_label)
@@ -2104,6 +2126,7 @@ class SettingsWindow(QMainWindow):
         self.accent_label = QLabel("", self)
         self.accent_slider.valueChanged.connect(
             lambda v: self.accent_label.setText(f"{v}%"))
+        self.accent_slider.valueChanged.connect(self._schedule_appearance_live)
         accent_row.addWidget(QLabel("Colour accent", self))
         accent_row.addWidget(self.accent_slider, 1)
         accent_row.addWidget(self.accent_label)
@@ -2160,7 +2183,8 @@ class SettingsWindow(QMainWindow):
         self._paint_color_buttons()
         self.preview.update()
         backdrop = "dark" if float(luminance) < 0.5 else "light"
-        self._status(f"state colours retuned for a {backdrop} backdrop — Save to apply")
+        self._status(f"state colours retuned for a {backdrop} backdrop")
+        self._schedule_appearance_live()
 
     def _match_wallpaper(self) -> None:
         """One click: sample the configured wallpaper and retune for it."""
@@ -2192,10 +2216,44 @@ class SettingsWindow(QMainWindow):
         if col.isValid():
             self._colors[key] = col.name()
             self._paint_color_buttons()
+            self.preview.update()
+            self._schedule_appearance_live()
 
     def _reset_colors(self) -> None:
         self._colors = dict(DEFAULT_SETTINGS["colors"])
         self._paint_color_buttons()
+        self.preview.update()
+        self._schedule_appearance_live()
+
+    # ------------------------------------------------------- live appearance
+
+    def _schedule_appearance_live(self, *_args) -> None:
+        """Debounce a live apply; the last change wins."""
+        self._live_timer.start()
+
+    def _apply_appearance_live(self) -> None:
+        """Write the Appearance values to settings.json and notify the bubble.
+
+        Skips the write when the disk already holds these values, which is how
+        a plain window load (where _load_values sets the widgets from disk) is
+        told apart from a real edit — no separate 'loading' flag to get stuck.
+        """
+        try:
+            self._collect()
+        except Exception:            # a half-built form must not raise here
+            log.exception("live appearance apply: could not collect settings")
+            return
+        wanted = {k: self.cfg.get(k) for k in self.APPEARANCE_KEYS}
+        try:
+            on_disk = json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            on_disk = {}
+        if all(on_disk.get(k) == v for k, v in wanted.items()):
+            return                   # nothing changed: this was a load, not an edit
+        if self.save():
+            self._status(
+                f"Appearance applied live — shape '{wanted['bubble_design']}'. "
+                "No restart needed.")
 
     # ----------------------------------------------------------------- startup
 

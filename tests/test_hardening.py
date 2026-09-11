@@ -312,6 +312,7 @@ class TestMissingAudioFallback:
             "whisper_model": audio._whisper_model,
             "piper_voice": audio._piper_voice,
             "configure_returns_none": audio.configure() is None,
+            "portaudio_busy": audio.portaudio_busy(),
             "aliases": {
                 "resample": callable(mod._resample_to_16k),
                 "mic_lock": hasattr(mod._MIC_OPERATION_LOCK, "acquire"),
@@ -330,6 +331,11 @@ class TestMissingAudioFallback:
             report["Recorder"] = "ImportError"
         else:
             report["Recorder"] = "no-error"
+        # the listener's recovery path calls this from inside an except block, so
+        # it must be a usable no-op rather than an AttributeError
+        with audio.portaudio_in_use():
+            pass
+        report["portaudio_ctx"] = True
         print(json.dumps(report))
         """
     )
@@ -363,6 +369,9 @@ class TestMissingAudioFallback:
         assert report["piper_voice"] is None
         # configure() is called at import time: a partial install must get here
         assert report["configure_returns_none"] is True
+        # nothing is open in a partial install, so the teardown guard is inert
+        assert report["portaudio_busy"] is False
+        assert report["portaudio_ctx"] is True
         assert report["aliases"] == {"resample": True, "mic_lock": True}
         # and the audio entry points must fail loudly, never return junk
         for probe in ("transcribe", "get_whisper", "play_wav", "Recorder"):

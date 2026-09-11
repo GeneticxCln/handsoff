@@ -181,6 +181,39 @@ full provenance/rollback story for the *manifest* itself remains as-is).
    anywhere in the runtime and is not coerced; it is exempted explicitly in the
    new guard rather than silently ignored. Removing it would rewrite users'
    `settings.json`, so it is left in place and recorded here.
+10. **"Changing the bubble shape does nothing" — the real cause was that the
+   Appearance tab never applied live.** The tab's own tooltip promised
+   "applies immediately; the bubble repaints within seconds. No Save needed",
+   but the design combo had **no change handler at all** and the sliders only
+   updated their own number labels. The preview repainted instantly, so it
+   *looked* like the change had been taken; the settings file was untouched
+   until a separate Save click nobody knew to make. The write path itself was
+   fine (driven directly, Save persisted and the bubble's live-reload applied
+   it) — the missing piece was the write.
+   Fix: `SettingsWindow.APPEARANCE_KEYS` (`bubble_design`, `animation_energy`,
+   `bubble_accent`) now debounce a real save 400 ms after any edit — the shape
+   combo, both sliders, the colour buttons, wallpaper matching and colour
+   reset. A plain window load is told apart from an edit by comparing against
+   the file on disk (no "loading" flag to get stuck), so merely opening the
+   window writes nothing. Regression scenario
+   `test_shape_change_applies_without_pressing_save` drives the real window
+   offscreen and asserts the file changes with no Save click; a second scenario
+   asserts that opening and closing the window leaves the file byte-identical.
+11. **The recorded crash was a PortAudio teardown race, not the bubble crashing
+   on its own.** `~/.local/state/handsoff/handsoff.log` records
+   `Fatal Python error: Aborted … Thread-7 (_spea…) sounddevice.py line 915 in
+   __init__` — the hands-free listener's recovery path calls `sd._terminate()`
+   (process-global: it tears down *every* stream) after six failed mic opens,
+   and the recorded abort is that reinit landing mid-playback on the `_speak`
+   thread. `core/audio.py` now exposes `portaudio_in_use()` / `portaudio_busy()`
+   (a counter, entered by `play_wav`), and the listener **defers** the reinit
+   with a warning instead of aborting the interpreter. Pinned by
+   `test_portaudio_reinit_is_guarded_while_streams_are_open` (incl. that the
+   guard is wired into the reinit path) and
+   `test_play_wav_holds_the_portaudio_mark`. The `_MissingAudio` partial-install
+   fallback now carries the same guard as an inert no-op — the recovery path
+   calls it from *inside* an `except` block, where an `AttributeError` would
+   escape.
 
 ## Addendum — 2026-09-09 improvement-program closure (settings schema, self-edit
 ## confirm, voice pinning, VRAM-aware whisper)

@@ -11,6 +11,7 @@ import re
 import subprocess
 import threading
 import wave
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -328,6 +329,35 @@ def tts_to_wav(text: str, wav_path: Path, voice_getter=None) -> None:
             voice.synthesize(text, w)
 
 
+# PortAudio is process-global, so sd._terminate()/_initialize() (the
+# hands-free listener's recovery path for a wedged device) tears down EVERY
+# stream at once. Running that while this process is speaking aborts the whole
+# interpreter -- the recorded crash is "Fatal Python error: Aborted" inside
+# sounddevice's OutputStream.__init__ on the _speak thread, i.e. the reinit
+# landing mid-playback. The listener therefore asks before it reinitializes.
+_portaudio_users = 0
+_portaudio_lock = threading.Lock()
+
+
+@contextmanager
+def portaudio_in_use():
+    """Mark a stretch in which a PortAudio stream must not be torn down."""
+    global _portaudio_users
+    with _portaudio_lock:
+        _portaudio_users += 1
+    try:
+        yield
+    finally:
+        with _portaudio_lock:
+            _portaudio_users -= 1
+
+
+def portaudio_busy() -> bool:
+    """True while a stream this process owns is open (playback or capture)."""
+    with _portaudio_lock:
+        return _portaudio_users > 0
+
+
 def play_wav(path: Path, cancel: threading.Event) -> None:
     """Blocking playback; returns early if cancel is set (barge-in)."""
     with wave.open(str(path), "rb") as w:
@@ -335,23 +365,26 @@ def play_wav(path: Path, cancel: threading.Event) -> None:
         data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
     if ch > 1:
         data = data.reshape(-1, ch)[:, 0]
-    stream = sd.OutputStream(samplerate=sr, channels=1, dtype="int16", blocksize=1024)
-    stream.start()
-    try:
-        for i in range(0, len(data), 4096):
-            if cancel.is_set():
-                break
-            stream.write(data[i: i + 4096].reshape(-1, 1))
-    finally:
+    with portaudio_in_use():
+        stream = sd.OutputStream(samplerate=sr, channels=1, dtype="int16",
+                                 blocksize=1024)
+        stream.start()
         try:
-            stream.stop()
-            stream.close()
-        except Exception:
-            pass
+            for i in range(0, len(data), 4096):
+                if cancel.is_set():
+                    break
+                stream.write(data[i: i + 4096].reshape(-1, 1))
+        finally:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
 
 
 __all__ = [
     "SAMPLE_RATE", "Recorder", "_resample_to_16k", "_open_input",
     "_stop_recorder_bounded", "get_whisper", "get_piper", "transcribe",
     "tts_to_wav", "play_wav", "configure",
+    "portaudio_in_use", "portaudio_busy",
 ]
