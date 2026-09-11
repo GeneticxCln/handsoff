@@ -1129,10 +1129,10 @@ STATE_COLORS = {
 # Per-state animation recipe: swirl speed (turns/s), glow boost, hue sweep
 # (deg) and target energy driving halo/specular intensity.
 _BUBBLE_FX = {
-    IDLE: (0.18, 0.10, 25.0, 0.12),
-    LISTENING: (0.55, 0.30, 50.0, 0.55),
-    SPEAKING: (0.50, 0.32, 90.0, 0.60),
-    THINKING: (0.85, 0.40, 140.0, 0.78),
+    IDLE: (0.20, 0.10, 25.0, 0.12),
+    LISTENING: (0.60, 0.30, 50.0, 0.55),
+    SPEAKING: (0.55, 0.32, 90.0, 0.60),
+    THINKING: (0.95, 0.40, 140.0, 0.78),
 }
 WINDOW_PX = SETTINGS["bubble_size"]   # transparent window; bubble is ~69% of it
 BUBBLE_R0 = WINDOW_PX * 44.0 / 128.0  # idle bubble radius
@@ -5778,7 +5778,7 @@ class BubbleWidget(QWidget):
         # orbiting key light: one full 360° trip per orbit period — the lit
         # cap, hotspot, rim arc and bounce all hang off this angle, so the
         # sphere visibly turns under a circling light.
-        orbit_hz = {"idle": 0.10, "listening": 0.25, "thinking": 0.38, "speaking": 0.30}.get(self._state, 0.10)
+        orbit_hz = {"idle": 0.06, "listening": 0.28, "thinking": 0.42, "speaking": 0.33}.get(self._state, 0.06)
         la = 3 * math.pi / 4 + t * 2 * math.pi * orbit_hz
         lx, ly = math.cos(la), -math.sin(la)  # screen pos: y grows downward
 
