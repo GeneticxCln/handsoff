@@ -453,9 +453,8 @@ class TestInstalledCopySmoke:
                 (bin_dir / name).write_bytes(src.read_bytes())
         core_dir = bin_dir / "core"
         core_dir.mkdir(exist_ok=True)
-        for name in ("__init__.py", "settings.py", "audio.py", "brain.py",
-                     "tools.py", "doctor.py", "lifecycle.py", "calendar.py"):
-            (core_dir / name).write_bytes((HERE / "core" / name).read_bytes())
+        for src in sorted((HERE / "core").glob("*.py")):
+            (core_dir / src.name).write_bytes(src.read_bytes())
         (bin_dir / "handsoff-restart").chmod(0o755)
         state = home / "state"
         env = dict(os.environ)

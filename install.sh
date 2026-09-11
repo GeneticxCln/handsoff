@@ -56,7 +56,7 @@ case "${1:-}" in
                  settings_schema.py hardware.py \
                  core/__init__.py core/settings.py core/audio.py \
                  core/brain.py core/tools.py core/doctor.py core/lifecycle.py \
-                 core/calendar.py; do
+                 core/calendar.py core/assistant.py; do
             [ -f "$PREV/$f" ] || continue
             case "$f" in
                 handsoff.py|handsoff-restart|handsoff-settings.py) m=755 ;;
@@ -268,8 +268,9 @@ done
 if [ -f "$HERE/core/__init__.py" ] && [ -f "$HERE/core/settings.py" ] \
         && [ -f "$HERE/core/audio.py" ] && [ -f "$HERE/core/brain.py" ] \
         && [ -f "$HERE/core/tools.py" ] && [ -f "$HERE/core/doctor.py" ] \
-        && [ -f "$HERE/core/lifecycle.py" ] && [ -f "$HERE/core/calendar.py" ]; then
-    for m in __init__ settings audio brain tools doctor lifecycle calendar; do
+        && [ -f "$HERE/core/lifecycle.py" ] && [ -f "$HERE/core/calendar.py" ] \
+        && [ -f "$HERE/core/assistant.py" ]; then
+    for m in __init__ settings audio brain tools doctor lifecycle calendar assistant; do
         install -m 644 "$HERE/core/$m.py" "$STAGE_DIR/core/$m.py" \
             || stage_fail "could not stage core/$m.py"
     done
@@ -305,7 +306,7 @@ fi
 SWITCH_FILES_755="handsoff.py handsoff-restart"
 [ -f "$STAGE_DIR/handsoff-settings.py" ] \
     && SWITCH_FILES_755="$SWITCH_FILES_755 handsoff-settings.py"
-SWITCH_FILES_644="settings_schema.py hardware.py core/__init__.py core/settings.py core/audio.py core/brain.py core/tools.py core/doctor.py core/lifecycle.py core/calendar.py"
+SWITCH_FILES_644="settings_schema.py hardware.py core/__init__.py core/settings.py core/audio.py core/brain.py core/tools.py core/doctor.py core/lifecycle.py core/calendar.py core/assistant.py"
 switch_fail() {
     echo "    FATAL: $1 — restoring the previous release" >&2
     if [ "$HAD_PREV" = "1" ]; then
@@ -438,6 +439,7 @@ $manifest_whisper_sha256
     "core/doctor.py": {"source_sha256": "$(sha_of "$HERE/core/doctor.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/doctor.py")"},
     "core/lifecycle.py": {"source_sha256": "$(sha_of "$HERE/core/lifecycle.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/lifecycle.py")"},
     "core/calendar.py": {"source_sha256": "$(sha_of "$HERE/core/calendar.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/calendar.py")"},
+    "core/assistant.py": {"source_sha256": "$(sha_of "$HERE/core/assistant.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/assistant.py")"},
     "handsoff-restart": {"source_sha256": "$(sha_of "$HERE/handsoff-restart")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"}
   }
 }

@@ -2166,6 +2166,9 @@ class WakeSpotter:
 
 
 
+# Assistant collaborators (pomodoro/notifications/reminders/ticks): small
+# state machines with explicit deps; the Assistant keeps thin delegates.
+from core.assistant import PomodoroController
 # Calendar parsing lives in core.calendar (stdlib-only, no Qt/Assistant).
 # These aliases preserve the historical H.* names used by tests, the
 # briefing, and the ToolBelt host-dependency fallback.
@@ -3115,9 +3118,9 @@ class Assistant(QObject):
         self._notification_proc = None
         self._notification_stop = None
         self._notification_thread = None
-        self._pomodoro_stop = None
-        self._pomodoro_thread = None
-        self._pomodoro_state = None
+        self._pomodoro = PomodoroController(
+            announce=self._announce_now, spawn=self._start_worker,
+            is_closed=self._is_closed)
         self._tools = ToolBelt(
             on_restart_pending=self._prepare_restart,
             permissions=SETTINGS["permissions"],
@@ -3702,47 +3705,10 @@ class Assistant(QObject):
 
     def _set_pomodoro(self, action: str, work: float, break_minutes: float) -> str:
         """Own the bounded Pomodoro worker and announce work/break transitions."""
-        if action == "status":
-            state = self._pomodoro_state
-            if not state:
-                return "pomodoro is off"
-            remaining = max(0, int(state["until"] - time.monotonic()))
-            return (f"pomodoro is in {state['phase']} phase with "
-                    f"{remaining // 60} minutes remaining")
-        if action == "stop":
-            if self._pomodoro_stop is not None:
-                self._pomodoro_stop.set()
-            self._pomodoro_stop = None
-            self._pomodoro_state = None
-            return "pomodoro stopped"
-        if self._is_closed():
-            return "ERROR: assistant is shut down"
-        if self._pomodoro_thread is not None and self._pomodoro_thread.is_alive():
-            return "pomodoro is already running"
-        stop = threading.Event()
-        self._pomodoro_stop = stop
-        self._pomodoro_state = {"phase": "work", "until": time.monotonic() + work * 60,
-                                "work": work, "break": break_minutes}
-        self._pomodoro_thread = self._start_worker(
-            self._pomodoro_loop, args=(stop,), name="pomodoro")
-        self._announce_now(f"Pomodoro started: {work:.0f} minutes of work.")
-        return f"pomodoro started: {work:.0f} minute work and {break_minutes:.0f} minute break"
+        return self._pomodoro.command(action, work, break_minutes)
 
     def _pomodoro_loop(self, stop: threading.Event) -> None:
-        phase = "work"
-        while not stop.is_set():
-            state = self._pomodoro_state
-            if not state:
-                return
-            if stop.wait(max(0.05, state["until"] - time.monotonic())):
-                return
-            phase = "break" if phase == "work" else "work"
-            minutes = state["break"] if phase == "break" else state["work"]
-            self._pomodoro_state = {**state, "phase": phase,
-                                    "until": time.monotonic() + minutes * 60}
-            self._announce_now(
-                f"Pomodoro: {('break' if phase == 'break' else 'back to work')} "
-                f"for {minutes:.0f} minutes.")
+        self._pomodoro._loop(stop)
 
     # -- reminders --------------------------------------------------------------
 
@@ -3870,10 +3836,9 @@ class Assistant(QObject):
         if getattr(self, "_tools", None) is not None:
             self._tools.stop_watchers()
         self._set_notification_reader(False)
-        if self._pomodoro_stop is not None:
-            self._pomodoro_stop.set()
-        self._pomodoro_stop = None
-        self._pomodoro_state = None
+        pom = getattr(self, "_pomodoro", None)
+        if pom is not None:
+            pom.shutdown()
         if self._recorder is not None:
             try:
                 self._recorder.stop()
