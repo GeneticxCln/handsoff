@@ -523,10 +523,20 @@ def _deployment_snapshot() -> dict:
     same_installed_repo = bool(installed_hash and repo_hash and installed_hash == repo_hash)
     repo_dir = repo.parent if repo else None
     bin_dir = installed.parent
+    # What gets compared comes from the installer's manifest, which is written
+    # by glob over the files actually deployed — so a newly added module is
+    # covered the moment it ships. _DEPLOY_FILES is the floor for a
+    # manifest-less install (or a hand-rolled checkout). Maintaining a second
+    # hand-written list here is exactly how core/theme.py reached the
+    # deployment and then went missing from it while doctor still said
+    # `in-sync`.
+    manifest_files = manifest.get("files")
+    tracked = sorted(set(_DEPLOY_FILES) | (
+        set(manifest_files) if isinstance(manifest_files, dict) else set()))
     files: dict = {}
     all_match = True
     partial_source = False  # installed file exists but its source is missing
-    for rel in _DEPLOY_FILES:
+    for rel in tracked:
         src = repo_dir / rel if repo_dir is not None else None
         src_hash = _sha256_file(src) if src is not None else None
         dst_hash = _sha256_file(bin_dir / rel)
@@ -1028,6 +1038,10 @@ def reload_derived_settings() -> None:
     WHISPER_SIZE = SETTINGS.get("whisper_size", WHISPER_SIZE)
     WHISPER_DEVICE = SETTINGS.get("whisper_device", "auto")
     PIPER_VOICE_NAME = SETTINGS.get("piper_voice", PIPER_VOICE_NAME)
+    # Appearance-tab animation knobs (bubble repaints from these every frame)
+    global BUBBLE_ACCENT, ANIM_ENERGY
+    BUBBLE_ACCENT = min(1.0, max(0.0, float(SETTINGS.get("bubble_accent", 0.5))))
+    ANIM_ENERGY = min(2.0, max(0.2, float(SETTINGS.get("animation_energy", 1.0))))
     if "_audio" in globals():
         _audio.configure(
             sample_rate=SAMPLE_RATE,
@@ -1133,7 +1147,24 @@ _BUBBLE_FX = {
     SPEAKING: (0.55, 0.32, 90.0, 0.60),
     THINKING: (0.95, 0.40, 140.0, 0.78),
 }
+
+
+def _fx_energy(state: str) -> float:
+    """Target glow energy for a state, scaled by the animation-energy setting.
+
+    1.0 (the default) reproduces the historical curve exactly; the slider
+    lifts or calms halo/specular intensity for every design at once.
+    """
+    base = _BUBBLE_FX.get(state, _BUBBLE_FX[IDLE])[3]
+    return min(1.0, max(0.0, base * (0.4 + 0.6 * ANIM_ENERGY)))
+
+
 WINDOW_PX = SETTINGS["bubble_size"]   # transparent window; bubble is ~69% of it
+# Appearance-tab live knobs: accent punch (0..1) and global animation energy
+# (0.2..2.0).  Defaults are the neutral values, so an old settings.json that
+# predates these keys keeps rendering exactly as before.
+BUBBLE_ACCENT = float(SETTINGS.get("bubble_accent", 0.5))
+ANIM_ENERGY = float(SETTINGS.get("animation_energy", 1.0))
 BUBBLE_R0 = WINDOW_PX * 44.0 / 128.0  # idle bubble radius
 GLOW_PAD = WINDOW_PX * 7.0 / 128.0    # glow ring thickness; fits inside the mask
 GEOM_K = WINDOW_PX / 128.0            # scale for all radius offsets
@@ -1177,7 +1208,10 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
 
         class Recorder:
             def __init__(self, *_args, **_kwargs):
-                self._missing()
+                # a nested class does NOT inherit the outer one's attributes, so
+                # self._missing would be an AttributeError: name it explicitly so
+                # a partial install fails with the honest ImportError instead
+                _MissingAudio._missing()
 
     _audio = _MissingAudio()
 
@@ -1996,44 +2030,34 @@ MAX_REMINDERS = 64
 MAX_REMIND_DAYS = 365
 
 
+def _reminder_store() -> ReminderStore:
+    """Bind the store to the CURRENT module globals before every use.
+
+    A store that captured its path at import time would keep writing the real
+    reminders.json after a test (or any caller) rebinds REMINDERS_FILE — the
+    exact accident this indirection exists to prevent.
+    """
+    _REMINDER_STORE.path = REMINDERS_FILE
+    _REMINDER_STORE.lock = REMINDERS_LOCK
+    return _REMINDER_STORE
+
+
 def _load_reminders() -> list[dict]:
     """Read reminders.json, dropping entries that are malformed."""
-    try:
-        data = json.loads(REMINDERS_FILE.read_text())
-        if not isinstance(data, list):
-            return []
-        out = []
-        for r in data:
-            if not isinstance(r, dict) or not isinstance(r.get("name"), str) \
-                    or not isinstance(r.get("due"), (int, float)):
-                continue
-            try:
-                r["repeat_hours"] = float(r.get("repeat_hours") or 0)
-            except (TypeError, ValueError):
-                r["repeat_hours"] = 0.0
-            out.append(r)
-        return out
-    except (OSError, ValueError):
-        return []
+    return _reminder_store().load()
 
 
 def _save_reminders(items: list[dict]) -> None:
     """Caller MUST hold REMINDERS_LOCK + the reminders.json sidecar flock:
     two concurrent writers would corrupt each other's read-modify-write."""
-    _backup_runtime_json(REMINDERS_FILE)
-    _atomic_private_write(REMINDERS_FILE, json.dumps(items, indent=1))
+    _reminder_store().save(items)
 
 
 def _update_reminders(mutate) -> list[dict]:
     """One serialized read-modify-write transaction: load → mutate → save,
     under REMINDERS_LOCK (threads) plus the reminders.json sidecar flock
     via _settings_file_lock (processes). Every mutation goes through this."""
-    with REMINDERS_LOCK, _core_settings._settings_file_lock()(
-            REMINDERS_FILE.parent, "reminders.json.lock"):
-        items = _load_reminders()
-        items = mutate(items) or items
-        _save_reminders(items)
-        return items
+    return _reminder_store().update(mutate)
 
 
 def _fmt_due_in(due_epoch: float, now: float | None = None) -> str:
@@ -2168,9 +2192,25 @@ class WakeSpotter:
 
 # Assistant collaborators (pomodoro/notifications/reminders/ticks): small
 # state machines with explicit deps; the Assistant keeps thin delegates.
-from core.assistant import NotificationReader, PomodoroController
+from core.assistant import NotificationReader, PomodoroController, ReminderStore
 from core.assistant import dbus_strings as _core_dbus_strings
 from core.assistant import notification_muted as _core_notification_muted
+from core.assistant import split_due_reminders as _split_due_reminders
+
+# The reminder queue's storage logic (parsing, serialized transactions,
+# startup catch-up, due-split arithmetic) lives in core.assistant.ReminderStore;
+# this instance binds it to the app's real paths, locks and writers, and the
+# thin aliases below keep the historical H.* names the ToolBelt's `_dep()`
+# contract and the tests use.
+_REMINDER_STORE = ReminderStore(
+    REMINDERS_FILE,
+    lock=REMINDERS_LOCK,
+    file_lock=_core_settings._settings_file_lock(),
+    backup=_backup_runtime_json,
+    write=_atomic_private_write,
+    logger=log,
+    clock=time.time,
+)
 # Calendar parsing lives in core.calendar (stdlib-only, no Qt/Assistant).
 # These aliases preserve the historical H.* names used by tests, the
 # briefing, and the ToolBelt host-dependency fallback.
@@ -2323,35 +2363,14 @@ def _fmt_dur(seconds: float) -> str:
 
 
 def _due_reminders(items: list[dict], now: float) -> tuple[list[dict], list[dict]]:
-    """Split into (fired, kept). Repeats advance in whole repeat-steps so a
-    sleep/restart never loses one, and never machine-guns a backlog."""
-    fired, kept = [], []
-    for r in items:
-        if r["due"] > now:
-            kept.append(r)
-            continue
-        fired.append(r)
-        step = float(r.get("repeat_hours") or 0) * 3600
-        if step > 0:
-            ahead = r["due"] + max(1, int((now - r["due"]) // step) + 1) * step
-            kept.append({**r, "due": ahead})
-    return fired, kept
+    """Split into (fired, kept); the arithmetic lives in core.assistant so the
+    store, the worker tick and the tests share one implementation."""
+    return _split_due_reminders(items, now)
 
 
 def _take_missed_reminders() -> list[dict]:
     """Pop reminders that came due while we were off (startup call)."""
-    with REMINDERS_LOCK, _core_settings._settings_file_lock()(
-            REMINDERS_FILE.parent, "reminders.json.lock"):
-        items = _load_reminders()
-        if not items:
-            return []
-        fired, kept = _due_reminders(items, time.time())
-        if fired:
-            try:
-                _save_reminders(kept)
-            except OSError:
-                log.exception("could not prune fired reminders")
-    return fired
+    return _reminder_store().take_missed()
 
 
 # -- snooze: while this offer is live, a bare "snooze" re-arms the just-fired
@@ -3572,18 +3591,10 @@ class Assistant(QObject):
     def _reminder_worker(self) -> None:
         while not self._shutdown_event.wait(2.0):
             try:
-                # non-reentrant flock sidecars: never nest two
-                # _settings_file_lock() guards on the same lock file in one
-                # thread (the second LOCK_EX would block forever) — the
-                # in-process REMINDERS_LOCK serializes us here instead.
-                with REMINDERS_LOCK, _core_settings._settings_file_lock()(
-                        REMINDERS_FILE.parent, "reminders.json.lock"):
-                    items = _load_reminders()
-                    fired, kept = [], items
-                    if items:
-                        fired, kept = _due_reminders(items, time.time())
-                    if fired and kept != items:
-                        _save_reminders(kept)
+                # drain_due() owns the whole read-modify-write (never nest two
+                # flock sidecars: the non-reentrant LOCK_EX would block forever;
+                # the store's in-process lock serializes threads instead)
+                fired = _reminder_store().drain_due()
                 if not fired:
                     continue
                 for r in fired:
@@ -5240,7 +5251,7 @@ class BubbleWidget(QWidget):
         self._color_ui = [_c0.redF(), _c0.greenF(), _c0.blueF()]
         self._radius_ui = None
         self._radius_vel = 0.0
-        self._energy_ui = _BUBBLE_FX[IDLE][3]
+        self._energy_ui = _fx_energy(IDLE)
 
         self.setWindowFlags(
             Qt.Window
@@ -5298,7 +5309,7 @@ class BubbleWidget(QWidget):
         cu[2] += (tgt.blueF() - cu[2]) * kc
         # animation energy follows the state (halo/specular intensity)
         ke = 1.0 - math.exp(-dt * 4.0)
-        self._energy_ui += (_BUBBLE_FX.get(self._state, _BUBBLE_FX[IDLE])[3] - self._energy_ui) * ke
+        self._energy_ui += (_fx_energy(self._state) - self._energy_ui) * ke
         # radius spring: critically-damped-ish chase, settles without overshoot
         want = self._radius_target(now)
         if self._radius_ui is None:
@@ -5348,32 +5359,46 @@ class BubbleWidget(QWidget):
         p.end()
 
     def _frame(self) -> dict:
-        """Shared per-frame animation state for every bubble design."""
+        """Shared per-frame animation state for every bubble design.
+
+        `animation_energy` scales every motion term (orbit trip, swirl speed,
+        hue sweep) and `bubble_accent` scales how hard the state colour punches
+        through (saturation and glow alpha), so both Appearance sliders move
+        all ten designs at once instead of needing ten hand-tuned variants.
+        """
         cx, cy = self.width() / 2, self.height() / 2
         t = self._clock.elapsed() / 1000.0
         color = QColor.fromRgbF(*self._color_ui)
         swirl_speed, swirl_boost, hue_speed, _fx_e = _BUBBLE_FX.get(self._state, _BUBBLE_FX[IDLE])
+        k_anim, accent = ANIM_ENERGY, BUBBLE_ACCENT
         radius = self._radius_ui if self._radius_ui is not None else self._radius_target(t)
         energy = min(1.0, max(0.0, self._energy_ui))
         # orbiting key light: one full 360° trip per orbit period
         orbit_hz = {"idle": 0.06, "listening": 0.28, "thinking": 0.42, "speaking": 0.33}.get(self._state, 0.06)
-        la = 3 * math.pi / 4 + t * 2 * math.pi * orbit_hz
+        la = 3 * math.pi / 4 + t * 2 * math.pi * orbit_hz * k_anim
         lx, ly = math.cos(la), -math.sin(la)  # screen pos: y grows downward
         return {
             "cx": cx, "cy": cy, "t": t, "color": color, "radius": radius,
             "energy": energy, "level": self._level_ui, "la": la, "lx": lx, "ly": ly,
             "inner": radius * (1.0 - 0.34 - 0.10 * swirl_boost),
             "base_hue": max(0.0, QColor.fromRgbF(*self._color_ui).hueF()),
-            "sat": min(1.0, color.hslSaturationF() * 1.15),
-            "swirl_speed": swirl_speed, "swirl_boost": swirl_boost, "hue_speed": hue_speed,
+            "sat": min(1.0, color.hslSaturationF() * (1.0 + 0.35 * accent)),
+            "swirl_speed": swirl_speed * k_anim, "swirl_boost": swirl_boost,
+            "hue_speed": hue_speed * k_anim, "accent": accent, "anim": k_anim,
         }
 
     def _conic(self, f: dict, angle_deg: float, alpha: int, comet: bool = False) -> QConicalGradient:
         g = QConicalGradient(f["cx"], f["cy"], angle_deg)
+        # bubble_accent drives the glow's punch; 0.5 is neutral, so the slider
+        # only ever moves the look away from the historical baseline.
+        alpha = int(max(0, min(255, alpha * (0.55 + 0.9 * float(f.get("accent", 0.5))))))
         if comet:
-            # asymmetric comet head + fading tail: rotation is unmistakable
-            stops = ((0.00, 0.78, 1.00), (0.12, 0.66, 0.90), (0.30, 0.58, 0.60),
-                     (0.55, 0.52, 0.36), (0.80, 0.50, 0.28), (1.00, 0.78, 1.00))
+            # asymmetric comet head + fading tail: rotation is unmistakable.
+            # animation energy brightens head and tail, not just their speed.
+            lift = 1.0 + 0.10 * (float(f.get("anim", 1.0)) - 1.0)
+            stops = tuple((pos, min(1.0, light * lift), a) for pos, light, a in (
+                (0.00, 0.78, 1.00), (0.12, 0.66, 0.90), (0.30, 0.58, 0.60),
+                (0.55, 0.52, 0.36), (0.80, 0.50, 0.28), (1.00, 0.78, 1.00)))
         else:
             stops = tuple((i / 5.0, 0.60 + 0.10 * f["swirl_boost"], alpha / 255.0) for i in range(6))
         first = None

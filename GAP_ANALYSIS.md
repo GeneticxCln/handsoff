@@ -56,14 +56,131 @@ green (2026-09-10)**, `py_compile` clean, `bash -n` clean, coverage 71%
    guard. The GH workflow stays the authoritative definition; keep the two
    files in lockstep.
 
-Still open after this pass: the live-host redeploy (the running bubble
-predates this tree, so its doctor correctly reports `installed-drift` until
-`./install.sh` runs again), the six human acceptance items in
+Still open after this pass: the live-host redeploy (done — the appearance
+set is deployed and doctor reports `in-sync`; see addendum item 7), the six
+human acceptance items in
 `ACCEPTANCE.md`, unsupported D-Bus Notify layouts, further settings-GUI
-coverage depth (67% now; the remaining gaps are heavy widget-interaction
+coverage depth (68% now; the remaining gaps are heavy widget-interaction
 flows), and the consciously-accepted Phase-3 leftovers (staged release
 directory *inside* the runtime + remote-transport policy doc are done; the
 full provenance/rollback story for the *manifest* itself remains as-is).
+
+
+## Addendum — 2026-09-11 appearance controls, hygiene, reminders extraction
+
+1. **The bubble got its appearance knobs.** Two new settings — `bubble_accent`
+   (0–1: how hard each shape leans on its state colour, via saturation and
+   glow alpha) and `animation_energy` (0.2–2.0: orbit speed, swirl speed, hue
+   sweep, comet brightness and glow energy) — applied in the one shared frame
+   state every design reads, so one slider moves all ten shapes instead of ten
+   hand-tuned variants. Both defaults are the historical values exactly, so an
+   older settings.json renders as before. They live-apply through the existing
+   settings watcher (no restart), and the Appearance preview paints from the
+   same two functions.
+2. **One-click wallpaper matching** (`core/theme.py`, stdlib + ImageMagick only,
+   no new Python dependency): the wallpaper path is found on a wallpaper line
+   of the niri config, sampled to a mean colour via `magick`, and the four
+   state colours are retuned for a dark (brighten + saturate) or light (deepen
+   + saturate) backdrop. Detection degrades to `None` and the GUI says so; the
+   explicit **Dark tuning** / **Light tuning** buttons always work.
+3. **Hygiene pass.** `attic/` is out of both workflows' `py_compile` sets (it
+   is a provenance archive, and its README now says so); 1.7 MB of untracked,
+   gitignored `ruvector.db`/`.swarm` debris removed; and the untested
+   `_MissingAudio` fallback is now driven for real in a child process with
+   `core.audio` made unimportable — which immediately found a bug: the nested
+   `Recorder` called `self._missing()`, which a nested class cannot inherit, so
+   a partial install raised `AttributeError` instead of the intended
+   `ImportError`. Fixed.
+4. **Reminders extracted — the god-object split continues.** The queue's
+   storage logic (parse/prune, serialized read-modify-write transactions,
+   startup catch-up, and the pure due-split arithmetic) moved from `handsoff.py`
+   into `core.assistant.ReminderStore` + `split_due_reminders`, with the app's
+   paths, locks and writers injected; `handsoff.py` keeps thin `H.*` aliases so
+   the ToolBelt `_dep()` contract and the existing tests keep working. The
+   store is rebound to the *current* globals on every call, because a store that
+   captures its path at construction silently writes the real `reminders.json`
+   after a test redirects the module global — which is exactly what happened
+   during this pass (the queue was overwritten with test entries and several
+   were spoken aloud). The file was restored to its one evidenced genuine entry,
+   the overwritten content was preserved at
+   `reminders.json.testjunk-20260911`, and two regression pins now fail if the
+   late binding is ever removed.
+5. **Coverage back above the floor.** An offscreen scenario now renders all ten
+   designs across the four state colours at both energy and accent extremes,
+   which took the paint paths out of the dark: TOTAL 68.35% → 75%,
+   `handsoff.py` 59% → 71%, `core/theme.py` 100%, 737 tests, floor 70 holds.
+6. **CI failures now explain themselves.** Every suite job in `.gitlab-ci.yml`
+   writes a junit report — GitLab's native *Test-summary* tab and merge-request
+   test widget — uploads it `when: always`, and runs `ci/pytest_summary.py` in
+   `after_script`: a digest of failing test names with their messages, in a
+   log section that opens itself on failure and folds away when green. It also
+   recognises this project's recurring Debian-slim signatures (missing
+   `libasound.so.2`, `libgomp`, offscreen-Qt libraries, failed pip installs)
+   and names the exact CI layer to extend, so the ALSA-style failure that
+   broke the first pipeline is now self-diagnosing. With a masked
+   `GITLAB_SUMMARY_TOKEN` it posts the same digest as a merge-request note,
+   where Markdown renders — a job token cannot create notes (GitLab #464591),
+   so absence of the variable is detected and skipped, never an error. The
+   digest is pinned by `tests/test_ci_summary.py` (24 tests; the module
+   measures 94% and is the only non-shipped code kept inside the coverage
+   measurement — excluding tested code is how regressions hide).
+7. **The first deploy of the appearance work exposed a packaging defect.**
+   `core/theme.py` was added to the checkout and reached *nothing*:
+   `install.sh` staged, switched, rolled back and hashed core modules from
+   four hand-written lists, and `handsoff.py:_DEPLOY_FILES` kept a fifth
+   (8 of what are now 15 deployed files). The settings GUI silently fell back
+   to "no wallpaper matching", and `--ptt doctor` reported **`in-sync`** the
+   whole time — the manifest only hashes files someone remembered to name.
+   Both sides are now generated: the installer globs `core/*.py` for staging,
+   the switch list, rollback and the manifest (with `CORE_REQUIRED` kept as an
+   explicit floor that fails the stage if a hard-imported module disappears),
+   and `_deployment_snapshot()` compares `_DEPLOY_FILES` ∪ the manifest's file
+   set. A rehearsal now fails loudly if any checkout module is left behind.
+   Regression tests pin both, driven from the checkout rather than a list:
+   `test_rehearsal_deploys_every_core_module` asserts the deployed set and the
+   hashed set each equal `core/*.py`, `test_installer_ships_every_core_module`
+   pins the glob design (and rejects a literal `core/...` manifest entry), and
+   `test_manifest_drives_the_compared_set` proves a module that exists in the
+   checkout but not in the deployment is now reported as `installed-drift`.
+   Deployed and verified: 15 manifest rows, `core/theme.py` present with
+   matching hashes, `in-sync`, 737 tests, coverage 74.68% ≥ 70.
+8. **Audit: every remaining hand-maintained list, and what was done with it.**
+   The `core/theme.py` defect was one instance of a pattern, so install.sh and
+   the runtime were swept for the rest.
+
+   *Fixed:* (a) the shipped **top-level** module set was written out in seven
+   separate steps (rollback, uninstall, staging, the compile gate, the prev
+   save, the switch, the manifest); it is now defined once — `TOP_REQUIRED`
+   (the hard-import floor) plus `is_exec()` — and everything else globs
+   `*.py`, so a module beside `handsoff.py` cannot be forgotten. (b) The
+   **uninstall** list is read back from the deployment manifest, so it removes
+   exactly what was deployed (and a hand-edited manifest cannot escape the
+   tree); the fallback is the required floor. Both paths deliberately avoid
+   globbing `~/.local/bin`, a shared user directory — a regression test plants
+   an unrelated `user_own_script.py` and requires it to survive. (c) The
+   **rehearsal** floor now derives from the same definition, and it fails
+   loudly if any checkout module is missing from the deployed set. (d) Both
+   workflows' compile gates now call **`ci/compile_all.py`**, which discovers
+   sources instead of enumerating them — the old pair of lists had to be kept
+   in sync by hand and skipped any newly added file.
+
+   *Guarded, because they were silently unenforced:* every `DEFAULT_SETTINGS`
+   key must be referenced by `coerce_settings` (one dead key, `autostart`, is
+   exempt) and must reach the settings app or be listed as intentionally
+   runtime-only (five: `tool_call_times`, `whisper_device`, `confirm_seconds`,
+   `streaming_tts`, `world_cooldown_min`). Adding a setting otherwise ships an
+   unvalidated value, or a setting with no control, with nothing failing.
+
+   *Checked and left alone:* the patient/`PTT_ACTIONS` command set has no second
+   copy (the GUI sends the same strings and a mismatch is loud, not silent);
+   `core/doctor.py`'s `__slots__` dep list is single-file with documented
+   safe defaults; and the content lists (day names, terminal markers, blocked
+   commands, `VOICE_CATALOG`, `hardware.SECTIONS`) are domain data rather than
+   packaging, where drift means a feature gap, not a missing file.
+9. **One dead setting found.** `autostart` (`settings_schema.py`) is not read
+   anywhere in the runtime and is not coerced; it is exempted explicitly in the
+   new guard rather than silently ignored. Removing it would rewrite users'
+   `settings.json`, so it is left in place and recorded here.
 
 ## Addendum — 2026-09-09 improvement-program closure (settings schema, self-edit
 ## confirm, voice pinning, VRAM-aware whisper)

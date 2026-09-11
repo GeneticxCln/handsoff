@@ -9,6 +9,9 @@ parallel = True
 omit =
     tests/*
     attic/*
+    # ci/pytest_summary.py is CI tooling but it *is* measured (94%, driven by
+    # tests/test_ci_summary.py) — excluded code that is tested is how
+    # regressions hide, so only the two archives above are omitted.
     */site-packages/*
     # PySide6's vendored shibokensupport/signature_bootstrap register paths
     # inside the project dir during Qt imports (the source lives in
@@ -18,10 +21,11 @@ omit =
     */signature_bootstrap.py
 
 [report]
-# Floor tracks measured reality, not aspiration: handsoff.py 67%, hardware.py
-# 84%, core/* 64-100%, and the Qt settings GUI (handsoff-settings.py) went from
-# ~19% to 67% once tests/test_settings_gui.py began driving it in offscreen
-# subprocesses (TOTAL 71%). Raise further only with new tests, not
-# omit-patterns.
+# Floor tracks measured reality, not aspiration: handsoff.py 71% (the offscreen
+# bubble-render scenario took the ten designs out of the dark), hardware.py ~84%,
+# core/assistant.py ~84%, core/theme.py 100%, ci/pytest_summary.py 94%, and the Qt
+# settings GUI (handsoff-settings.py) ~68% since tests/test_settings_gui.py began
+# driving it in offscreen subprocesses — TOTAL 75%. Raise further only with new
+# tests, not omit-patterns.
 fail_under = 70
 show_missing = True

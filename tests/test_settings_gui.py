@@ -188,6 +188,153 @@ def save_refuses_without_model():
 
 
 @scenario
+def design_change_applies_on_sparse_settings():
+    # Regression: a settings.json that predates bubble_design (the key is
+    # simply absent on disk) must accept a newly picked shape, and the saved
+    # value must land on disk so the bubble repaints it.
+    seed({"model": "testmodel:latest", "bubble_size": 97})
+    win.reload_from_disk()
+    idx = win.design_combo.findData("saturn")
+    assert idx >= 0
+    win.design_combo.setCurrentIndex(idx)
+    assert win.save() is True
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["bubble_design"] == "saturn"
+    assert "Applied live" in win.status_label.text() or \
+        "Bubble unreachable" in win.status_label.text()
+
+
+@scenario
+def disk_change_does_not_reset_unsaved_edits():
+    # Regression: the bubble writes settings.json on its own (notification
+    # auto-mute, handsfree toggle). The 2s disk poll must not reset widgets
+    # the user has touched since the last save — that silently reverted
+    # Appearance picks (the "bubble shape does not apply" bug).
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt as _Qt
+    seed({"model": "testmodel:latest", "bubble_size": 97})
+    win.reload_from_disk()
+    idx = win.design_combo.findData("saturn")
+    win.design_combo.setCurrentIndex(idx)
+    # a real interaction marks the form dirty through the app-wide filter
+    win.show()
+    app.processEvents()
+    QTest.mouseClick(win, _Qt.MouseButton.LeftButton)
+    app.processEvents()
+    assert win._user_edited is True
+    # meanwhile the bubble persists something unrelated to disk
+    seed({"model": "testmodel:latest", "bubble_size": 96})
+    win._check_disk_changes()
+    # the user's pick survives and the status bar explains the hold
+    assert win.design_combo.currentData() == "saturn"
+    assert "keeping your edits" in win.status_label.text()
+    # an explicit reload still brings disk state back
+    win.reload_from_disk()
+    assert win.design_combo.currentData() == "orb"
+    assert win._user_edited is False
+
+
+@scenario
+def appearance_energy_and_accent_roundtrip():
+    # the two new Appearance knobs must survive save/load like every other key,
+    # and the live preview must paint from whatever the sliders report
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    win.energy_slider.setValue(160)
+    win.accent_slider.setValue(80)
+    assert win.energy_label.text() == "1.6×"
+    assert win.accent_label.text() == "80%"
+    assert win.save() is True
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["animation_energy"] == 1.6
+    assert on_disk["bubble_accent"] == 0.8
+    win.reload_from_disk()
+    assert win.energy_slider.value() == 160
+    assert win.accent_slider.value() == 80
+    win.preview.resize(420, 160)
+    assert not win.preview.grab().isNull()
+
+
+@scenario
+def wallpaper_tuning_buttons_retune_palette():
+    # offline: detection fails cleanly and must not touch the palette, while the
+    # explicit Dark/Light buttons still retune it without a wallpaper or magick
+    import types
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    before = dict(win._colors)
+    win._match_wallpaper()
+    assert "could not detect the wallpaper" in win.status_label.text()
+    assert win._colors == before
+    win._apply_wallpaper_tuning(0.05)
+    assert win._colors != before
+    dark = dict(win._colors)
+    assert "dark backdrop" in win.status_label.text()
+    win._apply_wallpaper_tuning(0.95)
+    assert win._colors != dark
+    assert "light backdrop" in win.status_label.text()
+    # detected path: a stub detector must actually drive the tuning
+    real = settings_app._THEME
+    settings_app._THEME = types.SimpleNamespace(
+        tune_colors_for_background=real.tune_colors_for_background,
+        detect_wallpaper_luminance=lambda *_a, **_k: 0.02)
+    try:
+        win._colors = dict(before)
+        win._match_wallpaper()
+        assert win._colors != before
+        assert "dark backdrop" in win.status_label.text()
+    finally:
+        settings_app._THEME = real
+    # and the retuned palette persists through save
+    assert win.save() is True
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["colors"] == win._colors
+
+
+@scenario
+def bubble_designs_render_at_energy_extremes():
+    # all ten designs share one frame state, so render every design in every
+    # state colour at both animation-energy and accent extremes: a broken paint
+    # branch or a bad clamp fails here instead of on the desktop
+    class _Signal:
+        def connect(self, *_a, **_k):
+            return None
+
+    class _Stub:
+        # the widget only wires two signals and stores itself back on the
+        # assistant, so a bare stub is enough to exercise every paint branch
+        sigState = _Signal()
+        sigLevel = _Signal()
+
+    widget = bubble.BubbleWidget(_Stub())
+    widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    designs = list(getattr(settings_app.SCHEMA, "BUBBLE_DESIGNS", ("orb",)))
+    states = ("idle", "listening", "thinking", "speaking")
+    painted = 0
+    for design in designs:
+        bubble.SETTINGS["bubble_design"] = design
+        for state in states:
+            widget._state = state
+            base = bubble.STATE_COLORS[state]
+            widget._color_ui = [base.redF(), base.greenF(), base.blueF()]
+            for energy in (0.2, 1.0, 2.0):
+                bubble.ANIM_ENERGY = energy
+                for accent in (0.0, 1.0):
+                    bubble.BUBBLE_ACCENT = accent
+                    assert not widget.grab().isNull()
+                    painted += 1
+    assert painted == len(designs) * len(states) * 3 * 2
+    # the neutral defaults must reproduce the historical framing exactly
+    bubble.ANIM_ENERGY = 1.0
+    bubble.BUBBLE_ACCENT = 0.5
+    widget._state = "idle"
+    frame = widget._frame()
+    assert frame["anim"] == 1.0
+    assert frame["accent"] == 0.5
+    assert abs(frame["energy"] - bubble._fx_energy("idle")) < 1e-9
+
+
+@scenario
 def external_change_reloads_and_reports():
     seed({"model": "third:latest"})
     win._check_disk_changes()
@@ -567,6 +714,11 @@ def _run_scenario(name: str, tmp_path: Path) -> subprocess.CompletedProcess:
 SCENARIO_NAMES = [
     "save_roundtrip",
     "save_refuses_without_model",
+    "design_change_applies_on_sparse_settings",
+    "disk_change_does_not_reset_unsaved_edits",
+    "appearance_energy_and_accent_roundtrip",
+    "wallpaper_tuning_buttons_retune_palette",
+    "bubble_designs_render_at_energy_extremes",
     "external_change_reloads_and_reports",
     "missing_settings_file_mtime_is_zero",
     "conversation_pane_renders_roles_and_tool_calls",

@@ -6,14 +6,18 @@ from __future__ import annotations
 
 import fcntl
 import importlib.util
+import json
 import os
 import socket
+import subprocess
+import sys
+import textwrap
 import threading
 from pathlib import Path
 
 import pytest
 
-from conftest import HERE as ROOT
+from conftest import HERE as ROOT, _user_site
 
 HERE = ROOT   # the repo root
 
@@ -273,3 +277,93 @@ class TestRuntimePrepareStartupIntegration:
             break
         assert (H.LOCK_FILE.stat().st_mode & 0o777) == 0o600
         fh.close()
+
+
+class TestMissingAudioFallback:
+    """`handsoff.py` guards `from core import audio` with an inline fallback so a
+    pre-Phase-4a bundle (no core/audio.py) still boots. Nothing pinned it: this
+    imports the real module in a child process with core.audio made
+    unimportable, under a throwaway HOME so no real config or log is touched.
+    """
+
+    DRIVER = textwrap.dedent(
+        """
+        import builtins, importlib.util, json, os, sys
+        real_import = builtins.__import__
+
+        def _blocked(name, globals=None, locals=None, fromlist=(), level=0):
+            # exactly the import the compatibility branch wraps; nothing else in
+            # core/ imports core.audio, so this is the real partial-install case
+            if name == "core" and fromlist and "audio" in fromlist:
+                raise ImportError("simulated partial install: no core/audio.py")
+            return real_import(name, globals, locals, fromlist, level)
+
+        builtins.__import__ = _blocked
+        spec = importlib.util.spec_from_file_location(
+            "handsoff_no_audio", os.path.join(sys.argv[1], "handsoff.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        audio = mod._audio
+        report = {
+            "class": type(audio).__name__,
+            "device_choice": list(audio._whisper_device_choice()),
+            "cuda_error": bool(audio._is_cuda_error("cuda")),
+            "free_vram": audio._nvidia_free_vram_mb(),
+            "whisper_model": audio._whisper_model,
+            "piper_voice": audio._piper_voice,
+            "configure_returns_none": audio.configure() is None,
+            "aliases": {
+                "resample": callable(mod._resample_to_16k),
+                "mic_lock": hasattr(mod._MIC_OPERATION_LOCK, "acquire"),
+            },
+        }
+        for probe in ("transcribe", "get_whisper", "play_wav"):
+            try:
+                getattr(audio, probe)()
+            except ImportError:
+                report[probe] = "ImportError"
+            else:
+                report[probe] = "no-error"
+        try:
+            audio.Recorder()
+        except ImportError:
+            report["Recorder"] = "ImportError"
+        else:
+            report["Recorder"] = "no-error"
+        print(json.dumps(report))
+        """
+    )
+
+    def test_partial_install_imports_and_fails_loudly(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        env = dict(os.environ)
+        # a redirected HOME hides user site-packages (sounddevice + PySide6 live
+        # there), so keep the real one on PYTHONPATH: this test is about the
+        # missing core/audio.py, not about missing dependencies
+        env.update({
+            "HOME": str(home),
+            "XDG_STATE_HOME": str(home / ".local" / "state"),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "PYTHONPATH": os.pathsep.join(
+                p for p in (str(HERE), _user_site(), env.get("PYTHONPATH", "")) if p),
+        })
+        proc = subprocess.run(
+            [sys.executable, "-c", self.DRIVER, str(HERE)],
+            env=env, capture_output=True, text=True, timeout=180, cwd=str(HERE),
+        )
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert report["class"] == "_MissingAudio"
+        # the defensive stubs other code reads must keep their documented values
+        assert report["device_choice"] == ["cpu", "int8"]
+        assert report["cuda_error"] is False
+        assert report["free_vram"] is None
+        assert report["whisper_model"] is None
+        assert report["piper_voice"] is None
+        # configure() is called at import time: a partial install must get here
+        assert report["configure_returns_none"] is True
+        assert report["aliases"] == {"resample": True, "mic_lock": True}
+        # and the audio entry points must fail loudly, never return junk
+        for probe in ("transcribe", "get_whisper", "play_wav", "Recorder"):
+            assert report[probe] == "ImportError", probe

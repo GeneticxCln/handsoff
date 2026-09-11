@@ -175,6 +175,25 @@ class TestSettingsCoercion:
         s = H._load_settings()
         assert s["bubble_size"] == 192 and s["tts_rate"] == 2.0
 
+    def test_every_schema_key_is_touched_by_coercion(self, H):
+        """A schema key that coercion never mentions is a silent hole.
+
+        coerce_settings validates key by key, hand-written, so adding a
+        DEFAULT_SETTINGS entry and forgetting to validate it ships a setting
+        that reaches the bubble raw — a string where a bool is expected, an
+        out-of-range number leaking through. Nothing fails when that happens,
+        which is why this guard exists.
+        """
+        body = inspect.getsource(H.coerce_settings)
+        # Deliberately passed through: written by the installer, read by
+        # nothing in the runtime (a dead schema entry, noted in GAP_ANALYSIS).
+        free_form = {"autostart"}
+        missing = sorted(k for k in H.DEFAULT_SETTINGS
+                         if f'"{k}"' not in body and k not in free_form)
+        assert missing == [], (
+            f"these settings are never coerced: {missing} — validate them in "
+            "coerce_settings, or add them to free_form with a reason")
+
     def test_bubble_design_accepted_and_garbage_falls_back(self, H, tmp_path, monkeypatch):
         """Every shipped design loads; garbage coerces to orb (never a crash)."""
         for name in ("orb", "halo", "reactor", "bloom", "droplet", "cube",
@@ -251,11 +270,65 @@ class TestSettingsCoercion:
 # ------------------------------------------------- monolith split: step (a)
 
 
+class TestSchemaWiring:
+    """Adding a setting takes three edits, and two of them are now guarded.
+
+    A new DEFAULT_SETTINGS key must reach (1) coerce_settings — guarded in
+    TestSettingsCoercion — (2) a control in the settings app, and (3) whatever
+    consumes it. Forgetting (2) fails nothing and shows nothing: the setting
+    just cannot be edited, and nobody notices. This makes that a decision.
+    """
+
+    # Consumed by the bubble, deliberately without a settings-app control.
+    NO_GUI_CONTROL = {
+        "tool_call_times",     # bookkeeping the bubble writes at runtime
+        "whisper_device",      # read as WHISPER_DEVICE; defaults to auto-detect
+        "confirm_seconds",     # default for the per-tool confirmation policy
+        "streaming_tts",       # read by the speech path only
+        "world_cooldown_min",  # read by the world-warning ticker
+    }
+
+    def test_every_schema_key_reaches_the_settings_app(self, H):
+        source = (HERE / "handsoff-settings.py").read_text()
+        missing = sorted(k for k in H.DEFAULT_SETTINGS
+                         if f'"{k}"' not in source
+                         and k not in self.NO_GUI_CONTROL)
+        assert missing == [], (
+            f"these settings have no settings-app wiring: {missing} — add a "
+            "control, or list them in NO_GUI_CONTROL with a reason")
+
+
 class TestSettingsSplit:
     """Split step (a): the settings machinery lives in core/settings.py behind
     an explicit Settings object; handsoff.py re-exports it under the old
     names. These pins are the refactor's safety net — the H.* contract and
     the path-redirect pattern must not regress while the code moves."""
+
+    def test_three_way_merge_sparse_disk_key_not_leaked(self, H):
+        """Regression (bubble design not applying): a key present in the
+        GUI's coerced snapshot but absent from the sparse on-disk file must
+        not come back from the merge as a deepcopy'd _MISSING sentinel —
+        deepcopy breaks the `is not _MISSING` filter and json.dumps then
+        raises TypeError, aborting the whole save after the backup step."""
+        m = H._core_settings._three_way_merge
+        expected = {"model": "m", "bubble_design": "orb", "bubble_size": 128}
+        current = {"model": "m", "bubble_size": 97}   # sparse disk file
+        candidate = {"model": "m", "bubble_design": "orb", "bubble_size": 97}
+        merged, conflict = m(expected, current, candidate, "")
+        assert conflict is None
+        assert "bubble_design" not in merged
+        json.dumps(merged)   # must stay JSON-serializable
+
+    def test_three_way_merge_unchanged_candidate_preserves_disk_extras(self, H):
+        """When the GUI changed nothing (candidate == expected), the merge
+        returns the disk dict verbatim: foreign runtime keys such as
+        tool_call_times must survive a full save."""
+        m = H._core_settings._three_way_merge
+        expected = {"model": "m"}
+        current = {"model": "m", "tool_call_times": [1, 2]}
+        merged, conflict = m(expected, current, dict(expected), "")
+        assert conflict is None
+        assert merged == current
 
     def test_settings_object_loads_and_persists(self, H, tmp_path, monkeypatch):
         obj = H._core_settings.settings_object(

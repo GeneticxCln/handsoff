@@ -41,6 +41,27 @@ BIN_DIR="$HOME/.local/bin"
 CONF_DIR="$HOME/.config/handsoff"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
 
+# --- the shipped set, defined once ------------------------------------------
+# Staging, the compile gate, the rollback save, the switch, rollback and the
+# deployment manifest all derive from these facts, because the version of this
+# script that hand-listed its files shipped core/theme.py nowhere while
+# `--ptt doctor` still reported in-sync: a new module was compiled from the
+# checkout, never installed and never hashed, so nothing could notice. The
+# same list was duplicated in seven places and could drift in seven ways.
+#   * every *.py beside handsoff.py is part of the app (glob),
+#   * handsoff-restart is the one non-Python artifact, and
+#   * TOP_EXECUTABLE names the entry points installed 0755.
+# TOP_REQUIRED is the floor: what handsoff.py hard-imports. Losing one of those
+# must fail the stage loudly rather than deploy an app that dies on import.
+TOP_REQUIRED="handsoff.py settings_schema.py hardware.py"
+TOP_EXECUTABLE="handsoff.py handsoff-settings.py handsoff-restart"
+is_exec() {   # 0 when the basename is an entry point (installed 0755)
+    case " $TOP_EXECUTABLE " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 case "${1:-}" in
     --rollback)
         # Manual rollback path: the switch itself auto-restores on failure;
@@ -52,17 +73,21 @@ case "${1:-}" in
         fi
         echo "==> Rolling back to the previous release ($PREV)"
         mkdir -p "$BIN_DIR/core"
-        for f in handsoff.py handsoff-restart handsoff-settings.py \
-                 settings_schema.py hardware.py \
-                 core/__init__.py core/settings.py core/audio.py \
-                 core/brain.py core/tools.py core/doctor.py core/lifecycle.py \
-                 core/calendar.py core/assistant.py; do
-            [ -f "$PREV/$f" ] || continue
-            case "$f" in
-                handsoff.py|handsoff-restart|handsoff-settings.py) m=755 ;;
-                *) m=644 ;;
-            esac
-            install -m "$m" "$PREV/$f" "$BIN_DIR/$f"
+        # prev/ only ever holds files this installer put there, so restoring
+        # the whole tree is safe — and globbing it means a module added since
+        # prev was saved still comes back.
+        for f in "$PREV"/*.py "$PREV"/handsoff-restart; do
+            [ -f "$f" ] || continue
+            base="$(basename "$f")"
+            if is_exec "$base"; then m=755; else m=644; fi
+            install -m "$m" "$f" "$BIN_DIR/$base"
+        done
+        # core/ restores by glob for the same reason it ships by glob: a
+        # hand-maintained list here means a rollback silently drops whatever
+        # module was added since the list was written.
+        for f in "$PREV"/core/*.py; do
+            [ -f "$f" ] || continue
+            install -m 644 "$f" "$BIN_DIR/core/$(basename "$f")"
         done
         echo "    previous release restored — restart the bubble to load it:"
         echo "      systemctl --user restart handsoff   (or: ~/.local/bin/handsoff-restart)"
@@ -105,11 +130,41 @@ if [ "${1:-}" = "--uninstall" ]; then
         fi
     fi
     systemctl --user disable --now handsoff.service 2>/dev/null || true
-    rm -f "$HOME/.config/systemd/user/handsoff.service" \
-          "$BIN_DIR/handsoff.py" "$BIN_DIR/handsoff-restart" \
-          "$BIN_DIR/handsoff-settings.py" \
-          "$BIN_DIR/settings_schema.py" "$BIN_DIR/hardware.py"
+    rm -f "$HOME/.config/systemd/user/handsoff.service"
+    # Remove exactly what was deployed, read back from the manifest the
+    # installer wrote — it is generated from the shipped set, so a module added
+    # later is removed too. ~/.local/bin is a shared user directory and is
+    # never globbed for deletion; the fallback is the required floor.
+    _deployed=0
+    PY="${PYBIN:-$(command -v python3 2>/dev/null || true)}"
+    if [ -n "$PY" ] && [ -f "$CONF_DIR/deployment.json" ]; then
+        _manifest_files="$("$PY" - "$CONF_DIR/deployment.json" 2>/dev/null <<'PY_EOF' || true
+import json, sys
+# Only relative paths inside the deployment tree are ever named, so a corrupt
+# or hand-edited manifest cannot point the uninstaller outside ~/.local/bin.
+try:
+    files = json.load(open(sys.argv[1]))["files"]
+except Exception:
+    raise SystemExit(0)
+for rel in sorted(files):
+    parts = rel.split("/")
+    if rel.startswith("/") or ".." in parts or "" in parts:
+        continue
+    print(rel)
+PY_EOF
+)"
+        for rel in $_manifest_files; do
+            rm -f "$BIN_DIR/$rel" && _deployed=1
+        done
+    fi
     rm -rf "$BIN_DIR/core"
+    if [ "$_deployed" = "0" ]; then
+        # No manifest (an older install, or it was removed): fall back to the
+        # hard-imported floor plus the two optional/non-Python artifacts.
+        for rel in $TOP_REQUIRED handsoff-settings.py handsoff-restart; do
+            rm -f "$BIN_DIR/$rel"
+        done
+    fi
     systemctl --user daemon-reload 2>/dev/null || true
     # kill only real bubble processes: python executable + EXACT cmdline match.
     # A bare `pkill -f handsoff.py` would kill bystanders whose cmdline merely
@@ -248,40 +303,39 @@ stage_fail() {
     exit 1
 }
 # --- collect the shipped set into the stage (live files untouched yet)
-install -m 755 "$HERE/handsoff.py" "$STAGE_DIR/handsoff.py" \
-    || stage_fail "could not stage handsoff.py"
-if [ -f "$HERE/handsoff-settings.py" ]; then
-    install -m 755 "$HERE/handsoff-settings.py" "$STAGE_DIR/handsoff-settings.py" \
-        || stage_fail "could not stage handsoff-settings.py"
-fi
-# Supporting modules imported next to the bubble (schema = single source of
-# DEFAULT_SETTINGS; hardware = the lazy-imported hardware/world watch; core/ =
-# the extracted runtime). All must exist or the installed copy dies on import.
-for mod in settings_schema hardware; do
-    if [ -f "$HERE/$mod.py" ]; then
-        install -m 644 "$HERE/$mod.py" "$STAGE_DIR/$mod.py" \
-            || stage_fail "could not stage $mod.py"
-    else
-        stage_fail "$HERE/$mod.py is missing but required by handsoff.py"
-    fi
+# Globs, not lists: anything beside handsoff.py ships (handsoff-settings.py
+# included when present), and TOP_REQUIRED fails the stage if a hard-imported
+# module has gone missing.
+for src in "$HERE"/*.py; do
+    base="$(basename "$src")"
+    if is_exec "$base"; then m=755; else m=644; fi
+    install -m "$m" "$src" "$STAGE_DIR/$base" \
+        || stage_fail "could not stage $base"
 done
-if [ -f "$HERE/core/__init__.py" ] && [ -f "$HERE/core/settings.py" ] \
-        && [ -f "$HERE/core/audio.py" ] && [ -f "$HERE/core/brain.py" ] \
-        && [ -f "$HERE/core/tools.py" ] && [ -f "$HERE/core/doctor.py" ] \
-        && [ -f "$HERE/core/lifecycle.py" ] && [ -f "$HERE/core/calendar.py" ] \
-        && [ -f "$HERE/core/assistant.py" ]; then
-    for m in __init__ settings audio brain tools doctor lifecycle calendar assistant; do
-        install -m 644 "$HERE/core/$m.py" "$STAGE_DIR/core/$m.py" \
-            || stage_fail "could not stage core/$m.py"
-    done
-else
-    stage_fail "$HERE/core/ is missing but required by handsoff.py"
-fi
+for mod in $TOP_REQUIRED; do
+    [ -f "$HERE/$mod" ] \
+        || stage_fail "$HERE/$mod is missing but required by handsoff.py"
+done
+# core/ ships as a SET, so it is staged by glob. It used to be a
+# hand-maintained copy list, which meant a newly added module (core/theme.py)
+# was compiled from the checkout but never installed -- and because the
+# deployment manifest enumerated files the same way, doctor reported in-sync
+# while the feature was simply absent (the settings GUI quietly fell back to
+# "no wallpaper matching"). CORE_REQUIRED is a floor that fails the stage
+# loudly if a hard-imported module disappears; the glob is the ceiling.
+CORE_REQUIRED="__init__ settings audio brain tools doctor lifecycle calendar assistant"
+for m in $CORE_REQUIRED; do
+    [ -f "$HERE/core/$m.py" ] \
+        || stage_fail "$HERE/core/$m.py is missing but required by handsoff.py"
+done
+for src in "$HERE"/core/*.py; do
+    install -m 644 "$src" "$STAGE_DIR/core/$(basename "$src")" \
+        || stage_fail "could not stage $(basename "$src")"
+done
 install -m 755 "$HERE/handsoff-restart" "$STAGE_DIR/handsoff-restart" \
     || stage_fail "could not stage handsoff-restart"
 # --- gate 1: every staged Python file must byte-compile before it can ship
-STAGED_PY=("$STAGE_DIR/handsoff.py" "$STAGE_DIR/settings_schema.py" "$STAGE_DIR/hardware.py")
-[ -f "$STAGE_DIR/handsoff-settings.py" ] && STAGED_PY+=("$STAGE_DIR/handsoff-settings.py")
+STAGED_PY=("$STAGE_DIR"/*.py)
 STAGED_PY+=("$STAGE_DIR"/core/*.py)
 "${PYBIN}" -m py_compile "${STAGED_PY[@]}" \
     || stage_fail "staged sources failed to byte-compile — refusing to deploy"
@@ -293,8 +347,12 @@ HAD_PREV=0
 if [ -f "$BIN_DIR/handsoff.py" ]; then
     rm -rf "$PREV_DIR.staging" "$PREV_DIR"
     mkdir -p "$PREV_DIR.staging/core"
-    for f in handsoff.py handsoff-settings.py settings_schema.py hardware.py handsoff-restart; do
-        [ -f "$BIN_DIR/$f" ] && cp -p "$BIN_DIR/$f" "$PREV_DIR.staging/$f"
+    # Save the deployed copy of every file we ship — taken from the stage's own
+    # list, so an unrelated .py a user keeps in ~/.local/bin is never swept into
+    # prev and then restored over something later.
+    for f in "$STAGE_DIR"/*.py "$STAGE_DIR/handsoff-restart"; do
+        base="$(basename "$f")"
+        [ -f "$BIN_DIR/$base" ] && cp -p "$BIN_DIR/$base" "$PREV_DIR.staging/$base"
     done
     for f in "$BIN_DIR"/core/*.py; do
         [ -f "$f" ] && cp -p "$f" "$PREV_DIR.staging/core/"
@@ -303,10 +361,21 @@ if [ -f "$BIN_DIR/handsoff.py" ]; then
     HAD_PREV=1
 fi
 # --- the switch: install staged files; any failure restores the previous set
-SWITCH_FILES_755="handsoff.py handsoff-restart"
-[ -f "$STAGE_DIR/handsoff-settings.py" ] \
-    && SWITCH_FILES_755="$SWITCH_FILES_755 handsoff-settings.py"
-SWITCH_FILES_644="settings_schema.py hardware.py core/__init__.py core/settings.py core/audio.py core/brain.py core/tools.py core/doctor.py core/lifecycle.py core/calendar.py core/assistant.py"
+# Built from the staged tree rather than listed: whatever was staged -- and
+# therefore byte-compiled by the gate above -- is exactly what switches in.
+SWITCH_FILES_755="handsoff-restart"
+SWITCH_FILES_644=""
+for f in "$STAGE_DIR"/*.py; do
+    base="$(basename "$f")"
+    if is_exec "$base"; then
+        SWITCH_FILES_755="$SWITCH_FILES_755 $base"
+    else
+        SWITCH_FILES_644="$SWITCH_FILES_644 $base"
+    fi
+done
+for f in "$STAGE_DIR"/core/*.py; do
+    SWITCH_FILES_644="$SWITCH_FILES_644 core/$(basename "$f")"
+done
 switch_fail() {
     echo "    FATAL: $1 — restoring the previous release" >&2
     if [ "$HAD_PREV" = "1" ]; then
@@ -418,6 +487,23 @@ PY_EOF
 )"; then :; else whisper_sha256=""; fi
 manifest_whisper_sha256=""
 [ -n "$whisper_sha256" ] && manifest_whisper_sha256="  \"whisper_sha256\": \"$whisper_sha256\","
+# Hash every core module staged (glob, not a list) so doctor's drift check
+# covers a new module the moment it ships -- the reason the missing
+# core/theme.py went unnoticed is that the manifest never mentioned it.
+manifest_core_files=""
+for f in "$HERE"/core/*.py; do
+    rel="core/$(basename "$f")"
+    manifest_core_files="$manifest_core_files
+    \"$rel\": {\"source_sha256\": \"$(sha_of "$HERE/$rel")\", \"installed_sha256\": \"$(sha_of "$BIN_DIR/$rel")\"},"
+done
+# Same for the top-level modules: discovered beside handsoff.py, so doctor's
+# drift check and `--uninstall` both learn about a new file automatically.
+manifest_top_files=""
+for f in "$HERE"/*.py; do
+    rel="$(basename "$f")"
+    manifest_top_files="$manifest_top_files
+    \"$rel\": {\"source_sha256\": \"$(sha_of "$HERE/$rel")\", \"installed_sha256\": \"$(sha_of "$BIN_DIR/$rel")\"},"
+done
 atomic_write "$CONF_DIR/deployment.json" 600 <<MANIFEST_EOF
 {
   "installed_at": "$(date -Is)",
@@ -427,19 +513,8 @@ atomic_write "$CONF_DIR/deployment.json" 600 <<MANIFEST_EOF
 $manifest_whisper_sha256
   "python": "$PYBIN",
   "files": {
-    "handsoff.py": {"source_sha256": "$(sha_of "$HERE/handsoff.py")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff.py")"},
-    "handsoff-settings.py": {"source_sha256": "$(sha_of "$HERE/handsoff-settings.py")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-settings.py")"},
-    "settings_schema.py": {"source_sha256": "$(sha_of "$HERE/settings_schema.py")", "installed_sha256": "$(sha_of "$BIN_DIR/settings_schema.py")"},
-    "hardware.py": {"source_sha256": "$(sha_of "$HERE/hardware.py")", "installed_sha256": "$(sha_of "$BIN_DIR/hardware.py")"},
-    "core/__init__.py": {"source_sha256": "$(sha_of "$HERE/core/__init__.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/__init__.py")"},
-    "core/settings.py": {"source_sha256": "$(sha_of "$HERE/core/settings.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/settings.py")"},
-    "core/audio.py": {"source_sha256": "$(sha_of "$HERE/core/audio.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/audio.py")"},
-    "core/brain.py": {"source_sha256": "$(sha_of "$HERE/core/brain.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/brain.py")"},
-    "core/tools.py": {"source_sha256": "$(sha_of "$HERE/core/tools.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/tools.py")"},
-    "core/doctor.py": {"source_sha256": "$(sha_of "$HERE/core/doctor.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/doctor.py")"},
-    "core/lifecycle.py": {"source_sha256": "$(sha_of "$HERE/core/lifecycle.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/lifecycle.py")"},
-    "core/calendar.py": {"source_sha256": "$(sha_of "$HERE/core/calendar.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/calendar.py")"},
-    "core/assistant.py": {"source_sha256": "$(sha_of "$HERE/core/assistant.py")", "installed_sha256": "$(sha_of "$BIN_DIR/core/assistant.py")"},
+$manifest_top_files
+$manifest_core_files
     "handsoff-restart": {"source_sha256": "$(sha_of "$HERE/handsoff-restart")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"}
   }
 }
@@ -624,13 +699,25 @@ from pathlib import Path
 manifest = json.loads(Path(sys.argv[1]).read_text())
 assert manifest["files"]
 PY_EOF
-    for required in \
-        "$BIN_DIR/handsoff.py" "$BIN_DIR/settings_schema.py" "$BIN_DIR/hardware.py" \
-        "$BIN_DIR/core/__init__.py" "$BIN_DIR/core/settings.py" "$BIN_DIR/core/doctor.py" \
-        "$BIN_DIR/core/lifecycle.py" \
-        "$BIN_DIR/handsoff-restart" \
-        "$SYSTEMD_DIR/handsoff.service" "$CONF_DIR/niri-window-rule.kdl"; do
+    # The floor derives from the same one definition as everything else, so it
+    # cannot drift; the non-Python artifacts are named explicitly.
+    for required in $TOP_REQUIRED handsoff-restart; do
+        [ -f "$BIN_DIR/$required" ] \
+            || { echo "FATAL: rehearsal missing $BIN_DIR/$required" >&2; exit 1; }
+    done
+    for required in "$SYSTEMD_DIR/handsoff.service" "$CONF_DIR/niri-window-rule.kdl"; do
         [ -f "$required" ] || { echo "FATAL: rehearsal missing $required" >&2; exit 1; }
+    done
+    # Every module in the checkout must have reached the deployed set -- the
+    # exact check that would have caught the missing core/theme.py, and it runs
+    # on every rehearsal from now on.
+    for src in "$HERE"/*.py; do
+        [ -f "$BIN_DIR/$(basename "$src")" ] \
+            || { echo "FATAL: rehearsal did not deploy $(basename "$src")" >&2; exit 1; }
+    done
+    for src in "$HERE"/core/*.py; do
+        [ -f "$BIN_DIR/core/$(basename "$src")" ] \
+            || { echo "FATAL: rehearsal did not deploy core/$(basename "$src")" >&2; exit 1; }
     done
     echo "rehearsal complete: copied files, manifest, unit, and niri snippet verified"
     exit 0

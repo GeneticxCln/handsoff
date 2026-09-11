@@ -29,6 +29,11 @@ DEFAULT_SETTINGS: dict = {
     "handsfree": False,
     "bubble_size": 128,
     "bubble_design": "orb",  # Appearance tab: orb|halo|reactor|bloom|droplet|cube|equalizer|crystal|saturn|void
+    "bubble_accent": 0.5,      # 0..1 accent punch: how hard each shape leans on its
+                               # state colour (glow alpha, saturation, comet light)
+    "animation_energy": 1.0,   # 0.2..2.0 global animation scale: orbit speed, swirl
+                               # speed, hue sweep and comet brightness. 1.0 = the
+                               # default feel (the old 'Subtle' preset sits mid-scale)
     "colors": {
         "idle": "#4f8cff", "listening": "#ff4d5e",
         "thinking": "#ff9e2c", "speaking": "#3ecf6e",

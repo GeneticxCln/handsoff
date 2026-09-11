@@ -32,7 +32,7 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 659 tests pin the behavior (`python -m pytest tests/`),
+automatically. 737 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
 regression, and ops — including offscreen-Qt scenarios that drive the
 settings GUI itself.
@@ -93,6 +93,11 @@ in VRAM between questions).
 ### The bubble
 
 - **Hold left button** → talk; release → send. Drag to move the bubble.
+- **Shape & feel** — the Appearance tab picks one of ten designs (orb, halo,
+  reactor, bloom, droplet, cube, equalizer, crystal, saturn, void), an
+  animation-energy scale (orbit speed, swirl, comet brightness) and a colour-
+  accent punch, one click of **Match wallpaper** retunes all four state colours
+  for a dark or light backdrop, and both sliders apply live.
 - **Click** (short press) while it speaks → barge-in: it stops talking.
 - **Right-click** → menu (restart, settings, quit).
 - Colors: blue idle · red listening · orange thinking · green speaking.
@@ -346,7 +351,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest tests/ -q     # 659 tests
+python -m pytest tests/ -q     # 737 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 ```
@@ -357,6 +362,16 @@ Python 3.12 and 3.13 (offscreen Qt, no audio hardware needed), a coverage
 floor job, byte-compilation of every source file, shell syntax checks with
 supply-chain pin guards, and an installer smoke test. Background-thread
 exceptions fail the run via `pytest.ini` rather than passing silently.
+
+**When the pipeline goes red, read the summary before the log.** Each suite job
+writes a junit report (GitLab's native *Test summary* tab and merge-request test
+widget), and `ci/pytest_summary.py` prints a short digest — failing test names
+with their messages, plus the known Debian-slim environment fixes — in its own
+log section, opened automatically on failure and folded away when green. Set a
+masked `GITLAB_SUMMARY_TOKEN` variable and the same digest is posted as a merge
+request note, where its Markdown renders (`--post`); a CI job token cannot
+create notes, so without the variable posting is skipped and the job is
+unaffected.
 The suite includes an **installed-copy smoke test**: a fake `~/.local/bin`
 deployment is booted offscreen and poked over the control socket, so a
 checkout that works but deploys broken cannot slip through.

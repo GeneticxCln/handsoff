@@ -71,10 +71,13 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: python -m py_compile
+      - name: python -m py_compile (every source)
         run: |
-          python -m py_compile handsoff.py handsoff-settings.py settings_schema.py hardware.py core/*.py attic/patch_wakeword.py tests/fake_ollama.py
-          python -m py_compile tests/*.py
+          # Discovered, not listed: an enumerated compile set silently skips a
+          # newly added module — which is exactly how core/theme.py escaped the
+          # installer. attic/ is a provenance archive and stays out, matching
+          # its exclusion from .coveragerc.
+          python ci/compile_all.py
 
   # Shell syntax checks for every shipped script.
   shell:

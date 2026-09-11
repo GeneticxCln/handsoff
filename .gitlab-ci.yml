@@ -16,20 +16,40 @@
 # jobs). The GitHub runners get all of these from the shared ubuntu image;
 # Debian slim needs them explicitly. Digests are frozen, so the Debian base
 # (trixie, hence the t64 package names) cannot drift under us.
+#
+# When a suite job fails, read the summary before the log: the junit report
+# gives GitLab's Test-summary tab, and `after_script` prints a short digest of
+# failing tests plus the known env-fix hints (see ci/pytest_summary.py).
 
 stages: [test, static, smoke]
 
 default:
   interruptible: true
 
-# Pip download cache, keyed on the constraints file (same on every job).
-.pip_cache: &pip_cache
+# Per-job plumbing shared by every job that runs the suite: the pip download
+# cache (keyed on the constraints file), the junit report that feeds GitLab's
+# native Test-summary tab and MR test widget, and the log digest that turns a
+# failure into a short list of names + messages + the env fix.
+#
+# `when: always` + `after_script` are what make failures self-explanatory: the
+# report uploads and the digest prints even when the job dies, and both follow
+# the report even when it was never written (the digest says so explicitly).
+.shared: &shared
   cache:
     key:
       files:
         - requirements-lock.txt
     paths:
       - .pip-cache
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit: tests/report.xml
+  # A fresh shell with a reset cwd, so both paths are absolute.
+  after_script:
+    - python "$CI_PROJECT_DIR/ci/pytest_summary.py"
+      "$CI_PROJECT_DIR/tests/report.xml" --post
 
 # One shell line: offscreen-Qt runtime libraries, the ALSA runtime
 # (sounddevice's bundled PortAudio needs libasound.so.2), OpenMP
@@ -52,12 +72,13 @@ default:
     # The offscreen-launch test spawns the real bubble without a display.
     QT_QPA_PLATFORM: offscreen
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
-  <<: *pip_cache
+  <<: *shared
   script:
     - *qt_deps
     - python -m pip install --upgrade pip
     - pip install -r requirements.txt -c requirements-lock.txt
     - python -m pytest tests/ -q
+      --junitxml="$CI_PROJECT_DIR/tests/report.xml"
 
 tests:3.12:
   extends: .tests_base
@@ -79,7 +100,7 @@ coverage:
     # their parallel data files in the workspace for the combine.
     COVERAGE_PROCESS_START: "$CI_PROJECT_DIR/.coveragerc"
     COVERAGE_FILE: "$CI_PROJECT_DIR/.coverage"
-  <<: *pip_cache
+  <<: *shared
   script:
     - *qt_deps
     - python -m pip install --upgrade pip
@@ -87,6 +108,7 @@ coverage:
     - pip install pytest-cov
     - python -m pytest tests/ -q --cov=. --cov-config=.coveragerc
       --cov-report=term-missing --cov-fail-under=70
+      --junitxml="$CI_PROJECT_DIR/tests/report.xml"
 
 # --- Byte-compile every shipped source (GH: `compile` job) ------------------
 # py_compile never imports: no Qt libs or dependencies needed at all.
@@ -94,10 +116,10 @@ compile:
   stage: static
   image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
   script:
-    - python -m py_compile handsoff.py handsoff-settings.py settings_schema.py
-      hardware.py core/*.py attic/patch_wakeword.py
-      tests/fake_ollama.py
-    - python -m py_compile tests/*.py
+    # Discovered, not listed: an enumerated compile set silently skips a newly
+    # added module — exactly how core/theme.py escaped the installer. attic/
+    # (provenance archive) stays out, matching .coveragerc's omit list.
+    - python ci/compile_all.py
 
 # --- Shell checks + pin guards (GH: `shell` job) ----------------------------
 shell:

@@ -153,6 +153,8 @@ def coerce_settings(s: dict) -> dict:
     _num("num_ctx", int, 1024, 2 ** 20)
     _num("history_tokens", int, 0, 2 ** 20)     # 0 = auto (3/4 of num_ctx)
     _num("bubble_size", int, 96, 192)
+    _num("bubble_accent", float, 0.0, 1.0)
+    _num("animation_energy", float, 0.2, 2.0)
     _bd = str(s.get("bubble_design", "orb")).strip().lower()
     s["bubble_design"] = _bd if _bd in _schema.BUBBLE_DESIGNS else DEFAULT_SETTINGS["bubble_design"]
     _num("mic_threshold", int, 50, 10_000)
@@ -421,6 +423,11 @@ _MISSING = object()
 def _three_way_merge(expected, current, candidate, path: str):
     """Merge GUI changes onto current data, returning (value, conflict-key)."""
     if candidate == expected:
+        if current is _MISSING:
+            return _MISSING, None
+        # Ponytail: deepcopy(_MISSING) yields a NEW sentinel object that the
+        # `is not _MISSING` check below can no longer filter, leaking a non-
+        # JSON-serializable object into the written file (TypeError at save).
         return copy.deepcopy(current), None
     if current == expected or candidate == current:
         return copy.deepcopy(candidate), None

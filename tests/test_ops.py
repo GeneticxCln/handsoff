@@ -174,6 +174,41 @@ class TestDeploymentReporting:
         assert snap["files"]["hardware.py"]["source_sha256"] is None
         assert snap["files"]["hardware.py"]["match"] is None
 
+    def test_manifest_drives_the_compared_set(self, H, monkeypatch, tmp_path):
+        """The compared files come from the installer's manifest, not a second
+        hardcoded list.
+
+        core/theme.py was added to the checkout, was never installed, and
+        doctor still reported `in-sync` — because the per-file comparison ran
+        over _DEPLOY_FILES, which had never heard of it. Driven by the
+        manifest, the same deployment is correctly reported as drift.
+        """
+        checkout = tmp_path / "checkout"
+        installed = tmp_path / "home" / ".local" / "bin"
+        checkout.mkdir()
+        installed.mkdir(parents=True)
+        (checkout / ".git").mkdir()
+        (checkout / "handsoff.py").write_text("# checkout\n")
+        for rel in H._DEPLOY_FILES:
+            src = checkout / rel
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_text("# checkout\n")
+            dst = installed / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text("# checkout\n")
+        # The module exists in the checkout but never reached the deployment.
+        (checkout / "core" / "theme.py").write_text("# checkout theme\n")
+        manifest = tmp_path / "deployment.json"
+        manifest.write_text(json.dumps({"files": {"core/theme.py": {}}}))
+        monkeypatch.setattr(H, "SELF_PATH", checkout / "handsoff.py")
+        monkeypatch.setattr(H, "HOME", tmp_path / "home")
+        monkeypatch.setattr(H, "DEPLOYMENT_FILE", manifest)
+        snap = H._deployment_snapshot()
+        assert "core/theme.py" in snap["files"], (
+            "the manifest's files must be compared, not just the floor list")
+        assert snap["files"]["core/theme.py"]["match"] is False
+        assert snap["status"] == "installed-drift"
+
     def test_health_includes_deployment(self, H, monkeypatch):
         """`--ptt health` must answer 'is the running code the tested code?'"""
         a = H.Assistant.__new__(H.Assistant)
@@ -621,6 +656,92 @@ class TestInstallerRehearsal:
         assert (root / ".config" / "systemd" / "user" / "handsoff.service").exists()
         snippet = root / ".config" / "handsoff" / "niri-window-rule.kdl"
         assert "window-rule" in snippet.read_text()
+
+    def test_rehearsal_deploys_every_core_module(self, tmp_path):
+        """Regression: core/theme.py was added and never installed.
+
+        Staging, the switch list, the rollback list and the manifest each
+        enumerated core modules by name, so the settings GUI silently lost
+        wallpaper matching — and doctor still said `in-sync`, because the
+        manifest only hashed the files it was told about. Driven from the
+        checkout, so any module added later is covered without editing this
+        test.
+        """
+        result, root, _sentinel = self._run(tmp_path)
+        assert result.returncode == 0, result.stderr
+        bin_dir = root / ".local" / "bin"
+        manifest = json.loads(
+            (root / ".config" / "handsoff" / "deployment.json").read_text())
+
+        checkout_core = sorted(p.name for p in (HERE / "core").glob("*.py"))
+        assert checkout_core, "checkout has no core modules — test is vacuous"
+        deployed_core = sorted(p.name for p in (bin_dir / "core").glob("*.py"))
+        assert deployed_core == checkout_core, (
+            "every checkout core module must reach the deployed set")
+
+        # Top level too: the same hand-list lived in seven places here, so a
+        # new module beside handsoff.py had seven ways to be forgotten.
+        checkout_top = sorted(p.name for p in HERE.glob("*.py"))
+        deployed_top = sorted(p.name for p in bin_dir.glob("*.py"))
+        assert deployed_top == checkout_top, (
+            "every top-level module must reach the deployed set")
+        assert (bin_dir / "handsoff-restart").exists()
+
+        # ...and the manifest must hash all of them, or doctor cannot see that
+        # one is missing or stale (the core/theme.py bug).
+        hashed = sorted(k for k in manifest["files"] if k.startswith("core/"))
+        assert hashed == [f"core/{name}" for name in checkout_core]
+        hashed_top = sorted(k for k in manifest["files"] if "/" not in k)
+        assert hashed_top == sorted(checkout_top + ["handsoff-restart"])
+        for rel in manifest["files"]:
+            entry = manifest["files"][rel]
+            assert entry["source_sha256"] == entry["installed_sha256"], rel
+
+    def _uninstall(self, tmp_path, home):
+        """Run --uninstall with a stubbed systemctl.
+
+        The real uninstaller calls `systemctl --user`; stubbing it on PATH
+        keeps this test from ever reaching the developer's live user bus.
+        """
+        stub_dir = tmp_path / "stub-bin"
+        stub_dir.mkdir(exist_ok=True)
+        stub = stub_dir / "systemctl"
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+        env = dict(os.environ)
+        env.update({
+            "HOME": str(home),
+            "XDG_STATE_HOME": str(home / ".local" / "state"),
+            "PATH": str(stub_dir) + os.pathsep + os.environ["PATH"],
+        })
+        return subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--uninstall"],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+
+    def test_uninstall_removes_what_it_deployed_and_nothing_else(self, tmp_path):
+        """--uninstall must remove the deployed set without sweeping the
+        shared ~/.local/bin, where unrelated user scripts live.
+
+        The removal list is read back from the deployment manifest (generated
+        from the shipped set), so a module added later is removed too, and a
+        hand-edited manifest cannot point the uninstaller outside the tree.
+        """
+        result, root, _sentinel = self._run(tmp_path)
+        assert result.returncode == 0, result.stderr
+        bin_dir = root / ".local" / "bin"
+        assert (bin_dir / "handsoff.py").exists()
+        stranger = bin_dir / "user_own_script.py"
+        stranger.write_text("# not ours\n")
+
+        r = self._uninstall(tmp_path, root)
+        assert r.returncode == 0, r.stderr
+        assert stranger.exists(), (
+            "uninstall must never delete files it did not install")
+        assert not (bin_dir / "handsoff.py").exists()
+        assert not (bin_dir / "handsoff-restart").exists()
+        assert not (bin_dir / "core").exists()
+        assert not (bin_dir / "settings_schema.py").exists()
 
     def test_manifest_write_failure_preserves_previous_file(self, tmp_path):
         root = tmp_path / "rehearsal"

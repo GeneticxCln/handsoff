@@ -130,10 +130,15 @@ SETTINGS_VERSION = SCHEMA.SETTINGS_VERSION
 
 H = _LazyHandsoff()
 
+try:                                  # core.theme ships with the app's core/ dir;
+    from core import theme as _THEME  # a partial install just disables wallpaper
+except ImportError:                   # tuning instead of refusing to open
+    _THEME = None
+
 import numpy as np  # noqa: E402  (after handsoff, which already required it)
 import sounddevice as sd  # noqa: E402
 
-from PySide6.QtCore import QElapsedTimer, QPointF, Qt, QTimer  # noqa: E402
+from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout,
@@ -381,11 +386,14 @@ def _fsync_dir(path: Path) -> None:
 class BubblePreview(QWidget):
     """Four animated glyphs previewing the state colours, size and design."""
 
-    def __init__(self, colors_fn, size_fn, design_fn=None) -> None:
+    def __init__(self, colors_fn, size_fn, design_fn=None,
+                 energy_fn=None, accent_fn=None) -> None:
         super().__init__()
         self._colors_fn = colors_fn
         self._size_fn = size_fn
         self._design_fn = design_fn or (lambda: "orb")
+        self._energy_fn = energy_fn or (lambda: 1.0)
+        self._accent_fn = accent_fn or (lambda: 0.5)
         self.setMinimumHeight(150)
         self._clock = QElapsedTimer()
         self._clock.start()
@@ -404,19 +412,23 @@ class BubblePreview(QWidget):
         cy = h / 2 - 8
         slots = [w * (i + 0.5) / 4 for i in range(4)]
         t = self._clock.elapsed() / 1000.0
+        # the same two knobs the bubble reads: energy drives the pulse depth,
+        # accent drives the glow punch — the preview must not lie about them
+        e = max(0.2, min(2.0, float(self._energy_fn())))
+        accent = max(0.0, min(1.0, float(self._accent_fn())))
         for i, (name, color) in enumerate(colors.items()):
             cx = slots[i]
             tt = t + i * 0.9
             if name == "idle":
-                r = orb_r + 2.0 * k * (1 + math.sin(2 * math.pi * tt / 3.8)) / 2
+                r = orb_r + 2.0 * k * e * (1 + math.sin(2 * math.pi * tt / 3.8)) / 2
             elif name == "listening":
-                r = orb_r + (4 + 5 * abs(math.sin(2 * math.pi * tt / 0.9))) * k
+                r = orb_r + (4 + 5 * abs(math.sin(2 * math.pi * tt / 0.9))) * k * e
             elif name == "thinking":
-                r = orb_r + 2.5 * k * math.sin(3 * tt + 1.3)
+                r = orb_r + 2.5 * k * e * math.sin(3 * tt + 1.3)
             else:
-                r = orb_r + 4.0 * k * (0.5 - 0.5 * math.cos(2 * math.pi * tt / 0.6))
+                r = orb_r + 4.0 * k * e * (0.5 - 0.5 * math.cos(2 * math.pi * tt / 0.6))
             glow = QColor(color)
-            glow.setAlpha(50)
+            glow.setAlpha(int(max(0, min(255, 50 * (0.55 + 0.9 * accent)))))
             grad = QRadialGradient(cx, cy, r + 6 * k)
             grad.setColorAt(0.0, glow)
             glow.setAlpha(0)
@@ -1049,12 +1061,26 @@ class SettingsWindow(QMainWindow):
         self.refresh_voices()
 
         # if settings.json changes on disk (the bubble persists its hands-free
-        # toggle, another window saves, …) reload instead of clobbering it on Save
+        # toggle, another window saves, …) reload instead of clobbering it on Save.
+        # The reload is suppressed once the user edits anything (event filter
+        # below): a bubble-side write (e.g. notification auto-mute) would
+        # otherwise reset widgets mid-edit and silently lose the user's pick —
+        # the "my bubble shape reverts" bug.
+        self._user_edited = False
         self._disk_mtime = self._settings_mtime()
         self._disk_timer = QTimer(self)
         self._disk_timer.setInterval(2000)
         self._disk_timer.timeout.connect(self._check_disk_changes)
         self._disk_timer.start()
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        # Any interaction anywhere in the window (or its dialogs) marks the
+        # form dirty; the disk-poll auto-reload then stands down until Save
+        # or an explicit reload clears the flag.
+        if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.KeyPress):
+            self._user_edited = True
+        return super().eventFilter(obj, event)
 
     # ---------------------------------------------------------------- helpers
 
@@ -2048,10 +2074,40 @@ class SettingsWindow(QMainWindow):
         self.design_combo = QComboBox(self)
         for name in getattr(SCHEMA, "BUBBLE_DESIGNS", ("orb",)):
             self.design_combo.addItem(name.capitalize(), name)
-        self.design_combo.setToolTip("Bubble shape — applies when the bubble restarts")
+        self.design_combo.setToolTip("Bubble shape — applies live; the bubble repaints within seconds")
         design_row.addWidget(QLabel("Bubble design", self))
         design_row.addWidget(self.design_combo, 1)
         lay.addLayout(design_row)
+
+        # one global animation scale + one accent punch, both applied by every
+        # design in the bubble's shared frame state (no per-shape tuning)
+        energy_row = QHBoxLayout()
+        self.energy_slider = QSlider(Qt.Horizontal, self)
+        self.energy_slider.setRange(20, 200)
+        self.energy_slider.setToolTip(
+            "Scales orbit speed, swirl speed, hue sweep and comet brightness "
+            "for every design. 1.0 is the original feel.")
+        self.energy_label = QLabel("", self)
+        self.energy_slider.valueChanged.connect(
+            lambda v: self.energy_label.setText(f"{v / 100:.1f}×"))
+        energy_row.addWidget(QLabel("Animation energy", self))
+        energy_row.addWidget(self.energy_slider, 1)
+        energy_row.addWidget(self.energy_label)
+        lay.addLayout(energy_row)
+
+        accent_row = QHBoxLayout()
+        self.accent_slider = QSlider(Qt.Horizontal, self)
+        self.accent_slider.setRange(0, 100)
+        self.accent_slider.setToolTip(
+            "How hard each shape leans on its state colour: saturation and "
+            "glow punch. 50% is the original look.")
+        self.accent_label = QLabel("", self)
+        self.accent_slider.valueChanged.connect(
+            lambda v: self.accent_label.setText(f"{v}%"))
+        accent_row.addWidget(QLabel("Colour accent", self))
+        accent_row.addWidget(self.accent_slider, 1)
+        accent_row.addWidget(self.accent_label)
+        lay.addLayout(accent_row)
 
         colors_row = QHBoxLayout()
         for key, title in (("idle", "Idle"), ("listening", "Listening"),
@@ -2066,14 +2122,62 @@ class SettingsWindow(QMainWindow):
         colors_row.addWidget(reset)
         lay.addLayout(colors_row)
 
+        tune_row = QHBoxLayout()
+        match_btn = QPushButton("Match wallpaper", self)
+        match_btn.setToolTip(
+            "Sample the configured wallpaper and retune all four state colours "
+            "so the bubble reads clearly against it")
+        match_btn.clicked.connect(self._match_wallpaper)
+        dark_btn = QPushButton("Dark tuning", self)
+        dark_btn.setToolTip("Retune the palette for a dark backdrop (no detection)")
+        dark_btn.clicked.connect(lambda: self._apply_wallpaper_tuning(0.05))
+        light_btn = QPushButton("Light tuning", self)
+        light_btn.setToolTip("Retune the palette for a light backdrop (no detection)")
+        light_btn.clicked.connect(lambda: self._apply_wallpaper_tuning(0.95))
+        tune_row.addWidget(match_btn)
+        tune_row.addWidget(dark_btn)
+        tune_row.addWidget(light_btn)
+        lay.addLayout(tune_row)
+
         self.preview = BubblePreview(
             lambda: {k: QColor(c) for k, c in self._colors.items()},
             lambda: self.size_slider.value(),
             lambda: self.design_combo.currentData() or "orb",
+            lambda: self.energy_slider.value() / 100.0,
+            lambda: self.accent_slider.value() / 100.0,
         )
         lay.addWidget(self.preview)
         self._paint_color_buttons()
         return w
+
+    def _apply_wallpaper_tuning(self, luminance: float) -> None:
+        """Retune the four state colours for a dark or light backdrop."""
+        if _THEME is None:
+            self._status("theme helpers unavailable in this install")
+            return
+        tuned = _THEME.tune_colors_for_background(self._colors, luminance)
+        self._colors = tuned
+        self._paint_color_buttons()
+        self.preview.update()
+        backdrop = "dark" if float(luminance) < 0.5 else "light"
+        self._status(f"state colours retuned for a {backdrop} backdrop — Save to apply")
+
+    def _match_wallpaper(self) -> None:
+        """One click: sample the configured wallpaper and retune for it."""
+        if _THEME is None:
+            self._status("theme helpers unavailable in this install")
+            return
+        try:
+            luminance = _THEME.detect_wallpaper_luminance(NIRI_CONFIG)
+        except OSError as e:
+            self._status(f"could not read the wallpaper: {e}")
+            return
+        if luminance is None:
+            self._status(
+                "could not detect the wallpaper (need an image path in the niri "
+                "config + ImageMagick) — use Dark/Light tuning")
+            return
+        self._apply_wallpaper_tuning(luminance)
 
     def _paint_color_buttons(self) -> None:
         for key, btn in self.color_buttons.items():
@@ -2236,6 +2340,13 @@ class SettingsWindow(QMainWindow):
         mtime = self._settings_mtime()
         if mtime != self._disk_mtime:
             self._disk_mtime = mtime
+            if self._user_edited:
+                # the user has unsaved edits: reloading now would wipe them.
+                # Save still wins via the three-way merge; say so.
+                self._status(
+                    "settings changed on disk — keeping your edits; "
+                    "Save will merge both")
+                return
             self.reload_from_disk()
             self._status("settings reloaded from disk (changed outside this window)")
 
@@ -2247,6 +2358,7 @@ class SettingsWindow(QMainWindow):
             data = {}
         self.cfg = merge_settings(data)
         self._loaded_cfg = copy.deepcopy(self.cfg)
+        self._user_edited = False
         self._load_values()
 
     def _load_values(self) -> None:
@@ -2265,6 +2377,10 @@ class SettingsWindow(QMainWindow):
                 "\n".join(f"{k} = {v}" for k, v in sorted(pol.items())))
         _di = self.design_combo.findData(str(self.cfg.get("bubble_design", "orb")))
         self.design_combo.setCurrentIndex(_di if _di >= 0 else 0)
+        self.energy_slider.setValue(int(round(min(
+            2.0, max(0.2, float(self.cfg.get("animation_energy", 1.0)))) * 100)))
+        self.accent_slider.setValue(int(round(min(
+            1.0, max(0.0, float(self.cfg.get("bubble_accent", 0.5)))) * 100)))
         self.dryrun_chk.setChecked(bool(self.cfg.get("dry_run", False)))
         self.thresh_spin.setValue(int(self.cfg["mic_threshold"]))
         wi = self.whisper_combo.findData(self.cfg["whisper_size"])
@@ -2357,6 +2473,8 @@ class SettingsWindow(QMainWindow):
         self.cfg["workspace_aliases"] = alias_map
         self.cfg["bubble_size"] = self.size_slider.value()
         self.cfg["bubble_design"] = self.design_combo.currentData() or "orb"
+        self.cfg["animation_energy"] = self.energy_slider.value() / 100.0
+        self.cfg["bubble_accent"] = self.accent_slider.value() / 100.0
         self.cfg["colors"] = dict(self._colors)
         self.cfg["permissions"] = {k: chk.isChecked() for k, chk in self.perm_checks.items()}
         policy_map: dict[str, str] = {}
@@ -2418,6 +2536,7 @@ class SettingsWindow(QMainWindow):
         self.cfg = written
         self._loaded_cfg = copy.deepcopy(written)
         self._disk_mtime = self._settings_mtime()
+        self._user_edited = False   # form now matches disk
         # One autostart owner, same rule as the installer: when the systemd
         # user unit manages the bubble, niri spawn-at-startup is NOT added.
         msg = apply_autostart(self.autostart_chk.isChecked())

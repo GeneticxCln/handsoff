@@ -6,6 +6,7 @@ delegating methods so the H.* monkeypatch contract and tests keep working.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -279,3 +280,119 @@ class NotificationReader:
             if stop.is_set():
                 return
             # loop() returned via exhaustion: loop to respawn.
+
+
+def split_due_reminders(items: list[dict], now: float
+                        ) -> tuple[list[dict], list[dict]]:
+    """Split reminders into (fired, kept).
+
+    Repeats advance in whole repeat-steps, so a sleep or restart never loses
+    one and a long sleep never machine-guns a backlog of missed occurrences.
+    Pure arithmetic on purpose: the store, the worker tick and the tests all
+    share this one implementation.
+    """
+    fired, kept = [], []
+    for r in items:
+        if r["due"] > now:
+            kept.append(r)
+            continue
+        fired.append(r)
+        step = float(r.get("repeat_hours") or 0) * 3600
+        if step > 0:
+            ahead = r["due"] + max(1, int((now - r["due"]) // step) + 1) * step
+            kept.append({**r, "due": ahead})
+    return fired, kept
+
+
+class ReminderStore:
+    """The persisted reminder queue: reminders.json behind one writer.
+
+    Everything the queue needs from the application is injected — the
+    in-process lock, the cross-process sidecar flock factory, the atomic
+    write + backup helpers, a logger and a clock — so the parsing, the
+    serialized transactions and the startup catch-up can be tested without
+    an Assistant, Qt or a real config directory.
+
+    Locking contract (unchanged from the inlined version this replaces): the
+    sidecar flock is non-reentrant, so a caller must never nest two of those
+    guards on the same thread; `lock` serializes threads instead.
+    """
+
+    def __init__(self, path, *, lock, file_lock, backup, write,
+                 logger=None, clock=time.time) -> None:
+        # `path` and `lock` stay public: the host application rebinds its
+        # REMINDERS_FILE/REMINDERS_LOCK globals (tests redirect them) and
+        # refreshes both here before each use, so the store must never be
+        # constructed once with a captured path.
+        self.path = path
+        self.lock = lock
+        self._file_lock = file_lock
+        self._backup = backup
+        self._write = write
+        self._log = logger or logging.getLogger("handsoff")
+        self._clock = clock
+
+    def load(self) -> list[dict]:
+        """Read reminders.json, dropping entries that are malformed."""
+        try:
+            data = json.loads(self.path.read_text())
+            if not isinstance(data, list):
+                return []
+            out = []
+            for r in data:
+                if not isinstance(r, dict) or not isinstance(r.get("name"), str) \
+                        or not isinstance(r.get("due"), (int, float)):
+                    continue
+                try:
+                    r["repeat_hours"] = float(r.get("repeat_hours") or 0)
+                except (TypeError, ValueError):
+                    r["repeat_hours"] = 0.0
+                out.append(r)
+            return out
+        except (OSError, ValueError):
+            return []
+
+    def save(self, items: list[dict]) -> None:
+        """Caller MUST hold `lock` + the sidecar flock: two concurrent
+        writers would corrupt each other's read-modify-write."""
+        self._backup(self.path)
+        self._write(self.path, json.dumps(items, indent=1))
+
+    def update(self, mutate) -> list[dict]:
+        """One serialized read-modify-write transaction: load, mutate, save.
+        Every mutation of the queue goes through here."""
+        with self.lock, self._file_lock(self.path.parent, "reminders.json.lock"):
+            items = self.load()
+            items = mutate(items) or items
+            self.save(items)
+            return items
+
+    def take_missed(self) -> list[dict]:
+        """Pop reminders that came due while we were off (startup call)."""
+        with self.lock, self._file_lock(self.path.parent, "reminders.json.lock"):
+            items = self.load()
+            if not items:
+                return []
+            fired, kept = split_due_reminders(items, self._clock())
+            if fired:
+                try:
+                    self.save(kept)
+                except OSError:
+                    self._log.exception("could not prune fired reminders")
+        return fired
+
+    def drain_due(self) -> list[dict]:
+        """Worker tick: fire everything due now and persist the survivors.
+
+        Returns the fired entries (empty when nothing is due). The whole
+        read-modify-write happens under one guard pair here, which is why
+        callers must not wrap this in a flock of their own.
+        """
+        with self.lock, self._file_lock(self.path.parent, "reminders.json.lock"):
+            items = self.load()
+            fired, kept = [], items
+            if items:
+                fired, kept = split_due_reminders(items, self._clock())
+            if fired and kept != items:
+                self.save(kept)
+        return fired

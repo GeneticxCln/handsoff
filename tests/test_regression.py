@@ -1333,3 +1333,44 @@ class TestResourceAlerts:
         for part in ("resource_chk", "ram_alert_spin", "vram_alert_spin",
                      'resource_alerts', 'ram_alert_percent', 'vram_alert_percent'):
             assert part in src
+
+
+class TestReminderStoreSeam:
+    """The reminder queue was extracted into core.assistant.ReminderStore, and
+    the store is rebound to H.REMINDERS_FILE/H.REMINDERS_LOCK on every call.
+
+    That seam is load-bearing: a store that captured its path at construction
+    time kept writing the REAL reminders.json from tests (spurious reminders
+    spoken out loud). These pins fail if the late binding is ever removed.
+    """
+
+    def _redirect(self, H, monkeypatch, tmp_path):
+        target = tmp_path / "reminders.json"
+        monkeypatch.setattr(H, "REMINDERS_FILE", target)
+        monkeypatch.setattr(H, "REMINDERS_LOCK", H.threading.RLock())
+        return target
+
+    def test_aliases_write_to_the_rebound_path(self, H, monkeypatch, tmp_path):
+        target = self._redirect(H, monkeypatch, tmp_path)
+        H._update_reminders(lambda items: items + [{"name": "seam", "due": 1.0}])
+        assert [r["name"] for r in json.loads(target.read_text())] == ["seam"]
+        assert [r["name"] for r in H._load_reminders()] == ["seam"]
+        # and the store object itself was repointed, not left on the old file
+        assert H._REMINDER_STORE.path == target
+
+    def test_take_missed_uses_the_rebound_path(self, H, monkeypatch, tmp_path):
+        target = self._redirect(H, monkeypatch, tmp_path)
+        now = time.time()
+        H._update_reminders(lambda items: [
+            {"name": "past", "due": now - 5, "repeat_hours": 0},
+            {"name": "future", "due": now + 600, "repeat_hours": 0},
+        ])
+        assert [r["name"] for r in H._take_missed_reminders()] == ["past"]
+        assert [r["name"] for r in H._load_reminders()] == ["future"]
+        assert json.loads(target.read_text())[0]["name"] == "future"
+
+    def test_due_helper_and_core_share_one_implementation(self, H):
+        from core.assistant import split_due_reminders
+        items = [{"name": "a", "due": 1.0, "repeat_hours": 0},
+                 {"name": "b", "due": 9.0, "repeat_hours": 0}]
+        assert H._due_reminders(items, 5.0) == split_due_reminders(items, 5.0)

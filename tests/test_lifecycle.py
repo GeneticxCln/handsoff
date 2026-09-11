@@ -25,6 +25,10 @@ from conftest import HERE as ROOT, _load, _user_site
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
+# Bytes planted in a fake deployment's core/ to prove a rollback restores the
+# whole saved module set (see TestInstallerRehearsal / the rollback tests).
+SENTINEL_CORE_BYTES = "# OLD core module bytes\n"
+
 
 class TestCoreLifecycle:
     """core.lifecycle imports independently and provides minimal turn primitives."""
@@ -685,26 +689,68 @@ class TestRestartResilience:
         assert "for u in ydotool.service ydotoold.service" in text
         assert "ydotoold running via" in text
 
-    def test_installer_ships_core_doctor(self):
-        """core/doctor.py is the new home of the doctor diagnostic; the
-        installer must copy it into the deployed set and the deployment
-        manifest must hash it (so drift detection still works after the
-        monolith cut)."""
+    def test_installer_ships_every_core_module(self):
+        """core/ ships as a SET, not a hand-maintained list.
+
+        core/theme.py was added and silently never installed: staging, the
+        switch list, the rollback list and the deployment manifest each
+        enumerated core modules by name, so the settings GUI lost wallpaper
+        matching while doctor still reported `in-sync` — the manifest can only
+        hash files it was told about. This pins the design that makes a new
+        module deployable without editing install.sh at all.
+        """
         text = (HERE / "install.sh").read_text()
-        assert "core/doctor.py" in text, (
-            "install.sh must add core/doctor.py to the deployed file set")
-        # Manifest must hash it too — the deployment manifest stanza lives
-        # inside a `<<MANIFEST_EOF ... MANIFEST_EOF` heredoc and is what
-        # _deployment_snapshot() in handsoff.py diffs against. Slice out
-        # that body and look for the line.
+        # Staging, the switch list and rollback all glob the tree.
+        assert '"$HERE"/core/*.py' in text, "core/ must be staged by glob"
+        assert '"$STAGE_DIR"/core/*.py' in text, (
+            "the switch list must be built from what was staged")
+        assert '"$PREV"/core/*.py' in text, (
+            "rollback must restore the whole saved core/ set")
+        assert "CORE_REQUIRED=" in text, (
+            "the hand-maintained list may only survive as an explicit floor")
+        # ...and the manifest hashes the staged set instead of enumerating it.
+        # The stanza lives inside a `<<MANIFEST_EOF ... MANIFEST_EOF` heredoc,
+        # which is what _deployment_snapshot() in handsoff.py diffs against.
         open_tag = "<<MANIFEST_EOF"
         close_tag = "MANIFEST_EOF"
         start = text.find(open_tag)
         end = text.find(close_tag, start + len(open_tag))
         assert start != -1 and end != -1, "MANIFEST_EOF heredoc not found"
         manifest_body = text[start + len(open_tag):end]
-        assert '"core/doctor.py"' in manifest_body, (
-            "core/doctor.py must appear in the deployment manifest hash check")
+        assert "$manifest_core_files" in manifest_body, (
+            "the manifest must hash every staged core module")
+        assert '"core/doctor.py"' not in manifest_body, (
+            "a literal core/ entry is exactly how a new module escapes drift "
+            "detection — the manifest must be generated")
+        # The generator must hash both copies per module, or doctor cannot
+        # see a stale deployment.
+        generator = text[text.index("manifest_core_files="):start]
+        assert "source_sha256" in generator and "installed_sha256" in generator
+
+    def test_installer_defines_the_shipped_set_once(self):
+        """The shipped top-level set must be discovered, not re-listed.
+
+        It used to be written out in seven separate steps (rollback,
+        uninstall, staging, the compile gate, the prev save, the switch and
+        the manifest), so a module added beside handsoff.py had seven
+        independent ways to be forgotten — the same defect that shipped
+        core/theme.py nowhere while doctor reported in-sync.
+        """
+        text = (HERE / "install.sh").read_text()
+        assert "TOP_REQUIRED=" in text, "the required floor must be explicit"
+        assert 'for src in "$HERE"/*.py; do' in text, "staging must glob"
+        assert 'STAGED_PY=("$STAGE_DIR"/*.py)' in text, "compile must glob"
+        assert 'for f in "$STAGE_DIR"/*.py "$STAGE_DIR/handsoff-restart"' in text, \
+            "the prev save must take the stage's own list"
+        assert 'for f in "$PREV"/*.py' in text, "rollback must glob"
+        assert "manifest_top_files=" in text, "the manifest must be generated"
+        # The old hand-written lists must be gone, not merely joined.
+        assert "for mod in settings_schema hardware" not in text
+        assert 'SWITCH_FILES_644="settings_schema.py hardware.py"' not in text
+        assert '"$BIN_DIR/settings_schema.py"' not in text, (
+            "uninstall must not hard-list the deployed files")
+        assert '"$BIN_DIR"/*.py' not in text, (
+            "uninstall must never sweep the shared ~/.local/bin")
 
     def test_lock_failure_logs_instead_of_silent_exit(self, H, monkeypatch):
         """If the lock can't be acquired, say so in the log (no more silent vanish)."""
@@ -797,6 +843,9 @@ class TestStagedRelease:
                       "handsoff-restart"):
                 (bin_dir / f).write_text(bin_py)
             (bin_dir / "core" / "__init__.py").write_text(bin_py)
+            # A module the old hand-maintained lists would have dropped on
+            # rollback: sentinel bytes prove the restore is glob-driven.
+            (bin_dir / "core" / "theme.py").write_text(SENTINEL_CORE_BYTES)
         return home, conf
 
     def _run_rehearsal(self, tmp_path, home):
@@ -844,6 +893,10 @@ class TestStagedRelease:
         )
         assert rb.returncode == 0, rb.stderr
         assert bin_handsoff.read_text() == "# OLD deployed bytes\n"
+        # ...including core modules the previous release had: rollback restores
+        # the whole saved set, not just the modules someone remembered to list.
+        assert (home / ".local" / "bin" / "core" / "theme.py").read_text() \
+            == SENTINEL_CORE_BYTES
 
     def test_rollback_without_previous_release_fails_cleanly(self, tmp_path):
         home, conf = self._fake_home(tmp_path, bin_py=None)
@@ -861,7 +914,10 @@ class TestStagedRelease:
         """A staged set that cannot byte-compile must never reach the live
         bin — the gate must run before any install into BIN_DIR."""
         text = (HERE / "install.sh").read_text()
-        assert 'STAGED_PY=("$STAGE_DIR/handsoff.py"' in text
+        # The staged set is globbed from the stage itself, so whatever shipped
+        # is what was compiled — a listed set could name a file it never staged.
+        assert 'STAGED_PY=("$STAGE_DIR"/*.py)' in text
+        assert 'STAGED_PY+=("$STAGE_DIR"/core/*.py)' in text
         assert 'py_compile "${STAGED_PY[@]}"' in text
         compile_line = text.index('py_compile "${STAGED_PY[@]}"')
         first_install = text.index('install -m 755 "$STAGE_DIR/$f" "$BIN_DIR/$f"')

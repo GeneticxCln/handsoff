@@ -60,6 +60,23 @@ class FakeAssistant:
         elif not active and self.state == "listening":
             self.state = "idle"
 
+    # ContinuousListener._health_tick() probes these optional assistant hooks on
+    # every tick and log.exception()s when they are absent — which buries the
+    # CI log in tracebacks. They are declared here as deliberate no-ops: the
+    # listener under test does not own scheduling policy, but it does expect the
+    # Assistant surface to exist.
+    def _resource_tick(self) -> None:
+        pass
+
+    def _world_tick(self) -> None:
+        pass
+
+    def _hardware_tick(self) -> None:
+        pass
+
+    def _maybe_self_heal(self, degraded) -> None:
+        pass
+
 
 class TestSpeechGate:
     def test_silence_produces_no_events(self, H):
