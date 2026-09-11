@@ -1219,18 +1219,34 @@ class TestAmbientCapabilities:
         assert saved and saved[-1][0] == "notification_mute_apps"
 
     def test_notification_parser_filters_mute(self, H, monkeypatch):
-        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
-                                             "notification_mute_apps": ["secret"]})
-        tb = self._tb(H, on_announce=lambda text: (_ for _ in ()).throw(AssertionError()))
+        from core import assistant as assist_mod
+        announced: list = []
+        reader = assist_mod.NotificationReader(
+            spawn=lambda *a, **k: None, is_closed=lambda: False,
+            announce=announced.append,
+            muted=lambda a, s, b: assist_mod.notification_muted(
+                a, s, b, mute_apps=["secret"], app_name="handsoff"),
+            popen_factory=None, persist=lambda k, v: None)
         lines = ['signal time=1 interface=org.freedesktop.Notifications member=Notify',
                  '   string "secret-app"', '   uint32 0', '   string ""',
                  '   string "title"', '   string "body"']
+
         class P:
             stdout = lines
             def poll(self): return None
-        tb._announce_now = tb._on_announce
-        tb._dbus_strings = H.Assistant._dbus_strings
-        H.Assistant._notification_loop(tb, P(), threading.Event())
+        reader.loop(P(), threading.Event())
+        assert announced == []
+        clean = ['signal time=2 interface=org.freedesktop.Notifications member=Notify',
+                 '   string "mail"', '   uint32 0', '   string ""',
+                 '   string "hi"', '   string "you have mail"']
+
+        class P2:
+            stdout = clean
+            def poll(self): return None
+        reader.loop(P2(), threading.Event())
+        assert len(announced) == 1 and "Notification from mail" in announced[0]
+        # historical seams stay live for external callers
+        assert H.Assistant._dbus_strings('   string "a"') == ["a"]
 
     def test_pomodoro_delegates_and_validates(self, H):
         calls = []

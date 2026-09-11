@@ -112,11 +112,8 @@ class TestSourceIntegrity:
         a._cancel = threading.Event()
         a._listener = types.SimpleNamespace(stop=lambda: None)
         a._tools = None
-        a._notification_thread = None
-        a._notification_stop = None
-        a._notification_proc = None
-        a._pomodoro_stop = None
-        a._pomodoro_state = None
+        a._notifications = types.SimpleNamespace(
+            set_enabled=lambda enabled: "notification reader disabled")
         a._recorder = None
         a._pipeline_q = __import__("queue").Queue(maxsize=1)
         a._state = H.IDLE

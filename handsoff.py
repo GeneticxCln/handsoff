@@ -2168,7 +2168,9 @@ class WakeSpotter:
 
 # Assistant collaborators (pomodoro/notifications/reminders/ticks): small
 # state machines with explicit deps; the Assistant keeps thin delegates.
-from core.assistant import PomodoroController
+from core.assistant import NotificationReader, PomodoroController
+from core.assistant import dbus_strings as _core_dbus_strings
+from core.assistant import notification_muted as _core_notification_muted
 # Calendar parsing lives in core.calendar (stdlib-only, no Qt/Assistant).
 # These aliases preserve the historical H.* names used by tests, the
 # briefing, and the ToolBelt host-dependency fallback.
@@ -3115,9 +3117,11 @@ class Assistant(QObject):
         self._recently_spoken: list[str] = []   # last TTS lines, for echo rejection
         self._handsfree = bool(SETTINGS.get("handsfree", False))
         self._listener = ContinuousListener(self)
-        self._notification_proc = None
-        self._notification_stop = None
-        self._notification_thread = None
+        self._notifications = NotificationReader(
+            spawn=self._start_worker, is_closed=self._is_closed,
+            announce=self._announce_now, muted=self._notification_muted,
+            popen_factory=lambda *a, **k: subprocess.Popen(*a, **k),
+            persist=set_setting)
         self._pomodoro = PomodoroController(
             announce=self._announce_now, spawn=self._start_worker,
             is_closed=self._is_closed)
@@ -3529,50 +3533,12 @@ class Assistant(QObject):
         """Start/stop a session D-Bus notification monitor. Notification text
         is never replayed from history; only future notifications are spoken,
         and muted app names are filtered before TTS."""
-        if enabled:
-            if self._is_closed():
-                return "ERROR: assistant is shut down"
-            if self._notification_thread is not None and self._notification_thread.is_alive():
-                return "notification reader is already on"
-            try:
-                self._notification_proc = subprocess.Popen(
-                    ["dbus-monitor", "--session",
-                     "interface='org.freedesktop.Notifications',member='Notify'"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, bufsize=1, start_new_session=True)
-            except FileNotFoundError:
-                self._notification_proc = None
-                set_setting("notification_reader", False)
-                return "ERROR: dbus-monitor is not installed"
-            except OSError as e:
-                self._notification_proc = None
-                set_setting("notification_reader", False)
-                return f"ERROR: notification monitor failed: {e}"
-            stop = threading.Event()
-            self._notification_stop = stop
-            self._notification_thread = self._start_worker(
-                self._notification_reader_run, args=(stop,),
-                name="notification-reader")
-            log.info("desktop notification reader enabled")
-            return "notification reader enabled"
-        stop = self._notification_stop
-        proc = self._notification_proc
-        self._notification_stop = None
-        self._notification_proc = None
-        if stop is not None:
-            stop.set()
-        if proc is not None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-        log.info("desktop notification reader disabled")
-        return "notification reader disabled"
+        return self._notifications.set_enabled(enabled)
 
     @staticmethod
     def _dbus_strings(line: str) -> list[str]:
         """Extract ordinary quoted D-Bus string values from monitor output."""
-        return re.findall(r'(?<!\\)"((?:\\.|[^"\\])*)"', line)
+        return _core_dbus_strings(line)
 
     @staticmethod
     def _notification_muted(app: str, summary: str, body: str) -> bool:
@@ -3580,128 +3546,19 @@ class Assistant(QObject):
         semantics (app substring to keep 'Noisy'→'NoisyApp', summary whole
         word, never body); self-mute when app==handsoff or 'handsoff' in
         summary/body."""
-        try:
-            a = (app or "").lower()
-            s = (summary or "").lower()
-            b = (body or "").lower()
-            # SELF first: our own popups echo the app name in summary/body.
-            if a.strip() == APP_NAME.lower():
-                return True
-            if APP_NAME.lower() in s or APP_NAME.lower() in b:
-                return True
-            for raw in (SETTINGS.get("notification_mute_apps") or []):
-                m = str(raw or "").strip().lower()
-                if not m:
-                    continue
-                if m in a:
-                    return True
-                try:
-                    if re.search(r"\b" + re.escape(m) + r"\b", s):
-                        return True
-                except re.error:
-                    if m in s:
-                        return True
-            return False
-        except Exception:
-            return False
+        return _core_notification_muted(
+            app, summary, body,
+            mute_apps=SETTINGS.get("notification_mute_apps"),
+            app_name=APP_NAME)
 
     def _notification_loop(self, proc, stop: threading.Event) -> None:
-        values: list[str] | None = None  # None: between messages, ignore trailers
-        try:
-            for line in proc.stdout or ():
-                if stop.is_set():
-                    return
-                if "member=Notify" in line and (
-                        line.startswith("signal ") or line.startswith("method call ")):
-                    values = []
-                    continue
-                if values is None:
-                    continue
-                if not values and not line.lstrip().startswith("string"):
-                    continue
-                values.extend(self._dbus_strings(line))
-                # Notify's signature is (app, replaces-id, icon, summary,
-                # body, actions, hints, expire-time). dbus-monitor prints the
-                # uint32/arrays separately, so the four strings we need are
-                # app, icon, summary, body — consume once per message and
-                # ignore the actions/hints trailers (sender-pid, urgency…),
-                # which must never fire their own announcements.
-                if len(values) >= 4:
-                    app, _icon, summary, body = values[:4]
-                    values = None  # consumed: one utterance per message
-                    try:
-                        if self._notification_muted(app, summary, body):
-                            log.info("notification muted from %s", app)
-                            continue
-                    except Exception:
-                        pass
-                    now = time.monotonic()
-                    with _READER_COOLDOWN_LOCK:
-                        last = _READER_APP_LAST.get(app.lower())
-                        if last is not None and now - last < _READER_APP_COOLDOWN:
-                            log.info("notification cooldown suppresses %s", app)
-                            continue
-                        _READER_APP_LAST[app.lower()] = now
-                    text = f"Notification from {app}: {summary}"
-                    if body.strip():
-                        text += f". {body.strip()}"
-                    try:
-                        self._announce_now(text[:500])
-                    except Exception:
-                        log.exception("notification announcement failed")
-            # stdout exhaustion (dbus-monitor died/restarted): log it so a
-            # silent reader is visible; the reconnect wrapper below respawns
-            # with bounded backoff. Direct _notification_loop callers (tests)
-            # simply return here.
-            if not stop.is_set():
-                log.warning("notification reader stdout exhausted — monitor exited")
-        except (OSError, ValueError):
-            if not stop.is_set():
-                log.exception("notification reader stopped unexpectedly")
-        finally:
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.terminate()
-                except (AttributeError, OSError):
-                    pass
+        self._notifications.loop(proc, stop)
 
     def _notification_reader_run(self, stop: threading.Event) -> None:
-        """Production wrapper: run _notification_loop, respawning dbus-monitor
-        with bounded backoff when its stdout is exhausted. At most 5 respawns,
-        1s→30s exponential backoff; gives up quietly when disabled."""
-        backoff = 1.0
-        attempts = 0
-        while not stop.is_set() and attempts < 5:
-            proc = getattr(self, "_notification_proc", None)
-            if proc is None or (hasattr(proc, "poll") and proc.poll() is not None):
-                # previous monitor died — respawn it under backoff
-                if stop.wait(backoff):
-                    return
-                try:
-                    proc = subprocess.Popen(
-                        ["dbus-monitor", "--session",
-                         "interface='org.freedesktop.Notifications',member='Notify'"],
-                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        text=True, bufsize=1, start_new_session=True)
-                    self._notification_proc = proc
-                    log.warning("notification reader respawned (attempt %d)", attempts + 1)
-                except Exception:
-                    log.exception("notification reader respawn failed")
-                    backoff = min(backoff * 2.0, 30.0)
-                    attempts += 1
-                    continue
-                backoff = min(backoff * 2.0, 30.0)
-                attempts += 1
-            try:
-                self._notification_loop(proc, stop)
-            except Exception:
-                log.exception("notification reader pass failed")
-            if stop.is_set():
-                return
-            # _notification_loop returned via exhaustion: loop to respawn.
-            # If proc is a test fake (no real dbus), its poll() is 0 (dead)
-            # but Popen would succeed in prod — in tests this wrapper is never
-            # used (tests call _notification_loop directly), so no hang.
+        """Production wrapper: run loop(), respawning dbus-monitor with
+        bounded backoff when its stdout is exhausted."""
+        self._notifications.run(stop)
+
 
     def _set_pomodoro(self, action: str, work: float, break_minutes: float) -> str:
         """Own the bounded Pomodoro worker and announce work/break transitions."""
@@ -3859,7 +3716,7 @@ class Assistant(QObject):
                     pending[2].set()
                     q.task_done()
                 try:
-                    q.put_nowait(None)
+                    q.put_nowait((None, None, None))  # worker unpacks then exits on audio None
                 except queue.Full:
                     pass
         deadline = time.monotonic() + SHUTDOWN_JOIN_TIMEOUT

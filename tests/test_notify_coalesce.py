@@ -114,19 +114,27 @@ def _notify_lines(app, summary="hi", body="there"):
         "   int32 5000",
     ]
 
+def _reader(H, said):
+    """A NotificationReader wired like the Assistant builds it: live
+    settings for the mute list, spoken lines captured."""
+    from core import assistant as assist_mod
+    return assist_mod.NotificationReader(
+        spawn=lambda *a, **k: None, is_closed=lambda: False,
+        announce=said.append,
+        muted=lambda a, s, b: H.Assistant._notification_muted(a, s, b),
+        popen_factory=None, persist=lambda k, v: None)
+
 
 class TestReaderCooldown:
     def _run_loop(self, H, monkeypatch, apps):
         H._notify_reset()
         monkeypatch.setitem(H.SETTINGS, "notification_mute_apps", [])
         said: list = []
-        a = H.Assistant.__new__(H.Assistant)
-        a._announce_now = said.append
         lines = []
         for app in apps:
             lines.extend(_notify_lines(app))
         proc = types.SimpleNamespace(stdout=iter(lines), poll=lambda: 0)
-        a._notification_loop(proc, threading.Event())
+        _reader(H, said).loop(proc, threading.Event())
         return said
 
     def test_same_app_repeats_suppressed(self, H, monkeypatch):
@@ -147,11 +155,9 @@ class TestReaderCooldown:
         H._notify_reset()
         monkeypatch.setitem(H.SETTINGS, "notification_mute_apps", ["noisy"])
         said: list = []
-        a = H.Assistant.__new__(H.Assistant)
-        a._announce_now = said.append
         proc = types.SimpleNamespace(
             stdout=iter(_notify_lines("NoisyApp")), poll=lambda: 0)
-        a._notification_loop(proc, threading.Event())
+        _reader(H, said).loop(proc, threading.Event())
         assert said == [], said
 
     def test_one_message_yields_one_announcement_despite_trailers(self, H, monkeypatch):
@@ -174,13 +180,12 @@ class TestReaderCooldown:
         H._notify_reset()
         monkeypatch.setitem(H.SETTINGS, "notification_mute_apps", [])
         said: list = []
-        a = H.Assistant.__new__(H.Assistant)
-        a._announce_now = said.append
+        reader = _reader(H, said)
         proc = types.SimpleNamespace(
             stdout=iter(_notify_lines("Something", summary="timer",
                                       body="handsoff snoozed it")),
             poll=lambda: 0)
-        a._notification_loop(proc, threading.Event())
+        reader.loop(proc, threading.Event())
         assert said == [], said
         # summary mention also self-mutes
         said.clear()
@@ -188,7 +193,7 @@ class TestReaderCooldown:
             stdout=iter(_notify_lines("Something", summary="handsoff timer",
                                       body="done")),
             poll=lambda: 0)
-        a._notification_loop(proc2, threading.Event())
+        reader.loop(proc2, threading.Event())
         assert said == [], said
 
     def test_user_mute_matches_app_and_summary_word_not_body(self, H, monkeypatch):
@@ -197,14 +202,13 @@ class TestReaderCooldown:
         H._notify_reset()
         monkeypatch.setitem(H.SETTINGS, "notification_mute_apps", ["noisy"])
         said: list = []
-        a = H.Assistant.__new__(H.Assistant)
-        a._announce_now = said.append
+        reader = _reader(H, said)
         # body-only 'noisy' still announces (mute never looks at body)
         proc = types.SimpleNamespace(
             stdout=iter(_notify_lines("Firefox", summary="hi",
                                       body="noisy background chatter")),
             poll=lambda: 0)
-        a._notification_loop(proc, threading.Event())
+        reader.loop(proc, threading.Event())
         assert len(said) == 1, said
         # summary whole-word mutes
         H._notify_reset()
@@ -213,19 +217,18 @@ class TestReaderCooldown:
             stdout=iter(_notify_lines("Firefox", summary="noisy build",
                                       body="done")),
             poll=lambda: 0)
-        a._notification_loop(proc2, threading.Event())
+        reader.loop(proc2, threading.Event())
         assert said == [], said
 
     def test_stray_lines_and_back_to_back_messages(self, H, monkeypatch):
         H._notify_reset()
         monkeypatch.setitem(H.SETTINGS, "notification_mute_apps", [])
         said: list = []
-        a = H.Assistant.__new__(H.Assistant)
-        a._announce_now = said.append
+        reader = _reader(H, said)
         lines = ["stray quoted string before any Notify"]
         lines += _notify_lines("Slack", summary="one", body="first")
         lines += _notify_lines("Mail", summary="two", body="second")
         proc = types.SimpleNamespace(stdout=iter(lines), poll=lambda: 0)
-        a._notification_loop(proc, threading.Event())
+        reader.loop(proc, threading.Event())
         assert len(said) == 2, said
         assert "Slack" in said[0] and "Mail" in said[1]

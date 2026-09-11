@@ -52,3 +52,57 @@ def test_pomodoro_shutdown_is_idempotent():
     pomo.command("start", 25, 5)
     pomo.shutdown()
     pomo.shutdown()
+
+
+def _reader(spoken: list, **kw):
+    from core.assistant import NotificationReader
+    args = dict(spawn=lambda *a, **k: None, is_closed=lambda: False,
+                announce=spoken.append,
+                muted=lambda a, s, b: False,
+                popen_factory=None, persist=lambda k, v: None)
+    args.update(kw)
+    return NotificationReader(**args)
+
+
+def test_reader_start_stop_lifecycle():
+    spoken: list = []
+    procs: list = []
+
+    class FakeProc:
+        def __init__(self, *a, **k):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    import types as _types
+    reader = _reader(
+        spoken,
+        spawn=lambda *a, **k: _types.SimpleNamespace(is_alive=lambda: True),
+        popen_factory=lambda *a, **k: procs.append(FakeProc(*a, **k)) or procs[-1])
+    assert reader.set_enabled(True) == "notification reader enabled"
+    assert reader.set_enabled(True) == "notification reader is already on"
+    assert reader.set_enabled(False) == "notification reader disabled"
+    assert procs and procs[0].terminated is True
+    reader.shutdown()  # idempotent, never started-twice state
+
+
+def test_reader_missing_binary_disables_and_persists():
+    spoken: list = []
+    saved: list = []
+
+    def nobin(*a, **k):
+        raise FileNotFoundError("no dbus-monitor")
+
+    reader = _reader(spoken, popen_factory=nobin, persist=lambda k, v: saved.append((k, v)))
+    assert reader.set_enabled(True) == "ERROR: dbus-monitor is not installed"
+    assert saved == [("notification_reader", False)]
+
+
+def test_reader_refuses_when_closed():
+    reader = _reader([], is_closed=lambda: True,
+                     popen_factory=lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not spawn")))
+    assert reader.set_enabled(True) == "ERROR: assistant is shut down"
