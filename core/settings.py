@@ -153,6 +153,8 @@ def coerce_settings(s: dict) -> dict:
     _num("num_ctx", int, 1024, 2 ** 20)
     _num("history_tokens", int, 0, 2 ** 20)     # 0 = auto (3/4 of num_ctx)
     _num("bubble_size", int, 96, 192)
+    _bd = str(s.get("bubble_design", "orb")).strip().lower()
+    s["bubble_design"] = _bd if _bd in _schema.BUBBLE_DESIGNS else DEFAULT_SETTINGS["bubble_design"]
     _num("mic_threshold", int, 50, 10_000)
     _num("tts_rate", float, 0.5, 2.0)
     _num("tts_volume", float, 0.1, 2.0)

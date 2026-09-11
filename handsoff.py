@@ -5769,42 +5769,64 @@ class BubbleWidget(QWidget):
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
+        f = self._frame()
+        design = str(SETTINGS.get("bubble_design", "orb")).strip().lower()
+        if design == "halo":
+            self._paint_halo(p, f)
+        elif design == "reactor":
+            self._paint_reactor(p, f)
+        elif design == "bloom":
+            self._paint_bloom(p, f)
+        else:
+            self._paint_orb(p, f)
+        p.end()
+
+    def _frame(self) -> dict:
+        """Shared per-frame animation state for every bubble design."""
         cx, cy = self.width() / 2, self.height() / 2
         t = self._clock.elapsed() / 1000.0
         color = QColor.fromRgbF(*self._color_ui)
         swirl_speed, swirl_boost, hue_speed, _fx_e = _BUBBLE_FX.get(self._state, _BUBBLE_FX[IDLE])
         radius = self._radius_ui if self._radius_ui is not None else self._radius_target(t)
         energy = min(1.0, max(0.0, self._energy_ui))
-        # orbiting key light: one full 360° trip per orbit period — the lit
-        # cap, hotspot, rim arc and bounce all hang off this angle, so the
-        # sphere visibly turns under a circling light.
+        # orbiting key light: one full 360° trip per orbit period
         orbit_hz = {"idle": 0.06, "listening": 0.28, "thinking": 0.42, "speaking": 0.33}.get(self._state, 0.06)
         la = 3 * math.pi / 4 + t * 2 * math.pi * orbit_hz
         lx, ly = math.cos(la), -math.sin(la)  # screen pos: y grows downward
+        return {
+            "cx": cx, "cy": cy, "t": t, "color": color, "radius": radius,
+            "energy": energy, "level": self._level_ui, "la": la, "lx": lx, "ly": ly,
+            "inner": radius * (1.0 - 0.34 - 0.10 * swirl_boost),
+            "base_hue": max(0.0, QColor.fromRgbF(*self._color_ui).hueF()),
+            "sat": min(1.0, color.hslSaturationF() * 1.15),
+            "swirl_speed": swirl_speed, "swirl_boost": swirl_boost, "hue_speed": hue_speed,
+        }
 
-        base_hue = max(0.0, QColor.fromRgbF(*self._color_ui).hueF())
-        sat = min(1.0, color.hslSaturationF() * 1.15)
-        inner = radius * (1.0 - 0.34 - 0.10 * swirl_boost)   # dark core
+    def _conic(self, f: dict, angle_deg: float, alpha: int, comet: bool = False) -> QConicalGradient:
+        g = QConicalGradient(f["cx"], f["cy"], angle_deg)
+        if comet:
+            # asymmetric comet head + fading tail: rotation is unmistakable
+            stops = ((0.00, 0.78, 1.00), (0.12, 0.66, 0.90), (0.30, 0.58, 0.60),
+                     (0.55, 0.52, 0.36), (0.80, 0.50, 0.28), (1.00, 0.78, 1.00))
+        else:
+            stops = tuple((i / 5.0, 0.60 + 0.10 * f["swirl_boost"], alpha / 255.0) for i in range(6))
+        first = None
+        for pos, light, a in stops:
+            c = QColor.fromHslF(
+                (f["base_hue"] + (0.5 - abs(0.5 - pos)) * f["hue_speed"] / 360.0) % 1.0,
+                f["sat"], light, a if comet else alpha / 255.0,
+            )
+            if first is None:
+                first = QColor(c)
+            g.setColorAt(pos, c)
+        g.setColorAt(1.0, first)
+        return g
 
-        def _swirl_conic(angle_deg: float, alpha: int, comet: bool = False) -> QConicalGradient:
-            g = QConicalGradient(cx, cy, angle_deg)
-            if comet:
-                # asymmetric comet head + fading tail: rotation is unmistakable
-                stops = ((0.00, 0.78, 1.00), (0.12, 0.66, 0.90), (0.30, 0.58, 0.60),
-                         (0.55, 0.52, 0.36), (0.80, 0.50, 0.28), (1.00, 0.78, 1.00))
-            else:
-                stops = tuple((i / 5.0, 0.60 + 0.10 * swirl_boost, alpha / 255.0) for i in range(6))
-            first = None
-            for pos, light, a in stops:
-                c = QColor.fromHslF(
-                    (base_hue + (0.5 - abs(0.5 - pos)) * hue_speed / 360.0) % 1.0,
-                    sat, light, a if comet else alpha / 255.0,
-                )
-                if first is None:
-                    first = QColor(c)
-                g.setColorAt(pos, c)
-            g.setColorAt(1.0, first)
-            return g
+    def _paint_orb(self, p: QPainter, f: dict) -> None:
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy = f["radius"], f["energy"]
+        la, lx, ly, inner = f["la"], f["lx"], f["ly"], f["inner"]
+        swirl_speed = f["swirl_speed"]
 
         # organic silhouette: thinking wobbles, speaking ripples, rest stay round
         wob_amt = 1.0 if self._state == THINKING else (0.45 if self._state == SPEAKING else 0.0)
@@ -5831,14 +5853,14 @@ class BubbleWidget(QWidget):
         ring_path = outer_path.subtracted(inner_path)
         p.save()
         p.setClipPath(ring_path)
-        p.setBrush(QBrush(_swirl_conic(-t * 360.0 * swirl_speed, 255, comet=True)))
+        p.setBrush(QBrush(self._conic(f, -t * 360.0 * swirl_speed, 255, comet=True)))
         p.drawEllipse(QPointF(cx, cy), radius, radius)
         thin = QPainterPath()
         thin.addEllipse(QPointF(cx, cy), radius, radius)
         thin_inner = QPainterPath()
         thin_inner.addEllipse(QPointF(cx, cy), inner * 1.12, inner * 1.12)
         p.setClipPath(thin.subtracted(thin_inner))
-        p.setBrush(QBrush(_swirl_conic(t * 360.0 * swirl_speed * 0.6 + 40.0, int(60 + 90 * energy))))
+        p.setBrush(QBrush(self._conic(f, t * 360.0 * swirl_speed * 0.6 + 40.0, int(60 + 90 * energy))))
         p.drawEllipse(QPointF(cx, cy), radius, radius)
         # radial falloff: darken toward the core with translucent black over the ring
         shade = QRadialGradient(QPointF(cx, cy), radius)
@@ -5889,7 +5911,7 @@ class BubbleWidget(QWidget):
         crescent_inner.addEllipse(QPointF(cx, cy), inner * 0.78, inner * 0.78)
         p.save()
         p.setClipPath(crescent.subtracted(crescent_inner))
-        p.setBrush(QBrush(_swirl_conic(-t * 360.0 * 0.05 + 135.0, 70)))
+        p.setBrush(QBrush(self._conic(f, -t * 360.0 * 0.05 + 135.0, 70)))
         p.drawEllipse(QPointF(cx, cy), inner, inner)
         p.restore()
         # rim light: dim base ring + bright arc parked under the orbiting light
@@ -5907,7 +5929,148 @@ class BubbleWidget(QWidget):
         hot.setAlpha(int(140 + 60 * energy))
         p.setPen(QPen(hot, max(1.5, inner * 0.075), Qt.SolidLine, Qt.RoundCap))
         p.drawPath(arc)
-        p.end()
+
+    def _paint_halo(self, p: QPainter, f: dict) -> None:
+        """Hollow torus: the wallpaper shows through the middle."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy = f["radius"], f["energy"]
+        thick = radius * (0.16 + 0.05 * energy + 0.10 * f["level"])
+        outer, inner_r = radius, radius - thick
+        p.setPen(Qt.NoPen)
+        halo = QRadialGradient(QPointF(cx, cy), radius + GLOW_PAD)
+        halo_color = QColor(color)
+        halo_color.setAlpha(int(25 + 40 * energy))
+        halo.setColorAt(0.0, QColor(0, 0, 0, 0))
+        halo.setColorAt(max(0.0, inner_r / (radius + GLOW_PAD)), QColor(0, 0, 0, 0))
+        halo.setColorAt(max(0.0, outer / (radius + GLOW_PAD)), halo_color)
+        halo_color.setAlpha(0)
+        halo.setColorAt(1.0, halo_color)
+        p.drawEllipse(QPointF(cx, cy), radius + GLOW_PAD, radius + GLOW_PAD)
+        # glassy disc inside, barely there
+        disc = QRadialGradient(QPointF(cx, cy), inner_r)
+        disc.setColorAt(0.0, QColor(255, 255, 255, 14))
+        disc.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.setBrush(QBrush(disc))
+        p.drawEllipse(QPointF(cx, cy), inner_r, inner_r)
+        # torus with an orbiting comet head
+        ring = QPainterPath()
+        ring.addEllipse(QPointF(cx, cy), outer, outer)
+        hole = QPainterPath()
+        hole.addEllipse(QPointF(cx, cy), inner_r, inner_r)
+        p.save()
+        p.setClipPath(ring.subtracted(hole))
+        p.setBrush(QBrush(self._conic(f, -t * 360.0 * f["swirl_speed"], 230, comet=True)))
+        p.drawEllipse(QPointF(cx, cy), outer, outer)
+        p.restore()
+        # bright bead parked on the ring at a known angle (phase-exact)
+        bead_a = t * 2 * math.pi * f["swirl_speed"]
+        bead_r = (outer + inner_r) / 2
+        p.setBrush(QColor(255, 255, 255, 200))
+        p.drawEllipse(QPointF(cx + math.cos(bead_a) * bead_r, cy - math.sin(bead_a) * bead_r),
+                      thick * 0.32, thick * 0.32)
+        # breathing core dot
+        dot_r = radius * 0.07 * (1.0 + 0.3 * math.sin(2 * math.pi * t / 1.2))
+        dot = QColor(color)
+        dot.setAlpha(int(150 + 80 * energy))
+        p.setBrush(QBrush(dot))
+        p.drawEllipse(QPointF(cx, cy), dot_r, dot_r)
+
+    def _arc(self, p: QPainter, cx: float, cy: float, r: float, a0: float, span: float,
+             color: QColor, width: float) -> None:
+        """Bright polyline arc from a0-span/2 to a0+span/2 (math angles)."""
+        path = QPainterPath()
+        for i in range(25):
+            a = a0 - span / 2 + i * (span / 24)
+            x, y = cx + math.cos(a) * r, cy - math.sin(a) * r
+            path.moveTo(x, y) if i == 0 else path.lineTo(x, y)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap))
+        p.drawPath(path)
+
+    def _paint_reactor(self, p: QPainter, f: dict) -> None:
+        """Segmented tech ring: three arcs, tick marks, pulsing core."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy = f["radius"], f["energy"]
+
+        k = GEOM_K
+        p.setPen(Qt.NoPen)
+        halo = QRadialGradient(QPointF(cx, cy), radius + GLOW_PAD)
+        halo_c = QColor(color)
+        halo_c.setAlpha(int(20 + 30 * energy))
+        halo.setColorAt(0.0, QColor(0, 0, 0, 0))
+        halo.setColorAt(max(0.0, radius / (radius + GLOW_PAD)), halo_c)
+        halo_c.setAlpha(0)
+        halo.setColorAt(1.0, halo_c)
+        p.setBrush(QBrush(halo))
+        p.drawEllipse(QPointF(cx, cy), radius + GLOW_PAD, radius + GLOW_PAD)
+        disc = QColor(color)
+        disc.setAlpha(16)
+        p.setBrush(QBrush(disc))
+        p.drawEllipse(QPointF(cx, cy), radius, radius)
+        react = 1.0 + f["level"] * 1.5  # voice-reactive spin
+        segs = ((0.98, 0.50, 1.75, 3.2), (0.86, -0.35, 1.22, 2.4), (0.74, 0.80, 2.44, 1.8))
+        for rr, spd, span, wdt in segs:
+            c = QColor(color)
+            c.setAlpha(int(120 + 90 * energy))
+            self._arc(p, cx, cy, radius * rr, t * 2 * math.pi * spd * react, span, c, wdt * k)
+        # tick ring, slow drift
+        for i in range(12):
+            a = i * math.pi / 6 + t * 0.15
+            long_tick = i % 3 == 0
+            r1, r2 = radius * 0.62, radius * (0.68 if long_tick else 0.65)
+            c = QColor(color)
+            c.setAlpha(130 if long_tick else 70)
+            p.setPen(QPen(c, (2.0 if long_tick else 1.2) * k))
+            p.drawLine(QPointF(cx + math.cos(a) * r1, cy - math.sin(a) * r1),
+                       QPointF(cx + math.cos(a) * r2, cy - math.sin(a) * r2))
+        core_r = radius * 0.10 * (1.0 + 0.35 * energy + 0.5 * f["level"])
+        core_c = QColor(color)
+        core_c.setAlpha(230)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(core_c))
+        p.drawEllipse(QPointF(cx, cy), core_r, core_r)
+        p.setBrush(QColor(255, 255, 255, 160))
+        p.drawEllipse(QPointF(cx, cy), core_r * 0.4, core_r * 0.4)
+
+    def _paint_bloom(self, p: QPainter, f: dict) -> None:
+        """Edgeless glow blob: soft radial bloom with drifting sparks."""
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy = f["radius"], f["energy"]
+        p.setPen(Qt.NoPen)
+        mist = QRadialGradient(QPointF(cx, cy), radius * 1.35)
+        mist_c = QColor(color)
+        mist_c.setAlpha(int(70 + 60 * energy))
+        mist.setColorAt(0.0, mist_c)
+        mist_c.setAlpha(0)
+        mist.setColorAt(1.0, mist_c)
+        p.setBrush(QBrush(mist))
+        p.drawEllipse(QPointF(cx, cy), radius * 1.35, radius * 1.35)
+        blob = self._wobble_path(cx, cy, radius * 0.72, t * 0.7, 0.6)
+        body = QRadialGradient(QPointF(cx, cy - radius * 0.2), radius)
+        top = QColor(color).lighter(150)
+        top.setAlpha(int(150 + 60 * energy))
+        body.setColorAt(0.0, top)
+        mid = QColor(color)
+        mid.setAlpha(110)
+        body.setColorAt(0.55, mid)
+        low = QColor(color).darker(170)
+        low.setAlpha(0)
+        body.setColorAt(1.0, low)
+        p.setBrush(QBrush(body))
+        p.drawPath(blob)
+        # bright breathing heart
+        heart_r = radius * 0.20 * (1.0 + 0.18 * math.sin(2 * math.pi * t / 1.4))
+        heart = QColor(color).lighter(170)
+        heart.setAlpha(220)
+        p.setBrush(QBrush(heart))
+        p.drawEllipse(QPointF(cx, cy), heart_r, heart_r)
+        # drifting sparks on golden-angle orbits
+        for i in range(5):
+            a = t * (0.3 + 0.07 * i) + i * 2.39996
+            r = radius * (0.45 + 0.09 * i)
+            s = QColor(255, 255, 255, 70)
+            p.setBrush(QBrush(s))
+            p.drawEllipse(QPointF(cx + math.cos(a) * r, cy - math.sin(a) * r), 1.6, 1.6)
 
     @staticmethod
     def _wobble_path(cx: float, cy: float, r0: float, t: float, amt: float = 1.0) -> QPainterPath:

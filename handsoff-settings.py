@@ -1949,6 +1949,15 @@ class SettingsWindow(QMainWindow):
         size_row.addWidget(self.size_label)
         lay.addLayout(size_row)
 
+        design_row = QHBoxLayout()
+        self.design_combo = QComboBox(self)
+        for name in getattr(SCHEMA, "BUBBLE_DESIGNS", ("orb",)):
+            self.design_combo.addItem(name.capitalize(), name)
+        self.design_combo.setToolTip("Bubble shape — applies when the bubble restarts")
+        design_row.addWidget(QLabel("Bubble design", self))
+        design_row.addWidget(self.design_combo, 1)
+        lay.addLayout(design_row)
+
         colors_row = QHBoxLayout()
         for key, title in (("idle", "Idle"), ("listening", "Listening"),
                            ("thinking", "Thinking"), ("speaking", "Speaking")):
@@ -2158,6 +2167,8 @@ class SettingsWindow(QMainWindow):
         elif isinstance(pol, dict) and pol and getattr(self, "policy_edit", None) is not None:
             self.policy_edit.setPlainText(
                 "\n".join(f"{k} = {v}" for k, v in sorted(pol.items())))
+        _di = self.design_combo.findData(str(self.cfg.get("bubble_design", "orb")))
+        self.design_combo.setCurrentIndex(_di if _di >= 0 else 0)
         self.dryrun_chk.setChecked(bool(self.cfg.get("dry_run", False)))
         self.thresh_spin.setValue(int(self.cfg["mic_threshold"]))
         wi = self.whisper_combo.findData(self.cfg["whisper_size"])
@@ -2249,6 +2260,7 @@ class SettingsWindow(QMainWindow):
                 alias_map[k] = v
         self.cfg["workspace_aliases"] = alias_map
         self.cfg["bubble_size"] = self.size_slider.value()
+        self.cfg["bubble_design"] = self.design_combo.currentData() or "orb"
         self.cfg["colors"] = dict(self._colors)
         self.cfg["permissions"] = {k: chk.isChecked() for k, chk in self.perm_checks.items()}
         policy_map: dict[str, str] = {}
