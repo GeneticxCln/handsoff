@@ -5775,22 +5775,30 @@ class BubbleWidget(QWidget):
         swirl_speed, swirl_boost, hue_speed, _fx_e = _BUBBLE_FX.get(self._state, _BUBBLE_FX[IDLE])
         radius = self._radius_ui if self._radius_ui is not None else self._radius_target(t)
         energy = min(1.0, max(0.0, self._energy_ui))
-        # fixed key-light direction (top-left), unit-ish vector
-        lx, ly = -0.682, -0.731
+        # orbiting key light: one full 360° trip per orbit period — the lit
+        # cap, hotspot, rim arc and bounce all hang off this angle, so the
+        # sphere visibly turns under a circling light.
+        orbit_hz = {"idle": 0.10, "listening": 0.25, "thinking": 0.38, "speaking": 0.30}.get(self._state, 0.10)
+        la = 3 * math.pi / 4 + t * 2 * math.pi * orbit_hz
+        lx, ly = math.cos(la), -math.sin(la)  # screen pos: y grows downward
 
         base_hue = max(0.0, QColor.fromRgbF(*self._color_ui).hueF())
+        sat = min(1.0, color.hslSaturationF() * 1.15)
         inner = radius * (1.0 - 0.34 - 0.10 * swirl_boost)   # dark core
 
-        def _swirl_conic(angle_deg: float, alpha: int) -> QConicalGradient:
+        def _swirl_conic(angle_deg: float, alpha: int, comet: bool = False) -> QConicalGradient:
             g = QConicalGradient(cx, cy, angle_deg)
+            if comet:
+                # asymmetric comet head + fading tail: rotation is unmistakable
+                stops = ((0.00, 0.78, 1.00), (0.12, 0.66, 0.90), (0.30, 0.58, 0.60),
+                         (0.55, 0.52, 0.36), (0.80, 0.50, 0.28), (1.00, 0.78, 1.00))
+            else:
+                stops = tuple((i / 5.0, 0.60 + 0.10 * swirl_boost, alpha / 255.0) for i in range(6))
             first = None
-            for i in range(6):
-                pos = i / 5.0
+            for pos, light, a in stops:
                 c = QColor.fromHslF(
                     (base_hue + (0.5 - abs(0.5 - pos)) * hue_speed / 360.0) % 1.0,
-                    min(1.0, color.hslSaturationF() * 1.15),
-                    0.60 + 0.10 * swirl_boost,
-                    alpha / 255.0,
+                    sat, light, a if comet else alpha / 255.0,
                 )
                 if first is None:
                     first = QColor(c)
@@ -5823,7 +5831,7 @@ class BubbleWidget(QWidget):
         ring_path = outer_path.subtracted(inner_path)
         p.save()
         p.setClipPath(ring_path)
-        p.setBrush(QBrush(_swirl_conic(-t * 360.0 * swirl_speed, 255)))
+        p.setBrush(QBrush(_swirl_conic(-t * 360.0 * swirl_speed, 255, comet=True)))
         p.drawEllipse(QPointF(cx, cy), radius, radius)
         thin = QPainterPath()
         thin.addEllipse(QPointF(cx, cy), radius, radius)
@@ -5849,7 +5857,7 @@ class BubbleWidget(QWidget):
         )
         core = QRadialGradient(
             QPointF(cx + lx * inner * 0.55, cy + ly * inner * 0.55), inner * 1.6)
-        core.setColorAt(0.0, QColor(64, 69, 86))
+        core.setColorAt(0.0, QColor(150, 158, 180))
         core.setColorAt(0.35, tint)
         core.setColorAt(0.75, QColor(20, 22, 29))
         core.setColorAt(1.0, QColor(10, 11, 15))
@@ -5871,9 +5879,9 @@ class BubbleWidget(QWidget):
 
         # --- specular life: breathing hotspot + slow-drifting crescent ---
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(255, 255, 255, int(40 + 10 * math.sin(2 * math.pi * t / 2.3))))
+        p.setBrush(QColor(255, 255, 255, int(55 + 15 * math.sin(2 * math.pi * t / 1.7))))
         p.drawEllipse(
-            QPointF(cx + lx * inner * 0.52, cy + ly * inner * 0.52), inner * 0.28, inner * 0.19
+            QPointF(cx + lx * inner * 0.50, cy + ly * inner * 0.50), inner * 0.30, inner * 0.21
         )
         crescent = QPainterPath()
         crescent.addEllipse(QPointF(cx, cy), inner * 0.86, inner * 0.86)
@@ -5884,12 +5892,21 @@ class BubbleWidget(QWidget):
         p.setBrush(QBrush(_swirl_conic(-t * 360.0 * 0.05 + 135.0, 70)))
         p.drawEllipse(QPointF(cx, cy), inner, inner)
         p.restore()
-        # thin colored rim light between core and swirl
+        # rim light: dim base ring + bright arc parked under the orbiting light
         rim = QColor(color)
-        rim.setAlpha(int(70 + 60 * energy))
+        rim.setAlpha(int(50 + 30 * energy))
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(rim, max(1.0, inner * 0.05)))
         p.drawEllipse(QPointF(cx, cy), inner * 0.97, inner * 0.97)
+        arc = QPainterPath()
+        for i in range(21):
+            a = la - 0.6 + i * (1.2 / 20)
+            x, y = cx + math.cos(a) * inner * 0.97, cy - math.sin(a) * inner * 0.97
+            arc.moveTo(x, y) if i == 0 else arc.lineTo(x, y)
+        hot = QColor(color)
+        hot.setAlpha(int(140 + 60 * energy))
+        p.setPen(QPen(hot, max(1.5, inner * 0.075), Qt.SolidLine, Qt.RoundCap))
+        p.drawPath(arc)
         p.end()
 
     @staticmethod
