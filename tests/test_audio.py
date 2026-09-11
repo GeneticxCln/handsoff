@@ -535,6 +535,21 @@ class TestNativeRateMicAndFuzzyWake:
         same = np.zeros(1600, dtype=np.int16)
         assert H._resample_to_16k(same, 16000) is same
 
+    def test_resample_kills_ultrasonic_images(self, H):
+        """A 12 kHz whine at 48 kHz must not fold onto 4 kHz (linear interp
+        imaged it at full strength); a 1 kHz voice tone passes through."""
+        t = np.arange(48000 * 2, dtype=np.float32) / 48000.0
+
+        def band_peak(y, f0, f1):
+            Y = np.abs(np.fft.rfft(y.astype(np.float32)))
+            f = np.fft.rfftfreq(len(y), 1 / 16000)
+            return Y[(f >= f0) & (f < f1)].max()
+
+        voice = H._resample_to_16k((np.sin(2 * np.pi * 1000 * t) * 12000).astype(np.int16), 48000)
+        assert abs(int(np.abs(voice).max()) - 12000) < 1500
+        whine = H._resample_to_16k((np.sin(2 * np.pi * 12000 * t) * 12000).astype(np.int16), 48000)
+        assert band_peak(whine, 3900, 4100) < 0.05 * band_peak(voice, 900, 1100)
+
     def test_match_wake_fuzzy_misheard_name(self, H):
         # the exact E2E failure: piper's 'cypher' transcribed as 'Siphon'
         assert H._match_wake("Hey Siphon, what is the capital of France?") == \

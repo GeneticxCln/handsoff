@@ -60,21 +60,22 @@ def configure(*, sample_rate: int = 16_000, whisper_size: str = "base",
 
 
 def _resample_to_16k(data: np.ndarray, rate: int) -> np.ndarray:
-    """Resample flat int16 audio to SAMPLE_RATE (linear interp, speech-grade)."""
+    """Resample flat int16 audio to SAMPLE_RATE (FFT brickwall, anti-aliased).
+
+    Linear interpolation folds everything above 8 kHz back into the voice
+    band (a 12 kHz whine lands on 4 kHz at full strength); truncating the
+    spectrum instead is a near-ideal lowpass for any ratio with no new
+    dependency. A 60 s capture is ~12 MB — no chunking needed."""
     if rate == SAMPLE_RATE or data.size == 0:
         return data
-    # ponytail: chunked interp bounds peak memory for long captures.
-    out: list[np.ndarray] = []
-    _CH = 480_000
-    ratio = SAMPLE_RATE / float(rate)
-    for off in range(0, data.size, _CH):
-        seg = data[off: off + _CH]
-        duration = seg.size / float(rate)
-        target_n = max(1, int(round(seg.size * ratio)))
-        x_old = np.linspace(0.0, duration, num=seg.size, endpoint=False)
-        x_new = np.linspace(0.0, duration, num=target_n, endpoint=False)
-        out.append(np.interp(x_new, x_old, seg.astype(np.float32)).astype(np.int16))
-    return np.concatenate(out) if out else data[:0]
+    n_in = int(data.size)
+    n_out = max(1, int(round(n_in * SAMPLE_RATE / float(rate))))
+    spectrum = np.fft.rfft(data.astype(np.float32))
+    kept = np.zeros(n_out // 2 + 1, dtype=np.complex64)
+    m = min(len(spectrum), len(kept))
+    kept[:m] = spectrum[:m]
+    out = np.fft.irfft(kept, n_out) * (n_out / n_in)
+    return np.clip(out, -32768, 32767).astype(np.int16)
 
 
 def _open_input(device, rate: int, blocksize: int, cb) -> tuple:
