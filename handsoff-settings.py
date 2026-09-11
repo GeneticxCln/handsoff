@@ -134,7 +134,7 @@ import numpy as np  # noqa: E402  (after handsoff, which already required it)
 import sounddevice as sd  # noqa: E402
 
 from PySide6.QtCore import QElapsedTimer, QPointF, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QColor, QFont, QPainter, QRadialGradient, QBrush, QPen  # noqa: E402
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
@@ -379,12 +379,13 @@ def _fsync_dir(path: Path) -> None:
 
 
 class BubblePreview(QWidget):
-    """Four animated orbs previewing the state colours and bubble size."""
+    """Four animated glyphs previewing the state colours, size and design."""
 
-    def __init__(self, colors_fn, size_fn) -> None:
+    def __init__(self, colors_fn, size_fn, design_fn=None) -> None:
         super().__init__()
         self._colors_fn = colors_fn
         self._size_fn = size_fn
+        self._design_fn = design_fn or (lambda: "orb")
         self.setMinimumHeight(150)
         self._clock = QElapsedTimer()
         self._clock.start()
@@ -423,12 +424,7 @@ class BubblePreview(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(grad))
             p.drawEllipse(QPointF(cx, cy), r + 6 * k, r + 6 * k)
-            body = QRadialGradient(cx, cy - r * 0.25, r * 1.15)
-            body.setColorAt(0.0, QColor(color).lighter(140))
-            body.setColorAt(1.0, QColor(color).darker(160))
-            p.setBrush(QBrush(body))
-            p.setPen(QPen(QColor(255, 255, 255, 45), 1))
-            p.drawEllipse(QPointF(cx, cy), r, r)
+            self._glyph(p, self._design_fn(), cx, cy, r, QColor(color), tt, k)
             p.setPen(QPen(QColor(140, 140, 140)))
             f = QFont()
             f.setPointSize(8)
@@ -436,6 +432,105 @@ class BubblePreview(QWidget):
             p.drawText(int(cx - 40), int(cy + orb_r + 6 * k + 16), 80, 14,
                        Qt.AlignHCenter, name)
         p.end()
+
+    def _glyph(self, p, design: str, cx: float, cy: float, r: float,
+               color: QColor, t: float, k: float) -> None:
+        """Mini silhouette of the selected design in a state colour."""
+        import math as _math
+        if design == "halo":
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(color, max(2.0, r * 0.28)))
+            p.drawEllipse(QPointF(cx, cy), r * 0.86, r * 0.86)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(color))
+            p.drawEllipse(QPointF(cx, cy), r * 0.12, r * 0.12)
+        elif design == "reactor":
+            for j, (rr, spd, span) in enumerate(((0.95, 0.5, 1.8), (0.78, -0.4, 1.2), (0.62, 0.8, 2.4))):
+                a0 = t * 2 * _math.pi * spd + j
+                path = QPainterPath()
+                for i in range(17):
+                    a = a0 - span / 2 + i * (span / 16)
+                    x, y = cx + _math.cos(a) * r * rr, cy - _math.sin(a) * r * rr
+                    path.moveTo(x, y) if i == 0 else path.lineTo(x, y)
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(color, 2.2, Qt.SolidLine, Qt.RoundCap))
+                p.drawPath(path)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(color))
+            p.drawEllipse(QPointF(cx, cy), r * 0.14, r * 0.14)
+        elif design == "bloom":
+            body = QRadialGradient(cx, cy, r)
+            c = QColor(color)
+            c.setAlpha(150)
+            body.setColorAt(0.0, c)
+            c.setAlpha(0)
+            body.setColorAt(1.0, c)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(body))
+            p.drawEllipse(QPointF(cx, cy), r, r)
+            p.setBrush(QBrush(QColor(color).lighter(160)))
+            p.drawEllipse(QPointF(cx, cy), r * 0.22, r * 0.22)
+        elif design == "droplet":
+            drop = QPainterPath()
+            for i in range(37):
+                ang = i * 2 * _math.pi / 36
+                tip = _math.exp(-((ang - _math.pi / 2) / 0.55) ** 2)
+                rr = r * 0.85 * (1.0 + 0.42 * tip)
+                x, y = cx + rr * _math.cos(ang) * 0.92, cy - rr * _math.sin(ang)
+                drop.moveTo(x, y) if i == 0 else drop.lineTo(x, y)
+            drop.closeSubpath()
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(color))
+            p.drawPath(drop)
+        elif design == "cube":
+            rot = t * 0.5
+            pts = [(cx + r * 0.9 * _math.cos(rot + i * _math.pi / 3),
+                    cy - r * 0.9 * _math.sin(rot + i * _math.pi / 3)) for i in range(6)]
+            p.setPen(QPen(QColor(color).lighter(140), 1.6))
+            p.setBrush(QBrush(QColor(color).darker(130)))
+            p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
+            p.setPen(QPen(QColor(255, 255, 255, 90), 1.0))
+            for x, y in pts:
+                p.drawLine(QPointF(cx, cy), QPointF(x, y))
+        elif design == "equalizer":
+            p.setBrush(Qt.NoBrush)
+            for i in range(14):
+                a = i * 2 * _math.pi / 14
+                ln = r * (0.15 + 0.5 * abs(_math.sin(t * 3 + i * 1.1)))
+                p.setPen(QPen(color, 2.4, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(QPointF(cx + _math.cos(a) * r * 0.35, cy - _math.sin(a) * r * 0.35),
+                           QPointF(cx + _math.cos(a) * (r * 0.35 + ln), cy - _math.sin(a) * (r * 0.35 + ln)))
+        elif design == "crystal":
+            pts = [(cx + r * 0.9 * _math.cos(t * 0.4 + i * _math.pi / 3),
+                    cy - r * 0.9 * _math.sin(t * 0.4 + i * _math.pi / 3)) for i in range(6)]
+            p.setPen(QPen(QColor(color).lighter(140), 1.6))
+            p.setBrush(QBrush(QColor(color).darker(150)))
+            p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
+        elif design == "saturn":
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(color))
+            p.drawEllipse(QPointF(cx, cy), r * 0.5, r * 0.5)
+            p.save()
+            p.translate(cx, cy)
+            p.rotate(-20)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(color).lighter(130), 2.0))
+            p.drawEllipse(QPointF(0, 0), r * 0.95, r * 0.32)
+            p.restore()
+        elif design == "void":
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(5, 5, 8)))
+            p.drawEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(color).lighter(170), 1.8))
+            p.drawEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
+        else:  # orb
+            body = QRadialGradient(cx, cy - r * 0.25, r * 1.15)
+            body.setColorAt(0.0, QColor(color).lighter(140))
+            body.setColorAt(1.0, QColor(color).darker(160))
+            p.setBrush(QBrush(body))
+            p.setPen(QPen(QColor(255, 255, 255, 45), 1))
+            p.drawEllipse(QPointF(cx, cy), r, r)
 
 
 class VoiceDownloadDialog(QDialog):
@@ -1974,6 +2069,7 @@ class SettingsWindow(QMainWindow):
         self.preview = BubblePreview(
             lambda: {k: QColor(c) for k, c in self._colors.items()},
             lambda: self.size_slider.value(),
+            lambda: self.design_combo.currentData() or "orb",
         )
         lay.addWidget(self.preview)
         self._paint_color_buttons()

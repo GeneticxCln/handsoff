@@ -3593,6 +3593,27 @@ class Assistant(QObject):
             except Exception:
                 log.exception("reminder worker pass failed")
 
+    def _settings_watch_worker(self) -> None:
+        """Pick up settings.json saves within seconds, no restart required.
+
+        Stats the file every 3 s; on mtime change the reload runs on the Qt
+        thread via sigCommand (widget resizes are only legal there). The
+        GUI notify is best-effort — this watcher is the backstop, so even a
+        hand-edited settings.json applies live."""
+        last = 0.0
+        try:
+            last = SETTINGS_FILE.stat().st_mtime
+        except OSError:
+            pass
+        while not self._shutdown_event.wait(3.0):
+            try:
+                mtime = SETTINGS_FILE.stat().st_mtime
+            except OSError:
+                continue
+            if mtime != last:
+                last = mtime
+                self.sigCommand.emit("reload-settings")
+
     def _announce_missed(self, missed: list[dict]) -> None:
         if self._is_closed():
             return
@@ -3674,6 +3695,7 @@ class Assistant(QObject):
             self._start_worker(self._announce_missed, args=(missed,),
                                name="missed-reminders")
         self._start_worker(self._reminder_worker, name="reminders")
+        self._start_worker(self._settings_watch_worker, name="settings-watch")
 
     def shutdown(self) -> None:
         self._lifecycle_ensure()
