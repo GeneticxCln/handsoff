@@ -216,6 +216,17 @@ def _stop_recorder_bounded(rec, timeout: float = 3.0):
             except Exception:
                 log.exception("recorder stop failed")
                 box["audio"] = None
+            # A bounded stop that gave up is not the same as a silent press:
+            # this owner thread is still holding the mic and will hand back the
+            # utterance the caller stopped waiting for. It cannot be delivered
+            # any more (the turn is gone), so it is SAID rather than dropped,
+            # otherwise "push-to-talk did nothing" has no trace to explain it.
+            if box.get("abandoned"):
+                late = box.get("audio")
+                log.warning(
+                    "recorder stop finished after the caller gave up — "
+                    "discarding a late capture of %d frames (missed utterance)",
+                    0 if late is None else len(late))
         finally:
             callback = getattr(rec, "_handsoff_stop_done", None)
             with _MIC_OPERATION_STATE_LOCK:
@@ -235,6 +246,9 @@ def _stop_recorder_bounded(rec, timeout: float = 3.0):
     th.start()
     th.join(timeout)
     if th.is_alive():
+        # Tell the owner its result will not be collected, so the late capture
+        # is reported instead of vanishing with the thread.
+        box["abandoned"] = True
         return None, True
     return box.get("audio"), False
 

@@ -1466,20 +1466,58 @@ _whisper_device_choice = _audio._whisper_device_choice
 _is_cuda_error = _audio._is_cuda_error
 
 
+# The loaded models live in TWO places for historical reasons: core.audio owns
+# them (it loads, uses and drops them) and this module mirrors them, because
+# `_speak`, health, doctor and the test suite still ask `H._tts_model`/H._whisper_model
+# "is a model loaded?". A mirror must never undo a drop.
+#
+# It could, and did: the push (`_audio._tts_model = _tts_model`) is read-then-assign,
+# so a settings reload that dropped the cache could land between the two steps and
+# be overwritten by the stale model the caller had just read. That model then came
+# back and STAYED — the load saw a non-None cache, returned the old model, and the
+# adopt published it to this module again — so a voice/device change silently did
+# nothing until the next reload. One lock, held only for the assignment and never
+# across a load, makes push-then-drop and drop-then-push the only two orders, and
+# both end consistent.
+_model_cache_lock = threading.Lock()
+
+
+def _push_model(attr: str) -> None:
+    """Hand this module's copy of a model to core.audio, atomically.
+
+    Takes the attribute NAME, not its value, and reads it inside the lock. A
+    value read at the call site is read *before* the lock is taken, so a drop
+    that lands in between is overwritten by the stale model just the same — the
+    lock would serialise the write while protecting nothing.
+    """
+    with _model_cache_lock:
+        setattr(_audio, attr, globals()[attr])
+
+
+def _adopt_model(attr: str, loaded):
+    """Publish core.audio's model here — unless it was dropped meanwhile.
+
+    The identity check is the whole point: if the cache was dropped while this
+    call was loading, `_audio` no longer holds `loaded` and publishing it back
+    into the mirror would set up exactly the resurrection the lock prevents.
+    The caller still gets the model it asked for either way.
+    """
+    with _model_cache_lock:
+        if getattr(_audio, attr, None) is loaded:
+            globals()[attr] = loaded
+    return loaded
+
+
 def get_whisper():
-    _audio._whisper_model = _whisper_model
-    result = _audio.get_whisper()
-    globals()["_whisper_model"] = _audio._whisper_model
-    return result
+    _push_model("_whisper_model")
+    return _adopt_model("_whisper_model", _audio.get_whisper())
 
 
 def get_tts():
     # Keep old H.get_tts monkeypatches effective without coupling core.audio
     # back to this module (same seam shape as get_whisper above).
-    _audio._tts_model = _tts_model
-    result = _audio.get_tts()
-    globals()["_tts_model"] = _audio._tts_model
-    return result
+    _push_model("_tts_model")
+    return _adopt_model("_tts_model", _audio.get_tts())
 
 
 def warm_tts() -> int:
@@ -1495,12 +1533,15 @@ def warm_tts() -> int:
 
 def transcribe(audio_int16: np.ndarray) -> str:
     # Keep old H.get_whisper monkeypatches effective without coupling core.audio
-    # back to this module.
-    _audio._whisper_cpu_fallback = _whisper_cpu_fallback
-    _audio._whisper_model = _whisper_model
+    # back to this module. The model itself is published through `get_whisper`
+    # (core.audio calls it via model_getter), so only the cpu-fallback flag is
+    # mirrored here — read inside the lock for the same reason as the models.
+    _push_model("_whisper_model")
+    with _model_cache_lock:
+        _audio._whisper_cpu_fallback = globals()["_whisper_cpu_fallback"]
     result = _audio.transcribe(audio_int16, model_getter=get_whisper)
-    globals()["_whisper_model"] = _audio._whisper_model
-    globals()["_whisper_cpu_fallback"] = _audio._whisper_cpu_fallback
+    with _model_cache_lock:
+        globals()["_whisper_cpu_fallback"] = _audio._whisper_cpu_fallback
     return result
 
 
@@ -4726,19 +4767,24 @@ class Assistant(QObject):
         SETTINGS.clear()
         SETTINGS.update(new)
         reload_derived_settings()
+        # Both copies go under `_model_cache_lock`, the same lock the mirror
+        # uses: dropping one side while a transcribe/get_tts call is between
+        # its push and its load is how a dropped model came back and stayed.
         if (SETTINGS.get("whisper_size"), SETTINGS.get("whisper_device")) != old_whisper:
-            globals()["_whisper_model"] = None
-            try:
-                _audio._whisper_model = None
-            except AttributeError:
-                pass
+            with _model_cache_lock:
+                globals()["_whisper_model"] = None
+                try:
+                    _audio._whisper_model = None
+                except AttributeError:
+                    pass
             log.info("live settings reload: whisper cache dropped (loads on next turn)")
         if SETTINGS.get("tts_reference") != old_voice:
-            globals()["_tts_model"] = None
-            try:
-                _audio._tts_model = None
-            except AttributeError:
-                pass
+            with _model_cache_lock:
+                globals()["_tts_model"] = None
+                try:
+                    _audio._tts_model = None
+                except AttributeError:
+                    pass
             log.info("live settings reload: tts cache dropped "
                      "(reconditions on the next turn)")
         global WINDOW_PX, BUBBLE_R0, GLOW_PAD, GEOM_K
@@ -6997,6 +7043,11 @@ class ControlServer:
         # touch OUR path, or a server left running from earlier would create a
         # socket at whatever path the global now names (measured: it did).
         self._bound_path: str | None = None
+        # The last slow diagnostic worker (health/doctor). A timed-out worker
+        # cannot be cancelled — it is blocked in an Ollama or nvidia-smi call —
+        # so without this the accept loop would start a fresh one per request
+        # and pile them up against a wedged backend.
+        self._diag_worker: threading.Thread | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -7113,7 +7164,21 @@ class ControlServer:
                     def _with_timeout(fn, timeout_s: float):
                         """Run slow diagnostics off the accept thread: the
                         accept loop must stay responsive (1s accept timeout)
-                        even when Ollama/nvidia-smi wedge."""
+                        even when Ollama/nvidia-smi wedge.
+
+                        At most one such worker exists at a time. A timed-out
+                        worker keeps running (it is blocked in the backend
+                        call; nothing here can cancel it), so spawning another
+                        per request is how repeated `health`/`doctor` against a
+                        wedged Ollama piles up threads that never return. A
+                        second request is refused fast and by name instead of
+                        adding to the pile.
+                        """
+                        prev = self._diag_worker
+                        if prev is not None and prev.is_alive():
+                            raise TimeoutError(
+                                "a previous diagnostic is still running "
+                                "(the backend is not answering)")
                         box: dict = {}
 
                         def _run() -> None:
@@ -7122,7 +7187,9 @@ class ControlServer:
                             except Exception as e:  # noqa: BLE001
                                 box["err"] = e
 
-                        t = threading.Thread(target=_run, daemon=True)
+                        t = threading.Thread(target=_run, daemon=True,
+                                             name="diag-worker")
+                        self._diag_worker = t
                         t.start()
                         t.join(timeout_s)
                         if t.is_alive():
@@ -7141,9 +7208,13 @@ class ControlServer:
                                 snap = _with_timeout(
                                     self._assistant.mic_health, 4.0)
                                 reply = json.dumps(snap, ensure_ascii=False)
-                            except Exception:
+                            except Exception as e:  # noqa: BLE001
                                 log.exception("health snapshot failed")
-                                reply = "error: health snapshot failed (see log)"
+                                # Name the cause in the reply too: the commonest
+                                # one is "a previous diagnostic is still running",
+                                # and "see log" sends the user digging for a
+                                # sentence we already have.
+                                reply = f"error: health snapshot failed: {e}"
                         elif action == "level":
                             # deliberately NOT wrapped in _with_timeout: it reads
                             # three scalars and the Voice meter polls it ~20x/s,
@@ -7161,9 +7232,9 @@ class ControlServer:
                         elif action == "doctor":
                             try:
                                 reply = _with_timeout(run_doctor, 4.5)
-                            except Exception:
+                            except Exception as e:  # noqa: BLE001
                                 log.exception("doctor report failed")
-                                reply = "error: doctor report failed (see log)"
+                                reply = f"error: doctor report failed: {e}"
                         elif action == "say":
                             reply = self._assistant.say_preview(action_arg)
                         elif action == "settings":

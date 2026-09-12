@@ -207,13 +207,37 @@ PY_EOF
             rm -f "$BIN_DIR/$rel" && _deployed=1
         done
     fi
-    rm -rf "$BIN_DIR/core"
     if [ "$_deployed" = "0" ]; then
         # No manifest (an older install, or it was removed): fall back to the
         # hard-imported floor plus the two optional/non-Python artifacts.
         for rel in $TOP_REQUIRED handsoff-settings.py handsoff-restart; do
             rm -f "$BIN_DIR/$rel"
         done
+        for m in $CORE_REQUIRED; do
+            rm -f "$BIN_DIR/core/$m.py"
+        done
+        # The checkout IS the module list (this script lives in it), which is
+        # the same rule staging uses. The floor alone would leave every module
+        # added later (core/theme.py, …) behind, so the directory could never
+        # become empty enough to remove and uninstall would litter.
+        for src in "$HERE"/core/*.py; do
+            if [ -f "$src" ]; then
+                rm -f "$BIN_DIR/core/$(basename "$src")"
+            fi
+        done
+    fi
+    # Never `rm -rf` this directory. ~/.local/bin is a SHARED user directory and
+    # `core` is a plausible name for somebody else's package; the manifest loop
+    # above has already removed every file this install deployed. Drop the
+    # directory only when it is ours to drop — empty, or holding nothing but
+    # bytecode we generated.
+    if [ -d "$BIN_DIR/core" ]; then
+        if find "$BIN_DIR/core" -mindepth 1 \
+                ! -name '__pycache__' ! -name '*.pyc' 2>/dev/null | head -n1 | grep -q .; then
+            echo "    kept $BIN_DIR/core — it still holds files this install did not deploy"
+        else
+            rm -rf "$BIN_DIR/core"
+        fi
     fi
     systemctl --user daemon-reload 2>/dev/null || true
     # kill only real bubble processes: python executable + EXACT cmdline match.
@@ -378,14 +402,20 @@ else
 fi
 
 echo "==> [3/8] Directories"
-mkdir -p "$BIN_DIR" "$CONF_DIR/whisper-model" "$STATE_DIR"
+mkdir -p "$BIN_DIR" "$CONF_DIR/whisper-model" "$CONF_DIR/releases" "$STATE_DIR"
 
 echo "==> [4/8] Staging the release (compile-gated, rollback-able)"
 # Nothing is installed until a complete staged copy has passed the compile
 # and import gates; the currently-deployed set is kept at
 # $CONF_DIR/releases/prev so `install.sh --rollback` can restore it.
 RELEASES_DIR="$CONF_DIR/releases"
-STAGE_DIR="$RELEASES_DIR/staged.$$"
+# mktemp, never a PID-suffixed name: the PID is predictable and two installs
+# can run at once (the bubble's own self-edit restart racing a manual run),
+# which would have them staging into, gating and switching the SAME directory.
+STAGE_DIR="$(mktemp -d "$RELEASES_DIR/staged.XXXXXX")" || {
+    echo "    FATAL: could not create a staging directory under $RELEASES_DIR" >&2
+    exit 1
+}
 PREV_DIR="$RELEASES_DIR/prev"
 mkdir -p "$STAGE_DIR/core"
 stage_fail() {

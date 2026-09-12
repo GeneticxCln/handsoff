@@ -44,3 +44,18 @@ tests/report.xml
 voice-test.wav
 voice-test-*.wav
 niri-keybinds.kdl
+# Corrupt-config quarantines written by core.settings._quarantine_bad
+# (`settings.json.bad-<timestamp>-<pid>`). They are the damaged original, kept
+# for inspection — never source. README/GAP_ANALYSIS live in the repo, so a
+# quarantine of a repo-resident settings file would otherwise be committed.
+*.bad-*
+# Audio scratch at the repo ROOT only: voice-clip experiments and samples
+# synthesised while working on TTS (a 6 MB wav is not source). Scoped to the
+# root with a leading slash so a future fixture under tests/ is still trackable.
+/*.wav
+/*.flac
+/*.mp3
+/*.m4a
+# `testpaths = tests`, so a root-level `test.py` is a scratch file by
+# construction — pytest never collects it, but `git add -A` would.
+/test.py

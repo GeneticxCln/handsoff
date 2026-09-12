@@ -93,6 +93,90 @@ class TestCoreLifecycle:
         assert counter["gen"] == 2
 
 
+class _YieldingList(list):
+    """A list whose item access releases the GIL.
+
+    `counter[0] += 1` is load-add-store, and what makes it racy is the chance
+    of a thread switch between the two. This container makes that chance a
+    certainty, so a missing lock fails every run instead of once in a while —
+    measured earlier, the plain one-liner produced 0 duplicates in 64 000
+    claims under the GIL, which is why the race needed a shape that yields.
+    """
+
+    def __getitem__(self, i):
+        value = list.__getitem__(self, i)
+        time.sleep(0.002)
+        return value
+
+    def __setitem__(self, i, value):
+        time.sleep(0.002)
+        list.__setitem__(self, i, value)
+
+
+class _YieldingDict(dict):
+    """The dict-counter shape, with the same deliberate gap."""
+
+    def get(self, key, default=None):
+        value = dict.get(self, key, default)
+        time.sleep(0.002)
+        return value
+
+    def __setitem__(self, key, value):
+        time.sleep(0.002)
+        dict.__setitem__(self, key, value)
+
+
+class TestTurnGenerationIsAtomic:
+    """Two turns must never claim the SAME generation.
+
+    The generation is what the staleness checks (`gen != self._gen`) and the
+    gen-keyed transcript cache trust, so a duplicate lets one utterance's text
+    be answered in another turn. `next_turn` is the exported form of that
+    counter and is reachable from any embedder, so it takes the lock itself
+    rather than relying on its callers.
+    """
+
+    @staticmethod
+    def _claim(lifecycle, counter, results, barrier):
+        barrier.wait(timeout=5)
+        results.append(lifecycle.next_turn(counter).generation)
+
+    def test_concurrent_claims_are_all_distinct_list_counter(self):
+        import core.lifecycle as lifecycle
+
+        counter = _YieldingList([0])
+        results: list = []
+        barrier = threading.Barrier(4)
+        threads = [threading.Thread(target=self._claim,
+                                    args=(lifecycle, counter, results, barrier))
+                   for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert len(results) == 4, "a claimant never returned"
+        assert len(set(results)) == 4, (
+            f"two turns claimed the same generation: {sorted(results)}")
+        assert counter[0] == 4
+
+    def test_concurrent_claims_are_all_distinct_dict_counter(self):
+        import core.lifecycle as lifecycle
+
+        counter = _YieldingDict({"gen": 0})
+        results: list = []
+        barrier = threading.Barrier(4)
+        threads = [threading.Thread(target=self._claim,
+                                    args=(lifecycle, counter, results, barrier))
+                   for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert len(set(results)) == 4, (
+            f"two turns claimed the same generation: {sorted(results)}")
+        assert counter["gen"] == 4
+
+
 class TestSourceIntegrity:
     @pytest.mark.parametrize("name", ["handsoff.py", "handsoff-settings.py"])
     def test_compiles(self, name):

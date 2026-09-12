@@ -26,6 +26,108 @@ from conftest import HERE as ROOT, _load, _user_site, wait_for
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
 
+class TestModelCacheDropIsFinal:
+    """A settings reload drops the model caches; a call in flight must not undo it.
+
+    The mirror between this module and core.audio was read-then-assign, so a
+    drop landing between the read and the write was overwritten by the stale
+    model the caller had just read — and it STAYED: the load saw a non-None
+    cache, returned the old model, and the adopt published it here again. A
+    voice or device change then silently did nothing until the next reload.
+    """
+
+    def test_a_drop_landing_as_the_push_takes_the_lock_is_not_overwritten(
+            self, H, monkeypatch):
+        stale = object()
+        monkeypatch.setattr(H, "_tts_model", stale)
+        monkeypatch.setattr(H._audio, "_tts_model", stale)
+        real = threading.Lock()
+
+        class DropThenLock:
+            """The reload's drop runs exactly as the push takes the lock.
+
+            This is the interleaving the lock exists to remove: a push that
+            reads the module copy BEFORE taking the lock can be overtaken by a
+            drop and then write the stale model straight back.
+            """
+
+            def __init__(self):
+                self.fired = False
+
+            def __enter__(self):
+                if not self.fired:
+                    self.fired = True
+                    H._tts_model = None
+                    H._audio._tts_model = None
+                real.acquire()
+                return self
+
+            def __exit__(self, *exc):
+                real.release()
+                return False
+
+        monkeypatch.setattr(H, "_model_cache_lock", DropThenLock())
+        H._push_model("_tts_model")
+        assert H._audio._tts_model is None, (
+            "the push overwrote a drop that had already happened — the dropped "
+            "model comes back and stays")
+
+    def test_adopt_does_not_republish_a_model_the_drop_removed(
+            self, H, monkeypatch):
+        loaded = object()
+        monkeypatch.setattr(H, "_tts_model", None)
+        monkeypatch.setattr(H._audio, "_tts_model", loaded)
+        H._adopt_model("_tts_model", loaded)
+        assert H._tts_model is loaded, "a model audio still holds must be adopted"
+
+        # The reload dropped the cache while this call was loading: publishing
+        # the model back here is what made the drop ineffective next call.
+        H._tts_model = None
+        H._audio._tts_model = None
+        H._adopt_model("_tts_model", loaded)
+        assert H._tts_model is None, (
+            "a model the drop removed must not be republished into the mirror")
+
+
+class _SlowStopRecorder:
+    """A recorder whose stop() blocks until released, then hands back frames."""
+
+    def __init__(self, frames: int = 500):
+        self.release = threading.Event()
+        self._frames = frames
+        self._handsoff_stop_done = None
+
+    def stop(self):
+        self.release.wait(timeout=5)
+        return np.zeros(self._frames, dtype=np.int16)
+
+
+class TestBoundedStopReportsLateAudio:
+    """A stop that times out must not look like a press that captured nothing.
+
+    The owner thread keeps the mic and finishes anyway; its utterance cannot be
+    delivered once the turn is gone, so it is said (frames, in the journal)
+    rather than vanishing with the thread. Without this, "push-to-talk did
+    nothing" leaves no trace at all.
+    """
+
+    def test_a_late_capture_is_reported_rather_than_dropped(self, H, caplog):
+        rec = _SlowStopRecorder(frames=500)
+        with caplog.at_level("WARNING", logger="handsoff"):
+            audio, wedged = H._stop_recorder_bounded(rec, timeout=0.05)
+            assert (audio, wedged) == (None, True), (
+                "a bounded stop that gave up reports no audio and says so")
+            rec.release.set()
+            deadline = time.time() + 5
+            while time.time() < deadline and not any(
+                    "late capture" in r.getMessage() for r in caplog.records):
+                time.sleep(0.01)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("late capture" in m and "500" in m for m in messages), (
+            "the discarded late utterance must be reported with its size: "
+            f"{messages}")
+
+
 def test_core_audio_imports_independently():
     """The extracted primitives must not require the Qt/application module."""
     mod = _load("core_audio_compat", HERE / "core" / "audio.py")
@@ -1368,6 +1470,29 @@ class TestHandsfreeConfirm:
                 sock_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def test_a_wedged_diagnostic_is_not_piled_up(self, H, server, monkeypatch):
+        """Repeated `health` against a wedged backend must not spawn a worker each.
+
+        A timed-out diagnostic worker cannot be cancelled — it is blocked in
+        the backend call — so spawning one per request is how repeated
+        `health`/`doctor` against a stalled Ollama piles up threads that never
+        return. The accept loop is serial, so the second request arrives while
+        the first's worker is still wedged: it must be refused by name.
+        """
+        sock_path = H.CONTROL_SOCK
+        from test_lifecycle import TestControlSocket
+        monkeypatch.setattr(H.Assistant, "mic_health",
+                            lambda self: time.sleep(10) or {})
+
+        first = TestControlSocket._roundtrip(sock_path, "health")
+        assert "timed out" in first, first
+
+        second = TestControlSocket._roundtrip(sock_path, "health")
+        assert "still running" in second, (
+            f"a second diagnostic was started instead of being refused: {second}")
+        workers = [t for t in threading.enumerate() if t.name == "diag-worker"]
+        assert len(workers) == 1, f"{len(workers)} diagnostic workers piled up"
 
     def test_healthy_toggle_on_confirms(self, H, _no_ollama_probe):
         a, spoken = self._mk(H, "listening")

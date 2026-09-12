@@ -3,6 +3,92 @@
 Date: 2026-09-09 · Phase 0/1/2 of the external task list are closed (see the
 Addendum below); remaining consciously-accepted items are at the bottom.
 
+## Addendum — 2026-09-12 third audit batch: turn-counter atomicity, the model
+## mirror that undid a reload, and two shared-directory hazards
+
+Six real defects fixed, one finding disproved by measurement, one left as
+documented. New guards: **7/7 mutations of the fixes back to their old
+behaviour were caught**; 929 tests (was 920) green in six orderings, coverage
+78.13% ≥ 70, `ci/compile_all.py` clean.
+
+* **The exported turn counter was not atomic.** `core.lifecycle.next_turn` did
+  `counter[0] += 1` then read the value back — load-add-store, then a separate
+  read — with no lock. It is re-exported as `H.next_turn`, so any embedder can
+  reach it, and the generation is exactly what the staleness checks
+  (`gen != self._gen`) and the gen-keyed transcript cache trust: two turns
+  claiming the same generation lets one utterance's text be answered in
+  another turn. The increment and the read are now one critical section. The
+  guard is deterministic rather than a race probe: a list/dict subclass that
+  sleeps inside `__getitem__`/`__setitem__` makes the interleaving certain, so
+  removing the lock fails every run — the earlier measurement is why, since
+  the plain one-liner produced **0 duplicates in 64 000 claims** under the GIL
+  and would have made a naive stress test green forever.
+* **A settings reload's model drop could be undone by a call in flight.** The
+  model caches live in two places for historical reasons — `core.audio` owns
+  them, and `handsoff.py` mirrors them so `_speak`, health, doctor and the
+  tests can ask `H._tts_model` "is a model loaded?". The mirror was
+  read-then-assign, so a drop landing between the two steps was overwritten by
+  the stale model the caller had just read, and it **stayed**: the load saw a
+  non-None cache, returned the old model, and the adopt published it into the
+  mirror again. A voice or device change then silently did nothing until the
+  next reload. Three changes: the push reads the module copy **inside** the
+  lock (a value read at the call site is read before the lock is taken, so the
+  lock would have serialised the write and protected nothing — that was my own
+  first attempt, caught by reviewing the ordering rather than by a test), the
+  reload's drop takes the same lock, and the adopt refuses to republish a
+  model `core.audio` no longer holds.
+* **The uninstaller `rm -rf`'d a shared directory.** `~/.local/bin` is a user
+  directory, `core` is a plausible name for someone else's package, and the
+  wipe ran unconditionally — including when there was **no manifest**, i.e.
+  when nothing at all had named the directory's contents. The manifest loop
+  already removed every file this install deployed, so the directory is now
+  dropped only when it is ours to drop (empty, or holding nothing but bytecode
+  we generated) and saying so when it is kept. The no-manifest fallback also
+  removes the checkout's own `core/*.py` — the same rule staging uses — because
+  the imported floor alone would leave every module added later behind and the
+  directory could never become empty.
+* **The staging directory was predictable.** `staged.$$` is PID-derived, and
+  nothing stops a second install starting while the first runs (the bubble's
+  own self-edit restart racing a manual `./install.sh`), in which case both
+  stage, gate and switch the **same** directory. It is created with `mktemp -d`
+  now, and the releases directory it lives in is created first, or `mktemp`
+  fails on a fresh install.
+* **Timed-out diagnostics piled up threads.** A diagnostic worker cannot be
+  cancelled — it is blocked in an Ollama or `nvidia-smi` call — so starting one
+  per request is how repeated `health`/`doctor` against a wedged backend
+  accumulates threads that never return. At most one runs at a time, and a
+  second request is refused by name instead of joining the pile; the reply now
+  carries the cause instead of "see log".
+* **A bounded stop that gave up dropped the utterance silently.** `stop()`
+  timing out returns `(None, True)` and the caller logs `wedged=1`, but the
+  owner thread keeps the mic and finishes anyway — and the audio it captured
+  was discarded with the thread, so "push-to-talk did nothing" left no trace
+  that anything was ever spoken. The late capture is now reported as a WARNING
+  with its frame count.
+* **Repo hygiene.** The untracked voice-clip scratch (`optimus.wav` 6.1 MB,
+  `optimus_clip.wav`, `output.wav`) and the root `test.py` were one `git add -A`
+  from being committed; `.gitignore` now covers root-level audio (scoped with a
+  leading slash so a future fixture under `tests/` stays trackable) and a root
+  `test.py` (`testpaths = tests`, so such a file is scratch by construction).
+  Corrupt-config quarantines (`*.bad-<ts>-<pid>`) are ignored for the same
+  reason `*.bak-*` already was.
+* **Disproved by measurement: the ydotool probe does not false-positive.** The
+  finding was that a unix **DGRAM** `connect()` succeeds with no server, so a
+  dead daemon reads as reachable. Measured on this kernel: a socket inode with
+  no listener behind it returns **`ECONNREFUSED (111)` for both DGRAM and
+  STREAM** `connect()`, so the probe cannot report a dead daemon as reachable.
+  What remains is narrower and stated rather than fixed: a daemon that is alive
+  but wedged still accepts the connection, because the probe is a connect and
+  not a round-trip. A round-trip needs ydotoold's wire struct, and the
+  previously proposed `/proc`-inode alternative was already measured to break a
+  root-owned daemon — so the honest position is a documented limitation.
+* **Left alone, deliberately: the watcher's residual ReDoS surface.** Nested
+  quantifiers are refused and the blast radius is one daemon thread whose
+  cursor advance is bounded, so an alternation like `(a|aa)+` can still burn
+  that thread. It matters only if watcher patterns become user-facing free
+  text, which they are not; changing it now would trade a documented bounded
+  risk for an unbounded one (`re` has no timeout).
+
 ## Addendum — 2026-09-12 speech engine migration: Piper -> chatterbox-turbo
 
 Piper is gone from the tree: the engine is now **chatterbox-turbo**, the voice

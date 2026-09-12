@@ -661,6 +661,72 @@ class TestInstallerPurgeBackup:
         assert result.returncode == 0, result.stderr
         assert len(list(home.glob("handsoff-backup-*.tar.gz"))) == 2
 
+    def test_uninstall_keeps_a_foreign_core_directory(self, tmp_path):
+        """`~/.local/bin` is shared; `core/` is not ours to `rm -rf`.
+
+        The uninstaller removed exactly what the manifest named and then wiped
+        the whole directory anyway. Any unrelated package installed under a
+        name as plausible as `core` was deleted with it — and the directory is
+        never solely ours: the manifest can be missing (an older install), in
+        which case nothing named its contents at all.
+        """
+        home = tmp_path / "home"
+        bin_dir = home / ".local" / "bin"
+        core = bin_dir / "core"
+        core.mkdir(parents=True)
+        (core / "__init__.py").write_text("# ours\n")
+        (core / "audio.py").write_text("# ours\n")
+        (core / "someone_elses_module.py").write_text("# NOT ours\n")
+        conf = home / ".config" / "handsoff"
+        conf.mkdir(parents=True)
+        (conf / "deployment.json").write_text(json.dumps({
+            "files": {"handsoff.py": {}, "core/__init__.py": {},
+                      "core/audio.py": {}}}))
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+        (fake_bin / "systemctl").chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--uninstall"],
+            env={**os.environ, "HOME": str(home),
+                 "XDG_STATE_HOME": str(home / ".local" / "state"),
+                 "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]},
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not (core / "audio.py").exists(), "our manifest-named file must go"
+        assert (core / "someone_elses_module.py").exists(), (
+            "a file this install never deployed was deleted with the directory")
+        assert "kept" in result.stdout and "did not deploy" in result.stdout, (
+            f"keeping it must be said, not silent: {result.stdout!r}")
+
+    def test_uninstall_drops_core_only_when_it_is_ours_to_drop(self, tmp_path):
+        """With no manifest the fallback removes the floor, then the directory
+        only when nothing foreign is left in it."""
+        home = tmp_path / "home"
+        core = home / ".local" / "bin" / "core"
+        core.mkdir(parents=True)
+        (core / "audio.py").write_text("# ours\n")
+        (core / "theme.py").write_text("# ours\n")
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+        (fake_bin / "systemctl").chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--uninstall"],
+            env={**os.environ, "HOME": str(home),
+                 "XDG_STATE_HOME": str(home / ".local" / "state"),
+                 "PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]},
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not (core / "audio.py").exists(), "the imported floor must be removed"
+        assert not core.exists(), (
+            "an empty core/ directory is ours to remove — otherwise uninstall "
+            "leaves litter behind")
+
     def test_purge_refuses_invalid_tar_listing(self, tmp_path):
         result, home, conf, state = self._run_purge(
             tmp_path,
@@ -742,6 +808,22 @@ class TestInstallerRehearsal:
         top = {p for p in rel if "/" not in p} | declared_top
         core = {p.split("/", 1)[1] for p in rel if p.startswith("core/")} | declared_core
         return top, core
+
+    def test_staging_directory_cannot_collide_between_two_installs(self):
+        """`staged.$$` is predictable, so two installs shared one stage.
+
+        Nothing stops a second install starting while the first runs — the
+        bubble's own self-edit restart can race a manual `./install.sh`, and
+        both would stage, gate and switch the SAME directory. The staging path
+        is therefore created by `mktemp -d`; the releases directory it lives in
+        has to exist first, or mktemp fails on a fresh install.
+        """
+        src = (HERE / "install.sh").read_text(encoding="utf-8")
+        assert 'STAGE_DIR="$(mktemp -d' in src, (
+            "the staging directory must be unpredictable")
+        assert "staged.$$" not in src
+        assert '"$CONF_DIR/releases"' in src.split("mktemp -d")[0], (
+            "the staging parent must be created before mktemp -d runs")
 
     def test_rehearsal_deploys_every_module_the_project_owns(self, tmp_path):
         """Regression: core/theme.py was added and never installed.

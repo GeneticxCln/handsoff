@@ -28,6 +28,9 @@ class TurnState:
     result: Any = None
 
 
+_COUNTER_LOCK = threading.Lock()
+
+
 def next_turn(counter: list[int] | dict) -> TurnState:
     """Advance the mutable counter and return a fresh TurnState.
 
@@ -37,13 +40,21 @@ def next_turn(counter: list[int] | dict) -> TurnState:
 
     Returns:
         A new TurnState with incremented generation and fresh cancel/done events.
+
+    The increment and the read are one critical section. `counter[0] += 1` is
+    load-add-store and the generation is what the staleness checks and the
+    gen-keyed transcript cache trust, so two concurrent callers must never be
+    handed the same value — one utterance would then be answered with another's
+    text. The lock is module-level because the counter container belongs to the
+    caller and one call may be made per container from different threads.
     """
-    if isinstance(counter, list):
-        counter[0] += 1
-        gen = counter[0]
-    else:
-        counter["gen"] = counter.get("gen", 0) + 1
-        gen = counter["gen"]
+    with _COUNTER_LOCK:
+        if isinstance(counter, list):
+            counter[0] += 1
+            gen = counter[0]
+        else:
+            counter["gen"] = counter.get("gen", 0) + 1
+            gen = counter["gen"]
     return TurnState(
         generation=gen,
         cancel=threading.Event(),
