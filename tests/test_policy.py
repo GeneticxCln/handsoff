@@ -325,6 +325,10 @@ class TestSpawnInterpreterBoundary:
             class P: returncode = 0; stdout = ""; stderr = ""
             return P()
         monkeypatch.setattr("subprocess.run", fake_run)
+        # The spawn gate ends with `shutil.which(target)`, so the test needs a
+        # `firefox` to exist — an image without a browser turned "GUI apps are
+        # allowed" into "no program named 'firefox' is installed".
+        monkeypatch.setattr("shutil.which", lambda n: f"/usr/bin/{n}")
         out, err = belt.execute(
             "run_command", {"command": "niri msg action spawn -- firefox"})
         assert not err, out

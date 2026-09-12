@@ -414,6 +414,22 @@ def bubble_designs_render_at_energy_extremes():
 
     widget = bubble.BubbleWidget(_Stub())
     widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    from PySide6.QtGui import QImage
+
+    def _pixels():
+        # The widget's paint, onto a surface we cleared ourselves. grab()
+        # reads the platform's backing store, which is not a valid instrument
+        # for a WA_TranslucentBackground widget -- the background is never
+        # erased -- the same conclusion that moved the overflow sweep onto a
+        # cleared QImage. It also made this measurement depend on the
+        # container's surface behaving like the developer's: in CI all 24
+        # design/slider pairs reported zero changed pixels on the same Qt
+        # version that passes here.
+        img = QImage(widget.size(), QImage.Format_ARGB32)
+        img.fill(0)
+        widget.render(img)
+        return bytes(img.constBits())
+
     designs = list(getattr(settings_app.SCHEMA, "BUBBLE_DESIGNS", ("orb",)))
     states = ("idle", "listening", "thinking", "speaking")
     painted = 0
@@ -453,19 +469,28 @@ def bubble_designs_render_at_energy_extremes():
         bubble.ANIM_ENERGY = 1.0
         bubble.BUBBLE_ACCENT = 0.5
         setattr(bubble, key, lo)
-        before = bytes(widget.grab().toImage().constBits())
+        before = _pixels()
         setattr(bubble, key, hi)
-        after = bytes(widget.grab().toImage().constBits())
+        after = _pixels()
         n = min(len(before), len(after))
         return sum(1 for i in range(0, n - 3, 4)
                    if any(x != y for x, y in zip(before[i:i + 3], after[i:i + 3])))
 
-    weak = [f"{d}/{k}"
-            for d in designs
-            for k, lo, hi in (("BUBBLE_ACCENT", 0.0, 1.0),
-                              ("ANIM_ENERGY", 0.2, 2.0))
-            if _changed(d, k, lo, hi) < 100]
-    assert not weak, "slider changes no visible pixels on: " + ", ".join(weak)
+    counts = {f"{d}/{k}": _changed(d, k, lo, hi)
+              for d in designs
+              for k, lo, hi in (("BUBBLE_ACCENT", 0.0, 1.0),
+                                ("ANIM_ENERGY", 0.2, 2.0))}
+    weak = [name for name, n in counts.items() if n < 100]
+    if weak:
+        # Say WHICH instrument failed to see anything: a surface that paints
+        # nothing at all is a different problem from one design ignoring a
+        # slider, and the two have been confused once already.
+        blank = sum(1 for b in _pixels() if b)
+        raise AssertionError(
+            "slider changes no visible pixels on: " + ", ".join(weak) +
+            f"\\n  widget {widget.size().width()}x{widget.size().height()}"
+            f"  non-zero bytes in a cleared render: {blank}"
+            f"  changed-pixel counts: {sorted(set(counts.values()))[:8]}")
 
     # the neutral defaults must reproduce the historical framing exactly.
     # _energy_ui is a smoothed chase (it converges during _on_tick), so pin it

@@ -546,6 +546,11 @@ class TestScreenVision:
             return P()
         monkeypatch.setattr("subprocess.run", fake_run)
         monkeypatch.setattr("subprocess.Popen", lambda *a, **k: None)
+        # Resolution is `shutil.which`, so faking only the subprocess left this
+        # test needing a real `foot` in the image: with none it returned
+        # "no program matching 'terminal'" and the alias assertions never ran.
+        monkeypatch.setattr(H.shutil, "which",
+                            lambda n: f"/usr/bin/{n}" if n == "foot" else None)
         out, err = belt.execute("open_app", {"app": "terminal"})
         assert not err and "launched foot" in out
         out, err = belt.execute("open_app", {"app": "python"})

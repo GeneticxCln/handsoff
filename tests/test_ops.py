@@ -81,6 +81,15 @@ class TestTypingSelftestWiring:
         monkeypatch.setattr(H.ToolBelt, "_niri_msg", staticmethod(lambda *a, **k: FakeMsg()))
         monkeypatch.setattr(H.shutil, "which",
                             lambda n: "/usr/bin/foot" if n == "foot" else None)
+        # The daemon probe is the one piece of the selftest that reads the real
+        # machine, and with no live socket every later stage is skipped: the
+        # refusal results this test is about never run. Reproduced by pointing
+        # XDG_RUNTIME_DIR at a directory with no socket. Stage 1 is still
+        # exercised — by its own test above — so it is stubbed here.
+        monkeypatch.setattr(H.ToolBelt, "_ydotool_socket",
+                            staticmethod(lambda: "/tmp/fake-ydotool.sock"))
+        monkeypatch.setattr(H.ToolBelt, "_socket_connectable",
+                            staticmethod(lambda p: True))
         monkeypatch.setattr(H.ToolBelt, "_terminal_marker",
                             classmethod(lambda cls, w: "foot"))
         monkeypatch.setattr(H.ToolBelt, "_typing_guard",
@@ -798,10 +807,17 @@ class TestInstallerRehearsal:
         declared_core = {"__init__.py", "settings.py", "audio.py", "brain.py",
                          "tools.py", "doctor.py", "lifecycle.py", "calendar.py",
                          "assistant.py"}
-        tracked = subprocess.run(
-            ["git", "-C", str(HERE), "ls-files", "--", "*.py"],
-            capture_output=True, text=True)
-        if tracked.returncode != 0:
+        # A machine without git raises FileNotFoundError here rather than
+        # returning non-zero, so the fallback below never applied and the test
+        # errored instead of degrading — the mirror-image of the installer's
+        # own rule, which globs when git is missing.
+        try:
+            tracked = subprocess.run(
+                ["git", "-C", str(HERE), "ls-files", "--", "*.py"],
+                capture_output=True, text=True)
+        except OSError:
+            tracked = None
+        if tracked is None or tracked.returncode != 0:
             return (set(p.name for p in HERE.glob("*.py")),
                     set(p.name for p in (HERE / "core").glob("*.py")))
         rel = [line for line in tracked.stdout.split() if line.endswith(".py")]

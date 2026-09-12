@@ -1256,12 +1256,19 @@ class TestLiveMicProbe:
         assert len(handed) == 1 and handed[0].dtype == np.int16
         assert "speech captured" in p.snapshot()["last_event"]
 
-    def test_transcribe_worker_updates_snapshot(self):
+    def test_transcribe_worker_updates_snapshot(self, monkeypatch):
         mod, P = self._load_probe_class()
         p = P()
         p._running = True
         me = threading.current_thread()
         p._transcribe_thread = me                     # we ARE the worker
+        # The worker's contract is the MAPPING (empty text ->
+        # "(unintelligible)"). Leaving the real whisper in the path made this
+        # test depend on a model being loadable: with none it raised, the
+        # worker took its error branch, and the transcript stayed "" — green
+        # wherever the model is cached, red in a container, for a reason that
+        # has nothing to do with the probe.
+        monkeypatch.setattr(mod.H, "transcribe", lambda audio: "")
         p._transcribe_worker(np.zeros(1600, dtype=np.int16))
         s = p.snapshot()
         assert s["transcript"] == "(unintelligible)"  # silence → empty text

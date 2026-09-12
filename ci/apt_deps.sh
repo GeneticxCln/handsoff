@@ -42,7 +42,12 @@ install_one libasound2t64 libasound2 || status=1
 # bash: the Docker executor's shell. libgl*/libegl/libxkbcommon/libfontconfig:
 # offscreen Qt. libgomp1: onnxruntime/ctranslate2 wheels. libportaudio2: what
 # `ctypes.util.find_library('portaudio')` has to resolve at `import sounddevice`.
-for pkg in bash libgl1 libegl1 libxkbcommon0 libfontconfig1 libportaudio2 libgomp1; do
+# git: install.sh derives the shipped set from `git ls-files` and falls back to
+# globbing without it, so a git-less job tests the fallback while the tests
+# assert the tracked-set rule. procps: the read-only system probes the policy
+# tests actually execute (`uptime`, `free`).
+for pkg in bash libgl1 libegl1 libxkbcommon0 libfontconfig1 libportaudio2 \
+           libgomp1 git procps; do
     install_one "$pkg" || status=1
 done
 rm -rf /var/lib/apt/lists/*
