@@ -487,10 +487,13 @@ def bubble_designs_render_at_energy_extremes():
         # slider, and the two have been confused once already.
         blank = sum(1 for b in _pixels() if b)
         raise AssertionError(
+            # all one line on purpose: this text lives inside GUI_DRIVER, so an
+            # escaped newline here would be a real newline in the generated
+            # source and an unterminated string literal there
             "slider changes no visible pixels on: " + ", ".join(weak) +
-            f"\\n  widget {widget.size().width()}x{widget.size().height()}"
-            f"  non-zero bytes in a cleared render: {blank}"
-            f"  changed-pixel counts: {sorted(set(counts.values()))[:8]}")
+            f" | widget {widget.size().width()}x{widget.size().height()}"
+            f" | non-zero bytes in a cleared render: {blank}"
+            f" | changed-pixel counts: {sorted(set(counts.values()))[:8]}")
 
     # the neutral defaults must reproduce the historical framing exactly.
     # _energy_ui is a smoothed chase (it converges during _on_tick), so pin it
@@ -668,13 +671,27 @@ def every_design_reacts_to_voice_level():
     bubble.BUBBLE_ACCENT = 0.5
     designs = list(getattr(settings_app.SCHEMA, "BUBBLE_DESIGNS", ("orb",)))
 
+    from PySide6.QtGui import QImage
+
     def _frame_at(design, level, clock=None):
         if clock is not None:
             widget._clock = clock
         widget._level_target = level       # nothing left to chase
         widget._level_ui = level
         bubble.SETTINGS["bubble_design"] = design
-        return bytes(widget.grab().toImage().constBits())
+        # Paint onto a surface we cleared ourselves. grab() reads the platform
+        # backing store, which is not a valid instrument for a
+        # WA_TranslucentBackground widget -- the background is never erased. It
+        # reported exactly zero changed pixels on halo/reactor/bloom in CI while
+        # the same Qt version here reported thousands, and the three designs
+        # share nothing but being measured first, which is what gives the
+        # instrument away rather than the painters. Clearing first also makes
+        # the equalizer clock comparison below meaningful: on a reused surface a
+        # stale frame can make two different clocks look identical.
+        img = QImage(widget.size(), QImage.Format_ARGB32)
+        img.fill(0)
+        widget.render(img)
+        return bytes(img.constBits())
 
     def _changed(design, quiet, loud):
         before = _frame_at(design, quiet)
@@ -700,9 +717,21 @@ def every_design_reacts_to_voice_level():
 
     measured = {d: _changed(d, 0.0, 1.0) for d in designs}
     weak = [f"{d}={n}" for d, n in measured.items() if n < 100]
-    assert not weak, (
-        "the voice changes no visible pixels on: " + ", ".join(weak)
-        + f" (all: {measured})")
+    if weak:
+        # Which instrument failed, not just which design: a surface that paints
+        # nothing at all is a different problem from a painter that ignores the
+        # voice, and the two have already been confused once in this file.
+        _frame_at("orb", 1.0)
+        img = QImage(widget.size(), QImage.Format_ARGB32)
+        img.fill(0)
+        widget.render(img)
+        blank = sum(1 for b in bytes(img.constBits()) if b)
+        raise AssertionError(
+            "the voice changes no visible pixels on: " + ", ".join(weak)
+            + f" (all: {measured})"
+            # one line, no escapes: this text is inside GUI_DRIVER
+            + f" | widget {widget.size().width()}x{widget.size().height()}"
+            + f" | non-zero bytes in a cleared orb render: {blank}")
 
     # ...and for the meter specifically, the reaction must come from the shared
     # level rather than a local timer. The equalizer used to derive bar length
