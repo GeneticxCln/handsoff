@@ -30,9 +30,54 @@ _MONTH_NAMES = ("January", "February", "March", "April", "May", "June",
                 "December")
 
 
+_LOOPBACK = ("localhost", "127.0.0.1", "::1")
+
+
+def _ics_scheme_error(source: str):
+    """Why `source` must not be fetched over the network, or None if it may.
+
+    A Google-style "secret iCal address" is a bearer credential: anyone who
+    sees the URL can read the whole calendar, and the calendar says where the
+    user is and who they meet. Over cleartext http a MITM gets both the token
+    and the contents, while the settings row has always advertised https — so
+    that is what is enforced. Loopback stays allowed, because a URL pointing
+    at this machine's own port is not on the wire and breaking a local
+    calendar server would be pointless pedantry.
+    """
+    m = re.match(r"^(https?)://([^/?#]*)", source, re.I)
+    if not m or m.group(1).lower() == "https":
+        return None
+    host = m.group(2).rsplit("@", 1)[-1]        # drop any user:pass@
+    if host.startswith("["):                    # [::1]:8080
+        host = host[1:host.index("]")] if "]" in host else host[1:]
+    else:
+        host = host.split(":")[0]
+    if host.lower() in _LOOPBACK or host.startswith("127."):
+        return None
+    return ("plain http:// sends the calendar and its secret iCal token in "
+            "clear text — use https:// (http:// is allowed for localhost)")
+
+
+def _ics_source_label(source: str) -> str:
+    """A source reduced to something safe to say out loud.
+
+    The whole point of a "secret iCal address" is that the URL *is* the
+    password, so it must never be echoed into the conversation — an error
+    message is not a reason to leak it.
+    """
+    m = re.match(r"^(https?)://([^/?#]*)", str(source), re.I)
+    if not m:
+        return str(source)
+    host = m.group(2).rsplit("@", 1)[-1]
+    return f"{m.group(1).lower()}://{host or '?'}/… (path redacted)"
+
+
 def _ics_fetch(source: str) -> str:
     """Read an ICS calendar from an https URL or a local file path."""
     if re.match(r"^https?://", source, re.I):
+        refusal = _ics_scheme_error(source)
+        if refusal:
+            raise ValueError(refusal)
         return _http_get(source, timeout=15).decode("utf-8", "replace")
     return Path(source).expanduser().read_text(encoding="utf-8", errors="replace")
 

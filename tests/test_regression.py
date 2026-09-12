@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -21,7 +22,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site
+from conftest import HERE as ROOT, _load, _user_site, wait_for
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -43,7 +44,8 @@ class TestAuditFixes:
         a._speak = fake_speak
         a._set = lambda gen, state: None
         a._fire_timer("tea")
-        time.sleep(0.2)
+        assert wait_for(lambda: "text" in captured), \
+            "the timer announcement never reached the speaker"
         assert captured.get("cancel_set") is False, "cancel was pre-set — reminder would be silent"
         assert "tea" in captured.get("text", "")
 
@@ -106,6 +108,46 @@ class TestAuditFixes:
         s = coerce_settings({**H.DEFAULT_SETTINGS, "allow_remote_ollama": True})
         assert s["allow_remote_ollama"] is True
 
+    def test_remote_opt_in_does_not_fail_open_on_uncoerced_settings(self, H, monkeypatch):
+        """The opt-in predicate used truthiness, so a caller that seeded
+        SETTINGS without coerce_settings (`"yes"`, 1) read as opted-in even
+        though the settings contract is strictly `is True`. That is the
+        fail-open half of the disagreement: one file, two answers.
+        """
+        monkeypatch.setattr(H, "OLLAMA_BASE", "http://192.0.2.10:11434")
+        monkeypatch.delenv("HANDSOFF_ALLOW_REMOTE_OLLAMA", raising=False)
+        monkeypatch.setattr(H, "_REMOTE_OLLAMA_WARNED", False)
+        for junk in ("yes", 1, "true", "on", [1], {"a": 1}):
+            monkeypatch.setattr(H, "SETTINGS",
+                                {**H.DEFAULT_SETTINGS, "allow_remote_ollama": junk})
+            assert H._ollama_remote_opted_in() is False, junk
+            with pytest.raises(RuntimeError, match="non-loopback"):
+                H._guard_ollama_endpoint()
+
+    def test_opt_in_source_names_the_channel(self, H, monkeypatch):
+        """One predicate answers for guard, settings contract and doctor."""
+        monkeypatch.delenv("HANDSOFF_ALLOW_REMOTE_OLLAMA", raising=False)
+        monkeypatch.setattr(H, "SETTINGS",
+                            {**H.DEFAULT_SETTINGS, "allow_remote_ollama": True})
+        assert H._remote_ollama_optin_source() == "settings"
+        monkeypatch.setattr(H, "SETTINGS",
+                            {**H.DEFAULT_SETTINGS, "allow_remote_ollama": False})
+        assert H._remote_ollama_optin_source() == ""
+        monkeypatch.setenv("HANDSOFF_ALLOW_REMOTE_OLLAMA", "yes")
+        assert H._remote_ollama_optin_source() == "env"
+        assert H._ollama_remote_opted_in() is True
+
+    def test_doctor_names_the_env_opt_in_channel(self, H, monkeypatch):
+        """The env var is a second opt-in Settings cannot display, so doctor
+        must say the environment is what made the brain remote."""
+        monkeypatch.setattr(H, "OLLAMA_BASE", "http://192.0.2.10:11434")
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        monkeypatch.setenv("HANDSOFF_ALLOW_REMOTE_OLLAMA", "1")
+        text = H.run_doctor()
+        assert "explicitly allowed" in text
+        assert "HANDSOFF_ALLOW_REMOTE_OLLAMA" in text
+        assert "NOT visible in Settings" in text
+
     def test_doctor_flags_remote_brain_unless_allowed(self, H, monkeypatch):
         """--ptt doctor must surface the remote-brain trust warning, and must
         show the explicitly-allowed state once opted in."""
@@ -148,7 +190,8 @@ class TestAuditFixes:
             cancel_set=cancel.is_set())
         a._set = lambda gen, state: None
         a._announce_missed([{"name": "pills"}])
-        time.sleep(0.2)
+        assert wait_for(lambda: "cancel_set" in captured), \
+            "the missed-reminder announcement never reached the speaker"
         assert captured.get("cancel_set") is False
 
     def test_matches_recent_speech_takes_text(self, H):
@@ -474,7 +517,7 @@ class TestHistoryTokenTrim:
         monkeypatch.setattr(H, "ollama_chat",
                             lambda m, t: calls.append((m, t)) or {})
         monkeypatch.setattr(H, "get_whisper", lambda: None)
-        monkeypatch.setattr(H, "get_piper", lambda: None)
+        monkeypatch.setattr(H, "get_tts", lambda: None)
         monkeypatch.setattr(H, "ollama_available", lambda: True)
         a._maybe_report_crash = lambda: None
         a._speak = lambda *x, **k: None
@@ -489,6 +532,61 @@ class TestHistoryTokenTrim:
         assert msgs[1:-1] == a._history, "warmup must include current history"
         assert msgs[-1]["content"] == "hi"
         assert tools is H.TOOLS, "warmup must pass the full tool schemas"
+
+    def _loader_assistant(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        a._models_ready = H.threading.Event()
+        a._history = []
+        a._maybe_report_crash = lambda: None
+        a._speak = lambda *x, **k: None
+        a._set = lambda *x: None
+        a._gen = 0
+        a._cancel = H.threading.Event()
+        return a
+
+    def test_loader_warms_the_speech_engine(self, H, monkeypatch):
+        """The FIRST spoken reply used to be the slow one.
+
+        Measured through the control socket: 1.5 s to first audio on the first
+        reply after a fresh start, 0.6 s on every later one — the decoder, flow
+        sampler and vocoder compile their CUDA kernels on first use. The loader
+        already pays the model load, so it must also pay this.
+        """
+        warmed = []
+        monkeypatch.setattr(H, "get_whisper", lambda: None)
+        monkeypatch.setattr(H, "get_tts", lambda: None)
+        monkeypatch.setattr(H, "warm_tts", lambda: warmed.append(1) or 128)
+        monkeypatch.setattr(H, "ollama_chat", lambda m, t: {})
+        monkeypatch.setattr(H, "ollama_available", lambda: True)
+        a = self._loader_assistant(H)
+        a._loader()
+        assert warmed, "the loader never warmed the speech engine"
+
+    def test_a_failed_warm_up_is_not_a_failed_startup(self, H, monkeypatch):
+        """A warm-up is an optimisation: if it breaks, the bubble must still
+        come up (and say so) rather than lose speech entirely."""
+        def boom():
+            raise RuntimeError("no CUDA kernels for this shape")
+
+        monkeypatch.setattr(H, "get_whisper", lambda: None)
+        monkeypatch.setattr(H, "get_tts", lambda: None)
+        monkeypatch.setattr(H, "warm_tts", boom)
+        monkeypatch.setattr(H, "ollama_chat", lambda m, t: {})
+        monkeypatch.setattr(H, "ollama_available", lambda: True)
+        a = self._loader_assistant(H)
+        a._loader()                       # must not raise
+        assert a._models_ready.is_set(), "startup must still complete"
+
+    def test_the_warm_up_does_not_load_a_model_of_its_own(self, H):
+        """core.audio must warm the model it is HANDED.
+
+        If it fell back to loading one itself, a test that stubs get_tts would
+        pull 3.8 GB into the test process — and a failed load elsewhere would
+        be retried silently at warm-up time.
+        """
+        fake = types.SimpleNamespace(generate=lambda text: [0.0] * 64)
+        assert H._audio.warm_tts(model=None) == 0, "nothing to warm, no load"
+        assert H._audio.warm_tts(model=fake) > 0
 
     def test_spotter_active_does_not_starve_vad_gate(self, H, monkeypatch):
         """REGRESSION: the spotter path reset the VAD gate after EVERY frame,
@@ -1020,7 +1118,8 @@ class TestAuditNineFindings:
         a._set = lambda *x: None
         a._speak = lambda *x, **k: None
         assert a._try_snooze("snooze 5 minutes", 1, H.threading.Event()) is True
-        H.time.sleep(0.2)
+        assert wait_for(lambda: bool(H._load_reminders())), \
+            "the snooze was never persisted (worker did not finish)"
         saved = H._load_reminders()
         assert saved and saved[0]["name"] == "tea", saved
         # and the offer is closed only after success
@@ -1212,10 +1311,16 @@ class TestAmbientCapabilities:
 
     def test_notification_mute_list_is_bounded_and_persisted(self, H, monkeypatch):
         saved = []
-        monkeypatch.setattr(H, "_persist_setting", lambda k, v: saved.append((k, v)))
+        # Model the real wrapper's contract (persist, update memory, return
+        # True): set_setting only updates SETTINGS on a reported success.
+        monkeypatch.setattr(H, "_persist_setting", lambda k, v: (
+            saved.append((k, v)), H.SETTINGS.__setitem__(k, v), True)[-1])
+        monkeypatch.setitem(H.SETTINGS, "notification_mute_apps",
+                            H.SETTINGS["notification_mute_apps"])
         tb = self._tb(H, on_notification=lambda enabled: None)
         out = tb.notification_reader("mute", ",".join(f"app{i}" for i in range(40)))
         assert "app0" in out and len(H.SETTINGS["notification_mute_apps"]) == 32
+        assert "WARNING" not in out, out
         assert saved and saved[-1][0] == "notification_mute_apps"
 
     def test_notification_parser_filters_mute(self, H, monkeypatch):
@@ -1369,8 +1474,217 @@ class TestReminderStoreSeam:
         assert [r["name"] for r in H._load_reminders()] == ["future"]
         assert json.loads(target.read_text())[0]["name"] == "future"
 
+    def test_cancelling_the_last_reminder_actually_empties_the_queue(self, H, monkeypatch, tmp_path):
+        """cancel_reminder's mutate returns [] when it drops the last entry.
+
+        `mutate(items) or items` treated that falsy result as "no change" and
+        saved the loaded list straight back, so cancelling the final reminder
+        silently did nothing. mutate() returning [] must be honoured; only an
+        explicit None means "edited in place".
+        """
+        target = self._redirect(H, monkeypatch, tmp_path)
+        H._update_reminders(lambda items: items + [{"name": "only", "due": 1.0}])
+        assert [r["name"] for r in H._load_reminders()] == ["only"]
+        # the real cancel path: core.tools.cancel_reminder builds exactly this
+        H._update_reminders(lambda items: [r for r in items if r["name"] != "only"])
+        assert H._load_reminders() == []
+        assert json.loads(target.read_text()) == []
+
+    def test_in_place_mutation_still_persists_without_a_return(self, H, monkeypatch, tmp_path):
+        """A mutate that edits and returns None must not be reverted to None."""
+        target = self._redirect(H, monkeypatch, tmp_path)
+        H._update_reminders(lambda items: items + [{"name": "kept", "due": 1.0}])
+        def _in_place(items):
+            items[0]["due"] = 42.0
+        H._update_reminders(_in_place)
+        assert json.loads(target.read_text())[0]["due"] == 42.0
+
     def test_due_helper_and_core_share_one_implementation(self, H):
         from core.assistant import split_due_reminders
         items = [{"name": "a", "due": 1.0, "repeat_hours": 0},
                  {"name": "b", "due": 9.0, "repeat_hours": 0}]
         assert H._due_reminders(items, 5.0) == split_due_reminders(items, 5.0)
+
+
+class _FakeStreamResponse:
+    """Minimal NDJSON response: iterable of raw lines, usable as a context mgr."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def _ndjson(*pieces):
+    return [(json.dumps({"message": {"role": "assistant", "content": p}}
+                        ) + "\n").encode("utf-8") for p in pieces]
+
+
+def _stream(q, cancel, urlopen):
+    """Drive the real streamer (core.brain) with a stubbed urlopen."""
+    from core import brain
+    return brain.ollama_chat_stream([{"role": "user", "content": "hi"}], q,
+                                    cancel, None, base="http://127.0.0.1:9",
+                                    model="m", num_ctx=8192, guard=lambda: None,
+                                    logger=logging.getLogger("test.stream"),
+                                    state={}, urlopen=urlopen)
+
+
+class TestStreamedReplyFiltering:
+    """The speech filter must be narrow, and must fall silent on a barge-in.
+
+    Two real defects: `not sentence.startswith("<")` silently swallowed
+    legitimate replies that merely begin with '<' ("<3", "<5 minutes"), and an
+    UNCLOSED <think> block streamed the model's reasoning into TTS. Separately,
+    after a barge-in the pending tail was queued anyway and spoken over the
+    user.
+    """
+
+    def test_unclosed_think_block_never_reaches_speech(self, H):
+        assert H.strip_thinking("Sure. <think>internal reasoning") == "Sure."
+        assert H.strip_thinking("<think>only reasoning") == ""
+
+    def test_closed_think_block_still_stripped(self, H):
+        assert H.strip_thinking("a<think>b</think>c") == "ac"
+
+    def test_legitimate_less_than_replies_are_not_dropped(self, H):
+        for good in ("<3 that's sweet", "it's <5 minutes away", "<html> is a tag"):
+            assert H.is_leaked_markup(good) is False, good
+
+    def test_control_tokens_are_still_dropped(self, H):
+        for bad in ("<think>", "</think>", "<tool_call>", "<|im_start|>"):
+            assert H.is_leaked_markup(bad) is True, bad
+
+    def test_fallback_filter_matches_core_brain(self, H):
+        """The no-core fallback must behave identically to the real filter."""
+        from core import brain
+        corpus = ["hello <think>secret", "a<think>b</think>c", "<3 sweet",
+                  "it's <5 minutes", "<think>only", "plain.",
+                  "<tool_call>{}", "<|im_start|>x", "[TOOL_CALLS] junk\nreal",
+                  "mixed <think>a</think> b<think>c"]
+        for text in corpus:
+            assert H._fallback_strip_thinking(text) == brain.strip_thinking(text), text
+            assert (H._fallback_is_leaked_markup(text)
+                    == brain.is_leaked_markup(text)), text
+
+    def test_a_less_than_reply_is_actually_streamed(self, H):
+        import queue as _queue
+        q, cancel = _queue.Queue(), threading.Event()
+        resp = _FakeStreamResponse(_ndjson("<3 that's sweet."))
+        _stream(q, cancel, lambda req, timeout=None: resp)
+        assert "<3 that's sweet." in list(q.queue), list(q.queue)
+
+    def test_barge_in_does_not_speak_the_pending_tail(self, H):
+        """Cancel mid-stream: nothing may be queued except the terminator."""
+        import queue as _queue
+        q, cancel = _queue.Queue(), threading.Event()
+
+        def _lines():
+            yield _ndjson("The answer is ")[0]
+            cancel.set()            # the user starts talking here
+            yield _ndjson("42")[0]
+
+        class _Resp(_FakeStreamResponse):
+            def __iter__(self):
+                return _lines()
+
+        _stream(q, cancel, lambda req, timeout=None: _Resp([]))
+        assert list(q.queue) == [None], list(q.queue)
+
+
+class TestWatcherPatternSafety:
+    """A file watcher runs its pattern on every appended line, once a second,
+    on a daemon thread that nothing can interrupt — and `re` has no timeout.
+    The pattern is data the model or the user hands us, so the exponential
+    shapes are refused up front and the text any single evaluation sees is
+    capped."""
+
+    def test_the_refused_shape_really_is_catastrophic(self):
+        """Prove the refusal protects against something real, by measuring it.
+
+        `(a+)+$` against a 29-character NON-matching line runs for minutes —
+        every added character doubles the work — so a watcher handed this
+        pattern would pin a core and stop watching for good. Measured in a
+        subprocess so the suite stays fast.
+        """
+        probe = ("import re\n"
+                 "re.compile(r'(a+)+$').search('a' * 28 + '!' + ' ' * 100)\n"
+                 "print('returned')\n")
+        with pytest.raises(subprocess.TimeoutExpired):
+            subprocess.run([sys.executable, "-c", probe], timeout=2.0,
+                           check=True, capture_output=True)
+
+    def test_watch_file_refuses_exponential_patterns(self, H, tmp_path):
+        p = tmp_path / "x.log"
+        p.write_text("")
+        tb = H.ToolBelt(on_restart_pending=lambda: None)
+        for bad in ("(a+)+$", r"(\d+)*", "(.*x){4}"):
+            out = tb.watch_file(str(p), bad, "start")
+            assert out.startswith("REFUSED"), (bad, out)
+            assert "exponentially" in out, (bad, out)
+        assert tb.watch_file(str(p), "x" * 400, "start").startswith("REFUSED")
+        assert tb.watch_file(str(p), action="list").endswith("none")
+
+    def test_ordinary_patterns_are_untouched(self, H, tmp_path):
+        """The guard names only shapes it can be sure about: a legitimate
+        pattern must never be refused on a guess."""
+        p = tmp_path / "x.log"
+        p.write_text("")
+        tb = H.ToolBelt(on_restart_pending=lambda: None)
+        for good in ("ERROR|WARN", r"\b(foo|bar)\b", r"^\d{4}-\d{2}",
+                     "(ERROR|WARN): .*", "[a-z]+=[0-9]+"):
+            assert "watching" in tb.watch_file(str(p), good, "start"), good
+        tb.stop_watchers()
+
+    def test_a_burst_is_bounded_per_poll_and_deferred_not_dropped(self, H, tmp_path):
+        """The per-poll line cap must bound work WITHOUT losing lines.
+
+        Examining only the first N lines of a burst while advancing the cursor
+        past the whole chunk would drop the rest forever — the cap has to defer
+        them to the next poll instead.
+        """
+        from core.tools import WATCH_LINES_PER_POLL
+        p = tmp_path / "burst.log"
+        p.write_text("")                     # a watcher arms at the CURRENT end
+        total = WATCH_LINES_PER_POLL + 100
+
+        seen: list = []
+        stop = threading.Event()
+        t = threading.Thread(target=H.ToolBelt._file_watch_loop,
+                             args=(p, re.compile("hit"), stop, seen.append),
+                             daemon=True)
+        t.start()
+        first_poll = None
+        try:
+            # Arming is unobservable by design (a watcher "starts at the
+            # current end"), so wait out a full poll interval: arming happens
+            # BEFORE the loop's first stop.wait(1.0), so once an iteration has
+            # completed the loop is provably parked at offset 0 of a file that
+            # was still empty — which makes the burst below unambiguously new
+            # data rather than a race with the first stat().
+            time.sleep(1.2)
+            p.write_text("".join(f"hit {i}\n" for i in range(total)))
+            deadline = time.monotonic() + 5
+            while not seen and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # long enough for the whole first poll (the emits are microseconds)
+            # and short enough that the second poll cannot have started
+            time.sleep(0.4)
+            first_poll = len(seen)
+            deadline = time.monotonic() + 6
+            while len(seen) < total and time.monotonic() < deadline:
+                time.sleep(0.05)
+        finally:
+            stop.set()
+            t.join(3.0)
+        assert first_poll == WATCH_LINES_PER_POLL, first_poll
+        # …and the rest was deferred to the next poll, not skipped
+        assert len(seen) == total, len(seen)
+        assert [int(s.split()[-1]) for s in seen] == list(range(total))

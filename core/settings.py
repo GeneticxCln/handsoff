@@ -32,6 +32,9 @@ from . import load_module
 _schema = load_module("settings_schema")
 DEFAULT_SETTINGS = _schema.DEFAULT_SETTINGS
 SETTINGS_VERSION = _schema.SETTINGS_VERSION
+# Keys a past version wrote that this build retired; dropped on load AND on
+# write, so a read-merge-write cannot resurrect them (see the schema).
+RETIRED_SETTINGS = tuple(getattr(_schema, "RETIRED_SETTINGS", ()))
 
 
 # ------------------------------------------------------------ safe-file primitives
@@ -121,10 +124,33 @@ def _quarantine_bad(path: Path) -> None:
 def _backup_runtime_json(path: Path) -> None:
     """One-generation .bak beside a runtime JSON file (history, memory,
     reminders, settings). Best-effort: a backup failure must never block the
-    write that follows — the atomic write is the real safety mechanism."""
+    write that follows — the atomic write is the real safety mechanism.
+
+    The copy is itself atomic (temp + replace), which matters exactly when the
+    disk is full: `shutil.copy2` writes straight over the old `.bak`, so a
+    failure part-way left the *backup* truncated — the one file you would
+    restore from, damaged by the very failure it exists for. Mode 0600 is set
+    before it becomes visible (copy2 preserves the SOURCE's mode, so a runtime
+    file that was still 0644 when copied left a 0644 backup holding the same
+    transcript).
+    """
     try:
         if path.exists():
-            shutil.copy2(path, str(path) + ".bak")
+            dst = Path(str(path) + ".bak")
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "wb") as out, path.open("rb") as src:
+                    shutil.copyfileobj(src, out)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, dst)
+            except BaseException:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
     except OSError:
         logging.getLogger("handsoff").debug(
             "backup of %s failed (continuing)", path)
@@ -262,12 +288,12 @@ def coerce_settings(s: dict) -> dict:
         log.warning("invalid whisper_device %r — using 'auto'", s.get("whisper_device"))
         _wd = "auto"
     s["whisper_device"] = _wd
-    if not isinstance(s.get("piper_voice"), str):
-        log.warning("invalid piper_voice — using default %r",
-                    DEFAULT_SETTINGS["piper_voice"])
-        s["piper_voice"] = str(DEFAULT_SETTINGS["piper_voice"])
+    if not isinstance(s.get("tts_reference"), str):
+        log.warning("invalid tts_reference — using default %r",
+                    DEFAULT_SETTINGS["tts_reference"])
+        s["tts_reference"] = str(DEFAULT_SETTINGS["tts_reference"])
     else:
-        s["piper_voice"] = str(s["piper_voice"]).strip()
+        s["tts_reference"] = str(s["tts_reference"]).strip()
     if not isinstance(s.get("mic_device"), str):
         log.warning("invalid mic_device — using default %r",
                     DEFAULT_SETTINGS["mic_device"])
@@ -294,11 +320,11 @@ def coerce_settings(s: dict) -> dict:
 def _migrate_settings(data: dict, _slog: "logging.Logger | None" = None) -> dict:
     """Migrate an older settings.json layout to SETTINGS_VERSION.
 
-    Currently a no-op passthrough: version 1 IS the current layout, so the
-    only work is stamping missing versions. When the layout changes, bump
-    SETTINGS_VERSION in settings_schema.py and add a step here — never load
-    a future version (the file was written by newer code this process may
-    not understand; keep the values but warn, exactly like unknown keys).
+    Each step upgrades exactly one version, so a v0 file walks every step in
+    order. When the layout changes, bump SETTINGS_VERSION in settings_schema.py
+    and add a step here — never load a future version (the file was written by
+    newer code this process may not understand; keep the values but warn,
+    exactly like unknown keys).
     """
     log2 = _slog or logging.getLogger("handsoff")
     try:
@@ -309,7 +335,23 @@ def _migrate_settings(data: dict, _slog: "logging.Logger | None" = None) -> dict
         log2.warning("settings.json version %d is newer than this build's %d "
                      "— loading anyway, values may be misread", ver, SETTINGS_VERSION)
         return data
-    # future migrations: `if ver < 2: ...rename/restructure...; ver = 2`
+    if ver < 2:
+        # Piper -> chatterbox-turbo (v2). The old value was a path to a 60 MB
+        # .onnx voice; chatterbox cannot read it, and handing it to
+        # prepare_conditionals would fail the >5 s reference-clip assertion on
+        # every turn. It is DROPPED rather than renamed: a piper voice is not a
+        # usable reference clip, and silently keeping a stale path would make
+        # the GUI show a voice the bubble cannot load. The user gets the
+        # built-in voice until they pick a clip.
+        old_voice = data.pop("piper_voice", None)
+        # NOTE: do not `setdefault("tts_reference", "")` here. This runs on the
+        # data READ FROM DISK, before the defaults/env dict is merged, so an
+        # inserted empty string wins the merge and silently kills the
+        # HANDSOFF_VOICE override (and any default the schema sets later).
+        if old_voice:
+            log2.info("settings.json migrated: dropped piper_voice (%s); "
+                      "TTS now uses the built-in chatterbox voice", old_voice)
+        ver = 2
     if ver < SETTINGS_VERSION:
         log2.info("settings.json migrated v%d -> v%d", ver, SETTINGS_VERSION)
     data["version"] = SETTINGS_VERSION
@@ -372,7 +414,7 @@ def _load_settings(settings_file: Path) -> dict:
     env_map = {
         "ollama_host": "OLLAMA_HOST", "model": "HANDSOFF_MODEL",
         "num_ctx": "HANDSOFF_NUM_CTX", "whisper_size": "HANDSOFF_WHISPER",
-        "piper_voice": "HANDSOFF_VOICE",
+        "tts_reference": "HANDSOFF_VOICE",
     }
     for key, var in env_map.items():
         if os.environ.get(var):
@@ -447,11 +489,40 @@ def _three_way_merge(expected, current, candidate, path: str):
     return None, path or "settings"
 
 
+def _drop_retired_settings(data: dict) -> dict:
+    """Remove RETIRED_SETTINGS from a dict that is about to be written.
+
+    Read-merge-write used to operate on the raw file, so a key the migration
+    removed was put straight back by the next unrelated save — and, since the
+    loader drops retired keys, every start then warned `unknown settings key
+    'piper_voice'` forever, for a key the user never wrote.
+
+    Removal is key-driven, not version-gated: a file can be stamped with a
+    version whose value changes were written but whose key removal was not (an
+    older persist stamped v2 while still carrying piper_voice), and a version
+    gate would then never fire again.
+
+    Only *retired* keys go. Unknown keys are kept: they belong to a newer
+    build's settings.json, and a write must not erase configuration it merely
+    fails to understand (pinned by
+    `test_handsfree_toggle_preserves_concurrent_settings_saves`).
+    """
+    if not RETIRED_SETTINGS:
+        return dict(data)
+    return {k: v for k, v in data.items() if k not in RETIRED_SETTINGS}
+
+
 def _read_settings_for_write(settings_file: Path) -> dict:
+    """The on-disk dict, converged to this build's schema, as a write base.
+
+    Migrating here is what makes a migration durable; dropping retired keys
+    here is what makes it stick even when the file claims a version it does not
+    fully honour. This is the one place that decides what a write may contain.
+    """
     try:
         loaded = json.loads(settings_file.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
-            return loaded
+            return _drop_retired_settings(_migrate_settings(loaded))
     except FileNotFoundError:
         return {}
     except ValueError:
@@ -489,6 +560,10 @@ def _write_settings_dict(data: dict, settings_file: Path, config_dir: Path,
             data = dict(data)
         if stamp_version:
             data["version"] = SETTINGS_VERSION
+        # Same rule as the single-key writer: a full save must not be able to
+        # reintroduce a key this build retired (the GUI's edit dict is built
+        # through merge_settings, which can carry one along).
+        data = _drop_retired_settings(data)
         _backup_runtime_json(settings_file)
         _atomic_private_write(
             settings_file, json.dumps(data, ensure_ascii=False, indent=1))
@@ -496,23 +571,41 @@ def _write_settings_dict(data: dict, settings_file: Path, config_dir: Path,
 
 
 def _persist_setting(key: str, value, settings_file: Path,
-                     config_dir: Path) -> None:
-    """Persist one runtime setting without overwriting unrelated settings."""
+                     config_dir: Path) -> bool:
+    """Persist one runtime setting without overwriting unrelated settings.
+
+    Returns False when nothing reached the disk. Report it rather than
+    returning silently: callers used to update their in-memory copy anyway, so
+    a failed write left the runtime using (and believing) a value the next
+    start would not read back.
+    """
     with _SETTINGS_WRITE_LOCK, _settings_file_lock()(config_dir):
         try:
             data = _read_settings_for_write(settings_file)
         except OSError:
             logging.getLogger("handsoff").warning(
                 "persist_setting %r aborted: settings file unreadable", key)
-            return
+            return False
         data[key] = value
         data["version"] = SETTINGS_VERSION   # every on-disk write is stamped
         # NOTE: _atomic_private_write creates its own uniquely-named temp
         # file; a pre-computed ".json.tmp" path here would reintroduce the
         # predictable-name race that helper exists to prevent.
         _backup_runtime_json(settings_file)
-        _atomic_private_write(
-            settings_file, json.dumps(data, ensure_ascii=False, indent=1))
+        try:
+            _atomic_private_write(
+                settings_file, json.dumps(data, ensure_ascii=False, indent=1))
+        except OSError as e:
+            # A full disk (ENOSPC), a read-only mount or a vanished directory
+            # lands here. Returning False is the whole point of this
+            # signature: callers report an unsaved change, and one that does
+            # `is False` would instead crash the tool call with a traceback.
+            # The old file is intact either way — the write is atomic.
+            logging.getLogger("handsoff").warning(
+                "persist_setting %r failed (%s: %s) — keeping the old value",
+                key, type(e).__name__, e)
+            return False
+        return True
 
 
 class Settings:
@@ -558,11 +651,17 @@ class Settings:
     def ensure_loaded(self) -> dict:
         return self._data if self._loaded else self.load()
 
-    def persist(self, key: str, value) -> None:
+    def persist(self, key: str, value) -> bool:
         """Read-merge-write ONE key through the cross-process lock (no
-        derived-global side effects here — the caller owns those)."""
-        _persist_setting(key, value, self.settings_file, self.config_dir)
+        derived-global side effects here — the caller owns those).
+
+        Returns whether the value reached the disk; the cached dict is only
+        updated when it did, so memory and the file cannot disagree.
+        """
+        if not _persist_setting(key, value, self.settings_file, self.config_dir):
+            return False
         self._data[key] = value
+        return True
 
     def write_all(self, data: dict, *, expected_data: dict | None = None) -> dict:
         """Version-stamped, backed-up full-file write (the settings app's

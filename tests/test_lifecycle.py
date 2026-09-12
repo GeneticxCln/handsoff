@@ -222,6 +222,326 @@ class TestControlSocket:
         assert self._roundtrip(H.CONTROL_SOCK, "bogus").startswith(
             "error: unknown command 'bogus'")
 
+    def test_control_socket_refuses_a_foreign_uid(self, server, monkeypatch):
+        """Defence in depth: a peer that is not us is refused and logged.
+
+        This is NOT the boundary that protects the socket — STATE_DIR is 0700
+        and refuses to start otherwise, which is what keeps other users out.
+        A same-uid process has our uid, so no credential check can exclude it.
+        What this pins is that the explicit check exists and that a refused
+        peer never reaches the action dispatcher.
+        """
+        H, delivered, _app = server
+        monkeypatch.setattr(H, "_peer_uid", lambda conn: os.getuid() + 1)
+        assert self._roundtrip(H.CONTROL_SOCK, "interrupt") == "error: not permitted\n"
+        assert "interrupt" not in delivered
+
+    def test_control_socket_allows_our_own_uid(self, server):
+        """The same-uid path (every real caller) must be untouched."""
+        H, _delivered, _app = server
+        assert self._roundtrip(H.CONTROL_SOCK, "status").startswith("state=")
+
+    def test_generation_bump_is_atomic_under_contention(self, H):
+        """Two threads must never claim the same turn generation.
+
+        `self._gen += 1` then `gen = self._gen` was not atomic. Duplicate
+        generations defeat the `gen != self._gen` staleness checks and the
+        gen-keyed transcript cache, so a second utterance can be answered with
+        the first utterance's text. Every increment now goes through
+        _bump_gen under one lock.
+        """
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+        asst = H.Assistant()
+        seen: list[int] = []
+        guard = threading.Lock()
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)          # maximise interleaving
+        try:
+            def _worker() -> None:
+                for _ in range(150):
+                    gen, _cancel = asst._bump_gen()
+                    with guard:
+                        seen.append(gen)
+            threads = [threading.Thread(target=_worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            sys.setswitchinterval(old_interval)
+        assert len(seen) == 8 * 150
+        assert len(set(seen)) == len(seen), "two turns claimed the same generation"
+
+    def test_bump_gen_holds_its_lock_across_the_claim(self, H):
+        """Deterministic proof that the claim happens under the lock.
+
+        The reproducible failure was the WIDE shape: `self._gen += 1`, then
+        `self._cancel = threading.Event()`, then `gen = self._gen`. Building
+        the event between the increment and the read is a real switch point,
+        and 8 threads claimed 714 duplicate generations per 32 000 in ~2% of
+        turns (128 000 claims: 16 930 duplicates). The narrow one-liner alone
+        did NOT reproduce under the GIL — which is exactly why a stress test
+        is too weak to pin this and why the lock is asserted directly.
+        """
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+        asst = H.Assistant()
+        claimed: dict = {}
+        reached = threading.Event()  # set when the claimer is inside __enter__
+        real_lock = asst._gen_lock
+
+        class Probe:
+            """Delegates to the real lock, announcing the attempt first.
+
+            Without this the test could only sleep and hope the competing
+            thread had reached the claim; signalling from __enter__ makes
+            "nothing claimed yet" mean *blocked*, which is the property under
+            test — not *not scheduled yet*.
+            """
+
+            def __enter__(self):
+                reached.set()
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc):
+                return real_lock.__exit__(*exc)
+
+            def acquire(self, *a, **k):
+                return real_lock.acquire(*a, **k)
+
+            def release(self):
+                return real_lock.release()
+
+        asst._gen_lock = Probe()
+
+        def _claim() -> None:
+            claimed["gen"] = asst._bump_gen()[0]
+
+        before = asst._gen
+        real_lock.acquire()
+        try:
+            t = threading.Thread(target=_claim)
+            t.start()
+            assert reached.wait(2.0), "the claimer never reached the lock"
+            assert "gen" not in claimed, "_bump_gen claimed without its lock"
+        finally:
+            real_lock.release()
+        t.join(2.0)
+        assert claimed.get("gen") == before + 1
+
+    def test_generation_is_only_bumped_inside_the_locked_helper(self):
+        """Source guard: a new call site must use _bump_gen, not `+= 1`. """
+        src = (HERE / "handsoff.py").read_text(encoding="utf-8")
+        raw = [i for i, line in enumerate(src.splitlines())
+               if line.strip() == "self._gen += 1"]
+        assert len(raw) == 1, (
+            f"{len(raw)} raw generation increments bypass _bump_gen's lock")
+        helper_start = src[:src.index("def _bump_gen")].count("\n")
+        assert raw[0] > helper_start, "the increment must live inside _bump_gen"
+
+    def test_clear_history_roundtrip_empties_memory_and_disk(self, H, tmp_path, monkeypatch):
+        """A model switch in Settings must clear the RUNNING bubble.
+
+        Truncating HISTORY_FILE from another process is not enough: the bubble
+        holds the transcript in `_history` and rewrites the whole file on its
+        next save, so the old conversation comes straight back. The socket
+        action is what makes a model switch actually take effect.
+        """
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+        hist = tmp_path / "history.json"
+        monkeypatch.setattr(H, "HISTORY_FILE", hist)
+        monkeypatch.setattr(H, "CONTROL_SOCK", tmp_path / "control.sock")
+        hist.write_text(json.dumps([{"role": "user", "content": "stale"}]))
+        asst = H.Assistant()
+        assert asst._history                     # loaded the stale transcript
+        asst._history = [{"role": "user", "content": "stale"},
+                         {"role": "assistant", "content": "reply"}]
+        srv = H.ControlServer(asst)
+        srv.start()
+        try:
+            deadline = time.time() + 5
+            reply = ""
+            while time.time() < deadline:
+                try:
+                    reply = self._roundtrip(H.CONTROL_SOCK, "clear-history")
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            assert reply.startswith("ok: cleared 2"), reply
+        finally:
+            srv.stop()
+        assert asst._history == []
+        assert json.loads(hist.read_text()) == []
+        # and a stale in-memory copy cannot come back on the next save
+        asst._save_history()
+        assert json.loads(hist.read_text()) == []
+
+    def test_clear_history_is_a_documented_ptt_action(self, H):
+        assert "clear-history" in H.PTT_ACTIONS
+        assert "clear-history" in H.USAGE
+
+    def test_level_command_reports_the_shared_voice_level(self, server):
+        # What the Settings → Voice meter polls. It has to be the signal the
+        # DESIGNS paint from and it has to say WHERE it came from: a bare
+        # number cannot tell "the mic never fed the level" from "the feed
+        # arrived but the bubble is not showing it", which is the whole point
+        # of having a meter at all.
+        H, _delivered, _app = server
+        doc = json.loads(self._roundtrip(H.CONTROL_SOCK, "level"))
+        assert set(doc) == {"raw", "ui", "source", "age_s", "state", "handsfree"}
+        assert doc["raw"] == 0.0 and doc["ui"] == 0.0
+        assert doc["source"] == "none", "nothing has fed a level yet"
+        assert doc["age_s"] is None
+        assert doc["state"] == "idle"
+
+
+def _bare_assistant(H):
+    """An Assistant with no threads, no audio and no Qt event loop.
+
+    Only the voice-level bookkeeping is under test, so this builds the object
+    the same way the rest of the suite does (H.Assistant.__new__) and seeds
+    just what _emit_level / level_snapshot touch. `seen` collects what the
+    signal actually carried, because recording a level without emitting it
+    would silently break every design's voice reaction.
+    """
+    a = H.Assistant.__new__(H.Assistant)
+    a._lifecycle_ensure()
+    a._state = H.IDLE
+    a._level_last = 0.0
+    a._level_source = "none"
+    a._level_at = 0.0
+    seen: list = []
+    a.sigLevel = type("S", (), {"emit": staticmethod(seen.append)})()
+    a.seen = seen
+    return a
+
+
+class TestSharedVoiceLevel:
+    """The one level signal the bubble's designs and the Settings meter share."""
+
+    def test_emit_records_the_value_and_its_source(self, H):
+        a = _bare_assistant(H)
+        a._emit_level(0.5, "mic")
+        assert a.level_snapshot()["raw"] == 0.5
+        assert a.level_snapshot()["source"] == "mic"
+        a._emit_level(0.9, "tts")
+        snap = a.level_snapshot()
+        assert snap["raw"] == 0.9 and snap["source"] == "tts", (
+            "the bubble's own voice must be distinguishable from the mic")
+        assert a.seen == [0.5, 0.9], (
+            "the level must still reach sigLevel, or no design reacts to it")
+
+    def test_emit_clamps_and_survives_garbage(self, H):
+        a = _bare_assistant(H)
+        for bad in (-3.0, 7.0, 0.25):
+            a._emit_level(bad, "mic")
+            snap = a.level_snapshot()
+            assert 0.0 <= snap["raw"] <= 1.0, f"{bad!r} produced {snap['raw']}"
+        assert snap["raw"] == 0.25
+        a._emit_level(7.0, "mic")
+        assert a.level_snapshot()["raw"] == 1.0, (
+            "a too-loud value clamps, it does not vanish")
+        emitted = len(a.seen)
+        for bad in ("loud", None, object()):
+            before = a.level_snapshot()["raw"]
+            a._emit_level(bad, "mic")
+            assert a.level_snapshot()["raw"] == before, (
+                f"{bad!r} must be ignored, not zeroed")
+        assert len(a.seen) == emitted, "junk must not reach the signal either"
+
+    def test_age_only_moves_on_a_nonzero_level(self, H):
+        # silence must NOT look like a fresh feed: a wedged producer emitting
+        # exact zeros is the failure this exposes in the Voice meter.
+        a = _bare_assistant(H)
+        assert a.level_snapshot()["age_s"] is None
+        a._emit_level(0.4, "mic")
+        first = a.level_snapshot()["age_s"]
+        assert first is not None and first < 1.0
+        time.sleep(0.05)
+        a._emit_level(0.0, "mic")
+        assert a.level_snapshot()["age_s"] > first, (
+            "a zero level must not reset the age")
+
+    def test_ui_level_falls_back_when_there_is_no_bubble_widget(self, H):
+        # headless (or before the widget exists) the smoothed painter value is
+        # unknowable, so the meter must show the raw signal rather than zero
+        a = _bare_assistant(H)
+        a._emit_level(0.33, "ptt")
+        snap = a.level_snapshot()
+        assert snap["ui"] == 0.33 and snap["source"] == "ptt"
+
+    def test_the_playback_hook_is_a_tagged_publisher(self, H):
+        # core.audio calls whatever Assistant.__init__ registered, and that
+        # callable is now the tagged publisher — which is what lets the meter
+        # say "the bubble's own voice" instead of showing a bare number while
+        # the mic is deliberately blanked.
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+        mod = getattr(H, "_audio", None)
+        if not hasattr(mod, "_level_hook_lock"):
+            pytest.skip("core.audio is a stub in this environment")
+        a = H.Assistant()
+        try:
+            with mod._level_hook_lock:
+                hook = mod._level_hook
+            assert hook is not None, "playback must feed the visual level"
+            hook(0.37)
+            snap = a.level_snapshot()
+            assert snap["raw"] == 0.37 and snap["source"] == "tts", snap
+        finally:
+            with mod._level_hook_lock:
+                mod._level_hook = None
+            a.shutdown()
+
+    def test_the_playback_hook_is_a_tagged_publisher(self, H):
+        # core.audio calls whatever Assistant.__init__ registered, and that
+        # callable is now the tagged publisher — which is what lets the meter
+        # say "the bubble's own voice" instead of showing a bare number while
+        # the mic is deliberately blanked.
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+        mod = getattr(H, "_audio", None)
+        if not hasattr(mod, "_level_hook_lock"):
+            pytest.skip("core.audio is a stub in this environment")
+        a = H.Assistant()
+        try:
+            with mod._level_hook_lock:
+                hook = mod._level_hook
+            assert hook is not None, "playback must feed the visual level"
+            hook(0.37)
+            snap = a.level_snapshot()
+            assert snap["raw"] == 0.37 and snap["source"] == "tts", snap
+        finally:
+            with mod._level_hook_lock:
+                mod._level_hook = None
+            a.shutdown()
+
+    def test_ui_level_is_the_value_the_painters_read(self, H):
+        # the meter exists to show what the DESIGNS use, so _level_ui wins over
+        # the raw signal whenever the widget is there to have one
+        a = _bare_assistant(H)
+        a._emit_level(0.80, "mic")
+        a._bubble_widget = type("W", (), {"_level_ui": 0.25})()
+        snap = a.level_snapshot()
+        assert snap["raw"] == 0.8 and snap["ui"] == 0.25, snap
+
+    def test_snapshot_survives_a_deleted_widget(self, H):
+        # RuntimeError is what PySide raises once the C++ object is gone; the
+        # health/level readouts run during shutdown and must not explode
+        a = _bare_assistant(H)
+
+        class _Gone:
+            @property
+            def _level_ui(self):
+                raise RuntimeError("wrapped C/C++ object has been deleted")
+
+        a._emit_level(0.6, "mic")
+        a._bubble_widget = _Gone()
+        snap = a.level_snapshot()
+        assert snap["raw"] == 0.6 and snap["ui"] == 0.6
+
     def test_client_rejects_unknown_action(self, H):
         assert H.ptt_client(["nonsense"]) == 2
 
@@ -424,6 +744,12 @@ class TestStreamingChat:
 
     @pytest.fixture  # function-scoped: class-scope-on-instance-method is deprecated (removed in pytest 10)
     def fake_ollama(self):
+        """A live fake Ollama on an ephemeral port.
+
+        The server is polled until it actually answers instead of sleeping a
+        fixed 0.8 s and hoping: on a loaded machine the readiness bet fails and
+        the test reports a broken brain rather than a slow start.
+        """
         import subprocess as sp, socket, time
         s = socket.socket()
         s.bind(("127.0.0.1", 0))
@@ -431,13 +757,30 @@ class TestStreamingChat:
         s.close()
         proc = sp.Popen([sys.executable, str(HERE / "tests" / "fake_ollama.py"), str(port)],
                         stdout=sp.DEVNULL, stderr=sp.DEVNULL)
-        time.sleep(0.8)
-        yield f"http://127.0.0.1:{port}"
-        proc.terminate()
+        base = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + 15
+        ready = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                # a TCP connect, not an HTTP GET: the fake only implements
+                # POST /api/chat, and readiness is exactly "is the listener up"
+                with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                    ready = True
+                    break
+            except OSError:
+                time.sleep(0.05)
+        try:
+            assert ready, ("fake ollama never came up"
+                           f" (rc={proc.poll()})")
+            yield base
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
 
     def test_stream_sentences_and_tool_calls(self, H, fake_ollama):
         import queue as qmod
-        monkey_patch_target = fake_ollama
         old_base = H.OLLAMA_BASE
         H.OLLAMA_BASE = fake_ollama
         try:
@@ -752,6 +1095,40 @@ class TestRestartResilience:
         assert '"$BIN_DIR"/*.py' not in text, (
             "uninstall must never sweep the shared ~/.local/bin")
 
+    def test_installer_ships_only_files_the_project_owns(self):
+        """Top-level membership is `declared + what git tracks`, not `*.py`.
+
+        A bare glob delivered whatever happened to sit beside handsoff.py: a
+        scratch `test.py` from a TTS experiment was copied into ~/.local/bin
+        (the user's PATH) and hashed into the deployment manifest, so the next
+        edit to that scratch file made `--ptt doctor` report the WHOLE
+        installation as "installed-drift" — a false alarm about the bubble,
+        raised by a file the bubble never uses. A stray name can also collide
+        with a real binary in $BIN_DIR and overwrite it.
+
+        Discovery must stay automatic (the earlier audit's point: no list to
+        maintain), so this pins the rule and its single definition rather than
+        any enumeration: the helper is called from staging, from the manifest
+        generator and from the rehearsal check, and the glob survives only as
+        the no-git fallback.
+        """
+        text = (HERE / "install.sh").read_text()
+        assert "ship_file()" in text, "membership needs one named definition"
+        assert "ship_top() { ship_file" in text and "ship_core() { ship_file" in text, (
+            "core/ and the top level must share that one rule, not duplicate it")
+        assert 'git -C "$HERE" ls-files' in text, (
+            "tracked files are how a new module ships without editing this")
+        assert 'TRACKED_PY=""' in text, "the no-git fallback must be explicit"
+        assert text.count("ship_top ") + text.count("ship_core ") >= 6, (
+            "staging, the manifest and the rehearsal check must agree, for both")
+        assert "CORE_REQUIRED=" in text and "DECLARED_PY=" in text, (
+            "the declared floor and the declared set must both be explicit")
+        # the manifest generator is inside the MANIFEST heredoc's vicinity and
+        # must filter with the same helper, or doctor tracks what never shipped
+        gen = text[text.index("manifest_top_files="):text.index("<<MANIFEST_EOF")]
+        assert 'ship_top "$rel" || continue' in gen, (
+            "the manifest must use the same membership rule as staging")
+
     def test_lock_failure_logs_instead_of_silent_exit(self, H, monkeypatch):
         """If the lock can't be acquired, say so in the log (no more silent vanish)."""
         import builtins
@@ -861,6 +1238,37 @@ class TestStagedRelease:
             ["bash", str(HERE / "install.sh"), "--rehearsal"],
             env=env, capture_output=True, text=True, timeout=300,
         )
+
+    def test_rehearsal_never_delivers_a_scratch_file(self, tmp_path):
+        """End to end: an untracked *.py in the checkout stays out of ~/.local/bin.
+
+        The behavioural half of the membership rule above — a rehearsal in a
+        throw-away HOME, with a scratch module written beside handsoff.py the
+        way a user's experiment really sits there (removed again either way).
+        """
+        probe = subprocess.run(["git", "-C", str(HERE), "rev-parse",
+                                "--is-inside-work-tree"],
+                               capture_output=True, text=True)
+        if probe.returncode != 0:
+            pytest.skip("not a git work tree: the installer falls back to the glob")
+        scratch = HERE / "test_zz_scratch_experiment.py"
+        assert not scratch.exists(), f"refusing to clobber an existing {scratch}"
+        home, conf = self._fake_home(tmp_path)
+        scratch.write_text("print('a user experiment, not part of the app')\n")
+        try:
+            r = self._run_rehearsal(tmp_path, home)
+            assert r.returncode == 0, r.stderr[-3000:]
+            assert f"NOT shipping {scratch.name}" in r.stdout, r.stdout[-2000:]
+            assert not (home / ".local" / "bin" / scratch.name).exists(), \
+                "a scratch file was delivered into the user's PATH"
+            manifest = json.loads((conf / "deployment.json").read_text())
+            assert scratch.name not in manifest["files"], \
+                "doctor would track a file the bubble never uses"
+            # ...while the project's own modules still shipped
+            assert "handsoff.py" in manifest["files"]
+            assert "core/theme.py" in manifest["files"]
+        finally:
+            scratch.unlink(missing_ok=True)
 
     def test_rehearsal_switches_and_saves_previous_release(self, tmp_path):
         """A rehearsal install must gate through the stage and keep the old

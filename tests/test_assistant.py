@@ -233,3 +233,177 @@ def test_store_follows_a_rebound_path(tmp_path):
     store.save([{"name": "moved", "due": 1.0}])
     assert not (tmp_path / "first").exists()
     assert [r["name"] for r in store.load()] == ["moved"]
+
+
+# ------------------------------------------- concurrency & lifecycle (batch 3)
+def test_pomodoro_double_start_is_serialised():
+    """Two overlapping turns must not start two workers.
+
+    `is_alive()` then `start()` with no lock is a check-then-act, and a spoken
+    turn can overlap a hands-free one. Two loops announce every phase boundary
+    twice, which sounds exactly like the timer malfunctioning.
+    """
+    spoken: list = []
+    import threading as _t
+    barrier = _t.Barrier(8)
+    results: list = []
+    guard = _t.Lock()
+
+    pomo, started = _controller(spoken)
+
+    def _start():
+        barrier.wait()
+        r = pomo.command("start", 25, 5)
+        with guard:
+            results.append(r)
+
+    threads = [_t.Thread(target=_start) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5.0)
+    pomo.shutdown()
+    assert len(started) == 1, started
+    assert sum(1 for r in results if r.startswith("pomodoro started")) == 1, results
+    assert sum(1 for s in spoken if "Pomodoro started" in s) == 1, spoken
+
+
+def test_pomodoro_stop_cannot_leave_a_ghost_transition():
+    """A stop landing exactly as a phase expires must not announce the phase.
+
+    The loop's `wait()` timing out and the user's stop are independent events.
+    Announcing the transition without re-checking under the lock shutdown()
+    takes means the bubble says "pomodoro stopped" and then speaks the next
+    phase anyway.
+    """
+    spoken: list = []
+    pomo, _ = _controller(spoken)
+    pomo._state = {"phase": "work", "until": time.monotonic() - 1,
+                   "work": 0.001, "break": 30.0}
+
+    class RacyStop:
+        """The timeout expires at the same instant the user asks to stop."""
+
+        def __init__(self):
+            self._set = False
+
+        def is_set(self):
+            return self._set
+
+        def set(self):
+            self._set = True
+
+        def wait(self, timeout):
+            pomo.shutdown()          # the user stops here…
+            return False             # …and the wait still reports "timed out"
+
+    racy = RacyStop()
+    pomo._stop = racy
+    pomo._loop(racy)
+    assert spoken == [], spoken
+
+
+def test_pomodoro_shutdown_joins_the_worker():
+    """`stopped` must mean the worker is OUT, not on its way out.
+
+    The worker is given a slow unwind after it notices the stop, so this
+    asserts the join itself rather than the thread's speed: without it,
+    command("stop") returns while the loop is still unwinding.
+    """
+    spoken: list = []
+    pomo, started = _controller(spoken)
+    unwound = threading.Event()
+
+    def slow_loop(stop):
+        stop.wait(5.0)          # notice the stop…
+        time.sleep(0.25)        # …then take a moment to unwind
+        unwound.set()
+
+    pomo._loop = slow_loop
+    assert pomo.command("start", 25, 5).startswith("pomodoro started")
+    deadline = time.monotonic() + 2
+    while not started[0].is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    pomo.shutdown()
+    assert unwound.is_set(), "shutdown returned before the worker finished"
+    assert pomo._thread is None
+
+
+def test_reader_disable_joins_so_a_restart_cannot_orphan_it():
+    """`off` must mean the worker is gone before the next `on`.
+
+    Without the join, disable returned while the old loop was still parked on
+    the dead monitor's stdout; enabling again immediately started a second loop
+    beside it — two readers, one holding the previous stop event, both
+    speaking notifications.
+    """
+    spoken: list = []
+    started: list = []
+
+    def spawn(target, args=(), name="t"):
+        th = threading.Thread(target=target, args=args, name=name, daemon=True)
+        started.append(th)
+        th.start()
+        return th
+
+    class SlowProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    reader = _reader(spoken, spawn=spawn, popen_factory=lambda *a, **k: SlowProc())
+
+    def slow_loop(proc, stop):
+        stop.wait(5.0)          # notice the stop…
+        time.sleep(0.25)        # …then take a moment to unwind
+
+    reader.loop = slow_loop
+    assert reader.set_enabled(True) == "notification reader enabled"
+    deadline = time.monotonic() + 2
+    while not started[0].is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert reader.set_enabled(False) == "notification reader disabled"
+    assert not started[0].is_alive(), "disable returned before the worker stopped"
+    assert reader._thread is None
+    assert reader.set_enabled(True) == "notification reader enabled"
+    assert len(started) == 2, started        # exactly one new worker, no orphan
+    reader.set_enabled(False)
+
+
+def test_reader_gives_up_loudly_instead_of_claiming_to_be_on():
+    """Respawns exhausted ⇒ the setting must stop saying "on".
+
+    dbus-monitor dying repeatedly used to leave notification_reader=True with
+    no monitor and no reader: the toggle said on, nothing was listening, and no
+    notification would ever be spoken again.
+    """
+    spoken: list = []
+    saved: list = []
+
+    class DeadProc:
+        stdout: tuple = ()
+
+        def poll(self):
+            return 0                 # already exited
+
+        def terminate(self):
+            pass
+
+    class InstantStop:
+        """No real waiting: exhaust the five respawns in milliseconds."""
+        def is_set(self):
+            return False
+
+        def set(self):
+            pass
+
+        def wait(self, timeout):
+            return False
+
+    reader = _reader(spoken, popen_factory=lambda *a, **k: DeadProc(),
+                     persist=lambda k, v: saved.append((k, v)))
+    reader.run(InstantStop())
+    assert saved and saved[-1] == ("notification_reader", False), saved
+    assert reader._proc is None

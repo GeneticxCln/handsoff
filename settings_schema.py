@@ -9,9 +9,23 @@ Precedence elsewhere: built-in defaults <- environment <- settings.json.
 """
 from __future__ import annotations
 
-SETTINGS_VERSION: int = 1   # bumped on incompatible settings.json layout changes
+SETTINGS_VERSION: int = 2   # bumped on incompatible settings.json layout changes
+                            # v2: piper_voice -> tts_reference (Piper -> chatterbox)
 
-BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void")
+# Keys a past version wrote that this build deliberately retired. They are
+# dropped from settings.json on the next WRITE as well as on load, because
+# otherwise a read-merge-write puts them straight back: the loader then warns
+# `unknown settings key` on every single start, for a key the user never wrote.
+#
+# This list is deliberately explicit and narrow. Dropping *every* key the schema
+# does not know would be simpler, and wrong: a settings.json written by a NEWER
+# build carries keys this build has never heard of, and erasing them on save
+# destroys configuration on version skew. Unknown-but-not-retired keys survive a
+# write untouched; the loader keeps warning about them, which is how the user
+# learns a newer build wrote them.
+RETIRED_SETTINGS = ("piper_voice",)
+
+BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void", "sauron", "pikachu")
 
 DEFAULT_SETTINGS: dict = {
     "ollama_host": "http://127.0.0.1:11434",
@@ -21,14 +35,14 @@ DEFAULT_SETTINGS: dict = {
     "history_tokens": 0,       # 0 = auto: ctx − prompt − reply reserve
     "whisper_size": "tiny",
     "whisper_device": "auto",   # auto=GPU when free VRAM fits, else cpu; or forced "cpu"/"cuda"
-    "piper_voice": "",
-    "tts_rate": 1.0,
+    "tts_reference": "",   # optional >=5 s clip to clone; "" = built-in voice
+    "tts_rate": 1.0,       # applied by resampling chatterbox's 24 kHz output
     "tts_volume": 1.0,
     "mic_device": "",
     "mic_threshold": 600,
     "handsfree": False,
     "bubble_size": 128,
-    "bubble_design": "orb",  # Appearance tab: orb|halo|reactor|bloom|droplet|cube|equalizer|crystal|saturn|void
+    "bubble_design": "orb",  # Appearance tab; must be one of BUBBLE_DESIGNS above
     "bubble_accent": 0.5,      # 0..1 accent punch: how hard each shape leans on its
                                # state colour (glow alpha, saturation, comet light)
     "animation_energy": 1.0,   # 0.2..2.0 global animation scale: orbit speed, swirl

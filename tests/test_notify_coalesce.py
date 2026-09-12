@@ -40,19 +40,42 @@ def _wait_for(pred, timeout=3.0):
     return pred()
 
 
+def _flushed(H, calls=None, minimum=0, timeout=5.0):
+    """Wait for the coalescer to finish a batch, instead of `sleep(0.6)`.
+
+    The debounce is H._NOTIFY_DELAY (0.5 s) and the popups are sent from a
+    `threading.Timer` callback, so a fixed sleep is a bet that this machine is
+    idle — a loaded CI box fails a correct implementation. Waiting on the
+    coalescer's OWN state is the same assertion without the stopwatch, and it
+    is stronger: once nothing is pending no further popup can appear (only
+    notify() schedules a timer), and a batch that WOULD send a trailing
+    duplicate still has its timer set, so the state is not idle yet.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        with H._NOTIFY_LOCK:
+            st = H._NOTIFY_STATE
+            idle = (st.get("timer") is None and not st.get("pending")
+                    and not st.get("overflow"))
+        if idle and (calls is None or len(calls) >= minimum):
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+
+
 class TestNotifyCoalesce:
     def test_isolated_notify_sends_one_popup(self, H, calls):
         H.notify("hello world")
-        assert _wait_for(lambda: len(calls) >= 1)
-        time.sleep(0.6)  # no trailing duplicate may appear
+        assert _flushed(H, calls, 1), "the batch never flushed"
+        # no trailing duplicate
         assert calls == [["notify-send", "-a", "handsoff", "handsoff",
                           "hello world"]]
 
     def test_identical_burst_coalesces_with_count(self, H, calls):
         for _ in range(5):
             H.notify("build finished")
-        assert _wait_for(lambda: len(calls) >= 1)
-        time.sleep(0.6)
+        assert _flushed(H, calls, 1), "the batch never flushed"
         assert len(calls) == 1, calls
         assert calls[0][:4] == ["notify-send", "-a", "handsoff", "handsoff"]
         assert "build finished" in calls[0][4] and "×5" in calls[0][4]
@@ -60,8 +83,7 @@ class TestNotifyCoalesce:
     def test_distinct_burst_capped_with_summary(self, H, calls):
         for i in range(12):
             H.notify(f"event number {i}")
-        assert _wait_for(lambda: len(calls) >= H._NOTIFY_BURST + 1)
-        time.sleep(0.6)
+        assert _flushed(H, calls, H._NOTIFY_BURST + 1), "the batch never flushed"
         assert len(calls) == H._NOTIFY_BURST + 1, calls
         summary = calls[-1][4]
         assert "more" in summary and "notification" in summary
@@ -74,7 +96,10 @@ class TestNotifyCoalesce:
 
         monkeypatch.setattr(H.subprocess, "run", boom)
         H.notify("whatever")  # must not raise, sync or in flush thread
-        time.sleep(0.8)
+        # let the flush actually run: an exception raised in the timer thread
+        # is promoted to a failure by pytest.ini, but only if it happens
+        # before the test returns
+        assert _flushed(H, timeout=5.0), "the failing flush never completed"
 
 
 def _notify_lines(app, summary="hi", body="there"):

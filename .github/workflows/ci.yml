@@ -6,9 +6,12 @@ on:
 
 jobs:
   # The full test suite. Single source of truth: requirements.txt (pinned
-  # floors: numpy<3, PySide6<7). Whisper/piper/openwakeword are lazy-imported
-  # and every test that touches them monkeypatches the call, so installing
-  # the full manifest only costs time, never new failures.
+  # floors: numpy<3, PySide6<7). Whisper/openwakeword are lazy-imported and
+  # every test that touches them monkeypatches the call, so installing the full
+  # manifest only costs time, never new failures. The speech engine is NOT in
+  # the manifest (install.sh owns it): it pulls torch, which would cost every
+  # job gigabytes on a GPU-less runner and buy nothing — the suite pins that
+  # torch and chatterbox are never imported.
   tests:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -33,11 +36,11 @@ jobs:
       - name: Run the test suite
         run: python -m pytest tests/ -q
 
-  # Coverage floor: TOTAL must stay >= 60% (matches .coveragerc).
+  # Coverage floor: TOTAL must stay >= 70% (matches .coveragerc, which also
+  # carries the omit list: tests/ and attic/ excluded).
   # Local `pytest` stays plugin-free; only this job installs pytest-cov.
-  # Omit list + floor live in .coveragerc (tests/ and attic/ excluded).
   coverage:
-    name: Coverage floor (>= 60%)
+    name: Coverage floor (>= 70%)
     runs-on: ubuntu-latest
     env:
       QT_QPA_PLATFORM: offscreen
@@ -60,6 +63,38 @@ jobs:
           COVERAGE_PROCESS_START: ${{ github.workspace }}/.coveragerc
           COVERAGE_FILE: ${{ github.workspace }}/.coverage
         run: python -m pytest tests/ -q --cov=. --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=70
+
+  # Ordering-dependence probe. The suite must pass whatever order it runs in,
+  # but the default collection order is the one a developer sees every day, so
+  # a dependence on it hides there and surfaces only when something unrelated
+  # changes the file list. This job re-runs the whole suite twice: once with the
+  # tests shuffled, once with only the FILE order shuffled (each file's own
+  # sequence intact — a stricter probe of what a file leaves behind, and much
+  # easier to read when it fires). The seed comes from the commit SHA, so the
+  # order differs commit to commit yet is printed by the run banner and fully
+  # reproducible. Only the 3.12 leg needs it; the shuffle is interpreter-blind.
+  order:
+    name: Ordering-dependence probe
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -c requirements-lock.txt
+      - name: Shuffled test order
+        env:
+          HANDSOFF_TEST_ORDER_SEED: ${{ github.sha }}
+        run: python -m pytest tests/ -q
+      - name: Shuffled file order
+        env:
+          HANDSOFF_TEST_ORDER_FILES: ${{ github.sha }}
+        run: python -m pytest tests/ -q
 
   # Byte-compile every shipped Python source. py_compile never imports, so no
   # dependencies are needed and syntax rot in any file fails the build.

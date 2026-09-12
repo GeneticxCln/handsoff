@@ -18,8 +18,12 @@ PySide6>=6.8,<7        # Qt GUI (bubble + settings app)
 sounddevice>=0.5       # mic capture + playback (needs libportaudio2)
 
 # --- EXTRAS (optional features; missing = feature disabled, app still runs) ---
+# NOT listed here: the speech engine (chatterbox-tts, previously piper-tts).
+# It drags in torch (~2-3 GB), and CI installs this manifest on GPU-less
+# runners where that buys nothing — the suite asserts torch is never imported.
+# install.sh installs it [2b/8], preferring the distro's torch, and lazy-imports
+# it the same way as everything else here.
 faster-whisper>=1.0    # speech-to-text (lazy import in get_whisper)
-piper-tts>=1.6         # speech synthesis (lazy import in get_piper)
 openwakeword>=0.4      # wake-spotter (lazy import; needs onnxruntime below)
 onnxruntime>=1.17      # backend for openwakeword
 

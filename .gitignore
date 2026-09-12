@@ -3,6 +3,13 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.egg-info/
+# coverage.py data files: .coveragerc sets parallel=True and the CI coverage job
+# runs with --cov=., so a local run leaves `.coverage` plus `parallel = True`
+# shards (`.coverage.<host>.<pid>.<rand>`). They are binaries, not source, and
+# a `git add -A` would otherwise stage them.
+.coverage
+.coverage.*
+htmlcov/
 
 # --- handsoff runtime state (regenerated; never source control) ---
 ruvector.db

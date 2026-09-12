@@ -22,13 +22,28 @@ from conftest import HERE as ROOT, _user_site
 HERE = ROOT   # the repo root
 
 
-@pytest.fixture(scope="module")
-def H():
-    spec = importlib.util.spec_from_file_location(
-        "handsoff_core_hardening", HERE / "handsoff.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# NOTE: this module used to load its OWN second copy of the monolith (as
+# handsoff_core_hardening), which defeated conftest's config isolation — that
+# import read the developer's real ~/.config/handsoff/settings.json and
+# resolved CONFIG_DIR/STATE_DIR into their real home. It now shares the
+# session-scoped instance from conftest, so there is exactly one module object
+# and it always points at a throw-away config.
+
+
+def test_the_suite_cannot_touch_the_real_config_or_state(H):
+    """Guard the isolation itself, not just the code it protects.
+
+    If this ever regresses, every later run silently reads and writes the
+    developer's real settings, history and control socket — and starts grading
+    itself against their personal configuration again.
+    """
+    real_home = Path.home()
+    for name in ("CONFIG_DIR", "STATE_DIR", "HISTORY_FILE", "MEMORY_FILE",
+                 "LOG_FILE", "CONTROL_SOCK"):
+        path = getattr(H, name)
+        assert real_home not in path.parents, (name, path)
+        assert real_home != path, (name, path)
+    assert H.SETTINGS_FILE != real_home / ".config" / "handsoff" / "settings.json"
 
 
 @pytest.fixture()
@@ -39,7 +54,7 @@ def sandbox(H, monkeypatch, tmp_path):
     monkeypatch.setattr(H, "CONFIG_DIR", cfg)
     monkeypatch.setattr(H, "STATE_DIR", state)
     monkeypatch.setattr(H, "WHISPER_MODEL_DIR", cfg / "whisper-model")
-    monkeypatch.setattr(H, "PIPER_VOICE_DIR", cfg / "piper-voice")
+    monkeypatch.setattr(H._audio, "TTS_REFERENCE", "")
     monkeypatch.setattr(H, "SETTINGS_FILE", cfg / "settings.json")
     monkeypatch.setattr(H, "HISTORY_FILE", cfg / "history.json")
     monkeypatch.setattr(H, "MEMORY_FILE", cfg / "memory.json")
@@ -261,6 +276,58 @@ class TestRuntimePrepareStartupIntegration:
         assert srv._server is None
         assert not (sandbox / "state" / "control.sock").exists()
 
+    def test_runtime_backup_is_always_owner_only(self, H, sandbox):
+        """A .bak holds the same secrets as its source, so it must be 0600.
+
+        `shutil.copy2` preserves the SOURCE's mode. A runtime file that was
+        still 0644 when it was backed up therefore left a world-readable copy
+        of the same transcript — measurable on this machine, where several
+        history.json.bak-* sidecars are 0644.
+        """
+        cfg = sandbox / "cfg"
+        cfg.mkdir(parents=True, exist_ok=True)
+        src = cfg / "history.json"
+        src.write_text("[]", encoding="utf-8")
+        os.chmod(src, 0o644)                      # a loose legacy file
+        H._backup_runtime_json(src)
+        bak = Path(str(src) + ".bak")
+        assert bak.exists()
+        assert (bak.stat().st_mode & 0o777) == 0o600, oct(
+            bak.stat().st_mode & 0o777)
+
+    def test_secure_runtime_files_sweeps_loose_backups(self, H, sandbox):
+        """Existing sidecars are re-hardened on startup, not just new ones.
+
+        Backups written before the source was tightened stay loose forever
+        otherwise; the files this was found on were real 0644 transcripts.
+        """
+        cfg = sandbox / "cfg"
+        state = sandbox / "state"
+        cfg.mkdir(parents=True, exist_ok=True)
+        state.mkdir(parents=True, exist_ok=True)
+        loose = [cfg / "history.json.bak-modelswitch",
+                 cfg / "settings.json.bak-threshold",
+                 state / "reminders.json.bak"]
+        for p in loose:
+            p.write_text("[]", encoding="utf-8")
+            os.chmod(p, 0o644)
+        assert H._secure_runtime_files() is True
+        for p in loose:
+            assert (p.stat().st_mode & 0o777) == 0o600, p
+
+    def test_secure_runtime_files_leaves_no_symlinked_backup_alone(
+            self, H, sandbox):
+        """The sweep must not follow a symlink out of the config dir."""
+        cfg = sandbox / "cfg"
+        cfg.mkdir(parents=True, exist_ok=True)
+        outside = sandbox / "outside.txt"
+        outside.write_text("keep", encoding="utf-8")
+        os.chmod(outside, 0o644)
+        (cfg / "history.json.bak-evil").symlink_to(outside)
+        H._secure_runtime_files()
+        assert (outside.stat().st_mode & 0o777) == 0o644, "followed the symlink"
+        assert outside.read_text(encoding="utf-8") == "keep"
+
     def test_lock_file_created_private(self, H, sandbox):
         H.STATE_DIR.mkdir(parents=True, exist_ok=True)
         fh = None
@@ -310,7 +377,10 @@ class TestMissingAudioFallback:
             "cuda_error": bool(audio._is_cuda_error("cuda")),
             "free_vram": audio._nvidia_free_vram_mb(),
             "whisper_model": audio._whisper_model,
-            "piper_voice": audio._piper_voice,
+            "tts_model": audio._tts_model,
+            "tts_reference": audio.TTS_REFERENCE,
+            "tts_engine": audio.TTS_ENGINE,
+            "tts_device": audio._tts_device,
             "configure_returns_none": audio.configure() is None,
             "portaudio_busy": audio.portaudio_busy(),
             "aliases": {
@@ -318,7 +388,8 @@ class TestMissingAudioFallback:
                 "mic_lock": hasattr(mod._MIC_OPERATION_LOCK, "acquire"),
             },
         }
-        for probe in ("transcribe", "get_whisper", "play_wav"):
+        for probe in ("transcribe", "get_whisper", "play_wav", "get_tts",
+                      "reference_problem"):
             try:
                 getattr(audio, probe)()
             except ImportError:
@@ -366,7 +437,13 @@ class TestMissingAudioFallback:
         assert report["cuda_error"] is False
         assert report["free_vram"] is None
         assert report["whisper_model"] is None
-        assert report["piper_voice"] is None
+        assert report["tts_model"] is None
+        assert report["tts_reference"] == ""
+        assert report["tts_engine"] == "chatterbox-turbo"
+        # mic_health() reports the loading device: without the stub a partial
+        # install raises AttributeError out of the `health` command instead of
+        # answering, which is the whole reason every path exists there.
+        assert report["tts_device"] == ""
         # configure() is called at import time: a partial install must get here
         assert report["configure_returns_none"] is True
         # nothing is open in a partial install, so the teardown guard is inert

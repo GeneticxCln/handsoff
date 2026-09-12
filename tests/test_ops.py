@@ -389,7 +389,12 @@ class TestDoctorModuleExtraction:
         # output has drifted and every existing test diff will fail.
         assert "brain: OLLAMA UNREACHABLE at http://127.0.0.1:9 — " \
                "`systemctl status ollama`, then `ollama pull tinyllama`" in text
-        assert "tts: voice NOT loaded yet; stt: whisper NOT loaded yet" in text
+        # The tts line names the engine and its voice (built-in vs a reference
+        # clip), because "voice NOT loaded yet" cannot tell a healthy built-in
+        # voice from a clip the engine refuses — the question doctor is run to
+        # answer when speech is wrong.
+        assert (f"tts: {H.TTS_ENGINE} (built-in voice) — model NOT loaded yet; "
+                "stt: whisper NOT loaded yet") in text
         assert "mic: NO input devices visible — check the mic is plugged in" in text
         assert "niri IPC: UNAVAILABLE (no niri in tests) — desktop actions will fail" in text
         assert "ydotool: NOT INSTALLED (typing tools will fail)" in text
@@ -434,6 +439,59 @@ class TestBoundedJobs:
         assert "exit code 0" in out
         assert "hello-jobs" in out
         assert announced and "exit code 0" in announced[0]
+
+    def test_completion_is_announced_exactly_once_under_concurrent_polls(
+            self, H, monkeypatch):
+        """A finished job must be announced once, however many polls race.
+
+        `if not job._announced: job._announced = True` is a check-then-set with
+        no lock. A spoken turn and a hands-free turn can overlap, so both polls
+        could see False and announce the same finished job twice. The window is
+        only a couple of bytecodes, so the claim is asserted through the lock
+        rather than by hoping a stress test lands in it.
+        """
+        tb, announced = self._belt(H, monkeypatch)
+        out, err = tb.execute("start_command", {"command": "echo once-only"})
+        assert not err, out
+        jid = next(iter(tb._jobs))
+        job = tb._jobs[jid]
+        deadline = time.time() + 10
+        while time.time() < deadline and not job.poll()[1]:
+            time.sleep(0.05)
+        job._announce_lock.acquire()
+        try:
+            t = threading.Thread(
+                target=lambda: tb.execute("job_status", {"job_id": jid}))
+            t.start()
+            time.sleep(0.2)
+            assert announced == [], "announced without holding the claim lock"
+        finally:
+            job._announce_lock.release()
+        t.join(3.0)
+        assert len(announced) == 1, announced
+        assert job.claim_announcement() is False, "claimed twice"
+
+    def test_announcement_claim_is_exclusive(self, H, monkeypatch):
+        """Many concurrent claims: exactly one winner."""
+        tb, _ = self._belt(H, monkeypatch)
+        tb.execute("start_command", {"command": "echo claim"})
+        job = tb._jobs[next(iter(tb._jobs))]
+        winners: list[int] = []
+        guard = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def _claim():
+            barrier.wait()
+            if job.claim_announcement():
+                with guard:
+                    winners.append(1)
+
+        threads = [threading.Thread(target=_claim) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(3.0)
+        assert sum(winners) == 1, winners
 
     def test_job_id_refusals_match_run_command(self, H, monkeypatch):
         """Bounded jobs must not widen the whitelist."""
@@ -657,15 +715,42 @@ class TestInstallerRehearsal:
         snippet = root / ".config" / "handsoff" / "niri-window-rule.kdl"
         assert "window-rule" in snippet.read_text()
 
-    def test_rehearsal_deploys_every_core_module(self, tmp_path):
+    def _expected_shipped(self):
+        """The set the installer must deliver, derived the way IT derives it.
+
+        Membership is `declared entry points + what git tracks`, not a bare
+        glob: a glob delivered whatever sat in the checkout, so the user's
+        scratch `test.py` was copied into ~/.local/bin and hashed into the
+        deployment manifest — editing it then made `--ptt doctor` call the whole
+        installation stale, and a stray name could overwrite a real binary in
+        $BIN_DIR. Derived here independently (git, not install.sh) so a new
+        module is still covered without editing this test; outside a git work
+        tree the installer globs, which is what a tarball install has.
+        """
+        declared_top = {"handsoff.py", "handsoff-settings.py", "hardware.py",
+                        "settings_schema.py"}
+        declared_core = {"__init__.py", "settings.py", "audio.py", "brain.py",
+                         "tools.py", "doctor.py", "lifecycle.py", "calendar.py",
+                         "assistant.py"}
+        tracked = subprocess.run(
+            ["git", "-C", str(HERE), "ls-files", "--", "*.py"],
+            capture_output=True, text=True)
+        if tracked.returncode != 0:
+            return (set(p.name for p in HERE.glob("*.py")),
+                    set(p.name for p in (HERE / "core").glob("*.py")))
+        rel = [line for line in tracked.stdout.split() if line.endswith(".py")]
+        top = {p for p in rel if "/" not in p} | declared_top
+        core = {p.split("/", 1)[1] for p in rel if p.startswith("core/")} | declared_core
+        return top, core
+
+    def test_rehearsal_deploys_every_module_the_project_owns(self, tmp_path):
         """Regression: core/theme.py was added and never installed.
 
         Staging, the switch list, the rollback list and the manifest each
-        enumerated core modules by name, so the settings GUI silently lost
-        wallpaper matching — and doctor still said `in-sync`, because the
-        manifest only hashed the files it was told about. Driven from the
-        checkout, so any module added later is covered without editing this
-        test.
+        enumerated modules by name, so the settings GUI silently lost wallpaper
+        matching — and doctor still said `in-sync`, because the manifest only
+        hashed the files it was told about. Driven from the checkout, so any
+        module added later is covered without editing this test.
         """
         result, root, _sentinel = self._run(tmp_path)
         assert result.returncode == 0, result.stderr
@@ -673,26 +758,36 @@ class TestInstallerRehearsal:
         manifest = json.loads(
             (root / ".config" / "handsoff" / "deployment.json").read_text())
 
-        checkout_core = sorted(p.name for p in (HERE / "core").glob("*.py"))
-        assert checkout_core, "checkout has no core modules — test is vacuous"
+        expected_top, expected_core = self._expected_shipped()
+        assert expected_core, "no core modules expected — test is vacuous"
         deployed_core = sorted(p.name for p in (bin_dir / "core").glob("*.py"))
-        assert deployed_core == checkout_core, (
-            "every checkout core module must reach the deployed set")
+        assert deployed_core == sorted(expected_core), (
+            "every project core module must reach the deployed set")
 
         # Top level too: the same hand-list lived in seven places here, so a
         # new module beside handsoff.py had seven ways to be forgotten.
-        checkout_top = sorted(p.name for p in HERE.glob("*.py"))
         deployed_top = sorted(p.name for p in bin_dir.glob("*.py"))
-        assert deployed_top == checkout_top, (
-            "every top-level module must reach the deployed set")
+        assert deployed_top == sorted(expected_top), (
+            "every project top-level module must reach the deployed set")
         assert (bin_dir / "handsoff-restart").exists()
+
+        # Files the project does NOT own stay out of the user's PATH entirely: a
+        # scratch experiment in the checkout is not the installer's to deliver.
+        owned = expected_top | {f"core/{n}" for n in expected_core}
+        present = {p.name for p in HERE.glob("*.py")}
+        present |= {f"core/{p.name}" for p in (HERE / "core").glob("*.py")}
+        for rel in sorted(present - owned):
+            assert not (bin_dir / rel).exists(), (
+                f"a file the project does not own was delivered: {rel}")
+            assert rel not in manifest["files"], (
+                f"doctor would track a file the bubble never uses: {rel}")
 
         # ...and the manifest must hash all of them, or doctor cannot see that
         # one is missing or stale (the core/theme.py bug).
         hashed = sorted(k for k in manifest["files"] if k.startswith("core/"))
-        assert hashed == [f"core/{name}" for name in checkout_core]
+        assert hashed == [f"core/{name}" for name in sorted(expected_core)]
         hashed_top = sorted(k for k in manifest["files"] if "/" not in k)
-        assert hashed_top == sorted(checkout_top + ["handsoff-restart"])
+        assert hashed_top == sorted(expected_top | {"handsoff-restart"})
         for rel in manifest["files"]:
             entry = manifest["files"][rel]
             assert entry["source_sha256"] == entry["installed_sha256"], rel
@@ -794,3 +889,137 @@ class TestInstallerRehearsal:
         )
         assert result.returncode != 0
         assert unit.read_text() == original
+
+
+class TestBoundedJobBuffer:
+    """The drain buffer keeps the NEWEST output and leaves nothing behind when
+    a job dies in a way it cannot reap."""
+
+    @staticmethod
+    def _job(H, argv):
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                start_new_session=True)
+        return H.BoundedJob("job-buffer", " ".join(argv), proc)
+
+    def test_output_tail_keeps_the_newest_bytes(self, H):
+        """The buffer must retain the END of the output, not the beginning.
+
+        Keeping the FIRST MAX_OUTPUT bytes meant "here is the recent output"
+        handed back the startup banner and dropped whatever came after it —
+        which, for a job long enough to outrun the cap, is the part that
+        matters.
+        """
+        script = ("import sys\n"
+                  "sys.stdout.write('HEAD-MARKER\\n')\n"
+                  "sys.stdout.write('x' * 1500000)\n"
+                  "sys.stdout.write('\\nTAIL-MARKER\\n')\n")
+        job = self._job(H, [sys.executable, "-c", script])
+        deadline = time.time() + 30
+        while time.time() < deadline and not job.poll()[1]:
+            time.sleep(0.05)
+        assert job.poll()[1] is True, "job did not finish"
+        job._join_drain(timeout=10.0)
+        tail = job.output_tail(4096)
+        assert "TAIL-MARKER" in tail, tail[:200]
+        assert "HEAD-MARKER" not in tail, tail[:200]
+        # still bounded: at most two caps plus one chunk in flight
+        assert job._out_len <= H.BoundedJob.MAX_OUTPUT * 2 + 65536, job._out_len
+
+    def test_unreapable_kill_is_not_reported_as_done(self, H):
+        """A SIGKILL that has not reaped must keep the job open.
+
+        Reporting 'timeout-killed' while returncode is still None drops the
+        only reaper the job has, leaving a zombie until handsoff exits.
+        """
+        class StuckProc:
+            pid = 4242
+            returncode = None
+            stdout = None
+
+            def kill(self):
+                pass
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("stuck", timeout)
+
+        job = H.BoundedJob("job-stuck", "sleep 99999", StuckProc())
+        job.started -= H.BoundedJob.MAX_LIFETIME_S + 1
+        assert job.poll() == ("running", False)
+
+        class ReapProc(StuckProc):
+            def __init__(self):
+                self.returncode = None
+
+            def wait(self, timeout=None):
+                self.returncode = -9
+                return -9
+
+        reaped = H.BoundedJob("job-killed", "sleep 99999", ReapProc())
+        reaped.started -= H.BoundedJob.MAX_LIFETIME_S + 1
+        assert reaped.poll() == ("timeout-killed", True)
+
+    def test_a_blocked_drainer_is_released(self, H):
+        """read() returns only when EVERY writer closes the pipe.
+
+        The job starts its own session, so a grandchild that inherited stdout
+        keeps the drainer blocked long after the job is gone; closing our end
+        ends the thread instead of leaking it for the rest of the session.
+        """
+        class BlockedPipe:
+            def __init__(self):
+                self.closed = threading.Event()
+                self.release = threading.Event()
+
+            def read(self, n):
+                self.release.wait(30)
+                return ""                  # EOF once released
+
+            def close(self):
+                self.closed.set()
+                self.release.set()
+
+        class BlockedProc:
+            pid = 7
+            returncode = None
+
+            def __init__(self):
+                self.stdout = BlockedPipe()
+
+            def kill(self):
+                pass
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("blocked", timeout)
+
+        proc = BlockedProc()
+        job = H.BoundedJob("job-blocked", "leaky", proc)
+        assert job._drain_thread is not None
+        time.sleep(0.2)
+        assert job._drain_thread.is_alive(), "drainer should be blocked in read()"
+        job._unstick_drain()
+        assert proc.stdout.closed.is_set(), "the pipe was never closed"
+        assert not job._drain_thread.is_alive(), "drain thread leaked"
+        assert job._drain_done.is_set()
+
+    def test_reap_path_releases_the_drainer(self, H, monkeypatch):
+        """...and job_status is what calls it."""
+        tb, _announced = TestBoundedJobs()._belt(H, monkeypatch)
+        calls: list = []
+        monkeypatch.setattr(H.BoundedJob, "_unstick_drain",
+                            lambda self: calls.append(self.id))
+        out, err = tb.execute("start_command", {"command": "echo wiring"})
+        assert not err, out
+        jid = next(iter(tb._jobs))
+        deadline = time.time() + 10
+        while jid in tb._jobs and time.time() < deadline:
+            tb.execute("job_status", {"job_id": jid})
+            time.sleep(0.05)
+        assert jid not in tb._jobs, "job was never reaped"
+        assert calls == [jid], calls

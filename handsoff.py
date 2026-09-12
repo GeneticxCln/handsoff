@@ -19,7 +19,7 @@ tools → Assistant state machine → Bubble UI → main(). Run:
 Settings app:
     python ~/.local/bin/handsoff-settings.py   (also: right-click the bubble → Settings…)
     Writes ~/.config/handsoff/settings.json: microphone, Ollama host/model,
-    whisper size, piper voice + speech rate/volume, tool permissions, bubble
+    whisper size, TTS voice reference + speech rate/volume, tool permissions, bubble
     size and colours, and the niri autostart entry.
     Precedence: built-in defaults <- environment <- settings.json.
 
@@ -30,7 +30,7 @@ Environment overrides (apply only where settings.json has no value):
 Files:
     ~/.config/handsoff/settings.json    settings written by the settings app
     ~/.config/handsoff/whisper-model/   faster-whisper model cache
-    ~/.config/handsoff/piper-voice/     piper voice (.onnx + .onnx.json)
+    ~/.config/handsoff/chatterbox/      speech weights + an optional reference clip
     ~/.config/handsoff/history.json     conversation memory (survives restarts)
     ~/.local/state/handsoff/reminders.json   pending reminders (survive restarts)
     ~/.local/bin/handsoff-restart       kills + relaunches this program
@@ -58,6 +58,7 @@ import shlex
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -122,7 +123,7 @@ HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "handsoff"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(HOME / ".local/state"))) / APP_NAME
 WHISPER_MODEL_DIR = CONFIG_DIR / "whisper-model"
-PIPER_VOICE_DIR = CONFIG_DIR / "piper-voice"
+TTS_ENGINE = "chatterbox-turbo"
 SELF_PATH = Path(__file__).resolve()  # the AI edits this file to modify itself
 RESTART_SCRIPT = HOME / ".local/bin" / "handsoff-restart"
 SETTINGS_APP = HOME / ".local/bin" / "handsoff-settings.py"
@@ -253,6 +254,26 @@ from core import load_module as _load_module
 # host supplies the existing globals and callbacks so historical monkeypatch
 # seams and public names remain stable.
 
+# Text filtering for a bundle whose core/ is not importable. Defined at MODULE
+# level, not inside the legacy class, so it is a single implementation the tests
+# can compare against core.brain's — a fallback that drifts from the real one is
+# exactly how a legitimate "<3" reply ended up being dropped from speech.
+_LEAKED_MARKUP_RE = re.compile(
+    r"^\s*(?:</?(?:think|tool_calls?|im_start|im_end)\b|<\|)", re.IGNORECASE)
+
+
+def _fallback_is_leaked_markup(sentence: str) -> bool:
+    return bool(_LEAKED_MARKUP_RE.match(sentence or ""))
+
+
+def _fallback_strip_thinking(text: str) -> str:
+    value = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+    # an UNCLOSED block must go too, or the reasoning is spoken aloud
+    value = re.sub(r"<think>.*\Z", "", value, flags=re.DOTALL)
+    return re.sub(r"^\s*\[TOOL_CALLS\][^\n]*(?:\n|$)", "", value,
+                  flags=re.MULTILINE).strip()
+
+
 try:
     _brain = _load_module("brain")
 except ImportError:
@@ -265,12 +286,8 @@ except ImportError:
 
     class _LegacyBrain:
         TurnStream = _LegacyTurnStream
-
-        @staticmethod
-        def strip_thinking(text):
-            text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
-            return re.sub(r"^\s*\[TOOL_CALLS\][^\n]*(?:\n|$)", "", text,
-                          flags=re.MULTILINE).strip()
+        strip_thinking = staticmethod(_fallback_strip_thinking)
+        is_leaked_markup = staticmethod(_fallback_is_leaked_markup)
 
         @staticmethod
         def _read_http_error(error):
@@ -359,11 +376,13 @@ except ImportError:
                                 break
                             sentence, buf = buf[:match.end()], buf[match.end():]
                             sentence = cls.strip_thinking(sentence)
-                            if sentence and not sentence.startswith("<"):
+                            if sentence and not cls.is_leaked_markup(sentence):
                                 q.put(sentence)
-                tail = cls.strip_thinking(buf)
-                if tail and not tail.startswith("<"):
-                    q.put(tail)
+                # no tail flush after a barge-in: it would be spoken over the user
+                if not (cancel is not None and cancel.is_set()):
+                    tail = cls.strip_thinking(buf)
+                    if tail and not cls.is_leaked_markup(tail):
+                        q.put(tail)
             except urllib.error.HTTPError as error:
                 detail = cls._read_http_error(error)
                 if error.code == 400 and tools and "tool" in detail.lower():
@@ -601,10 +620,11 @@ def _doctor_ctx() -> dict:
     """handsoff globals → hardware ctx (never the reverse: no SETTINGS import)."""
     return {
         "ollama_base": OLLAMA_BASE, "ollama_model": OLLAMA_MODEL,
-        "whisper_size": WHISPER_SIZE, "piper_voice": PIPER_VOICE_NAME,
+        "whisper_size": WHISPER_SIZE, "tts_engine": TTS_ENGINE,
+        "tts_reference": TTS_REFERENCE,
+        "tts_weights_dir": str(_audio.tts_weights_dir()),
         "mic_device": str(SETTINGS.get("mic_device") or ""),
         "whisper_model_dir": str(WHISPER_MODEL_DIR),
-        "piper_voice_dir": str(PIPER_VOICE_DIR),
         "control_sock": str(CONTROL_SOCK), "state_dir": str(STATE_DIR),
         "systemd_unit_file": str(SYSTEMD_UNIT_FILE),
     }
@@ -653,7 +673,9 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         ollama_base=OLLAMA_BASE,
         ollama_model=OLLAMA_MODEL,
         ollama_available=ollama_available,
-        piper_voice=_piper_voice,
+        tts_model=_tts_model,
+        tts_engine=TTS_ENGINE,
+        tts_reference=TTS_REFERENCE,
         whisper_model=_whisper_model,
         deployment_snapshot=_deployment_snapshot,
         hardware_snapshot=_doctor_snapshot,
@@ -668,6 +690,7 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         control_sock=CONTROL_SOCK,
         crash_log=CRASH_LOG,
         remote_ollama_allowed=_ollama_remote_opted_in,
+        remote_ollama_optin_source=_remote_ollama_optin_source,
         shutil=shutil,
         sounddevice=sd,
         log=log,
@@ -907,9 +930,20 @@ def _secure_runtime_files() -> bool:
 
     Deliberately no short-circuit: every file gets hardened even when an
     earlier one is bad, and the AND of the results is returned."""
-    paths = (SETTINGS_FILE, HISTORY_FILE, MEMORY_FILE, CRASH_LOG,
+    paths = [SETTINGS_FILE, HISTORY_FILE, MEMORY_FILE, CRASH_LOG,
              PENDING_FILE, LOCK_FILE, LOG_FILE, CONTROL_SOCK, MIC_EVENTS_FILE,
-             REMINDERS_FILE)
+             REMINDERS_FILE]
+    # Backups hold the SAME secrets as the files they copy (a transcript, the
+    # settings), and `shutil.copy2` inherits the SOURCE's mode at copy time —
+    # so any sidecar written while the source was still loose stays loose
+    # forever. Hardening the live file is not enough: sweep the sidecars too,
+    # or history.json.bak-modelswitch keeps a 0644 conversation transcript.
+    for directory in (CONFIG_DIR, STATE_DIR):
+        try:
+            paths.extend(p for p in directory.glob("*.bak*")
+                         if not p.is_symlink())
+        except OSError:
+            log.warning("could not enumerate backups in %s", directory)
     # materialize first: all(generator) short-circuits, which would leave
     # every file after a bad one unhardened
     return all([_secure_file(path) for path in paths])
@@ -921,7 +955,7 @@ _quarantine_bad = _core_settings._quarantine_bad
 
 def _prepare_runtime() -> bool:
     """Create the runtime roots privately and harden existing state files."""
-    for directory in (CONFIG_DIR, STATE_DIR, WHISPER_MODEL_DIR, PIPER_VOICE_DIR):
+    for directory in (CONFIG_DIR, STATE_DIR, WHISPER_MODEL_DIR):
         if not _private_dir(directory):
             return False
     return _secure_runtime_files()
@@ -947,26 +981,39 @@ def _write_settings_dict(data: dict, *, stamp_version: bool = True) -> None:
                                         stamp_version=stamp_version)
 
 
-def _persist_setting(key: str, value) -> None:
+def _persist_setting(key: str, value) -> bool:
     """Persist one runtime setting (implemented in core.settings; this wrapper
-    is the tests' patch seam and adds the derived-global refresh)."""
-    _core_settings._persist_setting(key, value, SETTINGS_FILE, CONFIG_DIR)
+    is the tests' patch seam and adds the derived-global refresh).
+
+    Returns whether it reached the disk. The runtime globals and the derived
+    settings are refreshed ONLY on success: updating them after a swallowed
+    write error left the bubble running on (and re-stamping) a value that the
+    next start would not read back.
+    """
+    if not _core_settings._persist_setting(key, value, SETTINGS_FILE, CONFIG_DIR):
+        log.warning("setting %r was NOT persisted — keeping the old value", key)
+        return False
     SETTINGS[key] = value
     SETTINGS["version"] = SETTINGS_VERSION
     reload_derived_settings()
+    return True
 
 
-def set_setting(key: str, value) -> None:
+def set_setting(key: str, value) -> bool:
     """Single entry point for every SETTINGS mutation.
 
     Takes the in-process lock AND the cross-process file lock (via
     _persist_setting's read-merge-write), refreshes the in-memory copy and
     derived globals — no caller may use a raw ``SETTINGS[k] = v`` write and
-    bypass the lock. Updates SETTINGS first so a mocked _persist_setting
-    (tests) still leaves the in-memory state honest.
+    bypass the lock. Returns whether the value reached the disk.
+
+    Memory is updated by the wrapper, so only on success. Writing SETTINGS
+    first (the old behaviour) meant a failed write left the bubble running on
+    — and re-stamping — a value the next start could not read back, the exact
+    divergence `_persist_setting` was fixed to prevent for its other callers.
+    A caller that must tell the user about an unsaved change checks this.
     """
-    SETTINGS[key] = value
-    _persist_setting(key, value)
+    return bool(_persist_setting(key, value))
 
 
 SETTINGS = _load_settings()
@@ -1006,7 +1053,9 @@ def _history_budget() -> int:
     return max(1024, OLLAMA_NUM_CTX - _fixed_prompt_tokens() - 1024)
 WHISPER_SIZE = SETTINGS["whisper_size"]
 WHISPER_DEVICE = SETTINGS.get("whisper_device", "auto")
-PIPER_VOICE_NAME = SETTINGS["piper_voice"]
+# Speech engine: chatterbox-turbo, with an OPTIONAL >=5 s reference clip whose
+# voice it clones. "" means the model's own built-in voice.
+TTS_REFERENCE = str(SETTINGS.get("tts_reference") or "")
 
 
 def reload_derived_settings() -> None:
@@ -1017,7 +1066,7 @@ def reload_derived_settings() -> None:
     tool-support probing when the model changes.
     """
     global OLLAMA_BASE, OLLAMA_MODEL, OLLAMA_NUM_CTX
-    global WHISPER_SIZE, WHISPER_DEVICE, PIPER_VOICE_NAME
+    global WHISPER_SIZE, WHISPER_DEVICE, TTS_REFERENCE
     global _FIXED_PROMPT_TOKENS, _TOOLS_SUPPORTED
     host = str(SETTINGS.get("ollama_host", OLLAMA_BASE))
     if not host.startswith(("http://", "https://")):
@@ -1037,7 +1086,7 @@ def reload_derived_settings() -> None:
     OLLAMA_NUM_CTX = new_ctx
     WHISPER_SIZE = SETTINGS.get("whisper_size", WHISPER_SIZE)
     WHISPER_DEVICE = SETTINGS.get("whisper_device", "auto")
-    PIPER_VOICE_NAME = SETTINGS.get("piper_voice", PIPER_VOICE_NAME)
+    TTS_REFERENCE = str(SETTINGS.get("tts_reference") or "")
     # Appearance-tab animation knobs (bubble repaints from these every frame)
     global BUBBLE_ACCENT, ANIM_ENERGY
     BUBBLE_ACCENT = min(1.0, max(0.0, float(SETTINGS.get("bubble_accent", 0.5))))
@@ -1048,8 +1097,7 @@ def reload_derived_settings() -> None:
             whisper_size=WHISPER_SIZE,
             whisper_device=WHISPER_DEVICE,
             whisper_model_dir=WHISPER_MODEL_DIR,
-            piper_voice_dir=PIPER_VOICE_DIR,
-            piper_voice_name=PIPER_VOICE_NAME,
+            tts_reference=TTS_REFERENCE,
             settings=SETTINGS,
             logger=log,
         )
@@ -1184,14 +1232,24 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
         _whisper_lock = threading.Lock()
         _CUDA_ERR_RE = re.compile(r"cuda|cublas|cudnn", re.IGNORECASE)
         _WHISPER_VRAM_MB = {}
-        _piper_lock = threading.Lock()
+        _tts_lock = threading.Lock()
+        _tts_model = None
+        # mic_health() reports the loading device and the configured voice, so
+        # these must exist here too: a partial install answers `health` (and the
+        # settings app's whole Voice tab) or it raises AttributeError instead of
+        # reporting that the engine is missing.
+        _tts_device = ""
+        TTS_ENGINE = "chatterbox-turbo"
+        TTS_REFERENCE = ""
+        MIN_REFERENCE_S = 5.0
         _MIC_OPERATION_LOCK = threading.RLock()
         _MIC_OPERATION_STATE_LOCK = threading.Lock()
         _MIC_OPERATION_OWNER = None
         _whisper_model = None
         _whisper_cpu_fallback = False
-        _piper_voice = None
         _nvidia_free_vram_mb = staticmethod(lambda: None)
+        tts_weights_dir = staticmethod(lambda: Path("/nonexistent"))
+        tts_weights_cached = staticmethod(lambda: False)
         _whisper_device_choice = staticmethod(lambda *_args: ("cpu", "int8"))
         _is_cuda_error = staticmethod(lambda *_args: False)
 
@@ -1225,7 +1283,8 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
             return False
 
         _resample_to_16k = _open_input = _stop_recorder_bounded = _missing
-        get_whisper = get_piper = transcribe = tts_to_wav = play_wav = _missing
+        get_whisper = get_tts = transcribe = tts_to_wav = play_wav = _missing
+        reference_problem = reference_clip_seconds = _missing
 
         class Recorder:
             def __init__(self, *_args, **_kwargs):
@@ -1241,8 +1300,7 @@ _audio.configure(
     whisper_size=WHISPER_SIZE,
     whisper_device=WHISPER_DEVICE,
     whisper_model_dir=WHISPER_MODEL_DIR,
-    piper_voice_dir=PIPER_VOICE_DIR,
-    piper_voice_name=PIPER_VOICE_NAME,
+    tts_reference=TTS_REFERENCE,
     settings=SETTINGS,
     logger=log,
 )
@@ -1401,8 +1459,8 @@ _TRANSCRIBE_LOCK = _audio._TRANSCRIBE_LOCK
 _whisper_lock = _audio._whisper_lock
 _CUDA_ERR_RE = _audio._CUDA_ERR_RE
 _WHISPER_VRAM_MB = _audio._WHISPER_VRAM_MB
-_piper_lock = _audio._piper_lock
-_piper_voice = None
+_tts_lock = _audio._tts_lock
+_tts_model = None
 _nvidia_free_vram_mb = _audio._nvidia_free_vram_mb
 _whisper_device_choice = _audio._whisper_device_choice
 _is_cuda_error = _audio._is_cuda_error
@@ -1415,11 +1473,24 @@ def get_whisper():
     return result
 
 
-def get_piper():
-    _audio._piper_voice = _piper_voice
-    result = _audio.get_piper()
-    globals()["_piper_voice"] = _audio._piper_voice
+def get_tts():
+    # Keep old H.get_tts monkeypatches effective without coupling core.audio
+    # back to this module (same seam shape as get_whisper above).
+    _audio._tts_model = _tts_model
+    result = _audio.get_tts()
+    globals()["_tts_model"] = _audio._tts_model
     return result
+
+
+def warm_tts() -> int:
+    """Load-then-synthesize once at startup (seam for tests: see core.audio).
+
+    Takes the loaded model through this module's `get_tts` so the historical
+    monkeypatch seam keeps working, and passes it EXPLICITLY: core.audio must
+    not fall back to loading a model of its own here, or a test that stubs
+    get_tts would quietly pull 3.8 GB into the test process.
+    """
+    return _audio.warm_tts(model=get_tts())
 
 
 def transcribe(audio_int16: np.ndarray) -> str:
@@ -1434,7 +1505,7 @@ def transcribe(audio_int16: np.ndarray) -> str:
 
 
 def tts_to_wav(text: str, wav_path: Path) -> None:
-    return _audio.tts_to_wav(text, wav_path, voice_getter=get_piper)
+    return _audio.tts_to_wav(text, wav_path, voice_getter=get_tts)
 
 
 play_wav = _audio.play_wav
@@ -1518,14 +1589,29 @@ def _ollama_remote() -> bool:
         return True
 
 
-def _ollama_remote_opted_in() -> bool:
+_REMOTE_OLLAMA_ENV = "HANDSOFF_ALLOW_REMOTE_OLLAMA"
+_REMOTE_OLLAMA_ENV_TOKENS = frozenset({"1", "true", "yes", "on"})
+
+
+def _remote_ollama_optin_source() -> str:
+    """Which channel opted into a non-loopback brain: '' | 'settings' | 'env'.
+
+    The single source of truth for the remote-brain opt-in, used by the send
+    guard, the settings file's contract and `--ptt doctor` alike. The settings
+    value is compared with `is True` rather than truthiness, matching
+    core.settings.coerce_settings' fail-closed contract, so a caller that
+    seeds SETTINGS without coercion cannot fail open on `"yes"` or `1`.
+    """
     settings = globals().get("SETTINGS") or {}
-    configured = bool(settings.get(
-        "allow_remote_ollama",
-        DEFAULT_SETTINGS.get("allow_remote_ollama", False)))
-    return configured or os.environ.get("HANDSOFF_ALLOW_REMOTE_OLLAMA", "").strip().lower() in {
-        "1", "true", "yes", "on"
-    }
+    if settings.get("allow_remote_ollama") is True:
+        return "settings"
+    if os.environ.get(_REMOTE_OLLAMA_ENV, "").strip().lower() in _REMOTE_OLLAMA_ENV_TOKENS:
+        return "env"
+    return ""
+
+
+def _ollama_remote_opted_in() -> bool:
+    return bool(_remote_ollama_optin_source())
 
 
 _REMOTE_OLLAMA_WARNED = False
@@ -1602,6 +1688,9 @@ _READER_COOLDOWN_LOCK = threading.Lock()
 _READER_APP_LAST: dict[str, float] = {}
 
 _ANNOUNCE_LOCK = threading.Lock()  # serialize ALL _speak playback (no overlap)
+# Voice-preview cap: `--ptt say` is driven by a GUI button, but it is still a
+# socket, so an unbounded payload would let one caller queue minutes of speech.
+_SAY_PREVIEW_MAX = 300
 _ANNOUNCE_CANCEL = threading.Event()  # cancels the previous announcement's playback
 _ANNOUNCE_CANCEL_LOCK = threading.Lock()  # guards _ANNOUNCE_CANCEL rebind (no live race)
 
@@ -1821,6 +1910,7 @@ def ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> dict:
 
 
 strip_thinking = _brain.strip_thinking
+is_leaked_markup = _brain.is_leaked_markup
 
 
 def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
@@ -1928,12 +2018,31 @@ def _world_norm_key(title: str) -> str:
 
 
 def _load_world_seen() -> dict:
-    """{norm_key: epoch} of spoken/announced events; corrupt → {}."""
+    """{norm_key: epoch} of spoken/announced events; corrupt → {}.
+
+    The reference time is the NEWEST stamp in the file whenever that is ahead
+    of the wall clock. Expiry is measured from it, so a backwards clock step
+    (NTP correction, DST fix, VM resume, a manually set clock) cannot expire
+    every entry at once and make the bubble announce headlines the user has
+    already heard. Entries are still bounded by the same TTL, so the store
+    cannot grow or pin itself forever.
+    """
     try:
         data = json.loads(WORLD_EVENTS_FILE.read_text(encoding="utf-8"))
-        now = time.time()
-        return {str(k): float(v) for k, v in data.items()
-                if str(k).strip() and float(v) > now - WORLD_EVENTS_TTL_S}
+        stamps: dict[str, float] = {}
+        for k, v in data.items():
+            key = str(k).strip()
+            if not key:
+                continue
+            try:
+                stamps[key] = float(v)
+            except (TypeError, ValueError):
+                continue
+        if not stamps:
+            return {}
+        now = max([time.time()] + list(stamps.values()))
+        return {k: v for k, v in stamps.items()
+                if v > now - WORLD_EVENTS_TTL_S}
     except (OSError, ValueError, TypeError, AttributeError):
         return {}
 
@@ -2248,13 +2357,16 @@ from core.calendar import (
     _ics_month_length,
     _ics_nth_weekday,
     _ics_parse_dt,
+    _ics_scheme_error,
+    _ics_source_label,
     _ics_unfold,
 )
 # Re-exported for the H.* test seam and the ToolBelt host fallback.
 _CALENDAR_EXPORTS = (
     _DAY_NAMES, _MONTH_NAMES, _fmt_events, _ics_add_months, _ics_allday,
     _ics_events_from_text, _ics_expand, _ics_fetch, _ics_month_day,
-    _ics_month_length, _ics_nth_weekday, _ics_parse_dt, _ics_unfold,
+    _ics_month_length, _ics_nth_weekday, _ics_parse_dt, _ics_scheme_error,
+    _ics_source_label, _ics_unfold,
 )
 
 
@@ -2927,7 +3039,7 @@ class ContinuousListener:
             self._assistant._vad_speech(True)
         if gate.in_speech:
             frames.append(indata.copy())
-            self._assistant.sigLevel.emit(min(1.0, rms / 2000.0))
+            self._assistant._emit_level(min(1.0, rms / 2000.0), "mic")
         if event == "end" or len(frames) >= max_frames:
             self.gate_open = False
             self._assistant._vad_speech(False)
@@ -3150,6 +3262,9 @@ class Assistant(QObject):
     sigLevel = Signal(float)
     sigUtterance = Signal(object)     # hands-free: np.ndarray from the VAD thread
     sigCommand = Signal(str)          # control-socket commands → main thread
+    # Class-level so it exists on an instance built with __new__ (tests do this)
+    # as well as a normally constructed one; one Assistant per process anyway.
+    _gen_lock = threading.Lock()      # makes the generation increment atomic
 
     def __init__(self) -> None:
         super().__init__()
@@ -3216,6 +3331,85 @@ class Assistant(QObject):
         self._start_worker(self._pipeline_worker, name="pipeline")
         self.sigUtterance.connect(self._on_utterance)
         self.sigCommand.connect(self._on_command)
+        # -- the shared voice level: who published it, how loud, and when --
+        # Written from the VAD / push-to-talk / playback threads, so these are
+        # plain scalars (atomic enough under the GIL) rather than a lock. The
+        # control socket's `level` command reads them back for the Settings →
+        # Voice meter, which is how the feed gets diagnosed without watching
+        # the bubble repaint.
+        self._level_last = 0.0
+        self._level_source = "none"
+        self._level_at = 0.0
+        # Voice-reactive visuals need a level while the bubble is SPEAKING too,
+        # and the mic is deliberately blanked then (its own TTS would re-trigger
+        # the VAD). core.audio.play_wav therefore reports what it is actually
+        # playing through this hook. Best-effort: the feed swallows any error
+        # from the GUI side, so a broken widget can never stall playback.
+        if "_audio" in globals():
+            hook = getattr(_audio, "set_level_hook", None)
+            if hook is not None:
+                hook(lambda v: self._emit_level(v, "tts"))
+
+    # -- the shared voice level ------------------------------------------------
+
+    def _emit_level(self, value: float, source: str) -> None:
+        """Publish one voice level AND remember where it came from.
+
+        All three producers call this instead of `sigLevel.emit` directly — the
+        continuous listener's VAD, the push-to-talk recorder and core.audio's
+        playback hook. Keeping the bookkeeping at the single point where the
+        signal is produced is what lets `level_snapshot()` answer "is the mic
+        feeding, or is the bubble's own voice driving the visuals?" rather than
+        reporting a bare number that looks identical either way.
+        """
+        try:
+            val = min(1.0, max(0.0, float(value)))
+        except (TypeError, ValueError):
+            return
+        self._level_last = val
+        self._level_source = source
+        if val > 0.0:
+            self._level_at = time.monotonic()
+        try:
+            self.sigLevel.emit(val)
+        except Exception:
+            # Both callers that matter run on threads whose death is silent and
+            # expensive (the PortAudio callback, the TTS playback thread), so a
+            # raising slot — realistically a widget deleted mid-shutdown — must
+            # not travel back into them. Same contract as core.audio._emit_level.
+            log.debug("voice level emit failed", exc_info=True)
+
+    def level_snapshot(self) -> dict:
+        """Live voice-level state, served by the control socket's `level`
+        command.
+
+        `raw` is the last value a producer emitted and `ui` is the smoothed
+        value the bubble's painters read out of `_frame()["level"]` — the number
+        every design actually animates from. Reporting both is the whole point:
+        it separates "nothing is feeding the level" from "the feed is fine but
+        the bubble is not showing it". `age_s` is how long ago a non-zero level
+        was seen (None = none since start), which is what exposes a wedged feed
+        that is emitting exact zeros.
+        """
+        bw = getattr(self, "_bubble_widget", None)
+        try:
+            ui = getattr(bw, "_level_ui", None) if bw is not None else None
+        except RuntimeError:
+            ui = None                      # widget deleted during shutdown
+        try:
+            raw = float(getattr(self, "_level_last", 0.0) or 0.0)
+            ui = raw if ui is None else float(ui)
+            at = float(getattr(self, "_level_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            raw, ui, at = 0.0, 0.0, 0.0
+        return {
+            "raw": round(raw, 4),
+            "ui": round(ui, 4),
+            "source": str(getattr(self, "_level_source", "none")),
+            "age_s": (round(time.monotonic() - at, 3) if at else None),
+            "state": str(self.state),
+            "handsfree": bool(getattr(self, "_handsfree", False)),
+        }
 
     # -- health snapshot (mic + brain + TTS) --------------------------------
 
@@ -3251,8 +3445,12 @@ class Assistant(QObject):
     def mic_health(self) -> dict:
         """One JSON-ready snapshot of the assistant's vital signs: mic health
         (same state machine as the journal lines), brain (Ollama + model) and
-        TTS (piper) status. Served over the control socket as `health`; kept
-        free of Qt/logging side effects so it is trivially testable."""
+        TTS (chatterbox) status. Served over the control socket as `health`;
+        kept free of Qt/logging side effects so it is trivially testable.
+
+        `tts.engine` and `tts.reference` are reported rather than just ready/
+        not, because "ready" is not enough to tell a built-in-voice bubble from
+        one that failed to condition on a reference clip."""
         snap = {
             "assistant": self.state,
             "handsfree": bool(self._handsfree),
@@ -3265,7 +3463,10 @@ class Assistant(QObject):
             "reachable": ollama_available(),
         }
         snap["tts"] = {
-            "ready": _piper_voice is not None,
+            "ready": _tts_model is not None,
+            "engine": TTS_ENGINE,
+            "device": _audio._tts_device or None,
+            "reference": TTS_REFERENCE or None,
             "whisper_ready": _whisper_model is not None,
         }
         snap["deployment"] = _deployment_snapshot()
@@ -3273,16 +3474,54 @@ class Assistant(QObject):
 
     # -- mic self-heal -------------------------------------------------------
 
+    def _bump_gen(self) -> "tuple[int, threading.Event]":
+        """Atomically claim the next turn generation and a fresh cancel event.
+
+        `self._gen += 1` followed by `gen = self._gen` is two steps, and the
+        callers live on different threads (Qt input, the listener, PTT, the
+        reminder worker, the health tick). Interleaved, two turns can be
+        claimed with the SAME generation — which is exactly the value the
+        staleness checks (`gen != self._gen`) and the gen-keyed transcript
+        cache trust, so one utterance can be answered with another's text.
+        One lock, one writer: every increment goes through here.
+        """
+        with self._gen_lock:
+            self._gen += 1
+            return self._gen, threading.Event()
+
     def _say_now(self, text: str) -> None:
         """Standalone announcement: speak text outside any turn pipeline."""
         if self._is_closed():
             return
-        self._gen += 1
-        gen, cancel = self._gen, threading.Event()   # fresh: _cancel may be set
+        gen, cancel = self._bump_gen()   # fresh: _cancel may be set
         self._start_worker(
             target=lambda: (self._speak(text, gen, cancel), self._set(gen, IDLE)),
             name="selfheal-tts", daemon=True,
         )
+
+    def say_preview(self, text: str) -> str:
+        """Speak a one-off line as a voice preview; returns a status line.
+
+        The settings app asks the RUNNING bubble to do this instead of loading
+        its own engine: a second ChatterboxTurboTTS is ~2.7 GB of VRAM in a
+        second process, and it would preview a voice the bubble is not actually
+        using (the reference clip and rate/volume are applied at the bubble's
+        tts_to_wav, not the GUI's).
+
+        Deliberately routed through _announce_now rather than _speak directly:
+        a preview is not a turn, so it must not bump the turn generation, and it
+        must cancel whatever is playing the way every announcement does —
+        otherwise the user hears the preview under the bubble's reply.
+        """
+        text = " ".join((text or "").split())
+        if not text:
+            return "error: say needs text"
+        truncated = len(text) > _SAY_PREVIEW_MAX
+        if truncated:
+            text = text[:_SAY_PREVIEW_MAX]
+        self._announce_now(text)
+        note = f" (truncated to {_SAY_PREVIEW_MAX} chars)" if truncated else ""
+        return f"ok: speaking {len(text)} chars with {TTS_ENGINE}{note}"
 
     def _is_closed(self) -> bool:
         self._lifecycle_ensure()
@@ -3634,8 +3873,15 @@ class Assistant(QObject):
                     log.info("reminder fired")
                     self.sigCommand.emit("__timer:%s\x1f%s" % (
                         r["name"], float(r.get("repeat_hours") or 0)))
-            except Exception:
+            except Exception as exc:
+                # A full disk makes drain_due() raise before it returns the
+                # fired entries, so the reminder is never delivered AND never
+                # pruned: it silently stops working, one journal line per tick.
                 log.exception("reminder worker pass failed")
+                self._report_once(
+                    "reminder store unavailable", exc,
+                    "handsoff: reminders are not firing — "
+                    f"{type(exc).__name__}: {str(exc)[:160]}")
 
     def _settings_watch_worker(self) -> None:
         """Pick up settings.json saves within seconds, no restart required.
@@ -3666,8 +3912,7 @@ class Assistant(QObject):
         msg = f"While I was off, these reminders came due: {names}{extra}."
         log.info("announcing %d missed reminder(s)", len(missed))
         notify(f"handsoff missed reminders: {names}")
-        self._gen += 1
-        gen, cancel = self._gen, threading.Event()   # fresh: _cancel may be stale
+        gen, cancel = self._bump_gen()   # fresh: _cancel may be stale
         self._start_worker(
             lambda: (self._speak(msg, gen, cancel), self._set(gen, IDLE)),
             name="missed-rem-tts")
@@ -3680,10 +3925,10 @@ class Assistant(QObject):
         log.info("announcing timer")
         notify(f"handsoff timer: {name}")
         self.interrupt()
-        self._gen += 1
-        # a FRESH cancel event: interrupt() just set self._cancel, and _speak
-        # returns immediately on a set event — the reminder would never be spoken
-        gen, cancel = self._gen, threading.Event()
+        # _bump_gen hands back a FRESH cancel event: interrupt() just set
+        # self._cancel, and _speak returns immediately on a set event — the
+        # reminder would never be spoken
+        gen, cancel = self._bump_gen()
         self._start_worker(
             lambda: (self._speak(msg, gen, cancel), self._set(gen, IDLE)),
             name="timer-tts")
@@ -3710,8 +3955,7 @@ class Assistant(QObject):
             if age < 86400:
                 head = crash.read_text(errors="replace")[:200].replace("\n", " ")
                 log.warning("previous crash detected (%.0fs ago): %s", age, head)
-                self._gen += 1
-                gen, cancel = self._gen, threading.Event()
+                gen, cancel = self._bump_gen()
                 self._start_worker(
                     lambda: (self._speak(
                         "Heads up: I crashed earlier. It was logged, and I'm running again.",
@@ -3809,9 +4053,24 @@ class Assistant(QObject):
         except Exception as e:
             errors.append(f"whisper: {e}")
         try:
-            get_piper()
+            get_tts()
         except Exception as e:
-            errors.append(f"piper: {e}")
+            errors.append(f"tts: {e}")
+        # Pay the engine's one-time cost now. Measured through the control
+        # socket: the first spoken reply after a fresh start took ~1.5 s to
+        # first audio and every later one ~0.6 s, because the decoder, flow
+        # sampler and vocoder compile their CUDA kernels on first use. The
+        # model is already loaded here, so this spends that time where nobody
+        # is waiting for an answer.
+        try:
+            t0 = time.monotonic()
+            warm_samples = warm_tts()
+            if warm_samples:
+                log.info("speech engine warmed (%d samples in %.1fs)",
+                         warm_samples, time.monotonic() - t0)
+        except Exception:
+            log.warning("speech warm-up failed — the first reply will be slow",
+                        exc_info=True)
         if not ollama_available():
             errors.append(f"ollama: no server at {OLLAMA_BASE} (systemctl start ollama)")
         else:
@@ -3823,7 +4082,7 @@ class Assistant(QObject):
             log.error("startup: %s", e)
         if errors:
             notify("handsoff: " + " | ".join(errors))
-        # warm the LLM now (after whisper/piper, which load first). This is
+        # warm the LLM now (after whisper/tts, which load first). This is
         # MORE than a VRAM load: it sends the REAL system prompt + tool
         # schemas (+ history) so Ollama's KV cache holds the exact prefix a
         # real turn uses — the first question then only evaluates its own
@@ -3902,12 +4161,31 @@ class Assistant(QObject):
             self._ptt_stopping = False
             self._ptt_stop_recorder = None
 
+    def _resume_handsfree_listener(self) -> None:
+        """Bring the continuous listener back after a push-to-talk press."""
+        if not self._handsfree:
+            return
+        try:
+            self._listener.start()
+        except Exception:
+            log.exception("push-to-talk: could not restart hands-free listening")
+
     def begin_listening(self) -> None:
         self.interrupt()
         if self._handsfree:
-            # the continuous listener owns the mic; a press just barges in
-            self._listener.suspend()
-            return
+            # Hands-free owns the mic, but a push-to-talk press must still mean
+            # "record me now": park the continuous listener for the duration of
+            # the press and record normally, then bring it back on release.
+            # One stream at a time, because two InputStreams on one device is
+            # what wedges this mic. Previously the press just called
+            # suspend() and returned without ever opening a recorder, so with
+            # hands-free on the PTT key was a silent no-op with no feedback —
+            # which is exactly what "push to talk is broken" looks like.
+            self._ptt_handsfree_parked = True
+            try:
+                self._listener.stop()
+            except Exception:
+                log.exception("push-to-talk: could not park hands-free listening")
         lock = self._ptt_ensure()
         # press#2 during a wedged stop: wait briefly for the in-flight
         # stop worker, else refuse cleanly instead of a doomed second open.
@@ -3957,16 +4235,17 @@ class Assistant(QObject):
         if old is not None:
             log.warning("begin_listening refused: recorder still owns microphone")
             return
-        self._gen += 1
-        self._cancel = threading.Event()
-        gen, cancel = self._gen, self._cancel
+        gen, cancel = self._bump_gen()
+        self._cancel = cancel
         with lock:
             try:
                 self._ptt_epoch = int(getattr(self, "_ptt_epoch", 0) or 0) + 1
             except Exception:
                 pass
         rec = Recorder(
-            on_level=self.sigLevel.emit,
+            # push-to-talk is its own source: the Settings meter distinguishes
+            # "hands-free is hearing me" from "my PTT key is recording"
+            on_level=lambda v: self._emit_level(v, "ptt"),
             device=str(SETTINGS["mic_device"]) if SETTINGS["mic_device"] else None,
             threshold=int(SETTINGS["mic_threshold"]),
         )
@@ -3988,11 +4267,17 @@ class Assistant(QObject):
         self._set(gen, LISTENING)
 
     def finish_listening(self) -> None:
-        if self._handsfree:
-            self._listener.resume()
-            return
+        # A press that parked the hands-free listener must submit the recorder
+        # it opened, not just resume the listener: the old hands-free early
+        # return threw the captured audio away, so PTT never produced a turn.
+        # The listener is restarted once the recorder is actually released
+        # (in _work, below) — never while the mic is still held open.
+        parked = bool(getattr(self, "_ptt_handsfree_parked", False))
+        self._ptt_handsfree_parked = False
         rec, self._recorder = self._recorder, None
         if rec is None:
+            if parked:
+                self._resume_handsfree_listener()
             return
         # PTT release must never block the Qt thread: stream.stop()/close()
         # on the flaky Yeti wedges for seconds, and submit's health line can
@@ -4001,9 +4286,8 @@ class Assistant(QObject):
         # next gen now (a second press invalidates this release), paint
         # THINKING immediately, stop->submit off-thread.
         self.interrupt()
-        self._gen += 1
-        gen = self._gen
-        self._cancel = threading.Event()
+        gen, cancel = self._bump_gen()
+        self._cancel = cancel
         self._set(gen, THINKING)
         lock = self._ptt_ensure()
         try:
@@ -4017,7 +4301,7 @@ class Assistant(QObject):
         except Exception:
             pass
 
-        def _work(_rec=rec, _gen=gen, _epoch=ptt_epoch) -> None:
+        def _work(_rec=rec, _gen=gen, _epoch=ptt_epoch, _parked=parked) -> None:
             t0 = time.monotonic()
             try:
                 audio, wedged = self._stop_recorder_bounded(_rec, timeout=3.0)
@@ -4067,29 +4351,47 @@ class Assistant(QObject):
                         except Exception:
                             pass
             finally:
-                pass
+                if _parked:
+                    self._resume_handsfree_listener()
 
         threading.Thread(target=_work, name="ptt-stop", daemon=True).start()
 
     def submit_audio(self, audio: np.ndarray | None) -> None:
-        """Shared entry point: push-to-talk releases and hands-free utterances."""
+        """Shared entry point: push-to-talk releases and hands-free utterances.
+
+        A capture that produced nothing is a MIC fault, not a quiet user, so the
+        two cases are told apart in the journal and a deliberate key press is
+        never dropped in silence: an empty/quiet hands-free utterance is ordinary
+        (room noise, a stray syllable) and stays at INFO, while the same on a
+        push-to-talk release means the device is muted, wrong, or wedged — the
+        one case where the user is standing there waiting for an answer.
+        """
         if self._is_closed():
             return
         if audio is None:
+            log.warning(
+                "no audio from the recorder — the utterance produced nothing "
+                "(bounded stop timed out, or the input device failed to open)")
             self._set(self._gen, IDLE)
             return
-        if len(audio) < SAMPLE_RATE * 0.3 \
-                or int(np.max(np.abs(audio))) < int(SETTINGS["mic_threshold"]):
-            log.info("discarding too-short/quiet capture")
+        peak = int(np.max(np.abs(audio))) if len(audio) else 0
+        if len(audio) < SAMPLE_RATE * 0.3 or peak < int(SETTINGS["mic_threshold"]):
+            detail = ("frames=%d peak=%d threshold=%d"
+                      % (len(audio), peak, int(SETTINGS["mic_threshold"])))
+            if self._handsfree:
+                log.info("discarding too-short/quiet capture (%s)", detail)
+            else:
+                log.warning(
+                    "push-to-talk capture rejected (%s) — the microphone may be "
+                    "muted, the wrong input device, or too far away", detail)
             self._set(self._gen, IDLE)
             return
         # NOTE: the echo check lives in _pipeline now — it needs whisper,
         # which must never run on the Qt GUI thread (it froze the UI after
         # every spoken reply), and this way the audio is transcribed once
         self.interrupt()
-        self._gen += 1
-        self._cancel = threading.Event()
-        gen, cancel = self._gen, self._cancel
+        gen, cancel = self._bump_gen()
+        self._cancel = cancel
         self._set(gen, THINKING)
         # zero-LLM stop: probe the transcript in parallel; if it is a bare
         # stop command the queued turn is drained before the brain ever runs
@@ -4216,10 +4518,40 @@ class Assistant(QObject):
                 return
             try:
                 self._pipeline(audio, gen, cancel)
-            except Exception:
-                log.exception("pipeline worker crash")
+            except Exception as exc:
+                self._report_turn_failure(exc, gen, cancel)
             finally:
                 self._pipeline_q.task_done()
+
+    def _report_turn_failure(self, exc: BaseException, gen: int,
+                             cancel: threading.Event) -> None:
+        """A turn that crashed must be REPORTED, not swallowed.
+
+        This used to be `log.exception("pipeline worker crash")` and nothing
+        else. The most common cause is the speech model being unavailable —
+        whisper missing, unreadable or damaged, so `transcribe()` raises on
+        every single utterance: the user spoke and got NOTHING back, for good,
+        while the bubble still looked like it was listening and the journal
+        said only "crash".
+
+        Reported once per distinct cause (a broken model fails on every turn;
+        repeating the alarm each time is its own bug) with the cause NAMED,
+        and the bubble is put back to idle so it is not left stuck mid-turn.
+        """
+        key = f"{type(exc).__name__}: {exc}"[:160]
+        log.error("turn failed: %s", key, exc_info=exc)
+        first = self._report_once(
+            "turn failed", exc, f"handsoff: that turn failed — {key}")
+        try:
+            self._set(gen, IDLE)
+        except Exception:
+            log.exception("could not reset the state after a failed turn")
+        if not first or gen != self._gen or self._is_closed():
+            return
+        try:
+            self._speak(f"Sorry — I could not handle that: {key}", gen, cancel)
+        except Exception:
+            log.exception("could not speak the turn-failure report")
 
     def _is_stop_utt(self, text: str) -> bool:
         """True for a bare stop command: stop, quiet, shut up, be quiet,
@@ -4355,9 +4687,19 @@ class Assistant(QObject):
             # permissions, …) and this process's SETTINGS copy is stale —
             # dumping it would silently revert the user's saves.
             # (set_setting does exactly that merge under both locks.)
-            set_setting("handsfree", on)
+            saved = set_setting("handsfree", on)
         except OSError:
+            saved = False
             log.exception("cannot persist handsfree setting")
+        if saved is False:
+            # The listener really did start/stop, so the session is fine — but
+            # the choice is not on disk, and the next start will not honour it.
+            # Saying so is the whole difference between a surprising revert and
+            # a known one. (`except OSError` never fired: _persist_setting
+            # reports failure, it does not raise.)
+            log.warning(
+                "hands-free is %s for this session but the setting was NOT "
+                "saved — it will revert on restart", "on" if on else "off")
         if on:
             self._listener.start()
         else:
@@ -4380,7 +4722,7 @@ class Assistant(QObject):
             log.exception("live settings reload: cannot load settings.json")
             return
         old_whisper = (SETTINGS.get("whisper_size"), SETTINGS.get("whisper_device"))
-        old_voice = SETTINGS.get("piper_voice")
+        old_voice = SETTINGS.get("tts_reference")
         SETTINGS.clear()
         SETTINGS.update(new)
         reload_derived_settings()
@@ -4391,13 +4733,14 @@ class Assistant(QObject):
             except AttributeError:
                 pass
             log.info("live settings reload: whisper cache dropped (loads on next turn)")
-        if SETTINGS.get("piper_voice") != old_voice:
-            globals()["_piper_voice"] = None
+        if SETTINGS.get("tts_reference") != old_voice:
+            globals()["_tts_model"] = None
             try:
-                _audio._piper_voice = None
+                _audio._tts_model = None
             except AttributeError:
                 pass
-            log.info("live settings reload: piper cache dropped (loads on next turn)")
+            log.info("live settings reload: tts cache dropped "
+                     "(reconditions on the next turn)")
         global WINDOW_PX, BUBBLE_R0, GLOW_PAD, GEOM_K
         try:
             WINDOW_PX = min(192, max(96, int(SETTINGS.get("bubble_size", WINDOW_PX))))
@@ -4441,9 +4784,13 @@ class Assistant(QObject):
         elif action == "stop":
             self.finish_listening()
         elif action == "toggle":
+            # NOTE: no `and not self._handsfree` here. That guard sent every
+            # PTT press straight to the interrupt branch while hands-free was
+            # on, so the key did nothing at all — begin_listening() now parks
+            # the listener and records for the duration of the press.
             if self.state == LISTENING and self._recorder is not None:
                 self.finish_listening()
-            elif self.state == IDLE and not self._handsfree:
+            elif self.state == IDLE:
                 self.begin_listening()
             else:
                 self._listener.reset()
@@ -4468,8 +4815,7 @@ class Assistant(QObject):
             on = (True if action == "dictation-on" else
                   False if action == "dictation-off"
                   else not self._dictation)
-            self._gen += 1
-            gen, cancel = self._gen, threading.Event()
+            gen, cancel = self._bump_gen()
             self._set_dictation(on, gen, cancel)
         elif action == "reload-settings":
             self._reload_settings_live()
@@ -4931,15 +5277,15 @@ class Assistant(QObject):
         around playback so two OutputStreams can never overlap. Synthesis is
         intentionally outside the lock so slow TTS does not block other speech
         from reaching its cancellation/playback check."""
-        if _piper_voice is None and not self._models_ready.is_set():
+        if _tts_model is None and not self._models_ready.is_set():
             self._models_ready.wait(30)
         if sentence_q is None:
             text = (text or "").strip()
             if not text or cancel.is_set():
                 return
-            self._last_spoken = text
-            self._turn_spoke = True
             self._set(gen, SPEAKING)
+            # Armed BEFORE playback: the mic hears our own voice while it
+            # plays, so the echo filter needs the text ahead of time.
             self._recently_spoken.append(text)
             del self._recently_spoken[:-2]
             try:
@@ -4950,8 +5296,18 @@ class Assistant(QObject):
                         if not cancel.is_set():
                             log.info("saying response (%d chars)", len(text))
                             play_wav(wav, cancel)
-            except Exception:
+            except Exception as exc:
                 log.exception("TTS failed")
+                # "Spoke" must mean the user HEARD it: these three used to be
+                # set before synthesis, so an unreadable speech model left the
+                # bubble believing it had replied — the follow-up window
+                # opened on nothing and the user's next utterance was
+                # echo-filtered against a line that was never spoken.
+                self._unarm_speech(text)
+                self._report_speech_failure(exc)
+            else:
+                self._last_spoken = text
+                self._turn_spoke = True
             # announce-and-listen: a full spoken reply opens a short window in
             # which the NEXT utterance is taken without the wake word. Only
             # after natural completion — an interrupted (barged-in) reply
@@ -4973,11 +5329,8 @@ class Assistant(QObject):
                 continue
             if sentence is None:
                 break
-            self._last_spoken = sentence
-            self._turn_spoke = True
             self._set(gen, SPEAKING)
-            said.append(sentence)
-            self._recently_spoken.append(sentence)
+            self._recently_spoken.append(sentence)   # before playback: echo
             del self._recently_spoken[:-2]
             try:
                 with tempfile.TemporaryDirectory(dir=str(STATE_DIR)) as td:
@@ -4988,8 +5341,14 @@ class Assistant(QObject):
                             return
                         log.info("saying: %s", sentence)
                         play_wav(wav, cancel)
-            except Exception:
+            except Exception as exc:
                 log.exception("TTS failed (streaming)")
+                self._unarm_speech(sentence)
+                self._report_speech_failure(exc)
+                continue
+            said.append(sentence)
+            self._last_spoken = sentence
+            self._turn_spoke = True
         self._last_spoken = " ".join(said)
         # announce-and-listen (streaming path): same arming as above
         if self._turn_spoke and not cancel.is_set() and self._handsfree \
@@ -4997,6 +5356,44 @@ class Assistant(QObject):
             self._followup_until = _tick_now() + float(
                 SETTINGS["followup_seconds"])
             log.info("follow-up window open for %ss", SETTINGS["followup_seconds"])
+
+    def _unarm_speech(self, text: str) -> None:
+        """Withdraw `text` from the echo list: it was queued for playback but
+        synthesis or playback failed, so it was never actually spoken."""
+        try:
+            self._recently_spoken.remove(text)
+        except ValueError:
+            pass
+
+    def _report_once(self, kind: str, exc: BaseException,
+                     message: str) -> bool:
+        """Notify the user ONCE per distinct cause; True when first.
+
+        The caller has already logged the occurrence (with its traceback);
+        this decides whether the PERSON is told. These failures repeat — a
+        broken voice fails on every reply, a full disk fails on every tick —
+        so a notification per occurrence would be worse than the silence it
+        replaces.
+        """
+        key = f"{kind}: {type(exc).__name__}: {exc}"[:200]
+        seen = getattr(self, "_failures_reported", None)
+        if seen is None:
+            seen = self._failures_reported = set()
+        if key in seen:
+            return False
+        seen.add(key)
+        try:
+            if not self._is_closed():
+                notify(message)
+        except Exception:
+            log.exception("could not report %s", kind)
+        return True
+
+    def _report_speech_failure(self, exc: BaseException) -> None:
+        """Tell the user their reply could not be spoken (once per cause)."""
+        key = f"{type(exc).__name__}: {str(exc)[:160]}"
+        self._report_once("speech synthesis unavailable", exc,
+                          f"handsoff: I could not speak that reply — {key}")
 
     # -- restart bookkeeping ---------------------------------------------------
 
@@ -5042,6 +5439,21 @@ class Assistant(QObject):
                 HISTORY_FILE, json.dumps(self._history, ensure_ascii=False, indent=1))
         except OSError:
             log.exception("cannot save history")
+
+    def clear_history(self) -> int:
+        """Drop the conversation memory and persist the empty history.
+
+        Returns how many messages were dropped. This exists because the
+        history is held in `self._history` and `_save_history` rewrites the
+        whole file: another process truncating HISTORY_FILE alone would be
+        undone on the bubble's next turn, which is why a model switch in
+        Settings has to ask the RUNNING bubble to forget as well.
+        """
+        dropped = len(self._history)
+        self._history = []
+        self._save_history()
+        log.info("conversation history cleared (%d message(s) dropped)", dropped)
+        return dropped
 
 
 # -- rolling memory: durable facts that survive history trimming -------------------
@@ -5387,6 +5799,10 @@ class BubbleWidget(QWidget):
             self._paint_saturn(p, f)
         elif design == "void":
             self._paint_void(p, f)
+        elif design == "sauron":
+            self._paint_sauron(p, f)
+        elif design == "pikachu":
+            self._paint_pikachu(p, f)
         else:
             self._paint_orb(p, f)
         p.end()
@@ -5397,7 +5813,19 @@ class BubbleWidget(QWidget):
         `animation_energy` scales every motion term (orbit trip, swirl speed,
         hue sweep) and `bubble_accent` scales how hard the state colour punches
         through (saturation and glow alpha), so both Appearance sliders move
-        all ten designs at once instead of needing ten hand-tuned variants.
+        every design at once instead of needing hand-tuned variants.
+
+        The voice is deliberately NOT part of this dict's `energy` any more.
+        Folding `level` into `energy` was the quick way to make every design
+        react (it replaced six painters reading `level` and an equalizer that
+        faked its reactivity with a local `sin(t)` pulse), but it made them all
+        react the SAME way — every shape brightened by the same gain, so the
+        designs lost their identities exactly when the bubble is most alive.
+        `level` is published here and each painter now owns its own reaction:
+        the orb ripples, the cube flashes its facets, the crystal refracts, the
+        halo sends a wave round its torus, and so on. Every one of those terms
+        is written to be neutral at level 0 (multiplied by 1.0, or added as 0),
+        so a silent bubble renders exactly as it did before.
         """
         cx, cy = self.width() / 2, self.height() / 2
         t = self._clock.elapsed() / 1000.0
@@ -5406,25 +5834,55 @@ class BubbleWidget(QWidget):
         k_anim, accent = ANIM_ENERGY, BUBBLE_ACCENT
         radius = self._radius_ui if self._radius_ui is not None else self._radius_target(t)
         energy = min(1.0, max(0.0, self._energy_ui))
+        # one shared voice signal for every design: 0.0 in silence, 1.0 loud.
+        # Painters read it from here and each does its own thing with it.
+        lv = min(1.0, max(0.0, float(self._level_ui)))
         # orbiting key light: one full 360° trip per orbit period
         orbit_hz = {"idle": 0.06, "listening": 0.28, "thinking": 0.42, "speaking": 0.33}.get(self._state, 0.06)
         la = 3 * math.pi / 4 + t * 2 * math.pi * orbit_hz * k_anim
         lx, ly = math.cos(la), -math.sin(la)  # screen pos: y grows downward
+        # Both Appearance sliders are folded into the shared frame state HERE,
+        # once, because only two painters ever called _conic() — the rest draw
+        # with f["color"] / f["energy"], so an accent applied inside _conic()
+        # alone measured as literally zero changed pixels on reactor, droplet,
+        # void and <0.1% on five more. Every painter reads
+        # this dict, so applying it here is what makes the sliders reach all
+        # every design instead of just the orb.
+        #
+        # 0.5 is neutral in BOTH directions (gain 1.0), so the default settings
+        # render exactly as before and the slider is honest on the way down as
+        # well: the old `1.0 + 0.35 * accent` was 1.175 at the default and could
+        # never reduce saturation, so the lower half of the slider did nothing.
+        a = 2.0 * (accent - 0.5)                  # -1 .. +1, 0 at the default
+        sat = min(1.0, max(0.0, color.hslSaturationF() * (1.0 + 0.35 * a)))
+        glow = 1.0 + 0.45 * a
+        hue = color.hueF()
+        punched = QColor.fromHslF(hue if hue >= 0.0 else 0.0, sat,
+                                  color.lightnessF(), 1.0)
         return {
-            "cx": cx, "cy": cy, "t": t, "color": color, "radius": radius,
-            "energy": energy, "level": self._level_ui, "la": la, "lx": lx, "ly": ly,
+            "cx": cx, "cy": cy, "t": t, "color": punched, "radius": radius,
+            # animation_energy scales the glow every design already paints from,
+            # not just the motion terms most of them ignore; neutral at 1.0.
+            # The voice is NOT folded in: see the docstring. (There used to be an
+            # `energy0` alongside it — the same value without the voice lift,
+            # for the one painter whose geometry the lift corrupted. With the
+            # lift gone the two are identical, so `energy0` is retired rather
+            # than kept around as a second name for the same number.)
+            "energy": energy * (0.6 + 0.4 * k_anim),
+            "level": lv, "la": la, "lx": lx, "ly": ly,
             "inner": radius * (1.0 - 0.34 - 0.10 * swirl_boost),
-            "base_hue": max(0.0, QColor.fromRgbF(*self._color_ui).hueF()),
-            "sat": min(1.0, color.hslSaturationF() * (1.0 + 0.35 * accent)),
+            "base_hue": max(0.0, hue),
+            "sat": sat, "glow": glow,
             "swirl_speed": swirl_speed * k_anim, "swirl_boost": swirl_boost,
             "hue_speed": hue_speed * k_anim, "accent": accent, "anim": k_anim,
         }
 
     def _conic(self, f: dict, angle_deg: float, alpha: int, comet: bool = False) -> QConicalGradient:
         g = QConicalGradient(f["cx"], f["cy"], angle_deg)
-        # bubble_accent drives the glow's punch; 0.5 is neutral, so the slider
-        # only ever moves the look away from the historical baseline.
-        alpha = int(max(0, min(255, alpha * (0.55 + 0.9 * float(f.get("accent", 0.5))))))
+        # bubble_accent drives the glow's punch; the factor is computed once in
+        # _frame() so "neutral at 0.5" lives in one place and the painters that
+        # avoid _conic() still respond.
+        alpha = int(max(0, min(255, alpha * float(f.get("glow", 1.0)))))
         if comet:
             # asymmetric comet head + fading tail: rotation is unmistakable.
             # animation energy brightens head and tail, not just their speed.
@@ -5452,8 +5910,12 @@ class BubbleWidget(QWidget):
         la, lx, ly, inner = f["la"], f["lx"], f["ly"], f["inner"]
         swirl_speed = f["swirl_speed"]
 
+        # The voice ripples the whole silhouette: the glass visibly shivers with
+        # the room. Levels are neutral at 0, so a silent bubble stays round.
+        lv = min(1.0, max(0.0, float(f["level"])))
         # organic silhouette: thinking wobbles, speaking ripples, rest stay round
         wob_amt = 1.0 if self._state == THINKING else (0.45 if self._state == SPEAKING else 0.0)
+        wob_amt = max(wob_amt, 0.45 * lv)
         outer_path = QPainterPath()
         if wob_amt > 0.0:
             outer_path = self._wobble_path(cx, cy, radius, t, wob_amt)
@@ -5495,6 +5957,23 @@ class BubbleWidget(QWidget):
         p.drawEllipse(QPointF(cx, cy), radius, radius)
         p.restore()
 
+        # --- voice ripples: two rings spreading through the glass, from the
+        #     core outward, fading as they go. This is the orb's own reaction —
+        #     it used to just brighten like every other design.
+        if lv > 0.004:
+            p.save()
+            p.setClipPath(ring_path)
+            p.setBrush(Qt.NoBrush)
+            for i in range(2):
+                ph = (t * (0.55 + 0.3 * i) + i * 0.5) % 1.0
+                rr = inner + (radius - inner) * ph
+                c = QColor(color).lighter(150)
+                c.setAlpha(int(min(255.0, 190 * lv * (1.0 - ph))))
+                p.setPen(QPen(c, max(1.2, radius * 0.04 * (1.0 - 0.4 * ph)),
+                              Qt.SolidLine, Qt.RoundCap))
+                p.drawEllipse(QPointF(cx, cy), rr, rr)
+            p.restore()
+
         # --- 3D glass core: lit hemisphere facing the key light ---
         tint = QColor(
             int(26 * 0.88 + color.red() * 0.12),
@@ -5523,9 +6002,11 @@ class BubbleWidget(QWidget):
         p.setBrush(bounce)
         p.drawEllipse(QPointF(cx, cy + inner * 0.52), inner * 0.55, inner * 0.26)
 
-        # --- specular life: breathing hotspot + slow-drifting crescent ---
+        # --- specular life: breathing hotspot + slow-drifting crescent. The
+        #     hotspot catches the voice, the way a lamp glints when you speak.
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(255, 255, 255, int(55 + 15 * math.sin(2 * math.pi * t / 1.7))))
+        p.setBrush(QColor(255, 255, 255,
+                          int(min(255.0, 55 + 15 * math.sin(2 * math.pi * t / 1.7) + 90 * lv))))
         p.drawEllipse(
             QPointF(cx + lx * inner * 0.50, cy + ly * inner * 0.50), inner * 0.30, inner * 0.21
         )
@@ -5550,15 +6031,19 @@ class BubbleWidget(QWidget):
             x, y = cx + math.cos(a) * inner * 0.97, cy - math.sin(a) * inner * 0.97
             arc.moveTo(x, y) if i == 0 else arc.lineTo(x, y)
         hot = QColor(color)
-        hot.setAlpha(int(140 + 60 * energy))
-        p.setPen(QPen(hot, max(1.5, inner * 0.075), Qt.SolidLine, Qt.RoundCap))
+        hot.setAlpha(int(min(255.0, 140 + 60 * energy + 60 * lv)))
+        p.setPen(QPen(hot, max(1.5, inner * 0.075 * (1.0 + 0.5 * lv)),
+                      Qt.SolidLine, Qt.RoundCap))
         p.drawPath(arc)
 
     def _paint_halo(self, p: QPainter, f: dict) -> None:
         """Hollow torus: the wallpaper shows through the middle."""
         cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
         radius, energy = f["radius"], f["energy"]
-        thick = radius * (0.16 + 0.05 * energy + 0.10 * f["level"])
+        # The voice swells the torus and drives a brightness wave round it: the
+        # ring itself thickens outward as you speak. Neutral at level 0.
+        lv = min(1.0, max(0.0, float(f["level"])))
+        thick = radius * (0.16 + 0.05 * energy + 0.16 * lv)
         outer, inner_r = radius, radius - thick
         p.setPen(Qt.NoPen)
         halo = QRadialGradient(QPointF(cx, cy), radius + GLOW_PAD)
@@ -5583,19 +6068,30 @@ class BubbleWidget(QWidget):
         hole.addEllipse(QPointF(cx, cy), inner_r, inner_r)
         p.save()
         p.setClipPath(ring.subtracted(hole))
-        p.setBrush(QBrush(self._conic(f, -t * 360.0 * f["swirl_speed"], 230, comet=True)))
+        # the comet wave travels faster the louder the room is
+        p.setBrush(QBrush(self._conic(f, -t * 360.0 * f["swirl_speed"] * (1.0 + 1.1 * lv),
+                                     230, comet=True)))
         p.drawEllipse(QPointF(cx, cy), outer, outer)
         p.restore()
-        # bright bead parked on the ring at a known angle (phase-exact)
-        bead_a = t * 2 * math.pi * f["swirl_speed"]
+        # bright bead parked on the ring at a known angle (phase-exact), with a
+        # trailing bead behind it that only shows up with the voice
+        bead_a = t * 2 * math.pi * f["swirl_speed"] * (1.0 + 1.1 * lv)
         bead_r = (outer + inner_r) / 2
-        p.setBrush(QColor(255, 255, 255, 200))
+        p.setBrush(QColor(255, 255, 255, int(min(255.0, 200 + 55 * lv))))
         p.drawEllipse(QPointF(cx + math.cos(bead_a) * bead_r, cy - math.sin(bead_a) * bead_r),
-                      thick * 0.32, thick * 0.32)
-        # breathing core dot
-        dot_r = radius * 0.07 * (1.0 + 0.3 * math.sin(2 * math.pi * t / 1.2))
+                      thick * 0.32 * (1.0 + 0.35 * lv), thick * 0.32 * (1.0 + 0.35 * lv))
+        if lv > 0.004:
+            tail = QColor(255, 255, 255, int(min(255.0, 150 * lv)))
+            p.setBrush(QBrush(tail))
+            for k in (0.35, 0.75):
+                ta = bead_a - k
+                p.drawEllipse(
+                    QPointF(cx + math.cos(ta) * bead_r, cy - math.sin(ta) * bead_r),
+                    thick * (0.22 - 0.08 * k) * lv, thick * (0.22 - 0.08 * k) * lv)
+        # breathing core dot, flaring with the voice
+        dot_r = radius * 0.07 * (1.0 + 0.3 * math.sin(2 * math.pi * t / 1.2)) * (1.0 + 0.5 * lv)
         dot = QColor(color)
-        dot.setAlpha(int(150 + 80 * energy))
+        dot.setAlpha(int(min(255.0, 150 + 80 * energy + 70 * lv)))
         p.setBrush(QBrush(dot))
         p.drawEllipse(QPointF(cx, cy), dot_r, dot_r)
 
@@ -5627,27 +6123,32 @@ class BubbleWidget(QWidget):
         halo.setColorAt(1.0, halo_c)
         p.setBrush(QBrush(halo))
         p.drawEllipse(QPointF(cx, cy), radius + GLOW_PAD, radius + GLOW_PAD)
+        # The voice is the reactor's throttle: the segments open wider, the tick
+        # ring pushes outward and the whole thing spins up. Neutral at level 0.
+        lv = min(1.0, max(0.0, float(f["level"])))
         disc = QColor(color)
-        disc.setAlpha(16)
+        disc.setAlpha(int(16 + 34 * lv))
         p.setBrush(QBrush(disc))
         p.drawEllipse(QPointF(cx, cy), radius, radius)
-        react = 1.0 + f["level"] * 1.5  # voice-reactive spin
+        react = 1.0 + lv * 1.5  # voice-reactive spin
         segs = ((0.98, 0.50, 1.75, 3.2), (0.86, -0.35, 1.22, 2.4), (0.74, 0.80, 2.44, 1.8))
         for rr, spd, span, wdt in segs:
             c = QColor(color)
-            c.setAlpha(int(120 + 90 * energy))
-            self._arc(p, cx, cy, radius * rr, t * 2 * math.pi * spd * react, span, c, wdt * k)
-        # tick ring, slow drift
+            c.setAlpha(int(min(255.0, 120 + 90 * energy + 60 * lv)))
+            self._arc(p, cx, cy, radius * rr, t * 2 * math.pi * spd * react,
+                      span * (1.0 + 0.45 * lv), c, wdt * k * (1.0 + 0.25 * lv))
+        # tick ring, slow drift, extending outward with the voice
         for i in range(12):
             a = i * math.pi / 6 + t * 0.15
             long_tick = i % 3 == 0
-            r1, r2 = radius * 0.62, radius * (0.68 if long_tick else 0.65)
+            r1 = radius * 0.62
+            r2 = radius * ((0.68 if long_tick else 0.65) + 0.07 * lv)
             c = QColor(color)
-            c.setAlpha(130 if long_tick else 70)
+            c.setAlpha(int(min(255.0, (130 if long_tick else 70) + 60 * lv)))
             p.setPen(QPen(c, (2.0 if long_tick else 1.2) * k))
             p.drawLine(QPointF(cx + math.cos(a) * r1, cy - math.sin(a) * r1),
                        QPointF(cx + math.cos(a) * r2, cy - math.sin(a) * r2))
-        core_r = radius * 0.10 * (1.0 + 0.35 * energy + 0.5 * f["level"])
+        core_r = radius * 0.10 * (1.0 + 0.35 * energy + 0.5 * lv)
         core_c = QColor(color)
         core_c.setAlpha(230)
         p.setPen(Qt.NoPen)
@@ -5660,16 +6161,26 @@ class BubbleWidget(QWidget):
         """Edgeless glow blob: soft radial bloom with drifting sparks."""
         cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
         radius, energy = f["radius"], f["energy"]
+        # The voice makes the bloom breathe: the petals (the blob's own wobble)
+        # open wider, the mist thickens, and more sparks come out. The outer mist
+        # radius is deliberately NOT grown — it already reaches the window's
+        # round mask, so growing it would just clip. Neutral at level 0.
+        lv = min(1.0, max(0.0, float(f["level"])))
         p.setPen(Qt.NoPen)
         mist = QRadialGradient(QPointF(cx, cy), radius * 1.35)
         mist_c = QColor(color)
-        mist_c.setAlpha(int(70 + 60 * energy))
+        mist_c.setAlpha(int(min(255.0, 70 + 60 * energy + 80 * lv)))
         mist.setColorAt(0.0, mist_c)
         mist_c.setAlpha(0)
+        # The brighter the voice makes the mist, the further in its tail is
+        # pulled, so the extra alpha dies before the window's round mask instead
+        # of being cut off on it. At level 0 the stop lands exactly on 1.0, so
+        # the resting glow is untouched.
+        mist.setColorAt(1.0 - 0.20 * lv, mist_c)
         mist.setColorAt(1.0, mist_c)
         p.setBrush(QBrush(mist))
         p.drawEllipse(QPointF(cx, cy), radius * 1.35, radius * 1.35)
-        blob = self._wobble_path(cx, cy, radius * 0.72, t * 0.7, 0.6)
+        blob = self._wobble_path(cx, cy, radius * 0.72, t * 0.7, 0.6 + 0.6 * lv)
         body = QRadialGradient(QPointF(cx, cy - radius * 0.2), radius)
         top = QColor(color).lighter(150)
         top.setAlpha(int(150 + 60 * energy))
@@ -5683,30 +6194,41 @@ class BubbleWidget(QWidget):
         p.setBrush(QBrush(body))
         p.drawPath(blob)
         # bright breathing heart
-        heart_r = radius * 0.20 * (1.0 + 0.18 * math.sin(2 * math.pi * t / 1.4))
+        heart_r = radius * 0.20 * (1.0 + 0.18 * math.sin(2 * math.pi * t / 1.4)) * (1.0 + 0.5 * lv)
         heart = QColor(color).lighter(170)
         heart.setAlpha(220)
         p.setBrush(QBrush(heart))
         p.drawEllipse(QPointF(cx, cy), heart_r, heart_r)
-        # drifting sparks on golden-angle orbits
-        for i in range(5):
-            a = t * (0.3 + 0.07 * i) + i * 2.39996
-            r = radius * (0.45 + 0.09 * i)
-            s = QColor(255, 255, 255, 70)
+        # drifting sparks on golden-angle orbits: louder voice, faster swirl,
+        # brighter specks, and extra ones shaken loose from the core. The orbit
+        # radii stay under the mask (worst case 1.08 R).
+        for i in range(5 + int(3 * lv)):
+            a = t * (0.3 + 0.07 * i + 0.9 * lv) + i * 2.39996
+            # capped at 0.95 R: the first five are unchanged (0.81 R max), and
+            # the extra ones the voice shakes loose stay clear of the round mask
+            # instead of sitting right on the cut
+            r = radius * min(0.95, 0.45 + 0.09 * i)
+            s = QColor(255, 255, 255, int(min(255.0, 70 + 150 * lv)))
             p.setBrush(QBrush(s))
-            p.drawEllipse(QPointF(cx + math.cos(a) * r, cy - math.sin(a) * r), 1.6, 1.6)
+            rr = 1.6 * (1.0 + 0.6 * lv)
+            p.drawEllipse(QPointF(cx + math.cos(a) * r, cy - math.sin(a) * r), rr, rr)
 
     def _paint_droplet(self, p: QPainter, f: dict) -> None:
         """Teardrop that stretches with voice level and drips while listening."""
         cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
         radius, energy, level = f["radius"], f["energy"], f["level"]
         R = radius * 0.92
+        # The voice is surface tension here: a fast, small-amplitude ripple runs
+        # round the skin (on top of the slow idle swell) and the drip detaches
+        # sooner. Both are neutral at level 0 — the ripple term vanishes exactly.
+        lv = min(1.0, max(0.0, float(level)))
         stretch = 1.0 + 0.28 * level + (0.08 if self._state == LISTENING else 0.0)
         drop = QPainterPath()
         for i in range(73):
             ang = i * 2 * math.pi / 72
             tip = math.exp(-((ang - math.pi / 2) / 0.55) ** 2)
-            r = R * (1.0 + 0.45 * tip + 0.04 * math.sin(3 * ang + 3.0 * t))
+            r = R * (1.0 + 0.45 * tip + 0.04 * math.sin(3 * ang + 3.0 * t)
+                     + 0.03 * lv * math.sin(7 * ang - 5.0 * t))
             x, y = cx + r * math.cos(ang) * 0.92, cy - r * math.sin(ang) * stretch
             drop.moveTo(x, y) if i == 0 else drop.lineTo(x, y)
         drop.closeSubpath()
@@ -5724,26 +6246,35 @@ class BubbleWidget(QWidget):
         p.setBrush(QBrush(body))
         p.drawPath(drop)
         # specular streak down the lit side
-        p.setBrush(QColor(255, 255, 255, int(50 + 20 * energy)))
-        p.drawEllipse(QPointF(cx - R * 0.28, cy - R * 0.35 * stretch), R * 0.13, R * 0.22 * stretch)
-        # detaching drip while listening
+        p.setBrush(QColor(255, 255, 255, int(min(255.0, 50 + 20 * energy + 80 * lv))))
+        p.drawEllipse(QPointF(cx - R * 0.28, cy - R * 0.35 * stretch),
+                      R * 0.13 * (1.0 + 0.35 * lv), R * 0.22 * stretch)
+        # detaching drip while listening; the voice makes it detach sooner and
+        # more often, since the whole drop is agitated
         if self._state == LISTENING:
-            ph = (t * 0.7) % 1.0
+            ph = (t * (0.7 + 1.6 * lv)) % 1.0
             drip = QColor(color)
-            drip.setAlpha(int((1.0 - ph) * 200))
+            drip.setAlpha(int(min(255.0, (1.0 - ph) * (200 + 55 * lv))))
             p.setBrush(QBrush(drip))
             p.drawEllipse(QPointF(cx, cy + R * stretch + ph * R * 0.9),
-                          R * 0.10 * (1.0 - ph * 0.5), R * 0.13 * (1.0 - ph * 0.5))
+                          R * 0.10 * (1.0 - ph * 0.5) * (1.0 + 0.4 * lv),
+                          R * 0.13 * (1.0 - ph * 0.5) * (1.0 + 0.4 * lv))
         rim = QColor(color).lighter(140)
-        rim.setAlpha(int(120 + 80 * energy))
+        rim.setAlpha(int(min(255.0, 120 + 80 * energy + 60 * lv)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(rim, max(1.2, R * 0.045)))
+        p.setPen(QPen(rim, max(1.2, R * 0.045 * (1.0 + 0.35 * lv))))
         p.drawPath(drop)
 
     def _paint_cube(self, p: QPainter, f: dict) -> None:
         """Tumbling isometric glass cube catching the orbiting light."""
         cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
         radius, energy, la = f["radius"], f["energy"], f["la"]
+        # The voice flashes the facets: a front sweeps around the six faces and
+        # lights each one as it passes, so the cube reads as a ring of lamps
+        # rather than one uniformly brighter blob. `flash` is exactly 0 at
+        # level 0, so a silent cube is pixel-identical to before.
+        lv = min(1.0, max(0.0, float(f["level"])))
+        front = (t * 1.6) % 1.0 * 6.0
         R = radius * 0.95
         bob = math.sin(2 * math.pi * t / 3.0) * R * 0.04
         cy += bob
@@ -5753,10 +6284,13 @@ class BubbleWidget(QWidget):
         p.setPen(Qt.NoPen)
         halo = QRadialGradient(QPointF(cx, cy), R * 1.3)
         hc = QColor(color)
-        hc.setAlpha(int(25 + 35 * energy))
+        hc.setAlpha(int(min(255.0, 25 + 35 * energy + 60 * lv)))
         halo.setColorAt(0.7, hc)
         hc.setAlpha(0)
         halo.setColorAt(0.0, hc)
+        # tail pulled in by the voice, so the brighter halo fades out before the
+        # window's round mask rather than ending on it; 1.0 at level 0
+        halo.setColorAt(1.0 - 0.20 * lv, hc)
         halo.setColorAt(1.0, hc)
         p.setBrush(QBrush(halo))
         p.drawEllipse(QPointF(cx, cy), R * 1.3, R * 1.3)
@@ -5769,12 +6303,15 @@ class BubbleWidget(QWidget):
             tri.lineTo(x1, y1)
             tri.lineTo(*verts[(i + 1) % 6])
             tri.closeSubpath()
-            fill = QColor(color).darker(int(170 - 90 * facing))
-            fill.setAlpha(int(150 + 60 * facing))
+            # shortest way round the ring of six faces, for the flash front
+            d = min(abs(i - front), 6.0 - abs(i - front))
+            flash = max(0.0, 1.0 - d * 1.6) * lv
+            fill = QColor(color).darker(max(40, int(170 - 90 * facing - 70 * flash)))
+            fill.setAlpha(int(min(255.0, 150 + 60 * facing + 90 * flash)))
             p.setBrush(QBrush(fill))
             p.drawPath(tri)
         edge = QColor(color).lighter(150)
-        edge.setAlpha(int(140 + 80 * energy))
+        edge.setAlpha(int(min(255.0, 140 + 80 * energy + 70 * lv)))
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(edge, max(1.2, R * 0.04)))
         hex_path = QPainterPath()
@@ -5782,7 +6319,7 @@ class BubbleWidget(QWidget):
             hex_path.moveTo(vx, vy) if i == 0 else hex_path.lineTo(vx, vy)
         hex_path.closeSubpath()
         p.drawPath(hex_path)
-        p.setPen(QPen(QColor(255, 255, 255, 90), 1.0))
+        p.setPen(QPen(QColor(255, 255, 255, int(90 + 120 * lv)), 1.0))
         for vx, vy in verts:
             p.drawLine(QPointF(cx, cy), QPointF(vx, vy))
 
@@ -5790,16 +6327,27 @@ class BubbleWidget(QWidget):
         """Ring of 28 audio bars driven by mic level; flatline at idle."""
         cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
         radius, energy, level = f["radius"], f["energy"], f["level"]
+        anim = float(f.get("anim", 1.0))
         n = 28
         r_in = radius * 0.42
         p.setBrush(Qt.NoBrush)
         for i in range(n):
             a = i * 2 * math.pi / n
             if self._state == IDLE:
-                length = radius * 0.06 * (1.0 + 0.5 * math.sin(t * 2.2 + i * 0.7))
+                # the idle bars must scale with animation_energy too: they were
+                # the one path that ignored it, so the slider did nothing on
+                # this design at idle — the state it sits in most of the time.
+                # `anim` is 1.0 at the default, so the look is unchanged there.
+                length = radius * 0.06 * (1.0 + 0.5 * math.sin(t * 2.2 + i * 0.7)) * anim
             else:
-                pulse = max(0.0, math.sin(t * 6.0 + i * 1.3)) ** 1.5
-                length = radius * (0.05 + 0.45 * level * pulse + 0.08 * energy * (0.5 + 0.5 * math.sin(t * 3.0 + i)))
+                # Amplitude comes from the shared `level` signal, NOT a local
+                # sin(t) pulse: these bars are a meter, so they must show the
+                # voice rather than a timer that merely correlated with it.
+                # The per-bar factor is fixed geometry, so the ring keeps its
+                # shape but has no invented rhythm.
+                shape = 0.45 + 0.55 * (0.5 + 0.5 * math.cos(i * 2.39996))
+                length = radius * (0.05 + 0.55 * level * shape
+                                   + 0.06 * energy * (0.5 + 0.5 * math.cos(i * 2.0)))
             x1, y1 = cx + math.cos(a) * r_in, cy - math.sin(a) * r_in
             x2, y2 = cx + math.cos(a) * (r_in + length), cy - math.sin(a) * (r_in + length)
             c = QColor(color)
@@ -5819,20 +6367,27 @@ class BubbleWidget(QWidget):
         """Rotating faceted gem with glinting edges."""
         cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
         radius, energy, la = f["radius"], f["energy"], f["la"]
+        # The voice refracts this one: the inner hex swells and its hue splits
+        # away from the body colour, so the gem looks like it is bending light
+        # rather than merely brightening. Every term is neutral at level 0.
+        lv = min(1.0, max(0.0, float(f["level"])))
         R = radius * 0.95
         rot = t * 2 * math.pi * 0.06
         p.setPen(Qt.NoPen)
         halo = QRadialGradient(QPointF(cx, cy), R * 1.3)
         hc = QColor(color)
-        hc.setAlpha(int(30 + 40 * energy))
+        hc.setAlpha(int(min(255.0, 30 + 40 * energy + 50 * lv)))
         halo.setColorAt(0.75, hc)
         hc.setAlpha(0)
         halo.setColorAt(0.0, hc)
+        # tail pulled in by the voice, so the brighter halo fades out before the
+        # window's round mask rather than ending on it; 1.0 at level 0
+        halo.setColorAt(1.0 - 0.20 * lv, hc)
         halo.setColorAt(1.0, hc)
         p.setBrush(QBrush(halo))
         p.drawEllipse(QPointF(cx, cy), R * 1.3, R * 1.3)
         gem = QColor(color)
-        gem.setAlpha(70)
+        gem.setAlpha(int(70 + 45 * lv))
         p.setBrush(QBrush(gem))
         gem_path = QPainterPath()
         verts = []
@@ -5842,34 +6397,49 @@ class BubbleWidget(QWidget):
             gem_path.moveTo(vx, vy) if i == 0 else gem_path.lineTo(vx, vy)
         gem_path.closeSubpath()
         p.drawPath(gem_path)
-        # facet spokes + counter-rotating inner hex
-        p.setPen(QPen(QColor(255, 255, 255, 70), 1.0))
+        # facet spokes + counter-rotating inner hex, which the voice pushes
+        # outward and tints away from the body colour (the refraction):
+        p.setPen(QPen(QColor(255, 255, 255, int(min(255.0, 70 + 120 * lv))), 1.0))
         for vx, vy in verts:
             p.drawLine(QPointF(cx, cy), QPointF(vx, vy))
+        in_rot = -rot * 1.5 - 1.1 * lv
         in_path = QPainterPath()
         for i in range(6):
-            vx = cx + R * 0.55 * math.cos(-rot * 1.5 + i * math.pi / 3)
-            vy = cy - R * 0.55 * math.sin(-rot * 1.5 + i * math.pi / 3)
+            vx = cx + R * (0.55 + 0.22 * lv) * math.cos(in_rot + i * math.pi / 3)
+            vy = cy - R * (0.55 + 0.22 * lv) * math.sin(in_rot + i * math.pi / 3)
             in_path.moveTo(vx, vy) if i == 0 else in_path.lineTo(vx, vy)
         in_path.closeSubpath()
+        split = QColor.fromHslF((f["base_hue"] + 0.32 * lv) % 1.0,
+                                min(1.0, float(f["sat"]) + 0.25 * lv), 0.72)
+        # blended FROM white, so level 0 is exactly the white line this used to
+        # be: writing `split` directly made the resting gem take the state hue
+        refract = QColor(int(255 + (split.red() - 255) * lv),
+                         int(255 + (split.green() - 255) * lv),
+                         int(255 + (split.blue() - 255) * lv))
+        refract.setAlpha(int(min(255.0, 90 + 140 * lv)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 90), 1.2))
+        p.setPen(QPen(refract, 1.2 + 1.2 * lv))
         p.drawPath(in_path)
-        # glints on the two edges nearest the light
+        # glints on the two edges nearest the light, lengthening with the voice
         best = sorted(range(6), key=lambda i: abs(((rot + i * math.pi / 3) - la + math.pi) % (2 * math.pi) - math.pi))[:2]
         for i in best:
-            self._arc(p, cx, cy, R * 0.99, rot + i * math.pi / 3 + math.pi / 6, 0.5,
-                      QColor(255, 255, 255, int(150 + 70 * energy)), max(1.5, R * 0.05))
+            self._arc(p, cx, cy, R * 0.99, rot + i * math.pi / 3 + math.pi / 6,
+                      0.5 * (1.0 + 0.6 * lv),
+                      QColor(255, 255, 255, int(min(255.0, 150 + 70 * energy + 80 * lv))),
+                      max(1.5, R * 0.05 * (1.0 + 0.6 * lv)))
         edge = QColor(color).lighter(150)
-        edge.setAlpha(int(150 + 70 * energy))
+        edge.setAlpha(int(min(255.0, 150 + 70 * energy + 60 * lv)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(edge, max(1.2, R * 0.035)))
+        p.setPen(QPen(edge, max(1.2, R * 0.035 * (1.0 + 0.4 * lv))))
         p.drawPath(gem_path)
 
     def _paint_saturn(self, p: QPainter, f: dict) -> None:
         """Ringed planet with an orbiting moon."""
         cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
         radius, energy, lx, ly = f["radius"], f["energy"], f["lx"], f["ly"]
+        # The voice travels round the rings: the band swells, a brightness wave
+        # runs along it and the moon is pulled faster. Neutral at level 0.
+        lv = min(1.0, max(0.0, float(f["level"])))
         tilt, flat = -0.35, 0.32
 
         def _ring_pt(rr: float, a: float) -> tuple:
@@ -5887,13 +6457,15 @@ class BubbleWidget(QWidget):
             x, y = _ring_pt(radius * 1.02, a)
             back.moveTo(x, y) if i == 0 else back.lineTo(x, y)
         rc = QColor(color)
-        rc.setAlpha(int(110 + 70 * energy))
+        rc.setAlpha(int(min(255.0, 110 + 70 * energy + 60 * lv)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(rc, max(1.5, radius * 0.06), Qt.SolidLine, Qt.RoundCap))
+        p.setPen(QPen(rc, max(1.5, radius * 0.06 * (1.0 + 0.5 * lv)),
+                      Qt.SolidLine, Qt.RoundCap))
         p.drawPath(back)
         # glass planet
         globe = QRadialGradient(QPointF(cx + lx * pr * 0.5, cy + ly * pr * 0.5), pr * 1.6)
-        globe.setColorAt(0.0, QColor(120, 128, 150))
+        globe.setColorAt(0.0, QColor(int(120 + 90 * lv), int(128 + 80 * lv),
+                                     int(150 + 70 * lv)))
         mid = QColor(color)
         mid.setAlpha(235)
         globe.setColorAt(0.4, mid)
@@ -5901,20 +6473,32 @@ class BubbleWidget(QWidget):
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(globe))
         p.drawEllipse(QPointF(cx, cy), pr, pr)
-        p.setBrush(QColor(255, 255, 255, 70))
-        p.drawEllipse(QPointF(cx + lx * pr * 0.45, cy + ly * pr * 0.45), pr * 0.22, pr * 0.15)
+        p.setBrush(QColor(255, 255, 255, int(min(255.0, 70 + 90 * lv))))
+        p.drawEllipse(QPointF(cx + lx * pr * 0.45, cy + ly * pr * 0.45),
+                      pr * 0.22 * (1.0 + 0.5 * lv), pr * 0.15 * (1.0 + 0.4 * lv))
         # front half of the ring (in front of the planet)
         front = QPainterPath()
         for i in range(37):
             a = i * (math.pi / 36)
             x, y = _ring_pt(radius * 1.02, a)
             front.moveTo(x, y) if i == 0 else front.lineTo(x, y)
-        rc.setAlpha(int(170 + 60 * energy))
+        rc.setAlpha(int(min(255.0, 170 + 60 * energy + 60 * lv)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(rc, max(2.0, radius * 0.075), Qt.SolidLine, Qt.RoundCap))
+        p.setPen(QPen(rc, max(2.0, radius * 0.075 * (1.0 + 0.5 * lv)),
+                      Qt.SolidLine, Qt.RoundCap))
         p.drawPath(front)
-        # moon on a wider orbit
-        ma = t * 0.9
+        # a brightness wave travels round the front of the ring with the voice
+        if lv > 0.004:
+            wa = t * (1.3 + 2.4 * lv)
+            wave = QPainterPath()
+            for i in range(13):
+                x, y = _ring_pt(radius * 1.02, wa - 0.45 + i * (0.9 / 12))
+                wave.moveTo(x, y) if i == 0 else wave.lineTo(x, y)
+            wc = QColor(255, 255, 255, int(min(255.0, 210 * lv)))
+            p.setPen(QPen(wc, max(2.5, radius * 0.09), Qt.SolidLine, Qt.RoundCap))
+            p.drawPath(wave)
+        # moon on a wider orbit, pulled faster by the voice
+        ma = t * (0.9 + 0.7 * lv)
         mx, my = _ring_pt(radius * 1.30, ma)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(255, 255, 255, 200))
@@ -5924,33 +6508,303 @@ class BubbleWidget(QWidget):
         """Voice void: black disc with a level-flared event horizon."""
         cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
         radius, energy, level = f["radius"], f["energy"], f["level"]
+        # The voice accelerates the infall: the spiral streaks brighten, the
+        # sparks sweep inward faster and the horizon's flicker runs at a higher
+        # rate, so it looks like it is feeding rather than just glowing.
+        lv = min(1.0, max(0.0, float(level)))
         R = radius * 0.9
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(QColor(3, 3, 5)))
         p.drawEllipse(QPointF(cx, cy), R, R)
+        # the disc itself is deliberately black, so the accent has only these
+        # thin elements to act on: without this the slider measured 16 changed
+        # pixels out of 45796 — i.e. nothing. `glow` is 1.0 at the default.
+        glow = float(f.get("glow", 1.0))
         # infalling spiral streaks
         for k, (rr, spd, span) in enumerate(((0.80, 1.2, 1.2), (0.66, -0.9, 1.0), (0.52, 1.6, 0.8))):
             c = QColor(color).lighter(160)
-            c.setAlpha(int(22 + 45 * energy))
+            c.setAlpha(int(min(255.0, (22 + 45 * energy + 80 * lv) * glow)))
             self._arc(p, cx, cy, R * rr, t * 2 * math.pi * spd * 0.25 + k * 2.1, span, c,
-                      max(1.0, R * 0.03))
-        # spiralling infall sparks
+                      max(1.0, R * 0.03 * (1.0 + 0.5 * lv)))
+        # spiralling infall sparks, sweeping inward faster the louder it is
         for i in range(8):
-            ph = (t * 0.22 + i / 8) % 0.75
+            ph = (t * (0.22 + 0.55 * lv) + i / 8) % 0.75
             rr = R * (0.88 - ph)
             a = i * 2.4 + t * (1.0 + i * 0.1)
             s = QColor(color).lighter(170)
-            s.setAlpha(int((1.0 - ph) * (60 + 80 * energy)))
+            s.setAlpha(int(min(255.0, (1.0 - ph) * (60 + 80 * energy + 90 * lv) * glow)))
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(s))
             p.drawEllipse(QPointF(cx + math.cos(a) * rr, cy - math.sin(a) * rr), 1.6, 1.6)
-        # event horizon: hairline at idle, flaring with voice
-        flicker = 0.7 + 0.3 * math.sin(t * 13.0)
+        # event horizon: hairline at idle, flaring with voice — and its flicker
+        # runs faster as the level rises (13 Hz at rest, ~24 Hz at full voice)
+        flicker = 0.7 + 0.3 * math.sin(t * (13.0 + 11.0 * lv))
         rim_c = QColor(color).lighter(180)
-        rim_c.setAlpha(int(40 + 15 * math.sin(t * 0.8) + 190 * min(1.0, level * flicker + energy * 0.15)))
+        rim_c.setAlpha(int(min(255.0, (40 + 15 * math.sin(t * 0.8)
+                                        + 190 * min(1.0, level * flicker + energy * 0.15)) * glow)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(rim_c, max(1.0, R * (0.02 + 0.10 * level * flicker)), Qt.SolidLine, Qt.RoundCap))
+        p.setPen(QPen(rim_c, max(1.0, R * (0.02 + 0.10 * level * flicker) * (0.6 + 0.4 * glow)),
+                            Qt.SolidLine, Qt.RoundCap))
         p.drawEllipse(QPointF(cx, cy), R, R)
+
+    def _paint_sauron(self, p: QPainter, f: dict) -> None:
+        """The Eye of Sauron: a slit-pupilled eye wreathed in flame.
+
+        The fire is deliberately canonical — deep red through orange to a
+        white-hot core — because that is the design, not a palette choice. The
+        surrounding corona is tinted by the state colour instead, so the
+        Appearance colour picker still visibly moves it, and both sliders still
+        work: `energy` drives the blaze/pupil flare and `glow` (the colour
+        accent) the corona's punch. Like `void`, this design keeps its own
+        identity rather than taking the state colour as its body.
+        """
+        cx, cy, t, tint = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy, level = f["radius"], f["energy"], f["level"]
+        glow = float(f.get("glow", 1.0))
+        anim = float(f.get("anim", 1.0))
+        lx, ly = f["lx"], f["ly"]
+        R = radius * 1.02
+
+        # Voice reaction. `level` is the smoothed 0..1 amplitude the equalizer
+        # bars already follow: the mic while listening, and — via
+        # core.audio.play_wav — the actual playback while speaking, since the
+        # mic is blanked then. Every term below is written so that level == 0
+        # reproduces the previous rendering exactly (multiplied by 1.0, or
+        # added as 0), so a silent bubble looks unchanged.
+        lv = min(1.0, max(0.0, float(level)))
+        lv2 = lv * lv                     # a quieter floor, so a murmur is subtle
+
+        # two out-of-phase sines: a single one reads as a sine wave, two read
+        # as fire. `blaze` is the flickering intensity the whole eye shares.
+        flick = 0.78 + 0.16 * math.sin(t * 6.1) + 0.06 * math.sin(t * 17.3 + 1.1)
+        blaze = min(1.0, max(0.0, energy * 1.15 + 0.10 * anim + 0.35 * lv2)) * flick
+
+        p.setPen(Qt.NoPen)
+        # -- corona: fire first, with the state tint only as a thin outer aura.
+        # Ordering matters: a big tinted disc repainted most of the eye's own
+        # pixels (measured 38% warm, i.e. the aura was the subject and the fire
+        # the background). The tint now starts late and fades quickly.
+        halo = QRadialGradient(QPointF(cx, cy), R * 1.12)
+        hot = QColor(int(120 + 135 * blaze), int(40 + 90 * blaze), int(8 + 30 * blaze))
+        hot.setAlpha(int(min(255.0, (70 + 110 * blaze) * glow)))
+        halo.setColorAt(0.0, hot)
+        halo.setColorAt(0.74, hot)
+        mid = QColor(tint)
+        # the aura brightens with the voice too: the fire spreads outward
+        mid.setAlpha(int(min(255.0, 38 * glow * (1.0 + 0.9 * lv2))))
+        halo.setColorAt(0.90, mid)
+        mid.setAlpha(0)
+        halo.setColorAt(1.0, mid)
+        p.setBrush(QBrush(halo))
+        p.drawEllipse(QPointF(cx, cy), R * 1.12, R * 1.12)
+
+        # -- flame tongues licking outward, each on its own rhythm. The voice
+        #    reaches them further and brightens them, so speaking sets the eye
+        #    alight rather than just tinting it.
+        for i in range(14):
+            ang = i * 2 * math.pi / 14 + 0.12 * math.sin(t * 1.4 + i)
+            lick = 0.62 + 0.38 * math.sin(t * (3.1 + (i % 5) * 0.7) + i * 1.9)
+            outer = R * (1.02 + 0.30 * lick * (0.5 + 0.5 * blaze)
+                         + 0.22 * lv2 * lick)
+            x0, y0 = cx + math.cos(ang) * R * 0.82, cy - math.sin(ang) * R * 0.82
+            x1, y1 = cx + math.cos(ang) * outer, cy - math.sin(ang) * outer
+            fc = QColor(int(200 + 55 * blaze), int(70 + 105 * blaze),
+                        int(10 + 30 * blaze))
+            fc.setAlpha(int(min(255.0, (90 + 130 * lick) * glow * (1.0 + 0.75 * lv2))))
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(fc, max(1.2, R * 0.085 * (0.6 + 0.6 * lick)),
+                          Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+
+        # -- sclera: a wide almond (two quadratic arcs meeting at the corners)
+        sx, sy = R * 0.98, R * 0.60
+        lens = QPainterPath()
+        lens.moveTo(cx - sx, cy)
+        lens.quadTo(cx, cy - sy * 1.5, cx + sx, cy)
+        lens.quadTo(cx, cy + sy * 1.5, cx - sx, cy)
+        eye = QRadialGradient(QPointF(cx, cy), R)
+        eye.setColorAt(0.0, QColor(255, 236, 170))
+        eye.setColorAt(0.45, QColor(int(215 + 40 * blaze),
+                                    int(105 + 70 * blaze), 18))
+        eye.setColorAt(1.0, QColor(84, 16, 4))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(eye))
+        p.drawPath(lens)
+        # -- rim of fire hugging the eye: the Eye's signature edge
+        rim = QColor(255, int(150 + 70 * blaze), int(40 + 40 * blaze))
+        rim.setAlpha(int(min(255.0, (150 + 90 * blaze) * glow * (1.0 + 0.5 * lv))))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(rim, max(1.2, R * 0.045), Qt.SolidLine, Qt.RoundCap))
+        p.drawPath(lens)
+
+        # -- pupil: the vertical slit, drifting slightly toward the key light.
+        #    It NARROWS as the voice rises (the pupil contracts) and lengthens a
+        #    touch, which is the readable cue that the eye is reacting.
+        px = cx + lx * R * 0.06
+        py = cy + ly * R * 0.04
+        pw = R * (0.085 + 0.035 * blaze) * (1.0 - 0.46 * lv)
+        ph = sy * (0.92 - 0.18 * blaze) * (1.0 + 0.06 * lv)
+        # NoPen, explicitly: the rim-of-fire pen is still active here, and it
+        # outlined the slit in bright orange — the pupil read as a hot ring
+        # instead of a dark slit (and vanished entirely once the rim thickened).
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(6, 2, 2))
+        p.drawEllipse(QPointF(px, py), pw, ph)
+        # a hot filament inside the slit, so it reads as fire rather than a hole
+        fil = QColor(255, 214 - int(40 * blaze), 120)
+        fil.setAlpha(int(min(255.0, 150 * glow * (1.0 + 0.5 * lv))))
+        p.setBrush(fil)
+        p.drawEllipse(QPointF(px, py), max(0.8, pw * 0.30), max(1.5, ph * 0.80))
+        # wet glint, brightening with the voice
+        p.setBrush(QColor(255, 255, 255, int(min(255.0, 120 + 80 * min(1.0, level)))))
+        p.drawEllipse(QPointF(px - pw * 1.3, py - ph * 0.35),
+                      max(0.9, R * 0.035), max(0.9, R * 0.028))
+
+    def _paint_pikachu(self, p: QPainter, f: dict) -> None:
+        """Pikachu: a round yellow face, black-tipped ears and charging cheeks.
+
+        Like `void` and `sauron`, this design keeps its own canonical palette —
+        Pikachu yellow, black ear tips, red cheeks — because that IS the design,
+        not a palette choice. The state colour is relocated to an aura ring
+        BEHIND the head, so the Appearance colour picker still visibly moves it.
+        Both shared sliders and the voice reach it through the frame state every
+        painter consumes: `energy` drives the aura, the ear sway and the
+        breathing, `glow` (the accent) punches the aura and the cheek bloom, and
+        `level` charges the cheeks the way the games do — the bloom swells, a
+        hot core appears, the ears prick up and the mouth opens as the voice
+        rises. Every level term multiplies by 1.0 or adds 0 at level 0, so a
+        silent bubble renders the resting Pikachu exactly.
+
+        Geometry note: every number below is constrained by ONE hard limit.
+        The window carries an inscribed-ellipse mask (BubbleWidget.showEvent),
+        and the worst case is LISTENING at full level, where the radius has
+        already grown to `BUBBLE_R0 + 12 * GEOM_K` — leaving only 1.12 R of
+        headroom from the centre. Points past that are silently cut off on the
+        desktop, which is why the ears stop short of where the silhouette would
+        ideally reach. `pikachu_stays_inside_the_window_mask` pins the bound.
+        """
+        cx, cy, t, tint = f["cx"], f["cy"], f["t"], f["color"]
+        radius, energy, level = f["radius"], f["energy"], f["level"]
+        glow = float(f.get("glow", 1.0))
+        anim = float(f.get("anim", 1.0))
+        R = radius
+
+        lv = min(1.0, max(0.0, float(level)))
+        lv2 = lv * lv                     # a quieter floor: a murmur is subtle
+
+        # breathing at rest, and a small lift of the whole face with the voice
+        scale = (1.0 + 0.014 * math.sin(t * 2.2) * anim) * (1.0 + 0.035 * lv2)
+        head_rx, head_ry = R * 0.72 * scale, R * 0.60 * scale
+
+        # -- aura: the ONLY place the state colour lives, so the colour picker
+        #    clearly moves this design while the mascot keeps its own palette.
+        #    Capped to a 0.44 * width circle: that is inside the mask ellipse at
+        #    every radius, so the glow itself can never be clipped, and the ring
+        #    hugs the head rather than flooding the whole window.
+        p.setPen(Qt.NoPen)
+        halo_r = min(R * 1.12, 0.44 * self.width())
+        inner_f = min(0.80, max(head_rx, head_ry) / halo_r * 0.94)
+        clear = QColor(tint)
+        clear.setAlpha(0)
+        lit = QColor(tint)
+        lit.setAlpha(int(min(255.0, (26 + 62 * energy) * glow * (1.0 + 0.85 * lv2))))
+        halo = QRadialGradient(QPointF(cx, cy), halo_r)
+        halo.setColorAt(0.0, clear)
+        halo.setColorAt(inner_f, clear)
+        halo.setColorAt(min(0.97, inner_f + 0.18), lit)
+        halo.setColorAt(1.0, clear)
+        p.setBrush(QBrush(halo))
+        p.drawEllipse(QPointF(cx, cy), halo_r, halo_r)
+
+        # -- ears: drawn FIRST so the head hides their bases. A hard-stop
+        #    gradient along the ear axis gives the black tip without needing a
+        #    second path to trace the ear's outline. Each ear flicks on its own
+        #    phase, sways with the animation energy, and pricks up with the
+        #    voice — the whole reason the tip offsets are budgeted so tightly.
+        for sign in (-1.0, 1.0):
+            phase = 0.0 if sign > 0 else 2.1
+            flick = 1.0 + 0.03 * math.sin(t * 6.4 * anim + phase)
+            tilt = 0.10 * math.sin(t * 5.1 * anim + phase) + 0.06 * lv
+            bx1, by1 = cx + sign * R * 0.38, cy - R * 0.02
+            bx2, by2 = cx + sign * R * 0.08, cy - R * 0.40
+            tx = cx + sign * (R * 0.52 + tilt * R) * flick
+            ty = cy - R * 0.80 * flick
+            ear = QPainterPath()
+            ear.moveTo(bx1, by1)
+            ear.quadTo(cx + sign * R * 0.44, cy - R * 0.72, tx, ty)
+            ear.quadTo(cx + sign * R * 0.24, cy - R * 0.58, bx2, by2)
+            ear.closeSubpath()
+            eg = QLinearGradient(QPointF(bx1, by1), QPointF(tx, ty))
+            eg.setColorAt(0.0, QColor(255, 232, 116))
+            eg.setColorAt(0.55, QColor(250, 202, 38))
+            eg.setColorAt(0.585, QColor(32, 26, 13))
+            eg.setColorAt(1.0, QColor(11, 10, 7))
+            p.setBrush(QBrush(eg))
+            p.drawPath(ear)
+
+        # -- head
+        hx, hy = cx, cy + R * 0.10 * scale
+        head = QRadialGradient(QPointF(cx - R * 0.22, cy - R * 0.14), head_rx * 1.60)
+        head.setColorAt(0.0, QColor(255, 245, 160))
+        head.setColorAt(0.55, QColor(250, 205, 42))
+        head.setColorAt(1.0, QColor(206, 142, 12))
+        p.setBrush(QBrush(head))
+        p.drawEllipse(QPointF(hx, hy), head_rx, head_ry)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(146, 92, 6, 190), max(1.0, R * 0.030)))
+        p.drawEllipse(QPointF(hx, hy), head_rx, head_ry)
+
+        # -- cheeks: the whole point of a Pikachu reacting to a voice. The red
+        #    disc is always there; the bloom and the hot core are what the voice
+        #    adds, so silence is the resting face.
+        cheek_r = R * (0.135 + 0.035 * lv) * scale
+        for sign in (-1.0, 1.0):
+            ccx = hx + sign * R * 0.40 * scale
+            ccy = hy + R * 0.30 * scale
+            br = cheek_r * (2.1 + 0.9 * lv) * (1.0 + 0.10 * math.sin(t * 9.0 * anim + sign))
+            bloom = QRadialGradient(QPointF(ccx, ccy), br)
+            b = QColor(255, 58, 36)
+            b.setAlpha(int(min(255.0, (34 + 165 * lv2) * glow)))
+            bloom.setColorAt(0.0, b)
+            bz = QColor(255, 58, 36)
+            bz.setAlpha(0)
+            bloom.setColorAt(1.0, bz)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(bloom))
+            p.drawEllipse(QPointF(ccx, ccy), br, br)
+            p.setBrush(QColor(236, 60, 46))
+            p.drawEllipse(QPointF(ccx, ccy), cheek_r, cheek_r * 0.86)
+            if lv > 0.01:               # a hot core: the cheeks are charging
+                core = QColor(255, 216, 150, int(min(255.0, 215 * lv)))
+                p.setBrush(core)
+                p.drawEllipse(QPointF(ccx, ccy), cheek_r * 0.42, cheek_r * 0.36)
+
+        # -- eyes: solid with a glint, which catches as the bubble animates
+        eye_r = R * 0.105 * scale
+        p.setPen(Qt.NoPen)
+        for sign in (-1.0, 1.0):
+            ex = hx + sign * R * 0.22 * scale
+            ey = hy - R * 0.12 * scale
+            p.setBrush(QColor(26, 20, 14))
+            p.drawEllipse(QPointF(ex, ey), eye_r, eye_r * 1.12)
+            p.setBrush(QColor(255, 255, 255, 235))
+            p.drawEllipse(QPointF(ex - eye_r * 0.30, ey - eye_r * 0.44),
+                          eye_r * 0.36, eye_r * 0.36)
+
+        # -- nose and mouth. The mouth opens a little with the voice: a
+        #    speaking bubble reads as talking rather than just glowing.
+        p.setBrush(QColor(44, 32, 14))
+        p.drawEllipse(QPointF(hx, hy + R * 0.10 * scale), R * 0.030, R * 0.023)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(62, 42, 16, 225), max(1.0, R * 0.032),
+                      Qt.SolidLine, Qt.RoundCap))
+        mw = R * 0.17 * scale
+        my = hy + R * 0.27 * scale
+        for sign in (-1.0, 1.0):
+            mp = QPainterPath()
+            mp.moveTo(hx, my - R * 0.025)
+            mp.quadTo(hx + sign * mw * 0.55, my + R * (0.09 + 0.06 * lv), hx + sign * mw, my)
+            p.drawPath(mp)
 
     @staticmethod
     def _wobble_path(cx: float, cy: float, r0: float, t: float, amt: float = 1.0) -> QPainterPath:
@@ -6090,7 +6944,30 @@ class BubbleWidget(QWidget):
 PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                "handsfree", "handsfree-on", "handsfree-off",
                "handsfree-status", "dictation", "dictation-on", "dictation-off",
-               "status", "health", "doctor", "settings", "selftest", "reload-settings"}
+               "status", "health", "level", "doctor", "settings", "selftest",
+               "reload-settings", "clear-history", "say"}
+
+
+def _peer_uid(conn: "socket.socket") -> "int | None":
+    """uid of the process at the far end of a unix socket, or None if unknown.
+
+    Defence in depth, and it is worth being exact about what it does NOT do.
+    The real boundary is the state directory: `_prepare_runtime` refuses to
+    start unless STATE_DIR is owner-only and not a symlinked directory, and a
+    0700 directory is what stops another USER from reaching the socket at all
+    (the inode's own 0600 mode does not gate connect()). SO_PEERCRED reports
+    the peer's uid, and a same-UID process — a compromised child of ours, a
+    sandboxed app running as us — has the SAME uid, so this cannot exclude
+    that case. What it adds is an explicit check that still holds if the
+    directory mode is ever loosened, and a log line saying who tried.
+    """
+    try:
+        raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                              struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", raw)
+        return int(uid)
+    except (OSError, AttributeError, struct.error):
+        return None                  # non-Linux or no credentials: allow
 
 
 class ControlServer:
@@ -6107,6 +6984,19 @@ class ControlServer:
         self._stop = threading.Event()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        # Latch for the orphaned-path reports so a path that cannot be
+        # reclaimed cannot fill the journal with one line per idle second.
+        self._orphan_reported = False
+        # (st_dev, st_ino) of the path we bound, captured from lstat right
+        # after bind. NOTE: this cannot be derived from the socket fd —
+        # os.fstat() on an AF_UNIX fd returns the *socket object's* inode,
+        # never the filesystem entry's — so it is recorded, not computed.
+        self._sock_ident: tuple[int, int] | None = None
+        # The path string this server bound. CONTROL_SOCK is a module global
+        # that an embedder or a test can reassign; repair work must only ever
+        # touch OUR path, or a server left running from earlier would create a
+        # socket at whatever path the global now names (measured: it did).
+        self._bound_path: str | None = None
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -6143,6 +7033,8 @@ class ControlServer:
             os.chmod(CONTROL_SOCK, 0o600)
             server.listen(4)
             server.settimeout(1.0)
+            self._bound_path = str(CONTROL_SOCK)
+            self._sock_ident = self._ident_of(CONTROL_SOCK)
             self._server = server
         except OSError as e:
             log.error("control socket unavailable: %s", e)
@@ -6155,6 +7047,42 @@ class ControlServer:
                 try:
                     conn, _ = server.accept()
                 except socket.timeout:
+                    # The path can be removed underneath a live bubble (a
+                    # cleanup script, `rm ~/.local/state/handsoff/*`, an
+                    # unmount). The listener keeps accepting on an inode no
+                    # client can reach: `--ptt` says "not running", doctor says
+                    # "not created yet", and nothing anywhere says otherwise.
+                    # One lstat per idle second is the cheapest way to notice
+                    # and re-bind instead of degrading in silence.
+                    if self._stop.is_set():
+                        # Shutdown already removed the path. Re-binding here
+                        # would re-create the socket AFTER stop() cleaned up,
+                        # leaving behind exactly the stale inode this class
+                        # exists to avoid.
+                        break
+                    if str(CONTROL_SOCK) != self._bound_path:
+                        # CONTROL_SOCK names a path we did not bind: someone
+                        # else's socket, someone else's business. Repairing it
+                        # would create a control socket on a path this bubble
+                        # never owned — and in the test suite a server left
+                        # running would then materialise a 0600 socket under a
+                        # later test's temporary path.
+                        continue
+                    state = self._socket_path_state()
+                    if state == "gone":
+                        rebound = self._rebind(server)
+                        if rebound is not None:
+                            server = rebound
+                    elif state == "foreign" and not self._orphan_reported:
+                        # Someone else's socket took our path. Deleting it
+                        # could be another live bubble's socket, so say so and
+                        # leave it: a loud lie beats a silent theft.
+                        self._orphan_reported = True
+                        log.error(
+                            "control socket path %s now belongs to another inode — "
+                            "'--ptt' reaches whoever owns it, not this bubble "
+                            "(a second handsoff, or a stale path from another run)",
+                            CONTROL_SOCK)
                     continue
                 except OSError:
                     if not self._stop.is_set():
@@ -6162,7 +7090,25 @@ class ControlServer:
                     return
                 try:
                     conn.settimeout(5.0)
-                    action = conn.recv(1024).decode("utf-8", "replace").strip().lower()
+                    # Read the request BEFORE the credential check: closing a
+                    # socket that still holds the peer's unread bytes sends
+                    # RST, so a refused caller would see a connection reset
+                    # instead of the reason. Reading first keeps the refusal
+                    # legible (the check still gates every dispatch).
+                    raw = conn.recv(1024).decode("utf-8", "replace").strip()
+                    # Split the optional argument off BEFORE lowercasing: `say`
+                    # carries the text to synthesize, so lowercasing the whole
+                    # payload would make the bubble read a different sentence
+                    # than the one the user typed.
+                    action, _, action_arg = raw.partition(" ")
+                    action = action.lower()
+                    peer = _peer_uid(conn)
+                    if peer is not None and peer != os.getuid():
+                        log.warning(
+                            "control socket: refusing peer uid %s (ours is %s)",
+                            peer, os.getuid())
+                        conn.sendall(b"error: not permitted\n")
+                        continue
 
                     def _with_timeout(fn, timeout_s: float):
                         """Run slow diagnostics off the accept thread: the
@@ -6198,12 +7144,28 @@ class ControlServer:
                             except Exception:
                                 log.exception("health snapshot failed")
                                 reply = "error: health snapshot failed (see log)"
+                        elif action == "level":
+                            # deliberately NOT wrapped in _with_timeout: it reads
+                            # three scalars and the Voice meter polls it ~20x/s,
+                            # so spawning a worker thread per poll would be pure
+                            # overhead. `doctor`/`health` are the slow ones.
+                            reply = json.dumps(self._assistant.level_snapshot(),
+                                               ensure_ascii=False)
+                        elif action == "clear-history":
+                            # Settings asks for this when the model changes: the
+                            # bubble OWNS the history in memory and rewrites the
+                            # whole file on its next save, so truncating the file
+                            # from another process would be silently resurrected.
+                            reply = (f"ok: cleared {self._assistant.clear_history()} "
+                                     f"history message(s)")
                         elif action == "doctor":
                             try:
                                 reply = _with_timeout(run_doctor, 4.5)
                             except Exception:
                                 log.exception("doctor report failed")
                                 reply = "error: doctor report failed (see log)"
+                        elif action == "say":
+                            reply = self._assistant.say_preview(action_arg)
                         elif action == "settings":
                             if SETTINGS_APP.exists():
                                 subprocess.Popen(
@@ -6235,6 +7197,72 @@ class ControlServer:
                 _remove_stale_control_socket()
             except OSError:
                 log.exception("could not remove control socket")
+
+
+    @staticmethod
+    def _ident_of(path: Path) -> "tuple[int, int] | None":
+        try:
+            info = path.lstat()
+        except OSError:
+            return None
+        return (info.st_dev, info.st_ino)
+
+    def _socket_path_state(self) -> str:
+        """'ours' | 'gone' | 'foreign' for the path we bound.
+
+        'ours' also covers an unreadable path: a transient lstat failure
+        (permission on a parent directory, an idle-mounted home) must not make
+        the bubble replace a socket it cannot even inspect.
+        """
+        try:
+            info = CONTROL_SOCK.lstat()
+        except FileNotFoundError:
+            return "gone"
+        except OSError:
+            return "ours"
+        if self._sock_ident is None:
+            return "ours"
+        return "ours" if (info.st_dev, info.st_ino) == self._sock_ident else "foreign"
+
+    def _rebind(self, server: socket.socket) -> "socket.socket | None":
+        """Re-create the control socket after its path disappeared.
+
+        Returns the new listening socket, or None when the path cannot be
+        reclaimed safely (someone else owns it) — the caller then keeps the old
+        one and retries after the next idle second, so a foreign inode is never
+        unlinked on the strength of a guess.
+        """
+        if self._stop.is_set():
+            return None      # shutdown owns the path from here; do not resurrect it
+        if not self._bound_path or str(CONTROL_SOCK) != self._bound_path:
+            return None      # only ever repair the path this server bound
+        try:
+            # Same guard startup uses: refuses a symlink, a foreign owner, or a
+            # non-socket at that path rather than unlinking it.
+            _remove_stale_control_socket()
+            fresh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            fresh.bind(str(CONTROL_SOCK))
+            os.chmod(CONTROL_SOCK, 0o600)
+            fresh.listen(4)
+            fresh.settimeout(1.0)
+        except OSError as e:
+            if not self._orphan_reported:
+                self._orphan_reported = True
+                log.error(
+                    "control socket path is gone and could not be re-bound (%s) — "
+                    "'--ptt' cannot reach this bubble until it restarts", e)
+            return None
+        log.warning(
+            "control socket path was removed while running — re-bound at %s "
+            "(clients that failed in the meantime should retry)", CONTROL_SOCK)
+        self._sock_ident = self._ident_of(CONTROL_SOCK)
+        self._orphan_reported = False
+        try:
+            server.close()
+        except OSError:
+            pass
+        self._server = fresh
+        return fresh
 
 
 def _remove_stale_control_socket() -> None:
@@ -6278,9 +7306,17 @@ commands:
   dictation-on   enable voice dictation
   dictation-off  disable voice dictation
   reload-settings  re-read settings.json and apply without restart
+  clear-history  forget the stored conversation (used when the brain model
+                 changes, so a new model cannot parrot the old transcript)
   status         report state, hands-free mode and model
   health         full JSON health: mic, brain (Ollama) and TTS status
+  level          live JSON voice level: the signal every bubble design paints
+                 from (raw, the smoothed 'ui' value the painters read, which
+                 producer sent it and how long ago) — what Settings → Voice
+                 polls for its meter
   doctor         human-readable diagnostic: deployment hashes, Ollama, mic, niri, systemd
+  say <text>     speak <text> now as a voice preview (Settings → Voice uses this
+                 so the preview is the bubble's own voice, not a second model)
   selftest       run the hardware typing checks (launches scratch windows on
                  THIS desktop, types only into them, restores the clipboard)"""
 
@@ -6330,11 +7366,15 @@ def ptt_client(argv: list[str]) -> int:
         print("(bubble not running — local report)\n")
         print(run_doctor())
         return 0
+    payload = " ".join(argv)
+    if action == "say" and not payload.partition(" ")[2].strip():
+        sys.stderr.write("usage: python handsoff.py --ptt say <text>\n")
+        return 2
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5.0)
         s.connect(str(CONTROL_SOCK))
-        s.sendall(action.encode("utf-8"))
+        s.sendall(payload.encode("utf-8"))
         s.shutdown(socket.SHUT_WR)
         reply = b""
         while True:
@@ -6345,7 +7385,11 @@ def ptt_client(argv: list[str]) -> int:
         print(reply.decode("utf-8", "replace").strip())
         return 0
     except (FileNotFoundError, ConnectionRefusedError):
-        sys.stderr.write("handsoff is not running (no control socket)\n")
+        # Name the path: "not running" is the common case, but the interesting
+        # one is a client looking somewhere the bubble is not (a different
+        # XDG_STATE_HOME, a test HOME, a stale symlink) — then the message the
+        # user sees is the only clue about which socket was tried.
+        sys.stderr.write(f"handsoff is not running (no control socket at {CONTROL_SOCK})\n")
         return 1
     except OSError as e:
         sys.stderr.write(f"control socket error: {e}\n")
@@ -6435,7 +7479,7 @@ def main() -> int:
     log.info(
         "brain: ollama %s model %s (ctx %d) | stt: whisper %s | tts: %s (rate %.2f, vol %.2f)",
         OLLAMA_BASE, OLLAMA_MODEL, OLLAMA_NUM_CTX, WHISPER_SIZE,
-        SETTINGS["piper_voice"] or "(first *.onnx in piper-voice/)",
+        f"{TTS_ENGINE} ({TTS_REFERENCE or 'built-in voice'})",
         SETTINGS["tts_rate"], SETTINGS["tts_volume"],
     )
     log.info(

@@ -28,11 +28,21 @@ class PomodoroController:
         self._stop: threading.Event | None = None
         self._thread = None
         self._state: dict | None = None
+        # One lock for the whole start/stop/transition handshake. Two turns can
+        # overlap (a spoken turn and a hands-free one), so "is a worker alive?"
+        # then "start one" is a check-then-act that can start TWO loops — and
+        # two loops announce every phase boundary twice. It also serialises the
+        # phase flip against shutdown(), so a stop cannot land between the wait
+        # timing out and the announce that follows it. Re-entrant on purpose:
+        # the phase flip announces while holding it, and an announce is a
+        # callback into the rest of the app.
+        self._lock = threading.RLock()
 
     def command(self, action: str, work: float, break_minutes: float) -> str:
         """Own the bounded pomodoro worker and announce work/break transitions."""
         if action == "status":
-            state = self._state
+            with self._lock:
+                state = self._state
             if not state:
                 return "pomodoro is off"
             remaining = max(0, int(state["until"] - time.monotonic()))
@@ -43,40 +53,86 @@ class PomodoroController:
             return "pomodoro stopped"
         if self._is_closed():
             return "ERROR: assistant is shut down"
-        if self._thread is not None and self._thread.is_alive():
-            return "pomodoro is already running"
-        stop = threading.Event()
-        self._stop = stop
-        self._state = {"phase": "work", "until": time.monotonic() + work * 60,
-                       "work": work, "break": break_minutes}
-        self._thread = self._spawn(self._loop, args=(stop,), name="pomodoro")
-        self._announce(f"Pomodoro started: {work:.0f} minutes of work.")
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return "pomodoro is already running"
+            stop = threading.Event()
+            self._stop = stop
+            self._state = {"phase": "work", "until": time.monotonic() + work * 60,
+                           "work": work, "break": break_minutes}
+            self._thread = self._spawn(self._loop, args=(stop,), name="pomodoro")
+            self._announce(f"Pomodoro started: {work:.0f} minutes of work.")
         return f"pomodoro started: {work:.0f} minute work and {break_minutes:.0f} minute break"
 
     def _loop(self, stop: threading.Event) -> None:
         phase = "work"
         while not stop.is_set():
-            state = self._state
+            with self._lock:
+                state = self._state
             if not state:
                 return
             if stop.wait(max(0.05, state["until"] - time.monotonic())):
                 return
             phase = "break" if phase == "work" else "work"
             minutes = state["break"] if phase == "break" else state["work"]
-            self._state = {**state, "phase": phase,
-                           "until": time.monotonic() + minutes * 60}
-            self._announce(
-                f"Pomodoro: {('break' if phase == 'break' else 'back to work')} "
-                f"for {minutes:.0f} minutes.")
+            with self._lock:
+                # Re-check under the lock: the wait above may have expired at
+                # the same moment another thread stopped us, and announcing a
+                # transition after "pomodoro stopped" is a ghost the user
+                # cannot explain.
+                if stop.is_set() or self._state is None:
+                    return
+                self._state = {**self._state, "phase": phase,
+                               "until": time.monotonic() + minutes * 60}
+                self._announce(
+                    f"Pomodoro: {('break' if phase == 'break' else 'back to work')} "
+                    f"for {minutes:.0f} minutes.")
 
     def shutdown(self) -> None:
-        """Signal stop and clear phase state (the thread exits on its own)."""
-        stop, self._stop = self._stop, None
-        self._state = None
+        """Signal stop and clear phase state, then join the worker.
+
+        The join is what makes the stop real: without it `command('stop')`
+        could return while the loop was already past its wait and about to
+        announce the next phase, so the bubble said "pomodoro stopped" and
+        then spoke a transition anyway.
+        """
+        with self._lock:
+            stop, self._stop = self._stop, None
+            thread, self._thread = self._thread, None
+            self._state = None
         if stop is not None:
             stop.set()
+        _join_worker(thread, "pomodoro worker")
 
 log = logging.getLogger("handsoff")
+
+
+def _join_worker(thread, what: str, timeout: float = 2.0) -> None:
+    """Join a worker thread on stop, tolerating thread-like stand-ins.
+
+    `spawn` is injected (the app passes a real Thread; tests pass doubles), so
+    the only contract relied on here is `is_alive()` plus a join if one
+    exists. Never joins the calling thread, which would deadlock a worker
+    stopping itself. A worker still alive after the budget is the app's
+    problem, not a reason to hang the caller that asked for a stop.
+    """
+    if thread is None or thread is threading.current_thread():
+        return
+    try:
+        if not thread.is_alive():
+            return
+    except Exception:
+        return
+    join = getattr(thread, "join", None)
+    if join is None:
+        return
+    try:
+        join(timeout=timeout)
+    except Exception:
+        log.exception("%s join failed", what)
+        return
+    if thread.is_alive():
+        log.warning("%s did not stop within %.0fs", what, timeout)
 
 
 def dbus_strings(line: str) -> list[str]:
@@ -147,6 +203,11 @@ class NotificationReader:
         if enabled:
             if self._is_closed():
                 return "ERROR: assistant is shut down"
+            # A worker that gave up (or crashed) leaves _thread pointing at a
+            # dead thread; clearing it here keeps "already on" honest instead
+            # of refusing to restart a reader that is not actually reading.
+            if self._thread is not None and not self._thread.is_alive():
+                self._thread = None
             if self._thread is not None and self._thread.is_alive():
                 return "notification reader is already on"
             try:
@@ -171,8 +232,10 @@ class NotificationReader:
             return "notification reader enabled"
         stop = self._stop
         proc = self._proc
+        thread = self._thread
         self._stop = None
         self._proc = None
+        self._thread = None
         if stop is not None:
             stop.set()
         if proc is not None:
@@ -180,6 +243,11 @@ class NotificationReader:
                 proc.terminate()
             except OSError:
                 pass
+        # Join the worker. Without this, "off" was only a promise: the old
+        # loop could still be parked on the dead process's stdout, and enabling
+        # again immediately started a second loop beside it — two readers, one
+        # of them holding the previous stop event, both speaking notifications.
+        _join_worker(thread, "notification reader")
         log.info("desktop notification reader disabled")
         return "notification reader disabled"
 
@@ -280,6 +348,19 @@ class NotificationReader:
             if stop.is_set():
                 return
             # loop() returned via exhaustion: loop to respawn.
+        # Out of respawns while still enabled: dbus-monitor is not coming
+        # back, so the reader must stop claiming to be on. Leaving
+        # notification_reader=True here was the worst state — the toggle and
+        # the settings file said "on", nothing was listening, and no
+        # notification would ever be spoken again.
+        if not stop.is_set():
+            log.error("notification reader gave up after %d monitor respawns — "
+                      "turning it off", attempts)
+            self._proc = None
+            try:
+                self._persist("notification_reader", False)
+            except Exception:
+                log.exception("notification reader could not persist its stop")
 
 
 def split_due_reminders(items: list[dict], now: float
@@ -360,10 +441,18 @@ class ReminderStore:
 
     def update(self, mutate) -> list[dict]:
         """One serialized read-modify-write transaction: load, mutate, save.
-        Every mutation of the queue goes through here."""
+        Every mutation of the queue goes through here.
+
+        `mutate` returns the new list, or None to mean "I edited in place".
+        Only None preserves the loaded list: an empty list is a real result
+        (cancelling the last reminder), and `mutate(items) or items` used to
+        resurrect it, silently no-opping cancel-all.
+        """
         with self.lock, self._file_lock(self.path.parent, "reminders.json.lock"):
             items = self.load()
-            items = mutate(items) or items
+            result = mutate(items)
+            if result is not None:
+                items = result
             self.save(items)
             return items
 

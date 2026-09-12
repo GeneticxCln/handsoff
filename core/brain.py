@@ -12,9 +12,26 @@ import urllib.request
 from typing import Callable, MutableMapping
 
 
+# Control-token leakage is a small, CLOSED set, and matching only that set is
+# the point: the old filter dropped any sentence merely starting with '<', so
+# legitimate replies like "<3" or "it's <5 minutes away" were silently
+# swallowed before speech. It also only stripped CLOSED <think> blocks, so an
+# unterminated one streamed the model's reasoning straight into TTS.
+_LEAKED_MARKUP = re.compile(
+    r"^\s*(?:</?(?:think|tool_calls?|im_start|im_end)\b|<\|)", re.IGNORECASE)
+
+
+def is_leaked_markup(sentence: str) -> bool:
+    """True only for control-token leakage — not for any sentence starting '<'."""
+    return bool(_LEAKED_MARKUP.match(sentence or ""))
+
+
 def strip_thinking(text: str) -> str:
     """Clean model output before it is sent to speech."""
     value = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+    # an UNCLOSED block: drop it and everything after it, or the reasoning
+    # text is spoken aloud
+    value = re.sub(r"<think>.*\Z", "", value, flags=re.DOTALL)
     value = re.sub(r"^\s*\[TOOL_CALLS\][^\n]*(?:\n|$)", "", value,
                    flags=re.MULTILINE)
     return value.strip()
@@ -147,11 +164,14 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                         break
                     sentence, buf = buf[:match.end()], buf[match.end():]
                     sentence = strip_thinking(sentence).strip()
-                    if sentence and not sentence.startswith("<"):
+                    if sentence and not is_leaked_markup(sentence):
                         q.put(sentence)
-        tail = strip_thinking(buf).strip()
-        if tail and not tail.startswith("<"):
-            q.put(tail)
+        # Only flush what is still pending if the turn was NOT cancelled:
+        # after a barge-in the tail was queued anyway and spoken over the user.
+        if not (cancel is not None and cancel.is_set()):
+            tail = strip_thinking(buf).strip()
+            if tail and not is_leaked_markup(tail):
+                q.put(tail)
     except urllib.error.HTTPError as error:
         detail = _read_http_error(error)
         if error.code == 400 and tools and "tool" in detail.lower():
@@ -163,6 +183,19 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                 urlopen=urlopen, keep_alive=keep_alive)
         logger.error("streaming chat HTTP error: %s", error)
         raise RuntimeError(f"Ollama error {error.code}: {detail}") from None
+    except urllib.error.URLError as error:
+        # Same conversion the non-streaming path makes, and for the same
+        # reason: a refused/unreachable Ollama is the common failure, and the
+        # caller (`_brain_turn`) diagnoses a down brain from RuntimeError only.
+        # Letting URLError escape meant a dead Ollama was reported to the user
+        # as "my brain gave me an empty answer" while the real cause (with the
+        # `systemctl start ollama` fix) went unspoken and the error surfaced as
+        # an unhandled exception in the streamer thread.
+        logger.error("streaming chat cannot reach %s: %s", base, error.reason)
+        raise RuntimeError(
+            f"cannot reach Ollama at {base} ({error.reason}). "
+            "Start it with: systemctl start ollama"
+        ) from None
     except Exception:
         logger.exception("streaming chat failed")
         raise

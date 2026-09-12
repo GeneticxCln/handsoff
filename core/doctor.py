@@ -50,7 +50,9 @@ class DoctorDeps:
             ollama_base=H.OLLAMA_BASE,
             ollama_model=H.OLLAMA_MODEL,
             ollama_available=H.ollama_available,
-            piper_voice=H._piper_voice,
+            tts_model=H._tts_model,
+            tts_engine=H.TTS_ENGINE,
+            tts_reference=H.TTS_REFERENCE,
             whisper_model=H._whisper_model,
             deployment_snapshot=H._deployment_snapshot,
             hardware_snapshot=getattr(H, "_doctor_snapshot", None),
@@ -75,12 +77,13 @@ class DoctorDeps:
 
     __slots__ = (
         "ollama_base", "ollama_model", "ollama_available",
-        "piper_voice", "whisper_model",
+        "tts_model", "tts_engine", "tts_reference", "whisper_model",
         "deployment_snapshot",
         "hardware_snapshot", "hardware_prompt_context", "doctor_ttl",
         "niri_msg", "ydotool_socket", "socket_connectable",
         "sys_version_info", "restart_script", "systemd_unit_file",
         "control_sock", "crash_log", "remote_ollama_allowed",
+        "remote_ollama_optin_source",
         "shutil", "sounddevice", "log",
     )
 
@@ -91,7 +94,9 @@ class DoctorDeps:
         self.ollama_base: str = ""
         self.ollama_model: str = ""
         self.ollama_available: Callable[[], bool] = lambda: False
-        self.piper_voice: Any = None
+        self.tts_model: Any = None
+        self.tts_engine: str = ""
+        self.tts_reference: str = ""
         self.whisper_model: Any = None
         self.deployment_snapshot: Callable[[], dict] = lambda: {
             "status": "source-unknown", "running_path": "", "running_sha256": None,
@@ -109,6 +114,7 @@ class DoctorDeps:
         self.control_sock: Path = Path("/nonexistent/control.sock")
         self.crash_log: Path = Path("/nonexistent/crash.log")
         self.remote_ollama_allowed: Callable[[], bool] | None = None
+        self.remote_ollama_optin_source: Callable[[], str] | None = None
         self.shutil = shutil
         self.sounddevice = None
         self.log = log
@@ -154,6 +160,22 @@ def _is_remote_base(base: str) -> bool:
         return True
 
 
+def _tts_line(deps: "DoctorDeps") -> str:
+    """One line naming the speech engine, its voice, and whether it is up.
+
+    "voice loaded" used to be the whole story. That cannot distinguish the
+    built-in voice from a reference clip, and names no engine — so a bubble
+    that failed to condition on its clip, or that is still running the previous
+    engine, read exactly like a healthy one. Doctor is the tool the user runs
+    when speech is wrong, so it has to answer "which engine, which voice".
+    """
+    engine = deps.tts_engine or "tts"
+    voice = (f"reference {Path(deps.tts_reference).name}" if deps.tts_reference
+             else "built-in voice")
+    state = "model loaded" if deps.tts_model is not None else "model NOT loaded yet"
+    return f"tts: {engine} ({voice}) — {state}"
+
+
 def _remote_brain_lines(deps: "DoctorDeps") -> list[str]:
     """Trust warning appended after the brain line when the endpoint is not
     on this machine: conversation history, screenshots, and tool schemas
@@ -168,7 +190,22 @@ def _remote_brain_lines(deps: "DoctorDeps") -> list[str]:
         except Exception:
             opted = False
     if opted:
-        return ["brain privacy: REMOTE — explicitly allowed (allow_remote_ollama)"]
+        # Name the channel. The env var is a SECOND opt-in that Settings
+        # cannot show, so a user must be able to learn from doctor that their
+        # brain is remote because of the environment, not the checkbox.
+        source = ""
+        src_getter = getattr(deps, "remote_ollama_optin_source", None)
+        if src_getter is not None:
+            try:
+                source = str(src_getter() or "")
+            except Exception:
+                source = ""
+        where = {
+            "settings": "allow_remote_ollama in Settings",
+            "env": "HANDSOFF_ALLOW_REMOTE_OLLAMA in the environment "
+                   "— NOT visible in Settings",
+        }.get(source, "allow_remote_ollama")
+        return [f"brain privacy: REMOTE — explicitly allowed ({where})"]
     return [
         "brain privacy: REMOTE and NOT allowed — history, screenshots, and "
         "schemas leave this machine; every request FAILS CLOSED until "
@@ -223,7 +260,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.extend(_remote_brain_lines(deps))
 
         lines.append(
-            f"tts: {'voice loaded' if deps.piper_voice is not None else 'voice NOT loaded yet'}; "
+            f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
 
         audio = snap["audio"]
@@ -264,7 +301,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.extend(_remote_brain_lines(deps))
 
         lines.append(
-            f"tts: {'voice loaded' if deps.piper_voice is not None else 'voice NOT loaded yet'}; "
+            f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
 
         sd = deps.sounddevice

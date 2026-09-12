@@ -9,6 +9,7 @@ import ast as _ast
 import base64
 import datetime
 import difflib
+import fnmatch
 import functools
 import inspect
 import json
@@ -221,12 +222,27 @@ class BoundedJob:
     MAX_OUTPUT = 200000
     MAX_LIFETIME_S = 1800.0
 
+    def claim_announcement(self) -> bool:
+        """True for exactly ONE caller: the poll that may announce completion.
+
+        The old inline `if not job._announced: job._announced = True` is a
+        check-then-set with no lock, so two concurrent polls (a spoken turn and
+        a hands-free turn can overlap) both saw False and announced the same
+        finished job twice.
+        """
+        with self._announce_lock:
+            if self._announced:
+                return False
+            self._announced = True
+            return True
+
     def __init__(self, job_id: str, command: str, proc: subprocess.Popen) -> None:
         self.id = job_id
         self.command = command
         self.proc = proc
         self.started = time.monotonic()
         self._announced = False
+        self._announce_lock = threading.Lock()
         self._out_parts: list[str] = []
         self._out_len = 0
         self._out_lock = threading.Lock()
@@ -243,23 +259,31 @@ class BoundedJob:
                 if not chunk:
                     break
                 with self._out_lock:
-                    if self._out_len < self.MAX_OUTPUT:
-                        keep = chunk[:self.MAX_OUTPUT - self._out_len]
-                        self._out_parts.append(keep)
-                        self._out_len += len(keep)
+                    self._out_parts.append(chunk)
+                    self._out_len += len(chunk)
+                    # Keep the LAST MAX_OUTPUT chars, not the first: the whole
+                    # point of this buffer is output_tail, and a job that runs
+                    # for twenty minutes produces far more than the cap —
+                    # retaining the head meant "here is the recent output"
+                    # handed back the startup banner and dropped the error
+                    # that followed it. Trimming is amortised: halves the
+                    # buffer at a time so the join+slice is O(1) per chunk.
+                    if self._out_len > self.MAX_OUTPUT * 2:
+                        joined = ''.join(self._out_parts)
+                        keep = joined[-self.MAX_OUTPUT:]
+                        self._out_parts = [keep]
+                        self._out_len = len(keep)
         except (OSError, ValueError):
             pass
         finally:
             self._drain_done.set()
 
     def output_tail(self, limit: int=4096) -> str:
-        """Last `limit` chars of the RETAINED head (never blocks on the pipe).
+        """Last `limit` chars of the buffer — genuinely recent output.
 
-        The buffer keeps the FIRST MAX_OUTPUT bytes of the job's output and
-        discards the rest (still draining so the child never blocks) — so
-        this is a tail of the head, not of unbounded full output. Callers
-        must take the explicit reap join (_join_drain with the full budget)
-        before reading a finished job.
+        Bounded at MAX_OUTPUT (the newest bytes win), never blocks on the
+        pipe. Callers must take the explicit reap join (_join_drain with the
+        full budget) before reading a finished job.
         """
         with self._out_lock:
             s = ''.join(self._out_parts)
@@ -272,6 +296,28 @@ class BoundedJob:
         t = self._drain_thread
         if t is not None and t.is_alive() and (not self._drain_done.is_set()):
             t.join(timeout=timeout)
+
+    def _unstick_drain(self) -> None:
+        """Close the pipe under a drainer that will never finish on its own.
+
+        `read()` returns only when EVERY writer closes the pipe, and the job
+        runs in its own session, so a grandchild that inherited stdout keeps
+        the drainer blocked after the job itself is gone. Closing our end
+        raises ValueError inside the read (caught in _drain), which ends the
+        thread instead of leaking it for the rest of the session. Only ever
+        called once the job is finished/killed — closing it earlier would
+        give a live child EPIPE on write.
+        """
+        t = self._drain_thread
+        if t is None or not t.is_alive() or self._drain_done.is_set():
+            return
+        try:
+            self.proc.stdout.close()
+        except (AttributeError, OSError, ValueError):
+            pass
+        t.join(timeout=0.2)
+        if t.is_alive():
+            _dep().log.warning('job %s: output drain thread did not stop', self.id)
 
     def poll(self) -> tuple[str, bool]:
         """(state, done): 'running' | 'done' | 'timeout-killed'.
@@ -290,8 +336,16 @@ class BoundedJob:
             try:
                 self.proc.wait(timeout=2)
             except Exception:
-                pass
-            self._join_drain()
+                # SIGKILL cannot be ignored, so a timeout here means the
+                # child is stuck in uninterruptible I/O. Reporting it as
+                # finished would drop the only reaper we have, leaving a
+                # zombie until the process exits — say 'running' and try
+                # again on the next poll instead.
+                _dep().log.warning('job %s: SIGKILL did not reap pid %d yet',
+                                   self.id, self.proc.pid)
+                self._unstick_drain()
+                return ('running', False)
+            self._unstick_drain()
             return ('timeout-killed', True)
         self.proc.poll()
         if self.proc.returncode is not None:
@@ -337,6 +391,196 @@ def tool(func=None, *, name=None, gates=None, aliases=None, description=None, re
         f._tool_required = required
         return f
     return wrap(func) if func else wrap
+
+# -- secret-path guard ---------------------------------------------------------
+# Anything a tool reads can end up in the conversation, and the brain may be a
+# remote Ollama (see handsoff._guard_ollama_endpoint). Credential stores, key
+# material, shell history and browser profiles are never part of "help me with
+# my computer", so ONE predicate refuses them at every entry point that can
+# carry file CONTENTS into the transcript: read_file, watch_file (matched lines
+# are announced) and run_command (whose whitelist includes `cat`, which would
+# otherwise read a file read_file refuses). One copy, because three would drift.
+
+_SECRET_DIRS = (
+    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker",
+    ".password-store", ".mozilla", ".thunderbird", ".gnome2/keyrings",
+    ".config/gh", ".config/gcloud", ".config/heroku",
+    ".config/google-chrome", ".config/chromium", ".config/BraveSoftware",
+    ".local/share/keyrings", ".local/share/kwalletd",
+)
+_SECRET_FILES = (
+    ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".authinfo",
+    ".msmtprc", ".wget-hsts", ".histfile",
+    ".bash_history", ".zsh_history", ".fish_history", ".python_history",
+    ".node_repl_history", ".mysql_history", ".psql_history",
+    ".sqlite_history", ".lesshst", ".viminfo", ".irb_history",
+    # exact OpenSSH private-key names: a plain `id_rsa` inside ~/.ssh is
+    # already caught by the directory rule, these catch copies elsewhere.
+    # Deliberately NOT a glob — `id_rsa_notes.md` is a note, not a key.
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss",
+)
+_SECRET_GLOBS = (
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.kdbx", "*.ppk",
+    "*.ovpn", "*.token", "token", "credentials", "credentials.json",
+    "auth.json", "secrets.json", "secrets.yaml", "secrets.yml",
+    "service-account*.json", ".env", ".env.*", "*.env",
+)
+
+
+def denied_secret_path(path) -> str | None:
+    """Why `path` must not be read into the conversation, or None if it may be.
+
+    Returns a short reason for the REFUSED message. Matching happens on the
+    RESOLVED path, so `~/.ssh/../.ssh/id_rsa` and symlinks cannot slip past.
+    """
+    try:
+        p = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None                       # unreadable path: the caller reports it
+    for anc in p.parents:
+        if anc.name.lower() in _SECRET_DIRS:
+            return f"{anc.name}/ holds credentials or key material"
+    try:
+        rel = p.relative_to(Path.home()).as_posix().strip("/").lower()
+    except ValueError:
+        rel = ""
+    for d in _SECRET_DIRS:
+        if rel == d or rel.startswith(d + "/"):
+            return f"~/{d}/ holds credentials or key material"
+    name = p.name.lower()
+    if name in _SECRET_FILES:
+        return f"{p.name} is a credential or shell-history file"
+    for pat in _SECRET_GLOBS:
+        if fnmatch.fnmatch(name, pat):
+            return f"{p.name} matches the credential pattern {pat!r}"
+    return None
+
+
+# -- watcher-pattern guard -----------------------------------------------------
+# `re` has no timeout, and a file watcher evaluates its pattern on every
+# appended line once a second. A pattern that backtracks exponentially — the
+# classic `(a+)+$` shape the model or the user can hand us — therefore pins a
+# core and silently wedges that watcher forever, because nothing can interrupt
+# a running `re` call from the same thread. Three bounds, in order of how much
+# they actually buy:
+#   1. the exponential SHAPE is refused up front (a quantified group whose own
+#      content carries a quantifier: `(a+)+`, `(\d+)*`, `(.*x){4}`);
+#   2. the pattern's length is capped, so nobody hands us a 100 KB regex;
+#   3. the text any single evaluation sees is capped, so even a shape that
+#      slips past the check cannot chew through an unbounded line.
+# Residual risk is documented rather than hidden: an overlapping-alternation
+# blowup like `(a|aa)+` is still expressible, because telling it apart from a
+# safe `(foo|bar)+` needs first-character-set analysis we are not going to do.
+# The blast radius is one daemon watcher thread, which can never block
+# shutdown, and (3) keeps its work per line bounded.
+WATCH_PATTERN_MAX = 300
+WATCH_LINE_MAX = 4000
+WATCH_LINES_PER_POLL = 500
+
+
+def _has_quantifier(text: str) -> bool:
+    """A regex quantifier at depth 0 of `text` (escapes/classes skipped)."""
+    depth = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == '[':                      # `*` inside a class is a literal
+            j = i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == ']':
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth = max(0, depth - 1)
+        elif depth == 0 and c in '*+?':
+            return True
+        elif depth == 0 and c == '{' and text[i + 1:i + 2].isdigit():
+            return True
+        i += 1
+    return False
+
+
+def watcher_pattern_risk(pattern: str) -> str | None:
+    """Why `pattern` is too dangerous to evaluate once a second, else None.
+
+    Deliberately only reports the shapes we can name with confidence, so a
+    legitimate pattern is never refused on a guess: `re.compile` still owns
+    syntax errors, and this owns backtracking blowups.
+    """
+    if len(pattern) > WATCH_PATTERN_MAX:
+        return (f'pattern is longer than {WATCH_PATTERN_MAX} characters — '
+                f'watchers are for finding lines, not for parsing')
+    stack: list[int] = []
+    i = 0
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == '(':
+            stack.append(i)
+        elif c == ')' and stack:
+            inner = pattern[stack.pop() + 1:i]
+            if inner.startswith('?'):      # group modifier, not a quantifier
+                inner = inner[1:]
+            j = i + 1
+            quantified = (j < n and pattern[j] in '*+')
+            if not quantified and j < n and pattern[j] == '{':
+                quantified = pattern[j + 1:j + 2].isdigit()
+            if quantified and _has_quantifier(inner):
+                return ('nested quantifier — a quantified group that itself '
+                        'contains a quantifier can backtrack exponentially')
+        i += 1
+    return None
+
+
+# -- strict model-argument coercion -------------------------------------------
+# A small model emits arguments as JSON strings, and the old coercion guessed:
+# `bool("false")` is True (silently INVERTING a flag), `int("")` and
+# `float("")` became 0, and because it always passed every parameter, an
+# OMITTED optional numeric arg was sent as 0 instead of taking its documented
+# default. Guessing a value the model did not ask for is worse than saying so:
+# a malformed argument now raises and surfaces as "bad arguments".
+
+_BOOL_TRUE = frozenset({"true", "yes", "on", "1"})
+_BOOL_FALSE = frozenset({"false", "no", "off", "0", ""})
+
+
+def coerce_bool_arg(raw) -> bool:
+    """Strict bool for model-supplied args ("false" must not become True)."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    token = str(raw).strip().lower()
+    if token in _BOOL_TRUE:
+        return True
+    if token in _BOOL_FALSE:
+        return False
+    raise ValueError(f"expected true or false, got {raw!r}")
+
+
+def coerce_number_arg(raw, kind) -> "int | float":
+    """int/float for model-supplied args; raises instead of guessing 0."""
+    if isinstance(raw, bool):
+        raise ValueError(f"expected a number, got {raw!r}")
+    try:
+        return kind(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"expected {kind.__name__}, got {raw!r}") from e
+
 
 def _param_schema(func) -> dict:
     """{param: {'type': ..., 'description': ...}} from signature + docstring."""
@@ -546,12 +790,21 @@ class ToolBelt:
             return (f"REFUSED: '{name}' is DENIED by the user's command policy (handsoff settings) — do not retry this turn", True)
         if verdict == 'CONFIRM' and getattr(self, '_confirm_running', None) != name:
             with self._confirmation_lock():
+                # Whole offer decision inside one lock: previously the snapshot
+                # was taken here and re-read after the release, which reads like
+                # a check-then-act TOCTOU even though the only thing the second
+                # read did was add a log line.
                 pending = self._pending_confirm
-                if pending is None or pending.get('tool') != name or pending.get('turn') != getattr(self, '_user_turn_marker', 0):
-                    self._pending_confirm = {'tool': name, 'args': dict(args), 'until': time.monotonic() + self._policy.confirm_seconds(), 'turn': getattr(self, '_user_turn_marker', 0)}
-                log_decision(name, target, 'CONFIRM', 'offered; awaiting confirm_action')
-            if pending is not None and pending.get('tool') == name and (pending.get('turn') == getattr(self, '_user_turn_marker', 0)):
-                log_decision(name, target, 'CONFIRM', 'still awaiting confirm_action')
+                marker = getattr(self, '_user_turn_marker', 0)
+                repeat = (pending is not None and pending.get('tool') == name
+                          and pending.get('turn') == marker)
+                if not repeat:
+                    self._pending_confirm = {'tool': name, 'args': dict(args),
+                                             'until': time.monotonic() + self._policy.confirm_seconds(),
+                                             'turn': marker}
+                log_decision(name, target, 'CONFIRM',
+                             'still awaiting confirm_action' if repeat
+                             else 'offered; awaiting confirm_action')
             self._last_confirmation_offer = True
             extra = ''
             if name == 'edit_file' and self._is_self_edit(args):
@@ -571,34 +824,35 @@ class ToolBelt:
         alias_map = fn._tool_aliases
         sig = inspect.signature(fn)
         kwargs = {}
-        for pname, p in sig.parameters.items():
-            if pname == 'self':
-                continue
-            raw = args.get(pname)
-            if raw is None and pname in alias_map:
-                for alt in alias_map[pname]:
-                    if args.get(alt) is not None:
-                        raw = args[alt]
-                        break
-            if raw is None and p.default is inspect.Parameter.empty:
-                raw = ''
-            ann = p.annotation if p.annotation is not inspect.Parameter.empty else str
-            if isinstance(ann, str):
-                ann = {'bool': bool, 'int': int, 'float': float, 'str': str}.get(ann, str)
-            if ann is bool:
-                kwargs[pname] = bool(raw) if not isinstance(raw, bool) else raw
-            elif ann is int:
-                try:
-                    kwargs[pname] = int(raw or 0)
-                except (TypeError, ValueError):
-                    kwargs[pname] = 0
-            elif ann is float:
-                try:
-                    kwargs[pname] = float(raw or 0.0)
-                except (TypeError, ValueError):
-                    kwargs[pname] = 0.0
-            else:
-                kwargs[pname] = str(raw) if raw is not None else ''
+        try:
+            for pname, p in sig.parameters.items():
+                if pname == 'self':
+                    continue
+                raw = args.get(pname)
+                if raw is None and pname in alias_map:
+                    for alt in alias_map[pname]:
+                        if args.get(alt) is not None:
+                            raw = args[alt]
+                            break
+                if raw is None:
+                    if p.default is not inspect.Parameter.empty:
+                        # let the signature's own default apply; passing 0 here
+                        # silently overrode documented defaults
+                        continue
+                    raw = ''
+                ann = p.annotation if p.annotation is not inspect.Parameter.empty else str
+                if isinstance(ann, str):
+                    ann = {'bool': bool, 'int': int, 'float': float, 'str': str}.get(ann, str)
+                if ann is bool:
+                    kwargs[pname] = coerce_bool_arg(raw)
+                elif ann is int:
+                    kwargs[pname] = coerce_number_arg(raw, int)
+                elif ann is float:
+                    kwargs[pname] = coerce_number_arg(raw, float)
+                else:
+                    kwargs[pname] = str(raw) if raw is not None else ''
+        except ValueError as e:
+            return (f'ERROR: bad arguments for {name}: {e}', True)
         try:
             out = fn(**kwargs)
             return (out, out.startswith('ERROR') or out.startswith('REFUSED'))
@@ -628,6 +882,16 @@ class ToolBelt:
         if not argv:
             return (None, '', 'REFUSED: empty command', False)
         argv[0] = os.path.expanduser(argv[0])
+        # `cat` is on the whitelist, so validating only the executable would
+        # leave run_command a way to read exactly what read_file refuses.
+        # Every argument is checked against the same secret-path predicate.
+        for tok in argv[1:]:
+            if not tok or tok.startswith('-'):
+                continue
+            denied = denied_secret_path(tok)
+            if denied:
+                return (None, '', f"REFUSED: '{tok}' — {denied}. run_command "
+                        f"cannot read credential stores into the conversation", False)
         low = cmd.lower()
         exe_base = Path(argv[0]).name
         _unblocked = ''
@@ -737,11 +1001,21 @@ class ToolBelt:
         $XDG_RUNTIME_DIR/.ydotool_socket, but the CLI's compiled-in default
         is /tmp/.ydotool_socket — so without YDOTOOL_SOCKET set, every
         type/click dies with 'failed to connect'. Probe both and prefer the
-        one that actually answers. Failures are not cached: a daemon started
-        later must be picked up on the next call.
+        one that actually answers.
+
+        A cached path is revalidated before it is reused, not returned
+        blindly: the daemon restarts on whichever candidate the environment
+        points at now, and the old code handed back a cached-but-dead path
+        forever after — typing and clicking stayed broken permanently (loudly,
+        with an error every time) even though ydotoold had come back on the
+        other socket. Failures are not cached either: a daemon started later
+        must be picked up on the next call.
         """
         if cls._YDOTOOL_SOCK_CACHE:
-            return cls._YDOTOOL_SOCK_CACHE[0]
+            cached = cls._YDOTOOL_SOCK_CACHE[0]
+            if cls._socket_connectable(cached):
+                return cached
+            cls._YDOTOOL_SOCK_CACHE.clear()
         runtime = os.environ.get('XDG_RUNTIME_DIR')
         candidates = ([os.path.join(runtime, '.ydotool_socket')] if runtime else []) + [cls.YDOTOOL_SOCKET]
         for path in candidates:
@@ -1120,9 +1394,16 @@ class ToolBelt:
     @tool(gates='notifications', description='Read future desktop notifications aloud. Actions: start, stop, toggle, status, or mute (mute_apps is comma-separated app names). Private and disabled by default.')
     def notification_reader(self, action: str='status', mute_apps: str='') -> str:
         action = str(action or 'status').strip().lower()
+        # `is False` (not `not ...`): set_setting returns an exact bool, but a
+        # stubbed seam in tests returns None, which means "not checked" rather
+        # than "the write failed" — report only a real failure.
         if action == 'mute':
-            apps = [x.strip().lower() for x in str(mute_apps or '').split(',') if x.strip()]
-            _dep().set_setting('notification_mute_apps', apps[:32])
+            apps = [x.strip().lower() for x in str(mute_apps or '').split(',') if x.strip()][:32]
+            # The list echoed back is the one actually stored, not what was sent:
+            # a caller pasting 40 names must not be told all 40 are muted.
+            if _dep().set_setting('notification_mute_apps', apps) is False:
+                return ('WARNING: mute list is active but was NOT saved — it is '
+                        'lost on restart: ' + (', '.join(apps) or '(empty)'))
             return 'notification mute list set to: ' + (', '.join(apps) or '(empty)')
         if action not in ('start', 'stop', 'toggle', 'status'):
             return 'ERROR: action must be start, stop, toggle, status or mute'
@@ -1133,14 +1414,20 @@ class ToolBelt:
             current = True
         elif action == 'stop':
             current = False
+        unsaved = ''
         if action != 'status':
-            _dep().set_setting('notification_reader', current)
+            if _dep().set_setting('notification_reader', current) is False:
+                # The reader really did start/stop, so the session is right —
+                # but the choice is not on disk and the next start reverts it.
+                unsaved = (' WARNING: the change was not saved to settings.json '
+                           'and will revert on restart')
             if self._on_notification is not None:
                 result = self._on_notification(current)
                 if result:
-                    return result
+                    return result + unsaved
         muted = ', '.join(_dep().SETTINGS.get('notification_mute_apps') or []) or 'none'
-        return f"notification reader is {('on' if current else 'off')}; muted apps: {muted}"
+        return (f"notification reader is {('on' if current else 'off')}; "
+                f"muted apps: {muted}" + unsaved)
 
     @tool(gates='pomodoro', description='Start or control a repeating Pomodoro timer. action: start, stop, status. work_minutes defaults to 25 and break_minutes to 5.')
     def pomodoro(self, action: str='status', work_minutes: float=25, break_minutes: float=5) -> str:
@@ -1187,10 +1474,19 @@ class ToolBelt:
                 with path.open('r', encoding='utf-8', errors='replace') as fh:
                     fh.seek(position)
                     chunk = fh.read(min(size - position, 128000))
-                    position = fh.tell()
-                for line in chunk.splitlines():
-                    if pattern.search(line):
+                # Bounded evaluation: the pattern is data we do not control, so
+                # it never sees an unbounded line and never gets more than a
+                # fixed number of shots per poll. `consumed` is the byte count
+                # of the lines actually examined — the cursor advances by THAT,
+                # not by the whole chunk, so a burst bigger than the per-poll
+                # cap is deferred to the next poll instead of being skipped
+                # forever.
+                consumed = 0
+                for line in chunk.splitlines(keepends=True)[:WATCH_LINES_PER_POLL]:
+                    consumed += len(line)
+                    if pattern.search(line[:WATCH_LINE_MAX]):
                         emit(f'{path.name}: {line.strip()[:240]}')
+                position += consumed
             except OSError:
                 emit(f'file watcher lost {path}')
                 return
@@ -1226,6 +1522,10 @@ class ToolBelt:
             return f'no file watcher for {p}'
         if action != 'start':
             return 'ERROR: action must be start, stop or list'
+        denied = denied_secret_path(p)
+        if denied:
+            return (f'REFUSED: {p} — {denied}. Watched lines are announced, so '
+                    f'they would enter the conversation.')
         if not p.is_file():
             return f'ERROR: no readable file: {p}'
         try:
@@ -1234,6 +1534,10 @@ class ToolBelt:
             return f'ERROR: invalid pattern: {e}'
         if not rx.pattern:
             return 'ERROR: pattern must not be empty'
+        risky = watcher_pattern_risk(rx.pattern)
+        if risky:
+            return (f'REFUSED: {risky}. Use a simpler pattern — a watcher runs '
+                    f'your regex on every appended line, once a second.')
         with self._watch_lock:
             if key not in self._file_watchers and len(self._file_watchers) >= 4:
                 return 'ERROR: maximum of four file watchers reached'
@@ -1966,7 +2270,13 @@ class ToolBelt:
             try:
                 events.extend(_dep()._ics_events_from_text(_dep()._ics_fetch(src), win_start, win_end))
             except Exception as e:
-                bad.append(f'{src} ({type(e).__name__})')
+                # Never echo the source: for a Google-style feed the URL is a
+                # bearer token, and error strings (HTTPError especially)
+                # carry the full URL.
+                label = _dep()._ics_source_label(src)
+                reason = str(e).replace(str(src), label).strip()[:200] \
+                    or type(e).__name__
+                bad.append(f'{label} ({reason})')
         if bad and (not events):
             return 'ERROR: could not read calendar source(s): ' + '; '.join(bad)
         if not events:
@@ -2334,10 +2644,14 @@ class ToolBelt:
             state, done = job.poll()
             status = job.status_text(state, done)
             if done:
-                if not job._announced:
-                    job._announced = True
+                if job.claim_announcement():
                     self._announce_job(status)
                 job._join_drain(timeout=5.0)
+                # Still running after the full budget? Something inherited the
+                # job's stdout (the job starts its own session), so the
+                # drainer will never see EOF. Release it rather than leak the
+                # thread for the rest of the session.
+                job._unstick_drain()
                 out = job.output_tail(4096)
                 out = (out or '').strip()
                 if len(out) > BoundedJob.MAX_OUTPUT:
@@ -2554,8 +2868,15 @@ class ToolBelt:
         _dep().log.info('open_app: %s', chosen)
         if ids_before is None:
             return f'launched {chosen} (could not verify the window — niri window list unavailable)'
-        w, already = self._wait_new_window(ids_before, chosen, self.OPEN_APP_WAIT_S)
+        w, already, niri_down = self._wait_new_window(
+            ids_before, chosen, self.OPEN_APP_WAIT_S)
         if w is None:
+            if niri_down:
+                return (f'launched {chosen}, but the niri window list was '
+                        f'unreachable for the whole {self.OPEN_APP_WAIT_S:.0f}s '
+                        f'wait — the compositor IPC is down, so whether the '
+                        f'window appeared cannot be determined. Check that niri '
+                        f'is running, then use list my windows or wait_for_window.')
             return f'launched {chosen}, but no new window appeared within {self.OPEN_APP_WAIT_S:.0f}s — it may still be starting (or failed to launch); try wait_for_window or focus_window'
         if already:
             _dep().log.info('open_app: %s was already open', chosen)
@@ -2565,41 +2886,52 @@ class ToolBelt:
         self._mark_elements_stale()
         return note
 
-    def _wait_new_window(self, ids_before: set, name: str, timeout: float) -> tuple[dict | None, bool]:
+    def _wait_new_window(self, ids_before: set, name: str, timeout: float
+                         ) -> tuple[dict | None, bool, bool]:
         """Wait for the launched app's window after spawn.
 
         Priority: (1) a NEW window matching `name`; (2) after a short grace
         period, any NEW window; (3) an EXISTING window matching `name` — the
         app was likely already running and mapped nothing. Returns
-        (window, already_open); (None, False) when nothing appeared."""
+        (window, already_open, niri_down); (None, False, False) when nothing
+        appeared.
+
+        `niri_down` is true only when the window list was unreachable on EVERY
+        poll: "the compositor is gone" and "your app never drew a window" are
+        different faults, and the caller used to report the first as the
+        second — blaming the newly launched app for a dead niri IPC."""
         start = time.monotonic()
         deadline = start + timeout
         fallback: dict | None = None
+        polls = 0
+        unreachable = 0
         while True:
             try:
                 wins = self._niri_windows()
             except RuntimeError:
                 wins = []
+                unreachable += 1
+            polls += 1
             fresh = [w for w in wins if w.get('id') not in ids_before]
             for w in fresh:
                 if name and self._win_matches(w, name):
-                    return (w, False)
+                    return (w, False, False)
             if fallback is None and fresh:
                 fallback = fresh[0]
             now = time.monotonic()
             if now - start >= self._WIN_GRACE_S:
                 if fallback is not None:
-                    return (fallback, False)
+                    return (fallback, False, False)
                 for w in wins:
                     if name and self._win_matches(w, name):
-                        return (w, True)
+                        return (w, True, False)
             if now >= deadline:
-                return (None, False)
+                return (None, False, (polls > 0 and unreachable == polls))
             time.sleep(self._WIN_POLL_S)
 
-    @tool(description='Read a UTF-8 text file (any path, including your own source). May be truncated for very large files.')
+    @tool(description='Read a UTF-8 text file (any path except credentials, keys and shell history — never ask the user to paste those).')
     def read_file(self, path: str) -> str:
-        """Read a text file.
+        """Read a text file. Credential/key/history paths are refused.
 
         path: File path, ~ expanded.
         """
@@ -2608,6 +2940,10 @@ class ToolBelt:
             p = p.resolve()
         except OSError:
             pass
+        denied = denied_secret_path(p)
+        if denied:
+            return (f'REFUSED: {p} — {denied}. This goes into the conversation '
+                    f'(and may leave the machine); ask the user to read it themselves.')
         if not p.exists():
             return f'ERROR: no such file: {p}'
         if p.is_dir():
@@ -2666,7 +3002,11 @@ class ToolBelt:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             if p.exists():
-                shutil.copy2(p, str(p) + '.bak')
+                bak = Path(str(p) + '.bak')
+                shutil.copy2(p, bak)
+                # copy2 inherits the SOURCE mode: a 0644 project file would
+                # leave a 0644 backup holding the same content.
+                os.chmod(bak, 0o600)
             _dep()._atomic_private_write(p, content)
         except OSError as e:
             return f'ERROR: cannot write {p}: {e}'

@@ -3,7 +3,8 @@
 A self-modifying voice assistant that lives as a small round bubble on your
 desktop (Arch Linux / CachyOS + niri Wayland). Hold the bubble, speak, release
 — it transcribes locally (faster-whisper), answers with a local Ollama model,
-and speaks back with Piper TTS. Everything runs on your machine.
+and speaks back with Chatterbox TTS — the built-in voice, or a clone of a
+voice clip you pick. Everything runs on your machine.
 
 ![states](https://img.shields.io/badge/states-idle%20·%20listening%20·%20thinking%20·%20speaking-blue)
 
@@ -32,10 +33,23 @@ and speaks back with Piper TTS. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 750 tests pin the behavior (`python -m pytest tests/`),
+automatically. 890 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
-regression, and ops — including offscreen-Qt scenarios that drive the
-settings GUI itself.
+regression, ops, and fault injection — including offscreen-Qt scenarios that
+drive the settings GUI itself.
+
+**Fault injection** (`tests/test_fault_injection.py`) breaks one external seam at
+a time — Ollama refusing or going quiet, the mic handing back nothing,
+dbus-monitor dying, a disk write failing, the control socket vanishing, the
+compositor or ydotoold exiting mid-turn, a whisper/speech model going missing or
+unreadable, the disk filling up (ENOSPC), and the wall clock stepping backwards
+— and asserts the bubble degrades **loudly**: a WARNING/ERROR a person can find
+in `journalctl`, a spoken line naming the cause, a reported failure, a toggle
+that stops claiming to be on. It also asserts the silence of the alternative —
+no fabricated success, no swallowed error, no value reported as saved when it is
+not. Injections happen at the boundary (the HTTP opener, the recorder's return
+value, the popen factory, the write path, the file object the writer is handed),
+never by replacing the code under test.
 
 ## Requirements
 
@@ -56,10 +70,12 @@ The installer:
 1. Upgrades the system and installs packages (`pacman -Syu`, supported Arch
    policy) — python-pyside6, python-sounddevice, python-numpy, ollama, curl
 2. Installs the Python extras from `requirements.txt` (faster-whisper,
-   piper-tts, openwakeword/onnxruntime) into user site-packages
+   chatterbox-tts, openwakeword/onnxruntime) into user site-packages
 3. Places `handsoff.py`, `handsoff-settings.py`, and `handsoff-restart` in
    `~/.local/bin`
-4. Downloads the whisper model and a Piper voice (SHA256-verified, atomic)
+4. Downloads the whisper model (SHA256-verified, atomic) and prefetches the
+   chatterbox-turbo speech weights, checking they are actually usable rather
+   than merely present
 5. Writes a systemd **user service** (`handsoff.service`, `Restart=always`)
    so a crash never leaves you without the bubble
 6. Prints the niri config snippet to merge (`niri-window-rule.kdl`)
@@ -81,7 +97,7 @@ installer will **not** also add `spawn-at-startup` to niri.
 |---|---|---|
 | `HANDSOFF_MODEL` | `qwen3:8b` | Ollama model to pull/use |
 | `HANDSOFF_WHISPER` | `tiny` | whisper size (`tiny`…`large-v3`) |
-| `PIPER_VOICE_URL` | en_US lessac medium | any piper `.onnx` URL — set `PIPER_VOICE_SHA256`/`PIPER_VOICE_JSON_SHA256` too or the download is unverified (with a warning) |
+| `HANDSOFF_TTS_REPO` | `ResembleAI/chatterbox-turbo` | Hugging Face repo holding the speech weights |
 
 At runtime, environment overrides (only where settings.json has no value):
 `HANDSOFF_MODEL`, `HANDSOFF_NUM_CTX`, `HANDSOFF_WHISPER`, `HANDSOFF_VOICE`,
@@ -93,11 +109,27 @@ in VRAM between questions).
 ### The bubble
 
 - **Hold left button** → talk; release → send. Drag to move the bubble.
-- **Shape & feel** — the Appearance tab picks one of ten designs (orb, halo,
-  reactor, bloom, droplet, cube, equalizer, crystal, saturn, void), an
-  animation-energy scale (orbit speed, swirl, comet brightness) and a colour-
-  accent punch, one click of **Match wallpaper** retunes all four state colours
-  for a dark or light backdrop, and both sliders apply live.
+- **Shape & feel** — the Appearance tab picks one of twelve designs (orb, halo,
+  reactor, bloom, droplet, cube, equalizer, crystal, saturn, void, Eye of
+  Sauron, Pikachu), bubble size, an animation-energy scale (orbit speed, swirl, comet
+  brightness) and a colour-accent punch; one click of **Match wallpaper**
+  retunes all four state colours for a dark or light backdrop. Every control on
+  the tab — shape, size, both sliders, the four state colours, wallpaper
+  matching — applies live, with no Save needed. **Every design reacts to your
+  voice in its own way**, from one shared level signal: the orb ripples
+  outward, the halo sends a brightness wave round its torus, the reactor opens
+  its segments and spins up, the bloom shakes extra sparks loose, the droplet
+  ripples its skin and drips sooner, the cube flashes its facets in a sweeping
+  front, the equalizer's bars are the meter itself, the crystal refracts (its
+  inner hex swells and splits hue), saturn's ring carries a travelling wave,
+  the void accelerates its infall, the Eye of Sauron narrows its pupil and
+  flares its fire, and Pikachu charges its cheeks. Every one of those terms is
+  neutral at silence, so a quiet bubble renders exactly as it always did.
+  While the bubble is talking it follows its own playback level too (the mic is
+  muted during TTS, so `play_wav` reports what it is actually playing), and
+  which of the three producers fed the level — your mic while listening, your
+  push-to-talk key, or the bubble's own voice — is shown live by the meter in
+  **Settings → Voice**.
 - **Click** (short press) while it speaks → barge-in: it stops talking.
 - **Right-click** → menu (restart, settings, quit).
 - Colors: blue idle · red listening · orange thinking · green speaking.
@@ -112,6 +144,21 @@ in VRAM between questions).
 | `Mod+Shift+S` | open Settings (add manually; works even if the bubble is dead) |
 
 ### Voice
+
+**The speech engine is `chatterbox-turbo`.** With no voice clip set it speaks
+in the engine's own voice. Pick a clip in **Settings → Voice** (*Voice
+reference clip*) and it clones that voice instead; the engine requires **more
+than 5 seconds** of audio, so a short sample is refused loudly (in the GUI
+before you save it, and by the bubble at load time) rather than leaving you a
+mute assistant. *Preview* speaks through the **running bubble** (`--ptt say`)
+rather than loading a second copy of the model in the settings process — that
+second copy is ~2.7 GB of VRAM. `--ptt say <text>` does the same from a
+script, and `--ptt health` reports the engine, the device and which clip is
+loaded.
+
+Speed: measured ~3× faster than real time on a GPU (RTF ≈ 0.3), so replies are
+synthesized per sentence and stream as they are ready. On CPU it is slower than
+real time and the bubble says so at startup.
 
 Say the assistant's name (default "assistant", configurable — e.g. "cypher")
 to engage in hands-free mode; you then have an engagement window (default
@@ -135,12 +182,16 @@ Any of these work from a script or keybind, even while the bubble runs:
 ```bash
 python ~/.local/bin/handsoff.py --ptt status      # state, handsfree, model
 python ~/.local/bin/handsoff.py --ptt health      # JSON: mic + brain + TTS + deployment
+python ~/.local/bin/handsoff.py --ptt level       # JSON: live voice level + which producer fed it
 python ~/.local/bin/handsoff.py --ptt doctor      # full diagnostic (works even when the bubble is dead)
 python ~/.local/bin/handsoff.py --ptt toggle      # start/stop/interrupt
 python ~/.local/bin/handsoff.py --ptt interrupt   # silence it now
 python ~/.local/bin/handsoff.py --ptt handsfree   # toggle hands-free
 python ~/.local/bin/handsoff.py --ptt handsfree-status  # speak mic state
 python ~/.local/bin/handsoff.py --ptt settings    # open Settings
+python ~/.local/bin/handsoff.py --ptt clear-history  # forget the stored conversation
+                 # (Settings does this for you when the brain model changes, so a
+                 #  new model cannot parrot the old transcript)
 ```
 
 ## Trust & self-diagnosis
@@ -168,7 +219,21 @@ your conversation history, voice transcripts, screenshots, and tool schemas
 off this machine. The bubble refuses every brain request until you check
 *Allow a remote server* in Settings → Brain (`allow_remote_ollama: true`) or
 set `HANDSOFF_ALLOW_REMOTE_OLLAMA=1`; a warning is logged either way, and
-`--ptt doctor` shows the status (`brain privacy: REMOTE …`).
+`--ptt doctor` shows the status and **which channel** opted in (`brain privacy:
+REMOTE — explicitly allowed (allow_remote_ollama in Settings)`), because the
+environment variable is a second opt-in that Settings cannot display.
+
+**Credential paths are refused** — anything a tool reads can end up in the
+conversation (and, with a remote brain, off the machine), so `read_file`,
+`watch_file` and `run_command`'s arguments all share one denylist: `~/.ssh`,
+`~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.password-store`, browser
+profiles and keyrings, shell history, and secret-shaped names (`*.pem`,
+`*.key`, `*.env`, `credentials`, …). The check runs on the resolved path, so
+`~/.ssh/../.ssh/id_rsa` and symlinks are caught too, and it applies to `cat` as
+well — otherwise the shell whitelist would reopen exactly what `read_file`
+refuses. Ask the bubble to *edit* one of your own files instead, or read the
+file yourself. Public keys (`id_rsa.pub`) are still readable; they are not
+secrets.
 
 ## Permissions
 
@@ -226,9 +291,9 @@ Safety boundaries enforced in code (not just the prompt):
 | `wake_spotter` / `spotter_models` | false / `["hey_jarvis"]` | openWakeWord spotter |
 | `handsfree` | false | continuous listening |
 | `mic_device` / `mic_threshold` | system default / 600 | microphone |
-| `home_place` / `calendar_ics` / `briefing` | — | weather place, ICS sources, morning briefing (mentions mic problems since last time) |
+| `home_place` / `calendar_ics` / `briefing` | — | weather place, ICS sources (**https:// or a local path** — a Google "secret iCal address" is a bearer token, so plain `http://` is refused unless it points at localhost), morning briefing (mentions mic problems since last time) |
 | `resource_alerts` / `ram_alert_percent` / `vram_alert_percent` | false / 90 / 90 | opt-in crossing alerts for system RAM and NVIDIA VRAM |
-| `notification_reader` / `notification_mute_apps` | false / [] | opt-in future desktop notification reader and muted app names |
+| `notification_reader` / `notification_mute_apps` | false / [] | opt-in future desktop notification reader and muted app names; if `dbus-monitor` dies repeatedly the reader stops **and turns itself off** rather than claiming to still be on |
 | `workspace_aliases` | `{}` | e.g. `{"code": "2"}` → "go to code" |
 | `command_policy` | `{}` | per-tool `ALLOW`/`DENY`/`CONFIRM`; empty = all ALLOW |
 | `confirm_seconds` | 90 | how long a CONFIRM offer stays valid |
@@ -243,7 +308,7 @@ Safety boundaries enforced in code (not just the prompt):
 | `~/.config/handsoff/history.json` | conversation memory (survives restarts) |
 | `~/.config/handsoff/memory.json` | durable facts about you (survives trimming) |
 | `~/.config/handsoff/whisper-model/` | STT model cache |
-| `~/.config/handsoff/piper-voice/` | TTS voice |
+| `~/.config/handsoff/voice-clips/` | voice reference clips for TTS cloning (pick one in Settings → Voice) |
 | `~/.local/state/handsoff/reminders.json` | pending reminders |
 | `~/.local/state/handsoff/decisions.jsonl` | one JSON line per tool-policy decision (capped) |
 | `~/.config/handsoff/deployment.json` | installer manifest: source/installed sha256 per file |
@@ -277,6 +342,14 @@ instead of starting by hand; it waits for the lock.
   speech that passes the threshold is transcribed with the bubble's own
   whisper model, shown under *Last transcript*. Use it to verify a mic (and
   tune the threshold) before switching the bubble to it.
+- **Live level meter** (Settings → Voice): the same voice-level signal the
+  bubble's designs paint from, polled over the bubble's own control socket
+  (`--ptt level` prints exactly what the meter shows). *Raw* is what the audio
+  pipeline last emitted and *designs* is the smoothed value the bubble is
+  animating with, so a moving raw bar next to a stuck designs tick means the
+  feed arrives but the bubble is not showing it. `Last above zero` exposes a
+  feed that has gone silent. The *Live test* button above it checks the
+  microphone hardware instead; this one checks the bubble's feed.
 - **Live health bar** (Settings, bottom of the window): while the settings
   app is open, a status line polls the running bubble every 3 s and shows
   its mic state, brain (Ollama) reachability, and TTS/STT readiness —
@@ -351,17 +424,56 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest tests/ -q     # 750 tests
+python -m pytest tests/ -q              # 890 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
+
+# Re-run in a different order — the suite must not care what order it runs in.
+# Seeded and reproducible: the seed is printed in the run header and summary.
+HANDSOFF_TEST_ORDER_SEED=1234 python -m pytest tests/ -q   # tests shuffled
+HANDSOFF_TEST_ORDER_FILES=7  python -m pytest tests/ -q   # FILE order only
 ```
+
+Reproduce the coverage gate the way CI runs it — `.coveragerc` sets `parallel =
+True` and the offscreen-GUI scenarios are measured in **child processes**, which
+only start coverage when `COVERAGE_PROCESS_START` is exported (and they need the
+absolute `COVERAGE_FILE` so their shards are combined). Without those two
+variables the same suite reports ~60% and "fails" the 70% floor even though
+nothing is broken:
+
+```bash
+COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
+  python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
+  --cov-report=term-missing --cov-fail-under=70     # 890 tests, 77.1%
+```
+
+The suite is self-contained: it imports the bubble against a throw-away
+config/state directory, so it runs the code against the built-in defaults
+rather than your `~/.config/handsoff/settings.json`, and never writes to your
+real config, history or control socket. Each test also starts from the same
+module state — including the dependency-injection host that `core.tools` and
+`core.doctor` read, which a second loaded monolith (the settings-app suites load
+one) would otherwise leave pointing at the wrong instance — and fails if it
+leaves a stoppable worker thread (watcher, drainer, pomodoro, notification
+reader) running. So a test cannot pass because of a neighbour that ran earlier,
+or pass while leaking.
+
+Order is not part of the contract either, and collection order is exactly where
+a dependence on it hides. CI therefore re-runs the whole suite in two seeded
+modes: tests shuffled, and only the file order shuffled (each file's own
+sequence intact, which mimics what a developer sees and reads far more clearly
+when it fires). Both seeds come from the commit SHA, so the order differs from
+commit to commit while a red run stays exactly reproducible from the seed the
+banner prints.
 
 CI (`.github/workflows/ci.yml`, mirrored gate-for-gate in `.gitlab-ci.yml` for
 the GitLab remote) runs exactly these gates on every push: the suite on
 Python 3.12 and 3.13 (offscreen Qt, no audio hardware needed), a coverage
-floor job, byte-compilation of every source file, shell syntax checks with
-supply-chain pin guards, and an installer smoke test. Background-thread
-exceptions fail the run via `pytest.ini` rather than passing silently.
+floor job, an ordering-dependence probe (the suite re-run with the tests
+shuffled, then with only the file order shuffled), byte-compilation of every
+source file, shell syntax checks with supply-chain pin guards, and an installer
+smoke test. Background-thread exceptions fail the run via `pytest.ini` rather
+than passing silently.
 
 **When the pipeline goes red, read the summary before the log.** Each suite job
 writes a junit report (GitLab's native *Test summary* tab and merge-request test

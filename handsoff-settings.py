@@ -8,7 +8,7 @@ handsoff settings — a small GUI for the handsoff voice assistant bubble.
 Edits ~/.config/handsoff/settings.json (the bubble reads it at startup):
 
     Brain        Ollama host, model picker with capability badges, context size
-    Voice        microphone + threshold, whisper size, piper voice downloads,
+    Voice        microphone + threshold, whisper size, speech rate/volume,
                  speech rate and volume, test buttons
     Permissions  enable/disable tools, extra whitelisted commands
     Appearance   bubble size and the four state colours (live preview)
@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import importlib.util
 import copy
-import hashlib
 import html
 import json
 import logging
@@ -143,14 +142,18 @@ except ImportError:                   # tuning instead of refusing to open
 import numpy as np  # noqa: E402  (after handsoff, which already required it)
 import sounddevice as sd  # noqa: E402
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
+from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QRectF, Qt, QTimer  # noqa: E402
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPalette, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
-    QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
+
+# Spoken by Settings → Voice "Test voice". Kept short: the answer comes back
+# over the control socket, and `say` caps the payload anyway.
+_VOICE_TEST_LINE = "Hello, I am your desktop assistant."
 
 WHISPER_SIZES = {          # size key -> approx download size
     "tiny": "~75 MB", "tiny.en": "~75 MB", "base": "~145 MB",
@@ -158,28 +161,9 @@ WHISPER_SIZES = {          # size key -> approx download size
     "large-v3": "~3 GB",
 }
 
-VOICE_CATALOG = [          # (label, quality, onnx url on rhasspy/piper-voices)
-    ("English (US) — lessac", "medium (~63 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"),
-    ("English (US) — amy", "low (~25 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/low/en_US-amy-low.onnx"),
-    ("English (US) — ryan", "high (~120 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/high/en_US-ryan-high.onnx"),
-    ("English (GB) — alan", "low (~25 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/low/en_GB-alan-low.onnx"),
-    ("German — thorsten", "medium (~63 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx"),
-    ("French — siwis", "medium (~63 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/fr/fr_FR/siwis/medium/fr_FR-siwis-medium.onnx"),
-    ("Spanish — carlfm", "x-low (~20 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/carlfm/x_low/es_ES-carlfm-x_low.onnx"),
-    ("Italian — riccardo", "x-low (~20 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/it/it_IT/riccardo/x_low/it_IT-riccardo-x_low.onnx"),
-    ("Russian — dmitri", "medium (~63 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx"),
-    ("Ukrainian — ukrainian-tts", "medium (~63 MB)",
-     "https://huggingface.co/rhasspy/piper-voices/resolve/main/uk/uk_UA/ukrainian_tts/medium/uk_UA-ukrainian_tts-medium.onnx"),
-]
+# The piper voice catalog and its download dialog are GONE. chatterbox-turbo
+# ships exactly one built-in voice and conditions on an optional reference
+# clip, so there is nothing left to choose from a list of downloadable voices.
 
 NIRI_CONFIG = Path(os.environ.get("NIRI_CONFIG", str(HOME / ".config/niri/config.kdl")))
 AUTOSTART_LINE = f'spawn-at-startup "sh" "-c" "exec python \\"{HOME}/.local/bin/handsoff.py\\""'
@@ -337,6 +321,13 @@ def _backup_keep_n(path: Path, tag: str, keep: int = 5) -> None:
         f"{path.name}.{tag}.{stamp}-p{os.getpid()}-{_backup_keep_n.seq}")
     shutil.copy2(path, bak)
     try:
+        # copy2 preserves the SOURCE mode, so backing up a file that was still
+        # group/world-readable produced a readable copy of the same transcript.
+        # These backups hold conversations and settings: always owner-only.
+        os.chmod(bak, 0o600)
+    except OSError:
+        pass
+    try:
         olds = sorted(path.parent.glob(f"{path.name}.{tag}.*"),
                       key=lambda p: p.stat().st_mtime_ns)
     except OSError:
@@ -351,41 +342,23 @@ def _backup_keep_n(path: Path, tag: str, keep: int = 5) -> None:
 _backup_keep_n.seq = 0
 
 
-def _voice_want_sha(name: str) -> str:
-    """Expected sha256 for a voice file, like install.sh's download_verified:
-    the default lessac voice is pinned (env-overridable); anything else has
-    no known checksum."""
-    env, default = {
-        "en_US-lessac-medium.onnx": (
-            "PIPER_VOICE_SHA256",
-            "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f"),
-        "en_US-lessac-medium.onnx.json": (
-            "PIPER_VOICE_JSON_SHA256",
-            "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0"),
-    }.get(name, ("", ""))
-    return os.environ.get(env, default) if env else ""
+def _reference_note(audio, path: Path) -> str:
+    """Describe a reference clip the way the speech engine will judge it.
 
-
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _fsync_dir(path: Path) -> None:
-    """Persist a rename: best-effort directory fsync (no-op where unsupported)."""
-    try:
-        fd = os.open(os.fspath(path), os.O_DIRECTORY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    Delegates the RULE to core.audio.reference_problem so the settings app and
+    the bubble cannot disagree: a clip the GUI calls fine but the engine
+    refuses is a mute bubble with a green tick next to it. What is described
+    here is only the wording.
+    """
+    problem = audio.reference_problem(path)
+    if problem:
+        return f"⚠ {problem}"
+    seconds = audio.reference_clip_seconds(path)
+    if seconds is None:
+        return (f"reference {path.name} — duration unchecked "
+                f"(wav, flac, mp3 and m4a clips over "
+                f"{audio.MIN_REFERENCE_S:.0f}s are accepted)")
+    return f"reference {path.name} ({seconds:.1f}s)"
 
 
 class BubblePreview(QWidget):
@@ -548,165 +521,6 @@ class BubblePreview(QWidget):
             p.setBrush(QBrush(body))
             p.setPen(QPen(QColor(255, 255, 255, 45), 1))
             p.drawEllipse(QPointF(cx, cy), r, r)
-
-
-class VoiceDownloadDialog(QDialog):
-    """Pick a piper voice from a small catalog or any direct .onnx URL."""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Download a piper voice")
-        self.resize(560, 380)
-        self._cancel = threading.Event()
-
-        lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("Voices go to ~/.config/handsoff/piper-voice/"))
-        self.list = QListWidget(self)
-        for label, quality, url in VOICE_CATALOG:
-            it = QListWidgetItem(f"{label}  ·  {quality}")
-            it.setData(Qt.UserRole, url)
-            self.list.addItem(it)
-        self.list.setCurrentRow(0)
-        lay.addWidget(self.list)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("or URL:"))
-        self.url_edit = QLineEdit(self)
-        self.url_edit.setPlaceholderText("https://…/voice.onnx  (a .json config must sit next to it)")
-        row.addWidget(self.url_edit)
-        lay.addLayout(row)
-
-        self.bar = QProgressBar(self)
-        self.bar.setRange(0, 100)
-        lay.addWidget(self.bar)
-        self.status = QLabel("", self)
-        lay.addWidget(self.status)
-
-        btns = QHBoxLayout()
-        self.dl_btn = QPushButton("Download", self)
-        self.dl_btn.clicked.connect(self._download)
-        close = QPushButton("Close", self)
-        close.clicked.connect(self.reject)
-        btns.addWidget(self.dl_btn)
-        btns.addStretch(1)
-        btns.addWidget(close)
-        lay.addLayout(btns)
-
-    # -- download ---------------------------------------------------------------
-
-    def _pick_url(self) -> str | None:
-        sel = self.list.currentItem()
-        url = self.url_edit.text().strip() if self.url_edit.text().strip() else (
-            sel.data(Qt.UserRole) if sel else None)
-        if url and not url.lower().startswith("https://"):
-            # mirror the installer's HANDSOFF_UNVERIFIED_VOICE=1 escape: an
-            # explicit operator opt-in, never the default.
-            if os.environ.get("HANDSOFF_UNVERIFIED_VOICE") != "1":
-                self.status.setText("URL must use https://")
-                return None
-            self.status.setText(
-                "WARNING: non-https voice URL allowed "
-                "(HANDSOFF_UNVERIFIED_VOICE=1)")
-        if url and not url.endswith(".onnx"):
-            self.status.setText("URL must point to a .onnx file")
-            return None
-        return url
-
-    def _download(self) -> None:
-        url = self._pick_url()
-        if not url:
-            return
-        name = url.rsplit("/", 1)[-1]
-        dest = H.PIPER_VOICE_DIR / name
-        prog = {"pct": -1, "msg": "", "done": False, "err": None}
-
-        def fetch(target: Path, src: str) -> bool:
-            """Download one voice file; True when bytes were fetched. The
-            existing dest is re-verified first (never silently accept a
-            truncated earlier download — a truncated voice crashes piper)."""
-            want = _voice_want_sha(target.name)
-            if target.exists():
-                ok = (_sha256_file(target) == want) if want \
-                    else target.stat().st_size > 0
-                if ok:
-                    prog["msg"] = f"{target.name} already present"
-                    return False
-                target.unlink(missing_ok=True)
-            H.PIPER_VOICE_DIR.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".",
-                                            suffix=".part", dir=str(target.parent))
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    req = urllib.request.Request(src, headers={"User-Agent": "handsoff/1.0"})
-                    with urllib.request.urlopen(req, timeout=60) as r:
-                        total = int(r.headers.get("Content-Length") or 0)
-                        got = 0
-                        while True:
-                            if self._cancel.is_set():
-                                raise InterruptedError("cancelled")
-                            chunk = r.read(1 << 16)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            got += len(chunk)
-                            prog["pct"] = int(got * 100 / total) if total else -1
-                            prog["msg"] = f"{target.name}: {got // 1024 // 1024} MB"
-                        f.flush()
-                        os.fsync(f.fileno())
-                if want and _sha256_file(Path(tmp_name)) != want:
-                    raise ValueError(f"{target.name} checksum mismatch")
-                os.replace(tmp_name, target)
-                _fsync_dir(target.parent)
-            except BaseException:
-                try:
-                    Path(tmp_name).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise
-            return True
-
-        def worker() -> None:
-            try:
-                got_onnx = fetch(dest, url)
-                cfg = Path(str(dest) + ".json")
-                got_cfg = fetch(cfg, url + ".json")
-                if not (got_onnx or got_cfg):
-                    prog["msg"] = f"{name} already present"
-                elif not _voice_want_sha(dest.name):
-                    # ponytail: custom URL, no pinned checksum — warn loudly and
-                    # print the pin so the next download (or the bubble's own
-                    # PIPER_VOICE_SHA256 gate) can verify it.
-                    try:
-                        digest = _sha256_file(dest)
-                    except OSError:
-                        digest = ""
-                    prog["msg"] = (f"saved {name} (WARNING: unverified — pin with "
-                                   f"PIPER_VOICE_SHA256={digest})" if digest
-                                   else f"saved {name} (WARNING: unverified)")
-                else:
-                    prog["msg"] = f"saved {name}"
-            except Exception as e:
-                prog["err"] = e
-            prog["done"] = True
-
-        self.dl_btn.setEnabled(False)
-        threading.Thread(target=worker, daemon=True).start()
-
-        def poll() -> None:
-            if prog["pct"] >= 0:
-                self.bar.setValue(prog["pct"])
-            self.status.setText(prog.get("msg", ""))
-            if prog["done"]:
-                self.dl_btn.setEnabled(True)
-                if prog["err"]:
-                    self.status.setText(f"download failed: {prog['err']}")
-                else:
-                    self.bar.setValue(100)
-                    QTimer.singleShot(700, self.accept)
-                return
-            QTimer.singleShot(150, poll)
-
-        poll()
 
 
 class _LiveMicProbe:
@@ -930,17 +744,18 @@ class _LiveMicProbe:
             }
 
 
-def _health_query(sock_path, timeout: float = 1.5) -> "dict | None":
-    """Ask the running bubble for its JSON health snapshot over the control
-    socket. Returns the parsed dict, or None when the bubble isn't running,
-    the socket is stale or the answer isn't JSON (never raises)."""
+def _socket_command(sock_path, command: str, timeout: float = 1.5) -> "str | None":
+    """One request/response round-trip with the running bubble's control
+    socket. Returns the raw reply text, or None when the bubble isn't running,
+    the socket is stale, or the exchange fails — never raises, because every
+    caller is a status readout that must not take the window down with it."""
     if sock_path is None:
         return None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect(str(sock_path))
-        s.sendall(b"health")
+        s.sendall(command.encode("utf-8"))
         s.shutdown(socket.SHUT_WR)
         buf = b""
         while True:
@@ -949,10 +764,173 @@ def _health_query(sock_path, timeout: float = 1.5) -> "dict | None":
                 break
             buf += part
         s.close()
-        doc = json.loads(buf.decode("utf-8", "replace"))
-        return doc if isinstance(doc, dict) else None
+        return buf.decode("utf-8", "replace")
     except Exception:
         return None
+
+
+def _json_command(sock_path, command: str, timeout: float) -> "dict | None":
+    """`command` answered as a JSON object, or None (bad/absent reply)."""
+    text = _socket_command(sock_path, command, timeout)
+    if text is None:
+        return None
+    try:
+        doc = json.loads(text)
+    except Exception:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _health_query(sock_path, timeout: float = 1.5) -> "dict | None":
+    """Ask the running bubble for its JSON health snapshot over the control
+    socket. Returns the parsed dict, or None when the bubble isn't running,
+    the socket is stale or the answer isn't JSON (never raises)."""
+    return _json_command(sock_path, "health", timeout)
+
+
+def _level_query(sock_path, timeout: float = 0.5) -> "dict | None":
+    """Ask the running bubble for its live voice level (the `level` command).
+
+    This is the same signal the bubble's designs paint from: `raw` is the last
+    value the audio pipeline emitted and `ui` is the smoothed value that
+    reaches `_frame()["level"]` in every painter. Mirrors _health_query.
+    """
+    return _json_command(sock_path, "level", timeout)
+
+
+# who last published a level, in words the Voice tab can show
+_LEVEL_SOURCES = {"mic": "mic (hands-free)", "ptt": "mic (push-to-talk)",
+                  "tts": "the bubble's own voice", "none": "nothing yet"}
+
+
+class _LevelFeed:
+    """Polls the bubble's `level` command on a daemon thread.
+
+    The window must never wait on a socket on the GUI thread — and a busy
+    bubble makes that concrete: `doctor`/`health` hold the control server's
+    accept loop for seconds, so a synchronous poll would freeze the meter and
+    the whole window with it. The polling lives here; widgets only read the
+    latest reading. `sock_path_fn` is a callable so the bubble module stays
+    lazily loaded (see _LazyHandsoff) and tests can point it elsewhere.
+    """
+
+    def __init__(self, sock_path_fn, interval: float = 0.05) -> None:
+        self._sock_path_fn = sock_path_fn
+        self._interval = interval
+        self._latest: "dict | None" = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: "threading.Thread | None" = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="level-feed",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+
+    def latest(self) -> "dict | None":
+        """Most recent snapshot, or None when the bubble never answered."""
+        with self._lock:
+            return dict(self._latest) if self._latest else None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            doc = _level_query(self._sock_path_fn(), timeout=0.4)
+            with self._lock:
+                self._latest = doc
+            self._stop.wait(self._interval)
+
+
+class LevelMeter(QWidget):
+    """Live voice-level bar for the Voice tab.
+
+    It reads the SAME value the bubble's designs paint from, so it diagnoses
+    the feed rather than the microphone hardware (that is the separate "Live
+    test" button above it): `raw` is what the audio pipeline last emitted —
+    the mic while listening, the bubble's own voice while it speaks — and
+    `designs` is the smoothed value the bubble is animating with. Both are
+    shown because the interesting failure is exactly the gap between them.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(34)
+        self.setMinimumWidth(220)
+        self.setToolTip(
+            "Live level from the running bubble over its control socket — the "
+            "same signal every bubble design paints from. The bubble emits a "
+            "level only while it is listening or speaking, so a flat meter in "
+            "a quiet room is expected.")
+        self._doc: "dict | None" = None
+        self._raw = 0.0
+        self._ui = 0.0
+        self._peak = 0.0
+
+    def set_reading(self, doc: "dict | None") -> None:
+        """Feed one `level` snapshot in (None = the bubble did not answer)."""
+        self._doc = doc
+        if doc:
+            self._raw = max(0.0, min(1.0, float(doc.get("raw") or 0.0)))
+            self._ui = max(0.0, min(1.0, float(doc.get("ui") or 0.0)))
+            # peak hold with a decay, so a brief loud moment stays visible
+            self._peak = max(self._raw, self._peak * 0.90)
+        else:
+            self._raw = self._ui = self._peak = 0.0
+        self.update()
+
+    def text(self) -> str:
+        """One plain-text line. The readout label shows exactly this, so the
+        reading is assertable without touching pixels."""
+        doc = self._doc
+        if not doc:
+            return ("no reply — the bubble is not running, or busy answering "
+                    "doctor/health")
+        src = _LEVEL_SOURCES.get(str(doc.get("source")), str(doc.get("source")))
+        age = doc.get("age_s")
+        age_txt = "never" if age is None else f"{float(age):.1f} s ago"
+        return (f"raw {self._raw:.2f}  ·  designs {self._ui:.2f}  ·  {src}  ·  "
+                f"last above zero {age_txt}")
+
+    def paintEvent(self, _event) -> None:            # noqa: N802 (Qt naming)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            pad = 3
+            trough = QRectF(pad, pad, max(1.0, self.width() - 2 * pad),
+                            max(1.0, self.height() - 2 * pad))
+            p.setPen(Qt.NoPen)
+            base = self.palette().color(self.foregroundRole())
+            empty = QColor(base)
+            empty.setAlpha(38)
+            p.setBrush(QBrush(empty))
+            p.drawRoundedRect(trough, 3, 3)
+            if self._raw > 0.001:
+                fill = QRectF(trough)
+                fill.setWidth(max(2.0, trough.width() * self._raw))
+                p.setBrush(QBrush(QColor(214, 88, 74) if self._raw >= 0.85
+                                  else self.palette().color(
+                                      QPalette.ColorRole.Highlight)))
+                p.drawRoundedRect(fill, 3, 3)
+            # a tick where the smoothed value the designs use has reached: it
+            # lags the raw bar, and seeing them apart is the whole diagnosis
+            if self._ui > 0.001:
+                x = trough.left() + trough.width() * self._ui
+                p.setBrush(QBrush(base))
+                p.drawRect(int(x), int(trough.top()), 2, int(trough.height()))
+            if self._peak > 0.02:
+                px = trough.left() + trough.width() * self._peak
+                p.setBrush(QBrush(QColor(base.red(), base.green(), base.blue(), 120)))
+                p.drawRect(int(px) - 1, int(trough.top()), 2, int(trough.height()))
+        finally:
+            p.end()
 
 
 def _fmt_health(snap: dict) -> str:
@@ -1005,8 +983,14 @@ def _health_tooltip(snap: dict | None) -> str:
 
 
 class SettingsWindow(QMainWindow):
-    # The Appearance tab owns these; a change to any of them applies live.
-    APPEARANCE_KEYS = ("bubble_design", "animation_energy", "bubble_accent")
+    # EVERY value the Appearance tab owns; a change to any of them applies live.
+    # `colors` and `bubble_size` belong here too: the live-apply only writes when
+    # one of these actually differs from disk, so leaving them out meant a
+    # colour-only edit was skipped as "this was a load, not an edit" and the
+    # new colour never reached settings.json — the tab's "the colours don't
+    # apply" complaint.
+    APPEARANCE_KEYS = ("bubble_design", "bubble_size", "animation_energy",
+                       "bubble_accent", "colors")
 
     def __init__(self) -> None:
         super().__init__()
@@ -1031,7 +1015,8 @@ class SettingsWindow(QMainWindow):
         tabs = QTabWidget(self)
         self.tabs = tabs
         tabs.addTab(self._brain_tab(), "Brain")
-        tabs.addTab(self._voice_tab(), "Voice")
+        self._voice_page = self._voice_tab()     # the meter polls with its tab
+        tabs.addTab(self._voice_page, "Voice")
         tabs.addTab(self._permissions_tab(), "Permissions")
         tabs.addTab(self._appearance_tab(), "Appearance")
         tabs.addTab(self._startup_tab(), "Startup")
@@ -1070,13 +1055,25 @@ class SettingsWindow(QMainWindow):
         self._health_timer.start()
         QTimer.singleShot(300, self._refresh_health)
 
+        # Live voice-level meter (Voice tab). The socket polling happens on the
+        # feed's own thread and only while that tab is on screen: polling the
+        # bubble 20x/s while the user reads the Brain tab would be pure noise,
+        # and a synchronous poll would freeze the window on a busy bubble.
+        # `lambda: H.CONTROL_SOCK` keeps the bubble module lazily loaded (the
+        # settings GUI deliberately execs it only when something needs it).
+        self._level_feed = _LevelFeed(lambda: H.CONTROL_SOCK)
+        self._level_timer = QTimer(self)
+        self._level_timer.setInterval(60)
+        self._level_timer.timeout.connect(self._refresh_level)
+        self._level_feed_active(self.tabs.currentWidget() is self._voice_page)
+
         ol.addWidget(bottom)
         self.setCentralWidget(outer)
 
         self.reload_from_disk()
         self.refresh_models()
         self.refresh_mics()
-        self.refresh_voices()
+        self.refresh_tts()
 
         # if settings.json changes on disk (the bubble persists its hands-free
         # toggle, another window saves, …) reload instead of clobbering it on Save.
@@ -1108,6 +1105,32 @@ class SettingsWindow(QMainWindow):
         except OSError:
             pass
 
+    def _refresh_level(self) -> None:
+        """Repaint the Voice meter from the feed's latest reading. Never
+        blocks: the socket wait happened on the feed's own thread."""
+        meter = getattr(self, "level_meter", None)
+        if meter is None:
+            return
+        meter.set_reading(self._level_feed.latest())
+        readout = getattr(self, "level_readout", None)
+        if readout is not None:
+            readout.setText(meter.text())
+
+    def _level_feed_active(self, on: bool) -> None:
+        """Start/stop the Voice meter's polling with its tab's visibility."""
+        feed = getattr(self, "_level_feed", None)
+        timer = getattr(self, "_level_timer", None)
+        if feed is None or timer is None:
+            return
+        if on:
+            feed.start()
+            if not timer.isActive():
+                timer.start()
+            self._refresh_level()
+        else:
+            timer.stop()
+            feed.stop()
+
     def _refresh_health(self) -> None:
         """Poll the running bubble's `health` command off the GUI thread and
         render one compact vitals line (mic, brain, tts) in the status bar."""
@@ -1137,6 +1160,10 @@ class SettingsWindow(QMainWindow):
             self._live_probe.stop()
         if getattr(self, "_health_timer", None) is not None:
             self._health_timer.stop()
+        if getattr(self, "_level_timer", None) is not None:
+            self._level_timer.stop()
+        if getattr(self, "_level_feed", None) is not None:
+            self._level_feed.stop()
         super().closeEvent(event)
 
     def run_bg(self, fn, done) -> None:
@@ -1348,6 +1375,30 @@ class SettingsWindow(QMainWindow):
             lambda _i: self._mic_live_restart_if_on())
         lay.addWidget(mic_group)
 
+        # -- live level from the RUNNING BUBBLE -----------------------------
+        # "Live test" above proves the microphone itself works; this proves the
+        # bubble is publishing the level its designs paint from, which is a
+        # different failure and was previously invisible from here.
+        level_group = QGroupBox("Live level (from the bubble)", w)
+        lvl = QVBoxLayout(level_group)
+        self.level_meter = LevelMeter(level_group)
+        lvl.addWidget(self.level_meter)
+        self.level_readout = QLabel("waiting for the bubble\u2026", level_group)
+        self.level_readout.setStyleSheet("color: palette(mid);")
+        lvl.addWidget(self.level_readout)
+        level_note = QLabel(
+            "The exact signal the bubble's designs animate from, polled over "
+            "its control socket. <b>Raw</b> is what the audio pipeline last "
+            "emitted \u2014 your microphone while it listens, the bubble's own "
+            "voice while it speaks; <b>designs</b> is the smoothed value it is "
+            "painting with, so a raw bar that never moves the tick means the "
+            "feed is arriving but not being shown. The bubble emits a level "
+            "only while it is listening or speaking: a flat meter in a quiet "
+            "room is normal.", w)
+        level_note.setWordWrap(True)
+        lvl.addWidget(level_note)
+        lay.addWidget(level_group)
+
         hf_group = QGroupBox("Hands-free listening", w)
         hfl = QVBoxLayout(hf_group)
         self.hf_chk = QCheckBox("Continuous listening — talk without pressing anything", self)
@@ -1523,15 +1574,34 @@ class SettingsWindow(QMainWindow):
         stt_form.addRow(note)
         lay.addWidget(stt_group)
 
-        tts_group = QGroupBox("Text-to-speech (piper)", w)
+        tts_group = QGroupBox("Text-to-speech", w)
         tts_form = QFormLayout(tts_group)
-        voice_row = QHBoxLayout()
-        self.voice_combo = QComboBox(self)
-        voice_dl = QPushButton("Download voice…", self)
-        voice_dl.clicked.connect(self._download_voice)
-        voice_row.addWidget(self.voice_combo, 1)
-        voice_row.addWidget(voice_dl)
-        tts_form.addRow("Voice", voice_row)
+
+        self.tts_engine_label = QLabel("", w)
+        self.tts_engine_label.setWordWrap(True)
+        tts_form.addRow(self.tts_engine_label)
+
+        ref_row = QHBoxLayout()
+        self.tts_ref_edit = QLineEdit(self)
+        self.tts_ref_edit.setPlaceholderText("(built-in voice)")
+        ref_browse = QPushButton("Choose clip…", self)
+        ref_browse.clicked.connect(self._pick_reference)
+        ref_clear = QPushButton("Clear", self)
+        ref_clear.clicked.connect(self._clear_reference)
+        ref_row.addWidget(self.tts_ref_edit, 1)
+        ref_row.addWidget(ref_browse)
+        ref_row.addWidget(ref_clear)
+        tts_form.addRow("Voice clip", ref_row)
+
+        ref_note = QLabel(
+            "Optional: a clip longer than 5 seconds to clone. Leave empty for "
+            "the built-in voice.", w)
+        ref_note.setWordWrap(True)
+        tts_form.addRow(ref_note)
+
+        self.tts_ref_status = QLabel("", w)
+        self.tts_ref_status.setWordWrap(True)
+        tts_form.addRow(self.tts_ref_status)
 
         def slider_row(slider: QSlider, label: QLabel) -> QHBoxLayout:
             r = QHBoxLayout()
@@ -1554,6 +1624,9 @@ class SettingsWindow(QMainWindow):
         tts_form.addRow("Volume", slider_row(self.vol_slider, self.vol_label))
 
         self.voice_test_btn = QPushButton("Test voice", self)
+        self.voice_test_btn.setToolTip(
+            "Speak a line through the running bubble. It plays the SAVED voice, "
+            "rate and volume, so save first to hear a change.")
         self.voice_test_btn.clicked.connect(self.test_voice)
         tts_form.addRow(self.voice_test_btn)
         lay.addWidget(tts_group)
@@ -1581,21 +1654,50 @@ class SettingsWindow(QMainWindow):
         idx = self.mic_combo.findData(self.cfg["mic_device"])
         self.mic_combo.setCurrentIndex(max(0, idx))
 
-    def refresh_voices(self) -> None:
-        self.voice_combo.clear()
-        self.voice_combo.addItem("(first voice file found)", "")
-        try:
-            for onnx in sorted(H.PIPER_VOICE_DIR.glob("*.onnx")):
-                self.voice_combo.addItem(onnx.name, onnx.name)
-        except OSError:
-            pass
-        idx = self.voice_combo.findData(self.cfg["piper_voice"])
-        self.voice_combo.setCurrentIndex(max(0, idx))
+    def refresh_tts(self) -> None:
+        """Report the engine, its weights and the chosen reference clip.
 
-    def _download_voice(self) -> None:
-        dlg = VoiceDownloadDialog(self)
-        dlg.exec()
-        self.refresh_voices()
+        Replaces the voice combo + download dialog: chatterbox-turbo has ONE
+        built-in voice, so there is no catalog left to choose from and the only
+        choice is whether to clone an optional clip. The two things that
+        actually go wrong are a clip that is too short (the engine asserts
+        longer than 5 s, so a 2 s clip raises on EVERY turn) and weights that
+        were never downloaded. Both are reported here, while the user can still
+        fix them, rather than at the first spoken reply.
+        """
+        try:
+            engine = H.TTS_ENGINE
+            weights_ok = H._audio.tts_weights_cached()
+        except Exception as e:      # partial/older deployment: say so, don't crash
+            self.tts_ref_status.setText(f"speech engine unavailable: {e}")
+            return
+        self.tts_engine_label.setText(
+            f"Engine: {engine} — a neural voice that runs on the GPU. "
+            "The built-in voice needs no separate download.")
+        if not weights_ok:
+            self.tts_ref_status.setText(
+                f"⚠ {engine} weights are NOT downloaded — the bubble will be "
+                "mute until install.sh fetches them.")
+            return
+        ref = self.tts_ref_edit.text().strip()
+        if not ref:
+            self.tts_ref_status.setText(
+                f"{engine} weights present · built-in voice")
+            return
+        self.tts_ref_status.setText(_reference_note(H._audio, Path(ref)))
+
+    def _pick_reference(self) -> None:
+        start = self.tts_ref_edit.text().strip() or str(HOME)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a voice reference clip", start,
+            "Audio (*.wav *.flac *.mp3 *.m4a *.ogg);;All files (*)")
+        if path:
+            self.tts_ref_edit.setText(path)
+        self.refresh_tts()
+
+    def _clear_reference(self) -> None:
+        self.tts_ref_edit.setText("")
+        self.refresh_tts()
 
     def test_mic(self) -> None:
         device = self.mic_combo.currentData() or None
@@ -1691,43 +1793,28 @@ class SettingsWindow(QMainWindow):
         QTimer.singleShot(200, self._mic_live_tick)
 
     def test_voice(self) -> None:
+        """Preview the bubble's ACTUAL voice, over the control socket.
+
+        The old version loaded its own piper voice in this process. That is
+        impossible now and was wrong even then: chatterbox-turbo is ~2.7 GB of
+        VRAM, so a second instance inside the settings app would fight the
+        bubble for the GPU — and it would preview the GUI's idea of the voice
+        (its own rate, volume and clip) rather than what the bubble will
+        actually say. The bubble already owns the model, so ask it to speak.
+        """
         self.voice_test_btn.setEnabled(False)
-        self._status("synthesizing …")
-        voice_name = self.voice_combo.currentData() or ""
-        rate = self.rate_slider.value() / 100.0
-        vol = self.vol_slider.value() / 100.0
+        self._status("asking the bubble to speak …")
 
         def worker():
-            # load the SELECTED voice directly: the shared H globals
-            # (PIPER_VOICE_NAME / _piper_voice cache) must not be disturbed
-            import piper
-            from piper import SynthesisConfig
-            onnx = (H.PIPER_VOICE_DIR / voice_name
-                    if voice_name
-                    else next(iter(sorted(H.PIPER_VOICE_DIR.glob("*.onnx"))), None))
-            if onnx is None or not onnx.exists():
-                raise FileNotFoundError(
-                    f"no piper voice (*.onnx) in {H.PIPER_VOICE_DIR} — download one first")
-            try:
-                voice = piper.PiperVoice.load(str(onnx), config_path=str(onnx) + ".json")
-            except TypeError:  # very old piper builds without config_path
-                voice = piper.PiperVoice.load(str(onnx))
-            cfg = SynthesisConfig(length_scale=1.0 / max(0.5, rate), volume=max(0.1, vol))
-            H.STATE_DIR.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(prefix="voice-test-", suffix=".wav",
-                                            dir=str(H.STATE_DIR))
-            os.close(fd)
-            wav = Path(tmp_name)
-            try:
-                with wave.open(str(wav), "wb") as f:
-                    voice.synthesize_wav("Hello, I am your desktop assistant.", f, syn_config=cfg)
-                H.play_wav(wav, threading.Event())
-            finally:
-                try:
-                    wav.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            return "voice test played"
+            reply = _socket_command(H.CONTROL_SOCK, f"say {_VOICE_TEST_LINE}",
+                                    timeout=10.0)
+            if reply is None:
+                raise RuntimeError(
+                    f"the bubble is not running (no control socket at "
+                    f"{H.CONTROL_SOCK}) — start it, then test again")
+            if not reply.strip().startswith("ok"):
+                raise RuntimeError(reply.strip())
+            return reply.strip()
 
         def done(ok, result):
             self.voice_test_btn.setEnabled(True)
@@ -1950,21 +2037,25 @@ class SettingsWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ok != QMessageBox.Yes:
             return
-        try:
-            if H.HISTORY_FILE.exists():
-                _backup_keep_n(H.HISTORY_FILE, "bak-manual")
-            self.history_view.setPlainText("(history cleared — backup saved)")
-            self._status("history cleared (backup saved). Restart the bubble to apply.")
-        except OSError as e:
-            self._status(f"cannot clear history: {e}")
+        note = self._wipe_history("bak-manual")
+        if note.startswith("could not"):
+            self._status(note.strip())
+            return
+        self.history_view.setPlainText(f"(history cleared — {note})")
+        self._status(f"history cleared ({note}).")
 
     def _on_tab_changed(self, index: int) -> None:
         try:
-            if getattr(self, "tabs", None) is not None and self.tabs.widget(index) is getattr(
+            tabs = getattr(self, "tabs", None)
+            if tabs is not None and tabs.widget(index) is getattr(
                     self, "_history_page", None):
                 self._refresh_history()
                 self._refresh_facts()
                 self._refresh_decisions()
+            # the Voice meter only polls the bubble while its tab is on screen
+            self._level_feed_active(
+                tabs is not None and tabs.widget(index) is getattr(
+                    self, "_voice_page", None))
         except Exception:
             pass
 
@@ -2083,6 +2174,9 @@ class SettingsWindow(QMainWindow):
         self.size_label = QLabel("", self)
         self.size_slider.valueChanged.connect(
             lambda v: self.size_label.setText(f"{v} px window  ≈  {int(v * 0.69)} px bubble"))
+        # ...and actually apply it: this slider used to only relabel itself, so
+        # the bubble size never changed without pressing Save.
+        self.size_slider.valueChanged.connect(self._schedule_appearance_live)
         size_row.addWidget(QLabel("Bubble size", self))
         size_row.addWidget(self.size_slider, 1)
         size_row.addWidget(self.size_label)
@@ -2090,8 +2184,11 @@ class SettingsWindow(QMainWindow):
 
         design_row = QHBoxLayout()
         self.design_combo = QComboBox(self)
+        # display names for designs a bare .capitalize() would flatten
+        design_labels = {"sauron": "Eye of Sauron"}
         for name in getattr(SCHEMA, "BUBBLE_DESIGNS", ("orb",)):
-            self.design_combo.addItem(name.capitalize(), name)
+            self.design_combo.addItem(design_labels.get(name, name.capitalize()),
+                                      name)
         self.design_combo.setToolTip(
             "Bubble shape — applies immediately; the bubble repaints within "
             "seconds. No Save needed.")
@@ -2248,12 +2345,20 @@ class SettingsWindow(QMainWindow):
             on_disk = json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             on_disk = {}
-        if all(on_disk.get(k) == v for k, v in wanted.items()):
+        changed = [k for k in self.APPEARANCE_KEYS
+                   if on_disk.get(k) != wanted.get(k)]
+        if not changed:
             return                   # nothing changed: this was a load, not an edit
         if self.save():
-            self._status(
-                f"Appearance applied live — shape '{wanted['bubble_design']}'. "
-                "No restart needed.")
+            # name what moved instead of always reporting the shape: the old
+            # message made a colour or size change look like it had not been
+            # taken (and hid the fact that it never was).
+            pretty = {"bubble_design": "shape", "bubble_size": "size",
+                      "animation_energy": "animation energy",
+                      "bubble_accent": "colour accent", "colors": "state colours"}
+            self._status("Applied live: "
+                         + ", ".join(pretty.get(k, k) for k in changed)
+                         + ". No restart needed.")
 
     # ----------------------------------------------------------------- startup
 
@@ -2418,6 +2523,11 @@ class SettingsWindow(QMainWindow):
         self._loaded_cfg = copy.deepcopy(self.cfg)
         self._user_edited = False
         self._load_values()
+        # The disk is now the truth for which model the stored history belongs
+        # to. Without this a later unrelated save compared against the model
+        # from window-open and looked like a model SWITCH — which used to be a
+        # harmless backup but now clears the conversation.
+        self._model_at_open = str(self.cfg.get("model") or "")
 
     def _load_values(self) -> None:
         self.ctx_spin.setValue(int(self.cfg["num_ctx"]))
@@ -2445,6 +2555,8 @@ class SettingsWindow(QMainWindow):
         self.whisper_combo.setCurrentIndex(max(0, wi))
         self.rate_slider.setValue(int(float(self.cfg["tts_rate"]) * 100))
         self.vol_slider.setValue(int(float(self.cfg["tts_volume"]) * 100))
+        self.tts_ref_edit.setText(str(self.cfg.get("tts_reference") or ""))
+        self.refresh_tts()
         self.size_slider.setValue(int(self.cfg["bubble_size"]))
         self.hf_chk.setChecked(bool(self.cfg.get("handsfree", False)))
         self.wake_name_edit.setText(str(self.cfg.get("assistant_name", "assistant")))
@@ -2486,7 +2598,7 @@ class SettingsWindow(QMainWindow):
         self.cfg["history_tokens"] = self.hist_spin.value()
         self.cfg["max_tool_calls"] = self.toolrate_spin.value()
         self.cfg["whisper_size"] = self.whisper_combo.currentData() or "tiny"
-        self.cfg["piper_voice"] = self.voice_combo.currentData() or ""
+        self.cfg["tts_reference"] = self.tts_ref_edit.text().strip()
         self.cfg["tts_rate"] = self.rate_slider.value() / 100.0
         self.cfg["tts_volume"] = self.vol_slider.value() / 100.0
         self.cfg["mic_device"] = self.mic_combo.currentData() or ""
@@ -2573,13 +2685,8 @@ class SettingsWindow(QMainWindow):
         if new_model != self._model_at_open:
             # a new model must not inherit a conversation tuned for the old one:
             # the old history is the #1 cause of parroting after a model switch
-            try:
-                if H.HISTORY_FILE.exists():
-                    _backup_keep_n(H.HISTORY_FILE, "bak-modelswitch")
-                self._model_at_open = new_model
-                cleared_note = "  Memory cleared for the new model (backup saved)."
-            except OSError:
-                pass
+            cleared_note = self._clear_history_for_model_switch()
+            self._model_at_open = new_model
         try:
             # shared writer: version-stamps settings.json and keeps a one-
             # generation backup, so the bubble can migrate layouts safely
@@ -2603,6 +2710,47 @@ class SettingsWindow(QMainWindow):
         live_note = " Applied live." if live else " Bubble unreachable — restart to apply."
         self._status(f"Saved to {H.SETTINGS_FILE}. {msg}{cleared_note}{warn}{live_note}")
         return True
+
+    def _wipe_history(self, tag: str) -> str:
+        """Back up, empty and REALLY clear the stored conversation.
+
+        Truncating the file is only half the job. The running bubble holds the
+        transcript in `_history` and rewrites the whole file on its next turn,
+        so a clear that only touches the file is resurrected seconds later.
+        The socket call is what makes it stick; it is best-effort, and the
+        returned note says which of the two actually happened.
+        """
+        try:
+            if H.HISTORY_FILE.exists():
+                _backup_keep_n(H.HISTORY_FILE, tag)
+            H._atomic_private_write(H.HISTORY_FILE, "[]")   # empty JSON list
+        except OSError as e:
+            return f"could not clear history: {e}"
+        reply = self._clear_bubble_history()
+        if reply is None:
+            return "backup saved; bubble not running (it will start clean)"
+        if reply.startswith("ok"):
+            return "backup saved; the running bubble was told too"
+        return ("saved to disk only — the running bubble refused: "
+                f"{reply.strip()}")
+
+    def _clear_history_for_model_switch(self) -> str:
+        """Clear what a new model must not inherit.
+
+        This used to take a backup and leave the transcript in place, so the
+        new model read exactly the history the comment at the call site blames
+        for parroting.
+        """
+        return "  Memory cleared for the new model (" + self._wipe_history(
+            "bak-modelswitch") + ")."
+
+    @staticmethod
+    def _clear_bubble_history() -> "str | None":
+        """Ask the running bubble to drop its in-memory conversation.
+
+        Best-effort like _notify_bubble_reloaded: None means the bubble is not
+        running, in which case the truncated file IS the cleared state."""
+        return _socket_command(H.CONTROL_SOCK, "clear-history", timeout=3.0)
 
     @staticmethod
     def _notify_bubble_reloaded() -> bool:
@@ -2656,11 +2804,12 @@ def selftest() -> int:
     win.resize(780, 600)
     win.refresh_mics()
     win.refresh_models()
-    win.refresh_voices()
+    win.refresh_tts()
     QTimer.singleShot(4000, app.quit)
     app.exec()
     print(f"models listed: {win.model_list.count()}, "
-          f"mics: {win.mic_combo.count()}, voices: {win.voice_combo.count()}")
+          f"mics: {win.mic_combo.count()}, "
+          f"tts: {win.tts_ref_status.text()}")
     ok = win.save()
     print("settings.json written:", H.SETTINGS_FILE, "->", ok)
     return 0 if ok and win.model_list.count() > 0 else 1

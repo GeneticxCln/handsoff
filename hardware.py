@@ -15,6 +15,7 @@ import socket as _socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -108,24 +109,39 @@ def _sock_ok(sock: str) -> bool:
             s.close()
     return False
 
+# The TTL cache is shared: doctor's worker thread and the Qt thread's hardware
+# tick read and write the same dict, so the check and the store are taken under
+# one lock. It is deliberately NOT held across fn() — those probers shell out
+# (nvidia-smi, systemctl, journalctl), and serializing them would let one
+# stalled probe block every other section. Two threads may therefore probe the
+# same section at once and the last result wins; what the lock prevents is a
+# stamp written from a value that was already superseded, which is how a stale
+# entry came back looking freshly probed.
+_TTL_LOCK = threading.Lock()
+
+
 def _probe(section: str, fn, ttl_cache: dict | None, force: bool):
     """TTL-lite: cached slow sections skip the prober entirely."""
-    at = (ttl_cache or {}).get("at", {})
-    data = (ttl_cache or {}).get("data", {})
-    if (ttl_cache is not None and not force and section in data
-            and time.monotonic() - at.get(section, 0.0) < TTL[section]):
-        return data[section], True
+    if ttl_cache is not None and not force:
+        with _TTL_LOCK:
+            at = ttl_cache.get("at", {})
+            data = ttl_cache.get("data", {})
+            if (section in data
+                    and time.monotonic() - at.get(section, 0.0) < TTL[section]):
+                return data[section], True
     try:
         probed = fn()
     except Exception as e:  # ponytail: failure is data, not an exception
-        prev = (ttl_cache or {}).get("data", {}).get(section)
+        with _TTL_LOCK:
+            prev = (ttl_cache or {}).get("data", {}).get(section)
         if isinstance(prev, dict) and prev.get("ok"):
             probed = {**prev, "degraded": True, "error": str(e)[:200]}
         else:
             probed = _deg(e)
     if ttl_cache is not None:
-        ttl_cache.setdefault("at", {})[section] = time.monotonic()
-        ttl_cache.setdefault("data", {})[section] = probed
+        with _TTL_LOCK:
+            ttl_cache.setdefault("at", {})[section] = time.monotonic()
+            ttl_cache.setdefault("data", {})[section] = probed
     return probed, False
 
 def snapshot(ctx: dict | None = None, probers: dict | None = None,
@@ -233,23 +249,63 @@ def _ollama(ctx: dict, probers: dict) -> dict:
                                    for m in data.get("models", [])
                                    if isinstance(m, dict)]}
 
+def _hf_hub_cache() -> Path:
+    """The Hugging Face hub cache huggingface_hub would use.
+
+    Mirrors core.audio.hf_hub_cache() deliberately and without importing it:
+    hardware.py must stay stdlib-only (no whisper/torch imports), so the
+    env-var precedence is duplicated here rather than shared. If one changes,
+    the other has to — they answer the same question for different callers.
+    """
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        value = os.environ.get(var)
+        if value:
+            return Path(value).expanduser()
+    hf_home = os.environ.get("HF_HOME")
+    base = (Path(hf_home).expanduser() if hf_home
+            else Path.home() / ".cache" / "huggingface")
+    return base / "hub"
+
+
+def _snapshot_cached(root: Path) -> bool:
+    """True when a Hugging Face model directory holds a usable snapshot.
+
+    `root.is_dir()` is not the question: the cache nests the real files under
+    `snapshots/<revision>/`, and a download that was interrupted (or started)
+    leaves directories behind with no blobs. Reporting those as cached makes
+    the installer skip a 3.8 GB download and the bubble then fails its first
+    spoken turn.
+    """
+    snapshots = root / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    for snap in snapshots.iterdir():
+        if not snap.is_dir():
+            continue
+        try:
+            if any(p.is_file() and p.stat().st_size > 0 for p in snap.rglob("*")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _stt_tts(ctx: dict) -> dict:
     try:
-        vdir = Path(str(ctx.get("piper_voice_dir") or ""))
+        tdir = Path(str(ctx.get("tts_weights_dir") or ""))
         wdir = Path(str(ctx.get("whisper_model_dir") or ""))
-        onnx = sorted(p.name for p in vdir.glob("*.onnx")) if vdir.is_dir() else []
+        tts_cached = _snapshot_cached(tdir)
     except OSError as e:
         return _deg(e)
     cached = any(wdir.iterdir()) if wdir.is_dir() else False
-    if not onnx:
-        return {"ok": False, "whisper_cached": cached, "onnx": [],
-                "note": "no piper voices installed"}
-    ok_map = {n: (vdir / (n + ".json")).exists() for n in onnx}
-    if not all(ok_map.values()):
-        return {"ok": False, "whisper_cached": cached, "onnx": onnx,
-                "onnx_json_ok": ok_map, "note": "voice missing .json config"}
-    return {"ok": True, "whisper_size": str(ctx.get("whisper_size", "")),
-            "whisper_cached": cached, "onnx": onnx, "onnx_json_ok": ok_map}
+    out = {"ok": tts_cached, "whisper_size": str(ctx.get("whisper_size", "")),
+           "whisper_cached": cached,
+           "tts_engine": str(ctx.get("tts_engine") or "chatterbox-turbo"),
+           "tts_cached": tts_cached, "tts_weights_dir": str(tdir)}
+    if not tts_cached:
+        out["note"] = ("speech weights not downloaded — the bubble will be mute "
+                       "until install.sh fetches them")
+    return out
 
 def _systemd(ctx: dict) -> dict:
     unit = Path(str(ctx.get("systemd_unit_file") or ""))
@@ -380,9 +436,10 @@ def prompt_context(snap: dict, max_chars: int = 600) -> str:
     brain = (f"Brain: {snap.get('models', {}).get('ollama_model', '?')} via Ollama "
              f"({len(ollama.get('models', []))} models pulled)"
              if ollama.get("ok") else "Brain: ollama unreachable")
-    voices = ", ".join((stt.get("onnx") or [])[:2]) or "none"
-    voice = (f"Voices: whisper {stt.get('whisper_size', '?')} "
-             f"({'cached' if stt.get('whisper_cached') else 'not cached'}), piper: {voices}")
+    voice = (f"Voice: whisper {stt.get('whisper_size', '?')} "
+             f"({'cached' if stt.get('whisper_cached') else 'not cached'}), "
+             f"{stt.get('tts_engine') or 'chatterbox-turbo'} "
+             f"({'cached' if stt.get('tts_cached') else 'NOT downloaded'})")
     sock = mounts.get("sock_path") or "control socket"
     if ff.get("ok"):
         gpus = ", ".join(ff.get("gpu") or []) or "no GPU"
@@ -409,7 +466,9 @@ def main(argv: list[str] | None = None) -> int:
         "whisper_size": os.environ.get("HANDSOFF_WHISPER", ""),
         "mic_device": "",
         "whisper_model_dir": str(home / ".config/handsoff/whisper-model"),
-        "piper_voice_dir": str(home / ".config/handsoff/piper-voice"),
+        "tts_weights_dir": str(_hf_hub_cache() /
+                               "models--ResembleAI--chatterbox-turbo"),
+        "tts_engine": "chatterbox-turbo",
         "control_sock": str(home / ".local/state/handsoff/control.sock"),
         "state_dir": str(home / ".local/state/handsoff"),
         "systemd_unit_file": str(home / ".config/systemd/user/handsoff.service"),

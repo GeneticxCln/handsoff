@@ -501,10 +501,22 @@ class TestKillProcess:
         H._kill_offer.clear()
         return tb
 
+    # NOTE: the two-step tests below pin discovery to their own child rather
+    # than scanning /proc.  They are about the offer/confirm/terminate
+    # handshake, not about scanning (test_ambiguous_match_refused,
+    # test_no_match_and_other_users_invisible and test_port_targeting cover the
+    # real scan).  Left on the real scan they were order-dependent:
+    # kill_process('sleep') needs an EXACT single match, so any stray `sleep`
+    # owned by the same user — a leftover from an earlier suite, another test's
+    # helper, or the developer's own shell — turned the offer into an ambiguity
+    # ERROR and failed these tests for a reason unrelated to the code under
+    # test.  Discovery is pinned; the kill itself still happens for real.
+
     def test_two_step_confirm_required(self, H, monkeypatch):
         import subprocess as sp
         tb = self._tb(H, monkeypatch)
         d = sp.Popen(["sleep", "60"])
+        monkeypatch.setattr(tb, "_same_user_procs", lambda: [(d.pid, "sleep")])
         try:
             r = tb.kill_process("sleep")
             assert "About to stop" in r and d.poll() is None   # not killed yet
@@ -519,6 +531,7 @@ class TestKillProcess:
         import subprocess as sp
         tb = self._tb(H, monkeypatch)
         d = sp.Popen(["sleep", "60"])
+        monkeypatch.setattr(tb, "_same_user_procs", lambda: [(d.pid, "sleep")])
         try:
             tb.kill_process("sleep")
             assert "Cancelled" in tb.confirm_kill("no")
@@ -527,15 +540,19 @@ class TestKillProcess:
             d.kill(); d.wait()
 
     def test_ambiguous_match_refused(self, H, monkeypatch):
-        import subprocess as sp, time as t
+        """Two same-user matches are not a guess the tool may make.
+
+        Discovery is pinned to two entries rather than run against the real
+        /proc scan: the subject is the EXACT-single-match rule, and scanning
+        made the test depend on how many `sleep`s the machine happened to have
+        (and on a sleep to let two fresh children appear).
+        """
         tb = self._tb(H, monkeypatch)
-        d2, d3 = sp.Popen(["sleep", "60"]), sp.Popen(["sleep", "60"])
-        t.sleep(0.05)
-        try:
-            r = tb.kill_process("sleep")
-            assert r.startswith("ERROR") and "EXACT" in r
-        finally:
-            d2.kill(); d2.wait(); d3.kill(); d3.wait()
+        monkeypatch.setattr(tb, "_same_user_procs",
+                            lambda: [(4242, "sleep"), (4243, "sleep")])
+        r = tb.kill_process("sleep")
+        assert r.startswith("ERROR") and "EXACT" in r, r
+        assert not H._kill_offer, "an ambiguous match must not arm an offer"
 
     def test_no_match_and_other_users_invisible(self, H, monkeypatch):
         tb = self._tb(H, monkeypatch)
@@ -559,15 +576,35 @@ class TestKillProcess:
         assert r.startswith("REFUSED") and "me" in r
 
     def test_port_targeting(self, H, monkeypatch):
-        import subprocess as sp, time as t
+        """kill_process by listening port.
+
+        The port is allocated ephemerally and the test waits for the listener
+        to actually be up. The old version hardcoded 18744 and slept 0.6 s:
+        a fixed port collides with whatever else is on the machine (or with a
+        leftover server from an earlier crashed run) and the sleep was a bet
+        that http.server had finished binding. Now an early exit fails loudly
+        with the child's status instead of hanging on a stale assumption.
+        """
+        import subprocess as sp
+        import socket as _socket
         tb = self._tb(H, monkeypatch)
-        srv = sp.Popen(["python3", "-m", "http.server", "18744"])
-        t.sleep(0.6)
+        with _socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]     # free right now, ours to race
+        srv = sp.Popen(["python3", "-m", "http.server", str(port),
+                        "--bind", "127.0.0.1"],
+                       stdout=sp.DEVNULL, stderr=sp.DEVNULL)
         try:
-            r = tb.kill_process("18744")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and not tb._port_owner(port):
+                if srv.poll() is not None:
+                    pytest.fail(f"http.server exited early (rc={srv.returncode})")
+                time.sleep(0.05)
+            assert tb._port_owner(port), f"nothing listening on {port}"
+            r = tb.kill_process(str(port))
             # the offered name is the process comm (truncated to 15 chars),
             # so the python http.server shows up as 'python3'
-            assert "About to stop" in r and "python3" in r
+            assert "About to stop" in r and "python3" in r, r
             tb.confirm_kill("no")
         finally:
             srv.kill(); srv.wait()
@@ -658,6 +695,49 @@ class TestDecisionPolicy:
         tb._set_user_turn(2)
         out = tb.confirm_action("yes")
         assert "expired" in out
+
+    def test_concurrent_confirms_run_the_tool_once(self, H, monkeypatch, _fast_wait):
+        """The claimed CONFIRM TOCTOU does not exist — and must not start to.
+
+        The audit read the offer/clear as a snapshot taken under the lock and
+        re-checked after the release. It is not: the offer is both read AND
+        cleared inside one critical section, so a racing second confirm finds
+        nothing pending and refuses. Two actions where the user expected one is
+        exactly the kind of thing that must not creep back, so the invariant is
+        pinned with real threads rather than trusted by reading.
+        """
+        tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        runs: list = []
+        real_execute = tb.execute
+
+        def _counting_execute(name, args):
+            runs.append(name)
+            return real_execute(name, args)
+
+        tb.execute = _counting_execute
+        tb._set_user_turn(1)
+        tb.execute("wait", {"seconds": 1})       # the offer
+        runs.clear()
+        tb._set_user_turn(2)
+
+        results: list = []
+        guard = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def _confirm():
+            barrier.wait()
+            r = tb.confirm_action("yes")
+            with guard:
+                results.append(r)
+
+        threads = [threading.Thread(target=_confirm) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5.0)
+        assert sum(1 for r in results if "waited" in r) == 1, results
+        assert runs.count("wait") == 1, runs
+        assert tb._pending_confirm is None
 
     def test_kill_flow_bypasses_generic_confirm(self, H, monkeypatch):
         """kill_process manages its own two-step confirm; the generic one
@@ -847,3 +927,138 @@ class TestSplitConfirm:
         preview = H.ToolBelt._split_edit_preview(
             {"path": str(target), "content": "x\n" * 100}, limit=20)
         assert "diff truncated" in preview
+
+
+class TestSecretPathGuard:
+    """read_file, watch_file and run_command share ONE credential predicate.
+
+    Before this there was no denylist at all, and because `cat` sits on the
+    command whitelist, `run_command("cat ~/.ssh/id_rsa")` was a second route
+    to exactly what read_file happily returned too. Tool output is fed to the
+    brain, which may be a remote Ollama, so all three now refuse together.
+    """
+
+    @pytest.fixture()
+    def tb(self, H):
+        return H.ToolBelt(on_restart_pending=lambda: None), []
+
+    def _fake_secret(self, tmp_path):
+        """A hermetic ~/.ssh-shaped tree — no real credential is ever read."""
+        store = tmp_path / ".ssh"
+        store.mkdir(parents=True, exist_ok=True)
+        key = store / "id_rsa"
+        key.write_text("PRIVATE-KEY-BODY-MUST-NOT-ESCAPE", encoding="utf-8")
+        return key
+
+    def test_predicate_denies_canonical_stores(self):
+        from core.tools import denied_secret_path
+        for path in ("~/.ssh/id_rsa", "~/.ssh/config", "~/.gnupg/secring.gpg",
+                     "~/.aws/credentials", "~/.kube/config", "~/.netrc",
+                     "~/.bash_history", "~/.config/gh/hosts.yml",
+                     "~/.mozilla/firefox/p/cookies.sqlite",
+                     "~/.local/share/keyrings/login.keyring",
+                     "/tmp/server.pem", "/tmp/client.key", "/srv/app/.env"):
+            assert denied_secret_path(Path(path).expanduser()), path
+
+    def test_predicate_allows_ordinary_files(self):
+        from core.tools import denied_secret_path
+        for path in ("~/handsoff.py", "/tmp/notes.txt", "/tmp/tokenizer.py",
+                     "~/Documents/id_rsa_notes.md",  # a note, not a key
+                     "~/.config/handsoff/settings.json",
+                     "~/.sshx/notes.txt"):            # prefix, not the dir
+            assert denied_secret_path(Path(path).expanduser()) is None, path
+
+    def test_read_file_refuses_and_never_returns_the_body(self, tb, tmp_path):
+        belt, _ = tb
+        key = self._fake_secret(tmp_path)
+        out, err = belt.execute("read_file", {"path": str(key)})
+        assert err and out.startswith("REFUSED"), out
+        assert "PRIVATE-KEY-BODY-MUST-NOT-ESCAPE" not in out
+
+    def test_watch_file_refuses_the_same_path(self, tb, tmp_path):
+        belt, _ = tb
+        key = self._fake_secret(tmp_path)
+        out = belt.watch_file(str(key), "PRIVATE", "start")
+        assert out.startswith("REFUSED"), out
+        assert belt.watch_file("", "", "list") == "file watchers: none"
+
+    def test_run_command_cat_cannot_bypass_read_file(self, tb, tmp_path):
+        belt, _ = tb
+        key = self._fake_secret(tmp_path)
+        argv, _, err, _ = belt._validate_command(f"cat {key}")
+        assert argv is None and "REFUSED" in err and ".ssh" in err
+
+    def test_run_command_still_allows_ordinary_paths(self, tb, tmp_path):
+        belt, _ = tb
+        notes = tmp_path / "notes.txt"
+        notes.write_text("fine", encoding="utf-8")
+        argv, exe, err, _ = belt._validate_command(f"cat {notes}")
+        assert err is None and exe == "cat" and argv[-1] == str(notes)
+
+    def test_symlink_and_traversal_cannot_slip_past(self, tb, tmp_path):
+        belt, _ = tb
+        key = self._fake_secret(tmp_path)
+        sneaky = tmp_path / "innocent.txt"
+        sneaky.symlink_to(key)
+        out, err = belt.execute("read_file", {"path": str(sneaky)})
+        assert err and out.startswith("REFUSED"), out
+        dotdot = f"{tmp_path}/.ssh/../.ssh/id_rsa"
+        assert belt._validate_command(f"cat {dotdot}")[2] is not None
+
+
+class TestStrictArgumentCoercion:
+    """Wrong model arguments must be reported, never guessed.
+
+    The old coercion used truthiness and defaults: `bool("false")` is True, so
+    a JSON "false" silently INVERTED the flag; junk became 0; and because every
+    parameter was always passed, an OMITTED optional numeric argument was sent
+    as 0 instead of taking the default the signature documents.
+    """
+
+    @pytest.fixture()
+    def tb(self, H):
+        return H.ToolBelt(on_restart_pending=lambda: None), []
+
+    def test_bool_is_parsed_not_coerced(self):
+        from core.tools import coerce_bool_arg
+        for raw in ("false", "FALSE", "no", "off", "0", "", 0, False):
+            assert coerce_bool_arg(raw) is False, raw
+        for raw in ("true", "TRUE", "yes", "on", "1", 1, True):
+            assert coerce_bool_arg(raw) is True, raw
+
+    def test_bool_junk_raises_instead_of_guessing(self):
+        from core.tools import coerce_bool_arg
+        for raw in ("maybe", "2", "nope"):
+            with pytest.raises(ValueError):
+                coerce_bool_arg(raw)
+
+    def test_number_junk_raises_instead_of_becoming_zero(self):
+        from core.tools import coerce_number_arg
+        assert coerce_number_arg("5", int) == 5
+        assert coerce_number_arg("5.5", float) == 5.5
+        for raw in ("abc", "", None, [1]):
+            with pytest.raises(ValueError):
+                coerce_number_arg(raw, float)
+
+    def test_omitted_optional_number_takes_its_documented_default(
+            self, tb, H, monkeypatch, tmp_path):
+        """snooze_reminder(minutes=10): omitting it must mean 10, not 0.
+
+        The old loop always passed a value, so `int(None or 0)` sent 0 — which
+        then failed the 0.1..1440 bounds check, i.e. the documented default was
+        unreachable whenever the model left the argument out.
+        """
+        belt, _ = tb
+        monkeypatch.setattr(H, "REMINDERS_FILE", tmp_path / "reminders.json")
+        out, err = belt.execute("set_reminder", {"wake_name": "tea",
+                                                 "when_due": "in 3 hours"})
+        assert not err, out
+        out, err = belt.execute("snooze_reminder", {"name": "tea"})
+        assert not err, out
+        due = H._load_reminders()[0]["due"]
+        assert 9 * 60 <= due - time.time() <= 11 * 60, due
+
+    def test_malformed_number_is_reported_to_the_model(self, tb):
+        belt, _ = tb
+        out, err = belt.execute("snooze_reminder", {"name": "x", "minutes": "soon"})
+        assert err and "bad arguments" in out and "soon" in out, out

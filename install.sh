@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # handsoff installer — Arch Linux / CachyOS + niri (Wayland)
 #
-# Installs system + pip packages, downloads the whisper model and a piper
-# voice, and places handsoff.py + the restart script in ~/.local/bin.
+# Installs system + pip packages, downloads the whisper model and the speech
+# weights, and places handsoff.py + the restart script in ~/.local/bin.
 # Run it from the directory containing handsoff.py:
 #
 #   ./install.sh
 #
 # Overrides (optional): HANDSOFF_MODEL, HANDSOFF_WHISPER, HANDSOFF_WHISPER_REVISION,
-#   PIPER_VOICE_URL, HANDSOFF_PYTHON, HANDSOFF_NO_OLLAMA_SERVICE
+#   HANDSOFF_TTS_REPO, HANDSOFF_PYTHON, HANDSOFF_NO_OLLAMA_SERVICE
 set -euo pipefail
 
 # No-arg flags that must never touch the system: the CI smoke test runs these
 # so installer drift (syntax rot, broken early flow) is caught on every push.
 case "${1:-}" in
     -h|--help)
-        sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        # 2..11 is the whole comment block: the previous 2..10 range cut the
+        # second "Overrides" line, so --help silently hid half the documented
+        # environment knobs (including HANDSOFF_TTS_REPO).
+        sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         echo ""
         echo "Options:"
         echo "  --help            show this help"
@@ -48,19 +51,63 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
 # `--ptt doctor` still reported in-sync: a new module was compiled from the
 # checkout, never installed and never hashed, so nothing could notice. The
 # same list was duplicated in seven places and could drift in seven ways.
-#   * every *.py beside handsoff.py is part of the app (glob),
+#   * the top-level *.py files the PROJECT owns are part of the app,
 #   * handsoff-restart is the one non-Python artifact, and
 #   * TOP_EXECUTABLE names the entry points installed 0755.
 # TOP_REQUIRED is the floor: what handsoff.py hard-imports. Losing one of those
 # must fail the stage loudly rather than deploy an app that dies on import.
 TOP_REQUIRED="handsoff.py settings_schema.py hardware.py"
 TOP_EXECUTABLE="handsoff.py handsoff-settings.py handsoff-restart"
+# core/ ships as a SET. CORE_REQUIRED is the floor — the modules handsoff.py
+# hard-imports — and it fails the stage loudly if one of them disappears; the
+# glob over core/*.py is the ceiling. It used to be a hand-maintained copy list,
+# which meant a newly added module (core/theme.py) was compiled from the checkout
+# but never installed, and because the deployment manifest enumerated files the
+# same way, doctor reported in-sync while the feature was simply absent (the
+# settings GUI quietly fell back to "no wallpaper matching").
+CORE_REQUIRED="__init__ settings audio brain tools doctor lifecycle calendar assistant"
 is_exec() {   # 0 when the basename is an entry point (installed 0755)
     case " $TOP_EXECUTABLE " in
         *" $1 "*) return 0 ;;
         *) return 1 ;;
     esac
 }
+
+# --- which top-level files belong to the project ----------------------------
+# A bare glob shipped whatever happened to sit beside handsoff.py. It really
+# happened: a scratch `test.py` from a TTS experiment was copied into
+# ~/.local/bin (the user's PATH) and recorded in the deployment manifest, so
+# the next edit to that scratch file made `--ptt doctor` declare the whole
+# installation "installed-drift" — a false alarm about the bubble, raised by a
+# file the bubble does not use. A stray name can also COLLIDE with a real
+# binary in $BIN_DIR and overwrite it.
+#
+# So: the declared entry points always ship, plus every top-level *.py the repo
+# actually tracks. Discovery stays automatic (a new module ships once it is
+# committed — no list to maintain), while a scratch file never leaves the
+# checkout. Outside a git work tree (a tarball install) the glob is all there
+# is, and is kept as the fallback.
+TRACKED_PY=""
+if command -v git >/dev/null 2>&1 \
+    && git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # repo-relative paths, exactly as the globs below name them
+    TRACKED_PY="$(git -C "$HERE" ls-files -- '*.py' 2>/dev/null || true)"
+fi
+DECLARED_PY="$TOP_REQUIRED handsoff-settings.py"
+for m in $CORE_REQUIRED; do
+    DECLARED_PY="$DECLARED_PY core/$m.py"
+done
+ship_file() {   # $1 = repo-relative path; 0 → it is part of the project
+    if [ -z "$TRACKED_PY" ]; then
+        return 0                       # no git: the glob is the source of truth
+    fi
+    case " $DECLARED_PY " in
+        *" $1 "*) return 0 ;;           # declared entry points always ship
+    esac
+    printf '%s\n' "$TRACKED_PY" | grep -qx -- "$1"
+}
+ship_top() { ship_file "$1"; }
+ship_core() { ship_file "core/$1"; }
 
 case "${1:-}" in
     --rollback)
@@ -97,8 +144,11 @@ esac
 
 WHISPER_SIZE="${HANDSOFF_WHISPER:-tiny}"
 OLLAMA_MODEL="${HANDSOFF_MODEL:-qwen3:8b}"
-VOICE_URL_DEFAULT="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
-PIPER_VOICE_URL="${PIPER_VOICE_URL:-$VOICE_URL_DEFAULT}"
+# Speech engine weights. chatterbox-turbo replaced Piper, so this is a
+# Hugging Face repo (a directory of safetensors) rather than a single .onnx
+# voice file. huggingface_hub fetches content-addressed blobs and verifies
+# them on download, so there is no sha256 to pin here.
+TTS_REPO="${HANDSOFF_TTS_REPO:-ResembleAI/chatterbox-turbo}"
 # ponytail: resolve once; venv's python3 shadows system when activated.
 PYBIN="${HANDSOFF_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
 WHISPER_REVISION="${HANDSOFF_WHISPER_REVISION:-main}"
@@ -243,8 +293,9 @@ fi
 
 echo "==> [2/8] Python packages (pip, user site)"
 # Single source of truth: the manifest. Core deps also come from pacman above;
-# this covers the lazy-imported extras (faster-whisper, piper-tts,
-# openwakeword/onnxruntime for the wake spotter) at verified floors.
+# this covers the lazy-imported extras (faster-whisper, openwakeword/
+# onnxruntime for the wake spotter) at verified floors. The speech engine is
+# deliberately NOT here — see step [2b/8] below.
 PIP_REQUIREMENTS=("-r" "$HERE/requirements.txt")
 if [ -f "$HERE/requirements-lock.txt" ]; then
     if ! "${PYBIN}" - "$HERE/requirements.txt" "$HERE/requirements-lock.txt" <<'PY_EOF'
@@ -286,8 +337,48 @@ else
         "${PIP_REQUIREMENTS[@]}"
 fi
 
+echo "==> [2b/8] Speech engine (chatterbox-turbo)"
+# The engine is kept OUT of requirements.txt on purpose: it pulls torch, and CI
+# installs the manifest on GPU-less runners, where that would cost every job
+# gigabytes and buy nothing (the suite asserts torch is never imported).
+# install.sh owns it instead — the same way it owns ollama and the whisper
+# model. Torch comes from the distro when the distro has it: the packaged build
+# matches the system CUDA/ROCm stack, while PyPI's default Linux wheel drags its
+# own ~2-3 GB of NVIDIA libraries.
+if [ "$REHEARSAL" = "1" ]; then
+    echo "    skipping speech engine (rehearsal)"
+elif "${PYBIN}" -c "import chatterbox.tts_turbo" >/dev/null 2>&1; then
+    # tts_turbo is this engine's entry point AND it imports torch, so a
+    # successful import proves the whole stack — which keeps a redeploy from
+    # re-resolving gigabytes on every run.
+    echo "    chatterbox-turbo already importable — skipping"
+else
+    TORCH_PKGS=""
+    for p in python-torch python-torchaudio; do
+        if pacman -Si "$p" >/dev/null 2>&1; then
+            TORCH_PKGS="$TORCH_PKGS $p"
+        fi
+    done
+    if [ -n "$TORCH_PKGS" ] && [ -n "$PACMAN" ]; then
+        echo "    installing distro torch:$TORCH_PKGS"
+        $PACMAN -S --needed --noconfirm $TORCH_PKGS \
+            || echo "    note: distro torch install failed — pip will provide it" >&2
+    else
+        echo "    no distro torch — pip will pull its default wheel (large)"
+    fi
+    "${PYBIN}" -m pip install --user --break-system-packages --upgrade \
+        "chatterbox-tts>=0.1.7"
+    if ! "${PYBIN}" -c "import chatterbox.tts_turbo" >/dev/null 2>&1; then
+        echo "    FATAL: chatterbox-turbo is not importable after install — the" >&2
+        echo "      bubble would boot mute. Install it by hand and re-run:" >&2
+        echo "        ${PYBIN} -m pip install --user chatterbox-tts" >&2
+        exit 1
+    fi
+    echo "    speech engine ready"
+fi
+
 echo "==> [3/8] Directories"
-mkdir -p "$BIN_DIR" "$CONF_DIR/whisper-model" "$CONF_DIR/piper-voice" "$STATE_DIR"
+mkdir -p "$BIN_DIR" "$CONF_DIR/whisper-model" "$STATE_DIR"
 
 echo "==> [4/8] Staging the release (compile-gated, rollback-able)"
 # Nothing is installed until a complete staged copy has passed the compile
@@ -303,11 +394,17 @@ stage_fail() {
     exit 1
 }
 # --- collect the shipped set into the stage (live files untouched yet)
-# Globs, not lists: anything beside handsoff.py ships (handsoff-settings.py
-# included when present), and TOP_REQUIRED fails the stage if a hard-imported
-# module has gone missing.
+# Globs, not lists, but only over files the project OWNS: whatever the repo
+# tracks, plus the declared entry points, and TOP_REQUIRED fails the stage if a
+# hard-imported module has gone missing. Membership is decided in one place
+# (ship_file) so staging, the manifest and the rehearsal check cannot disagree.
+skip_unowned() {   # $1 = repo-relative path that failed the membership test
+    echo "    NOT shipping $1 — untracked in git, so it is not part of the project"
+    echo "      (commit it if it is a module; it would land in $BIN_DIR)"
+}
 for src in "$HERE"/*.py; do
     base="$(basename "$src")"
+    ship_top "$base" || { skip_unowned "$base"; continue; }
     if is_exec "$base"; then m=755; else m=644; fi
     install -m "$m" "$src" "$STAGE_DIR/$base" \
         || stage_fail "could not stage $base"
@@ -316,21 +413,18 @@ for mod in $TOP_REQUIRED; do
     [ -f "$HERE/$mod" ] \
         || stage_fail "$HERE/$mod is missing but required by handsoff.py"
 done
-# core/ ships as a SET, so it is staged by glob. It used to be a
-# hand-maintained copy list, which meant a newly added module (core/theme.py)
-# was compiled from the checkout but never installed -- and because the
-# deployment manifest enumerated files the same way, doctor reported in-sync
-# while the feature was simply absent (the settings GUI quietly fell back to
-# "no wallpaper matching"). CORE_REQUIRED is a floor that fails the stage
-# loudly if a hard-imported module disappears; the glob is the ceiling.
-CORE_REQUIRED="__init__ settings audio brain tools doctor lifecycle calendar assistant"
+# core/ ships as a SET, staged by glob; the floor (CORE_REQUIRED, defined with
+# the rest of the shipped set at the top) fails the stage loudly if a
+# hard-imported module disappears.
 for m in $CORE_REQUIRED; do
     [ -f "$HERE/core/$m.py" ] \
         || stage_fail "$HERE/core/$m.py is missing but required by handsoff.py"
 done
 for src in "$HERE"/core/*.py; do
-    install -m 644 "$src" "$STAGE_DIR/core/$(basename "$src")" \
-        || stage_fail "could not stage $(basename "$src")"
+    base="$(basename "$src")"
+    ship_core "$base" || { skip_unowned "core/$base"; continue; }
+    install -m 644 "$src" "$STAGE_DIR/core/$base" \
+        || stage_fail "could not stage core/$base"
 done
 install -m 755 "$HERE/handsoff-restart" "$STAGE_DIR/handsoff-restart" \
     || stage_fail "could not stage handsoff-restart"
@@ -438,7 +532,7 @@ PY_EOF
 fi
 echo "whisper model ready"
 # faster-whisper fetches via huggingface_hub (content-hashed blobs, verified
-# on download) — no separate sha256 manifest to check like the piper voice.
+# on download) — like the speech weights, there is no separate sha256 to check.
 # Fail loudly on an empty cache instead of booting deaf on a partial fetch.
 if [ -z "$(ls -A "$CONF_DIR/whisper-model" 2>/dev/null)" ]; then
     echo "    FATAL: whisper model download produced no files in $CONF_DIR/whisper-model" >&2
@@ -492,7 +586,9 @@ manifest_whisper_sha256=""
 # core/theme.py went unnoticed is that the manifest never mentioned it.
 manifest_core_files=""
 for f in "$HERE"/core/*.py; do
-    rel="core/$(basename "$f")"
+    base="$(basename "$f")"
+    rel="core/$base"
+    ship_core "$base" || continue     # same membership rule as staging
     manifest_core_files="$manifest_core_files
     \"$rel\": {\"source_sha256\": \"$(sha_of "$HERE/$rel")\", \"installed_sha256\": \"$(sha_of "$BIN_DIR/$rel")\"},"
 done
@@ -501,6 +597,10 @@ done
 manifest_top_files=""
 for f in "$HERE"/*.py; do
     rel="$(basename "$f")"
+    # Same membership rule as staging, from the same helper: a file that is not
+    # shipped must not be hashed into the manifest either, or doctor's drift
+    # check tracks something the bubble never uses.
+    ship_top "$rel" || continue
     manifest_top_files="$manifest_top_files
     \"$rel\": {\"source_sha256\": \"$(sha_of "$HERE/$rel")\", \"installed_sha256\": \"$(sha_of "$BIN_DIR/$rel")\"},"
 done
@@ -520,66 +620,82 @@ $manifest_core_files
 }
 MANIFEST_EOF
 
-echo "==> [6/8] Downloading piper voice (sha256-verified)"
+echo "==> [6/8] Speech weights ($TTS_REPO)"
+# chatterbox-turbo replaced the 60 MB piper .onnx voice: the engine is a 3.8 GB
+# neural model on the Hugging Face hub, so there is nothing left to checksum-pin
+# here — huggingface_hub fetches content-addressed blobs and verifies each one
+# as it downloads. What the installer must still guarantee is that the cache it
+# leaves behind is USABLE: an interrupted or blocked fetch used to be invisible
+# until the first spoken reply, which is the worst moment to learn the bubble is
+# mute. So the fetch is primed here and then verified.
 if [ "$REHEARSAL" = "1" ]; then
-    echo "    skipping voice download (rehearsal)"
+    echo "    skipping speech weights (rehearsal)"
 else
-voice="$(basename "$PIPER_VOICE_URL")"
-VOICE_SHA256="${PIPER_VOICE_SHA256:-5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f}"
-VOICE_JSON_SHA256="${PIPER_VOICE_JSON_SHA256:-efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0}"
-download_verified() {  # <url> <dest> <expected-sha256-or-empty>
-    local url="$1" dest="$2" want="$3" got
-    # existing files are verified too: an interrupted earlier download must
-    # not be silently accepted (a truncated voice crashes piper at runtime)
-    if [ -f "$dest" ] && [ -n "$want" ]; then
-        got="$(sha256sum "$dest" | awk '{print $1}')"
-        if [ "$got" == "$want" ]; then
-            return 0
-        fi
-        echo "    existing $(basename "$dest") failed checksum — re-downloading" >&2
-        rm -f "$dest"
-    fi
-    local tmp="$dest.part.$$"
-    curl -fL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmp" "$url"
-    if [ -z "$want" ]; then
-        # URL overridden without a SHA256: user's explicit choice — install
-        # unverified but say so loudly (default voice stays strictly checked)
-        echo "    WARNING: $(basename "$dest") downloaded WITHOUT checksum verification" >&2
-        mv "$tmp" "$dest"
-        return 0
-    fi
-    got="$(sha256sum "$tmp" | awk '{print $1}')"
-    if [ "$got" != "$want" ]; then
-        echo "    FATAL: checksum mismatch for $(basename "$dest")" >&2
-        echo "      expected $want" >&2
-        echo "      got      $got" >&2
-        rm -f "$tmp"
-        exit 1
-    fi
-    mv "$tmp" "$dest"
-}
-# a custom URL MUST come with a hash: the voice is spoken audio the user
-# cannot visually audit, so "warning-only" trust was a supply-chain hole.
-# To use a new voice, pin it first:
-#   curl -fsSL "$PIPER_VOICE_URL" | sha256sum
-#   ...then export PIPER_VOICE_SHA256=<digest> (and _JSON_SHA256 for the .json).
-# HANDSOFF_UNVERIFIED_VOICE=1 restores the old warning-only behavior, loudly,
-# for airgapped/experimental setups — an explicit, deliberate choice.
-if [ "$PIPER_VOICE_URL" != "$VOICE_URL_DEFAULT" ] \
-        && [ -z "${PIPER_VOICE_SHA256:-}" ] \
-        && [ "${HANDSOFF_UNVERIFIED_VOICE:-0}" != "1" ]; then
-    echo "    FATAL: custom PIPER_VOICE_URL requires PIPER_VOICE_SHA256" >&2
-    echo "      pin it:  curl -fsSL '$PIPER_VOICE_URL' | sha256sum" >&2
-    echo "      (or HANDSOFF_UNVERIFIED_VOICE=1 to accept an unverified voice)" >&2
-    exit 1
-fi
-if [ "$PIPER_VOICE_URL" != "$VOICE_URL_DEFAULT" ] \
-        && [ -z "${PIPER_VOICE_SHA256:-}" ]; then
-    echo "    WARNING (HANDSOFF_UNVERIFIED_VOICE=1): $voice downloads WITHOUT checksum verification" >&2
-    VOICE_SHA256=""
-fi
-download_verified "$PIPER_VOICE_URL" "$CONF_DIR/piper-voice/$voice" "$VOICE_SHA256"
-download_verified "$PIPER_VOICE_URL.json" "$CONF_DIR/piper-voice/$voice.json" "$VOICE_JSON_SHA256"
+    "${PYBIN}" - "$TTS_REPO" <<'PY_EOF'
+import os
+import sys
+from pathlib import Path
+
+REPO = sys.argv[1]
+
+
+def hub_cache() -> Path:
+    """The hub cache huggingface_hub will use.
+
+    Mirrors core.audio.hf_hub_cache() exactly (and hardware.py's copy): the
+    installer must prime the SAME directory the bubble reads, or the download is
+    paid for twice.
+    """
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(var):
+            return Path(os.environ[var]).expanduser()
+    hf_home = os.environ.get("HF_HOME")
+    base = (Path(hf_home).expanduser() if hf_home
+            else Path.home() / ".cache" / "huggingface")
+    return base / "hub"
+
+
+def snapshot_ok(root: Path) -> bool:
+    """True when the cache holds a snapshot with real weights.
+
+    `root.is_dir()` is not the question: the cache nests files under
+    snapshots/<revision>/, so a fetch that started and died leaves directories
+    with no blobs — reported as "cached" by a weaker check, and the bubble then
+    fails on every turn.
+    """
+    snapshots = root / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    for snap in snapshots.iterdir():
+        if snap.is_dir() and any(
+                p.is_file() and p.stat().st_size > 0
+                for p in snap.glob("*.safetensors")):
+            return True
+    return False
+
+
+root = hub_cache() / ("models--" + REPO.replace("/", "--"))
+if snapshot_ok(root):
+    print(f"    {REPO} already cached at {root}")
+else:
+    print(f"    downloading {REPO} (about 3.8 GB on the first run)")
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise SystemExit(f"    FATAL: huggingface_hub is missing ({exc}) — it "
+                         f"arrives with faster-whisper; re-run install.sh")
+    try:
+        snapshot_download(REPO)
+    except Exception as exc:
+        raise SystemExit(f"    FATAL: could not download {REPO}: {exc}")
+
+if not snapshot_ok(root):
+    raise SystemExit(
+        f"    FATAL: {REPO} has no usable weights under {root} — the bubble "
+        f"would start MUTE and only fail on its first spoken reply. Check the "
+        f"network or proxy, then re-run install.sh.")
+print(f"    speech weights ready: {root}")
+PY_EOF
 fi
 
 echo "==> [7/8] systemd user service (auto-restart if the bubble dies)"
@@ -708,16 +824,22 @@ PY_EOF
     for required in "$SYSTEMD_DIR/handsoff.service" "$CONF_DIR/niri-window-rule.kdl"; do
         [ -f "$required" ] || { echo "FATAL: rehearsal missing $required" >&2; exit 1; }
     done
-    # Every module in the checkout must have reached the deployed set -- the
+    # Every module the PROJECT owns must have reached the deployed set -- the
     # exact check that would have caught the missing core/theme.py, and it runs
-    # on every rehearsal from now on.
+    # on every rehearsal from now on. Membership is the same `ship_top` rule
+    # staging used, so this asserts what was supposed to ship, not what happens
+    # to be sitting in the checkout (a scratch test.py is not ours to deliver).
     for src in "$HERE"/*.py; do
-        [ -f "$BIN_DIR/$(basename "$src")" ] \
-            || { echo "FATAL: rehearsal did not deploy $(basename "$src")" >&2; exit 1; }
+        base="$(basename "$src")"
+        ship_top "$base" || continue
+        [ -f "$BIN_DIR/$base" ] \
+            || { echo "FATAL: rehearsal did not deploy $base" >&2; exit 1; }
     done
     for src in "$HERE"/core/*.py; do
-        [ -f "$BIN_DIR/core/$(basename "$src")" ] \
-            || { echo "FATAL: rehearsal did not deploy core/$(basename "$src")" >&2; exit 1; }
+        base="$(basename "$src")"
+        ship_core "$base" || continue
+        [ -f "$BIN_DIR/core/$base" ] \
+            || { echo "FATAL: rehearsal did not deploy core/$base" >&2; exit 1; }
     done
     echo "rehearsal complete: copied files, manifest, unit, and niri snippet verified"
     exit 0

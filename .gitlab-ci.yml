@@ -88,6 +88,29 @@ tests:3.13:
   extends: .tests_base
   image: "python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285" # 3.13-slim
 
+# --- Ordering-dependence probe (GH: `order` job) ---------------------------
+# The suite must pass whatever order it runs in; the default collection order
+# is what hides a dependence on it. Two full re-runs: tests shuffled, then
+# only the FILE order shuffled. The seed is the commit SHA (different every
+# commit, printed by the run banner, exactly reproducible). The first run to
+# fail leaves its junit report in place for the summary — the pipeline stops
+# before the second overwrites it.
+order:
+  stage: test
+  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  variables:
+    QT_QPA_PLATFORM: offscreen
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  <<: *shared
+  script:
+    - *qt_deps
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt -c requirements-lock.txt
+    - HANDSOFF_TEST_ORDER_SEED="$CI_COMMIT_SHA" python -m pytest tests/ -q
+      --junitxml="$CI_PROJECT_DIR/tests/report.xml"
+    - HANDSOFF_TEST_ORDER_FILES="$CI_COMMIT_SHA" python -m pytest tests/ -q
+      --junitxml="$CI_PROJECT_DIR/tests/report.xml"
+
 # --- Coverage floor (GH: `coverage` job) ------------------------------------
 coverage:
   stage: test

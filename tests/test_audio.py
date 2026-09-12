@@ -15,12 +15,13 @@ import sys
 import tempfile
 import time
 import types
+import wave
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site
+from conftest import HERE as ROOT, _load, _user_site, wait_for
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -29,9 +30,46 @@ def test_core_audio_imports_independently():
     """The extracted primitives must not require the Qt/application module."""
     mod = _load("core_audio_compat", HERE / "core" / "audio.py")
     for name in ("_resample_to_16k", "_open_input", "Recorder",
-                 "get_whisper", "get_piper", "transcribe", "tts_to_wav",
+                 "get_whisper", "get_tts", "transcribe", "tts_to_wav",
                  "play_wav"):
         assert hasattr(mod, name), name
+
+
+def test_importing_the_app_never_pulls_in_torch_or_chatterbox():
+    """The suite must stay runnable on a GPU-less runner.
+
+    requirements.txt deliberately does NOT carry the speech engine (it drags
+    in torch), so importing the app must not import it either: a lazy import
+    that drifts to module level would turn CI into a multi-gigabyte install
+    that fails for reasons unrelated to the change. Checked in a SUBPROCESS on
+    purpose — torch IS importable on a developer box, so an in-process check
+    would pass locally and fail only where it matters.
+    """
+    env = dict(os.environ)
+    with tempfile.TemporaryDirectory() as home:
+        # A throw-away HOME: an import must not be graded against the
+        # developer's own settings.json (the suite's isolation rule).
+        env.update({"HOME": home,
+                    "XDG_CONFIG_HOME": str(Path(home) / ".config"),
+                    "XDG_STATE_HOME": str(Path(home) / ".local" / "state")})
+        # Python resolves the user site-packages from HOME at interpreter
+        # startup, so a throw-away HOME hides a `pip install --user` tree and
+        # the import would fail for the wrong reason. Pass it explicitly.
+        user_site = _user_site()
+        if user_site:
+            env["PYTHONPATH"] = os.pathsep.join(
+                filter(None, [user_site, env.get("PYTHONPATH", "")]))
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, json; import handsoff; print(json.dumps(sorted("
+             "m for m in sys.modules if m.split('.')[0] in "
+             "{'torch', 'chatterbox', 'transformers'})))"],
+            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    loaded = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert loaded == [], (
+        f"importing handsoff pulled in {loaded} — it must stay lazy, or CI "
+        f"installs a multi-GB GPU stack to run this suite")
 
 
 def test_portaudio_reinit_is_guarded_while_streams_are_open(H):
@@ -102,6 +140,111 @@ def test_play_wav_holds_the_portaudio_mark(H, tmp_path):
     assert mod.portaudio_busy() is False, "the mark must be released afterwards"
 
 
+def test_play_wav_reports_a_level_that_follows_the_audio(H, tmp_path):
+    """A voice-reactive bubble needs a level WHILE it is speaking.
+
+    The mic is deliberately blanked during TTS (the bubble's own voice would
+    re-trigger the VAD), so the equalizer bars had nothing to follow and fell
+    back to a time-based pulse. play_wav now reports the level of what it is
+    actually playing: loud where the audio is loud, near-silent where it is
+    quiet, and a final 0 so the visual settles when speech stops.
+    """
+    import numpy as _np
+    import wave as _wave
+
+    mod = _load("core_audio_level", HERE / "core" / "audio.py")
+    written = []
+
+    class _Stream:
+        def __init__(self, **_kw):
+            pass
+
+        def start(self):
+            pass
+
+        def write(self, data):
+            written.append(_np.asarray(data).size)
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    real = mod.sd.OutputStream
+    mod.sd.OutputStream = _Stream
+    path = tmp_path / "tts.wav"
+    loud = (_np.full(4096, 12000, dtype=_np.int16)).tobytes()
+    soft = (_np.full(4096, 300, dtype=_np.int16)).tobytes()
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        w.writeframes(loud + soft + loud)
+    seen: list[float] = []
+    try:
+        mod.set_level_hook(seen.append)
+        mod.play_wav(path, threading.Event())
+    finally:
+        mod.set_level_hook(None)
+        mod.sd.OutputStream = real
+    assert seen, "playback must report a level"
+    assert seen[-1] == 0.0, f"must end at silence, got {seen[-1]}"
+    body = seen[:-1]
+    assert max(body) > 0.5, f"a loud passage must read loud: {body}"
+    assert min(body) < max(body) * 0.3, (
+        f"the level must follow the audio, not be a constant: {body}")
+    # updates stay frequent enough to look continuous (~46 ms per block at
+    # 22050 Hz), rather than stepping a few times per sentence
+    assert len(body) >= 3, body
+    assert written, "the audio must still actually be written"
+
+
+def test_a_broken_level_hook_never_breaks_playback(H, tmp_path):
+    """The visual is best-effort: a raising hook must not kill the audio."""
+    import numpy as _np
+    import wave as _wave
+
+    mod = _load("core_audio_level2", HERE / "core" / "audio.py")
+    played = []
+
+    class _Stream:
+        def __init__(self, **_kw):
+            pass
+
+        def start(self):
+            pass
+
+        def write(self, data):
+            played.append(_np.asarray(data).size)
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    real = mod.sd.OutputStream
+    mod.sd.OutputStream = _Stream
+    path = tmp_path / "tts.wav"
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        w.writeframes(_np.full(2048, 9000, dtype=_np.int16).tobytes())
+
+    def _boom(_value):
+        raise RuntimeError("widget went away mid-sentence")
+
+    try:
+        mod.set_level_hook(_boom)
+        mod.play_wav(path, threading.Event())      # must not raise
+    finally:
+        mod.set_level_hook(None)
+        mod.sd.OutputStream = real
+    assert played, "playback must complete despite the broken hook"
+
+
 class FakeSig:
     """Mimics a Qt signal: collect emitted values."""
 
@@ -120,6 +263,17 @@ class FakeAssistant:
         self.sigLevel = FakeSig()
         self.sigUtterance = FakeSig()
         self.vad_events: list[bool] = []
+        self.level_events: list[tuple] = []
+
+    def _emit_level(self, value: float, source: str = "mic") -> None:
+        """The Assistant's single level publisher.
+
+        The continuous listener and the push-to-talk recorder call this (not
+        sigLevel.emit) so the control socket can say WHICH producer fed the
+        level; the fake has to carry the same surface or the audio callback
+        raises AttributeError. Mirrors the real one: record, then emit."""
+        self.level_events.append((value, source))
+        self.sigLevel.emit(value)
 
     def _vad_speech(self, active: bool) -> None:
         self.vad_events.append(active)
@@ -260,6 +414,21 @@ class TestListenerSelfMute:
         for _ in range(max_f):                # hammer past the cap
             self._feed(lst, gate, frames, max_f, min_f, 3000.0)
         assert len(asst.sigUtterance.values) == 1
+
+    def test_voice_level_is_reported_as_the_mic_source(self, env):
+        # The Settings → Voice meter reads this back over the control socket,
+        # so WHERE a level came from has to be recorded at the producer. A raw
+        # sigLevel.emit here would leave the meter unable to tell hands-free
+        # listening from the bubble's own playback — which is the whole point
+        # of tagging the source at all.
+        lst, asst, gate, frames, max_f, min_f = env
+        for _ in range(5):
+            self._feed(lst, gate, frames, max_f, min_f, 3000.0)
+        assert asst.level_events, "the mic must feed the shared level"
+        assert {src for _v, src in asst.level_events} == {"mic"}
+        assert all(0.0 < v <= 1.0 for v, _s in asst.level_events), asst.level_events
+        assert [v for v, _s in asst.level_events] == asst.sigLevel.values, (
+            "recording the source must not change what the designs receive")
 
     def test_thinking_state_discards_frames(self, env):
         """Regression: while the brain is generating, mic input is junk
@@ -635,7 +804,12 @@ class TestNativeRateMicAndFuzzyWake:
         whine = H._resample_to_16k((np.sin(2 * np.pi * 12000 * t) * 12000).astype(np.int16), 48000)
         assert band_peak(whine, 3900, 4100) < 0.05 * band_peak(voice, 900, 1100)
 
-    def test_match_wake_fuzzy_misheard_name(self, H):
+    def test_match_wake_fuzzy_misheard_name(self, H, monkeypatch):
+        # The name is PINNED, not inherited: this test used to pass only on a
+        # machine whose settings.json said assistant_name='cypher' (the fuzzy
+        # skeleton needs >= 4 letters, and 'assistant' vs 'Siphon' shares none),
+        # so it graded the developer's config instead of the matching logic.
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
         # the exact E2E failure: piper's 'cypher' transcribed as 'Siphon'
         assert H._match_wake("Hey Siphon, what is the capital of France?") == \
             "what is the capital of France"
@@ -1227,7 +1401,8 @@ class TestHandsfreeConfirm:
         a._speak = lambda text, gen, cancel, sentence_q=None: captured.update(
             text=text, cancel_set=cancel.is_set())
         a._announce_now("check")
-        time.sleep(0.3)
+        assert wait_for(lambda: "text" in captured), \
+            "the announcement never reached the speaker"
         assert captured["text"] == "check"
         assert captured["cancel_set"] is False, \
             "announcement must never inherit a cancelled turn"
@@ -1255,6 +1430,106 @@ class TestHandsfreeConfirm:
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
         assert '"--ptt" "handsfree-status"' in src
         assert "Mod+Shift+J" in src
+
+
+class TestVoicePreviewSay:
+    """Settings → Voice "Test voice", which now speaks through the bubble.
+
+    The preview used to build its OWN speech model in the settings process.
+    chatterbox makes that untenable — ~2.7 GB of VRAM in a second process, and
+    it would preview the GUI's idea of the voice rather than the bubble's — so
+    the preview moved onto the control socket. What that opens up is the thing
+    this class pins: the command now has a PAYLOAD, and the payload is the
+    user's text.
+    """
+
+    @pytest.fixture()
+    def voice_server(self, H, tmp_path, monkeypatch):
+        """Real Assistant + ControlServer, with synthesis stubbed out."""
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.instance() or QCoreApplication([])
+        sock_path = tmp_path / "control.sock"
+        monkeypatch.setattr(H, "CONTROL_SOCK", sock_path)
+        spoken: list[str] = []
+        monkeypatch.setattr(
+            H, "tts_to_wav",
+            lambda text, wav, voice_getter=None: spoken.append(text))
+        monkeypatch.setattr(H, "play_wav", lambda wav, cancel: None)
+        # → a loaded model, so _speak does not wait on the startup loader.
+        monkeypatch.setattr(H, "_tts_model", object())
+        asst = H.Assistant()
+        srv = H.ControlServer(asst)
+        srv.start()
+        from test_lifecycle import TestControlSocket
+        deadline, last_err = time.time() + 5, None
+        while time.time() < deadline:
+            try:
+                if TestControlSocket._roundtrip(sock_path, "status").startswith("state="):
+                    break
+            except OSError as e:
+                last_err = e
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"control server never answered ({last_err})")
+        try:
+            yield H, spoken, TestControlSocket
+        finally:
+            srv.stop()
+
+    def test_the_payload_reaches_synthesis_with_its_case_intact(
+            self, H, voice_server):
+        """The dispatch lowercases the command word; the argument must survive.
+
+        One payload for the whole request means the naive implementation turns
+        "Hello THERE" into "hello there" — the user hears a different sentence
+        than the one they typed, which is exactly what a preview is for.
+        """
+        H, spoken, TestControlSocket = voice_server
+        reply = TestControlSocket._roundtrip(H.CONTROL_SOCK, "say Hello THERE")
+        assert reply.startswith("ok"), reply
+        assert wait_for(lambda: spoken == ["Hello THERE"]), spoken
+
+    def test_say_is_a_first_class_command_for_the_cli(self, H, voice_server):
+        """`--ptt say <text>` must be routed, not rejected as unknown."""
+        H, spoken, _rt = voice_server
+        assert H.ptt_client(["say", "Round", "trip."]) == 0
+        assert wait_for(lambda: spoken == ["Round trip."]), spoken
+
+    def test_say_without_text_is_a_usage_error_not_a_silent_ok(self, H,
+                                                               voice_server):
+        """A GUI button that reports success while saying nothing is the
+        silent-failure shape this whole audit is about."""
+        H, spoken, _rt = voice_server
+        assert H.ptt_client(["say"]) == 2
+        assert spoken == []
+
+    def test_a_preview_is_not_a_turn(self, H):
+        """It must not bump the generation: that would invalidate the reply
+        the user is listening to, or the turn they are waiting on."""
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 7
+        spoken = []
+        a._announce_now = spoken.append
+        reply = a.say_preview("Hello there")
+        assert spoken == ["Hello there"]
+        assert reply.startswith("ok"), reply
+        assert a._gen == 7, "a preview consumed a turn generation"
+
+    def test_a_preview_cannot_be_used_to_queue_minutes_of_speech(self, H):
+        """It is reachable over a socket, so the payload must be bounded."""
+        a = H.Assistant.__new__(H.Assistant)
+        spoken = []
+        a._announce_now = spoken.append
+        reply = a.say_preview("word " * 500)
+        assert spoken and len(spoken[0]) <= H._SAY_PREVIEW_MAX
+        assert "truncated" in reply, reply
+
+    def test_an_empty_preview_says_so(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        spoken = []
+        a._announce_now = spoken.append
+        assert a.say_preview("   ").startswith("error")
+        assert spoken == []
 
 
 class TestMicHistory:
@@ -1629,10 +1904,15 @@ class TestUtteranceHealth:
 
     def test_submit_audio_hook_order(self, H):
         """The line fires after the discard check and before the stop probe —
-        every accepted utterance gets exactly one health line."""
+        every accepted utterance gets exactly one health line.
+
+        The discard check now carries the measured frames/peak/threshold (a
+        rejected capture has to be diagnosable, and a push-to-talk one is a
+        WARNING), so this pins the message stem rather than a closed literal.
+        """
         src = inspect.getsource(H.Assistant.submit_audio)
         assert "self._log_utterance_health()" in src
-        assert src.index('"discarding too-short/quiet capture"')
+        assert src.index("discarding too-short/quiet capture")
         assert src.index("self._log_utterance_health()") \
             < src.index("self._maybe_instant_stop")
 
@@ -2300,3 +2580,421 @@ class TestStreamingFallback:
         assert result["content"] == "Fallback."
         assert [q.get(timeout=1), q.get(timeout=1)] == ["Fallback.", None]
         assert q.empty()
+
+
+class TestPttWorksWithHandsfreeOn:
+    """Push-to-talk must still RECORD while hands-free is on.
+
+    The user reported "push to talk is broken". The cause was that with
+    hands-free enabled `toggle` always fell through to the interrupt branch
+    (`and not self._handsfree`) and `begin_listening()` called
+    `_listener.suspend()` and returned without ever opening a recorder — so the
+    PTT key was a silent no-op with no feedback at all. A press now parks the
+    continuous listener and records; release submits and restarts it.
+    """
+
+    def _mk(self, H, monkeypatch, state=None):
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 0
+        a._state = H.IDLE if state is None else state
+        a._handsfree = True
+        a._recorder = None
+        a._cancel = threading.Event()
+        a._ptt_lock = threading.RLock()
+        a._ptt_epoch = 0
+        a._ptt_stopping = False
+        a._followup_until = 0.0
+        a._pipeline_q = __import__("queue").Queue()
+        a.sigLevel = FakeSig()
+        calls = types.SimpleNamespace(listener=[], submitted=[], interrupts=[],
+                                      recording=[])
+        a._calls = calls
+        a._listener = types.SimpleNamespace(
+            start=lambda: calls.listener.append("start"),
+            stop=lambda: calls.listener.append("stop"),
+            reset=lambda: None,
+            suspend=lambda: calls.listener.append("suspend"),
+            resume=lambda: calls.listener.append("resume"),
+        )
+
+        def _set(gen, st):
+            if gen != a._gen:
+                return
+            a._state = st
+
+        a._set = _set
+        a.interrupt = lambda: calls.interrupts.append(1)
+        a.submit_audio = lambda audio: calls.submitted.append(audio)
+        a._maybe_instant_stop = lambda audio, gen: None
+        a._log_utterance_health = lambda: None
+
+        class _Rec:
+            def __init__(self, on_level=None, device=None, threshold=600):
+                self._native_rate = H.SAMPLE_RATE
+                calls.recording.append(self)
+
+            def start(self):
+                self.started = True
+
+            def stop(self):
+                self.stopped = True
+                return np.zeros(H.SAMPLE_RATE, dtype=np.int16)
+
+        monkeypatch.setattr(H, "Recorder", _Rec)
+        return a
+
+    def test_toggle_parks_the_listener_and_records(self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        a._on_command("toggle")
+        assert a._calls.listener == ["stop"], (
+            "hands-free must be parked (stream closed), not merely suspended")
+        assert a._recorder is not None, "a PTT press must open a recorder"
+        assert a._calls.recording, "Recorder.start() must have run"
+        assert a._state == H.LISTENING
+        assert not a._calls.interrupts or len(a._calls.interrupts) == 1
+
+    def test_release_submits_the_capture_and_restarts_handsfree(
+            self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        audio = np.zeros(H.SAMPLE_RATE, dtype=np.int16)
+        audio[:1000] = 900
+        monkeypatch.setattr(a, "_stop_recorder_bounded",
+                            lambda rec, timeout=3.0: (audio, False))
+        a.begin_listening()
+        a.finish_listening()
+        for _ in range(400):            # the stop->submit runs off the Qt thread
+            if a._calls.submitted and "start" in a._calls.listener:
+                break
+            time.sleep(0.01)
+        assert a._calls.submitted, "the PTT capture must be submitted"
+        assert len(a._calls.submitted[0]) == len(audio)
+        assert "start" in a._calls.listener, (
+            "hands-free listening must come back after the press")
+        assert a._recorder is None
+
+    def test_resume_is_not_called_while_the_recorder_holds_the_mic(
+            self, H, monkeypatch):
+        """One mic stream at a time: the listener may only restart after the
+        recorder has been released, or the two wedge each other."""
+        a = self._mk(H, monkeypatch)
+        order = []
+        monkeypatch.setattr(a, "_stop_recorder_bounded",
+                            lambda rec, timeout=3.0: (order.append("stop"), None)[1])
+        a._resume_handsfree_listener = (
+            lambda: order.append("resume"))
+        a.begin_listening()
+        a.finish_listening()
+        for _ in range(400):
+            if "resume" in order:
+                break
+            time.sleep(0.01)
+        assert order == ["stop", "resume"], order
+
+    def test_interrupt_still_wins_while_speaking(self, H, monkeypatch):
+        """The fix must not turn the PTT key into "record" while the bubble is
+        talking — that press means stop talking."""
+        a = self._mk(H, monkeypatch, state=H.SPEAKING)
+        a._on_command("toggle")
+        assert a._recorder is None
+        assert a._calls.listener == [], a._calls.listener
+
+    def test_handsfree_off_is_unchanged(self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        a._handsfree = False
+        a.begin_listening()
+        assert a._recorder is not None
+        assert a._calls.listener == [], "nothing to park when hands-free is off"
+
+
+class TestAudioFailurePaths:
+    """Failures must not leave silent damage behind.
+
+    Each of these was a real defect: playback that failed left the bubble's
+    designs pinned at the last level with no further audio to release them, a
+    failed synthesis left a truncated wav where the last good one had been, a
+    second Recorder.start() dropped an open stream instead of closing it (so
+    PortAudio kept the device), and a retry at the native rate discarded the
+    original error.
+    """
+
+    @staticmethod
+    def _tone(path, frames=500):
+        import wave as _wave
+        with _wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(22050)
+            w.writeframes(b"\x00\x10" * frames)
+        return path
+
+    def test_play_wav_releases_the_level_when_the_constructor_fails(self, H, tmp_path):
+        import threading
+        mod = _load("core_audio_ctor_fail", HERE / "core" / "audio.py")
+        path = self._tone(tmp_path / "tone.wav")
+
+        class _NoDevice:
+            def __init__(self, **kw):
+                raise RuntimeError("no output device")
+
+        mod.sd.OutputStream = _NoDevice
+        seen = []
+        mod.set_level_hook(seen.append)
+        try:
+            with pytest.raises(RuntimeError):
+                mod.play_wav(path, threading.Event())
+            assert seen and seen[-1] == 0.0, seen
+        finally:
+            mod.set_level_hook(None)
+
+    def test_play_wav_closes_a_stream_that_failed_to_start_and_releases_level(
+            self, H, tmp_path):
+        import threading
+        mod = _load("core_audio_start_fail", HERE / "core" / "audio.py")
+        path = self._tone(tmp_path / "tone.wav")
+        closed = []
+
+        class _BoomStart:
+            def __init__(self, **kw):
+                pass
+
+            def start(self):
+                raise RuntimeError("device busy")
+
+            def write(self, data):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                closed.append(True)
+
+        mod.sd.OutputStream = _BoomStart
+        seen = []
+        mod.set_level_hook(seen.append)
+        try:
+            with pytest.raises(RuntimeError):
+                mod.play_wav(path, threading.Event())
+            assert seen and seen[-1] == 0.0, seen
+            assert closed, "a constructed stream must be closed even if start() fails"
+        finally:
+            mod.set_level_hook(None)
+
+    def test_tts_to_wav_keeps_the_previous_file_when_synthesis_fails(self, H, tmp_path):
+        mod = _load("core_audio_tts_fail", HERE / "core" / "audio.py")
+        target = self._tone(tmp_path / "reply.wav", frames=100)
+        good = target.read_bytes()
+
+        class _BadVoice:
+            def generate(self, text):
+                raise RuntimeError("tts engine died")
+
+        with pytest.raises(RuntimeError):
+            mod.tts_to_wav("hello", target, voice_getter=lambda: _BadVoice())
+        assert target.read_bytes() == good, "a failed synthesis truncated the good file"
+        assert not list(tmp_path.glob("*.part*")), "temp file left behind"
+
+    def test_tts_to_wav_replaces_atomically_on_success(self, H, tmp_path):
+        mod = _load("core_audio_tts_ok", HERE / "core" / "audio.py")
+        target = self._tone(tmp_path / "reply.wav", frames=100)
+
+        class _Voice:
+            def generate(self, text):
+                return np.full(2400, 0.25, dtype=np.float32)
+
+        mod.tts_to_wav("hello", target, voice_getter=lambda: _Voice())
+        # The header is part of the contract: play_wav reads the rate from it,
+        # so a 16 kHz header on 24 kHz samples would play the reply too fast.
+        with wave.open(str(target), "rb") as w:
+            assert w.getframerate() == mod.TTS_SR == 24000, w.getframerate()
+            assert (w.getnchannels(), w.getsampwidth()) == (1, 2)
+        assert target.read_bytes() != self._tone(tmp_path / "other.wav",
+                                                 frames=100).read_bytes()
+        assert not list(tmp_path.glob("*.part*"))
+
+    # ---- chatterbox-turbo seams (piper's replacement) ----------------------
+
+    def test_the_float32_shim_keeps_norm_loudness_in_float32(self, H):
+        """Without this patch EVERY reference clip dies.
+
+        Measured on NumPy 2.5.3 + chatterbox-tts 0.1.7: `norm_loudness`
+        computes `wav * gain_linear`, NumPy 2 promotes that to float64, and
+        s3tokenizer's mel matmul then raises "expected scalar type Float but
+        found Double". So voice conditioning is not flaky without the shim, it
+        is simply impossible — and the error names none of that.
+        """
+        mod = _load("core_audio_shim", HERE / "core" / "audio.py")
+
+        class _Model:
+            def norm_loudness(self, wav, sr, *a, **kw):
+                # what the real one does: a float64 gain times float32 samples
+                return np.float64(0.5) * np.asarray(wav, dtype=np.float32)
+
+        model = _Model()
+        assert model.norm_loudness(np.ones(4, dtype=np.float32), 24000).dtype \
+            == np.float64, "the double really does appear without the shim"
+        mod._patch_float32_norm(model)
+        out = model.norm_loudness(np.ones(4, dtype=np.float32), 24000)
+        assert out.dtype == np.float32, out.dtype
+        assert np.allclose(out, 0.5), "the shim must call through, not stub"
+
+    def test_the_shim_invents_nothing_on_a_model_without_the_method(self, H):
+        """A renamed/removed norm_loudness must not gain a method it never had
+        — a stub would silently skip the engine's own normalisation."""
+        mod = _load("core_audio_shim_bare", HERE / "core" / "audio.py")
+        model = object()
+        mod._patch_float32_norm(model)
+        assert not hasattr(model, "norm_loudness")
+
+    def test_two_syntheses_never_interleave(self, H):
+        """The engine carries the voice conditionals as MUTABLE state, so a
+        spoken reply overlapping another synthesis must not interleave — that
+        is what _TTS_RUN_LOCK is for, and it is easy to lose."""
+        mod = _load("core_audio_run_lock", HERE / "core" / "audio.py")
+        active, overlaps = [], []
+
+        class _Engine:
+            def generate(self, text):
+                active.append(text)
+                if len(active) > 1:
+                    overlaps.append(tuple(active))
+                time.sleep(0.05)
+                active.pop()
+                return np.zeros(16, dtype=np.float32)
+
+        engine = _Engine()
+        threads = [threading.Thread(target=mod.synthesize, args=("hi", engine))
+                   for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not overlaps, overlaps
+
+    def test_tts_rate_time_compresses_and_junk_is_ignored(self, H):
+        """chatterbox has no duration control, so rate is a resample — time
+        compression with a rising pitch. It must actually do something, and a
+        nonsense rate must fall back rather than divide by zero."""
+        mod = _load("core_audio_rate", HERE / "core" / "audio.py")
+        samples = np.linspace(-1, 1, 4800, dtype=np.float32)
+        fast = mod.resample_speed(samples, 2.0)
+        assert abs(fast.size - 2400) <= 2, fast.size
+        assert fast.dtype == np.float32
+        assert np.array_equal(mod.resample_speed(samples, 1.0), samples), \
+            "1.0x must be a byte-exact no-op, not an extra resample"
+        for junk in (0.0, -1.0, float("nan")):
+            assert mod.resample_speed(samples, junk).size == samples.size
+
+    def test_volume_scales_then_clips_instead_of_wrapping(self, H):
+        """The GUI allows 2.0x. int16 overflow WRAPS and turns a loud reply
+        into noise, so the samples must be clipped."""
+        mod = _load("core_audio_volume", HERE / "core" / "audio.py")
+
+        class _Engine:
+            def generate(self, text):
+                half = np.full(16, 0.9, dtype=np.float32)
+                return np.concatenate([half, -half])   # +0.9 and -0.9
+
+        setattr(mod, "SETTINGS", {"tts_rate": 1.0, "tts_volume": 1.5})
+        loud = mod.synthesize("x", model=_Engine())
+        assert loud.dtype == np.int16
+        assert int(np.max(np.abs(loud))) > 32000, "volume did not scale"
+        setattr(mod, "SETTINGS", {"tts_rate": 1.0, "tts_volume": 4.0})
+        sat = mod.synthesize("x", model=_Engine())
+        assert (int(np.max(sat)), int(np.min(sat))) == (32767, -32767), (
+            f"clipping is required: {int(np.max(sat))}/{int(np.min(sat))} — "
+            "wrapping is loud noise, not a no-op")
+
+    def test_a_short_reference_clip_is_named_before_the_engine_asserts(
+            self, H, tmp_path):
+        """The library asserts > 5 s and fires on EVERY turn, so a 2 s clip is
+        a mute bubble. The message must name the CLIP — reporting it as damaged
+        weights sends the user to re-download 3.8 GB."""
+        mod = _load("core_audio_ref_floor", HERE / "core" / "audio.py")
+        short = tmp_path / "optimus_clip.wav"
+        with wave.open(str(short), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(b"\x00\x00" * 24000)          # exactly 1 s
+        problem = mod.reference_problem(short)
+        assert problem and "optimus_clip.wav" in problem, problem
+        assert "5" in problem, problem
+        assert mod.reference_problem(tmp_path / "gone.wav") is not None
+        long_clip = tmp_path / "ok.wav"
+        with wave.open(str(long_clip), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 16000 * 6)
+        assert mod.reference_problem(long_clip) is None
+        assert mod.reference_clip_seconds(long_clip) == pytest.approx(6.0, abs=0.1)
+
+    def test_weights_are_looked_for_where_huggingface_puts_them(self, H,
+                                                                tmp_path,
+                                                                monkeypatch):
+        """The installer, doctor and settings app all ask this, and the answer
+        decides whether 3.8 GB is downloaded twice. A bare `is_dir()` also
+        reported a half-finished fetch as cached."""
+        mod = _load("core_audio_weights", HERE / "core" / "audio.py")
+        monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+        assert mod.hf_hub_cache() == tmp_path / "hub"
+        monkeypatch.delenv("HF_HUB_CACHE")
+        monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(tmp_path / "hub2"))
+        assert mod.hf_hub_cache() == tmp_path / "hub2"
+        monkeypatch.delenv("HUGGINGFACE_HUB_CACHE")
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+        assert mod.hf_hub_cache() == tmp_path / "hf" / "hub"
+        root = tmp_path / "hf" / "hub" / "models--ResembleAI--chatterbox-turbo"
+        monkeypatch.setattr(mod, "TTS_REPO_ID", "ResembleAI/chatterbox-turbo")
+        assert mod.tts_weights_dir() == root
+        # A snapshot directory with NO blobs is not "cached".
+        (root / "snapshots" / "deadbeef").mkdir(parents=True)
+        assert mod.tts_weights_cached() is False, (
+            "a half-finished download must not read as cached")
+        weight = root / "snapshots" / "deadbeef" / "s3gen.safetensors"
+        weight.write_bytes(b"weights")
+        assert mod.tts_weights_cached() is True
+
+    def test_recorder_start_closes_its_previous_stream(self, H):
+        mod = _load("core_audio_recorder", HERE / "core" / "audio.py")
+        closed = []
+
+        class _Stream:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def close(self):
+                closed.append(self)
+
+        streams = [_Stream(), _Stream()]
+        mod._open_input = lambda device, rate, bs, cb: (streams[len(closed)], rate)
+        rec = mod.Recorder(on_level=lambda v: None)
+        rec.start()
+        first = rec._stream
+        rec.start()                       # a second press without a stop
+        assert first in closed, "the superseded stream was dropped, not closed"
+        assert closed.count(first) == 1
+
+    def test_open_input_chains_the_original_error(self, H):
+        mod = _load("core_audio_open_fail", HERE / "core" / "audio.py")
+        first = OSError("device busy")
+        second = OSError("invalid sample rate")
+
+        class _SD:
+            @staticmethod
+            def InputStream(**kw):
+                raise first if kw.get("samplerate") == 16000 else second
+
+            @staticmethod
+            def query_devices(*a, **k):
+                return {"default_samplerate": "48000.0"}
+
+        mod.sd = _SD
+        with pytest.raises(OSError) as ei:
+            mod._open_input(None, 16000, 1024, lambda *a: None)
+        assert ei.value is second
+        assert ei.value.__cause__ is first, "the real cause was discarded"

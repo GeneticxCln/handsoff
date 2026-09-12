@@ -3,6 +3,184 @@
 Date: 2026-09-09 · Phase 0/1/2 of the external task list are closed (see the
 Addendum below); remaining consciously-accepted items are at the bottom.
 
+## Addendum — 2026-09-12 speech engine migration: Piper -> chatterbox-turbo
+
+Piper is gone from the tree: the engine is now **chatterbox-turbo**, the voice
+is either its built-in one or a clone of a reference clip the user picks, and
+the 60 MB `.onnx` voice, the voice catalogue and the download dialog are
+deleted. Tests: **920 green** (was 890) in six orderings, coverage **78.00%**
+≥ 70, `ci/compile_all.py` clean, and **16 mutations of the new guards back to
+the old behaviour were all caught**.
+
+* **The engine swap is wide, not deep.** Piper was referenced in 11 non-test
+  files and ~18 test files; the seams were already right (`tts_to_wav(text,
+  path, voice_getter)` and a lazily-imported getter), so `core/audio.py` gained
+  `get_tts()` with the same contract as `get_whisper` — names the engine, the
+  device, the cause and the remedy, and never caches a failure. Output is
+  24 kHz 16-bit PCM; `tts_rate` is applied by resampling (the engine has no
+  duration control) and `tts_volume` is clipped before quantisation.
+* **A reference clip could never have worked without a shim.** Measured on
+  this environment (NumPy 2.5.3, chatterbox-tts 0.1.7): `norm_loudness`
+  computes `wav * gain_linear`, which NumPy 2 promotes to float64, and the
+  s3tokenizer mel matmul then raises *"expected scalar type Float but found
+  Double"* — so **every** clip fails, not an odd one. One cast at that seam
+  (verified: as-is raises, cast returns tokens `(1, 250)`). It is applied in
+  `get_tts()`, and a guard asserts the shim is actually installed rather than
+  merely present in the file.
+* **The >5 s rule is one shared predicate.** `prepare_conditionals` asserts
+  the clip is longer than 5 s, so a two-second sample is not a degraded voice
+  but a **mute bubble**. `reference_problem()` answers for the bubble, the
+  installer, doctor and the settings GUI, and `get_tts()` checks it *before*
+  loading the weights — otherwise a bad clip is reported as "the weights are
+  missing or damaged", sending the user after the wrong thing entirely. The
+  measured case: the user's own `output.wav` is 2.56 s and is refused;
+  `optimus_clip.wav` (10 s) and `optimus.wav` (33 s) are accepted.
+* **The settings preview moved into the bubble.** Its old form loaded its own
+  voice in the settings process; a second `ChatterboxTurboTTS` would cost
+  another ~2.7 GB of VRAM. A new `say` control-socket action previews the
+  running bubble's actual voice — same code path, one model. It is queued and
+  length-capped (a 2000-word paste must not queue minutes of speech), and the
+  preview is synthesized, not spoken, so it cannot be mistaken for a reply.
+* **Migration, and the write that undid it.** `piper_voice` -> `tts_reference`
+  (`SETTINGS_VERSION` 2). The old value is **dropped, loudly**, not renamed: an
+  `.onnx` voice is not a reference clip, and carrying the path over would hand
+  `prepare_conditionals` a file it must reject on every turn. Then two real
+  defects surfaced, both found by *using* it rather than reading it:
+  1. `_read_settings_for_write` read the raw file **without migrating**, so one
+     unrelated single-key save put `piper_voice` straight back; and because
+     removal was version-gated, a file already stamped v2 that still carried
+     the key kept it **forever** — `unknown settings key 'piper_voice'` on every
+     single start, for a key the user never wrote. Removal is now key-driven,
+     so it cannot be re-stamped out of effect.
+  2. The first fix dropped *every* key the schema did not know, and the suite
+     caught what that costs: an existing regression test writes a key from a
+     **newer** build and requires it to survive. Wholesale filtering silently
+     erases configuration on version skew, which is worse than the nuisance it
+     cured. Only the keys a migration explicitly **retired** are removed
+     (`RETIRED_SETTINGS`, now `("piper_voice",)`, with its own forward-compat
+     guard so the over-broad version cannot come back).
+* **The xformers warning is a false lead, and it is now settled in the source.**
+  `xFormers can't load C++/CUDA extensions` appears at every start and looks
+  like the attention path is degraded. It is not: nothing in the TTS path calls
+  xformers, the models report no attention implementation, and kernel-level
+  evidence shows the attention already running `PyTorchMemEffAttention` (the
+  xformers kernel, upstreamed into PyTorch). It runs in **fp32** because that is
+  what `from_pretrained(device)` hardcodes — and half precision is not
+  available as a fix: a hand-cast fails inside the library's own graph
+  (`mat1 and mat2 must have the same dtype, but got Float and Half`). There is
+  also no xformers build for torch 2.11+cu130 (0.0.35 targets torch 2.10).
+* **The real latency win was the first call, not the steady state.** Measured:
+  warm synthesis runs at RTF ≈ 0.3 (86 chars -> 4.40 s of audio in 1.28 s), but
+  the **first** synthesis in a process costs 1.47–1.53 s against 0.57–0.69 s
+  afterwards. `warm_tts()` now pays that ~0.87 s once at startup, where it is a
+  startup cost rather than a penalty on the user's first reply.
+* **Verification, not a log line.** A test asserts importing the app never pulls
+  in torch or chatterbox (so CI's GPU-less runners still pass), the whole
+  reference path was measured end-to-end, and the clone was proven against the
+  built-in voice on one model and one sentence: **waveform correlation +0.015**,
+  2.96 s vs 2.60 s, f0 **138.3 Hz vs 218.2 Hz** against the clip's 109.6 Hz
+  (28.7 Hz away vs 108.6 Hz). A silent fallback would have produced *identical*
+  audio. Live, the running bubble spoke 94 chars with `source: "tts"` in the
+  level feed (56 non-zero samples, peak raw 0.467).
+
+## Addendum — 2026-09-12 fault injection, second pass: the four remaining
+## boundaries (compositor/ydotoold, speech models, ENOSPC, a backwards clock)
+
+Same method as the first pass — break one boundary at the seam and require the
+bubble to degrade *loudly* — extended to the four seams that were left: niri and
+ydotoold exiting mid-turn, the whisper/piper models missing or unreadable, the
+disk filling up, and the wall clock stepping backwards. **Twenty-six new tests**
+(`tests/test_fault_injection.py`, now 46) and **six real defects**, none of which
+the previous 864 tests could reach. Nine mutations of the fixes back to their old
+behaviour were run and **all nine were caught** by the new guards.
+
+* **A crashed turn was reported to nobody.** `_pipeline_worker` swallowed every
+  exception from `_pipeline` with `log.exception("pipeline worker crash")` and
+  nothing else. The commonest cause is the speech model being unavailable, which
+  fails on *every* utterance: the user spoke and got nothing back, for good,
+  while the bubble still looked like it was listening and the journal said only
+  "crash". It now names the cause, tells the person (a notification plus a spoken
+  line when the turn is still current), puts the bubble back to idle, and alarms
+  **once per distinct cause** — a broken model fails on every turn, so an alarm
+  per turn is its own bug. A stale turn does not talk over a newer one.
+* **A reply that could not be spoken was recorded as spoken.** `_speak` wrote
+  `_last_spoken`, `_turn_spoke` and `_recently_spoken` *before* synthesis, so a
+  missing or unreadable piper voice left the bubble believing it had answered:
+  the announce-and-listen window opened on silence and the user's next utterance
+  was echo-filtered against a line that was never spoken. The three are now set
+  only after playback really happened, the echo entry is withdrawn on failure,
+  and the failure is reported once per cause. The echo entry is still armed
+  *before* playback — deliberately, because the mic hears our own voice while it
+  plays — and in the streaming path a failed sentence is dropped from `said`
+  while the sentences that did play are kept.
+* **A missing model named neither the path nor the fix.** `get_whisper` let the
+  bare library error through ("Unable to open file 'model.bin'") and the CPU
+  fallback call was not wrapped at all; `get_piper` did the same for a damaged
+  voice. Both now raise a `RuntimeError` naming the model, the directory, the
+  original cause and `install.sh`. Neither caches its failure (the model stays
+  `None`), so a retry after re-downloading recovers — pinned, because a poisoned
+  loader would leave the bubble deaf forever with no way back.
+* **A dead ydotool socket was cached for the life of the process.**
+  `_YDOTOOL_SOCK_CACHE` returned the first connectable candidate forever, which
+  contradicted its own docstring ("a daemon started later must be picked up on
+  the next call"): once ydotoold died, typing and clicking stayed broken — with
+  an error every time, but permanently — even after the daemon came back on the
+  *other* candidate (runtime dir vs the CLI's compiled-in `/tmp` default). The
+  cached path is now revalidated and re-probed when it stops answering.
+* **A dead compositor was reported as a failed app launch.** `open_app`
+  snapshots the window list, spawns, then waits; if niri died in between, every
+  poll failed and `_wait_new_window` swallowed it, so the timeout was reported as
+  "no new window appeared — it may still be starting (or failed to launch)",
+  pointing the user at the wrong thing entirely. The wait now distinguishes "the
+  window list was unreachable on *every* poll" and says the compositor IPC is
+  down. Keyboard injection is unchanged and still fails closed on unverifiable
+  focus.
+* **A backwards clock step silently changed a TTL.** `_load_world_seen` kept
+  entries newer than `now - TTL`; read through a clock that has stepped *back*,
+  `now - TTL` moves back with it, so entries genuinely past the TTL qualify again
+  — the seen-store silently stops expiring and those headlines are never
+  announced again for the duration of the rollback. The newest stamp in the file
+  is now used as the reference when it is ahead of the clock (which is exactly
+  the pre-rollback time), while the TTL still bounds the store. Session timing
+  was already immune and stays so: `_tick_now()` is `time.monotonic`, pinned by a
+  test that steps the wall clock back two hours.
+* **A full disk broke a documented contract — and could damage the backup.**
+  `set_setting`/`_persist_setting` promise a bool ("did this reach the disk?"),
+  and every caller tests `is False` to warn about an unsaved change; an OSError
+  from the write escaped instead, so a full disk made those callers crash with a
+  traceback instead of saying the change was not saved. The write is now guarded
+  and reports `False`. Separately, `_backup_runtime_json` copied straight over the
+  old `.bak`, so a failure part-way left the **backup** truncated — the file you
+  would restore from, damaged by the very failure backups exist for; it is now a
+  temp file + `os.replace` like every other runtime write, with mode 0600 set
+  before it becomes visible. The reminder queue had the same shape of hole: an
+  ENOSPC makes `drain_due` raise before it returns the fired entries, so the
+  reminder is never delivered *and* never pruned — it silently stops working, one
+  journal line per tick. The worker now alarms once per cause.
+
+**A tenth finding came from the ordering probe, not from reading code.** With
+`HANDSOFF_TEST_ORDER_SEED=deadbeef` — the seed derived from the commit SHA, so CI
+would have hit it — the suite went red on
+`test_notification_reader_reports_an_unsaved_toggle`, green in collection order.
+Root cause, measured not theorised: `core.tools._CURRENT` (and `core.doctor`'s)
+is a ContextVar holding the dependency-injection host, and whichever handsoff
+instance **loads last** owns it process-wide; the settings-app suites load a
+second monolith, so from then on any test that builds a ToolBelt with `__new__`
+(there are many) resolves `_dep().SETTINGS` and `_dep().set_setting` against the
+*foreign* instance. conftest now restores both ContextVars around every test. A/B
+proof on the same seed: neutered fixture → the same single red; restored → 890
+green, and green in six orderings (default, seeds `1`/`424242`/`deadbeef`, file
+orders `2`/`cafef00d`).
+
+**Gates:** 890 tests, coverage **77.1% ≥ 70**, `ci/compile_all.py` clean, green
+in all six orderings above. Deployed three-way equal (`in-sync`, 15/15 files,
+`handsoff.py` 751adfea…, `core/tools.py` 926bd37c…, `core/audio.py`
+e05c90f9…, `core/settings.py` c6e82551…), service active, no journal warnings
+since restart, `--ptt status`/`--ptt level` answering, and every new guard
+verified present in the installed copies. Nothing committed — the uncommitted
+pile now spans five audit batches plus every feature of the last several turns.
+
+
 ## Addendum — 2026-09-10 full-project audit closure (trust gaps, release
 ## safety, policy UI, supply-chain pins)
 
@@ -64,6 +242,614 @@ coverage depth (68% now; the remaining gaps are heavy widget-interaction
 flows), and the consciously-accepted Phase-3 leftovers (staged release
 directory *inside* the runtime + remote-transport policy doc are done; the
 full provenance/rollback story for the *manifest* itself remains as-is).
+
+
+## Addendum — 2026-09-12 six-item critical review (verified, four fixed, two re-scoped)
+
+1. **Remote-Ollama opt-in disagreed with itself — partly real, and the fail-open
+   half is now closed.** The claim was that `handsoff.py`'s guard accepted any
+   *truthy* `allow_remote_ollama` (`"yes"`, `1`) while `core/settings.py`
+   requires exactly `True` and the GUI coerces junk to `False`, so the same
+   file could read as opted-in to one and not the other. Verified: the
+   disagreement is real in the predicate, but **not reachable through
+   `settings.json`** — the bubble's `SETTINGS` comes from the same
+   `coerce_settings`, and I checked every junk shape end to end (`"yes"`, `1`,
+   `"true"`, `"on"`, `[1]`, `{"a": 1}` all coerce to `False`, with a loud
+   warning). It *was* reachable for any caller that seeds `SETTINGS` without
+   coercion (tests, a future refactor), so `_remote_ollama_optin_source()` is
+   now the single predicate — `is True`, not truthiness — used by the send
+   guard and by `doctor` alike. The genuinely useful part of the finding is a
+   second opt-in channel nobody could see: `HANDSOFF_ALLOW_REMOTE_OLLAMA` in
+   the environment turns the brain remote with **no trace in Settings**, so
+   `--ptt doctor` now names which channel opted in (`allow_remote_ollama in
+   Settings` vs `HANDSOFF_ALLOW_REMOTE_OLLAMA in the environment — NOT visible
+   in Settings`). Guard verified to fail on the old truthy predicate.
+2. **Control-socket peer auth — the proposed fix cannot close the stated
+   threat.** Verified as described: there is no `SO_PEERCRED` check anywhere,
+   and the 0600 mode on the socket *inode* does not gate `connect()`. But the
+   claim that this leaves "any same-user process" able to send
+   `ptt`/`stop`/`settings` is an accepted risk that peer credentials cannot
+   address: `SO_PEERCRED` reports the peer's **uid**, and a compromised child
+   of ours or a sandboxed app running as us has *our* uid, so no uid check can
+   exclude it. The actual boundary is already in place and is stronger than the
+   claim assumed — `_prepare_runtime()` refuses to start unless `STATE_DIR`
+   (where `control.sock` lives) is owner-only and not a symlinked directory,
+   and it is `0700` on this machine, so another *user* cannot traverse to the
+   socket at all. What I added is therefore defence in depth, not a fix:
+   `_peer_uid()` logs and refuses a peer whose uid is not ours, which still
+   holds if the directory mode is ever loosened, and keeps a record of who
+   tried. The refusal reads the request before closing, because closing a
+   socket that still holds the peer's unread bytes sends RST and the caller
+   would see a connection reset instead of the reason.
+3. **Reminders could never be emptied — real, user-visible, fixed.**
+   `ReminderStore.update()` did `items = mutate(items) or items`, so
+   `core.tools.cancel_reminder`'s `[r for r in items if ...]` returning `[]`
+   was falsy, the *loaded* list was saved straight back and **cancelling the
+   last remaining reminder silently did nothing**. `mutate` now returns the new
+   list or `None` for "edited in place", and only `None` preserves the loaded
+   list. Two regression tests (cancel-to-empty persists `[]`; an in-place
+   mutation returning `None` is not reverted); both verified to fail on the old
+   line.
+4. **Racy turn generation — real, and the audit pointed at the wrong code.**
+   The finding named `core/lifecycle.next_turn()` (and its duplicate in
+   `handsoff.py`), but that helper has **no runtime callers** — it is a facade
+   kept alive by its own tests, so fixing it would have changed nothing. The
+   live increments are eight inline sites (`_say_now`, `_announce_missed`,
+   `_fire_timer`, the crash report, `begin_listening`, `finish_listening`, the
+   PTT submit path, the dictation toggle), all now going through
+   `Assistant._bump_gen()` under one lock. Measured rather than asserted, and
+   the measurement corrected the finding: the plain one-liner
+   (`self._gen += 1` then `gen = self._gen`) did **not** reproduce — 64 000
+   concurrent claims, zero duplicates under the GIL — but the *wide* shape,
+   where `threading.Event()` is constructed between the increment and the read
+   (three of the real sites), produced **714 duplicate generations per 32 000
+   claims (~2%)**, and 16 930 per 128 000. A duplicate generation is exactly
+   what the `gen != self._gen` staleness checks and the gen-keyed transcript
+   cache trust, so a second utterance could be answered with the first
+   utterance's transcript. The guard is deterministic (a second thread is
+   proven to block on the lock) rather than a stress test, because the stress
+   test alone passes on the narrow broken shape; a source guard also pins that
+   no new `self._gen += 1` appears outside the helper. Both verified to fail on
+   the mutated code.
+5. **Unrestricted file read into LLM context — real, and there was a second
+   door.** `read_file` had no denylist while `cat` sits on the command
+   whitelist, so `run_command("cat ~/.ssh/id_rsa")` was an independent route to
+   the same content, and `watch_file` announced matched lines from any path.
+   One predicate (`denied_secret_path()`) now covers all three: credential
+   stores and key material (~/.ssh, ~/.gnupg, ~/.aws, ~/.kube, ~/.docker,
+   ~/.password-store, browser profiles, keyrings), shell history, and
+   secret-shaped names (`*.pem`, `*.key`, `*.env`, `credentials`, …). It
+   matches on the **resolved** path, so `~/.ssh/../.ssh/id_rsa` and a symlink
+   cannot slip past; `read_file` refuses *before* the existence check so it is
+   not an oracle; and the model's own prompt now says the refusal exists so it
+   does not burn turns or ask the user to paste a key. Precision was tuned by
+   measurement: an `id_rsa*` glob wrongly refused `~/Documents/id_rsa_notes.md`,
+   so the OpenSSH names are exact (`id_rsa.pub` is deliberately readable —
+   public keys are not secrets) while `.ssh/` covers the real keys. Seven
+   tests, four of them verified to fail on the un-wired code.
+6. **Model-switch "memory cleared" didn't clear — real, and deeper than
+   stated.** Confirmed: the path took a backup and never truncated, so the new
+   model inherited exactly the transcript its own comment blames for
+   parroting. But truncating the file is *not* sufficient and the finding stops
+   one step short: the bubble holds the transcript in `_history` and
+   `_save_history()` rewrites the whole file, so a second process deleting it
+   is silently resurrected on the next turn. There is now a `clear-history`
+   control action (`Assistant.clear_history()`, documented in `USAGE`) and
+   Settings→Brain calls it after truncating, so both writers forget. The same
+   defect was sitting in the History tab's own manual **Clear** button, which
+   only ever took a backup and told the user to restart — both paths now share
+   one `_wipe_history()`. A related hazard turned up while testing: a disk
+   reload did not refresh `_model_at_open`, so an unrelated save after an
+   external model change looked like a switch — harmless while it only made a
+   backup, destructive once the clear is real — so `reload_from_disk()` now
+   rebases it. Guard is an offscreen scenario that fails both when the
+   truncation is removed and when the rebase is removed.
+
+Accepted consciously / out of scope here: same-uid control-socket callers (see
+item 2 — no credential check can separate them; the 0700 state directory is the
+boundary and the residual risk is documented rather than papered over), and
+`core/lifecycle.next_turn()`'s own counter, which is still unsynchronised but
+has no callers (see item 4) — left alone rather than refactored blind.
+
+
+## Addendum — 2026-09-12 second review batch (items 7–28): nine verified and fixed, one false, twelve unexamined
+
+A second list of "major" findings arrived. Every one was read against the tree
+before anything changed. **Nine were real and are fixed; one is a false finding;
+twelve were not reached in this pass and are listed as open at the end of this
+section rather than quietly implied to be done.**
+
+**7. Settings persist swallowed its own failure — real, fixed.**
+`_persist_setting` caught `OSError` and returned, but `Settings.persist` then did
+`self._data[key] = value` regardless, and the bubble's wrapper went further still
+— updating `SETTINGS`, re-stamping the version and running
+`reload_derived_settings()` — so the runtime used, and re-wrote, a value that was
+never on disk. It now returns a bool, `persist` only updates the cache on
+success, and the wrapper keeps the old value and logs when it did not reach the
+file. Three tests, verified to fail on the old code.
+
+**8. Backup sidecars were not hardened — real, with live evidence.**
+`shutil.copy2` preserves the *source* mode, so a runtime file copied while it was
+still 0644 left a 0644 backup holding the same content. This is not theoretical:
+`~/.config/handsoff/history.json.bak-modelswitch` — a full conversation
+transcript — is `0644` on this machine, as are `history.json.bak-parrot`,
+`.bak-ydotool-err`, `.bak-loop2` and `settings.json.bak-threshold`. New backups
+are forced to 0600 (`_backup_runtime_json`, `_backup_keep_n`, `edit_file`'s
+`.bak`), and `_secure_runtime_files()` now sweeps `*.bak*` in the config and state
+directories on startup, because hardening the live file never touched the
+sidecars written before it. Three tests, including one that a symlinked sidecar
+is not followed out of the config dir.
+
+**10. ydotool "reachable" false positive — NOT reproducible.** The claim was
+that a SOCK_DGRAM unix `connect()` succeeds with no server listening, so a dead
+`ydotoold` still probes reachable. Measured directly: bind + close a DGRAM
+socket, then connect → **`ECONNREFUSED` (errno 111)**, exactly like SOCK_STREAM.
+The kernel refuses when nothing is bound to the path, so `_socket_connectable`
+is not fooled. Worth recording because the proposed fix would have made things
+*worse*: a `/proc`-based "is a live process holding this inode" check cannot see
+a root-owned `ydotoold`, and would have reported the working daemon unreachable.
+
+**11. play_wav leaked a stream and pinned the visual — real, fixed.**
+`sd.OutputStream(...)` and `start()` sat *outside* the `try`, so a failure
+skipped the final `_emit_level(0.0)` — leaving the bubble's designs frozen at the
+last playback level with no further audio coming to release them — and a
+`start()` that raised after a successful construction leaked the stream. The
+stream is now created inside the `try` with teardown in the `finally`. Two tests
+(constructor fails, `start()` fails), both verified to fail on the old shape.
+
+**12. tts_to_wav left a truncated wav — real, fixed.** `wave.open(target, "wb")`
+truncates the target immediately, so a synthesis failure left a truncated file
+where the last good reply had been. It now synthesizes to a `.part<pid>` sibling
+and `os.replace`s it, unlinking the temp on any failure. Two tests (failure keeps
+the previous file; success still replaces it), verified to fail on the old code.
+
+**13. Recorder races — real, fixed.** `start()` overwrote `self._stream`, leaking
+the device (PortAudio kept it open), and `_cb` appended while `stop()`
+concatenated with no lock. `start()` now closes any previous stream first (and
+closes the new one if `start()` fails), and a buffer lock guards
+`_frames`/`_samples` and `_level`. The lock is deliberately **not** held across
+`stream.stop()`: PortAudio joins the callback there, so holding it would
+deadlock against `_cb` trying to append — which is why `stop()` stops the stream
+first and only then snapshots the buffer.
+
+**14. Bounded stop discarding audio — not examined this pass** (see open list).
+
+**15. `_open_input` hid the root cause — real, fixed.** The retry path did a bare
+`except Exception` and re-raised the *second* error, so "invalid sample rate"
+hid the real "device busy". The retry now does `raise retry_error from
+first_error`, so the original cause is in the traceback.
+
+**16. The thinking filter dropped legitimate replies — real, fixed, and it cut
+both ways.** `strip_thinking` only removed *closed* `<think>…</think>` blocks, so
+an unterminated one streamed the model's reasoning into TTS; and the stream loop
+dropped any sentence merely *starting* with `<`, so "<3 that's sweet" and "it's
+<5 minutes away" were silently swallowed before speech. The filter is now a
+closed set of real control tokens (`<think>`, `<tool_call>`, `<|...`) and
+unclosed blocks are dropped wholesale. The duplicated fallback filter in
+`handsoff.py` (used when `core/` is not importable) was hoisted to one
+module-level implementation, and a test asserts the fallback and `core.brain`
+agree over a corpus — the drift between two copies is how the `<` bug survived.
+Five tests, all verified to fail on the old code.
+
+**17. Barge-in spoke the pending tail — real, fixed.** When `cancel` broke the
+read loop, the buffered tail was queued anyway (only the terminator followed), so
+a partial sentence was spoken *over* the user who had just interrupted. The tail
+is now flushed only when the turn was not cancelled. Pinned by a test that sets
+`cancel` mid-stream and asserts the queue holds nothing but `None`.
+
+**18. Argument coercion guessed instead of reporting — real, and worse than
+claimed.** `bool("false")` is `True`, so a JSON `"false"` silently *inverted* a
+flag; junk became `0`. The unlisted half: because the loop always passed every
+parameter, an **omitted optional numeric argument was sent as `0` instead of
+taking the default its signature documents** — `snooze_reminder(minutes=10)`
+failed its own bounds check whenever the model left the argument out, making the
+documented default unreachable. Coercion is now strict (`true/false/yes/no/on/off`),
+junk raises and surfaces as `ERROR: bad arguments for <tool>: …, got 'soon'`, and
+an omitted parameter with a default is simply not passed. Five tests, including
+an end-to-end one that snoozes with no `minutes` and asserts ~10 minutes.
+
+### Open — not examined in this pass
+
+Listed explicitly so the gap is visible rather than assumed closed: **9**
+(`watch_file` ReDoS / symlink following / existence oracle), **14** (bounded stop
+discarding the owner thread's audio), **19** (CONFIRM TOCTOU), **20** (`BoundedJob`
+zombies and `output_tail` tailing the head), **21** (notification reader thread
+leak), **22** (pomodoro double-start), **23** (ICS over cleartext http), **24**
+(whisper mirror resurrection), **25** (GUI saving unvalidated values), **26**
+(`install.sh` `rm -rf` on a shared `BIN_DIR`), **27** (`_with_timeout` thread
+pile), **28** (CI floor/comment mismatch and the GitLab junit digest on jobs that
+write no report).
+
+**Update (same day, later in the session): items 9, 19, 20, 21, 22 and 23 are
+closed** — see the fourth addendum below, which also records that 19 was
+disproved rather than fixed and that 9 raised a new finding (the secret iCal URL
+was echoed into the transcript by the calendar error path). Still open: 14, 24,
+25, 26, 27, 28.
+
+Also observed while running the suites, and **not** caused by these changes:
+the `TestKillProcess` pair in `tests/test_policy.py` was order- and
+environment-sensitive — it matched `sleep` processes by name, so a stray `sleep`
+left by an earlier run made `kill_process` report "several match" and the
+confirmation assertions fail. **Fixed** in the third-review addendum below.
+
+
+## Addendum — 2026-09-12 third review batch (concurrency, isolation, install traps)
+
+A narrower batch than the previous two: two real shared-state races, one test
+isolation defect that could fail CI for unrelated reasons, and four items checked
+and deliberately left alone.
+
+1. **`hardware._probe` mutated the shared TTL cache without a lock.** The cache
+dict is shared between `doctor`'s worker thread and the Qt thread's hardware
+tick, and the check-then-store was unsynchronized, so a stamp could be written
+from a value that had already been superseded — a stale entry coming back
+looking freshly probed. A module-level `_TTL_LOCK` now guards the read and the
+write. It is deliberately **not** held across `fn()`: the probers shell out
+(`nvidia-smi`, `systemctl`, `journalctl`) and serializing them would let one
+stalled probe block every other section; two threads may still probe the same
+section at once and the last result wins, which is what the lock actually needs
+to prevent.
+2. **`BoundedJob` could announce the same completion twice.**
+`if not job._announced: job._announced = True` is a check-then-set with no lock,
+and a spoken turn and a hands-free turn can poll concurrently — both saw `False`
+and the finished job was spoken twice. Replaced by `claim_announcement()`, which
+returns `True` for exactly one caller.
+3. **`tests/conftest.py` loaded `handsoff.py` without registering it in
+`sys.modules`.** Several test modules load the monolith by path as
+`handsoff_core`; because that name was never registered, a later `import
+handsoff` built a **second instance** with its own `SETTINGS`, locks and caches.
+Core submodules were already shared (`H.ToolBelt is core.tools.ToolBelt`), so the
+divergence was inert in practice — but it is exactly the shape that produces
+order-dependent flakes rather than errors, so `_load` now registers the module
+(and only for `handsoff.py` aliases the bare name, since doing it for every
+module would put `core/audio.py` into `sys.modules` as `"audio"`), and unwinds
+on a failed load so no half-initialised module is left for the next test.
+4. **`TestKillProcess`'s two-step tests were environment-sensitive.** They
+matched `sleep` by name against the *real* `/proc` scan, while
+`kill_process` requires an EXACT single match — so any stray `sleep` owned by
+the same user (a leftover from an earlier suite, another test's helper, the
+developer's own shell) turned the offer into an "several match" ERROR and failed
+the test for a reason unrelated to the code under test. Reproduced
+deterministically with one stray `sleep`. Discovery is now pinned to the test's
+own child; the kill itself still happens for real, and the test still fails if
+the offer/confirm handshake regresses (verified by mutation). The real-scan
+behaviour keeps its coverage in `test_ambiguous_match_refused`,
+`test_no_match_and_other_users_invisible` and `test_port_targeting`.
+
+### Checked and deliberately not changed
+
+* **`ydotool` "reachable" false-positive (item 10)** — **not reproducible**: a
+dead DGRAM server returns `ECONNREFUSED (111)` from `connect()`, same as
+`SOCK_STREAM`, so liveness was never falsely reported. The `/proc`-inode check
+proposed as the fix would additionally have broken a root-owned `ydotoold`
+(same socket, different uid in `/proc/net/unix`). No change made.
+* **`install.sh` `PYTHON_PKGS` probe** — a stale pacman DB can report a new
+package as missing; the script already tells the user to refresh and documents
+the trap. Widening it to a blind `pacman -S` would trade a clear message for an
+unprompted sync. Left as documented behaviour, not a support trap to paper over.
+* **`_resample_to_16k`** — the FFT low-pass has no window, so non-integer
+ratios leak a little spectral energy. Quality-only, inaudible at speech rates,
+and the alternative (a real filter design) is a dependency-sized change for no
+functional gain.
+* **`core/__init__.py` module swap** — the loader's bare-name swap really is
+gated on `_origin_ok(prev_bare)` and the failure path restores. Subtle but
+correct; recorded as fragile rather than rewritten under a race-sensitive
+suite.
+
+Suite after this batch: **822 tests, coverage 76.2% ≥ 70**, `ci/compile_all.py`
+clean, and the `TestKillProcess` pair passes **with a stray `sleep` deliberately
+alive**, which is what the fix was for.
+
+
+## Addendum — 2026-09-12 fourth review batch (the six open items): five fixed, one disproved, one extra finding
+
+The six items left open by the previous passes, worked one at a time and each
+pinned with a guard that was verified to fail on the unfixed code.
+
+1. **`watch_file` ReDoS (item 9).** Real, and measured rather than assumed:
+   `(a+)+$` against a 29-character *non-matching* line runs for minutes — each
+   added character doubles the work — and a watcher evaluates its pattern once a
+   second on a daemon thread that nothing can interrupt, so the watcher dies for
+   good and pins a core doing it. Stdlib `re` has no timeout, so three bounds are
+   enforced instead: the exponential SHAPE (a quantified group whose own content
+   carries a quantifier: `(a+)+`, `(\d+)*`, `(.*x){4}`) is refused with a clear
+   message; the pattern length is capped; and the text any single evaluation sees
+   is capped. The refusal is deliberately limited to shapes we can name with
+   confidence, so a legitimate pattern is never rejected on a guess —
+   `(ERROR|WARN): .*` still works. Residual risk is documented rather than
+   hidden: an *overlapping-alternation* blowup like `(a|aa)+` is still
+   expressible, because telling it apart from a safe `(foo|bar)+` needs
+   first-character-set analysis we are not going to do.
+   Synthesis caught a bug of my own making here: the first version capped the
+   lines examined per poll but still advanced the file cursor past the whole
+   chunk, so a burst larger than the cap was **silently dropped forever**. The
+   cursor now advances only by the bytes actually examined, which defers the
+   rest to the next poll, and the guard tests both halves (bounded per poll AND
+   nothing skipped, in order).
+2. **CONFIRM TOCTOU (item 19) — disproved.** The finding described the pending
+   offer as a snapshot taken under the lock and re-checked after the release.
+   It is not: the offer is both read and cleared inside one
+   `_confirmation_lock` critical section, so a racing second `confirm_action`
+   finds nothing pending and refuses. Pinned with eight real threads (exactly
+   one may run the tool). The only thing the post-release read ever did was print
+   a second log line, which is what made it *look* like a check-then-act; that
+   read is gone. The finding's second half — the offer is not cleared at turn end
+   — is by design: the whole feature is "offer in one turn, confirm in the next",
+   and the offer is time-boxed by `confirm_seconds`. Narrowing it to "only the
+   immediately following turn" was considered and rejected: the turn marker is
+   the generation counter, which other events can bump, so the rule would
+   sometimes refuse a legitimate confirmation.
+3. **`BoundedJob` (item 20).** Three separate defects, all fixed. (a) The drain
+   buffer kept the FIRST `MAX_OUTPUT` bytes, so `output_tail` — documented as
+   "recent output" — handed back the startup banner and dropped whatever came
+   after it for any job that outran the cap; it now keeps the LAST bytes, with
+   amortised trimming that halves the buffer at a time. (b) A `SIGKILL` whose
+   `wait(timeout=2)` expired was swallowed and the job still reported
+   `timeout-killed`, dropping the only reaper the job has and leaving a zombie
+   until handsoff exited; it now stays `running` and retries. (c) `read()`
+   returns only when *every* writer closes the pipe, and the job runs in its own
+   session, so a grandchild that inherited stdout kept the drainer blocked for
+   the rest of the session — the reap path now releases it.
+4. **Notification reader (item 21).** `set_enabled(False)` never joined the
+   worker, so "off" was only a promise: the old loop could still be parked on the
+   dead monitor's stdout, and enabling again started a second loop beside it —
+   two readers, one holding the previous stop event, both speaking. Disable now
+   joins (and clears the reference). The bigger defect was the silent death: five
+   dead `dbus-monitor` respawns left `notification_reader=True` with nothing
+   listening, so the toggle and the settings file said on and no notification
+   would ever be spoken again. Giving up now logs at error level, clears the
+   monitor and persists the reader OFF.
+5. **Pomodoro (item 22).** The `is_alive()`-then-start pair was an unlocked
+   check-then-act, so two overlapping turns could start two workers announcing
+   every phase boundary twice; start/stop/transition now share one re-entrant
+   lock. The ghost announce was real and is now deterministic: the phase flip
+   re-checks under that lock whether a stop landed while its `wait()` was
+   expiring, so "pomodoro stopped" can no longer be followed by "back to work".
+   `shutdown()` also joins, so "stopped" means the worker is out rather than on
+   its way out.
+6. **ICS over cleartext (item 23).** A Google "secret iCal address" is a bearer
+   credential — whoever reads the URL reads the whole calendar — and the settings
+   row has always advertised https while the code accepted `http://` for any
+   host. Plain http is now refused off-loopback (`http://localhost` and
+   `127.0.0.0/8` stay allowed, since a URL pointing at this machine is not on the
+   wire). **New finding while fixing it:** the failure path echoed the *source
+   URL* into the transcript (`could not read calendar source(s): http://…/`, and
+   `HTTPError` strings carry the full URL), so a failing calendar fetch printed
+   the user's secret token into the conversation. Sources are now reported
+   scheme+host only, with the reason sanitised.
+
+Suite after this batch: **841 tests, coverage 76.4% ≥ 70**, `ci/compile_all.py`
+clean, all eight new guards verified to fail on the mutated (pre-fix) code —
+including, for the watcher, that a pattern the guard *refuses* really does hang
+a subprocess past a 2-second timeout.
+
+
+## Addendum — 2026-09-12 test-suite determinism audit (ambient state, ordering, wall-clock)
+
+A whole-suite audit for the defect class just fixed in `TestKillProcess` (tests
+that depend on ambient system state, stray processes, ordering, or wall-clock
+timing), fixing each at its cause rather than at each symptom. Two of the
+findings were systemic and would have kept producing flakes forever.
+
+1. **The suite graded itself against the developer's configuration.** The
+   monolith resolves `CONFIG_DIR`/`STATE_DIR` from `HOME`/`XDG_STATE_HOME` at
+   import and then READS the `settings.json` it finds, baking the result into
+   module-level state: `SETTINGS`, `SYSTEM_PROMPT`, derived globals. On this
+   machine `notification_reader` is true, so **every `Assistant()` built
+   anywhere in the suite spawned a live `dbus-monitor` and leaked its reader
+   thread** — 13 tests were leaving one running — and the system prompt was
+   built from a personal assistant name. Tests were also reading and writing the
+   real `~/.config/handsoff`, history, memory and control socket. conftest now
+   imports the app with `HOME`/`XDG_STATE_HOME`/`XDG_CONFIG_HOME` pointed at a
+   throw-away directory and restores them immediately, so the module is
+   configured from defaults and the tests are out of the developer's files.
+   A guard test asserts the isolation (no real home in the parents of
+   `CONFIG_DIR`, `STATE_DIR`, `HISTORY_FILE`, `MEMORY_FILE`, `LOG_FILE`,
+   `CONTROL_SOCK`), because the failure mode is silent: everything still passes,
+   just against someone else's settings. `test_hardening.py` was also loading
+   its OWN second copy of the monolith (bypassing the isolation entirely, and
+   giving the suite two module objects with separate locks and caches); it now
+   shares the one session-scoped instance.
+2. **Two tests only passed because of that configuration** — which is exactly
+   how a config-dependent suite hides in plain sight. `_match_wake` fuzzy-matches
+   a misheard name by pronunciation skeleton, and the skeleton needs a name of
+   four or more letters that shares consonants with what whisper heard;
+   `test_match_wake_fuzzy_misheard_name` asserted the whole `cypher`→`Siphon`
+   story while inheriting the name from `settings.json`, so on the default name
+   it failed. The name is now pinned in the test. `test_prompt_identity_uses_wake_name`
+   compared `SYSTEM_PROMPT` (baked at import) against live settings, so it only
+   matched when the real config had been renamed.
+3. **Ordering is now irrelevant by construction.** Tests hand-edit the
+   session-scoped monolith's globals (`SETTINGS["command_policy"]`, `OLLAMA_BASE`,
+   the snooze/kill offers, the notify coalescer) and several never restored
+   them, so a leak could only surface as a failure in an unrelated *later* file.
+   An autouse fixture snapshots and restores that state around every test, so no
+   test can be affected by one that ran earlier. Verified: the suite is green in
+   collection order, reversed order, and two shuffled file orders.
+4. **Leaked worker threads are now failures, at the test that leaked them.**
+   An autouse fixture fails a test that leaves a stoppable worker (file/process
+   watcher, job drainer, pomodoro, notification reader) running, after a bounded
+   settle so a legitimate unwind is not mistaken for a leak. It found the 13
+   reader leaks above the first time it ran, and was verified to fire on
+   deliberately leaked `watch-file`/`notification-reader` threads.
+5. **Wall-clock timing replaced by condition polling.** A fixed `sleep(N)`
+   followed by an assertion is a bet on this machine being idle — it can only
+   fail spuriously, never catch a bug faster. Converted:
+   * the four notify-coalescing tests slept 0.6–0.8 s against a 0.5 s production
+     debounce; they now wait on the coalescer's own state (timer cleared,
+     nothing pending) plus the expected popup count, which is *stronger*: a
+     batch that would send a trailing duplicate still has its timer set, so the
+     state is not idle yet. Verified to fail on a mutated flush that sends a
+     duplicate.
+   * `test_lifecycle`'s `fake_ollama` fixture slept 0.8 s hoping the server had
+     bound; it now polls a TCP connect on its ephemeral port and fails with the
+     child's exit code if it died. (An HTTP readiness probe was written first
+     and would have hung forever — the fake implements only `POST /api/chat`.)
+   * four sleeps-then-assert-a-worker-ran sites (reminder/timer/snooze
+     announcements, the snooze persistence) now poll through a shared
+     `conftest.wait_for`.
+   * the `_bump_gen` contention probe slept 0.15 s and hoped the competing
+     thread had reached the claim; it now wraps the lock so the test knows the
+     claimer is *inside* the acquire, which makes "nothing claimed yet" mean
+     blocked rather than not-yet-scheduled. Verified to fail on an unlocked
+     `_bump_gen`.
+6. **Ambient processes and a hardcoded port.** `test_port_targeting` bound port
+   18744 and slept 0.6 s: a fixed port collides with anything else on the
+   machine (or a leftover server from an earlier crashed run). It now takes an
+   ephemeral port and waits for the listener, failing with the child's status if
+   `http.server` exits early. `test_ambiguous_match_refused` scanned the real
+   `/proc` for two `sleep`s; it now pins discovery to two entries, since the
+   subject is the EXACT-single-match rule. The remaining `sleep`s in the suite
+   were reviewed one by one and left alone where they are bounded polling loops
+   or deliberate concurrency probes.
+7. **Order-independence is now a CI gate, not a manual habit.** Everything above
+   made the suite *capable* of passing in any order; nothing stopped the next
+   ordering dependence from living in collection order forever, since that is the
+   only order anyone runs day to day. `tests/conftest.py` gained two seeded
+   shuffle modes (`HANDSOFF_TEST_ORDER_SEED` for the tests, `HANDSOFF_TEST_ORDER_FILES`
+   for the file order only, each file's internal sequence intact), and a new
+   `order` job in both pipelines re-runs the whole suite in each mode. The seed
+   is derived from the commit SHA, so the order differs commit to commit while a
+   red build stays exactly reproducible from the seed the run banner prints (the
+   terminal summary repeats it, because CI runs `-q`, which suppresses the
+   header — a shuffled failure without its seed is not diagnosable). The
+   *file-contiguous* mode is not redundant: it is the stricter probe of what one
+   file leaves behind for the next, and its failure output is far easier to read.
+   The mechanism was proven to bite before it was wired in: a scratch module with
+   an intentional writer-before-reader dependence passed in collection order and
+   was caught by 3 of 8 shuffle seeds. Verified green across seven orderings
+   (HEAD-SHA test-shuffle, HEAD-SHA file-shuffle, plus seeds 1/424242/deadbeef
+   and 2/cafef00d), 842 tests each.
+
+Suite after the audit: **842 tests**, coverage 76.2% ≥ 70, `ci/compile_all.py`
+clean, green in collection, reversed and shuffled file order. No production code
+changed, so the deployed bubble is unchanged (`--ptt doctor` still `in-sync`).
+
+Also fixed while in these files: the `coverage` job's name and header comment
+both said **≥ 60%** while the command enforced `--cov-fail-under=70` (and
+`.coveragerc` said 70) — the floor itself was right, only the label lied.
+
+
+## Addendum — 2026-09-12 fault-injection pass (the boundaries, broken on purpose)
+
+Every other suite proves what the bubble does when things work. This pass breaks
+one external seam at a time — at the boundary (the HTTP opener, the recorder's
+return value, the popen factory, the write path), never by standing in for the
+code under test — and asserts the bubble degrades **loudly**: a WARNING/ERROR
+findable in `journalctl`, a spoken line naming the cause, a reported failure, a
+toggle that stops claiming to be on. It also asserts the *absence* of the silent
+alternative: no fabricated success, no swallowed error, no value reported as
+saved when it is not. `tests/test_fault_injection.py`, 19 tests, 4.6 s.
+
+**Five real defects, none of which any existing test could have caught:**
+
+1. **Ollama refusing produced the wrong diagnosis** (worst of the five, and it
+   hit the user-visible path every time their model server was down).
+   `core.brain.ollama_chat_stream` re-raised `urllib.error.URLError` as-is,
+   while the non-streaming `ollama_chat` converts it to `RuntimeError` *precisely
+   because* `_brain_turn` diagnoses a down brain from `RuntimeError` alone. With
+   streaming on (the default) a dead Ollama therefore spoke *"Sorry, my brain
+   gave me an empty answer"*, logged "stream finished without a result", and
+   threw the real error as an unhandled exception in the streamer thread — the
+   actionable part ("cannot reach Ollama at …; `systemctl start ollama`") went
+   unspoken. The conversion now happens in the streaming path too, and the test
+   drives the real `_brain_turn` with only the opener injected.
+2. **A push-to-talk press that produced nothing was dropped in silence.**
+   `submit_audio` returned bare — no line, no state, no trace — for `audio is
+   None` (bounded stop timed out, device failed to open) and logged a plain
+   `INFO` for a capture below the threshold. A muted device and a silent user
+   were indistinguishable in the journal. Now the empty case is a WARNING naming
+   the two causes, and a rejected capture reports `frames= peak= threshold=`; the
+   *hands-free* variant deliberately stays at INFO, because room noise there is
+   ordinary and crying wolf would make the loud case worthless.
+3. **A failed settings write left memory claiming the change.** `set_setting` —
+   the single entry point every mutation is supposed to go through — wrote
+   `SETTINGS[key]` *before* calling `_persist_setting`, and ignored its return,
+   reintroducing at the entry point exactly the divergence item 7 closed for the
+   wrapper's other callers. It now updates memory only on a reported success and
+   returns whether the value reached the disk.
+4. **The notification toggle lied about an unsaved change.** The
+   `notification_reader` tool (and the mute list) reported success regardless of
+   the write; both now return a WARNING naming the revert-on-restart. The same
+   for `set_handsfree`, whose `except OSError` was dead code — `_persist_setting`
+   reports failure, it does not raise.
+5. **A control socket that vanished under a live bubble was never noticed.**
+   The accept loop keeps listening on an inode no client can reach; `--ptt` said
+   "not running", doctor said "not created yet", and the running process said
+   nothing at all. The loop now compares the path against the ident captured at
+   bind (once per idle second) and either re-binds and says so, or — when
+   *another* inode holds the path — logs an error and leaves it alone, because
+   unlinking could delete a second live bubble's socket. The CLI also names the
+   socket it looked for now.
+
+6. **The installer delivered files the project does not own** — found *after*
+   deploying, and only because the deploy was verified: `--ptt doctor` reported
+   `installed-drift` minutes after a clean `in-sync`, on a tree where all fifteen
+   deployed files hashed equal. The cause was a sixth `.py` in the tracked set: a
+   scratch `test.py` the user had made for a TTS experiment. `install.sh` staged
+   `"$HERE"/*.py` on the theory that *anything beside handsoff.py is part of the
+   app* — so that scratch file was copied into `~/.local/bin` (the user's PATH)
+   and hashed into `deployment.json`, and the moment the user edited their own
+   experiment, doctor declared the whole bubble stale. A stray name can also
+   **collide with a real binary in `$BIN_DIR` and overwrite it** — the same shared
+   directory hazard as the uninstall path. Top-level membership is now *the
+   declared entry points plus what the repo tracks* (`git ls-files`), with the
+   glob kept as the fallback outside a git work tree, so a new module still ships
+   the moment it is committed (no list to maintain) while a scratch file never
+   leaves the checkout. One helper (`ship_top`) is the single definition, called
+   by staging, the manifest generator and the rehearsal check. Verified in an
+   isolated copy: a **committed** new module still shipped, an **untracked** one
+   was skipped and announced; and on the real tree the rehearsal prints
+   `NOT shipping test.py …` and the manifest no longer tracks it, so doctor
+   reports `in-sync` again.
+
+**Three findings about my own work, each caught by measuring rather than
+assuming:**
+
+* The obvious way to tell whether the path still names our socket — compare
+  `os.fstat(sock.fileno())` with `path.lstat()` — **does not work**: on an
+  AF_UNIX fd, `fstat` reports the *socket object's* inode, not the filesystem
+  entry's (measured: they differ). A draft built on it would have declared the
+  socket orphaned every second and re-bound forever. The ident is captured from
+  `lstat` right after `bind` instead, and that was measured to be stable and to
+  change when another process takes the path.
+* The first draft of the rebind **raced shutdown**: `stop()` removed the path,
+  the accept loop was sitting in its timeout branch, and the loop re-created the
+  socket *after* cleanup — leaving behind the stale inode the class exists to
+  avoid. It showed up as a cross-test failure (`clear_history_roundtrip` served
+  "cleared 0"), i.e. the very ordering dependence this suite has been auditing
+  for. The loop now breaks on the stop flag and `_rebind` refuses while
+  stopping, pinned by its own test.
+
+Every guard was verified to fail on the mutated code (six mutations: the
+URLError conversion, both halves of the capture path, the `set_setting`
+pre-write, both tool reports, the handsfree warning, the orphan check, and the  stop guard). Live verification on the running bubble, not just in tests: the
+control socket was deleted with the bubble up, `--ptt status` failed with the
+path named, and the bubble re-bound and logged the warning (inode 52035683 →
+52035763) with `--ptt status` answering again.
+
+* **The periodic repair first read the wrong thing — the module global.**
+  `CONTROL_SOCK` can be reassigned (every test that touches the control socket
+  does exactly that), and a server left running from an earlier test then
+  repaired *whatever path the global now named*: measured directly, a server
+  bound at `a.sock` happily created a fresh 0600 socket at `b.sock` after the
+  global moved. In the suite that surfaced as an intermittent — and, because it
+  is timing-based, only sometimes reproducible — failure in
+  `tests/test_hardening.py::TestSecureFile::test_stale_permissive_socket_self_heals`,
+  whose 0777 socket was replaced under it. Ownership is now the path string
+  captured at bind: anything else is somebody else's socket, and the server
+  touches nothing. (Note the first attempt at proving this guard bit failed
+  *because the guard was in two places* — the mutation had to remove both.)
+  Three consecutive file-shuffled full runs are green since, where two runs
+  before it produced the failure once.
+
+864 tests (20 fault-injection + 2 installer-membership), coverage 76.36% ≥ 70,
+`ci/compile_all.py` clean, green in default, shuffled-test and three
+file-shuffled orders. Deployed (`in-sync`, 15/15 files three-way equal,
+`handsoff.py` f5c7df39…, `core/brain.py` ed42875e…, `core/tools.py`
+f60bb35e…), service active, live bubble re-verified (`--ptt status`, `--ptt
+level`) and the installer now prints `NOT shipping test.py …` instead of
+delivering it.
 
 
 ## Addendum — 2026-09-11 appearance controls, hygiene, reminders extraction
@@ -199,7 +985,69 @@ full provenance/rollback story for the *manifest* itself remains as-is).
    `test_shape_change_applies_without_pressing_save` drives the real window
    offscreen and asserts the file changes with no Save click; a second scenario
    asserts that opening and closing the window leaves the file byte-identical.
-11. **The recorded crash was a PortAudio teardown race, not the bubble crashing
+11. **"On Appearance only the shapes apply" — measured, and it was true.** The
+   sliders saved correctly (`animation_energy` 1.1 / `bubble_accent` 0.49 were
+   on disk), but rendering a frame at slider extremes in a child process with a
+   frozen clock showed the accent changing **literally zero pixels** on
+   `reactor`, `droplet` and `void` and 2–35 pixels of 45796 on five more — 14
+   of 20 design/slider pairs moved nothing. The cause: `bubble_accent` was
+   applied only inside `_conic()`, which just `orb` and `halo` ever call; the
+   other eight painters draw with `f["color"]` / `f["energy"]`, neither of
+   which carried it. `animation_energy` was similarly confined to motion terms
+   most designs ignore, and the idle equalizer ignored it outright.
+   Fix: both sliders are folded into the shared frame dict once, in `_frame()`
+   — the accent punches `f["color"]`/`f["sat"]` and exports `f["glow"]`
+   (which `_conic` now reads instead of recomputing), and `anim` scales
+   `f["energy"]`, which all ten painters already consume. The void also scales
+   its rim/streaks by `glow`, and the equalizer's idle bars by `anim`.
+   All twenty pairs now move ≥1501 pixels.
+   Two honesty notes: `0.5` is **now** genuinely neutral in both directions
+   (`2 * (accent - 0.5)`), so the lower half of the slider reduces accent
+   instead of doing nothing — the old `1.0 + 0.35 * accent` was 1.175 at the
+   default and could never go below 1.0, contradicting the tab's own "50% is
+   the original look". Consequence: at defaults 7 of 10 designs are
+   pixel-identical to the previous build and the other three differ by 4–99
+   pixels of 45796, because the historical (pre-accent) look is what `1.0`
+   restores. `tests/test_settings_gui.py`'s render scenario now asserts the
+   pixel response per design rather than only that `_frame()` carries the
+   numbers — the weaker assertion that let this ship.
+12. **"Push to talk is broken" — it was, whenever hands-free was on.** If the
+   continuous listener is running, `_on_command("toggle")` took the `else`
+   branch (`elif state == IDLE and not self._handsfree`) and only interrupted,
+   while `begin_listening()` called `_listener.suspend()` and returned without
+   ever opening a recorder. So with hands-free on the PTT key was a **silent
+   no-op with no feedback whatsoever** — and hands-free was the user's stored
+   setting. Fix: a PTT press now parks the continuous listener (stop, not
+   suspend — one InputStream at a time on this device) and records normally;
+   `finish_listening` submits that capture and restarts the listener off the
+   Qt thread once the recorder is actually released; the `and not
+   self._handsfree` guard is gone. Interrupting while the bubble is speaking
+   still wins. Verified live with hands-free on: press → `state=listening`,
+   release → a 216064-frame submit and a spoken reply.
+   Pinned by `TestPttWorksWithHandsfreeOn` (5 tests; 3 of them fail against the
+   previous build, confirmed by mutation run).
+13. **"What about the colours — they don't apply" — and the size slider either.**
+   Two more instances of a control that looks wired but is not.
+   (a) `_apply_appearance_live` writes only when one of `APPEARANCE_KEYS`
+   differs from disk — that is how a form *load* is told apart from an edit.
+   `colors` was not in that tuple, so an edit that moved **only** a colour
+   compared equal, was read as "a load, not an edit", and returned before
+   `save()`. The colour never reached `settings.json`; the bubble was fine (it
+   has always rebuilt `STATE_COLORS` from `settings["colors"]` on reload, pinned
+   in `tests/test_lifecycle.py`). `colors` and `bubble_size` are now in the
+   compared set, and the status line names what actually moved instead of always
+   claiming the shape — the old message is part of why this read as "only the
+   shapes apply".
+   (b) `size_slider.valueChanged` was connected to a **label update only**, so
+   Bubble size never applied live either. It now schedules the same debounced
+   apply as the rest of the tab.
+   Both are pinned by new scenarios that fail against the previous build:
+   `colour_change_applies_without_save` (asserts the hex lands on disk and the
+   status names "state colours") and `size_slider_applies_without_save`. A third,
+   `loading_the_form_is_still_not_an_edit`, guards the property the fix could
+   have broken — a plain reload (which the 2s disk poll performs) still writes
+   nothing.
+14. **The recorded crash was a PortAudio teardown race, not the bubble crashing
    on its own.** `~/.local/state/handsoff/handsoff.log` records
    `Fatal Python error: Aborted … Thread-7 (_spea…) sounddevice.py line 915 in
    __init__` — the hands-free listener's recovery path calls `sd._terminate()`
@@ -214,6 +1062,68 @@ full provenance/rollback story for the *manifest* itself remains as-is).
    fallback now carries the same guard as an inert no-op — the recovery path
    calls it from *inside* an `except` block, where an `AttributeError` would
    escape.
+15. **Eleventh design: "Eye of Sauron"** (`sauron`). A slit-pupilled almond eye
+   wreathed in flame, added to `BUBBLE_DESIGNS`, dispatched in `paintEvent`,
+   and labelled "Eye of Sauron" in the combo (via a small display-name map, so
+   `sauron` does not render as a bare "Sauron").
+   Design decision worth recording: like `void`, this one keeps its **own**
+   palette — canonical fire (deep red → orange → white-hot core) — because that
+   is the design, not a palette choice. The state colour is not ignored, it is
+   relocated: it tints the outer corona and the flame wisps, so the Appearance
+   colour picker still visibly moves the eye. Both sliders work through the
+   shared frame state added in item 11: `energy` drives the blaze, pupil flare
+   and flame length, `glow` (the accent) the corona/rim punch.
+   That composition was **measured, not assumed**: the first cut put a large
+   tinted disc under the eye and only 38.3% of the drawn pixels were warm — the
+   state-colour aura had become the subject and the fire the background. Moving
+   the tint to a late, thin outer stop and adding a rim of fire took it to
+   **77.7%** warm (73.9–80.3% across the energy/accent extremes). Footprint is in
+   the family of the existing designs (105/104 half-extent vs orb 100/100, cube
+   107/110) and clips nothing. Structural checks confirm the intended form: a
+   bright iris with an 18 px dark slit on the centre row and a 76 px vertical
+   dark run on the centre column — a slit pupil, not a hole.
+   The render scenario is data-driven over `BUBBLE_DESIGNS`, so the new design
+   is automatically covered for all four state colours at the slider extremes
+   *and* by the ≥100-pixel response assertion. One hand-copied list was retired
+   in the process: `test_bubble_design_accepted_and_garbage_falls_back`
+   enumerated the ten names as literals and was already silently ignoring
+   `sauron`; it now iterates the shipped tuple with a non-empty floor.
+16. **The Eye reacts to the voice.** The pupil contracts and the fire flares
+   with `level` — the same 0..1 amplitude the equalizer bars follow — measured
+   at 11 → 10 → 8 → 6 → 4 near-black pupil pixels across levels 0 … 1.0, a
+   17% larger flame footprint, and ~21–33k visibly changed pixels.
+   Making this honest in *both* states needed a second piece: during SPEAKING
+   the listener returns early (`_process_frame` drops frames while the bubble
+   talks, so its own TTS cannot re-trigger the VAD) and never emits `sigLevel`.
+   The equalizer therefore only *looked* voice-reactive while speaking — it was
+   driven by a time-based pulse. `core/audio.py` now exposes `set_level_hook()`
+   and `play_wav` reports the level of what it is actually playing: per 1024-
+   sample block (~46 ms at 22050 Hz, ~21 updates/s, and the stream's own
+   blocksize so no extra latency), normalised against the clip's own peak so a
+   quiet reply still moves the visual and a loud one does not pin it, ending on
+   a final 0. `Assistant.__init__` registers `sigLevel.emit`. The feed is
+   best-effort: the hook call is wrapped, so a raising hook cannot break audio
+   (pinned). Because the bubble's level then tracks its own voice, the
+   equalizer's speaking bars became genuinely voice-driven as a side effect.
+   Every level term in the painter is written neutral at 0 (× (1.0 - …) or
+   + 0 × …), so a silent bubble renders exactly as before.
+17. **A real bug this work surfaced by measuring rather than looking:** the
+   pupil was drawn while the rim-of-fire **pen** was still active, so the slit
+   was outlined in bright orange instead of being a clean dark pupil — and once
+   the rim thickened with the voice it covered the slit entirely. Found because
+   the reaction measurement returned "0 near-black pixels" instead of a
+   narrowing. Fixed with an explicit `setPen(Qt.NoPen)`. Worth recording
+   because it is invisible to a "does it render without crashing" test and only
+   showed up when the pixels were counted.
+   The pixel test to pin this went through three wrong metrics before it was a
+   real guard, each failing in a different way: a cut *relative* to the row's
+   peak drifted with the flare and so measured the flare (it passed with the
+   narrowing deleted); a fixed pixel offset landed on background once the child
+   widget was a different size; and `min/max` of all lit pixels on a row
+   enclosed the dark gap outside the iris once the flames brightened, reporting
+   the pupil getting *wider* under the voice. The working version uses an
+   absolute cut, a central window, and only rows that cross the iris — and was
+   verified to FAIL when the narrowing is removed.
 
 ## Addendum — 2026-09-09 improvement-program closure (settings schema, self-edit
 ## confirm, voice pinning, VRAM-aware whisper)
@@ -547,6 +1457,155 @@ Findings, ranked:
    tokens and token-budget state); earlier installer fixes (per-package python
    probes, restart-if-active) survived the rework; stale "400+ tests" doc counts
    updated.
+
+18. **Every design reacts to the voice, from one shared signal.** The Eye
+   reacting was not enough, and "reacts to the voice" has to hold whichever
+   design is picked. Measured per design with the clock frozen, only six
+   painters read `level` at all (halo, reactor, droplet, equalizer, void,
+   sauron) and the equalizer faked its reactivity with a local
+   `sin(t * 6.0 + i * 1.3)` pulse — so `orb`, `bloom`, `cube`, `crystal` and
+   `saturn` changed **zero** pixels under the voice. The fix folds `level` into
+   `f["energy"]` once in `_frame()` (gain exactly `1.0` at level 0, so silence
+   renders as before), which every painter already consumes; and the equalizer's
+   active bars now take their amplitude from `level` with a fixed per-bar
+   shape instead of a timer. All eleven designs move when the voice moves: orb
+   6701 px, halo 3731, reactor 7483, bloom 9816, droplet 6945, cube 8244,
+   equalizer 2962, crystal 8457, saturn 704, void 1665, sauron 8136 (of 45796).
+   New scenario `every_design_reacts_to_voice_level` asserts it per design and
+   was verified to fail on the unfixed tree — listing exactly `orb, bloom, cube,
+   crystal, saturn = 0`. Two traps were hit while writing it, both worth
+   recording: (a) with the radius left live, the listening state's
+   `_radius_target` grows the whole bubble with the level, which changes >100 px
+   on *every* design and made the assertion pass on the broken code — it now
+   pins `_radius_ui`; (b) the shared lift fought the Eye's *bespoke* reaction
+   (its pupil width grows with `blaze`, so a voice-lifted `energy` widened the
+   pupil while the `lv` term narrowed it, collapsing the measured narrowing
+   from `11 -> 4` to `4 -> 2`), so `_frame()` also exports `energy0` — the same
+   value **without** the voice — and the Eye draws from that.
+   The Eye's own voice test was also a latent flake, not a regression: it never
+   stopped the 16 ms timer, so `grab()` ran `_on_tick` between setting
+   `_level_ui` and painting it and the smoothed level decayed toward
+   `_level_target`; its `>= 3 px` narrowing floor was really asserting the test
+   widget's radius and passed only because of that decay. It now stops the
+   timer, pins the target, and asserts the property that matters — the pupil
+   only ever narrows as the level rises (verified to fail when the `lv`
+   narrowing is removed, which reported `[4, 4, 5]`).
+19. **Twelfth design: Pikachu** (`pikachu`). A round yellow face — black-tipped
+   ears, red cheeks, glinting eyes, a mouth that opens with the voice — added to
+   `BUBBLE_DESIGNS`, dispatched in `paintEvent`, and selected as "Pikachu" in the
+   Appearance combo. Like `void` and `sauron` it keeps its own palette (that IS
+   the design), and relocates the state colour to an aura ring behind the head
+   so the colour picker still visibly moves it; `energy` drives the aura, the
+   ear sway and the breathing, `glow` (the accent) the aura and cheek bloom, and
+   `level` charges the cheeks while the ears prick up.
+   Two things were found by measuring instead of trusting the code:
+   (a) *The bubble window carries an inscribed-ellipse mask*
+   (`setMask(QRegion(rect, Ellipse))` in `showEvent`), so anything painted past
+   it is invisible on the desktop. The first cut of the ears reached 1.5 R and
+   leaked **818 px** outside the mask in the LISTENING state (where the radius
+   grows by `12 * GEOM_K`, leaving only ~1.12 R of headroom). The ear tips were
+   retuned into that budget and now leak 0 px across every state/level/anim
+   combination; while measuring, `droplet` (251 px) and `sauron` (305 px) were
+   found to overflow in the same state — pre-existing, left alone, and recorded
+   here rather than silently "fixed" by shrinking art the user has seen.
+   (b) *`grab()` is not a valid instrument for a translucent widget.* The first
+   mask measurement reported 1753 px of overflow on `bloom`; rendering onto an
+   explicitly cleared transparent image showed 0. `WA_TranslucentBackground`
+   means the widget never erases its background, so a fresh `QPixmap` can hold
+   stale pixels that look exactly like artwork. The overflow sweep was rewritten
+   to `QPainter`-render onto a cleared `QImage` and to read alpha — that is why
+   the numbers above can be trusted and the earlier ones could not.
+   Pikachu's composition was measured the same way (idle: 4864 drawn px, 43%
+   opaque, 0 outside the mask; the aura ring is capped to a `0.44 * width`
+   circle that is inside the mask for every radius).
+20. **The Voice tab can see the feed it is diagnosing.** `Assistant` now owns
+   the single level publisher (`_emit_level(value, source)`), which all three
+   producers call instead of `sigLevel.emit` directly — the listener's VAD
+   (`mic`), the push-to-talk recorder (`ptt`) and `core.audio`'s playback hook
+   (`tts`) — and `level_snapshot()` answers a new control-socket `level` command
+   with `raw`, the smoothed `ui` value the painters read, `source`, `age_s`,
+   `state` and `handsfree`. Settings → Voice draws that as a meter plus a text
+   readout.
+   Why both numbers: `raw` alone cannot distinguish "the mic never fed the
+   level" from "the feed arrived but the bubble is not showing it", which is
+   exactly the user-visible complaint the shared-level work was about. `age_s`
+   only advances on a **non-zero** level, so a wedged producer emitting exact
+   zeros is visible rather than looking freshly alive.
+   The polling runs on its own daemon thread (`_LevelFeed`) and only while the
+   Voice tab is on screen: a synchronous socket read would freeze the window,
+   and `doctor`/`health` hold the control server's single-threaded accept loop
+   for seconds, so `level` is deliberately answered inline while those two stay
+   wrapped in `_with_timeout`. The bubble module stays lazily loaded (the feed
+   takes `lambda: H.CONTROL_SOCK`), and `PTT_ACTIONS` grew `level` — which the
+   existing `test_ptt_actions_documented_in_usage` guard immediately caught, so
+   the `USAGE` text documents it too.
+   Two guards, both verified to fail on the mutated code: the control-socket
+   test (removing the `level` branch ⇒ `JSONDecodeError`) and the GUI scenario
+   (folding the meter's `ui` into `raw` ⇒ `AssertionError`), the latter driving
+   the real `SettingsWindow` against a real unix socket and asserting the
+   command actually sent is `level`. Routing the listener through
+   `_emit_level` also broke four `TestListenerSelfMute` tests and one playback
+   test, because `FakeAssistant` did not carry the new surface — the fake was
+   completed (it records the source AND forwards to `sigLevel`, so the existing
+   visual feed is pinned too) rather than the production call being made
+   defensive. One robustness change did come out of that thought: the emit is
+   wrapped, because both callers that matter run on threads whose death is
+   silent and expensive (the PortAudio callback, the TTS playback thread) and a
+   slot raising must not travel back into them — the same contract
+   `core.audio._emit_level` already had.
+
+21. **Each design owns its voice reaction.** Item 18 made every design react to
+   the voice by folding `level` into `f["energy"]` once — a uniform brightness
+   gain applied to all of them. That was the quick way to make the property
+   true, and it flattened exactly what makes the shapes worth having: with one
+   gain, twelve designs react identically, so the bubble loses its identity when
+   it is most alive. The shared lift is gone; `_frame()` still publishes `level`
+   and each painter now writes its own term:
+
+   | design | what the voice does | changed px |
+   |---|---|---|
+   | orb | ripple rings spread through the glass ring, silhouette shivers, hotspot + rim arc catch it | 1351 |
+   | halo | torus thickens outward, comet wave and bead speed up, trailing bead appears, core flares | 4240 |
+   | reactor | the three segments open wider, tick ring extends, core flares, spin accelerates | 4396 |
+   | bloom | petals (blob wobble) open, mist brightens, extra sparks and a faster swirl | 7463 |
+   | droplet | fast skin ripple over the slow swell, drip detaches sooner, rim + streak brighten | 5226 |
+   | cube | a flash front sweeps the six facets, edges and spokes flare | 6316 |
+   | equalizer | the bars *are* the meter; centre dot pulses | 2273 |
+   | crystal | inner hex swells and rotates off-phase, its hue splits away from the body (refraction), glints lengthen | 6328 |
+   | saturn | ring thickens, a brightness wave travels it, crescent widens, moon pulled faster | 1205 |
+   | void | infall streaks brighten, sparks sweep inward faster, horizon flicker rises 13 Hz → ~24 Hz | 1395 |
+   | sauron | pupil contracts, fire flares (item 16, unchanged) | 5977 |
+   | pikachu | cheeks charge, ears prick, mouth opens (item 19, unchanged) | 4996 |
+
+   The reactions are also distinct in *where* they act, not just how much: the
+   share of the change falling inside the inner half of the bubble runs from 21%
+   (void — an outward event horizon) to 70% (saturn — ring and core).
+   Two invariants were measured, not assumed:
+   *Neutrality*: with the level pinned at 0, all twelve designs render
+   **pixel-identical** to the previous tree (sha256 of the rendered buffer per
+   design, compared against the pre-change source). Every new term multiplies by
+   `1.0` or adds `0` at level 0 — writing the crystal's refracted pen colour
+   directly broke this (the resting gem took the state hue) and the comparison
+   caught it; it now blends *from* white.
+   *Footprint*: these are the first voice terms that add alpha to glows that
+   already reach the window's round mask, so the mask sweep was re-run. Bloom,
+   cube and crystal went from 0 to 461/175/313 px outside the mask — all of it
+   faint (max alpha 32–38 of 255, none above 64) and all of it *hidden by the
+   mask*, but a glow ending on the cut at 22% opacity is a visible seam waiting
+   to happen, so each of those three now pulls its gradient tail inward by
+   `1.0 - 0.20 * level` (exactly 1.0 at silence, so the resting glow is
+   untouched). All three are back to 0 outside-mask at every state/level/anim
+   combination; the only remaining overflow is the pre-existing droplet
+   (251 → 254 px) and saturn (6 → 8 px). Bloom's extra sparks are also capped at
+   0.95 R so they cannot sit on the cut.
+   The guard is `every_design_reacts_to_voice_level`, extended with the crisp
+   half of this regression: `_frame()` at level 0 and at level 1 must produce
+   the same `energy`, so re-introducing *any* shared lift fails immediately
+   (verified: it reports "the voice has leaked back into the shared energy
+   channel"). Together with the existing ≥100 px per design assertion that
+   forces every painter to own a term — reconstructed the intermediate state
+   (shared lift removed, no bespoke terms) and the scenario names exactly the
+   five designs that relied on it: `orb=7, bloom=0, cube=0, crystal=0, saturn=0`.
 
 Accepted consciously / out of scope here: Settings health-bar pixel verification on
 the dual-monitor setup (data-level verified in `ACCEPTANCE.md`), unsupported/unusual

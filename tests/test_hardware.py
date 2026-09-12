@@ -49,18 +49,25 @@ def _ok_probers(**over):
     return p
 
 
+def _weights(tmp_path, *sizes: int) -> Path:
+    """A fake HF hub snapshot: snapshots/<rev>/*.safetensors, or incomplete."""
+    root = tmp_path / "chatterbox-turbo"
+    snap = root / "snapshots" / "deadbeef"
+    snap.mkdir(parents=True, exist_ok=True)
+    for i, size in enumerate(sizes):
+        (snap / f"file{i}.safetensors").write_bytes(b"x" * size)
+    return root
+
+
 def _ctx(tmp_path, **over):
-    vdir = tmp_path / "piper-voice"
-    vdir.mkdir(exist_ok=True)
-    (vdir / " voice.onnx".strip()).write_text("fake")
-    (vdir / "voice.onnx.json").write_text("{}")
+    tdir = _weights(tmp_path, 8)
     wdir = tmp_path / "whisper-model"
     wdir.mkdir(exist_ok=True)
     (wdir / "tiny.pt").write_text("fake")
     ctx = {
         "ollama_base": "http://127.0.0.1:9", "ollama_model": "qwen3:8b",
-        "whisper_size": "tiny", "mic_device": "", "piper_voice": "",
-        "whisper_model_dir": str(wdir), "piper_voice_dir": str(vdir),
+        "whisper_size": "tiny", "mic_device": "", "tts_engine": "chatterbox-turbo",
+        "whisper_model_dir": str(wdir), "tts_weights_dir": str(tdir),
         "control_sock": str(tmp_path / "control.sock"),
         "state_dir": str(tmp_path),
         "systemd_unit_file": str(tmp_path / "handsoff.service"),
@@ -131,21 +138,38 @@ class TestOllama:
 
 
 class TestSttTtsMounts:
-    def test_empty_voice_dir(self, HW, tmp_path):
-        empty = tmp_path / "empty-voices"
+    def test_missing_weights_are_reported_not_assumed(self, HW, tmp_path):
+        """The murmur that matters is 3.8 GB away: a bubble without these is
+        mute, and "the directory exists" is not the question."""
+        empty = tmp_path / "empty-weights"
         empty.mkdir()
-        snap = HW.snapshot(_ctx(tmp_path, piper_voice_dir=str(empty)),
+        snap = HW.snapshot(_ctx(tmp_path, tts_weights_dir=str(empty)),
                            _ok_probers(), {})
-        assert snap["stt_tts"]["onnx"] == []
+        stt = snap["stt_tts"]
+        assert stt["tts_cached"] is False and stt["ok"] is False
+        assert "install.sh" in stt["note"], stt["note"]
+        assert stt["tts_engine"] == "chatterbox-turbo"
 
-    def test_onnx_without_json_flagged(self, HW, tmp_path):
-        vdir = tmp_path / "voices"
-        vdir.mkdir()
-        (vdir / "solo.onnx").write_text("fake")  # no .json sidecar
-        snap = HW.snapshot(_ctx(tmp_path, piper_voice_dir=str(vdir)),
+    def test_a_half_downloaded_snapshot_is_not_cached(self, HW, tmp_path):
+        """An interrupted fetch leaves snapshots/<rev>/ with no blobs — which
+        a bare is_dir() reports as ready, skipping the download that the very
+        next spoken turn needs."""
+        root = tmp_path / "half"
+        (root / "snapshots" / "deadbeef").mkdir(parents=True)
+        snap = HW.snapshot(_ctx(tmp_path, tts_weights_dir=str(root)),
                            _ok_probers(), {})
-        assert snap["stt_tts"]["onnx_json_ok"] == {"solo.onnx": False}
+        assert snap["stt_tts"]["tts_cached"] is False
         assert snap["stt_tts"]["ok"] is False
+        # ...and an empty file is not weights either
+        (root / "snapshots" / "deadbeef" / "s3gen.safetensors").write_bytes(b"")
+        snap = HW.snapshot(_ctx(tmp_path, tts_weights_dir=str(root)),
+                           _ok_probers(), {})
+        assert snap["stt_tts"]["tts_cached"] is False
+        (root / "snapshots" / "deadbeef" / "s3gen.safetensors").write_bytes(b"w")
+        snap = HW.snapshot(_ctx(tmp_path, tts_weights_dir=str(root)),
+                           _ok_probers(), {})
+        assert snap["stt_tts"]["tts_cached"] is True
+        assert snap["stt_tts"]["ok"] is True
 
     def test_missing_socket(self, HW, tmp_path):
         snap = HW.snapshot(_ctx(tmp_path), _ok_probers(), {})
@@ -198,7 +222,20 @@ class TestPromptContext:
         snap = HW.snapshot(_ctx(tmp_path), _ok_probers(), {})
         text = HW.prompt_context(snap)
         assert str(tmp_path / "control.sock") in text  # socket path exact
-        assert "voice.onnx" in text                    # voice file exact
+        # The voice line names the ENGINE and whether its weights are present.
+        # It used to list the .onnx files; with one built-in voice the useful
+        # fact is not which voice but whether the 3.8 GB are there at all.
+        assert "chatterbox-turbo" in text and "cached" in text
+
+    def test_a_mute_bubble_is_visible_in_the_prompt_context(self, HW, tmp_path):
+        """The AI reads this line when the user says "you're not talking" —
+        it must not claim a cached voice when the weights are absent."""
+        empty = tmp_path / "nothing"
+        empty.mkdir()
+        snap = HW.snapshot(_ctx(tmp_path, tts_weights_dir=str(empty)),
+                           _ok_probers(), {})
+        text = HW.prompt_context(snap)
+        assert "NOT downloaded" in text, text
 
 
 def _ff_json():
@@ -364,3 +401,61 @@ class TestYdotoolSockets:
             s_live.close()
             s_leg.close()
         assert snap["ydotool"]["socket"] == live
+
+
+class TestTtlCacheIsSharedSafely:
+    """The TTL cache is read and written by two threads at once.
+
+    doctor runs on the control server's worker thread while the Qt thread's
+    hardware tick peeks the same dict, so the cache check and store have to
+    happen under one lock. Nothing in hardware.py was synchronised before.
+    """
+
+    def test_cache_access_is_locked(self, HW):
+        import threading
+        cache: dict = {}
+        entered, finished = threading.Event(), threading.Event()
+
+        def _worker():
+            entered.set()
+            HW._probe("gpu", lambda: {"ok": True}, cache, False)
+            finished.set()
+
+        HW._TTL_LOCK.acquire()
+        try:
+            t = threading.Thread(target=_worker)
+            t.start()
+            assert entered.wait(2.0)
+            assert not finished.wait(0.25), "_probe touched the cache without the lock"
+        finally:
+            HW._TTL_LOCK.release()
+        t.join(2.0)
+        assert finished.is_set()
+        assert cache["data"]["gpu"] == {"ok": True}
+
+    def test_cache_still_short_circuits_within_ttl(self, HW):
+        calls: list = []
+        cache: dict = {}
+        probe = lambda: (calls.append(1), {"ok": True})[1]   # noqa: E731
+        first, cached = HW._probe("gpu", probe, cache, False)
+        again, cached2 = HW._probe("gpu", probe, cache, False)
+        assert first == again == {"ok": True}
+        assert cached is False and cached2 is True
+        assert len(calls) == 1, "the prober ran twice inside the TTL"
+
+    def test_force_bypasses_the_cache(self, HW):
+        calls: list = []
+        cache: dict = {}
+        probe = lambda: (calls.append(1), {"ok": True})[1]   # noqa: E731
+        HW._probe("gpu", probe, cache, False)
+        HW._probe("gpu", probe, cache, True)
+        assert len(calls) == 2
+
+    def test_degraded_previous_result_is_carried_forward(self, HW):
+        cache: dict = {}
+        HW._probe("gpu", lambda: {"ok": True, "name": "gpu0"}, cache, False)
+        def _boom():
+            raise RuntimeError("nvidia-smi wedged")
+        out, cached = HW._probe("gpu", _boom, cache, True)
+        assert out["ok"] is True and out["degraded"] is True
+        assert "nvidia-smi wedged" in out["error"]

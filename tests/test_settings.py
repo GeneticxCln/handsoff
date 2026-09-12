@@ -116,34 +116,33 @@ class TestSettingsApp:
         assert "apply_autostart(" in src
         assert "set_autostart(" not in src.replace("apply_autostart(", "")
 
-    def test_unverified_voice_url_requires_explicit_opt_in(self, monkeypatch):
-        mod = _load("handsoff_settings_voice_optin", HERE / "handsoff-settings.py")
+    def test_the_settings_app_never_loads_a_speech_model(self):
+        """`Test voice` must speak through the running bubble.
 
-        class _Text:
-            def __init__(self, value):
-                self.value = value
+        The old preview built its own piper voice in this process. That cannot
+        come back: chatterbox-turbo is ~2.7 GB of VRAM, so a second instance in
+        the settings app would fight the bubble for the GPU — and it would
+        preview the GUI's own rate/volume/clip rather than the voice the bubble
+        will actually use. Pinned on the source, because the tempting "just
+        load the model here" fix is invisible until a user's GPU is full.
+        """
+        import inspect
+        mod = _load("handsoff_settings_preview", HERE / "handsoff-settings.py")
+        src = inspect.getsource(mod.SettingsWindow.test_voice)
+        body = src.split('"""')[2]          # past the docstring, which names it
+        assert "say " in body, "the preview must ask the bubble to speak"
+        assert "piper" not in body and "chatterbox" not in body, body
+        assert "_socket_command" in body, "it must go over the control socket"
+        assert mod._VOICE_TEST_LINE and len(mod._VOICE_TEST_LINE) < 200
 
-            def text(self):
-                return self.value
-
-        class _Status:
-            def __init__(self):
-                self.messages = []
-
-            def setText(self, text):
-                self.messages.append(text)
-
-        dialog = mod.VoiceDownloadDialog.__new__(mod.VoiceDownloadDialog)
-        dialog.url_edit = _Text("http://example.test/voice.onnx")
-        dialog.list = type("List", (), {"currentItem": lambda self: None})()
-        dialog.status = _Status()
-        monkeypatch.delenv("HANDSOFF_UNVERIFIED_VOICE", raising=False)
-        assert dialog._pick_url() is None
-        assert "https://" in dialog.status.messages[-1]
-
-        monkeypatch.setenv("HANDSOFF_UNVERIFIED_VOICE", "1")
-        assert dialog._pick_url() == "http://example.test/voice.onnx"
-        assert "WARNING" in dialog.status.messages[-1]
+    def test_the_preview_reports_a_dead_bubble_by_socket_path(self, monkeypatch,
+                                                             tmp_path):
+        """"Nothing happened" is the failure this whole audit is about: the
+        preview has to say the bubble is down, and where it looked."""
+        mod = _load("handsoff_settings_preview_down", HERE / "handsoff-settings.py")
+        gone = tmp_path / "control.sock"
+        monkeypatch.setattr(mod.H, "CONTROL_SOCK", gone)
+        assert mod._socket_command(gone, "say hi", timeout=0.5) is None
 
 
 # ---------------------------------------------------------------- keyboard takeover
@@ -195,9 +194,15 @@ class TestSettingsCoercion:
             "coerce_settings, or add them to free_form with a reason")
 
     def test_bubble_design_accepted_and_garbage_falls_back(self, H, tmp_path, monkeypatch):
-        """Every shipped design loads; garbage coerces to orb (never a crash)."""
-        for name in ("orb", "halo", "reactor", "bloom", "droplet", "cube",
-                     "equalizer", "crystal", "saturn", "void"):
+        """Every shipped design loads; garbage coerces to orb (never a crash).
+
+        Driven from BUBBLE_DESIGNS rather than a hand-copied list: the literal
+        tuple that used to live here silently stopped covering new designs
+        (it was already missing "sauron" the moment it was added).
+        """
+        from settings_schema import BUBBLE_DESIGNS
+        assert len(BUBBLE_DESIGNS) >= 11, BUBBLE_DESIGNS   # never vacuous
+        for name in BUBBLE_DESIGNS:
             f = tmp_path / "settings.json"
             f.write_text(json.dumps({"bubble_design": name}))
             monkeypatch.setattr(H, "SETTINGS_FILE", f)
@@ -268,6 +273,140 @@ class TestSettingsCoercion:
 
 
 # ------------------------------------------------- monolith split: step (a)
+
+
+class TestPiperToChatterboxMigration:
+    """A settings.json written by the Piper build must load cleanly here.
+
+    The v1 file carries `piper_voice`, a path to a 60 MB .onnx voice that
+    chatterbox cannot read at all. Carrying it over as `tts_reference` would
+    hand `prepare_conditionals` a file it must reject (it needs > 5 s of audio)
+    on EVERY turn — a mute bubble with a tidy value in the GUI. So it is
+    dropped, loudly, and the user keeps the built-in voice until they pick a
+    clip.
+    """
+
+    @staticmethod
+    def _load(H, tmp_path, monkeypatch, payload):
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps(payload))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        return H._load_settings()
+
+    def test_a_v1_piper_voice_is_dropped_not_renamed(self, H, tmp_path,
+                                                    monkeypatch, caplog):
+        caplog.set_level("INFO", logger="handsoff")
+        s = self._load(H, tmp_path, monkeypatch, {
+            "version": 1, "piper_voice": "en_US-lessac-medium.onnx",
+            "tts_rate": 1.4, "assistant_name": "cypher"})
+        assert "piper_voice" not in s, "the stale key must not survive the load"
+        assert s["tts_reference"] == "", "an .onnx voice is not a reference clip"
+        assert s["tts_rate"] == 1.4 and s["assistant_name"] == "cypher", \
+            "an unrelated setting must not be collateral damage"
+        assert s["version"] == H.SETTINGS_VERSION == 2
+        # The migration must be what explains the drop. Asserting merely that
+        # the line mentions 'piper_voice' is satisfied by the loader's generic
+        # `unknown settings key 'piper_voice' — ignored` warning, so the suite
+        # would pass with the migration step deleted entirely.
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("dropped piper_voice" in m for m in messages), \
+            f"the migration must say WHAT it dropped; got {messages}"
+
+    def test_a_stale_key_does_not_survive_even_when_the_version_is_current(
+            self, H, tmp_path, monkeypatch):
+        """The trap that actually happened: the file was stamped v2 by a write
+        that still carried piper_voice, so a version-gated migration never ran
+        again and the key warned on every start forever.
+
+        Key removal must therefore be schema-driven — 'not in DEFAULT_SETTINGS'
+        is the test, not 'the version is old'.
+        """
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"version": H.SETTINGS_VERSION,
+                                 "piper_voice": "left-behind.onnx",
+                                 "mic_threshold": 640}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        H._SETTINGS_OBJ.settings_file = f
+        H._SETTINGS_OBJ.config_dir = tmp_path
+        assert H._SETTINGS_OBJ.persist("tts_volume", 0.8) is True
+        on_disk = json.loads(f.read_text())
+        assert "piper_voice" not in on_disk
+        assert on_disk["mic_threshold"] == 640 and on_disk["tts_volume"] == 0.8
+
+    def test_the_drop_survives_a_single_key_save(self, H, tmp_path, monkeypatch):
+        """A migration is only real if WRITES cannot resurrect what it removed.
+
+        Single-key persistence read the raw file and merged onto it, so the
+        next unrelated save put `piper_voice` straight back — and since the
+        schema no longer knows that key, every subsequent start warned
+        `unknown settings key 'piper_voice'` for a key the user never wrote.
+        """
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"version": 1, "piper_voice": "en_US-lessac.onnx",
+                                 "mic_threshold": 700}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        H._SETTINGS_OBJ.settings_file = f
+        H._SETTINGS_OBJ.config_dir = tmp_path
+        assert H._SETTINGS_OBJ.persist("tts_rate", 1.5) is True
+        on_disk = json.loads(f.read_text())
+        assert "piper_voice" not in on_disk, on_disk.get("piper_voice")
+        assert on_disk["tts_rate"] == 1.5
+        assert on_disk["mic_threshold"] == 700, "the save must not drop settings"
+        reloaded = H._load_settings()
+        assert "piper_voice" not in reloaded and reloaded["tts_rate"] == 1.5
+
+    def test_a_v2_file_is_left_alone(self, H, tmp_path, monkeypatch):
+        s = self._load(H, tmp_path, monkeypatch, {
+            "version": 2, "tts_reference": "/tmp/me.wav"})
+        assert s["tts_reference"] == "/tmp/me.wav"
+
+    def test_a_write_keeps_keys_from_a_newer_build(self, H, tmp_path,
+                                                 monkeypatch):
+        """Retired is not the same as unknown, and the difference is data loss.
+
+        Dropping every key the schema does not know is the tidy-looking fix for
+        the resurrected `piper_voice`, and it erases the settings of a NEWER
+        build sharing the same config: a downgrade would silently delete
+        configuration it merely fails to understand. Only the keys a migration
+        retired may be removed; everything else survives a write untouched.
+        """
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"version": 1, "piper_voice": "old.onnx",
+                                 "wake_word": "cypher",
+                                 "mic_threshold": 700}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        H._SETTINGS_OBJ.settings_file = f
+        H._SETTINGS_OBJ.config_dir = tmp_path
+        assert H._SETTINGS_OBJ.persist("tts_rate", 1.5) is True
+        on_disk = json.loads(f.read_text())
+        assert "piper_voice" not in on_disk, "a retired key must not come back"
+        assert on_disk["wake_word"] == "cypher", (
+            "a key this build has never heard of belongs to a newer build's "
+            "settings; deleting it on save is silent configuration loss")
+        assert on_disk["mic_threshold"] == 700 and on_disk["tts_rate"] == 1.5
+
+    def test_the_schema_no_longer_knows_piper(self):
+        import settings_schema
+        assert "piper_voice" not in settings_schema.DEFAULT_SETTINGS
+        assert settings_schema.DEFAULT_SETTINGS["tts_reference"] == ""
+        assert settings_schema.SETTINGS_VERSION >= 2
+
+    def test_the_voice_env_override_points_at_the_reference_clip(
+            self, H, tmp_path, monkeypatch):
+        """HANDSOFF_VOICE used to select a piper voice. It must now reach the
+        live key, or the documented override silently does nothing."""
+        monkeypatch.setenv("HANDSOFF_VOICE", "/tmp/clip.wav")
+        s = self._load(H, tmp_path, monkeypatch, {})
+        assert s["tts_reference"] == "/tmp/clip.wav"
+
+    def test_a_junk_reference_is_coerced_to_a_string(self, H, tmp_path,
+                                                   monkeypatch):
+        s = self._load(H, tmp_path, monkeypatch, {"tts_reference": ["a", "b"]})
+        assert s["tts_reference"] == "", (
+            "a list here must not reach the loader, which would try to open it")
 
 
 class TestSchemaWiring:
@@ -344,6 +483,48 @@ class TestSettingsSplit:
         obj["handsfree"] = True
         assert obj.as_dict()["handsfree"] is True
 
+    def test_persist_failure_does_not_leave_memory_disagreeing_with_disk(
+            self, H, tmp_path, monkeypatch):
+        """A swallowed write error used to still update the in-memory copy.
+
+        `_persist_setting` caught OSError and returned silently while
+        `Settings.persist` (and the bubble's wrapper, which also re-stamped the
+        version and refreshed the derived globals) set `_data[key] = value`
+        anyway. The runtime then used — and re-wrote — a value that was never
+        on disk. Failure must be reported and the old value kept.
+        """
+        obj = H._core_settings.settings_object(tmp_path / "settings.json", tmp_path)
+        obj.load()
+        obj[ "mic_threshold"] = 555
+        monkeypatch.setattr(H._core_settings, "_read_settings_for_write",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
+        assert obj.persist("mic_threshold", 777) is False
+        assert obj["mic_threshold"] == 555, "memory changed although the write failed"
+        assert json.loads((tmp_path / "settings.json").read_text(
+            encoding="utf-8"))["mic_threshold"] != 777
+
+    def test_persist_reports_success(self, H, tmp_path):
+        obj = H._core_settings.settings_object(tmp_path / "settings.json", tmp_path)
+        obj.load()
+        assert obj.persist("mic_threshold", 777) is True
+        assert obj["mic_threshold"] == 777
+
+    def test_bubble_wrapper_keeps_globals_when_the_write_fails(
+            self, H, tmp_path, monkeypatch):
+        """The bubble's wrapper must not refresh derived globals on a failure."""
+        monkeypatch.setattr(H, "SETTINGS_FILE", tmp_path / "settings.json")
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        H.SETTINGS["mic_threshold"] = 4242
+        refreshed = []
+        monkeypatch.setattr(H, "reload_derived_settings",
+                            lambda *a, **k: refreshed.append(True))
+        monkeypatch.setattr(H._core_settings, "_read_settings_for_write",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("nope")))
+        assert H._persist_setting("mic_threshold", 999) is False
+        assert H.SETTINGS["mic_threshold"] == 4242
+        assert refreshed == [], "derived globals refreshed for an unsaved value"
+        H.SETTINGS["mic_threshold"] = 0        # leave the global as we found it
+
     def test_wrapper_paths_follow_monkeypatched_globals(self, H, tmp_path, monkeypatch):
         """The split must NOT have baked paths in: monkeypatching H's path
         globals (the tests' established pattern) still redirects every
@@ -365,9 +546,17 @@ class TestSettingsSplit:
     def test_set_setting_uses_wrapper_seam(self, H, tmp_path, monkeypatch):
         """test_regression's seam pin, held at the unit level: set_setting must
         still route through the H._persist_setting wrapper (which adds the
-        in-memory update + derived-global refresh)."""
+        in-memory update + derived-global refresh).
+
+        The stub models the REAL wrapper's contract — write, update memory,
+        return True — because set_setting no longer pre-writes SETTINGS before
+        calling it (that pre-write is what let a failed disk write leave memory
+        and disk disagreeing). A stub that just records the call would be
+        testing nothing about the seam it stands in for.
+        """
         calls = []
-        monkeypatch.setattr(H, "_persist_setting", lambda k, v: calls.append((k, v)))
+        monkeypatch.setattr(H, "_persist_setting", lambda k, v: (
+            calls.append((k, v)), H.SETTINGS.__setitem__(k, v), True)[-1])
         # H is session-scoped: snapshot the key so the in-memory mutation
         # below is restored at teardown instead of leaking into other tests.
         monkeypatch.setitem(H.SETTINGS, "mic_threshold", H.SETTINGS["mic_threshold"])
@@ -556,7 +745,9 @@ class TestHealthCommand:
         assert s["mic"]["rate"] == 16000
         assert s["mic"]["stalled"] is False and s["mic"]["failing_since"] is None
         assert s["brain"]["reachable"] is True and "model" in s["brain"]
-        assert set(s["tts"]) == {"ready", "whisper_ready"}
+        assert set(s["tts"]) == {"ready", "whisper_ready", "engine",
+                                 "device", "reference"}
+        assert s["tts"]["engine"] == H.TTS_ENGINE
         json.dumps(s)          # must be JSON-serializable, always
 
     def test_snapshot_reflects_degraded_mic(self, H, monkeypatch):
@@ -628,7 +819,12 @@ class TestHealthCommand:
         assert payload["mic"]["state"] in ("listening", "silent",
                                            "open-failing", "stopped")
         assert payload["brain"]["reachable"] is True
-        assert set(payload["tts"]) == {"ready", "whisper_ready"}
+        # engine/device/reference are reported, not just readiness: "ready"
+        # cannot tell the built-in voice from a failed reference clip, and this
+        # snapshot is what Settings → Voice and the health bar read.
+        assert set(payload["tts"]) == {"ready", "whisper_ready", "engine",
+                                       "device", "reference"}
+        assert payload["tts"]["engine"] == H.TTS_ENGINE
 
     def test_health_listed_in_usage_and_actions(self, H):
         assert "health" in H.PTT_ACTIONS
