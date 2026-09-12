@@ -52,25 +52,18 @@ default:
     - python "$CI_PROJECT_DIR/ci/pytest_summary.py"
       "$CI_PROJECT_DIR/tests/report.xml" --post
 
-# One shell line: offscreen-Qt runtime libraries, PortAudio AND the ALSA runtime
-# it links against, OpenMP (onnxruntime imports in-process during test_audio and
-# needs libgomp), and bash (Debian slim ships none of these). Every job that runs
-# the suite keeps this in sync.
-#
-# `libasound2t64` alone is NOT enough, and believing it was cost a pipeline: at
-# import, sounddevice resolves the PortAudio library itself with
-# `ctypes.util.find_library('portaudio')`, so with only the ALSA runtime present
-# every job dies at `import handsoff` with "OSError: PortAudio library not
-# found" — before a single test runs. libportaudio2 is what provides
-# libportaudio.so.2, and it in turn links the libasound.so.2 above. Debian's
-# trixie build has no PulseAudio/PipeWire support, which is fine here: the suite
-# never opens a real device.
+# The apt layer every suite job inherits. It is a SCRIPT, not a one-liner:
+# a single unknown package name fails the whole `apt-get install`, the `&&`
+# chain then installs nothing, and the job runs the entire suite against a
+# container with no audio or Qt runtime — hundreds of `import handsoff` errors
+# whose cause is one line at the top of the log. That is not hypothetical:
+# `libdbus-1-3t64` does not exist in this image, so nothing was ever installed,
+# no matter what the list said. ci/apt_deps.sh installs each package on its
+# own, tries the t64 and plain names, and then verifies the SONAMEs by file —
+# including the `ctypes.util.find_library('portaudio')` lookup sounddevice
+# performs at import — so a gap fails there, by name.
 .qt_deps: &qt_deps
-  "apt-get update -qq
-  && apt-get install -yqq --no-install-recommends bash libglib2.0-0t64
-     libgl1 libegl1 libxkbcommon0 libdbus-1-3t64 libfontconfig1 libasound2t64
-     libportaudio2 libgomp1
-  && rm -rf /var/lib/apt/lists/*"
+  "bash ci/apt_deps.sh"
 
 # --- The full test suite (GH: `tests` matrix job) ---------------------------
 # Single source of truth: requirements.txt (pinned floors) installed with the
@@ -174,6 +167,7 @@ shell:
       fi
     - bash -n install.sh
     - bash -n handsoff-restart
+    - bash -n ci/apt_deps.sh
 
 # --- Installer smoke (GH: `smoke` job) --------------------------------------
 # --help must parse and print usage without touching the system.

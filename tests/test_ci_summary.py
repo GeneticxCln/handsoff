@@ -12,6 +12,7 @@ import importlib.util
 import json
 import pathlib
 import re
+import subprocess
 import sys
 
 import pytest
@@ -142,12 +143,43 @@ class TestSuiteJobsGetTheAudioRuntime:
                 f"{name} runs pytest without the `.qt_deps` apt layer, so it "
                 f"fails at `import handsoff` with no test names in the log")
 
-    def test_the_apt_layer_installs_portaudio_and_its_alsa_runtime(self):
+    def test_the_runtime_layer_must_not_be_a_single_apt_one_liner(self):
+        """One unknown package name used to install NOTHING, silently.
+
+        `apt-get install a b c && …` fails as a whole, so a single bad name
+        leaves a container with no audio runtime while the job runs the entire
+        suite — hundreds of import errors whose cause is one line at the top of
+        the log. It is a script now, and it verifies itself.
+        """
         block = self._blocks()[".qt_deps"]
-        assert "libportaudio2" in block, (
+        assert "apt-get install" not in block, (
+            "the apt layer must live in the checked script, where a failure can "
+            "be attributed to the package that caused it")
+        assert "ci/apt_deps.sh" in block
+        script = HERE / "ci" / "apt_deps.sh"
+        assert script.exists(), "the layer the jobs call must exist"
+        assert subprocess.run(["bash", "-n", str(script)]).returncode == 0, (
+            "the layer must at least parse")
+
+    def test_the_script_installs_portaudio_and_the_alsa_runtime(self):
+        text = (HERE / "ci" / "apt_deps.sh").read_text(encoding="utf-8")
+        assert "libportaudio2" in text, (
             "sounddevice resolves libportaudio itself; without libportaudio2 "
             "every job dies at import")
-        assert "libasound2t64" in block, "PortAudio links the ALSA runtime"
+        assert "libasound2t64" in text, "PortAudio links the ALSA runtime"
+        assert "libdbus-1-3t64 libdbus-1-3" in text, (
+            "names that shift with the t64 transition need a fallback — the "
+            "missing t64 name is what made the old one-liner install nothing")
+
+    def test_the_script_verifies_what_sounddevice_actually_looks_up(self):
+        """Installing a package is not the property; resolving it is."""
+        text = (HERE / "ci" / "apt_deps.sh").read_text(encoding="utf-8")
+        assert "libportaudio.so.2" in text, "verify the SONAME by file"
+        assert "find_library" in text and "portaudio" in text, (
+            "sounddevice resolves PortAudio through ctypes, so that lookup is "
+            "the one worth checking")
+        assert "exit 1" in text, (
+            "a missing library must fail the step, not warn and continue")
 
     def test_the_manifest_names_the_same_library(self):
         """`requirements.txt` documents the dependency the CI layer installs."""
