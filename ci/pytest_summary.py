@@ -45,8 +45,21 @@ DEFAULT_REPORT = "tests/report.xml"
 # Known Debian-slim environment failures -> the CI layer that fixes them.
 # Order matters: first match wins (most specific first).
 ENV_HINTS: list[tuple[str, str, str]] = [
+    # Two DIFFERENT packages, and confusing them is how a pipeline stayed red:
+    # sounddevice resolves the PortAudio library itself at import time, so
+    # without libportaudio2 every job dies before a single test runs. The ALSA
+    # runtime is a separate layer that PortAudio then links against. This entry
+    # must come first: "PortAudio library not found" is sounddevice's own
+    # message, while libasound.so.2 appears in a different failure (the dlopen
+    # of the ALSA runtime, after PortAudio loaded).
+    ("PortAudio library not found",
+     "the PortAudio library is missing (sounddevice looks it up with "
+     "`ctypes.util.find_library('portaudio')` at import, so this fails before "
+     "any test runs — and libasound2t64 alone does NOT fix it)",
+     "add the lib to ci `.qt_deps`: libportaudio2"),
     ("libasound.so.2",
-     "ALSA runtime missing (sounddevice's bundled PortAudio needs it)",
+     "ALSA runtime missing (PortAudio links it; this is not the same package "
+     "as libportaudio2)",
      "add the lib to ci `.qt_deps`: libasound2t64"),
     ("libgomp",
      "OpenMP runtime missing (onnxruntime / ctranslate2 wheels need it)",

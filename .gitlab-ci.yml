@@ -10,12 +10,13 @@
 #
 # Debian slim + PySide6 + sounddevice: the PySide6 wheels bundle Qt but
 # offscreen rendering still needs runtime libraries (glib/GL/EGL/xkbcommon/
-# dbus/fontconfig), and sounddevice's bundled PortAudio dlopens the ALSA
-# runtime (libasound.so.2 — without it every job importing sounddevice dies
-# with an OSError, which is exactly what failed the first pipeline's tests
-# jobs). The GitHub runners get all of these from the shared ubuntu image;
-# Debian slim needs them explicitly. Digests are frozen, so the Debian base
-# (trixie, hence the t64 package names) cannot drift under us.
+# dbus/fontconfig), and sounddevice needs the PortAudio library itself
+# (libportaudio2) plus the ALSA runtime that PortAudio links against
+# (libasound2t64) — see the `.qt_deps` note below, where getting that pair
+# wrong is what failed the tests jobs. The GitHub runners get all of these
+# from the shared ubuntu image; Debian slim needs them explicitly. Digests are
+# frozen, so the Debian base (trixie, hence the t64 package names) cannot
+# drift under us.
 #
 # When a suite job fails, read the summary before the log: the junit report
 # gives GitLab's Test-summary tab, and `after_script` prints a short digest of
@@ -51,16 +52,24 @@ default:
     - python "$CI_PROJECT_DIR/ci/pytest_summary.py"
       "$CI_PROJECT_DIR/tests/report.xml" --post
 
-# One shell line: offscreen-Qt runtime libraries, the ALSA runtime
-# (sounddevice's bundled PortAudio needs libasound.so.2), OpenMP
-# (onnxruntime imports in-process during test_audio and needs libgomp), and
-# bash (Debian slim ships none of these). Every job that runs the suite
-# keeps this in sync.
+# One shell line: offscreen-Qt runtime libraries, PortAudio AND the ALSA runtime
+# it links against, OpenMP (onnxruntime imports in-process during test_audio and
+# needs libgomp), and bash (Debian slim ships none of these). Every job that runs
+# the suite keeps this in sync.
+#
+# `libasound2t64` alone is NOT enough, and believing it was cost a pipeline: at
+# import, sounddevice resolves the PortAudio library itself with
+# `ctypes.util.find_library('portaudio')`, so with only the ALSA runtime present
+# every job dies at `import handsoff` with "OSError: PortAudio library not
+# found" — before a single test runs. libportaudio2 is what provides
+# libportaudio.so.2, and it in turn links the libasound.so.2 above. Debian's
+# trixie build has no PulseAudio/PipeWire support, which is fine here: the suite
+# never opens a real device.
 .qt_deps: &qt_deps
   "apt-get update -qq
   && apt-get install -yqq --no-install-recommends bash libglib2.0-0t64
      libgl1 libegl1 libxkbcommon0 libdbus-1-3t64 libfontconfig1 libasound2t64
-     libgomp1
+     libportaudio2 libgomp1
   && rm -rf /var/lib/apt/lists/*"
 
 # --- The full test suite (GH: `tests` matrix job) ---------------------------

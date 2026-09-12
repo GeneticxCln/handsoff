@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 
 import pytest
@@ -78,6 +79,82 @@ def _write(tmp_path, text, name="report.xml"):
     return path
 
 
+class TestSuiteJobsGetTheAudioRuntime:
+    """A suite job without `.qt_deps` dies at import, before any test runs.
+
+    `handsoff.py` imports sounddevice, which resolves the PortAudio library
+    itself with `ctypes.util.find_library('portaudio')`, and Debian slim ships
+    neither it nor the ALSA runtime it links against. So: every job that runs
+    pytest must inherit the anchor, and the anchor must install **both**
+    packages. Installing only libasound2t64 reads as sufficient and is exactly
+    the mistake that kept the tests jobs red — the failure is an import error
+    with no test names in it, which is why this is pinned.
+    """
+
+    @staticmethod
+    def _blocks():
+        """Top-level key -> its block of text. No yaml dependency for CI config.
+
+        Everything, including `name: value` lines like `.qt_deps: &qt_deps`, is
+        a block here — treating only `name:` lines as keys folds the anchors
+        into whichever job came before them, which is how a first attempt at
+        this test accused `default:` of running pytest.
+        """
+        blocks, name, lines = {}, None, []
+        text = (HERE / ".gitlab-ci.yml").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line and not line[0].isspace() and not line.startswith("#"):
+                if name:
+                    blocks[name] = "\n".join(lines)
+                name = line.split(":", 1)[0].strip()
+                lines = []
+            elif name:
+                lines.append(line)
+        if name:
+            blocks[name] = "\n".join(lines)
+        return blocks
+
+    def _effective(self, name, blocks, seen=()):
+        """A job's text plus what it inherits — via `extends:` and `<<: *shared`.
+
+        A job that runs pytest through an `extends:` template must be covered
+        too, or deleting the apt layer from the template would leave this test
+        green and vacuous.
+        """
+        text = blocks[name]
+        for ref in re.findall(r"^\s*extends:\s*([\w.]+)", text, re.M):
+            if ref in blocks and ref not in seen:
+                text += "\n" + self._effective(ref, blocks, seen + (name,))
+        if "<<: *shared" in text and ".shared" in blocks and ".shared" not in seen:
+            text += "\n" + blocks[".shared"]
+        return text
+
+    def test_every_job_that_runs_pytest_inherits_the_runtime_libraries(self):
+        blocks = self._blocks()
+        runners = {
+            name: self._effective(name, blocks)
+            for name in blocks if not name.startswith(".")
+            and "python -m pytest" in self._effective(name, blocks)
+        }
+        assert runners, "no job runs pytest — this test would be vacuous"
+        for name, text in runners.items():
+            assert "*qt_deps" in text, (
+                f"{name} runs pytest without the `.qt_deps` apt layer, so it "
+                f"fails at `import handsoff` with no test names in the log")
+
+    def test_the_apt_layer_installs_portaudio_and_its_alsa_runtime(self):
+        block = self._blocks()[".qt_deps"]
+        assert "libportaudio2" in block, (
+            "sounddevice resolves libportaudio itself; without libportaudio2 "
+            "every job dies at import")
+        assert "libasound2t64" in block, "PortAudio links the ALSA runtime"
+
+    def test_the_manifest_names_the_same_library(self):
+        """`requirements.txt` documents the dependency the CI layer installs."""
+        assert "libportaudio2" in (HERE / "requirements.txt").read_text(
+            encoding="utf-8")
+
+
 class TestShortName:
     """junit's `classname` is a module path plus optional class names."""
 
@@ -127,8 +204,33 @@ class TestSummarize:
         text = S.summarize(_write(tmp_path, RED)).markdown
         assert "**Likely cause:**" in text and "libasound2t64" in text
 
+    def test_env_hint_names_the_right_package_for_a_missing_portaudio(self, S):
+        """The digest must not answer this one with libasound2t64.
+
+        These are two different packages and the distinction cost a pipeline:
+        sounddevice resolves the PortAudio library itself at import, so the
+        trap is that the ALSA hint looks like the right one -- the two can even
+        appear in the same traceback.
+        """
+        got = S._env_hint("OSError: PortAudio library not found")
+        assert got and "**Fix:**" in got, got
+        # The FIX must be the PortAudio package. Mentioning the ALSA one in the
+        # explanation is useful (installing it alone does not help); offering it
+        # as the fix is the misdiagnosis that kept CI red.
+        fix = got.split("**Fix:**", 1)[1]
+        assert "libportaudio2" in fix, got
+        assert "libasound2t64" not in fix, got
+
+    def test_a_traceback_naming_both_still_fixes_the_portaudio_hint(self, S):
+        """One traceback can carry both strings; the first entry must win."""
+        both = ("OSError: PortAudio library not found\n"
+                "  OSError: libasound.so.2: cannot open shared object file")
+        fix = S._env_hint(both).split("**Fix:**", 1)[1]
+        assert "libportaudio2" in fix, fix
+
     def test_env_hints_cover_each_known_library(self, S):
         for message, expected in (
+            ("OSError: PortAudio library not found", "libportaudio2"),
             ("OSError: libasound.so.2: cannot open shared object file", "libasound2t64"),
             ("OSError: libgomp.so.1: cannot open shared object file", "libgomp1"),
             ("ImportError: libGL.so.1: cannot open", "offscreen-Qt"),
