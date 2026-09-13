@@ -2567,3 +2567,147 @@ body. 1052 tests green in seven orderings (default, shuffled-test seeds
 (15/15 files, service restarted, `--ptt doctor` reporting `deployment: in-sync` and
 `appearance: look Custom (pikachu, 134 px)`, installed
 `handsoff-settings.py --selftest` rc 0).
+
+## Addendum — the aperture budget: no design paints on the cut (2026-09-13)
+
+`design_region` is what decides which painted pixels survive on the desktop: the
+inscribed ellipse of the square window, plus whatever a design declares of its own (the
+cat's ears). Ink past it is ink Qt cuts off, so a shape that is meant to be pointed or
+round gets a flat edge exactly there. This ledger has carried that as a known open
+defect since the voice-reaction batch — "the only remaining overflow is the pre-existing
+droplet (251 → 254 px) and saturn (6 → 8 px)" — and it was larger than that note said.
+
+### What was crossing, measured
+
+One instrument, one sweep (every design × 4 clocks × 4 states × 2 levels × 4 radii,
+rendered offscreen with no mask applied, so what is counted is what the mask would
+cut). A pixel counts as ink at alpha ≥ 16 of 255, which is a visible step; the residue
+antialiasing leaves behind at the rim is ≤ 4.
+
+| design | px outside the rim | worst alpha | what was crossing |
+|---|---|---|---|
+| `sauron` | 523 | 255 | the flame tips (a round cap extends half the pen past the point it is drawn to, so clamping the point alone still left ink out) |
+| `droplet` | 391 | 254 | the teardrop's point through the top and its drip through the bottom, on every frame above silence |
+| `bloom` | 2 508 | 19 | the tail of the mist gradient |
+| `cube` | 1 396 | 19 | the halo |
+| `crystal` | 1 396 | 20 | the halo |
+| `saturn` | 16 | 200 | the moon's disc — a white dot sliced flat by the mask |
+
+The three faint ones are the same shape of defect as the loud ones: a gradient whose
+outer stops are reached INSIDE the disc it fills never actually fades to zero at the
+edge, so "alpha 0 at the boundary" was never true of the pixels between. Clamped, the
+fade completes inside the glass.
+
+### One budget, not six constants
+
+`APERTURE_R = WINDOW_PX / 2.0 - 1.0` — the inscribed circle, one pixel in from the true
+edge so an antialiased pixel sitting exactly on the boundary is not half outside — is
+now the single number every design's outermost reach is measured against. The droplet
+is fitted to it with one uniform scale factor (so it is still a teardrop, just one that
+stops at the rim rather than being cut by it); the halo designs cap their gradient
+radius; saturn caps its moon's orbit; the eye's flame tips clamp to the budget minus
+half their own pen width.
+
+### Two clamps measured as no-ops and were NOT shipped
+
+The project's rule is that an edit which moves nothing gets reverted rather than kept
+as decoration, so two candidate clamps were removed again after measuring:
+
+* **Pikachu's cheek bloom.** Clamping its reach measured max alpha 11 where it crossed
+  the rim — below the bar at which ink is visible. The unfixed expression is back.
+* **Saturn's ring.** At 1.02 R it never reaches the glass at any size or level the state
+  machine can ask for, so its clamp could not be pinned by any mutation. It is gone; the
+  moon's cap (16 px at alpha 200) is what remains.
+
+A third decision went the same way in the other direction: the detaching drip is
+deliberately **excluded** from the droplet's fit. Folding it in was tried first and it
+shrank the whole droplet (measured fit 0.51 instead of 0.62 at the phase where the drip
+is furthest along) to make room for a drip that is already outside the window by then —
+its drawn centre reaches y = 136.9 in a 128 px window while it still has alpha, and on
+the vertical axis "outside the mask" IS "outside the window rect", so Qt has clipped it
+before the mask could. A fine 5 ms sweep of the whole drip cycle at five radii measured
+**zero** pixels of any alpha outside the rim with the drip excluded.
+
+### The guard
+
+`every_design_keeps_ink_inside_its_aperture` (tests/test_settings_gui.py) walks all
+thirteen designs, four clocks, four states, both level extremes and all four radii the
+state machine can ask for, and fails naming the design, the frame and the worst alpha if
+any pixel at alpha ≥ 16 lands outside that design's OWN region. It also asserts the
+budget itself stays inside the glass (a budget set to the mask edge is a budget that
+measures nothing), and pins the droplet's silhouette — height at least 1.2× width, and a
+reach floor of 55 px — so a fit that squashed its height into a ball, or that collapsed
+it to fit the drip, fails as loudly as one that overflows.
+
+### Verified
+
+**10/10 mutations caught**, each one a revert of a decision above: the droplet drawn to
+its natural reach again; the drip folded back into the budget; the fit squashing the
+height; an over-clamped fit (0.5); the mist, the cube's halo and the crystal's halo back
+past the glass; saturn's moon on its old orbit; the eye's flame tips reaching out again;
+and the budget itself set to the glass edge. 1054 tests green in three orderings run
+(default, shuffled-test seed 20260913, shuffled-file seed 7), coverage **79.90 % ≥ 70**,
+`ci/compile_all.py` clean (41 files); deployed `in-sync` (`--ptt doctor`:
+`deployment: in-sync`, running sha256 `8011d3f5…` = checkout).
+
+## Addendum — core's loader failure paths, actually covered (2026-09-13)
+
+`core/__init__.py` was the worst-covered file in the tree at **65%** (54 of 156
+statements missed), and every one of those statements was in a *failure* path. That is
+the wrong file to leave untested: it is the code whose bugs are "two apps in one
+process", "the shared `core.audio` repointed at a second copy's paths", "a
+half-initialised app handed out to the next caller". The percentage was never the
+point — the unexercised branches were the guarantees.
+
+### What was untested
+
+Nothing exotic; every refusal and every fallback:
+
+* the canonical app name already held by a **foreign** module (and by one that is
+  **still initialising**), and the `setdefault` race where two loaders admit exactly one
+  copy — the loser must hand back the winner's module;
+* a load that **raises mid-exec** giving its slot back, and a candidate the interpreter
+  cannot build a spec for;
+* `load_module`'s two **foreign-submodule refusals** (at entry, and at the install point
+  where a concurrent import could otherwise be overwritten) and its failed-load restore
+  — the bare name and the `core.<name>` entry put back exactly as they were;
+* the `__import__` fallback, the candidate dedupe, a stat that fails being *skipped*
+  rather than treated as absence, and a HOME that cannot be resolved;
+* `_repo_root`'s `HANDSOFF_SOURCE_PATH` branch, `_allowed_dirs`' unresolvable-path
+  fallbacks, and `_origin_ok` answering **No** rather than raising.
+
+### How it is tested now
+
+`TestLoaderFailurePaths` (tests/test_sandbox.py) adds 19 tests. Two decisions make them
+worth anything:
+
+* **The state each branch guards is handed to the test.** The suite runs with the app
+  loaded, so the `no_app` fixture removes the registration and the instance record for
+  the duration and puts both back — the same rule the autouse registration fixture
+  applies, for the same reason (a test that evicted the app and left it evicted is how a
+  second bubble got built in an earlier session).
+* **The races are forced, not hoped for.** `module_from_spec` is intercepted so the
+  competing loader wins at exactly the window the docstring claims is closed. Two
+  branches that are otherwise unreachable — restoring a `core.<name>` that a concurrent
+  import installed mid-load, and refusing to swap one planted in the same window — are
+  pinned this way.
+
+One guard needed sharpening: `test_no_test_builds_a_module_by_hand` flagged **any**
+reference to `module_from_spec`, which would have made interception look like a
+hand-built load. It now flags the *pair* (`module_from_spec` together with
+`exec_module` in one file) — a test may intercept the function, it may not build a
+module and run it. Verified against a probe file that does exactly the banned thing:
+caught (`test_handbuilt_probe.py:7`).
+
+### Verified
+
+**18/18 mutations caught**, one per guard removed: the foreign-name and
+still-initialising refusals, the slot release, the race winner, both spec checks, both
+foreign-submodule refusals, the bare-name adoption, the stat-error fallback, the
+candidate dedupe, the `__import__` fallback, both failed-load restores, the
+`HANDSOFF_SOURCE_PATH` branch, `_origin_ok`, the origin-directory fallback and the bin
+candidate's. `core/__init__.py` is **100%** (156/156, was 65%); suite total
+**80.32% ≥ 70** (was 79.90%); 1073 tests green in default and shuffled-test order (seed
+20260913); `ci/compile_all.py` clean (41 files). The dedupe mutation is pinned by
+*observing* the filesystem — the repeated candidate is stat'd exactly once — rather than
+by the line being executed.

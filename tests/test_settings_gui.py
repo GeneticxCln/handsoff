@@ -1151,6 +1151,126 @@ def the_cat_keeps_its_ears_inside_its_own_mask():
 
 
 @scenario
+def every_design_keeps_ink_inside_its_aperture():
+    # A design may draw anything it likes as long as it is inside the glass.
+    # Ink past the mask is ink Qt cuts off, so the shape gets a flat edge
+    # exactly where it was meant to be round or pointed: the droplet's point
+    # and its drip, Saturn's moon, the Eye's flame tips, the tail of a halo
+    # that is supposed to fade to nothing. Six designs did it before the
+    # APERTURE_R budget existed — every one of those clamps is pinned here, so
+    # removing any of them fails this scenario.
+    #
+    # The bar is alpha 16 of 255 — one bar for every design, deliberately
+    # between the two things it must separate: <=4 is what antialiasing a
+    # design's own edge against the rasterised rim leaves behind (sub-pixel,
+    # invisible, and unavoidable), and the six spills this pins measured 19 to
+    # 255.
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QImage, QPainter
+    from settings_schema import BUBBLE_DESIGNS
+
+    class _Signal:
+        def connect(self, *_a, **_k):
+            return None
+
+    class _Stub:
+        sigState = _Signal()
+        sigLevel = _Signal()
+
+    class _Clock:
+        def __init__(self, ms):
+            self.ms = ms
+
+        def elapsed(self):
+            return self.ms
+
+    VISIBLE = 16
+    W = bubble.WINDOW_PX
+    assert bubble.APERTURE_R <= W / 2.0 - 1.0, (
+        "the aperture budget must stay at least a pixel inside the glass, or "
+        "the guard below is measuring against a budget the mask contradicts")
+    widget = bubble.BubbleWidget(_Stub())
+    widget.resize(W, W)
+    widget._anim.stop()
+
+    worst = (0, None)
+    for design in BUBBLE_DESIGNS:
+        region = bubble.design_region(design, W, W)
+        outside = [(x, y) for y in range(W) for x in range(W)
+                   if not region.contains(QPoint(x, y))]
+        for clock_ms in (0, 600, 2600, 4000):
+            widget._clock = _Clock(clock_ms)
+            for state in ("idle", "listening", "thinking", "speaking"):
+                widget._state = state
+                widget._energy_ui = bubble._fx_energy(state)
+                for level in (0.0, 1.0):
+                    # every radius the state machine can ask for: rest, the
+                    # idle breathe, the speaking pulse and the listening peak
+                    for grow in (0.0, 3.5, 7.0, 12.0):
+                        widget._level_target = widget._level_ui = level
+                        widget._radius_ui = bubble.BUBBLE_R0 + grow * bubble.GEOM_K
+                        img = QImage(W, W, QImage.Format_ARGB32)
+                        img.fill(0)
+                        painter = QPainter(img)
+                        getattr(widget, "_paint_" + design)(painter, widget._frame())
+                        painter.end()
+                        n = 0
+                        peak = 0
+                        for x, y in outside:
+                            a = img.pixelColor(x, y).alpha()
+                            if a >= VISIBLE:
+                                n += 1
+                                peak = max(peak, a)
+                        if n > worst[0]:
+                            worst = (n, (design, clock_ms, state, level, grow,
+                                         peak))
+    if worst[0]:
+        design, clock_ms, state, level, grow, peak = worst[1]
+        raise AssertionError(
+            f"`{design}` paints {worst[0]} pixel(s) of visible ink outside "
+            f"its own aperture (worst alpha {peak}) at clock={clock_ms} "
+            f"{state} lv={level} radius=+{grow} — Qt would cut them off")
+
+    # ...and the droplet must still BE a teardrop of its own size. A fit that
+    # only clamped its height would pass the check above by turning it into a
+    # ball, and folding the detaching drip back into the budget would pass it by
+    # shrinking the whole drop — so pin the silhouette, and a reach floor at the
+    # phase where a drip-inclusive fit is at its most destructive (clock 2600:
+    # the drip is 11 px past the rim there, already clipped by the window).
+    for clock_ms, state, level, grow in ((0, "idle", 0.0, 0.0),
+                                         (0, "idle", 0.0, 3.5),
+                                         (600, "listening", 1.0, 12.0),
+                                         (2600, "listening", 1.0, 12.0),
+                                         (4000, "listening", 1.0, 12.0)):
+        widget._clock = _Clock(clock_ms)
+        widget._state = state
+        widget._energy_ui = bubble._fx_energy(state)
+        widget._level_target = widget._level_ui = level
+        widget._radius_ui = bubble.BUBBLE_R0 + grow * bubble.GEOM_K
+        img = QImage(W, W, QImage.Format_ARGB32)
+        img.fill(0)
+        painter = QPainter(img)
+        widget._paint_droplet(painter, widget._frame())
+        painter.end()
+        pts = [(x, y) for y in range(W) for x in range(W)
+               if img.pixelColor(x, y).alpha() >= VISIBLE]
+        assert pts, f"the droplet draws nothing at {state} lv={level}"
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        wide = max(xs) - min(xs) + 1
+        tall = max(ys) - min(ys) + 1
+        assert tall >= wide * 1.2, (
+            f"the droplet is not a teardrop any more at {state} lv={level}: "
+            f"{wide}x{tall} — the aperture fit squashed its height")
+        reach = max(((x + 0.5 - W / 2.0) ** 2
+                     + (y + 0.5 - W / 2.0) ** 2) ** 0.5 for x, y in pts)
+        assert reach >= 55.0, (
+            f"the droplet collapsed to {reach:.1f} px at {state} lv={level} "
+            f"(clock {clock_ms}) — the fit is shrinking the design away "
+            f"instead of fitting it")
+
+
+@scenario
 def every_design_has_its_own_preview_glyph():
     # BubblePreview._glyph falls through to the orb for any design it does not
     # know, so a new design would show as an orb in the Appearance preview
@@ -1877,6 +1997,7 @@ SCENARIO_NAMES = [
     "a_look_sets_every_appearance_control",
     "every_look_is_renderable_and_reacts",
     "the_cat_keeps_its_ears_inside_its_own_mask",
+    "every_design_keeps_ink_inside_its_aperture",
     "every_design_has_its_own_preview_glyph",
     "appearance_panel_is_a_scrolling_column_of_cards",
     "look_tiles_are_drawn_from_the_shared_painter",

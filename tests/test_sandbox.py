@@ -14,13 +14,16 @@ to `conftest._load` and a test module is imported by pytest.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
+import core
 from core import APP_MODULE_NAME, app_instance, app_module, load_app_module
 
 from conftest import HERE as ROOT, _REAL_HOME, _load, _user_site, \
@@ -484,21 +487,30 @@ class TestNoLoaderBypassesTheSandbox:
     def test_no_test_builds_a_module_by_hand(self):
         """A hand-built loader is how the isolation is lost without a word.
 
-        `module_from_spec(...)` in test code means a load that does not go
-        through conftest's `_load` — i.e. one that resolves the real HOME again,
-        silently, because nothing in the load itself complains. Parsed with
-        `ast`, so the driver STRINGS (which are already sandboxed by env) do not
-        count.
+        `module_from_spec` plus an `exec_module` in test code IS a load that
+        never went through conftest's `_load` — i.e. one that resolves the real
+        HOME again, silently, because nothing in the load itself complains.
+        Parsed with `ast`, so the driver STRINGS (which are already sandboxed by
+        env) do not count.
+
+        The pair is what is banned, not the name: a test may INTERCEPT the
+        function to pin a race the loader guards (`TestLoaderFailurePaths`
+        replaces it, then puts it back), and such a test hand-executes nothing.
+        A file that both builds a module and runs it is the load this rule
+        exists for, and it is flagged wherever it appears.
         """
         offenders = []
         for path in sorted((HERE / "tests").glob("*.py")):
             if path.name in ("conftest.py", "fake_ollama.py"):
                 continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Attribute) \
-                        and node.attr == "module_from_spec":
-                    offenders.append(f"{path.name}:{node.lineno}")
+            attrs = [n.attr for n in ast.walk(tree)
+                     if isinstance(n, ast.Attribute)]
+            if "module_from_spec" in attrs and "exec_module" in attrs:
+                first = next(n for n in ast.walk(tree)
+                             if isinstance(n, ast.Attribute)
+                             and n.attr == "module_from_spec")
+                offenders.append(f"{path.name}:{first.lineno}")
         assert offenders == [], (
             "build modules through conftest._load (which sandboxes HOME), not "
             f"by hand: {offenders}")
@@ -653,6 +665,426 @@ class TestOneAppPerProcess:
             if "exec_module" in driver:
                 assert "sys.modules[" in driver, (
                     f"{name}'s driver exec's a module without naming it first")
+
+
+class TestLoaderFailurePaths:
+    """`core`'s loaders have to fail LOUDLY, and give nothing back.
+
+    Every branch below is a way a second app — or a half-built one — could be
+    produced instead of a refusal: a foreign module planted under the canonical
+    name, an app that is still initialising, a load that raises mid-exec, two
+    loaders racing for the same slot, a candidate the interpreter cannot build a
+    spec for, a support module that must not be swapped under a live foreign
+    submodule, and a failed support load that has to hand back exactly what it
+    replaced. They are exercised directly, because the happy path (and the
+    module body's own refusal) cannot reach any of them.
+
+    The suite normally runs WITH the app loaded, so the fixture below hands each
+    test the state these branches actually guard: nothing registered, nothing
+    recorded. Both are put back afterwards — a test that evicted the app and
+    left it evicted is how a second bubble got built in an earlier session.
+    """
+
+    @pytest.fixture()
+    def no_app(self, monkeypatch):
+        """A process that has not loaded the app yet, as at start-up."""
+        saved = sys.modules.pop(APP_MODULE_NAME, None)
+        monkeypatch.setattr(core, "_APP_INSTANCE", None)
+        try:
+            yield
+        finally:
+            if saved is not None:
+                sys.modules[APP_MODULE_NAME] = saved
+
+    def test_a_load_with_nothing_loadable_raises_and_names_what_it_tried(
+            self, no_app, tmp_path):
+        """No candidate at all is an ImportError, not a silent empty load."""
+        with pytest.raises(ImportError, match="cannot find the application"):
+            load_app_module([tmp_path / "absent.py"])
+        # A candidate that is not even a path is SKIPPED, not raised: the list
+        # comes from callers, and `Path(None)` / `Path(42)` must not be the
+        # error the operator sees.
+        with pytest.raises(ImportError, match="cannot find the application"):
+            load_app_module([None, 42, tmp_path / "absent.py"])
+
+    def test_a_foreign_module_under_the_canonical_name_is_refused(
+            self, no_app, tmp_path):
+        """A module planted under the app's name is not the app.
+
+        The origin rule is the same one `load_module` uses: a module whose file
+        lives outside the allowed dirs can never satisfy a loader, whatever it
+        calls itself.
+        """
+        planted = types.ModuleType(APP_MODULE_NAME)
+        planted.__file__ = str(tmp_path / "planted.py")
+        sys.modules[APP_MODULE_NAME] = planted
+        try:
+            with pytest.raises(ImportError,
+                               match="refusing to reuse a foreign"):
+                load_app_module([HERE / "handsoff.py"])
+        finally:
+            sys.modules.pop(APP_MODULE_NAME, None)
+        assert app_instance() is None, \
+            "the loader executed a second copy to 'resolve' the foreign name"
+
+    def test_an_app_that_is_still_initialising_refuses_a_second_load(
+            self, no_app):
+        """Registered but not ready is a refusal, not a reuse.
+
+        A half-built app is not a second view of one app: its `SETTINGS` is a
+        name the module that owns it has not defined yet. The file is a real one
+        in an allowed dir, so this is the *ready* check being tested, not the
+        origin rule.
+        """
+        half = types.ModuleType(APP_MODULE_NAME)
+        half.__file__ = str(HERE / "handsoff.py")
+        sys.modules[APP_MODULE_NAME] = half
+        try:
+            with pytest.raises(ImportError, match="still initialising"):
+                load_app_module([HERE / "handsoff.py"])
+        finally:
+            sys.modules.pop(APP_MODULE_NAME, None)
+        assert app_module() is None
+
+    def test_a_load_that_raises_gives_the_slot_back(self, no_app, tmp_path):
+        """A failed exec must not leave a half-initialised app behind.
+
+        `module_from_spec` + `setdefault` registers the name BEFORE the module
+        body runs, so a body that raises would otherwise leave a registered
+        module with no SETTINGS for the next caller to find and hand out.
+        """
+        boom = tmp_path / "boom.py"
+        boom.write_text("raise SystemExit('boom')\n", encoding="utf-8")
+        with pytest.raises(SystemExit):
+            load_app_module([boom])
+        assert APP_MODULE_NAME not in sys.modules, \
+            "the failed load left a half-initialised app registered"
+        assert app_instance() is None
+
+    def test_two_racing_loaders_admit_exactly_one_copy(
+            self, no_app, monkeypatch):
+        """`setdefault` decides, and the loser hands back the WINNER's module.
+
+        The interleaving is forced rather than hoped for: a concurrent loader
+        admits its module under the canonical name in the window between this
+        loader's `module_from_spec` and its own `setdefault`. The loser must
+        return that module WITHOUT executing anything — executing is the second
+        app, which is the whole thing this slot exists to prevent.
+        """
+        winner = types.ModuleType(APP_MODULE_NAME)
+        winner.__file__ = str(HERE / "handsoff.py")
+        real = importlib.util.module_from_spec
+
+        def racer(spec):
+            fresh = real(spec)
+            sys.modules.setdefault(APP_MODULE_NAME, winner)
+            return fresh
+
+        monkeypatch.setattr(importlib.util, "module_from_spec", racer)
+        try:
+            assert load_app_module([HERE / "handsoff.py"]) is winner
+        finally:
+            sys.modules.pop(APP_MODULE_NAME, None)
+        assert not hasattr(winner, "SETTINGS"), \
+            "the losing loader executed a copy of the app into the winner"
+
+    def test_a_candidate_the_interpreter_cannot_build_a_spec_for_is_skipped(
+            self, no_app, monkeypatch, tmp_path):
+        """A file this interpreter cannot turn into a module is not the app."""
+        cand = tmp_path / "app_like.py"
+        cand.write_text("SETTINGS = 1\n", encoding="utf-8")
+        monkeypatch.setattr(importlib.util, "spec_from_file_location",
+                            lambda *a, **k: None)
+        with pytest.raises(ImportError, match="cannot find the application"):
+            load_app_module([cand])
+
+    def test_a_support_module_with_an_unbuildable_spec_is_skipped(
+            self, monkeypatch, tmp_path):
+        """Same rule for `load_module`: skip it, then fail with its own name."""
+        pkg = tmp_path / "core"
+        pkg.mkdir()
+        (pkg / "sandbox_spec_mod.py").write_text("VALUE = 4\n",
+                                                  encoding="utf-8")
+        monkeypatch.setattr(core, "_HERE", pkg)
+        monkeypatch.setattr(importlib.util, "spec_from_file_location",
+                            lambda *a, **k: None)
+        with pytest.raises(ImportError,
+                           match="cannot load 'sandbox_spec_mod'"):
+            core.load_module("sandbox_spec_mod")
+
+    def test_a_home_that_cannot_be_resolved_does_not_stop_a_load(
+            self, monkeypatch, tmp_path):
+        """`_allowed_dirs` and the bin candidate both touch HOME.
+
+        Neither may take the whole load down with them: HOME is one origin out of
+        several, and a module beside the package has nothing to do with it.
+        """
+        pkg = tmp_path / "core"
+        pkg.mkdir()
+        (pkg / "synth_nohome.py").write_text("VALUE = 11\n", encoding="utf-8")
+        monkeypatch.setattr(core, "_HERE", pkg)
+
+        def no_home(cls):
+            raise OSError("no home")
+
+        monkeypatch.setattr(Path, "home", classmethod(no_home))
+        try:
+            mod = core.load_module("synth_nohome")
+        finally:
+            sys.modules.pop("core.synth_nohome", None)
+        assert getattr(mod, "VALUE") == 11
+        assert core._origin_ok(mod)
+
+    def test_a_foreign_submodule_appearing_mid_load_is_refused(
+            self, monkeypatch, tmp_path):
+        """The swap guard is re-checked at the INSTALL point, not only on entry.
+
+        A concurrent import that plants `core.<name>` between the entry check and
+        the install would otherwise be overwritten by this load — the same
+        "never swap under a live foreign submodule" rule, applied where the swap
+        actually happens.
+        """
+        pkg = tmp_path / "core"
+        pkg.mkdir()
+        (pkg / "synth_swap.py").write_text("VALUE = 7\n", encoding="utf-8")
+        monkeypatch.setattr(core, "_HERE", pkg)
+        planted = types.ModuleType("core.synth_swap")
+        planted.__file__ = str(tmp_path / "outside" / "planted.py")
+        real = importlib.util.module_from_spec
+
+        def racer(spec):
+            fresh = real(spec)
+            sys.modules["core.synth_swap"] = planted
+            return fresh
+
+        monkeypatch.setattr(importlib.util, "module_from_spec", racer)
+        monkeypatch.delitem(sys.modules, "core.synth_swap", raising=False)
+        try:
+            with pytest.raises(ImportError,
+                               match="refusing to swap foreign live submodule"):
+                core.load_module("synth_swap")
+        finally:
+            sys.modules.pop("core.synth_swap", None)
+
+    def test_a_failed_support_load_restores_what_it_replaced(
+            self, monkeypatch, tmp_path):
+        """No half-initialised squat: the previous entry comes back unchanged.
+
+        The bare name here is a FOREIGN module on purpose. That is the case the
+        loader refuses to overwrite, so the failing load has to put it back
+        rather than leaving either its own module or nothing.
+        """
+        pkg = tmp_path / "core"
+        pkg.mkdir()
+        (pkg / "synth_boom.py").write_text("raise RuntimeError('boom')\n",
+                                            encoding="utf-8")
+        monkeypatch.setattr(core, "_HERE", pkg)
+        prev = types.ModuleType("synth_boom")
+        prev.__file__ = str(tmp_path / "outside" / "prev.py")
+        monkeypatch.setitem(sys.modules, "synth_boom", prev)
+        monkeypatch.delitem(sys.modules, "core.synth_boom", raising=False)
+        with pytest.raises(RuntimeError):
+            core.load_module("synth_boom")
+        assert sys.modules["synth_boom"] is prev, \
+            "a failed load left its own module under the bare name"
+        assert "core.synth_boom" not in sys.modules
+
+    def test_a_failed_support_load_leaves_no_squat_behind(
+            self, monkeypatch, tmp_path):
+        """With nothing there before, nothing is there after."""
+        pkg = tmp_path / "core"
+        pkg.mkdir()
+        (pkg / "synth_boom2.py").write_text("raise RuntimeError('boom')\n",
+                                             encoding="utf-8")
+        monkeypatch.setattr(core, "_HERE", pkg)
+        monkeypatch.delitem(sys.modules, "synth_boom2", raising=False)
+        monkeypatch.delitem(sys.modules, "core.synth_boom2", raising=False)
+        with pytest.raises(RuntimeError):
+            core.load_module("synth_boom2")
+        assert "synth_boom2" not in sys.modules
+        assert "core.synth_boom2" not in sys.modules
+
+    def test_a_module_already_imported_by_its_bare_name_is_adopted(
+            self, monkeypatch):
+        """A plain `import hardware` is not a second copy of it.
+
+        A support module the interpreter already imported (by name, from the
+        checkout root) is registered under `core.<name>` and handed back —
+        re-exec'ing it would give two copies of a module that owns locks and
+        caches, which is the same defect as two apps one level down.
+        """
+        module = types.ModuleType("hardware")
+        module.__file__ = str(HERE / "hardware.py")          # an allowed dir
+        monkeypatch.setitem(sys.modules, "hardware", module)
+        monkeypatch.delitem(sys.modules, "core.hardware", raising=False)
+        assert core.load_module("hardware") is module
+        assert sys.modules["core.hardware"] is module
+
+    def test_a_foreign_submodule_already_cached_is_refused(self, monkeypatch,
+                                                          tmp_path):
+        """The entry check: a planted `core.<name>` is never swapped out."""
+        planted = types.ModuleType("core.synth_entry")
+        planted.__file__ = str(tmp_path / "planted.py")
+        monkeypatch.setitem(sys.modules, "core.synth_entry", planted)
+        with pytest.raises(ImportError,
+                           match="refusing to swap foreign live submodule"):
+            core.load_module("synth_entry")
+        assert sys.modules["core.synth_entry"] is planted
+
+    def test_a_candidate_the_filesystem_refuses_falls_through_to_an_import(
+            self, monkeypatch, tmp_path):
+        """A stat that fails is not a missing module.
+
+        The layout is the INSTALLED one — `~/.local/bin/<name>.py` beside
+        `~/.local/bin/core` — so the plain-import fallback is what loads this,
+        after the file-system candidate refuses to be stat'd. Both fallbacks have
+        to exist: a stat error is not evidence that the module is absent.
+        """
+        inst = tmp_path / ".local" / "bin"
+        pkg = inst / "core"
+        pkg.mkdir(parents=True)
+        (inst / "sandbox_inst_mod.py").write_text("VALUE = 9\n",
+                                                  encoding="utf-8")
+        monkeypatch.setattr(core, "_HERE", pkg)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.syspath_prepend(str(inst))
+        real_is_file = Path.is_file
+        refused = inst / "sandbox_inst_mod.py"
+
+        def broken(self):
+            if self == refused:
+                raise OSError("stat refused")
+            return real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", broken)
+        monkeypatch.delitem(sys.modules, "sandbox_inst_mod", raising=False)
+        monkeypatch.delitem(sys.modules, "core.sandbox_inst_mod",
+                            raising=False)
+        try:
+            mod = core.load_module("sandbox_inst_mod")
+        finally:
+            sys.modules.pop("sandbox_inst_mod", None)
+            sys.modules.pop("core.sandbox_inst_mod", None)
+        assert getattr(mod, "VALUE") == 9
+        assert str(mod.__file__) == str(refused)
+
+    def test_a_candidate_that_repeats_in_the_list_is_tried_once(
+            self, monkeypatch):
+        """The candidate list cannot make the loader consider a path twice.
+
+        With `_HERE` at the filesystem root the package dir and its parent are
+        the same directory, so both derived candidates are the same string —
+        the degenerate case the dedupe exists for, and the same doubling the
+        installed layout produces through the bin candidate. Asserted by
+        OBSERVING the filesystem, not by coverage: that path is stat'd once.
+        """
+        monkeypatch.setattr(core, "_HERE", Path("/"))
+        counted = Path("/sandbox_dedupe_mod.py")
+        asked: list = []
+        real_is_file = Path.is_file
+
+        def counting(self):
+            if self == counted:
+                asked.append(self)
+            return real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", counting)
+        monkeypatch.delitem(sys.modules, "sandbox_dedupe_mod", raising=False)
+        with pytest.raises(ImportError,
+                           match="cannot load 'sandbox_dedupe_mod'"):
+            core.load_module("sandbox_dedupe_mod")
+        assert len(asked) == 1, f"the same candidate was tried {len(asked)}x"
+
+    def test_a_failed_load_gives_back_the_concurrent_module_it_found(
+            self, monkeypatch, tmp_path):
+        """Also on the way OUT: whatever was there before is what is there after.
+
+        A concurrent import can install `core.<name>` between the entry check and
+        the install; a load that then fails has to hand that module back rather
+        than popping it, or the failing load breaks a working import.
+        """
+        pkg = tmp_path / "core"
+        pkg.mkdir()
+        (pkg / "synth_race.py").write_text("raise RuntimeError('boom')\n",
+                                           encoding="utf-8")
+        monkeypatch.setattr(core, "_HERE", pkg)
+        concurrent = types.ModuleType("core.synth_race")
+        concurrent.__file__ = str(pkg / "concurrent.py")      # an allowed dir
+        real = importlib.util.module_from_spec
+
+        def racer(spec):
+            fresh = real(spec)
+            sys.modules["core.synth_race"] = concurrent
+            return fresh
+
+        monkeypatch.setattr(importlib.util, "module_from_spec", racer)
+        monkeypatch.delitem(sys.modules, "core.synth_race", raising=False)
+        with pytest.raises(RuntimeError):
+            core.load_module("synth_race")
+        assert sys.modules["core.synth_race"] is concurrent, \
+            "the failing load took the concurrent module with it"
+
+    def test_the_origin_rule_survives_a_path_that_cannot_be_resolved(
+            self, monkeypatch, tmp_path):
+        """`resolve()` is a filesystem call, and it can fail.
+
+        The origin union is built at load time, so one unresolvable member — a
+        dead network mount, a permission error, an unwritable home — must fall
+        back to the path as given instead of raising out of the loader.
+        """
+        real = Path.resolve
+
+        def broken(self, *a, **k):
+            if str(self).startswith(str(tmp_path)):
+                raise OSError("resolve refused")
+            return real(self, *a, **k)
+
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "handsoff.py").write_text("# not executed\n", encoding="utf-8")
+        monkeypatch.setattr(Path, "resolve", broken)
+        monkeypatch.setattr(core, "_HERE", tmp_path / "core")
+        monkeypatch.setenv("HANDSOFF_SOURCE_PATH", str(src))
+        monkeypatch.setattr(Path, "home",
+                            classmethod(lambda cls: tmp_path / "home"))
+        dirs = core._allowed_dirs()
+        assert (tmp_path / "core") in dirs, "the package dir was dropped"
+        assert src in dirs, "the named checkout was dropped"
+        assert src / "core" in dirs, "the named checkout's core/ was dropped"
+        assert (tmp_path / "home" / ".local" / "bin") in dirs, \
+            "the installed dir was dropped"
+
+    def test_a_module_whose_path_cannot_be_resolved_is_not_ours(
+            self, monkeypatch, tmp_path):
+        """An unanswerable origin is a NO, not an exception into the caller."""
+        real = Path.resolve
+
+        def broken(self, *a, **k):
+            if str(self).startswith(str(tmp_path)):
+                raise OSError("resolve refused")
+            return real(self, *a, **k)
+
+        monkeypatch.setattr(Path, "resolve", broken)
+        planted = types.ModuleType("planted")
+        planted.__file__ = str(tmp_path / "planted.py")
+        assert core._origin_ok(planted) is False
+
+    def test_the_source_checkout_can_be_named_explicitly(self, monkeypatch,
+                                                        tmp_path):
+        """HANDSOFF_SOURCE_PATH is part of the origin union, in both spellings."""
+        root = tmp_path / "src"
+        root.mkdir()
+        (root / "handsoff.py").write_text("# not executed\n", encoding="utf-8")
+        monkeypatch.setenv("HANDSOFF_SOURCE_PATH", str(root / "handsoff.py"))
+        assert core._repo_root() == root
+        monkeypatch.setenv("HANDSOFF_SOURCE_PATH", str(root))
+        assert core._repo_root() == root
+        # A path that does not name handsoff.py is ignored, not accepted — and
+        # with nothing beside the package either, the answer is None rather than
+        # a guess at some parent directory.
+        monkeypatch.setenv("HANDSOFF_SOURCE_PATH", str(tmp_path / "other"))
+        monkeypatch.setattr(core, "_HERE", tmp_path / "nowhere")
+        assert core._repo_root() is None
 
 
 class TestImportStatementsCannotBypassTheSandbox:

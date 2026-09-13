@@ -1344,6 +1344,17 @@ ANIM_ENERGY = float(SETTINGS.get("animation_energy", 1.0))
 BUBBLE_R0 = WINDOW_PX * 44.0 / 128.0  # idle bubble radius
 GLOW_PAD = WINDOW_PX * 7.0 / 128.0    # glow ring thickness; fits inside the mask
 GEOM_K = WINDOW_PX / 128.0            # scale for all radius offsets
+# The window's mask is the inscribed ellipse of a SQUARE window — which is a
+# circle of this radius — so "inside the aperture" is a distance test, and this
+# is the budget every design's outermost reach has to fit in. One pixel inside
+# the true edge, because an antialiased pixel sitting exactly on the boundary is
+# half of it outside. Six designs used to exceed it, measured with the guard in
+# tests/test_settings_gui.py: `droplet` put its point and its drip through it
+# (391 px, alpha 254 — opaque), `sauron` its fire tips (523 px, alpha 255),
+# `saturn` its moon (16 px, alpha 200), and `bloom`, `cube` and `crystal` the
+# faint tails of their halos (1 396–2 508 px at alpha 19–20). Each of those
+# clamps is pinned by that guard — remove one and it fails.
+APERTURE_R = WINDOW_PX / 2.0 - 1.0
 LOCK_RETRIES = 40                     # lock wait on restart: 40 x 0.25s = 10s
 LOCK_RETRY_WAIT = 0.25
 
@@ -6652,7 +6663,15 @@ class BubbleWidget(QWidget):
         # round mask, so growing it would just clip. Neutral at level 0.
         lv = min(1.0, max(0.0, float(f["level"])))
         p.setPen(Qt.NoPen)
-        mist = QRadialGradient(QPointF(cx, cy), radius * 1.35)
+        # The mist reaches 1.35 R, which is past the glass at every size above
+        # rest: measured 2 508 pixels outside the rim before this clamp, the
+        # most opaque of them at alpha 19. Faint — but a gradient that is meant
+        # to fade to nothing ended on the cut instead, because its outer stops
+        # are reached INSIDE the disc it fills: "alpha 0 at the edge" was never
+        # true of the pixels between. Clamped, the fade completes inside the
+        # glass.
+        mist_r = min(radius * 1.35, APERTURE_R)
+        mist = QRadialGradient(QPointF(cx, cy), mist_r)
         mist_c = QColor(color)
         mist_c.setAlpha(int(min(255.0, 70 + 60 * energy + 80 * lv)))
         mist.setColorAt(0.0, mist_c)
@@ -6664,7 +6683,7 @@ class BubbleWidget(QWidget):
         mist.setColorAt(1.0 - 0.20 * lv, mist_c)
         mist.setColorAt(1.0, mist_c)
         p.setBrush(QBrush(mist))
-        p.drawEllipse(QPointF(cx, cy), radius * 1.35, radius * 1.35)
+        p.drawEllipse(QPointF(cx, cy), mist_r, mist_r)
         blob = self._wobble_path(cx, cy, radius * 0.72, t * 0.7, 0.6 + 0.6 * lv)
         body = QRadialGradient(QPointF(cx, cy - radius * 0.2), radius)
         top = QColor(color).lighter(150)
@@ -6708,17 +6727,48 @@ class BubbleWidget(QWidget):
         # sooner. Both are neutral at level 0 — the ripple term vanishes exactly.
         lv = min(1.0, max(0.0, float(level)))
         stretch = 1.0 + 0.28 * level + (0.08 if self._state == LISTENING else 0.0)
-        drop = QPainterPath()
+        # The shape is built first and then FITTED to the glass with one scale
+        # factor, because a teardrop drawn to its natural reach puts its point
+        # through the top of the aperture and its drip through the bottom —
+        # measured: opaque ink outside the rim on every frame above silence,
+        # 391 px of it at alpha 254 on the worst one. At rest it already fits
+        # (mostly), so the resting droplet barely moves; as the voice stretches
+        # it, the drop stops at the rim instead of being cut by it.
+        skin = []
         for i in range(73):
             ang = i * 2 * math.pi / 72
             tip = math.exp(-((ang - math.pi / 2) / 0.55) ** 2)
             r = R * (1.0 + 0.45 * tip + 0.04 * math.sin(3 * ang + 3.0 * t)
                      + 0.03 * lv * math.sin(7 * ang - 5.0 * t))
-            x, y = cx + r * math.cos(ang) * 0.92, cy - r * math.sin(ang) * stretch
+            skin.append((r * math.cos(ang) * 0.92, -r * math.sin(ang) * stretch))
+        drip_ph = ((t * (0.7 + 1.6 * lv)) % 1.0
+                   if self._state == LISTENING else None)
+        drip_dy = drip_rx = drip_ry = 0.0
+        if drip_ph is not None:
+            drip_rx = R * 0.10 * (1.0 - drip_ph * 0.5) * (1.0 + 0.4 * lv)
+            drip_ry = R * 0.13 * (1.0 - drip_ph * 0.5) * (1.0 + 0.4 * lv)
+            drip_dy = R * stretch + drip_ph * R * 0.9 + drip_ry
+        rim_w = max(1.2, R * 0.045 * (1.0 + 0.35 * lv))
+        # The drip is deliberately NOT part of this fit. Folding it in was tried
+        # and REVERTED: it shrank the whole droplet (measured fit 0.51 instead
+        # of 0.62 at the phase where the drip is furthest along) to make room
+        # for a drip that is already outside the window by then — its drawn
+        # centre reaches y=136.9 in a 128 px window while it still has alpha,
+        # and on the vertical axis "outside the mask" IS "outside the window",
+        # so Qt has clipped it before the mask could. A fine 5 ms sweep of the
+        # whole cycle at five radii measured ZERO pixels of any alpha outside
+        # the rim with the drip excluded.
+        reach = max([math.hypot(x, y) for x, y in skin])
+        # the rim is a stroke, so half of it is outside the path it outlines
+        budget = max(1.0, APERTURE_R - rim_w * 0.5)
+        fit = min(1.0, budget / reach) if reach else 1.0
+        drop = QPainterPath()
+        for i, (x, y) in enumerate(skin):
+            x, y = cx + x * fit, cy + y * fit
             drop.moveTo(x, y) if i == 0 else drop.lineTo(x, y)
         drop.closeSubpath()
         p.setPen(Qt.NoPen)
-        body = QLinearGradient(cx, cy - R * stretch, cx, cy + R)
+        body = QLinearGradient(cx, cy - R * stretch * fit, cx, cy + R * fit)
         hi = QColor(color).lighter(165)
         hi.setAlpha(235)
         body.setColorAt(0.0, hi)
@@ -6732,22 +6782,20 @@ class BubbleWidget(QWidget):
         p.drawPath(drop)
         # specular streak down the lit side
         p.setBrush(QColor(255, 255, 255, int(min(255.0, 50 + 20 * energy + 80 * lv))))
-        p.drawEllipse(QPointF(cx - R * 0.28, cy - R * 0.35 * stretch),
-                      R * 0.13 * (1.0 + 0.35 * lv), R * 0.22 * stretch)
+        p.drawEllipse(QPointF(cx - R * 0.28 * fit, cy - R * 0.35 * stretch * fit),
+                      R * 0.13 * (1.0 + 0.35 * lv) * fit, R * 0.22 * stretch * fit)
         # detaching drip while listening; the voice makes it detach sooner and
         # more often, since the whole drop is agitated
-        if self._state == LISTENING:
-            ph = (t * (0.7 + 1.6 * lv)) % 1.0
+        if drip_ph is not None:
             drip = QColor(color)
-            drip.setAlpha(int(min(255.0, (1.0 - ph) * (200 + 55 * lv))))
+            drip.setAlpha(int(min(255.0, (1.0 - drip_ph) * (200 + 55 * lv))))
             p.setBrush(QBrush(drip))
-            p.drawEllipse(QPointF(cx, cy + R * stretch + ph * R * 0.9),
-                          R * 0.10 * (1.0 - ph * 0.5) * (1.0 + 0.4 * lv),
-                          R * 0.13 * (1.0 - ph * 0.5) * (1.0 + 0.4 * lv))
+            p.drawEllipse(QPointF(cx, cy + drip_dy * fit),
+                          drip_rx * fit, drip_ry * fit)
         rim = QColor(color).lighter(140)
         rim.setAlpha(int(min(255.0, 120 + 80 * energy + 60 * lv)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(rim, max(1.2, R * 0.045 * (1.0 + 0.35 * lv))))
+        p.setPen(QPen(rim, rim_w))
         p.drawPath(drop)
 
     def _paint_cube(self, p: QPainter, f: dict) -> None:
@@ -6767,7 +6815,12 @@ class BubbleWidget(QWidget):
         verts = [(cx + R * math.cos(rot + i * math.pi / 3),
                   cy - R * math.sin(rot + i * math.pi / 3)) for i in range(6)]
         p.setPen(Qt.NoPen)
-        halo = QRadialGradient(QPointF(cx, cy), R * 1.3)
+        # The halo is 1.3 R, so at the listening peak its tail crossed the rim
+        # (measured 1 396 pixels outside it, most opaque alpha 19) — faint, but
+        # it is ink on the cut, and the outer stops land INSIDE the disc, so
+        # the intended fade to zero never reaches the edge itself
+        halo_r = min(R * 1.3, APERTURE_R)
+        halo = QRadialGradient(QPointF(cx, cy), halo_r)
         hc = QColor(color)
         hc.setAlpha(int(min(255.0, 25 + 35 * energy + 60 * lv)))
         halo.setColorAt(0.7, hc)
@@ -6778,7 +6831,7 @@ class BubbleWidget(QWidget):
         halo.setColorAt(1.0 - 0.20 * lv, hc)
         halo.setColorAt(1.0, hc)
         p.setBrush(QBrush(halo))
-        p.drawEllipse(QPointF(cx, cy), R * 1.3, R * 1.3)
+        p.drawEllipse(QPointF(cx, cy), halo_r, halo_r)
         for i in range(6):
             x1, y1 = verts[i]
             ang = rot + (i + 0.5) * math.pi / 3
@@ -6859,7 +6912,10 @@ class BubbleWidget(QWidget):
         R = radius * 0.95
         rot = t * 2 * math.pi * 0.06
         p.setPen(Qt.NoPen)
-        halo = QRadialGradient(QPointF(cx, cy), R * 1.3)
+        # same clamp as the cube: 1.3 R crossed the rim at the listening peak
+        # (measured 1 396 pixels past it, most opaque alpha 20)
+        halo_r = min(R * 1.3, APERTURE_R)
+        halo = QRadialGradient(QPointF(cx, cy), halo_r)
         hc = QColor(color)
         hc.setAlpha(int(min(255.0, 30 + 40 * energy + 50 * lv)))
         halo.setColorAt(0.75, hc)
@@ -6870,7 +6926,7 @@ class BubbleWidget(QWidget):
         halo.setColorAt(1.0 - 0.20 * lv, hc)
         halo.setColorAt(1.0, hc)
         p.setBrush(QBrush(halo))
-        p.drawEllipse(QPointF(cx, cy), R * 1.3, R * 1.3)
+        p.drawEllipse(QPointF(cx, cy), halo_r, halo_r)
         gem = QColor(color)
         gem.setAlpha(int(70 + 45 * lv))
         p.setBrush(QBrush(gem))
@@ -6935,17 +6991,24 @@ class BubbleWidget(QWidget):
 
         p.setPen(Qt.NoPen)
         pr = radius * 0.52
+        # The moon orbits at 1.30 R, which is wider than the glass once the
+        # bubble is at its listening size: measured, its disc crossed the rim
+        # (16 px at alpha 200 — a white dot sliced flat by the mask). It is
+        # capped to the aperture so the outermost thing Saturn draws is inside
+        # the rim. (Its ring, at 1.02 R, never crosses and so is NOT clamped —
+        # an aperture clamp there measured as a no-op and was not kept.)
+        ring_pen = max(1.5, radius * 0.06 * (1.0 + 0.5 * lv))
+        ring_r = radius * 1.02
         # back half of the ring (behind the planet)
         back = QPainterPath()
         for i in range(37):
             a = math.pi + i * (math.pi / 36)
-            x, y = _ring_pt(radius * 1.02, a)
+            x, y = _ring_pt(ring_r, a)
             back.moveTo(x, y) if i == 0 else back.lineTo(x, y)
         rc = QColor(color)
         rc.setAlpha(int(min(255.0, 110 + 70 * energy + 60 * lv)))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(rc, max(1.5, radius * 0.06 * (1.0 + 0.5 * lv)),
-                      Qt.SolidLine, Qt.RoundCap))
+        p.setPen(QPen(rc, ring_pen, Qt.SolidLine, Qt.RoundCap))
         p.drawPath(back)
         # glass planet
         globe = QRadialGradient(QPointF(cx + lx * pr * 0.5, cy + ly * pr * 0.5), pr * 1.6)
@@ -6965,7 +7028,7 @@ class BubbleWidget(QWidget):
         front = QPainterPath()
         for i in range(37):
             a = i * (math.pi / 36)
-            x, y = _ring_pt(radius * 1.02, a)
+            x, y = _ring_pt(ring_r, a)
             front.moveTo(x, y) if i == 0 else front.lineTo(x, y)
         rc.setAlpha(int(min(255.0, 170 + 60 * energy + 60 * lv)))
         p.setBrush(Qt.NoBrush)
@@ -6977,14 +7040,15 @@ class BubbleWidget(QWidget):
             wa = t * (1.3 + 2.4 * lv)
             wave = QPainterPath()
             for i in range(13):
-                x, y = _ring_pt(radius * 1.02, wa - 0.45 + i * (0.9 / 12))
+                x, y = _ring_pt(ring_r, wa - 0.45 + i * (0.9 / 12))
                 wave.moveTo(x, y) if i == 0 else wave.lineTo(x, y)
             wc = QColor(255, 255, 255, int(min(255.0, 210 * lv)))
-            p.setPen(QPen(wc, max(2.5, radius * 0.09), Qt.SolidLine, Qt.RoundCap))
+            wave_pen = max(2.5, radius * 0.09)
+            p.setPen(QPen(wc, wave_pen, Qt.SolidLine, Qt.RoundCap))
             p.drawPath(wave)
         # moon on a wider orbit, pulled faster by the voice
         ma = t * (0.9 + 0.7 * lv)
-        mx, my = _ring_pt(radius * 1.30, ma)
+        mx, my = _ring_pt(min(radius * 1.30, APERTURE_R - 2.2), ma)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(255, 255, 255, 200))
         p.drawEllipse(QPointF(mx, my), 2.2, 2.2)
@@ -7092,7 +7156,11 @@ class BubbleWidget(QWidget):
         # Ordering matters: a big tinted disc repainted most of the eye's own
         # pixels (measured 38% warm, i.e. the aura was the subject and the fire
         # the background). The tint now starts late and fades quickly.
-        halo = QRadialGradient(QPointF(cx, cy), R * 1.12)
+        # the aura is the outermost thing the eye draws, and at the top of the
+        # size range it reached past the glass (measured 523 pixels at alpha up
+        # to 255)
+        halo_r = min(R * 1.12, APERTURE_R)
+        halo = QRadialGradient(QPointF(cx, cy), halo_r)
         hot = QColor(int(120 + 135 * blaze), int(40 + 90 * blaze), int(8 + 30 * blaze))
         hot.setAlpha(int(min(255.0, (70 + 110 * blaze) * glow)))
         halo.setColorAt(0.0, hot)
@@ -7104,7 +7172,7 @@ class BubbleWidget(QWidget):
         mid.setAlpha(0)
         halo.setColorAt(1.0, mid)
         p.setBrush(QBrush(halo))
-        p.drawEllipse(QPointF(cx, cy), R * 1.12, R * 1.12)
+        p.drawEllipse(QPointF(cx, cy), halo_r, halo_r)
 
         # -- flame tongues licking outward, each on its own rhythm. The voice
         #    reaches them further and brightens them, so speaking sets the eye
@@ -7112,16 +7180,20 @@ class BubbleWidget(QWidget):
         for i in range(14):
             ang = i * 2 * math.pi / 14 + 0.12 * math.sin(t * 1.4 + i)
             lick = 0.62 + 0.38 * math.sin(t * (3.1 + (i % 5) * 0.7) + i * 1.9)
-            outer = R * (1.02 + 0.30 * lick * (0.5 + 0.5 * blaze)
-                         + 0.22 * lv2 * lick)
+            pen = max(1.2, R * 0.085 * (0.6 + 0.6 * lick))
+            # the tongues are capped by the glass AND by their own round caps:
+            # a stroke's cap extends half the pen past the point it is drawn to,
+            # so clamping the point alone still leaves ink outside.
+            outer = min(APERTURE_R - pen * 0.5,
+                        R * (1.02 + 0.30 * lick * (0.5 + 0.5 * blaze)
+                             + 0.22 * lv2 * lick))
             x0, y0 = cx + math.cos(ang) * R * 0.82, cy - math.sin(ang) * R * 0.82
             x1, y1 = cx + math.cos(ang) * outer, cy - math.sin(ang) * outer
             fc = QColor(int(200 + 55 * blaze), int(70 + 105 * blaze),
                         int(10 + 30 * blaze))
             fc.setAlpha(int(min(255.0, (90 + 130 * lick) * glow * (1.0 + 0.75 * lv2))))
             p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(fc, max(1.2, R * 0.085 * (0.6 + 0.6 * lick)),
-                          Qt.SolidLine, Qt.RoundCap))
+            p.setPen(QPen(fc, pen, Qt.SolidLine, Qt.RoundCap))
             p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
 
         # -- sclera: a wide almond (two quadratic arcs meeting at the corners)
@@ -7269,6 +7341,9 @@ class BubbleWidget(QWidget):
         for sign in (-1.0, 1.0):
             ccx = hx + sign * R * 0.40 * scale
             ccy = hy + R * 0.30 * scale
+            # (An aperture clamp on this bloom was tried and REVERTED: measured
+            # at alpha 11 where it crossed the rim, i.e. below the threshold at
+            # which ink is visible, so it was a no-op dressed as a fix.)
             br = cheek_r * (2.1 + 0.9 * lv) * (1.0 + 0.10 * math.sin(t * 9.0 * anim + sign))
             bloom = QRadialGradient(QPointF(ccx, ccy), br)
             b = QColor(255, 58, 36)
