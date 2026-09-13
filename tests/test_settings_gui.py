@@ -2642,6 +2642,101 @@ def the_appearance_panel_exports_the_art_as_a_pack():
 
 
 @scenario
+def the_appearance_panel_moves_a_look_as_one_file():
+    # A folder is not something anyone can attach to a message, so the same two
+    # things the card already does -- export the art on screen, install a pack
+    # you were given -- also exist as ONE file. What this pins is the wiring the
+    # user touches: the new buttons ask the same questions as their folder
+    # twins, a cancelled chooser installs nothing, an imported file really
+    # becomes the selected pack, and a refused file is REPORTED rather than
+    # leaving the panel looking as if the click did nothing.
+    import json as _json
+    import shutil as _shutil
+    import zipfile as _zipfile
+    from PySide6.QtGui import QColor, QImage
+
+    folder = settings_file.parent
+    packs_root = config_dir / "design-packs"
+    appearance.PACKS_DIR = packs_root
+    _shutil.rmtree(packs_root, ignore_errors=True)
+    destination = folder / "sent"
+    destination.mkdir(parents=True, exist_ok=True)
+
+    def art(name, rgba):
+        p = folder / name
+        img = QImage(48, 48, QImage.Format_ARGB32)
+        img.fill(QColor(*rgba))
+        assert img.save(str(p)), name
+        return p
+
+    fallback = art("file-any.png", (200, 200, 200, 255))
+    idle = art("file-idle.png", (30, 60, 200, 255))
+    speaking = art("file-speaking.png", (200, 60, 30, 255))
+
+    seed({"model": "testmodel:latest", "design_image_path": str(fallback)})
+    win.reload_from_disk()
+    win._design_images["idle"] = str(idle)
+    win._design_images["speaking"] = str(speaking)
+
+    real_name = settings_app.QInputDialog.getText
+    real_dir = settings_app.QFileDialog.getExistingDirectory
+    real_open = settings_app.QFileDialog.getOpenFileName
+    try:
+        # --- closing the file chooser installs nothing
+        settings_app.QFileDialog.getOpenFileName = lambda *a, **k: ("", "")
+        win._import_design_pack_file()
+        assert not packs_root.is_dir() or not list(packs_root.iterdir()), (
+            "a cancelled import must not install anything")
+
+        # --- export as ONE file: the art on screen, in a shape you can send
+        settings_app.QInputDialog.getText = lambda *a, **k: ("Shared Look", True)
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: str(destination))
+        win._export_design_pack_file()
+        written = destination / "shared-look.hpack"
+        assert written.is_file(), sorted(p.name for p in destination.iterdir())
+        assert _zipfile.is_zipfile(written), "a pack file has to be a plain zip"
+        assert "exported" in win.status_label.text(), win.status_label.text()
+        assert win._design_pack == "", "an export is not an install"
+        with _zipfile.ZipFile(written) as zf:
+            body = _json.loads(zf.read("pack.json").decode("utf-8"))
+            assert body["states"] == {"idle": "file-idle.png",
+                                      "speaking": "file-speaking.png"}, body
+            assert body["any"] == "file-any.png", body
+            assert zf.read(body["states"]["idle"]) == idle.read_bytes(), (
+                "the form's unsaved choice has to be what was exported")
+
+        # --- ...and importing that file back really selects the pack it holds
+        settings_app.QFileDialog.getOpenFileName = (
+            lambda *a, **k: (str(written), "Handsoff pack (*.hpack)"))
+        win._import_design_pack_file()
+        assert win._design_pack == "shared-look", win.status_label.text()
+        assert "installed pack" in win.status_label.text(), (
+            win.status_label.text())
+        assert win._design_picture("idle") == str(
+            packs_root / "shared-look" / "file-idle.png"), (
+            win._design_picture("idle"))
+
+        # --- a file that is not an archive is refused in the module's words and
+        # --- leaves the pack that IS working selected
+        junk = folder / "not-a-pack.hpack"
+        junk.write_bytes(b"nope")
+        settings_app.QFileDialog.getOpenFileName = (
+            lambda *a, **k: (str(junk), "Handsoff pack (*.hpack)"))
+        win._import_design_pack_file()
+        assert "not a zip archive" in win.status_label.text(), (
+            win.status_label.text())
+        assert win._design_pack == "shared-look", (
+            "a refused import must not change what is selected")
+        junk.unlink(missing_ok=True)
+    finally:
+        settings_app.QInputDialog.getText = real_name
+        settings_app.QFileDialog.getExistingDirectory = real_dir
+        settings_app.QFileDialog.getOpenFileName = real_open
+        _shutil.rmtree(packs_root, ignore_errors=True)
+
+
+@scenario
 def the_image_design_takes_one_picture_per_state():
     # One picture for idle/listening/thinking/speaking, chosen in the Shape card,
     # with `design_image_path` behind them as the fallback. What this pins is the
@@ -2867,6 +2962,7 @@ SCENARIO_NAMES = [
     "the_image_design_draws_the_users_picture",
     "the_image_design_can_use_an_installed_pack",
     "the_appearance_panel_exports_the_art_as_a_pack",
+    "the_appearance_panel_moves_a_look_as_one_file",
     "the_image_design_takes_one_picture_per_state",
     "appearance_panel_is_a_scrolling_column_of_cards",
     "look_tiles_are_drawn_from_the_shared_painter",

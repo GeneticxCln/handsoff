@@ -2738,6 +2738,17 @@ class SettingsWindow(QMainWindow):
             "install, so the pack keeps working when the folder it came from "
             "moves. Pictures may live in subfolders.")
         self.pack_install.clicked.connect(self._install_design_pack)
+        # The same install, from the shape a pack actually travels in: ONE file
+        # someone sent you. The archive is unpacked and checked by the bubble
+        # module BEFORE anything reaches the installed packs, and from there it
+        # is the same code path a folder takes \u2014 so a file can only ever do
+        # what a folder could already do.
+        self.pack_import_file = QPushButton("Import pack file\u2026", card)
+        self.pack_import_file.setToolTip(
+            "Install a pack that arrived as ONE file (a .hpack someone sent "
+            "you). Checked before anything is copied, then copied in, so it "
+            "keeps working wherever that file goes afterwards.")
+        self.pack_import_file.clicked.connect(self._import_design_pack_file)
         self.pack_clear = QPushButton("Clear", card)
         self.pack_clear.setToolTip("Stop using a pack; go back to one picture")
         self.pack_clear.clicked.connect(self._clear_design_pack)
@@ -2750,11 +2761,29 @@ class SettingsWindow(QMainWindow):
             "pictures and fallback) into a new folder as a pack you can share. "
             "Nothing is installed and nothing on screen changes.")
         self.pack_export.clicked.connect(self._export_design_pack)
+        # ...and the same art in the shape you can actually SEND: one file,
+        # because a folder is not something anyone can attach to a message.
+        self.pack_export_file = QPushButton("Export pack file\u2026", card)
+        self.pack_export_file.setToolTip(
+            "Write the art on screen (this pack, or your own per-state "
+            "pictures and fallback) into ONE .hpack file you can send to "
+            "someone, who installs it with Import pack file. Nothing is "
+            "installed and nothing on screen changes.")
+        self.pack_export_file.clicked.connect(self._export_design_pack_file)
         box.addLayout(self._field("Pack", self.pack_combo))
+        # Two rows on purpose: the first is what a pack does on THIS desktop
+        # (install a folder, export a folder, stop using one) and the second is
+        # the single-file form of the same two things \u2014 the pair you reach
+        # for when a look arrives or leaves as an attachment.
         pack_row = QHBoxLayout()
         pack_row.addWidget(self.pack_install)
         pack_row.addWidget(self.pack_export)
         pack_row.addWidget(self.pack_clear)
+        pack_row.addStretch(1)
+        box.addLayout(pack_row)
+        pack_row = QHBoxLayout()
+        pack_row.addWidget(self.pack_import_file)
+        pack_row.addWidget(self.pack_export_file)
         pack_row.addStretch(1)
         box.addLayout(pack_row)
         self.pack_label = self._muted("", card)
@@ -3427,11 +3456,42 @@ class SettingsWindow(QMainWindow):
         except Exception as exc:    # a data folder must never crash the panel
             self._status(f"could not install that pack ({exc})")
             return
-        # The status line carries the OUTCOME (installed, or why not) while the
-        # label always describes the CURRENT state: writing the outcome into the
-        # label would leave a refusal's sentence describing a pack that is no
-        # longer what is selected, and the next refresh would overwrite it
-        # anyway.
+        self._adopt_design_pack(slug, message)
+
+    def _import_design_pack_file(self) -> None:
+        """Install a pack that arrived as ONE file.
+
+        The same channel as Install pack\u2026, in the shape a pack actually
+        travels in: the archive is unpacked and checked by the bubble module
+        BEFORE anything reaches the installed packs, and from there it is the
+        identical install \u2014 so a file cannot do anything a folder could
+        not. The message shown either way is that module's own sentence.
+        """
+        try:
+            bubble = _core_module("bubble")
+        except Exception:
+            self._status("design packs are unavailable in this install")
+            return
+        chosen, _chosen_filter = QFileDialog.getOpenFileName(
+            self, "Choose a pack file", str(Path.home()),
+            "Handsoff pack (*.hpack);;Zip archive (*.zip);;All files (*)")
+        if not chosen:
+            return                  # cancelled: not an edit
+        try:
+            slug, message = bubble.install_pack_file(chosen)
+        except Exception as exc:    # a data file must never crash the panel
+            self._status(f"could not install that pack file ({exc})")
+            return
+        self._adopt_design_pack(slug, message)
+
+    def _adopt_design_pack(self, slug: str, message: str) -> None:
+        """Select the pack an install just landed \u2014 and report either way.
+
+        The status line carries the OUTCOME (installed, or why not) while the
+        label always describes the CURRENT state: writing the outcome into the
+        label would leave a refusal's sentence describing a pack that is no
+        longer what is selected, and the next refresh would overwrite it anyway.
+        """
         self._status(message)
         if not slug:
             self._refresh_pack_label()   # nothing changed: describe the state
@@ -3451,39 +3511,77 @@ class SettingsWindow(QMainWindow):
         self._refresh_design_image_label()
         self._schedule_appearance_live()
 
+    def _export_art(self) -> dict:
+        """The appearance settings as the FORM has them, for an export to read.
+
+        An export has to write what is ON SCREEN, and a picture chosen a moment
+        ago applies through a debounce \u2014 so `settings.json` can still hold
+        the previous one. The form's own values are handed over instead, which
+        is why both exports share this rather than each reading the saved file.
+        """
+        art = dict(self.cfg)
+        art["design_pack"] = str(self._design_pack or "")
+        art["design_image_path"] = str(self._design_image or "")
+        for state, key in STATE_IMAGE_KEYS:
+            art[key] = str(self._design_images.get(state) or "")
+        return art
+
+    def _ask_export_target(self, title: str):
+        """The name and destination an export asked for, or None if cancelled.
+
+        ONE prompt for both export shapes, so a cancelled dialog means the same
+        thing whichever button was pressed and neither can ask a different
+        question.
+        """
+        name, ok = QInputDialog.getText(
+            self, title, "Pack name (letters, digits, dash):",
+            text=str(self._design_pack or "my-look"))
+        if not ok or not str(name).strip():
+            return None             # cancelled: not an edit
+        parent = QFileDialog.getExistingDirectory(
+            self, "Choose the folder to write the pack into", str(Path.home()))
+        if not parent:
+            return None             # cancelled: nothing written
+        return str(name).strip(), parent
+
     def _export_design_pack(self) -> None:
-        """Write the art on screen as a pack folder, reported either way.
+        """Write the art on screen as a pack FOLDER, reported either way.
 
         A name and a destination are asked for, then handed to the bubble
         module, which writes nothing until the folder it built passes the SAME
-        validation an install uses. The FORM's choices are passed as the
-        settings rather than the saved file's, because a chosen picture applies
-        live and a debounced write must not decide whether the export is
-        current. Nothing is selected or installed afterwards: the result is a
-        folder to hand on, not a change to this desktop.
+        validation an install uses. Nothing is selected or installed afterwards:
+        the result is a folder to hand on, not a change to this desktop.
+        """
+        self._export_pack_like("Export pack", "export_pack")
+
+    def _export_design_pack_file(self) -> None:
+        """Write the art on screen as ONE file a look can be sent in.
+
+        The same art as `_export_design_pack` from the same module, in the shape
+        that can be attached to a message \u2014 which is the only difference
+        between them, and the reason both go through one place.
+        """
+        self._export_pack_like("Export pack file", "export_pack_file")
+
+    def _export_pack_like(self, title: str, method: str) -> None:
+        """Ask for a target, then run one of the module's two exports.
+
+        Both exports refuse, write and describe themselves in that module's own
+        words; this only decides WHICH one ran, so the two buttons cannot drift
+        into asking different questions or reporting different outcomes.
         """
         try:
             bubble = _core_module("bubble")
         except Exception:
             self._status("design packs are unavailable in this install")
             return
-        default = str(self._design_pack or "my-look")
-        name, ok = QInputDialog.getText(
-            self, "Export pack", "Pack name (letters, digits, dash):",
-            text=default)
-        if not ok or not str(name).strip():
+        asked = self._ask_export_target(title)
+        if asked is None:
             return                  # cancelled: not an edit
-        parent = QFileDialog.getExistingDirectory(
-            self, "Choose the folder to write the pack into", str(Path.home()))
-        if not parent:
-            return                  # cancelled: nothing written
-        art = dict(self.cfg)
-        art["design_pack"] = str(self._design_pack or "")
-        art["design_image_path"] = str(self._design_image or "")
-        for state, key in STATE_IMAGE_KEYS:
-            art[key] = str(self._design_images.get(state) or "")
+        name, parent = asked
         try:
-            _folder, message = bubble.export_pack(parent, name, art)
+            _written, message = getattr(bubble, method)(
+                parent, name, self._export_art())
         except Exception as exc:    # a data folder must never crash the panel
             self._status(f"could not export that pack ({exc})")
             return

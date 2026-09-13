@@ -181,6 +181,25 @@ in VRAM between questions).
   exists (nothing of yours is overwritten) and writes nothing at all unless the
   result passes the same validation an install does; a refusal says why in the
   status line and leaves no half-written folder behind.
+- **Pack files** — a folder is not something you can attach to a message, so a
+  look also travels as ONE file. **Export pack file…** writes the same art as
+  **Export pack…** through the same staging step, as `<name>.hpack`: a plain zip
+  holding `pack.json` and the pictures, so any archive tool can open it and the
+  manifest is the first entry. **Import pack file…** installs one, and it is the
+  same install a folder gets — the file is unpacked into a private temporary
+  folder and then handed to the identical code path, so a `.hpack` can only ever
+  do what a folder could and there is no second set of rules to forget. That
+  means it is validated before anything reaches `design-packs/`, keeps one
+  `.previous` generation, and is COPIED in rather than linked to the file it
+  came from. The suffix is not the contract: a `.zip` someone renamed installs,
+  and a `.hpack` that holds no `pack.json` is refused. Because the archive is
+  data someone else wrote, four things are checked by name before a byte is
+  unpacked — an entry that would leave the folder (`..`, an absolute path, a
+  drive letter, a symlink), more entries than a pack can hold, an unpacked size
+  over 64 MB, and a manifest at neither the top level nor inside exactly one
+  wrapper folder (`a zip that wraps the pack in a folder` is accepted, because
+  that is how people actually zip things; two candidates is refused, because
+  picking one would install a look you did not choose).
 - **Cat** is the first design whose outline leaves the bubble's circle: its
   ears are painted outside the inset ellipse, so the window's mask is built per
   design (`design_region`) and follows a live shape change as well as a resize.

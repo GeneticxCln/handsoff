@@ -712,6 +712,16 @@ class TestLive:
             "a live API call reports its quota, which is what doctor shows")
 
     def test_duckduckgo_answers_or_says_that_it_refused(self, H):
+        # WHICH of those happened cannot be forced from here: DuckDuckGo may
+        # serve results, a bot challenge, or a rate-limit status, and which one
+        # arrives depends on nothing this test controls. So what is pinned is the
+        # property that has to hold in ALL of them — an empty answer names the
+        # backend it asked and gives a reason in the vocabulary the module
+        # already uses. The challenge DETECTION itself is pinned
+        # deterministically by `test_a_bot_challenge_is_a_failure_not_an_empty_
+        # web`; a live test cannot make a challenge happen, and a test that
+        # accepted only the two reasons it had seen is how an HTTP 429 turns
+        # into a red suite that is nobody's regression.
         H._web.cache_clear()
         try:
             results, notes = H._web.search("python list comprehension",
@@ -721,7 +731,11 @@ class TestLive:
         if results:
             assert results[0].title and results[0].url, results
             return
-        assert "bot challenge" in notes[0] or "no results" in notes[0], (
-            "an empty DuckDuckGo answer must say WHICH it was: a blocked search "
-            "is not the same thing as nothing matching, and the user cannot "
-            "tell them apart from a bare 'no results'")
+        assert notes and notes[0].startswith("nothing found"), (
+            f"an empty answer has to say that nothing was FOUND: {notes!r}")
+        assert "ddg (DuckDuckGo): " in notes[0], (
+            f"an empty answer has to name the backend it asked: {notes[0]!r}")
+        reason = notes[0].split("ddg (DuckDuckGo): ", 1)[1].strip()
+        assert reason == "no results" or reason.startswith("failed ("), (
+            f"the reason has to be the vocabulary the rest of the module uses, "
+            f"not a raw exception: {reason!r}")

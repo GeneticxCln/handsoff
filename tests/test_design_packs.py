@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -594,6 +595,411 @@ class TestExportPack:
         name = json.loads((Path(folder) / "pack.json").read_text(encoding="utf-8"))["any"]
         assert (Path(folder) / name).read_bytes() == Path(given["any"]).read_bytes(), (
             "the panel's unsaved choices must be what is exported")
+
+
+class TestPackFile:
+    """A look travels as ONE file: the same pack in an envelope you can send.
+
+    A folder is not something anyone can attach to a message, so the export has
+    a second shape and the install has a second door. The assertion that matters
+    is the folder export's own — export it, install what was exported, and the
+    pictures have to be the ones you had — because a container that round-trips
+    is the entire reason to have one.
+
+    Everything else here is about the archive being DATA SOMEONE ELSE WROTE: not
+    a zip at all, named so it would escape the folder, marked as a symlink,
+    holding more entries than a pack has, unpacking to more than a pack can be,
+    holding two packs, holding none. None of it may reach the installed packs,
+    and each refusal has to NAME what is wrong with the file in the user's hand.
+    """
+
+    PALETTE = {"idle": (10, 20, 30, 255), "listening": (40, 50, 60, 255),
+               "thinking": (70, 80, 90, 255), "speaking": (100, 110, 120, 255),
+               "any": (200, 210, 220, 255)}
+
+    def art(self, folder: Path, *want: str) -> dict:
+        """{slot: path} for the named slots, as real PNGs with distinct bytes."""
+        return {label: png(folder / f"{label}.png", self.PALETTE[label])
+                for label in want}
+
+    def settings_for(self, files: dict) -> dict:
+        body = dict(DEFAULT_SETTINGS)
+        body["design_image_path"] = str(files.get("any") or "")
+        for state in BUBBLE_STATES:
+            body[f"design_image_{state}"] = str(files.get(state) or "")
+        return body
+
+    @staticmethod
+    def archive(path: Path, *entries) -> Path:
+        """A zip with the given (name, bytes) entries — whatever was sent."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w") as zf:
+            for name, data in entries:
+                zf.writestr(name, data)
+        return path
+
+    @staticmethod
+    def installed(bubble) -> list:
+        """What is in the packs directory — "nothing was installed" as a list."""
+        root = Path(bubble.PACKS_DIR)
+        return sorted(p.name for p in root.iterdir()) if root.is_dir() else []
+
+    def test_a_hand_built_look_round_trips_through_a_file(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "idle", "listening", "thinking",
+                         "speaking", "any")
+        parent = tmp_path / "share"
+        parent.mkdir()
+        written, message = bubble.export_pack_file(parent, "My Look",
+                                                   self.settings_for(files))
+        assert written, message
+        assert Path(written).name == "my-look.hpack", written
+        assert "exported" in message and "state picture" in message, message
+        assert sorted(p.name for p in parent.iterdir()) == ["my-look.hpack"], (
+            "the hidden file it was written to has to be gone, or every export "
+            "leaves litter beside the pack")
+        slug, installed = bubble.install_pack_file(written)
+        assert slug == "my-look", installed
+        bubble.SETTINGS.update({"design_pack": slug, "design_image_path": ""})
+        for state in BUBBLE_STATES:
+            drawn = Path(bubble.design_picture(state))
+            assert drawn.read_bytes() == Path(files[state]).read_bytes(), (
+                f"{state} drew {drawn}, not the picture that was exported")
+
+    def test_the_file_is_a_zip_a_person_could_open_themselves(self, bubble,
+                                                              tmp_path):
+        # `idle` as well as `any`, so the manifest has a nested object: the
+        # indentation that makes it readable is the nested line's.
+        files = self.art(tmp_path / "art", "idle", "any")
+        parent = tmp_path / "share"
+        parent.mkdir()
+        written, message = bubble.export_pack_file(parent, "look",
+                                                   self.settings_for(files))
+        assert written, message
+        assert zipfile.is_zipfile(written), "a pack file must be a plain zip"
+        with zipfile.ZipFile(written) as zf:
+            names = zf.namelist()
+            body = zf.read("pack.json").decode("utf-8")
+            picture = zf.read("any.png")
+            state = zf.read(json.loads(body)["states"]["idle"])
+        assert names[0] == "pack.json", names
+        # The manifest is text and is deflated; a PNG is already compressed, so
+        # storing it costs nothing and deflating it only spends time.
+        kinds = {i.filename: i.compress_type for i in zf.infolist()}
+        assert kinds["pack.json"] == zipfile.ZIP_DEFLATED, kinds
+        assert kinds["any.png"] == zipfile.ZIP_STORED, kinds
+        assert json.loads(body)["any"] == "any.png", body
+        assert "\n    " in body, "the manifest has to be readable by a human"
+        assert picture == Path(files["any"]).read_bytes(), (
+            "the picture has to be in the archive byte for byte")
+        assert state == Path(files["idle"]).read_bytes(), "and so has the state's"
+
+    def test_the_file_carries_what_the_folder_export_carries(self, bubble,
+                                                             tmp_path):
+        """Two shapes, ONE assembly — so this is a property, not a coincidence.
+
+        Both exports stage the art through the same step, which is what makes it
+        safe for them to be two buttons; the manifest and the picture bytes have
+        to match whichever one was pressed.
+        """
+        files = self.art(tmp_path / "art", "idle", "speaking", "any")
+        art = self.settings_for(files)
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "look", art)
+        assert folder, message
+        written, message = bubble.export_pack_file(parent, "look-two", art)
+        assert written, message
+        with zipfile.ZipFile(written) as zf:
+            in_file = json.loads(zf.read("pack.json").decode("utf-8"))
+            in_folder = json.loads(
+                (Path(folder) / "pack.json").read_text(encoding="utf-8"))
+            assert in_file["states"] == in_folder["states"], (in_file, in_folder)
+            assert in_file["any"] == in_folder["any"], (in_file, in_folder)
+            for name in in_folder["states"].values():
+                assert zf.read(name) == (Path(folder) / name).read_bytes(), name
+
+    def test_no_art_at_all_writes_nothing(self, bubble, tmp_path):
+        parent = tmp_path / "share"
+        parent.mkdir()
+        written, message = bubble.export_pack_file(parent, "empty",
+                                                   dict(DEFAULT_SETTINGS))
+        assert written == "", written
+        assert "no pictures to export" in message, message
+        assert list(parent.iterdir()) == [], "a refusal must write nothing"
+
+    def test_an_existing_pack_file_is_never_overwritten(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "any")
+        parent = tmp_path / "share"
+        parent.mkdir()
+        sentinel = parent / "look.hpack"
+        sentinel.write_bytes(b"mine")
+        written, message = bubble.export_pack_file(parent, "look",
+                                                   self.settings_for(files))
+        assert written == "", written
+        assert "already exists" in message, message
+        assert sentinel.read_bytes() == b"mine"
+        assert list(parent.iterdir()) == [sentinel], (
+            "nothing may be staged before the destination is settled")
+
+    def test_an_incomplete_look_is_refused_with_the_install_sentence(
+            self, bubble, tmp_path):
+        """The file export refuses in the SAME words the folder export does.
+
+        Both assemble through one staging step, so a look that cannot be drawn
+        has to be turned away with the sentence an install would use, whichever
+        export was asked to write it.
+        """
+        art = self.settings_for(self.art(tmp_path / "art", "idle"))
+        parent = tmp_path / "share"
+        parent.mkdir()
+        written, message = bubble.export_pack_file(parent, "half", art)
+        assert written == "", written
+        for state in ("listening", "thinking", "speaking"):
+            assert state in message, message
+
+    def test_an_incomplete_look_leaves_no_staging_behind(self, bubble, tmp_path):
+        art = self.settings_for(self.art(tmp_path / "art", "idle"))
+        parent = tmp_path / "share"
+        parent.mkdir()
+        written, message = bubble.export_pack_file(parent, "half", art)
+        assert written == "", written
+        for state in ("listening", "thinking", "speaking"):
+            assert state in message, message
+        assert list(parent.iterdir()) == [], (
+            "the staging folder must go, or a refusal leaves half a pack")
+
+    def test_a_file_that_is_not_an_archive_is_refused(self, bubble, tmp_path):
+        junk = tmp_path / "look.hpack"
+        junk.write_bytes(b"this is not a zip")
+        slug, message = bubble.install_pack_file(junk)
+        assert slug == "", slug
+        assert "not a zip archive" in message, message
+        assert self.installed(bubble) == []
+
+    def test_a_missing_file_is_refused(self, bubble, tmp_path):
+        slug, message = bubble.install_pack_file(tmp_path / "nope.hpack")
+        assert slug == "", slug
+        assert "is not a file" in message, message
+
+    def test_an_archive_with_no_manifest_is_refused(self, bubble, tmp_path):
+        source = self.archive(tmp_path / "look.hpack", ("idle.png", b"x"))
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "", slug
+        # The sentence has to be the ARCHIVE's — naming the file that is in the
+        # user's hand and calling it a pack file — not the folder install's,
+        # which would name a temporary directory nobody has ever heard of. Both
+        # wordings contain "has no pack.json", so that alone pins nothing.
+        assert "look.hpack has no pack.json" in message, message
+        assert "a pack file needs one" in message, message
+        assert self.installed(bubble) == []
+
+    def test_a_file_pack_is_validated_exactly_like_a_folder(self, bubble,
+                                                           tmp_path):
+        """An archive that unpacks cleanly can still be a broken PACK.
+
+        This is the reason the file door leads to the same install rather than a
+        second one: a manifest naming a picture the archive does not hold has to
+        be refused in the same words a folder would be, and nothing may land in
+        the packs directory — otherwise "it came as a file" would be a way to
+        skip the validation every folder goes through.
+        """
+        source = self.archive(
+            tmp_path / "broken.hpack",
+            ("pack.json",
+             json.dumps({"name": "Broken", "any": "missing.png"})))
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "", slug
+        assert "no file at" in message and "any" in message, message
+        assert self.installed(bubble) == []
+
+    def test_an_entry_that_escapes_the_folder_never_reaches_the_disk(
+            self, bubble, tmp_path):
+        """A `..` entry is refused BY NAME rather than quietly rewritten.
+
+        Python's own extractor sanitises this silently; a pack that had to be
+        rewritten to be safe is not the pack that was sent, so it is named and
+        refused — and the file it was aiming at must not exist afterwards.
+        """
+        source = self.archive(tmp_path / "evil.hpack", ("../escaped.png", b"x"))
+        dest = tmp_path / "unpack"
+        dest.mkdir()
+        problem, folder = bubble._extract_pack_archive(source, dest, "evil.hpack")
+        assert problem and "could leave the pack" in problem, problem
+        assert "../escaped.png" in problem, problem
+        assert folder is None
+        assert list(dest.iterdir()) == [], "nothing may be unpacked"
+        assert not (tmp_path / "escaped.png").exists()
+        assert bubble.install_pack_file(source)[0] == ""
+
+    def test_an_entry_named_for_a_windows_drive_is_refused(self, bubble,
+                                                           tmp_path):
+        """A drive letter is refused even on a system where it is just a name.
+
+        On Linux `C:\\any.png` is one legal (if strange) file name, so nothing
+        here would escape — but the same pack extracted on Windows would aim at a
+        drive, and a pack holds relative names like `idle.png`. Refusing it by
+        name costs nothing and means a pack behaves the same everywhere.
+        """
+        source = self.archive(tmp_path / "drive.hpack",
+                              ("C:\\any.png", b"x"))
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "", slug
+        assert "could leave the pack" in message, message
+        assert self.installed(bubble) == []
+
+    def test_an_absolute_entry_is_refused(self, bubble, tmp_path):
+        aim = tmp_path / "absolute.png"
+        source = self.archive(tmp_path / "abs.hpack", (str(aim), b"x"))
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "", slug
+        assert "could leave the pack" in message, message
+        assert not aim.exists(), "the entry must not land outside the archive"
+
+    def test_a_symlink_entry_is_refused(self, bubble, tmp_path):
+        """A zip can MARK an entry as a symlink; that is refused like a path out.
+
+        `zipfile` writes such an entry as ordinary text rather than a link, but
+        the entry is asking to be a link and a pack is a folder of pictures —
+        letting it through would answer "you sent a symlink" with "your picture
+        is not an image", which names the wrong problem.
+        """
+        source = tmp_path / "link.hpack"
+        with zipfile.ZipFile(source, "w") as zf:
+            info = zipfile.ZipInfo("any.png")
+            info.external_attr = 0o120777 << 16
+            zf.writestr(info, "/etc/passwd")
+        dest = tmp_path / "unpack"
+        dest.mkdir()
+        problem, _folder = bubble._extract_pack_archive(source, dest, "link.hpack")
+        assert problem and "could leave the pack" in problem, problem
+        assert list(dest.iterdir()) == []
+
+    def test_an_archive_with_too_many_entries_is_refused(self, bubble, tmp_path,
+                                                         monkeypatch):
+        """The count is capped, and the refusal says the number.
+
+        The cap is lowered rather than writing 65 real entries: what is pinned is
+        the REFUSAL, not the constant — a pack is a manifest and a handful of
+        pictures, and an archive holding hundreds is not one.
+        """
+        monkeypatch.setattr(bubble, "PACK_MAX_ENTRIES", 4)
+        source = self.archive(tmp_path / "many.hpack",
+                              *[(f"f{n}.png", b"x") for n in range(8)])
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "", slug
+        assert "8 entries" in message, message
+        assert "more than a design pack has" in message, message
+        assert self.installed(bubble) == []
+
+    def test_the_size_cap_refuses_before_anything_is_unpacked(self, bubble,
+                                                              tmp_path,
+                                                              monkeypatch):
+        """A pack file is an attachment, so what it unpacks to is capped.
+
+        The cap is lowered rather than committing two megabytes to the suite:
+        what is pinned is the REFUSAL and its sentence — and that it happens
+        before any part of the archive reaches the disk, which is what makes a
+        zip bomb a refusal instead of a slow surprise.
+        """
+        monkeypatch.setattr(bubble, "PACK_MAX_BYTES", 1 << 20)
+        source = self.archive(tmp_path / "bomb.hpack",
+                              ("any.png", b"x" * (2 << 20)))
+        dest = tmp_path / "unpack"
+        dest.mkdir()
+        problem, folder = bubble._extract_pack_archive(source, dest,
+                                                       "bomb.hpack")
+        assert problem and "more than 1 MB" in problem, problem
+        assert "more than a design pack can be" in problem, problem
+        assert folder is None, folder
+        assert list(dest.iterdir()) == [], (
+            "a size refusal must happen before a byte is written")
+        assert bubble.install_pack_file(source)[0] == ""
+        assert self.installed(bubble) == []
+
+    def test_a_zip_that_wraps_the_pack_in_a_folder_is_accepted(self, bubble,
+                                                               tmp_path):
+        """Because that is how a person actually zips a pack.
+
+        This module writes `pack.json` at the top level, but someone sharing a
+        pack zips the FOLDER — so one wrapper folder holding a manifest is the
+        pack, and both shapes a recipient will meet work.
+        """
+        files = self.art(tmp_path / "art", "any")
+        source = self.archive(
+            tmp_path / "wrapped.hpack",
+            ("my-look/pack.json",
+             json.dumps({"name": "My Look", "any": "any.png"})),
+            ("my-look/any.png", Path(files["any"]).read_bytes()))
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "my-look", message
+        loaded = bubble.load_pack(slug)
+        assert loaded is not None, message
+        assert Path(loaded["any"]).read_bytes() == Path(files["any"]).read_bytes()
+
+    def test_an_archive_holding_two_packs_is_refused(self, bubble, tmp_path):
+        """Two candidates is a question only the sender can answer.
+
+        Installing one of them silently would put a look on the desktop that the
+        recipient never chose, so ambiguity is named and refused instead.
+        """
+        source = self.archive(
+            tmp_path / "two.hpack",
+            ("a/pack.json", json.dumps({"any": "x.png"})),
+            ("a/x.png", b"x"),
+            ("b/pack.json", json.dumps({"any": "y.png"})),
+            ("b/y.png", b"y"))
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "", slug
+        assert "more than one pack.json" in message, message
+        assert self.installed(bubble) == []
+
+    def test_the_manifest_name_wins_over_the_file_name(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "any")
+        source = self.archive(
+            tmp_path / "whatever.hpack",
+            ("pack.json",
+             json.dumps({"name": "Prism Two", "any": "any.png"})),
+            ("any.png", Path(files["any"]).read_bytes()))
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "prism-two", message
+
+    def test_a_pack_with_no_name_installs_under_the_file_it_arrived_in(
+            self, bubble, tmp_path):
+        """The private folder it unpacked into must never become its name.
+
+        An archive is unpacked into a temporary directory whose name is nobody's
+        word for anything, so the file the user actually chose names the pack —
+        otherwise a look would install as `.handsoff-pack-ab12cd`.
+        """
+        files = self.art(tmp_path / "art", "any")
+        source = self.archive(
+            tmp_path / "Handed To Me.hpack",
+            ("pack.json", json.dumps({"any": "any.png"})),
+            ("any.png", Path(files["any"]).read_bytes()))
+        slug, message = bubble.install_pack_file(source)
+        assert slug == "handed-to-me", message
+        assert Path(bubble.PACKS_DIR, slug).is_dir()
+
+    def test_the_suffix_is_not_the_contract(self, bubble, tmp_path):
+        """Content decides, so a sender who renamed the file still works.
+
+        Someone holding `look.zip` should not have to fix its name before it
+        installs: the archive either holds a pack or it does not, and that is
+        the question actually asked of it.
+        """
+        files = self.art(tmp_path / "art", "any")
+        parent = tmp_path / "share"
+        parent.mkdir()
+        written, message = bubble.export_pack_file(parent, "look",
+                                                   self.settings_for(files))
+        assert written, message
+        renamed = parent / "look.zip"
+        shutil.copy2(written, renamed)
+        slug, message = bubble.install_pack_file(renamed)
+        assert slug == "look", message
+        loaded = bubble.load_pack(slug)
+        assert loaded is not None, message
+        assert Path(loaded["any"]).read_bytes() == Path(files["any"]).read_bytes()
 
 
 class TestSettingsPlumbing:

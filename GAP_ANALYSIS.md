@@ -3170,3 +3170,74 @@ refusals speaking their own sentences (`no pictures to export — give a state a
 a pack) first`, `… already exists — export into a folder that does not, so nothing you already
 have is overwritten`, `the pack needs a name with at least one letter or digit`). Nothing was
 written outside a temporary directory.
+
+## A pack that is ONE file (the envelope)
+
+**What was missing.** `Export pack…` wrote a FOLDER, which closed the gap on the desktop and
+opened a smaller one beside it: a folder is not something anyone can attach to a message. Sharing
+a look still meant zipping it yourself, telling the other person where to put it, and hoping they
+copied the pictures and not the folder around them. So the same two things the card already did —
+export the art on screen, install a pack you were given — gained a single-file form: `.hpack`,
+a plain zip holding `pack.json` beside its pictures.
+
+**The install is the SAME install, and that is the design.** `install_pack_file` unpacks the
+archive into a private temporary folder and then calls `install_pack`, so a file can only ever do
+what a folder could already do: validated by `_validate_pack` before anything reaches
+`design-packs/`, copied in so it survives the file being deleted, one `.previous` generation, and
+the same refusal sentences. Nothing about the safety rules had to be written twice — which is the
+only reason a second door is acceptable at all. The one thing that had to be added is naming: a
+folder installs under its folder name, but the private folder an archive is unpacked into is
+named for nobody, so `install_pack` gained a `fallback_name` and the FILE's own stem names the
+pack when its manifest carries none (`Handed To Me.hpack` → `handed-to-me`, never
+`.handsoff-pack-ab12cd`).
+
+**The export is the SAME assembly, and that is the other half.** Both exports stage the art
+through one `_stage_art`, which refuses the same things in the same words and cleans up its own
+staging folder on a refusal, so the two shapes cannot disagree about what a look IS. `export_pack`
+renames the staging folder into place; `export_pack_file` zips it to a hidden file and moves that
+into place, so a half-written pack can never be mistaken for a finished one. Pictures are STORED
+and the manifest DEFLATED, because a PNG is already compressed and `pack.json` is the one entry a
+person who opens the archive will read — and it is written first.
+
+**A pack file is an attachment, so it is the one place here that runs a stranger's input through
+the filesystem.** Four refusals, each naming what is wrong with the file in the user's hand:
+
+  * an entry whose name would leave the pack — `..`, an absolute path, a Windows drive letter, or
+    an entry marked as a symlink. Python's own extractor sanitises some of this SILENTLY, and
+    refusing by name is the honest version: a pack that had to be quietly rewritten to be safe is
+    not the pack that was sent. The drive-letter refusal is deliberate even on Linux, where
+    `C:\any.png` is merely a strange file name — the same pack opened on Windows would aim at a
+    drive, and a pack holds relative names.
+  * more entries than a pack has (`PACK_MAX_ENTRIES`, 64);
+  * an unpacked total over `PACK_MAX_BYTES` (64 MB), refused BEFORE a byte is written. The guard
+    reads the archive's own declared sizes, and that is the right number rather than a lazy one:
+    the extractor honours those sizes, so the declared total genuinely bounds the cost — a header
+    that understates it yields a short entry whose CRC then fails, and one that overstates it is
+    refused here. A second opinion measured during the write was written, then deleted: it cannot
+    fire except after this one already has, which makes it code no guard can distinguish.
+  * no `pack.json` — but a pack shared by a person is usually a zipped FOLDER, so exactly one
+    top-level folder holding a manifest is accepted as the pack. Two candidates is refused rather
+    than guessed at: an archive holding two packs is a question only its sender can answer, and
+    picking one would install a look the recipient never chose.
+
+**The suffix is not the contract.** `install_pack_file` never looks at it: content decides, so a
+`.zip` someone renamed installs and a `.hpack` holding no manifest is refused for what it is.
+Someone who received a file should not have to fix its name before it works.
+
+**Guards and evidence.** `TestPackFile` (22 cases, no QApplication — decode and tint are path
+functions) plus the offscreen scenario `the_appearance_panel_moves_a_look_as_one_file`. **29/29
+mutations** back to the old behaviour caught, one per decision, and the first sweep's three
+survivors were all my own guards rather than bad mutations: the no-manifest test asserted
+`"has no pack.json"`, which BOTH the archive reader's refusal and the folder install's refusal
+contain, so it could not tell the two doors apart — it now pins the archive's own wording and the
+file's name; and two mutations were pointed at a guard that never reaches the code they changed
+(the staging cleanup on the SUCCESS path, and validation inside the folder install), each now
+pointed at the test that actually observes it.
+
+One thing found while running the gates and NOT part of this feature: `tests/test_web.py`'s live
+DuckDuckGo test accepted only two of the shapes an empty answer can honestly take
+(`bot challenge` or `no results`), so an HTTP 429 from the same rate limiter turned the suite red.
+It now asserts the PROPERTY that has to hold in all of them — the answer names the backend it
+asked and gives a reason in the module's own vocabulary — because the challenge DETECTION it was
+trying to cover is already pinned deterministically by
+`test_a_bot_challenge_is_a_failure_not_an_empty_web`, which a live test cannot make happen.

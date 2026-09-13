@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 from PySide6.QtCore import QElapsedTimer, QPointF, QRect, QRectF, Qt, QTimer
@@ -421,6 +422,21 @@ PACK_DIR_NAME = "design-packs"
 PACKS_DIR = None        # set by the host; see packs_dir() for the fallback
 _PACK_CACHE: dict = {}  # (slug, mtime_ns, size) -> manifest or None
 _PACK_CACHE_MAX = 4
+# A pack can also travel as ONE file, because a folder is not something you can
+# send someone: the archive is a plain zip holding the same manifest and
+# pictures, so it opens with any tool, and the extension only tells a desktop
+# what to do with it. The content is the contract, never the suffix —
+# `install_pack_file` accepts a `.zip` someone renamed to `.hpack` or the other
+# way round, because a person who received a file should not have to fix its
+# name before it works.
+PACK_EXT = ".hpack"
+# Hard caps on what an archive is allowed to become. A pack file is an
+# ATTACHMENT from someone else, so unpacking it is the one place in this module
+# that runs untrusted input through the filesystem: a manifest and a handful of
+# pictures is the whole legitimate shape, and both a zip bomb and a folder of
+# ten thousand entries are refused by name rather than unpacked.
+PACK_MAX_ENTRIES = 64
+PACK_MAX_BYTES = 64 * 1024 * 1024
 
 
 def packs_dir():
@@ -730,13 +746,19 @@ def art_problem() -> str:
     return problem or design_image_problem()
 
 
-def install_pack(source) -> tuple:
+def install_pack(source, fallback_name="") -> tuple:
     """Copy the pack folder at `source` into the packs directory.
 
     Returns (slug, message): slug is "" when nothing was installed, and the
     message says what happened in the same words either way, so a caller has one
     thing to show and no exception to catch. The source is validated BEFORE
     anything is copied, so a refusal leaves the installed packs untouched.
+
+    `fallback_name` names the pack when its manifest carries no `name` of its
+    own. A folder installs under its own folder name; a pack that arrived as an
+    ARCHIVE is unpacked into a private temporary folder whose name means nothing
+    to anyone, so `install_pack_file` passes the file's own stem here and the
+    pack ends up named after the file the user chose.
     """
     root = packs_dir()
     if root is None:
@@ -755,7 +777,8 @@ def install_pack(source) -> tuple:
         return "", f"cannot read {src} ({exc.strerror or exc})"
     if not isinstance(raw, dict):
         return "", f"{PACK_MANIFEST} must be a JSON object"
-    slug = pack_slug(raw.get("name")) or pack_slug(src.name)
+    slug = (pack_slug(raw.get("name")) or pack_slug(fallback_name)
+            or pack_slug(src.name))
     if not slug:
         return "", "the pack needs a name with at least one letter or digit"
     # The SAME validator the renderer uses, so a folder this refuses would not
@@ -807,41 +830,47 @@ def effective_art(settings=None) -> tuple:
             state_pictures(src))
 
 
-def export_pack(parent, name, settings=None) -> tuple:
-    """Write the art in effect as a NEW pack folder under `parent`.
+def _export_target(parent, name, suffix: str) -> tuple:
+    """Where an export may write, or why it may not: (slug, path, problem).
 
-    Returns (folder, message): folder is "" when nothing was written, and the
-    message says what happened either way, so a caller has one thing to show and
-    no exception to catch. What is written is the art the bubble is drawing —
-    the selected pack's pictures, or your own per-state pictures with the
-    fallback behind them — so a look built by hand becomes a folder that can be
-    handed to someone else.
-
-    Two rules keep a one-click write safe. `parent/<slug>` must not already
-    exist: an export never eats a folder the user already has. And the pack is
-    assembled in a hidden staging folder and checked by `_validate_pack`, the
-    SAME authority `install_pack` uses, BEFORE it is moved into place — so a
-    folder this writes is one install will accept, and a refusal (an unreadable
-    picture, a state left uncovered with no fallback) removes what it wrote
-    instead of leaving half a pack in the user's directory.
+    Both exports refuse the same three things in the same words, so the folder
+    and the single file cannot drift into disagreeing about what a legal
+    destination is. `suffix` is what makes the difference between them — "" for
+    a folder named after the slug, `.hpack` for the one file.
     """
     slug = pack_slug(name)
     if not slug:
-        return "", "the pack needs a name with at least one letter or digit"
+        return "", None, "the pack needs a name with at least one letter or digit"
     try:
         root = Path(str(parent)).expanduser()
         if not root.is_dir():
-            return "", f"{root} is not a folder"
+            return "", None, f"{root} is not a folder"
     except (OSError, ValueError, TypeError):
-        return "", "that destination is not a folder"
-    target = root / slug
+        return "", None, "that destination is not a folder"
+    target = root / f"{slug}{suffix}"
     if target.exists():
-        return "", (f"{target} already exists — export into a folder that does "
-                    f"not, so nothing you already have is overwritten")
+        return "", None, (f"{target} already exists — export into a folder that "
+                           f"does not, so nothing you already have is overwritten")
+    return slug, target, ""
+
+
+def _stage_art(parent, slug, name, settings) -> tuple:
+    """Assemble the art in effect into a checked hidden folder under `parent`.
+
+    Returns (staging, built, problem). `problem` is "" exactly when `staging`
+    holds a pack `_validate_pack` accepts; on a refusal the folder is removed
+    HERE and `staging` is None, so the two states can never be confused by a
+    caller that forgot to clean up. ONE assembly serves both exports — the
+    folder and the single file — because the two must never disagree about what
+    a look IS.
+
+    The refusal comes back already worded for the user, including the plain "no
+    pictures to export", so each caller shows one sentence it did not compose.
+    """
     fallback, states = effective_art(settings)
     if not fallback and not states:
-        return "", ("no pictures to export — give a state a picture (or select "
-                    "a pack) first")
+        return None, None, ("no pictures to export — give a state a picture "
+                            "(or select a pack) first")
     used: dict = {}
 
     def _inside(label: str, path: str) -> str:
@@ -878,25 +907,260 @@ def export_pack(parent, name, settings=None) -> tuple:
     if named:
         manifest["states"] = named
     staging = None
-    built = None
     try:
-        staging = tempfile.mkdtemp(dir=str(root), prefix=f".{slug}-")
+        staging = tempfile.mkdtemp(dir=str(parent), prefix=f".{slug}-")
         for source, file_name in copies:
             shutil.copy2(source, Path(staging) / file_name)
         (Path(staging) / PACK_MANIFEST).write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         problem, built = _validate_pack(staging, manifest, slug)
         if problem:
-            return "", f"{slug}: {problem}"
+            shutil.rmtree(staging, ignore_errors=True)
+            return None, None, f"{slug}: {problem}"
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return None, None, f"cannot export {slug} ({exc.strerror or exc})"
+    return staging, built, ""
+
+
+def export_pack(parent, name, settings=None) -> tuple:
+    """Write the art in effect as a NEW pack folder under `parent`.
+
+    Returns (folder, message): folder is "" when nothing was written, and the
+    message says what happened either way, so a caller has one thing to show and
+    no exception to catch. What is written is the art the bubble is drawing —
+    the selected pack's pictures, or your own per-state pictures with the
+    fallback behind them — so a look built by hand becomes a folder that can be
+    handed to someone else.
+
+    Two rules keep a one-click write safe. `parent/<slug>` must not already
+    exist: an export never eats a folder the user already has. And the pack is
+    assembled in a hidden staging folder and checked by `_validate_pack`, the
+    SAME authority `install_pack` uses, BEFORE it is moved into place — so a
+    folder this writes is one install will accept, and a refusal (an unreadable
+    picture, a state left uncovered with no fallback) removes what it wrote
+    instead of leaving half a pack in the user's directory.
+    """
+    slug, target, problem = _export_target(parent, name, "")
+    if problem:
+        return "", problem
+    staging, built, problem = _stage_art(target.parent, slug, name, settings)
+    if problem:
+        return "", problem
+    try:
         Path(staging).rename(target)
     except OSError as exc:
         return "", f"cannot export {slug} ({exc.strerror or exc})"
     finally:
-        if staging:
-            shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
     return str(target), (f"exported {built['name']} to {target} "
                          f"({len(built['states'])} state picture(s)"
                          + (", plus a fallback)" if built["any"] else ")"))
+
+
+def export_pack_file(parent, name, settings=None) -> tuple:
+    """Write the art in effect as ONE file — a pack someone can send.
+
+    Returns (path, message) exactly as `export_pack` returns (folder, message),
+    and writes the same art by the same rules: the two differ only in what they
+    hand back, a folder or a single `.hpack` that can be attached to a message.
+    A folder is not something you can hand someone, which is the whole reason
+    this exists — `install_pack_file` reads it back.
+
+    The archive is written to a hidden file and MOVED into place afterwards, so
+    a half-written pack can never be mistaken for a finished one, and the
+    destination must not already exist for the same reason the folder export
+    refuses: a one-click write never eats something you already have.
+    """
+    slug, target, problem = _export_target(parent, name, PACK_EXT)
+    if problem:
+        return "", problem
+    staging, built, problem = _stage_art(target.parent, slug, name, settings)
+    if problem:
+        return "", problem
+    written = None
+    try:
+        handle, written = tempfile.mkstemp(dir=str(target.parent),
+                                           prefix=f".{slug}-", suffix=PACK_EXT)
+        os.close(handle)
+        _write_pack_archive(Path(written), staging)
+        os.replace(written, target)
+        written = None
+    except OSError as exc:
+        return "", f"cannot export {slug} ({exc.strerror or exc})"
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        if written:
+            try:
+                os.unlink(written)
+            except OSError:
+                pass
+    return str(target), (f"exported {built['name']} to {target} "
+                         f"({len(built['states'])} state picture(s)"
+                         + (", plus a fallback)" if built["any"] else ")"))
+
+
+def _write_pack_archive(archive, folder) -> None:
+    """Zip a validated staging folder into one pack file.
+
+    Pictures are STORED and the manifest DEFLATED: a PNG is already compressed,
+    so deflating it spends time to save nothing, while `pack.json` is text and
+    is the one entry a person who opens the archive will actually read — the
+    manifest is written FIRST, so the file reads in the order it makes sense.
+    """
+    root = Path(folder)
+    entries = sorted(root.rglob("*"),
+                     key=lambda p: (p.name != PACK_MANIFEST, str(p)))
+    with zipfile.ZipFile(archive, "w") as zf:
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            arcname = entry.relative_to(root).as_posix()
+            zf.write(entry, arcname,
+                     compress_type=(zipfile.ZIP_DEFLATED
+                                    if arcname == PACK_MANIFEST
+                                    else zipfile.ZIP_STORED))
+
+
+def _too_big(label: str) -> str:
+    """The one refusal for a pack file larger than a pack can be."""
+    return (f"{label} unpacks to more than {PACK_MAX_BYTES // (1 << 20)} MB "
+            f"— more than a design pack can be")
+
+
+def _archive_escape(members):
+    """The first entry name that would not stay inside the pack, or None.
+
+    An archive is data someone else wrote, so this is checked BEFORE anything is
+    unpacked: an absolute path, a `..` segment, a Windows drive letter or a
+    symlink entry is a name that would put a file where the recipient never
+    agreed to. Python's own extractor sanitises some of this SILENTLY; refusing
+    by name is the honest version, because a pack that had to be quietly
+    rewritten to be safe is not the pack that was sent.
+    """
+    # A symlink is refused even though `zipfile` writes such an entry as plain
+    # text rather than a link: the ENTRY is asking to be a link, and a pack is a
+    # folder of pictures — letting it through would turn "you sent a symlink"
+    # into "your picture is not an image", which names the wrong problem.
+    for member in members:
+        text = str(member.filename or "")
+        parts = Path(text.replace("\\", "/")).parts
+        if (not text or text.startswith("/") or ".." in parts
+                or (parts and ":" in parts[0])):
+            return text or "(an unnamed entry)"
+        if (member.external_attr >> 16) & 0o170000 == 0o120000:
+            return text
+    return None
+
+
+def _manifest_folder(root, label: str) -> tuple:
+    """Which folder `root` holds the manifest in: (problem, folder).
+
+    A pack file is written with `pack.json` at its top level, but a person
+    sharing a pack usually zips the FOLDER — so one top-level folder holding a
+    manifest is accepted as the pack too, and the two shapes a real recipient
+    will meet both work. More than one candidate is refused rather than guessed
+    at: an archive holding two packs is a question only its sender can answer,
+    and picking one would silently install the wrong look.
+    """
+    try:
+        entries = list(Path(root).iterdir())
+    except OSError as exc:
+        return (f"cannot read what {label} unpacked to "
+                f"({exc.strerror or exc})"), None
+    found = []
+    if (Path(root) / PACK_MANIFEST).is_file():
+        found.append(Path(root))
+    found += [p for p in entries
+              if p.is_dir() and (p / PACK_MANIFEST).is_file()]
+    if not found:
+        return f"{label} has no {PACK_MANIFEST} — a pack file needs one", None
+    if len(found) > 1:
+        return (f"{label} holds more than one {PACK_MANIFEST} — a pack file "
+                f"holds one pack"), None
+    return "", found[0]
+
+
+def _extract_pack_archive(archive, dest, label: str) -> tuple:
+    """Unpack one pack file into `dest`: (problem, folder holding the manifest).
+
+    Every refusal here is about not trusting the archive: it must BE a zip, it
+    must not hold more entries than a pack has, its unpacked total must fit what
+    a pack can be, and no entry may name a way out of the folder.
+
+    The size guard reads the archive's OWN declared sizes, and that is the right
+    number rather than a lazy one: the extractor below honours those sizes, so
+    the declared total genuinely bounds what unpacking can cost — a header that
+    understates it yields a short entry whose CRC then fails, and a header that
+    overstates it is refused HERE, before a byte is written. That is why a size
+    refusal leaves `dest` empty, and why this check does not need a second
+    opinion measured during the write.
+    """
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            members = zf.infolist()
+            if len(members) > PACK_MAX_ENTRIES:
+                return (f"{label} holds {len(members)} entries — more than a "
+                        f"design pack has"), None
+            if sum(m.file_size for m in members) > PACK_MAX_BYTES:
+                return _too_big(label), None
+            escape = _archive_escape(members)
+            if escape:
+                return (f"{label} holds an entry that could leave the pack "
+                        f"({escape}) — a pack file may only hold its own "
+                        f"pictures"), None
+            for member in members:
+                if member.is_dir():
+                    continue
+                target = Path(dest) / Path(*member.filename.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as source, open(target, "wb") as out:
+                    shutil.copyfileobj(source, out)
+    except zipfile.BadZipFile as exc:
+        return (f"{label} is not a pack file — it is not a zip archive "
+                f"({exc})"), None
+    except (OSError, ValueError) as exc:
+        return f"cannot unpack {label} ({exc})", None
+    return _manifest_folder(dest, label)
+
+
+def install_pack_file(source) -> tuple:
+    """Install a pack from ONE file — the archive `export_pack_file` writes.
+
+    Returns (slug, message) exactly as `install_pack` does, because it IS an
+    install: the file is unpacked into a private folder and then handed to the
+    same code path, so a pack file can only ever do what a pack FOLDER could
+    already do — the same `_validate_pack` authority, the same copy into the
+    install, the same one `.previous` generation. What is new is where the
+    folder came from, which is why none of the safety rules had to be written a
+    second time and none of them can be forgotten on the way in.
+
+    The file's own stem names the pack when its manifest has no `name`, because
+    the private folder it was unpacked into is named for nobody.
+    """
+    if packs_dir() is None:
+        return "", "design packs are not available in this install"
+    try:
+        src = Path(str(source)).expanduser()
+    except (OSError, ValueError, TypeError):
+        return "", "that is not a pack file"
+    label = src.name or "that file"
+    try:
+        if not src.is_file():
+            return "", f"{label} is not a file"
+    except OSError as exc:
+        return "", f"cannot read {label} ({exc.strerror or exc})"
+    try:
+        staging = tempfile.mkdtemp(prefix=".handsoff-pack-")
+    except OSError as exc:
+        return "", f"cannot unpack {label} ({exc.strerror or exc})"
+    try:
+        problem, folder = _extract_pack_archive(src, staging, label)
+        if problem:
+            return "", problem
+        return install_pack(folder, src.stem)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _image_lights(color: QColor, glow: float, energy: float, level: float):
