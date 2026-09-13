@@ -2424,3 +2424,86 @@ child does a plain `import handsoff` and asserts the canonical registration, the
 instance record, `__app_ready__` and `app_module()`; another starts the real
 bubble as a script (`__main__`) and talks to it over the control socket. Nothing
 committed.
+
+## Addendum — named Appearance looks, and the thirteen design (2026-09-13)
+
+The Appearance tab had one control per attribute and no way to say "make it look
+like *this*". The ask was a **Look** picker beside the shape picker, plus one more
+design; this is what shipped, and what the measurements said about it.
+
+### What a look is — and what it deliberately is not
+
+* **A look is data over the five keys the tab already owns** (`settings_schema.APPEARANCE_LOOKS`:
+  design, window size, animation energy, colour accent, the four state colours).
+  Clicking one sets those five controls and goes out through the *same* debounced
+  live-apply path a slider drag uses, so it reaches `settings.json` and the running
+  bubble with no Save and no second apply mechanism. `_collect()`/`save()` were not
+  touched.
+* **There is no `appearance_look` setting.** A stored name living beside the values
+  it describes is a second source of truth that can disagree with them — the GUI
+  reading "Neon" while the bubble renders Midnight — which is the failure shape this
+  tree has spent weeks deleting. The current look is **derived** by
+  `look_matching()` from the five values, so it cannot lie: one nudge of any slider
+  flips the section to "Custom" and unticks the button, and the status line names a
+  look only when the saved values land exactly on one (`_apply_appearance_live`
+  derives it, so a hand-tuned set that happens to match also reports itself).
+* **The catalogue must survive the loader.** A look that writes a value coercion
+  would replace is a one-click no-op, so `TestAppearanceLooks` validates every entry
+  against the loader's own bounds *and* round-trips each one through
+  `_load_settings()`, asserting the loaded values still read back as that look.
+  Look names are unique, looks are pairwise distinct, and the shipped defaults are
+  exactly the first look — so a fresh install shows a look rather than Custom.
+* **Eight looks** ship: Handsoff (the defaults), Midnight, Daylight, Ember, Neon,
+  All-seeing (the Eye), Spark (Pikachu) and Curious (the cat). The two mascot looks
+  keep the canonical palettes those designs are *for*; their tooltips say the state
+  colour tints the aura/corona rather than repainting the character, and the render
+  guard measures only what is true of them.
+
+### The cat
+
+* A round, **palette-driven** head with ears, whiskers, eyes and a rising tail — no
+  canonical colours to fight the picker (the property `void` lacked at 8 visible
+  pixels, and the one the user asked for by name). Measured: a state-colour swap
+  moves **8011** pixels past a visible step.
+* **One voice scalar.** Ears splay, the tail swings wider and lifts, the eyes
+  narrow, the inner-ear glow and the halo brighten — all from `_cat_reach(lv, t, anim)`,
+  which is 0 at rest and never above 1. That bound is what makes the mask possible.
+* **Its own silhouette.** It is the first design painted outside the inset ellipse,
+  so `design_region(name, w, h)` replaced the one-ellipse rule in `_apply_mask`, and
+  a look/design switch re-applies the aperture **at paint time** as well: a live
+  shape change keeps the widget's size, and `setFixedSize` on an unchanged size emits
+  no `resizeEvent`, so the size alone was never a sufficient trigger.
+* **Measured, not assumed.** Ear and tail geometry is defined once
+  (`_cat_ears`/`_cat_tail`) and **shared** by the painter and the mask builder. Two
+  real defects came out of the containment sweep (480 renders across 4 states, 5
+  levels, 3 radii, 8 clocks): the halo measured **66.6 px against a 64 px mask** at
+  the listening peak (fixed by capping it with the window, the same budget Pikachu's
+  aura uses), and the mask rasterised from integer polygons shaved the outermost
+  anti-aliased pixel of a round cap (fixed by building the mask's strokes a couple of
+  pixels wider than the painter's — a mask may keep more than the painter lays down,
+  never less). Worst case outside the mask now: **0 px**, and no ink on the window
+  border. Rejected as out-of-scope if a design ever needs to reach the corners: the
+  window would clip it there anyway (the diagonal budget is ~1.6 r, the axes ~1.14 r).
+
+### Also fixed, found by the new guard
+
+`BubblePreview._glyph` falls through to the orb for any design it does not know, and
+**sauron and pikachu were already falling through** — the preview had been drawing an
+orb beside a combo that said "Eye of Sauron". All three now have their own glyph, and
+`every_design_has_its_own_preview_glyph` fails on a duplicate or a fall-through. The
+same trap exists in the bubble's own dispatch, so
+`bubble_designs_render_at_energy_extremes` now asserts every name in
+`BUBBLE_DESIGNS` renders differently from the orb.
+
+### Verified
+
+**14/14 mutations caught** — the design dropped from the catalogue while a look still
+names it, an unparseable look colour, `look_matching` ignoring size, `look_matching`
+matching by design alone, a click that applies four of five controls, a click that
+sets the widgets but never applies them, a section that keeps its tick after a hand
+edit, a mask that ignores the design, a `design_region` that adds nothing, a mask
+that misses the animation's extremes, the halo cap removed, a cat that ignores the
+voice, the cat's paint branch removed (falls through to the orb), and a preview
+missing its glyph. 1051 tests green in seven orderings (default, shuffled-test seeds
+1/424242/deadbeef/20260913, shuffled-file seeds 2/cafef00d/7), coverage
+**79.65 % ≥ 70**, `ci/compile_all.py` clean (41 files).

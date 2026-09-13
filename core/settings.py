@@ -35,6 +35,40 @@ SETTINGS_VERSION = _schema.SETTINGS_VERSION
 # Keys a past version wrote that this build retired; dropped on load AND on
 # write, so a read-merge-write cannot resurrect them (see the schema).
 RETIRED_SETTINGS = tuple(getattr(_schema, "RETIRED_SETTINGS", ()))
+# The Appearance look catalogue lives in the schema (it is data over the same
+# five keys the schema already defaults), but the BUBBLE reaches it through
+# here: the installed layout resolves settings_schema through a loader the
+# settings app set up, so a bare `import settings_schema` in the bubble is not
+# the contract. A schema from an older install has no looks at all — that
+# reports Custom, which is the truthful answer rather than a crash.
+_look_matcher = getattr(_schema, "look_matching", None)
+_look_lookup = getattr(_schema, "look", None)
+
+
+def look_label(name: str) -> str:
+    """The display label for a look name, or the name itself if unknown.
+
+    The catalogue's own label ("All-seeing", not "allseeing") so the doctor
+    and the GUI name a look the same way.
+    """
+    entry = _look_lookup(name) if _look_lookup is not None else None
+    return str(entry["label"]) if entry else str(name or "")
+
+
+def look_matching(settings: dict) -> str:
+    """The Appearance look `settings` spell out, or "" when none does.
+
+    Derived, never stored: see the catalogue comment in the schema. The bubble
+    reports this in `--ptt health` / doctor, so "which look am I running" has a
+    one-line answer that cannot disagree with the settings it came from.
+    """
+    if _look_matcher is None:
+        return ""
+    try:
+        return _look_matcher(settings)
+    except Exception:            # a malformed settings dict must not break health
+        logging.getLogger("handsoff").debug("look_matching failed", exc_info=True)
+        return ""
 
 
 # ------------------------------------------------------------ safe-file primitives

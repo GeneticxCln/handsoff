@@ -543,6 +543,27 @@ def bubble_designs_render_at_energy_extremes():
             f" | non-zero bytes in a cleared render: {blank}"
             f" | changed-pixel counts: {sorted(set(counts.values()))[:8]}")
 
+    # ...and every design must be its OWN painting. A name in BUBBLE_DESIGNS
+    # with no dispatch branch falls through to the orb, so the combo would
+    # offer a "shape" that is really the orb (the preview glyph has the same
+    # trap, pinned by every_design_has_its_own_preview_glyph).
+    widget._clock = _FrozenClock()
+    widget._level_ui = widget._level_target = 0.0
+    widget._radius_ui = bubble.BUBBLE_R0
+    widget._state = "idle"
+    bubble.SETTINGS["bubble_design"] = "orb"
+    orb_pixels = _pixels()
+    same_as_orb = []
+    for design in designs:
+        if design == "orb":
+            continue
+        bubble.SETTINGS["bubble_design"] = design
+        if _pixels() == orb_pixels:
+            same_as_orb.append(design)
+    assert same_as_orb == [], (
+        "these designs paint exactly like the orb (no dispatch branch): "
+        + ", ".join(same_as_orb))
+
     # the neutral defaults must reproduce the historical framing exactly.
     # _energy_ui is a smoothed chase (it converges during _on_tick), so pin it
     # to the target rather than hoping the event loop got there: the frame's
@@ -922,6 +943,246 @@ def resizing_the_bubble_keeps_its_aperture():
     # aperture to the rectangle would pass the size assertions above.
     assert not widget.mask().contains(QPoint(1, 1)), \
         "mask is no longer elliptical"
+
+
+@scenario
+def a_look_sets_every_appearance_control():
+    # The Look picker is one click for the whole look. What must be true for
+    # EVERY catalogue entry, or the click is a lie: all five controls move, all
+    # five reach settings.json in one apply, the bubble is told once, the
+    # section names the look it is showing, and one nudge afterwards stops it
+    # claiming that look. Driven from APPEARANCE_LOOKS, so a look added later
+    # is covered without touching this scenario.
+    from settings_schema import APPEARANCE_LOOKS
+    assert len(APPEARANCE_LOOKS) >= 5, APPEARANCE_LOOKS   # never vacuous
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    notes = []
+    for entry in APPEARANCE_LOOKS:
+        notified = []
+        win._notify_bubble_reloaded = lambda: (notified.append(1), True)[1]
+        win._apply_look(entry["name"])
+        win._apply_appearance_live()      # what the debounce timer calls
+        on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert on_disk["bubble_design"] == entry["design"], (
+            entry["name"], on_disk.get("bubble_design"))
+        assert on_disk["bubble_size"] == entry["bubble_size"], entry["name"]
+        assert abs(float(on_disk["animation_energy"])
+                   - float(entry["animation_energy"])) < 1e-9, entry["name"]
+        assert abs(float(on_disk["bubble_accent"])
+                   - float(entry["bubble_accent"])) < 1e-9, entry["name"]
+        assert on_disk["colors"] == entry["colors"], (entry["name"],
+                                                       on_disk["colors"])
+        assert notified, f"{entry['name']} must tell the bubble to repaint"
+        assert win.design_combo.currentData() == entry["design"]
+        assert win.size_slider.value() == entry["bubble_size"]
+        assert entry["label"] in win.look_label.text(), \
+            (entry["name"], win.look_label.text())
+        assert win.look_buttons[entry["name"]].isChecked(), entry["name"]
+        assert win.status_label.text().startswith(
+            f"Applied look {entry['label']}"), win.status_label.text()
+        notes.append(entry["name"])
+    # the last look is on screen; nudge the size slider and the section must
+    # stop claiming it rather than leaving a stale tick behind
+    last = APPEARANCE_LOOKS[-1]
+    win.size_slider.setValue(int(last["bubble_size"]) + 1)
+    assert "Custom" in win.look_label.text(), win.look_label.text()
+    assert not any(b.isChecked() for b in win.look_buttons.values())
+    assert len(notes) == len(APPEARANCE_LOOKS)
+
+
+@scenario
+def every_look_is_renderable_and_reacts():
+    # A look is a promise about what the bubble shows. Render each one's design
+    # in its own palette offscreen and measure the two things that have gone
+    # wrong before on this tab: a palette change nobody can see (the void
+    # regression, 8 visible pixels) and a design that ignores the voice.
+    from PySide6.QtGui import QColor, QImage
+    from settings_schema import APPEARANCE_LOOKS
+
+    class _Signal:
+        def connect(self, *_a, **_k):
+            return None
+
+    class _Stub:
+        sigState = _Signal()
+        sigLevel = _Signal()
+
+    class _FrozenClock:
+        def elapsed(self):
+            return 4000
+
+    widget = bubble.BubbleWidget(_Stub())
+    widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    widget._clock = _FrozenClock()
+    widget._anim.stop()
+    widget._last_tick = 4.0
+    widget._radius_ui = bubble.BUBBLE_R0
+    widget._state = "idle"
+    bubble.ANIM_ENERGY = 1.0
+    bubble.BUBBLE_ACCENT = 0.5
+
+    def _pixels(level, color):
+        widget._level_target = widget._level_ui = level
+        c = QColor(color)
+        widget._color_ui = [c.redF(), c.greenF(), c.blueF()]
+        img = QImage(widget.size(), QImage.Format_ARGB32)
+        img.fill(0)
+        widget.render(img)
+        return bytes(img.constBits())
+
+    def _visible(before, after):
+        n = min(len(before), len(after))
+        out = 0
+        for i in range(0, n - 3, 4):
+            if before[i + 3] == 0 and after[i + 3] == 0:
+                continue
+            if max(abs(x - y) for x, y in zip(before[i:i + 3],
+                                              after[i:i + 3])) >= 48:
+                out += 1
+        return out
+
+    def _changed(before, after):
+        n = min(len(before), len(after))
+        return sum(1 for i in range(0, n - 3, 4)
+                   if any(x != y for x, y in zip(before[i:i + 3],
+                                                 after[i:i + 3])))
+
+    weak = []
+    for entry in APPEARANCE_LOOKS:
+        bubble.SETTINGS["bubble_design"] = entry["design"]
+        colors = entry["colors"]
+        base = _pixels(0.0, colors["idle"])
+        seen = max(_visible(base, _pixels(0.0, other))
+                   for other in (colors["listening"], colors["thinking"],
+                                 colors["speaking"]))
+        voice = _changed(_pixels(0.0, colors["idle"]),
+                         _pixels(1.0, colors["idle"]))
+        if seen < 400 or voice < 100:
+            weak.append(f"{entry['name']} (colour {seen}, voice {voice})")
+    if weak:
+        raise AssertionError(
+            "these looks do not reach the bubble: " + ", ".join(weak)
+            + f" | designs: {[e['design'] for e in APPEARANCE_LOOKS]}")
+
+
+@scenario
+def the_cat_keeps_its_ears_inside_its_own_mask():
+    # The cat is the first design whose outline leaves the inscribed ellipse.
+    # A mask is what decides which painted pixels survive on the desktop, so
+    # two things must hold: the mask covers EVERY pixel the painter lays down
+    # (otherwise the ears come back shorn, which is the whole reason a design
+    # could never be anything but a circle), and it still keeps the ellipse, so
+    # nothing that used to fit can be clipped now.
+    from PySide6.QtCore import QPoint, QRect
+    from PySide6.QtGui import QImage, QPainter, QRegion
+
+    class _Signal:
+        def connect(self, *_a, **_k):
+            return None
+
+    class _Stub:
+        sigState = _Signal()
+        sigLevel = _Signal()
+
+    class _Clock:
+        def __init__(self, ms):
+            self.ms = ms
+
+        def elapsed(self):
+            return self.ms
+
+    W = bubble.WINDOW_PX
+    widget = bubble.BubbleWidget(_Stub())
+    widget.resize(W, W)
+    widget._anim.stop()
+    ellipse = QRegion(QRect(0, 0, W, W), QRegion.Ellipse)
+    cat_region = bubble.design_region("cat", W, W)
+    assert bubble.design_region("orb", W, W) == ellipse, \
+        "the ordinary designs must keep the plain inset ellipse"
+    assert ellipse.subtracted(cat_region).isEmpty(), \
+        "the cat's mask must still keep the whole ellipse"
+    assert not cat_region.subtracted(ellipse).isEmpty(), \
+        "the cat's mask must add its own outline, not just re-use the ellipse"
+    # ...and the window USES it. A region that nothing applies is the same as
+    # no region at all, which is how the stale-aperture bug lived: the shape
+    # was correct on paper and never reached the widget.
+    bubble.SETTINGS["bubble_design"] = "cat"
+    widget.show()
+    app.processEvents()
+    assert widget.mask() != ellipse, \
+        "the cat's mask was computed but never applied to the window"
+    # ...and back again: a live shape switch keeps the widget's SIZE, so the
+    # mask cannot ride on resizeEvent alone
+    bubble.SETTINGS["bubble_design"] = "orb"
+    widget.setFixedSize(W, W)
+    widget.update()
+    app.processEvents()
+    assert widget.mask() == ellipse, \
+        "the ordinary designs must fall back to the plain inset ellipse"
+    bubble.SETTINGS["bubble_design"] = "cat"
+
+    worst = (0, None)
+    for clock_ms in (0, 700, 2600, 4000):
+        widget._clock = _Clock(clock_ms)
+        widget._last_tick = clock_ms / 1000.0
+        for state in ("idle", "listening", "thinking", "speaking"):
+            widget._state = state
+            widget._energy_ui = bubble._fx_energy(state)
+            for level in (0.0, 0.5, 1.0):
+                for grow in (0.0, 12.0):      # 12 = the listening peak
+                    widget._level_target = widget._level_ui = level
+                    widget._radius_ui = bubble.BUBBLE_R0 + grow * bubble.GEOM_K
+                    img = QImage(W, W, QImage.Format_ARGB32)
+                    img.fill(0)
+                    painter = QPainter(img)
+                    widget._paint_cat(painter, widget._frame())
+                    painter.end()
+                    outside = sum(
+                        1 for y in range(W) for x in range(W)
+                        if img.pixelColor(x, y).alpha()
+                        and not cat_region.contains(QPoint(x, y)))
+                    if outside > worst[0]:
+                        worst = (outside, (clock_ms, state, level, grow))
+    if worst[0]:
+        raise AssertionError(
+            f"the cat paints {worst[0]} pixel(s) outside its own mask at "
+            f"{worst[1]} — Qt would cut them off on the desktop")
+
+
+@scenario
+def every_design_has_its_own_preview_glyph():
+    # BubblePreview._glyph falls through to the orb for any design it does not
+    # know, so a new design would show as an orb in the Appearance preview
+    # while the bubble drew something else — the preview would be lying about
+    # the very thing the combo above it selects.
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QImage, QPainter, QColor
+    from settings_schema import BUBBLE_DESIGNS
+
+    preview = settings_app.BubblePreview(
+        lambda: {k: QColor("#4f8cff") for k in ("idle",)},
+        lambda: 128, lambda: "orb", lambda: 1.0, lambda: 0.5)
+    preview.resize(240, 200)
+    seen = {}
+    for design in BUBBLE_DESIGNS:
+        img = QImage(120, 120, QImage.Format_ARGB32)
+        img.fill(0)
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        preview._glyph(painter, design, 60.0, 60.0, 40.0,
+                       QColor("#4f8cff"), 4.0, 1.0)
+        painter.end()
+        seen[design] = bytes(img.constBits())
+    duplicates = [d for d in BUBBLE_DESIGNS
+                  if d != "orb" and seen.get(d) == seen.get("orb")]
+    if duplicates:
+        raise AssertionError(
+            "these designs render the orb glyph in the preview (unknown "
+            "designs fall through): " + ", ".join(duplicates))
+    assert len({v for v in seen.values()}) == len(BUBBLE_DESIGNS), (
+        "two designs share a preview glyph: "
+        + ", ".join(sorted(seen, key=lambda k: seen[k])))
 
 
 @scenario
@@ -1456,6 +1717,10 @@ SCENARIO_NAMES = [
     "every_design_reacts_to_voice_level",
     "every_design_shows_the_state_colour",
     "resizing_the_bubble_keeps_its_aperture",
+    "a_look_sets_every_appearance_control",
+    "every_look_is_renderable_and_reacts",
+    "the_cat_keeps_its_ears_inside_its_own_mask",
+    "every_design_has_its_own_preview_glyph",
     "voice_tab_level_meter_reads_the_bubble_feed",
     "external_change_reloads_and_reports",
     "missing_settings_file_mtime_is_zero",

@@ -85,6 +85,7 @@ class DoctorDeps:
         "control_sock", "crash_log", "remote_ollama_allowed",
         "remote_ollama_optin_source",
         "cap_refusal_note", "cap_refusals",
+        "appearance_look",
         "shutil", "sounddevice", "log",
     )
 
@@ -121,6 +122,10 @@ class DoctorDeps:
         # truthful answer for a host that has no registries to bound.
         self.cap_refusal_note: Callable[[], str] = lambda: ""
         self.cap_refusals: Callable[[], dict] = lambda: {}
+        # The Appearance look the settings spell out. A host without looks
+        # reports "", and the line is then omitted entirely, so this cannot
+        # change the output of a partial deps object.
+        self.appearance_look: Callable[[], str] = lambda: ""
         self.shutil = shutil
         self.sounddevice = None
         self.log = log
@@ -180,6 +185,21 @@ def _tts_line(deps: "DoctorDeps") -> str:
              else "built-in voice")
     state = "model loaded" if deps.tts_model is not None else "model NOT loaded yet"
     return f"tts: {engine} ({voice}) — {state}"
+
+
+def _appearance_lines(deps: "DoctorDeps") -> list[str]:
+    """The Appearance look line, when the host has looks to report.
+
+    A host that does not supply the dep yields no line at all, so this cannot
+    change the output of a partial deps object (the legacy path stays as it
+    was). The name is derived from the settings, never stored beside them, so
+    the line cannot disagree with what the bubble is actually drawing.
+    """
+    try:
+        note = deps.appearance_look() or ""
+    except Exception:
+        note = ""
+    return [f"appearance: {note}"] if note else []
 
 
 def _remote_brain_lines(deps: "DoctorDeps") -> list[str]:
@@ -268,6 +288,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append(
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
+        lines.extend(_appearance_lines(deps))
 
         audio = snap["audio"]
         if audio.get("ok") and audio.get("count"):
@@ -309,6 +330,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append(
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
+        lines.extend(_appearance_lines(deps))
 
         sd = deps.sounddevice
         if sd is not None:

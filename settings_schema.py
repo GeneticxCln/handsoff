@@ -25,7 +25,130 @@ SETTINGS_VERSION: int = 2   # bumped on incompatible settings.json layout change
 # learns a newer build wrote them.
 RETIRED_SETTINGS = ("piper_voice",)
 
-BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void", "sauron", "pikachu")
+BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void", "sauron", "pikachu", "cat")
+
+# ------------------------------------------------------------------ looks
+# One-click whole looks for the Appearance tab: a look sets the five keys the
+# tab already owns — design, window size, animation energy, colour accent and
+# the four state colours — through the same live-apply path a slider uses.
+#
+# There is deliberately NO ``appearance_look`` setting. A stored name beside
+# the values it claims to describe is a second source of truth that can
+# disagree with them (the GUI reading "Neon" while the bubble renders Midnight),
+# which is the exact failure this tree keeps removing. `look_matching()` DERIVES
+# the current look from the values, so it cannot lie: it returns "" whenever
+# the settings spell out no look at all, and the tab shows "Custom".
+#
+# Every value here must satisfy the bounds the loader enforces (see
+# core/settings.py) and every colour must be parseable — a look that writes a
+# value the loader would reject turns one click into a silent no-op, so
+# tests/test_settings.py validates the catalogue against those same rules
+# rather than trusting it. Look names are also unique, and the `handsoff` look
+# is EXACTLY the shipped defaults, so a fresh install reads as a look instead
+# of as Custom.
+APPEARANCE_LOOKS: tuple = (
+    {"name": "handsoff", "label": "Handsoff", "design": "orb",
+     "bubble_size": 128, "animation_energy": 1.0, "bubble_accent": 0.5,
+     "colors": {"idle": "#4f8cff", "listening": "#ff4d5e",
+                "thinking": "#ff9e2c", "speaking": "#3ecf6e"},
+     "note": "the shipped look — the defaults, one click away"},
+    {"name": "midnight", "label": "Midnight", "design": "orb",
+     "bubble_size": 132, "animation_energy": 0.7, "bubble_accent": 0.35,
+     "colors": {"idle": "#3f57d6", "listening": "#b03a6e",
+                "thinking": "#7b5cf0", "speaking": "#2f9e95"},
+     "note": "cool, slow and quiet — for a dark wallpaper"},
+    {"name": "daylight", "label": "Daylight", "design": "halo",
+     "bubble_size": 128, "animation_energy": 0.9, "bubble_accent": 0.85,
+     "colors": {"idle": "#1b4bbf", "listening": "#c01f2e",
+                "thinking": "#b3660a", "speaking": "#137a3f"},
+     "note": "the default palette darkened — for a light wallpaper"},
+    {"name": "ember", "label": "Ember", "design": "reactor",
+     "bubble_size": 144, "animation_energy": 1.7, "bubble_accent": 0.9,
+     "colors": {"idle": "#ff7a1a", "listening": "#e0231c",
+                "thinking": "#ffc14d", "speaking": "#ff5a2e"},
+     "note": "hot, fast and wide awake"},
+    {"name": "neon", "label": "Neon", "design": "equalizer",
+     "bubble_size": 136, "animation_energy": 1.9, "bubble_accent": 1.0,
+     "colors": {"idle": "#00e5ff", "listening": "#ff2da0",
+                "thinking": "#c77dff", "speaking": "#7cff3d"},
+     "note": "loud: maximum saturation, speed and glow"},
+    {"name": "allseeing", "label": "All-seeing", "design": "sauron",
+     "bubble_size": 144, "animation_energy": 1.4, "bubble_accent": 0.8,
+     "colors": {"idle": "#b06a12", "listening": "#ff3b14",
+                "thinking": "#ffb02e", "speaking": "#ff7a3d"},
+     "note": "the Eye keeps its own fire — these tint the corona"},
+    {"name": "spark", "label": "Spark", "design": "pikachu",
+     "bubble_size": 144, "animation_energy": 1.6, "bubble_accent": 0.9,
+     "colors": {"idle": "#3b6fe0", "listening": "#e0402e",
+                "thinking": "#e0a92a", "speaking": "#2fbf6a"},
+     "note": "Pikachu keeps its fur — these tint the aura"},
+    {"name": "curious", "label": "Curious", "design": "cat",
+     "bubble_size": 144, "animation_energy": 1.1, "bubble_accent": 0.6,
+     "colors": {"idle": "#5aa9e6", "listening": "#ef5d7a",
+                "thinking": "#f0a44a", "speaking": "#57c98b"},
+     "note": "the cat: ears up, tail moving, body in the state colour"},
+)
+
+
+def look_names() -> tuple:
+    """The catalogue's names, in display order."""
+    return tuple(entry["name"] for entry in APPEARANCE_LOOKS)
+
+
+def look(name: str):
+    """The catalogue entry `name` names, or None."""
+    wanted = str(name or "").strip().lower()
+    for entry in APPEARANCE_LOOKS:
+        if entry["name"] == wanted:
+            return entry
+    return None
+
+
+def _look_color(value) -> str:
+    """A colour in a comparable form ('#rrggbb' lower case, or as written)."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return text
+    return text if text.startswith("#") else "#" + text
+
+
+def _look_number(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def look_matching(settings) -> str:
+    """The look whose five values equal `settings`, or "" when none does.
+
+    Derived on purpose (see the catalogue comment): the Appearance tab calls
+    this after every change, so "which look is current" is answered by the
+    settings themselves. A value that is not a number can never match, hence
+    the NaN comparison — junk must read as Custom rather than crashing the tab.
+    """
+    if not isinstance(settings, dict):
+        return ""
+    colors = settings.get("colors")
+    colors = colors if isinstance(colors, dict) else {}
+    want_design = str(settings.get("bubble_design", "")).strip().lower()
+    want_size = _look_number(settings.get("bubble_size"))
+    want_energy = _look_number(settings.get("animation_energy"))
+    want_accent = _look_number(settings.get("bubble_accent"))
+    for entry in APPEARANCE_LOOKS:
+        if want_design != entry["design"]:
+            continue
+        if want_size != float(entry["bubble_size"]):
+            continue
+        if abs(want_energy - float(entry["animation_energy"])) > 1e-6:
+            continue
+        if abs(want_accent - float(entry["bubble_accent"])) > 1e-6:
+            continue
+        if any(_look_color(colors.get(key)) != _look_color(value)
+               for key, value in entry["colors"].items()):
+            continue
+        return entry["name"]
+    return ""
 
 DEFAULT_SETTINGS: dict = {
     "ollama_host": "http://127.0.0.1:11434",
@@ -43,6 +166,7 @@ DEFAULT_SETTINGS: dict = {
     "handsfree": False,
     "bubble_size": 128,
     "bubble_design": "orb",  # Appearance tab; must be one of BUBBLE_DESIGNS above
+                              # (APPEARANCE_LOOKS below sets this with the rest)
     "bubble_accent": 0.5,      # 0..1 accent punch: how hard each shape leans on its
                                # state colour (glow alpha, saturation, comet light)
     "animation_energy": 1.0,   # 0.2..2.0 global animation scale: orbit speed, swirl

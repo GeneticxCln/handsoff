@@ -163,7 +163,7 @@ import numpy as np  # noqa: E402  (after handsoff, which already required it)
 import sounddevice as sd  # noqa: E402
 
 from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QRectF, Qt, QTimer  # noqa: E402
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPalette, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
+from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPalette, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -534,6 +534,74 @@ class BubblePreview(QWidget):
             p.setBrush(Qt.NoBrush)
             p.setPen(QPen(QColor(color).lighter(170), 1.8))
             p.drawEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
+        elif design == "sauron":
+            # A slit-pupilled eye wreathed in flame: the mascot designs keep
+            # their own palette in the bubble, so the preview shows the same
+            # thing (state colour on the corona, not on the eye).
+            for sign in (-1.0, 1.0):
+                flame = QPainterPath()
+                flame.moveTo(cx, cy - r * 0.30)
+                flame.quadTo(cx + sign * r * 1.10, cy - r * 0.55,
+                             cx + sign * r * 0.95, cy + r * 0.30)
+                flame.quadTo(cx + sign * r * 0.60, cy + r * 0.20, cx, cy + r * 0.30)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(QColor(255, 106, 24, 190)))
+                p.drawPath(flame)
+            p.setBrush(QBrush(QColor(color).lighter(150)))
+            p.drawEllipse(QPointF(cx, cy), r * 0.72, r * 0.30)
+            p.setBrush(QBrush(QColor(255, 214, 120)))
+            p.drawEllipse(QPointF(cx, cy), r * 0.30, r * 0.22)
+            p.setBrush(QBrush(QColor(18, 10, 4)))
+            p.drawEllipse(QPointF(cx, cy), r * 0.055, r * 0.20)
+        elif design == "pikachu":
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(color).lighter(120)))
+            p.drawEllipse(QPointF(cx, cy + r * 0.08), r * 0.74, r * 0.66)
+            for sign in (-1.0, 1.0):
+                ear = QPainterPath()
+                ear.moveTo(cx + sign * r * 0.34, cy - r * 0.16)
+                ear.lineTo(cx + sign * r * 0.62, cy - r * 0.92)
+                ear.lineTo(cx + sign * r * 0.12, cy - r * 0.44)
+                ear.closeSubpath()
+                eg = QLinearGradient(QPointF(cx + sign * r * 0.30, cy - r * 0.30),
+                                     QPointF(cx + sign * r * 0.62, cy - r * 0.92))
+                eg.setColorAt(0.0, QColor(250, 205, 42))
+                eg.setColorAt(0.55, QColor(250, 205, 42))
+                eg.setColorAt(0.60, QColor(24, 20, 12))
+                eg.setColorAt(1.0, QColor(12, 10, 8))
+                p.setBrush(QBrush(eg))
+                p.drawPath(ear)
+            p.setBrush(QBrush(QColor(236, 60, 46)))
+            for sign in (-1.0, 1.0):
+                p.drawEllipse(QPointF(cx + sign * r * 0.42, cy + r * 0.34),
+                              r * 0.15, r * 0.13)
+            p.setBrush(QBrush(QColor(26, 20, 14)))
+            for sign in (-1.0, 1.0):
+                p.drawEllipse(QPointF(cx + sign * r * 0.24, cy - r * 0.06),
+                              r * 0.10, r * 0.11)
+        elif design == "cat":
+            # Ears first, then the head over their bases, then the tail behind:
+            # the same layering the bubble uses, so the preview cannot show a
+            # shape the desktop would not.
+            p.setPen(Qt.NoPen)
+            for sign in (-1.0, 1.0):
+                ear = QPainterPath()
+                ear.moveTo(cx + sign * r * 0.20, cy - r * 0.44)
+                ear.lineTo(cx + sign * r * 0.86, cy - r * 0.96)
+                ear.lineTo(cx + sign * r * 0.64, cy - r * 0.30)
+                ear.closeSubpath()
+                p.setBrush(QBrush(QColor(color).darker(135)))
+                p.setPen(QPen(QColor(color).lighter(150), 1.2))
+                p.drawPath(ear)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(color).lighter(125)))
+            p.drawEllipse(QPointF(cx, cy + r * 0.10), r * 0.76, r * 0.68)
+            p.setBrush(QBrush(QColor(246, 242, 238, 232)))
+            p.drawEllipse(QPointF(cx, cy + r * 0.32), r * 0.20, r * 0.13)
+            p.setBrush(QBrush(QColor(26, 22, 28)))
+            for sign in (-1.0, 1.0):
+                p.drawEllipse(QPointF(cx + sign * r * 0.28, cy - r * 0.04),
+                              r * 0.13, r * 0.16)
         else:  # orb
             body = QRadialGradient(cx, cy - r * 0.25, r * 1.15)
             body.setColorAt(0.0, QColor(color).lighter(140))
@@ -2343,7 +2411,133 @@ class SettingsWindow(QMainWindow):
         )
         lay.addWidget(self.preview)
         self._paint_color_buttons()
+        # Built LAST (all the controls exist by now) but shown FIRST: a look is
+        # a one-click way to set everything under it, so it belongs on top.
+        self._build_look_group(w, lay)
         return w
+
+    # ------------------------------------------------------------------ looks
+
+    def _build_look_group(self, parent: QWidget, lay) -> None:
+        """The named-look picker: one button per catalogue entry.
+
+        The catalogue is DATA in settings_schema (a look only names the five
+        keys the tab already owns), and "which look is current" is DERIVED from
+        the widgets — there is no stored name to fall out of step with them.
+        That is why the checked button is recomputed after every change instead
+        of being set once and trusted.
+        """
+        self.look_buttons: dict[str, QPushButton] = {}
+        self._looks = tuple(getattr(SCHEMA, "APPEARANCE_LOOKS", ()))
+        group = QGroupBox("Look", parent)
+        gl = QVBoxLayout(group)
+        row = QHBoxLayout()
+        for entry in self._looks:
+            btn = QPushButton(f"{entry['label']}", parent)
+            btn.setCheckable(True)
+            btn.setToolTip(self._look_tooltip(entry))
+            btn.clicked.connect(
+                lambda _=False, name=str(entry["name"]): self._apply_look(name))
+            self.look_buttons[str(entry["name"])] = btn
+            row.addWidget(btn)
+        row.addStretch(1)
+        gl.addLayout(row)
+        self.look_label = QLabel("", parent)
+        self.look_label.setStyleSheet("color: palette(mid);")
+        gl.addWidget(self.look_label)
+        if not self._looks:
+            # an older settings_schema in a partial install: say so rather than
+            # showing an empty box with no explanation
+            group.setTitle("Look (unavailable in this install)")
+            group.setEnabled(False)
+        lay.insertWidget(0, group)
+        self._refresh_look_buttons()
+
+    def _look_tooltip(self, entry: dict) -> str:
+        """Spell out exactly what the click will set — it overwrites your own."""
+        colors = entry["colors"]
+        return (
+            f"{entry['note']}\n"
+            f"shape {entry['design']} · {entry['bubble_size']} px · "
+            f"energy {float(entry['animation_energy']):.1f}× · "
+            f"accent {float(entry['bubble_accent']):.0%}\n"
+            f"idle {colors['idle']} · listening {colors['listening']} · "
+            f"thinking {colors['thinking']} · speaking {colors['speaking']}\n"
+            "Sets all five controls and applies live — no Save needed "
+            "(this replaces the current shape, size, sliders and colours).")
+
+    def _look_values_now(self) -> dict:
+        """The five Appearance values the controls are showing right now."""
+        return {
+            "bubble_design": self.design_combo.currentData() or "orb",
+            "bubble_size": self.size_slider.value(),
+            "animation_energy": self.energy_slider.value() / 100.0,
+            "bubble_accent": self.accent_slider.value() / 100.0,
+            "colors": dict(self._colors),
+        }
+
+    def _current_look(self) -> str:
+        """Name of the look the controls spell out, or "" for Custom."""
+        matcher = getattr(SCHEMA, "look_matching", None)
+        if matcher is None:
+            return ""
+        try:
+            return matcher(self._look_values_now())
+        except Exception:
+            log.debug("look lookup failed", exc_info=True)
+            return ""
+
+    def _refresh_look_buttons(self) -> None:
+        """Check the button the controls match — or none, and say "Custom".
+
+        Called after every appearance change, so nudging one slider drops the
+        tick immediately instead of leaving a look selected that the controls
+        no longer show.
+        """
+        buttons = getattr(self, "look_buttons", None)
+        if not buttons:
+            return
+        name = self._current_look()
+        for look_name, btn in buttons.items():
+            btn.setChecked(look_name == name)
+        if name:
+            entry = SCHEMA.look(name) if hasattr(SCHEMA, "look") else None
+            label = entry["label"] if entry else name
+            self.look_label.setText(f"current look: {label}")
+        else:
+            self.look_label.setText(
+                "current look: Custom — these are your own settings")
+
+    def _apply_look(self, name: str) -> None:
+        """One click: set every Appearance control from a named look.
+
+        Writes through the SAME debounced live-apply path a slider drag uses,
+        so the change reaches settings.json and the running bubble with no
+        Save. A look that names a design this build does not ship applies
+        NOTHING and says so: applying the other four keys would silently leave
+        a half-look behind.
+        """
+        lookup = getattr(SCHEMA, "look", None)
+        entry = lookup(name) if lookup is not None else None
+        if entry is None:
+            self._status(f"no such look: {name}")
+            return
+        index = self.design_combo.findData(str(entry["design"]))
+        if index < 0:
+            self._status(f"look {entry['label']}: this install has no "
+                         f"{entry['design']!r} shape — nothing applied")
+            return
+        self.design_combo.setCurrentIndex(index)
+        self.size_slider.setValue(int(entry["bubble_size"]))
+        self.energy_slider.setValue(
+            int(round(float(entry["animation_energy"]) * 100)))
+        self.accent_slider.setValue(
+            int(round(float(entry["bubble_accent"]) * 100)))
+        self._colors = {str(k): str(v) for k, v in entry["colors"].items()}
+        self._paint_color_buttons()
+        self.preview.update()
+        self._refresh_look_buttons()
+        self._schedule_appearance_live()
 
     def _apply_wallpaper_tuning(self, luminance: float) -> None:
         """Retune the four state colours for a dark or light backdrop."""
@@ -2423,7 +2617,14 @@ class SettingsWindow(QMainWindow):
     # ------------------------------------------------------- live appearance
 
     def _schedule_appearance_live(self, *_args) -> None:
-        """Debounce a live apply; the last change wins."""
+        """Debounce a live apply; the last change wins.
+
+        Every Appearance control funnels through here, which makes it the one
+        place to keep the Look section honest: the tick follows the CONTROLS, so
+        a hand edit (or a reload from disk) updates it too, not just a look
+        click.
+        """
+        self._refresh_look_buttons()
         self._live_timer.start()
 
     def _apply_appearance_live(self) -> None:
@@ -2450,11 +2651,18 @@ class SettingsWindow(QMainWindow):
         if self.save():
             # name what moved instead of always reporting the shape: the old
             # message made a colour or size change look like it had not been
-            # taken (and hid the fact that it never was).
+            # taken (and hid the fact that it never was). A change that lands
+            # exactly on a catalogue look says WHICH look, derived from the
+            # saved values rather than remembered from the click — so a hand
+            # tuned set that happens to match also reports itself as that look.
             pretty = {"bubble_design": "shape", "bubble_size": "size",
                       "animation_energy": "animation energy",
                       "bubble_accent": "colour accent", "colors": "state colours"}
-            self._status("Applied live: "
+            name = self._current_look()
+            entry = (SCHEMA.look(name) if name and hasattr(SCHEMA, "look")
+                     else None)
+            head = f"Applied look {entry['label']}" if entry else "Applied live"
+            self._status(head + ": "
                          + ", ".join(pretty.get(k, k) for k in changed)
                          + ". No restart needed.")
 
@@ -2692,6 +2900,8 @@ class SettingsWindow(QMainWindow):
         self._paint_color_buttons()
         if rejected:
             self._report_rejected_colors(rejected, "using the default")
+        # last: the tick must reflect the values just loaded from disk
+        self._refresh_look_buttons()
 
     def _collect(self) -> list[str]:
         problems: list[str] = []

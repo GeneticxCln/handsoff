@@ -33,7 +33,7 @@ voice clip you pick. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 890 tests pin the behavior (`python -m pytest tests/`),
+automatically. 1051 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
 regression, ops, and fault injection — including offscreen-Qt scenarios that
 drive the settings GUI itself.
@@ -109,22 +109,36 @@ in VRAM between questions).
 ### The bubble
 
 - **Hold left button** → talk; release → send. Drag to move the bubble.
-- **Shape & feel** — the Appearance tab picks one of twelve designs (orb, halo,
-  reactor, bloom, droplet, cube, equalizer, crystal, saturn, void, Eye of
-  Sauron, Pikachu), bubble size, an animation-energy scale (orbit speed, swirl, comet
-  brightness) and a colour-accent punch; one click of **Match wallpaper**
-  retunes all four state colours for a dark or light backdrop. Every control on
-  the tab — shape, size, both sliders, the four state colours, wallpaper
-  matching — applies live, with no Save needed. **Every design reacts to your
-  voice in its own way**, from one shared level signal: the orb ripples
+- **Shape & feel** — the Appearance tab picks one of thirteen designs (orb,
+  halo, reactor, bloom, droplet, cube, equalizer, crystal, saturn, void, Eye of
+  Sauron, Pikachu, Cat), bubble size, an animation-energy scale (orbit speed,
+  swirl, comet brightness) and a colour-accent punch; one click of **Match
+  wallpaper** retunes all four state colours for a dark or light backdrop.
+  Every control on the tab — shape, size, both sliders, the four state colours,
+  wallpaper matching — applies live, with no Save needed. **Every design reacts
+  to your voice in its own way**, from one shared level signal: the orb ripples
   outward, the halo sends a brightness wave round its torus, the reactor opens
   its segments and spins up, the bloom shakes extra sparks loose, the droplet
   ripples its skin and drips sooner, the cube flashes its facets in a sweeping
   front, the equalizer's bars are the meter itself, the crystal refracts (its
   inner hex swells and splits hue), saturn's ring carries a travelling wave,
   the void accelerates its infall, the Eye of Sauron narrows its pupil and
-  flares its fire, and Pikachu charges its cheeks. Every one of those terms is
-  neutral at silence, so a quiet bubble renders exactly as it always did.
+  flares its fire, Pikachu charges its cheeks, and the Cat's ears splay and its
+  tail swings wider as you talk. Every one of those terms is neutral at
+  silence, so a quiet bubble renders exactly as it always did.
+- **Looks** — the same tab's **Look** picker sets the whole appearance in one
+  click: a named look (Handsoff, Midnight, Daylight, Ember, Neon, All-seeing,
+  Spark, Curious) carries a shape, a size, both sliders and all four state
+  colours, and applies live like any other control. Nothing extra is stored:
+  the current look is *derived* from the five values, so the tab says "Custom"
+  the moment you nudge a slider instead of leaving a stale name on screen, and
+  `--ptt health`/`--ptt doctor` name the look the settings actually spell out.
+  The two looks built on Pikachu and the Eye of Sauron say so in their
+  tooltips: those designs keep their own palettes, so a look's colours tint
+  their aura/corona rather than repainting the character.
+- **Cat** is the first design whose outline leaves the bubble's circle: its
+  ears are painted outside the inset ellipse, so the window's mask is built per
+  design (`design_region`) and follows a live shape change as well as a resize.
   While the bubble is talking it follows its own playback level too (the mic is
   muted during TTS, so `play_wav` reports what it is actually playing), and
   which of the three producers fed the level — your mic while listening, your
@@ -424,7 +438,7 @@ instead of starting by hand; it waits for the lock.
 ## Development
 
 ```bash
-python -m pytest tests/ -q              # 890 tests
+python -m pytest tests/ -q              # 1051 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 
@@ -444,7 +458,7 @@ nothing is broken:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70     # 890 tests, 77.1%
+  --cov-report=term-missing --cov-fail-under=70     # 1051 tests, 79.7%
 ```
 
 The suite is self-contained: it imports the bubble against a throw-away

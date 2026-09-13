@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import inspect
+import re
 from collections import deque
 import threading
 import io
@@ -1017,3 +1018,147 @@ class TestSettingsHistoryTab:
         )
         assert out.returncode == 0, out.stderr[-2000:]
         assert "History" in out.stdout
+
+
+class TestAppearanceLooks:
+    """The named Appearance looks: the catalogue, and the derivation of it.
+
+    A look is DATA over the five keys the Appearance tab already owns, and
+    "which look is current" is derived from those values rather than stored
+    beside them. These pin the two halves that can rot silently: a catalogue
+    entry the loader would reject (one click becomes a no-op), and a
+    `look_matching` that claims a look the settings do not spell out.
+    """
+
+    def test_catalogue_is_valid_against_the_loader_rules(self, H):
+        """Every look must be loadable as written, or the click lies."""
+        from settings_schema import APPEARANCE_LOOKS, BUBBLE_DESIGNS
+        assert len(APPEARANCE_LOOKS) >= 5, APPEARANCE_LOOKS   # never vacuous
+        names, labels, colours = set(), set(), set()
+        for entry in APPEARANCE_LOOKS:
+            name = entry["name"]
+            assert name and name == name.strip().lower(), name
+            assert name not in names, f"duplicate look name {name!r}"
+            names.add(name)
+            assert entry["label"].strip() and entry["note"].strip(), entry
+            labels.add(entry["label"])
+            assert entry["design"] in BUBBLE_DESIGNS, entry
+            assert isinstance(entry["bubble_size"], int), entry
+            assert 96 <= entry["bubble_size"] <= 192, entry
+            assert 0.2 <= float(entry["animation_energy"]) <= 2.0, entry
+            assert 0.0 <= float(entry["bubble_accent"]) <= 1.0, entry
+            assert set(entry["colors"]) == {"idle", "listening",
+                                            "thinking", "speaking"}, entry
+            for key, value in entry["colors"].items():
+                # the parser's own shape (anchored, optional '#'): anything else
+                # is discarded by the loader and by the bubble
+                assert re.fullmatch(r"#?[0-9a-fA-F]{6}", str(value)), (key, value)
+            # Distinct looks: two entries with identical values would make
+            # "which look is this" unanswerable, and the second one unusable.
+            fingerprint = (entry["design"], entry["bubble_size"],
+                           float(entry["animation_energy"]),
+                           float(entry["bubble_accent"]),
+                           tuple(sorted((k, str(v).lower())
+                                        for k, v in entry["colors"].items())))
+            assert fingerprint not in colours, f"{name} duplicates another look"
+            colours.add(fingerprint)
+        assert len(labels) == len(names)
+
+    def test_each_look_survives_the_settings_loader(self, H, tmp_path, monkeypatch):
+        """The end-to-end version of the rule above: write a look, load it back.
+
+        Driven from the catalogue, so a look added later is covered
+        automatically. This is the check that catches a value the coercion
+        would quietly replace (an out-of-range size, a colour the parser
+        discards) — the click would look like it worked while disk held
+        something else.
+        """
+        from settings_schema import APPEARANCE_LOOKS
+        for entry in APPEARANCE_LOOKS:
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({
+                "bubble_design": entry["design"],
+                "bubble_size": entry["bubble_size"],
+                "animation_energy": entry["animation_energy"],
+                "bubble_accent": entry["bubble_accent"],
+                "colors": dict(entry["colors"]),
+            }), encoding="utf-8")
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            loaded = H._load_settings()
+            expected = {"bubble_design": entry["design"],
+                        "bubble_size": entry["bubble_size"],
+                        "animation_energy": entry["animation_energy"],
+                        "bubble_accent": entry["bubble_accent"]}
+            for key, want in expected.items():
+                assert loaded[key] == want, (entry["name"], key, loaded[key])
+            assert loaded["colors"] == entry["colors"], entry["name"]
+            assert H._core_settings.look_matching(loaded) == entry["name"], (
+                f"the loaded {entry['name']!r} no longer reads back as itself")
+
+    def test_the_shipped_defaults_read_as_the_first_look(self, H):
+        """A fresh install must show a look, not Custom — and `look_matching`
+        must agree with the loader's own idea of the defaults."""
+        from settings_schema import APPEARANCE_LOOKS, DEFAULT_SETTINGS
+        assert H._core_settings.look_matching(DEFAULT_SETTINGS) == \
+            APPEARANCE_LOOKS[0]["name"]
+        assert H._core_settings.look_matching(H._load_settings()) == \
+            APPEARANCE_LOOKS[0]["name"]
+
+    def test_a_single_differing_value_reads_as_custom(self, H):
+        """One nudge is enough to stop being that look — the tab must be able
+        to say Custom, and must never round a near-miss up to a named look."""
+        from settings_schema import APPEARANCE_LOOKS
+        entry = APPEARANCE_LOOKS[-1]
+        base = {
+            "bubble_design": entry["design"],
+            "bubble_size": entry["bubble_size"],
+            "animation_energy": entry["animation_energy"],
+            "bubble_accent": entry["bubble_accent"],
+            "colors": dict(entry["colors"]),
+        }
+        assert H._core_settings.look_matching(base) == entry["name"]
+        for key, value in (("bubble_size", entry["bubble_size"] + 1),
+                           ("animation_energy",
+                            float(entry["animation_energy"]) + 0.01),
+                           ("bubble_accent", float(entry["bubble_accent"]) + 0.01),
+                           ("bubble_design", "orb")):
+            if value == base.get(key):
+                continue
+            changed = dict(base)
+            changed[key] = value
+            assert H._core_settings.look_matching(changed) == "", (key, value)
+        for key in entry["colors"]:
+            changed = dict(base)
+            changed["colors"] = dict(base["colors"])
+            changed["colors"][key] = "#123456"
+            assert H._core_settings.look_matching(changed) == "", key
+        # ...and junk can never match anything (no crash, no false positive)
+        for junk in ({}, {"bubble_design": None, "bubble_size": "wide"},
+                     {"bubble_design": entry["design"], "bubble_size": "128",
+                      "animation_energy": "loud", "colors": None}):
+            assert H._core_settings.look_matching(junk) == ""
+
+    def test_the_bubble_reports_the_current_look(self, H):
+        """`--ptt health` / doctor name the look; the name comes from the
+        settings, so it cannot disagree with what the bubble is drawing."""
+        from settings_schema import APPEARANCE_LOOKS
+        entry = APPEARANCE_LOOKS[0]
+        H.SETTINGS.clear()
+        H.SETTINGS.update({"bubble_design": entry["design"],
+                           "bubble_size": entry["bubble_size"],
+                           "animation_energy": entry["animation_energy"],
+                           "bubble_accent": entry["bubble_accent"],
+                           "colors": dict(entry["colors"])})
+        assert H._appearance_look() == entry["name"]
+        assert entry["label"] in H._appearance_note()
+        assert entry["design"] in H._appearance_note()
+        # one nudge and the bubble says Custom instead of guessing
+        H.SETTINGS["bubble_design"] = "cube"
+        assert H._appearance_look() == ""
+        assert "Custom" in H._appearance_note()
+        # the doctor only grows a line when the host has looks to report
+        deps = H._build_doctor_deps()
+        assert any(line.startswith("appearance:") for line in
+                   H._core_doctor._lines(deps))
+        assert not any(line.startswith("appearance:") for line in
+                       H._core_doctor._lines(H._core_doctor.DoctorDeps()))

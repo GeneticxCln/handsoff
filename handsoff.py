@@ -97,16 +97,26 @@ except ImportError:
     _missing("sounddevice", "sounddevice", "python-sounddevice")
 
 try:
-    from PySide6.QtCore import QElapsedTimer, QObject, QPointF, Qt, QTimer, Signal
+    from PySide6.QtCore import (
+        QElapsedTimer,
+        QObject,
+        QPointF,
+        QRect,
+        Qt,
+        QTimer,
+        Signal,
+    )
     from PySide6.QtGui import (
-    QBrush,
-    QColor,
-    QConicalGradient,
-    QGuiApplication,
-    QLinearGradient,
+        QBrush,
+        QColor,
+        QConicalGradient,
+        QGuiApplication,
+        QLinearGradient,
         QPainter,
         QPainterPath,
+        QPainterPathStroker,
         QPen,
+        QPolygonF,
         QRadialGradient,
         QRegion,
     )
@@ -598,6 +608,32 @@ _DEPLOY_FILES = (
 )
 
 
+def _appearance_look() -> str:
+    """The Appearance look the current settings spell out, or "" for Custom.
+
+    Derived from the settings, never stored beside them (see the catalogue in
+    settings_schema): a saved name plus independently editable values is how a
+    GUI ends up claiming "Neon" while the bubble renders something else. This
+    is what `--ptt health` and the doctor report, so "which look am I running"
+    has an answer that cannot disagree with the bubble in front of you.
+    """
+    try:
+        return _core_settings.look_matching(SETTINGS)
+    except Exception:
+        return ""
+
+
+def _appearance_note() -> str:
+    """One doctor line: the look, the design and the window size."""
+    look = _core_settings.look_label(_appearance_look()) or "Custom"
+    design = str(SETTINGS.get("bubble_design", "orb"))
+    try:
+        size = int(SETTINGS.get("bubble_size", WINDOW_PX))
+    except (TypeError, ValueError):
+        size = WINDOW_PX
+    return f"look {look} ({design}, {size} px)"
+
+
 def _deployment_snapshot() -> dict:
     """Describe the code actually running and whether it matches the checkout.
 
@@ -778,6 +814,7 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         systemd_unit_file=SYSTEMD_UNIT_FILE,
         control_sock=CONTROL_SOCK,
         crash_log=CRASH_LOG,
+        appearance_look=_appearance_note,
         cap_refusal_note=_cap_refusal_note,
         cap_refusals=_cap_refusal_summary,
         remote_ollama_allowed=_ollama_remote_opted_in,
@@ -3699,6 +3736,11 @@ class Assistant(QObject):
             "reference": TTS_REFERENCE or None,
             "whisper_ready": _whisper_model is not None,
         }
+        snap["appearance"] = {
+            "look": _appearance_look() or "Custom",
+            "design": str(SETTINGS.get("bubble_design", "orb")),
+            "size": SETTINGS.get("bubble_size", WINDOW_PX),
+        }
         snap["deployment"] = _deployment_snapshot()
         return snap
 
@@ -5959,6 +6001,149 @@ def _trim_history(msgs: list[dict]) -> list[dict]:
 
 
 # -------------------------------------------------------------------------- bubble UI
+#
+# The window's own outline, per design. Most designs are painted inside the
+# inscribed ellipse of the square window, so the ellipse IS their shape. A
+# design whose outline leaves it (ears, a tail) has to say so here: the mask is
+# what decides which painted pixels survive on the desktop, and the previous
+# ellipse-for-everything rule is exactly why every design had to be a circle
+# and why a design with its own silhouette would arrive with the parts sheared
+# off. `design_region` only ever ADDS to the ellipse, so it cannot clip a design
+# that used to fit.
+
+# The cat's limbs, as fractions of the animated radius. One definition, used by
+# the painter and by the mask builder: a mask derived separately from the
+# drawing is how a design ends up silently cut off.
+# The horizontal budget is the tight one: the radius grows ~28% at the
+# listening peak, so a limb may only reach ~1.14 r sideways or ~1.14 r up
+# before the WINDOW itself clips it. The corners, where both coordinates stay
+# under the edge, allow ~1.6 r — which is why the ears and the tail's tip live
+# on the diagonal, and why the rest of the tail curls up the right side rather
+# than sweeping out sideways.
+CAT_EAR_BASE_IN = (0.16, 0.50)     # (x, -y)  inner base, on the head
+CAT_EAR_BASE_OUT = (0.62, 0.30)    # (x, -y)  outer base, on the head
+CAT_EAR_REST = (0.84, 0.92)        # (x, -y)  apex at rest
+CAT_EAR_VOICE = (0.14, 0.12)       # extra outward reach at full voice
+CAT_TAIL_WIDTH = 0.20              # stroke width, fractions of the radius
+CAT_TAIL_START = (0.62, 0.28)      # (x, y)   where the tail leaves the body
+CAT_TAIL_CTRL = ((0.94, 0.16), (0.92, -0.36))   # the two control points
+CAT_TAIL_END = (0.86, -0.74)       # the tip at rest
+CAT_TAIL_LIFT = 0.18               # how far the voice lifts the tail's tip
+
+
+def _cat_reach(level: float, t: float, anim: float) -> float:
+    """The cat's animation phase: 0 at rest, and never above 1.
+
+    Everything the ears and the tail do runs through this ONE bounded scalar.
+    That is what lets the window mask be computed on resize instead of per
+    frame: the limbs' geometry at any instant is `_cat_ears(..., reach)` for
+    some reach in [0, 1], so the mask can cover the whole span once.
+    """
+    lv = min(1.0, max(0.0, float(level)))
+    sway = 0.90 + 0.10 * math.sin(t * 3.1 * max(0.2, float(anim)))
+    return min(1.0, max(0.0, (0.22 + 0.78 * lv) * sway))
+
+
+def _cat_ears(cx: float, cy: float, r: float, reach: float) -> list:
+    """The cat's two ears: the painter's shape AND the mask's shape."""
+    out = []
+    for sign in (-1.0, 1.0):
+        base_in = QPointF(cx + sign * r * CAT_EAR_BASE_IN[0],
+                          cy - r * CAT_EAR_BASE_IN[1])
+        base_out = QPointF(cx + sign * r * CAT_EAR_BASE_OUT[0],
+                           cy - r * CAT_EAR_BASE_OUT[1])
+        tip = QPointF(cx + sign * r * (CAT_EAR_REST[0] + CAT_EAR_VOICE[0] * reach),
+                      cy - r * (CAT_EAR_REST[1] + CAT_EAR_VOICE[1] * reach))
+        out.append(QPolygonF([base_in, tip, base_out]))
+    return out
+
+
+def _cat_tail(cx: float, cy: float, r: float, reach: float) -> QPainterPath:
+    """The cat's tail: the same single definition the mask reads.
+
+    The voice swings it outward and lifts the tip; `reach` bounds both, so the
+    extreme is `_cat_tail(..., 1.0)` plus half the stroke width — which is what
+    `_cat_region` grows its region from.
+    """
+    c1x, c1y = CAT_TAIL_CTRL[0]
+    c2x, c2y = CAT_TAIL_CTRL[1]
+    sx, sy = CAT_TAIL_START
+    path = QPainterPath(QPointF(cx + r * sx, cy + r * sy))
+    path.cubicTo(QPointF(cx + r * (c1x + 0.04 * reach), cy + r * (c1y - 0.04 * reach)),
+                 QPointF(cx + r * (c2x + 0.08 * reach), cy + r * (c2y - 0.10 * reach)),
+                 QPointF(cx + r * (CAT_TAIL_END[0] + 0.06 * reach),
+                         cy + r * (CAT_TAIL_END[1] - CAT_TAIL_LIFT * reach)))
+    return path
+
+
+def _cat_tail_width(r: float) -> float:
+    return max(1.6, r * CAT_TAIL_WIDTH)
+
+
+def _cat_region(w: int, h: int) -> QRegion:
+    """Everything the cat paints that the inscribed ellipse would cut off.
+
+    Built from the painter's own `_cat_ears`/`_cat_tail`, sampled across the
+    whole reach span and grown by a margin, so the mask can only ever keep MORE
+    ink than the painter puts down. The radius is the animation's maximum
+    (`BUBBLE_R0 + 12 * GEOM_K`, the listening peak): a mask is computed on
+    resize, never per frame, so it has to cover the biggest frame, not the one
+    on screen when the size changed.
+    """
+    r = w * 56.0 / 128.0
+    cx, cy = w / 2.0, h / 2.0
+    region = QRegion()
+    # Both strokes are a couple of pixels WIDER than the painter's: the region
+    # is rasterised from integer polygons, and a mask built at exactly the
+    # painted width shaves the outermost antialiased pixel of a round cap
+    # (measured: two lit pixels left outside at the tail's tip, on the peak).
+    # A mask may always keep more than the painter lays down; never less.
+    tail_stroker = QPainterPathStroker()
+    tail_stroker.setWidth(_cat_tail_width(r) + 2.0)
+    # The painter OUTLINES an ear as well as filling it, so the mask has to
+    # cover the pen as well as the polygon: an outline half a pen-width outside
+    # the triangle is real ink, and "the mask is the polygon" leaves a fringe of
+    # it outside the aperture (measured: a stray lit pixel at the ear's inner
+    # edge, on the listening peak).
+    ear_stroker = QPainterPathStroker()
+    ear_stroker.setWidth(max(2.0, r * 0.028) + 1.0)
+    for reach in (0.0, 0.5, 1.0):
+        for poly in _cat_ears(cx, cy, r, reach):
+            grown = QPolygonF([
+                QPointF(cx + (p.x() - cx) * 1.06, cy + (p.y() - cy) * 1.06)
+                for p in poly])
+            region = region.united(QRegion(grown.toPolygon()))
+            ear_path = QPainterPath()
+            ear_path.addPolygon(poly)
+            ear_path.closeSubpath()
+            region = region.united(QRegion(
+                ear_stroker.createStroke(ear_path)
+                .toFillPolygon().toPolygon()))
+        region = region.united(QRegion(
+            tail_stroker.createStroke(_cat_tail(cx, cy, r, reach))
+            .toFillPolygon().toPolygon()))
+    return region
+
+
+def design_region(name: str, w: int, h: int) -> QRegion:
+    """The window outline for a design: the inscribed ellipse, plus its own.
+
+    Called from `BubbleWidget._apply_mask` on every resize and show, so the
+    aperture always matches the CURRENT rect (a QRegion mask does not rescale
+    with its widget).
+    """
+    w, h = int(w), int(h)
+    region = QRegion(QRect(0, 0, w, h), QRegion.Ellipse)
+    if str(name or "").strip().lower() == "cat":
+        # A 2 px slack on the ellipse, for this design only: its halo is the
+        # largest round body in the set, and un-grown it measures 66.6 px
+        # against a 64 px mask at the listening peak — one antialiased pixel
+        # short of the aperture (measured). Keeping a little MORE than the
+        # painter puts down is the only safe direction for a mask.
+        region = region.united(QRegion(QRect(-2, -2, w + 4, h + 4),
+                                       QRegion.Ellipse))
+        region = region.united(_cat_region(w, h))
+    return region
 
 
 class BubbleWidget(QWidget):
@@ -5983,6 +6168,13 @@ class BubbleWidget(QWidget):
         self._radius_ui = None
         self._radius_vel = 0.0
         self._energy_ui = _fx_energy(IDLE)
+        # Which design the current mask was cut for. A live shape switch
+        # changes the window's outline without changing its size, and
+        # setFixedSize on an unchanged size emits no resizeEvent — so the
+        # aperture has to follow the design too, or a cat's mask would linger
+        # over an orb (harmless: it can only keep more; but "the mask matches
+        # the design" should be a fact, not a coincidence of sizes).
+        self._mask_design: str | None = None
 
         self.setWindowFlags(
             Qt.Window
@@ -6067,6 +6259,11 @@ class BubbleWidget(QWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
         f = self._frame()
         design = str(SETTINGS.get("bubble_design", "orb")).strip().lower()
+        if design != self._mask_design:
+            # the shape changed under us (settings reload / self-edit): the
+            # aperture follows the DESIGN, and a size that did not change will
+            # never deliver the resizeEvent that used to be the only trigger
+            self._apply_mask()
         if design == "halo":
             self._paint_halo(p, f)
         elif design == "reactor":
@@ -6089,6 +6286,8 @@ class BubbleWidget(QWidget):
             self._paint_sauron(p, f)
         elif design == "pikachu":
             self._paint_pikachu(p, f)
+        elif design == "cat":
+            self._paint_cat(p, f)
         else:
             self._paint_orb(p, f)
         p.end()
@@ -7115,6 +7314,139 @@ class BubbleWidget(QWidget):
             mp.quadTo(hx + sign * mw * 0.55, my + R * (0.09 + 0.06 * lv), hx + sign * mw, my)
             p.drawPath(mp)
 
+    def _paint_cat(self, p: QPainter, f: dict) -> None:
+        """Cat: a state-coloured head with ears, whiskers and a moving tail.
+
+        Palette: unlike `void`, `sauron` and `pikachu`, this design keeps no
+        canonical colours of its own — head, ears and tail are painted IN the
+        state colour, so a colour click repaints it (the property the three
+        mascots trade away for identity). Only the muzzle, the eyes and the
+        whiskers are deliberately light, the way a real cat's are.
+
+        Voice: the ears rise and splay, the tail swings wider and lifts, the
+        eyes narrow, and the inner-ear glow and the halo brighten — every term
+        driven by ONE bounded scalar (`_cat_reach`), neutral at level 0, so a
+        silent bubble is the resting cat. That single scalar is also what lets
+        the window mask be built once from the same geometry instead of per
+        frame.
+
+        Silhouette: the ear tips leave the inscribed ellipse at the corners, so
+        this design declares its own region in `design_region` — without it Qt
+        silently shears the tips off on the desktop.
+        """
+        cx, cy, t, color = f["cx"], f["cy"], f["t"], f["color"]
+        R = f["radius"]
+        lv = min(1.0, max(0.0, float(f["level"])))
+        anim = float(f.get("anim", 1.0))
+        glow = float(f.get("glow", 1.0))
+        energy = float(f["energy"])
+        reach = _cat_reach(lv, t, anim)
+
+        def shade(light: int, alpha: int = 255) -> QColor:
+            c = QColor(color).lighter(int(light))
+            c.setAlpha(int(max(0, min(255, alpha))))
+            return c
+
+        # -- halo: the state colour over a dark wallpaper, and what the accent
+        #    slider punches. `void` needed the same fix for the same reason.
+        #    Capped by the WINDOW, not just by R: the radius grows ~28% at the
+        #    listening peak, and 1.18 of that peak measures 66.6 px against a
+        #    64 px mask -- i.e. the halo was the one part of this design the
+        #    desktop silently cut (591 px of it, measured). Same budget
+        #    pikachu's aura uses, and for the same reason.
+        halo_r = min(R * 1.18, 0.47 * self.width())
+        hc = shade(100, int(min(255.0, (58 + 44 * energy) * glow * (1.0 + 0.5 * lv))))
+        hg = QRadialGradient(QPointF(cx, cy), halo_r)
+        hg.setColorAt(min(0.95, (R * 0.66) / halo_r), hc)
+        hg.setColorAt(1.0, shade(100, 0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(hg))
+        p.drawEllipse(QPointF(cx, cy), halo_r, halo_r)
+
+        # -- tail: behind the body, so it reads as growing out of it
+        tail = QColor(color).lighter(125)
+        tail.setAlpha(int(min(255.0, (170 + 60 * lv) * glow)))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(tail, _cat_tail_width(R), Qt.SolidLine, Qt.RoundCap))
+        p.drawPath(_cat_tail(cx, cy, R, reach))
+
+        # -- ears: before the head, which hides their bases. The inner ear is
+        #    the state colour lightened and it brightens with the voice, so the
+        #    cat visibly prickles; the rim keeps the ear readable on its own.
+        for ear, sign in zip(_cat_ears(cx, cy, R, reach), (-1.0, 1.0)):
+            p.setBrush(QBrush(shade(76)))
+            p.setPen(QPen(shade(155), max(1.0, R * 0.028)))
+            p.drawPolygon(ear)
+            tip_x = (CAT_EAR_REST[0] + CAT_EAR_VOICE[0] * reach) * 0.84
+            tip_y = (CAT_EAR_REST[1] + CAT_EAR_VOICE[1] * reach) * 0.84
+            p.setBrush(QBrush(shade(int(min(255.0, 150 + 40 * lv + 30 * (glow - 1.0))))))
+            p.setPen(Qt.NoPen)
+            p.drawPolygon(QPolygonF([
+                QPointF(cx + sign * R * 0.24, cy - R * 0.44),
+                QPointF(cx + sign * R * tip_x, cy - R * tip_y),
+                QPointF(cx + sign * R * 0.52, cy - R * 0.34)]))
+
+        # -- head: a radial body, not a flat disc, so the state colour reads as
+        #    fur rather than as a painted circle
+        hx, hy = cx, cy + R * 0.08
+        head = QRadialGradient(QPointF(cx - R * 0.26, cy - R * 0.22), R * 1.30)
+        head.setColorAt(0.0, shade(168))
+        head.setColorAt(0.62, shade(100))
+        head.setColorAt(1.0, shade(134))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(head))
+        p.drawEllipse(QPointF(hx, hy), R * 0.74, R * 0.66)
+
+        # -- whiskers: state-tinted, lifted and brightened by the voice
+        p.setPen(QPen(shade(210, int(min(255.0, (150 + 95 * lv) * glow))),
+                      max(1.0, R * 0.022), Qt.SolidLine, Qt.RoundCap))
+        for sign in (-1.0, 1.0):
+            for i, (dy, spread, length) in enumerate(
+                    ((0.10, 0.16, 0.34), (0.20, 0.12, 0.36), (0.30, 0.06, 0.30))):
+                lift = 0.06 * lv * (1 + i)
+                x0 = hx + sign * R * 0.40
+                y0 = hy + R * (dy - 0.10)
+                p.drawLine(QPointF(x0, y0),
+                           QPointF(x0 + sign * R * length,
+                                   y0 - R * (spread + lift)))
+
+        # -- eyes: almond, narrowing with the voice, with a glint and a
+        #    state-coloured rim that brightens as the level rises
+        eye_ry = R * 0.17 * (1.0 - 0.42 * lv)
+        eye_rx = R * 0.13 * (1.0 + 0.14 * lv)
+        for sign in (-1.0, 1.0):
+            ex = hx + sign * R * 0.27
+            ey = hy - R * 0.10
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(24, 20, 26))
+            p.drawEllipse(QPointF(ex, ey), eye_rx, eye_ry)
+            p.setBrush(QColor(255, 255, 255, 235))
+            p.drawEllipse(QPointF(ex - eye_rx * 0.28, ey - eye_ry * 0.40),
+                          eye_rx * 0.30, eye_ry * 0.30)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(shade(190, int(min(255.0, 90 + 130 * lv))),
+                          max(1.0, R * 0.020)))
+            p.drawEllipse(QPointF(ex, ey), eye_rx * 1.25, eye_ry * 1.20)
+
+        # -- muzzle, nose and mouth: the light patch is what makes the rest of
+        #    the head unmistakably a face
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(246, 242, 238, 232))
+        p.drawEllipse(QPointF(hx, hy + R * 0.30), R * 0.19, R * 0.12)
+        p.setBrush(QColor(214, 96, 118))
+        p.drawPolygon(QPolygonF([
+            QPointF(hx - R * 0.045, hy + R * 0.22),
+            QPointF(hx + R * 0.045, hy + R * 0.22),
+            QPointF(hx, hy + R * 0.28)]))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(96, 78, 84, 230), max(1.0, R * 0.020),
+                      Qt.SolidLine, Qt.RoundCap))
+        for sign in (-1.0, 1.0):
+            mouth = QPainterPath(QPointF(hx, hy + R * 0.28))
+            mouth.quadTo(QPointF(hx + sign * R * 0.10, hy + R * (0.36 + 0.05 * lv)),
+                         QPointF(hx + sign * R * 0.17, hy + R * 0.30))
+            p.drawPath(mouth)
+
     @staticmethod
     def _wobble_path(cx: float, cy: float, r0: float, t: float, amt: float = 1.0) -> QPainterPath:
         path = QPainterPath()
@@ -7247,12 +7579,19 @@ class BubbleWidget(QWidget):
         was when the widget is resized, so the mask set at show time stayed the
         size the bubble was born at. Every live size change then drew the new,
         scaled design through the OLD aperture: growing it clipped the design to
-        the previous circle, and swapping shapes while big showed each shape's
+        the        previous circle, and swapping shapes while big showed each shape's
         scaled geometry inside a smaller stale one — the "bigger breaks it, and
         then the shapes don't match" report. Measured: mask 128x128 while the
         widget was 192x192.
+
+        The shape itself comes from `design_region`: the inscribed ellipse for
+        every design that is painted inside it, plus the design's own outline
+        where it has one (the cat's ears), so a design with a silhouette of its
+        own is not silently cut back to a circle on the desktop.
         """
-        self.setMask(QRegion(self.rect(), QRegion.Ellipse))
+        name = str(SETTINGS.get("bubble_design", "orb")).strip().lower()
+        self.setMask(design_region(name, self.width(), self.height()))
+        self._mask_design = name
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt spelling
         super().resizeEvent(event)
