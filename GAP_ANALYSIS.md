@@ -2711,3 +2711,159 @@ candidate's. `core/__init__.py` is **100%** (156/156, was 65%); suite total
 20260913); `ci/compile_all.py` clean (41 files). The dedupe mutation is pinned by
 *observing* the filesystem — the repeated candidate is stat'd exactly once — rather than
 by the line being executed.
+
+## Addendum — the bubble is its own module now (2026-09-13)
+
+`BubbleWidget`, its mask geometry and the state palette moved out of `handsoff.py`
+into `core/bubble.py` (1 800 lines), which completes the extraction this project has
+been running in slices. `handsoff.py` went from 6 689 to 3 863 measured statements; the
+monolith keeps the application, the module keeps what can be rendered and measured on
+its own.
+
+### Ownership, because that is what was actually broken
+
+Three attempts at "the appearance does not apply" were fixed at the symptom (the mask
+was re-applied on resize; the live path was made to rebuild the palette; the designs
+were made to read the level signal). The underlying defect was ownership: the window
+size and the geometry derived from it were written from **two** places — module
+constants at import, and the live settings path inside `Assistant` — so a size change
+could leave `APERTURE_R` sized for the previous window while the widget resized.
+
+The module now owns all of it (size, `BUBBLE_R0`, `GLOW_PAD`, `GEOM_K`, `APERTURE_R`,
+`STATE_COLORS`, `BUBBLE_ACCENT`, `ANIM_ENERGY`) and `configure()` is the single place
+the appearance is derived from settings. Both the cold start and the live save come
+through it, which is the point: they cannot disagree. The live path's duplicate
+geometry block was deleted rather than moved.
+
+### The host is injected, not reached for
+
+`core/bubble.py` is application-free, the same shape as `core/audio.py` and
+`core/tools.py`: it takes `SETTINGS`, `APP_NAME`, `SETTINGS_APP`, `RESTART_SCRIPT` and
+`notify` by injection right after the app loads it, and declares placeholders so it
+stays importable — and measurable — on its own. The context menu's paths and its
+notifier are the host's, not the module's.
+
+A partial install is handled the way `_MissingAudio` already was: a `_MissingBubble`
+fallback carries inert defaults so the app still imports, reports and fails loudly on
+use, instead of dying at import. `install.sh`'s `CORE_REQUIRED` floor gained `bubble`,
+and the installer rehearsal already proves every project core module reaches the
+deployed set.
+
+### The guards, and what each one would catch
+
+Five guards in `TestTheBubbleModuleOwnsTheAppearance`, all but one read the source
+rather than the running app, because the failure modes are structural:
+
+* **application-free** — no import of the app, and the injectable seams must still
+  exist. A module that imports `handsoff` cannot be loaded alone; a seam that
+  disappears leaves the host nothing to bind.
+* **the host really arrives** — `SETTINGS is` the app's dict (a *copy* is the silent
+  version of this bug: every colour and size the bubble reads would be stale),
+  `notify is` the app's notifier (an un-injected one is inert, so bubble errors go
+  unsaid).
+* **no second copy in the app** — no assignment to any appearance name and no
+  `BubbleWidget` class anywhere in `handsoff.py`, with the partial-install stub as the
+  single, bounded exemption (asserted to sit inside the loader's `except ImportError`
+  branch).
+* **the app may only bind the host** — every `Store` on `_core_bubble` must be one of
+  the five injected names. Writing geometry or a look knob from the app is how the
+  second writer comes back.
+* **the installer floor is derived, not remembered** — the core modules `handsoff.py`
+  requires are read out of its own `from core import …` / `_load_module(…)` uses and
+  every one must be in `CORE_REQUIRED`. This is the drift the project has already paid
+  for twice (`core/theme.py` shipped nowhere while doctor said `in-sync`; the list was
+  hand-maintained in seven places), and it now fails with the missing module's name.
+
+### Verified
+
+**10/10 mutations caught**, one per decision: a constant returning to the app, the
+widget class returning, the app writing a look knob onto the module, the notifier never
+injected, `SETTINGS` copied instead of shared, the module importing the app, an
+injected seam removed, the partial-install stub moved out of its `except ImportError`
+branch, `bubble` dropped from the installer floor, and a newly required core module
+added without telling the floor (that last one verifies the guard *derives* the list
+rather than repeating it).
+
+The 16 test-side failures the extraction left behind are cleared at the cause: five
+`play_wav` sites patched by *string* now name `core.audio.play_wav` (where the bubble
+actually plays), the no-audio driver reads `_resample_to_16k` through the app's handle
+to it, and the appearance tests reach the module that owns the state instead of an app
+handle. Three of those repoints were subtler than a rename and are worth recording: the
+menu guard patched `QMenu` on the app while the menu is built in the module; the
+quit-ordering test read `handsoff.py` for text that now lives in `core/bubble.py`; and
+the slider-visibility scenario set the two look knobs on the *app*, so every design
+looked like it ignored both sliders while the painters read their own untouched
+defaults.
+
+**Coverage is unchanged by the move, measured the way the project's gate measures it.**
+With `COVERAGE_PROCESS_START` exported (both CI definitions export it, and
+`.coveragerc` documents why: the offscreen-GUI drivers run the bubble in child
+processes, whose `parallel` data files pytest-cov combines at session end) the suite
+is **12 556 statements at 80.5%**, and `core/bubble.py` reads **94%** — the painters
+are measured, through the drivers that actually render them. Against HEAD the totals
+are 24 522 at 79.54% versus 24 652 at 79.75% in the *same* un-combined mode, so the
+split neither hid nor invented coverage: it moved 1 107 statements (1 010 of them
+missed) out of a 4 993-statement `handsoff.py` at 58% into a 1 107-statement module at
+94% once the children are counted.
+
+That measurement also produced an incident worth recording: `rm -f .coverage*` matches
+`.coveragerc`, so a cleanup between runs deleted the coverage CONFIG, and every report
+taken while it was gone silently omitted `tests/*` and measured the un-combined mode —
+which is why an earlier pass here reported `core/bubble.py` at 11% and blamed a
+combine gap that does not exist. The file is restored and the numbers above are from
+the gate's own configuration.
+
+### Found by deploying: the loader was shadowing the stdlib `calendar`
+
+The first deploy of the refactored tree came up with **no speech engines**:
+
+```
+ERROR handsoff: startup: whisper: faster_whisper is not installed
+  (cannot import name 'timegm' from 'calendar' (/…/.local/bin/core/calendar.py))
+ERROR handsoff: startup: tts: chatterbox is not installed (…same…)
+```
+
+The bubble was running with `tts.ready: false` and `whisper_ready: false`, and the
+message blamed the libraries — which were installed all along. Measured against
+`HEAD` in two side-by-side probes, the difference was total:
+
+| | `sys.modules['calendar']` after startup | `timegm` |
+|---|---|---|
+| HEAD (before) | `/usr/lib/python3.14/calendar.py` | present |
+| refactored tree (before the fix) | `/…/core/calendar.py` | **missing** |
+
+**Cause.** `core/calendar.py` shares its name with the standard library, and
+`core.load_module` registered every support module under its **bare** name as well as
+`core.<name>`. Two consequences compounded:
+
+1. The bare binding clobbered the stdlib entry, so every later `from calendar import
+   timegm` — `faster_whisper` and `chatterbox` both do it — got the app's module;
+2. the bare name was bound **before** the module's own body ran, so
+   `core/calendar.py`'s own `import calendar` (line 9) resolved to the half-built
+   module *itself*. The loader planted the shadow and then the module read it.
+
+**Why it appeared only now.** At HEAD, `handsoff.py` reached the module through
+`from core.calendar import (…)`, whose chain imported the stdlib `calendar` *first* —
+and `load_module` deliberately skips bare registration when the existing entry is not
+ours (`prev_bare is None or _origin_ok(prev_bare)`), so the shadow was avoided by
+accident of ordering. The refactor replaced those re-export imports with
+`_core_calendar = _load_module("calendar")`, which is precisely the call that performs
+the bare registration — so the safety margin the old import order provided was removed
+without anything noticing. **The suite was green through all of it**, which is the
+lesson: the whole `core/` loading path is exercised, but nothing asserted that a
+support module may not take a name the interpreter owns.
+
+**Fix.** `load_module` may no longer bind a bare name for anything in
+`sys.stdlib_module_names`; `core.<name>` is still registered either way, and every
+non-stdlib name keeps its bare alias (so the documented bare-name adoption of
+`hardware` is untouched). Two guards force the hazard rather than hoping for it — the
+stdlib entry for `calendar` is removed from `sys.modules` for the duration, so the
+guard cannot go vacuous on a machine where something else imports it early, and both
+directions are pinned: the stdlib must survive *and* a normal support module must keep
+its bare name, since "stop binding bare names at all" would be a different bug.
+
+**Verified live:** the redeployed bubble logs `speech engine warmed (17 944 samples in
+0.9 s)`, `doctor` reports `tts: chatterbox-turbo (reference optimus_clip.wav) — model
+loaded; stt: whisper loaded`, `health` reports `tts.ready: true, device: cuda`, and the
+`timegm` errors are gone. **2/2 mutations caught** (the stdlib check removed; bare
+registration disabled outright).

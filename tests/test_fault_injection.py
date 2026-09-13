@@ -41,7 +41,12 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from conftest import wait_for
+from conftest import core_module, wait_for
+
+from core import settings as _core_settings
+
+# Resolved on first use rather than at collection (conftest.core_module).
+_core_audio = core_module("audio")
 
 BASE = "http://127.0.0.1:11434"
 
@@ -938,7 +943,8 @@ class TestTurnAndSpeechFailures:  # noqa: D101 - see module docstring
         a = self._assistant(H, monkeypatch, tmp_path)
         played = []
         monkeypatch.setattr(H, "tts_to_wav", lambda text, path: None)
-        monkeypatch.setattr(H, "play_wav", lambda path, cancel: played.append(path))
+        monkeypatch.setattr(_core_audio, "play_wav",
+                            lambda path, cancel: played.append(path))
         H.Assistant._speak(a, "Hello there.", 7, threading.Event())
         assert played, "nothing was played"
         assert a._turn_spoke is True and a._last_spoken == "Hello there."
@@ -951,7 +957,8 @@ class TestTurnAndSpeechFailures:  # noqa: D101 - see module docstring
         a = self._assistant(H, monkeypatch, tmp_path)
         monkeypatch.setattr(H, "notify", lambda text: None)
         played = []
-        monkeypatch.setattr(H, "play_wav", lambda path, cancel: played.append(path))
+        monkeypatch.setattr(_core_audio, "play_wav",
+                            lambda path, cancel: played.append(path))
         state = {"n": 0}
 
         def flaky(text, path):
@@ -1033,7 +1040,7 @@ class TestDiskIsFull:
         target.write_text('{"keep": true}')
         before = target.read_bytes()
         with pytest.raises(OSError) as ei:
-            H._atomic_private_write(target, '{"keep": false}')
+            _core_settings._atomic_private_write(target, '{"keep": false}')
         assert ei.value.errno == errno.ENOSPC
         assert target.read_bytes() == before, "the previous file was damaged"
         leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]

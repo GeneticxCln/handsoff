@@ -23,6 +23,8 @@ import pytest
 
 from conftest import HERE as ROOT, _load, _user_site, run_driver
 
+from core import settings as _core_settings
+
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
 
@@ -184,7 +186,7 @@ class TestSettingsCoercion:
         out-of-range number leaking through. Nothing fails when that happens,
         which is why this guard exists.
         """
-        body = inspect.getsource(H.coerce_settings)
+        body = inspect.getsource(_core_settings.coerce_settings)
         # Deliberately passed through: written by the installer, read by
         # nothing in the runtime (a dead schema entry, noted in GAP_ANALYSIS).
         free_form = {"autostart"}
@@ -580,8 +582,8 @@ class TestSettingsSplit:
         assert (cs.DEFAULT_SETTINGS is H.DEFAULT_SETTINGS
                 or (same_origin and cs.DEFAULT_SETTINGS == H.DEFAULT_SETTINGS)), dbg
         assert same_origin and cs.SETTINGS_VERSION == H.SETTINGS_VERSION, dbg
-        assert (H.coerce_settings is cs.coerce_settings
-                or (same_origin and H.coerce_settings == cs.coerce_settings)), dbg
+        assert (_core_settings.coerce_settings is cs.coerce_settings
+                or (same_origin and _core_settings.coerce_settings == cs.coerce_settings)), dbg
 
     def test_loader_refuses_foreign_live_core_settings(self, H, monkeypatch):
         """A foreign module squatting on core.settings must make the shared

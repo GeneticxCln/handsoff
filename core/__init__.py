@@ -202,6 +202,19 @@ def load_app_module(candidates):
         f"(tried {[str(c) for c in candidates]})")
 
 
+# Names the interpreter owns. A support module may share one — `calendar`
+# does — and binding it BARE would hand our file to every later importer of
+# that name, permanently: a third-party `from calendar import timegm` inside
+# faster_whisper or chatterbox then raises ImportError and the app reports the
+# library as "not installed". Worse, the shadowing was silent and
+# order-dependent: the bare binding also ran BEFORE the module's own body, so
+# `core/calendar.py`'s own `import calendar` resolved to itself instead of the
+# stdlib, which is how the real calendar first failed to load — the loader
+# planted the shadow that its own module then read. `core.<name>` is still
+# registered either way, and every non-stdlib name keeps its bare alias.
+_STDLIB_NAMES = frozenset(getattr(sys, "stdlib_module_names", ()))
+
+
 def load_module(mod_name: str):
     """Load one of handsoff's supporting modules.
 
@@ -211,8 +224,9 @@ def load_module(mod_name: str):
     so a foreign module planted in sys.modules or on sys.path can never
     satisfy us. The sys.modules names are only filled when absent or
     same-origin (never clobbering a foreign entry, never swapping under a
-    live foreign submodule), and a failed exec restores whatever was there
-    (no half-initialized squat).
+    live foreign submodule, and never taking a stdlib name — see
+    `_STDLIB_NAMES`), and a failed exec restores whatever was there (no
+    half-initialized squat).
 
     Registered as 'core.<name>' so reimports are cached.
     """
@@ -255,16 +269,19 @@ def load_module(mod_name: str):
             raise ImportError(
                 f"handsoff core: refusing to swap foreign live submodule "
                 f"core.{mod_name} ({getattr(prev_core, '__file__', '?')})")
-        if prev_bare is None or _origin_ok(prev_bare):
+        bind_bare = ((prev_bare is None or _origin_ok(prev_bare))
+                     and mod_name not in _STDLIB_NAMES)
+        if bind_bare:
             sys.modules[mod_name] = mod          # canonical name
         sys.modules[f"core.{mod_name}"] = mod
         try:
             spec.loader.exec_module(mod)
         except Exception:
-            if prev_bare is None:
-                sys.modules.pop(mod_name, None)
-            else:
-                sys.modules[mod_name] = prev_bare
+            if bind_bare:
+                if prev_bare is None:
+                    sys.modules.pop(mod_name, None)
+                else:
+                    sys.modules[mod_name] = prev_bare
             if prev_core is None:
                 sys.modules.pop(f"core.{mod_name}", None)
             else:

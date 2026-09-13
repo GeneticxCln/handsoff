@@ -22,6 +22,8 @@ import pytest
 
 from conftest import HERE as ROOT, _load, _user_site, pin_offer, wait_for
 
+from core import calendar as _core_calendar
+
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
 
@@ -359,7 +361,7 @@ class TestICSOverrides:
         win_s = H.datetime.datetime.now().replace(hour=0, minute=0,
                                                   second=0, microsecond=0)
         win_e = win_s + H.datetime.timedelta(days=3)
-        ev = H._ics_events_from_text(text, win_s, win_e)
+        ev = _core_calendar._ics_events_from_text(text, win_s, win_e)
         starts = {(e["start"].strftime("%d%H"), e["summary"]) for e in ev}
         today = H.datetime.date.today()
         # EXDATE suppressed today's instance
@@ -406,7 +408,7 @@ class TestICSMonthlyYearly:
         ])
         ws = H.datetime.datetime(*win_s)
         we = H.datetime.datetime(*win_e)
-        return H._ics_events_from_text(text, ws, we)
+        return _core_calendar._ics_events_from_text(text, ws, we)
 
     def test_monthly_nth_weekday(self, H):
         # 2nd Tuesday: Jan 13 / Feb 10 / Mar 10 / Apr 14 2026
@@ -466,17 +468,17 @@ class TestCalendarSourceSafety:
                    "http://[::1]:8080/cal.ics",
                    "/tmp/cal.ics",
                    "~/.cal/cal.ics"):
-            assert H._ics_scheme_error(ok) is None, ok
+            assert _core_calendar._ics_scheme_error(ok) is None, ok
 
     def test_offending_http_names_the_problem(self, H):
-        why = H._ics_scheme_error("http://calendar.example.com/secret/basic.ics")
+        why = _core_calendar._ics_scheme_error("http://calendar.example.com/secret/basic.ics")
         assert why and "https://" in why, why
         # a user:pass@ prefix must not fool the loopback check either
-        assert H._ics_scheme_error("http://evil.example.com@127.0.0.1/cal.ics") is None
+        assert _core_calendar._ics_scheme_error("http://evil.example.com@127.0.0.1/cal.ics") is None
 
     def test_error_label_redacts_the_url(self, H):
-        label = H._ics_source_label(
+        label = _core_calendar._ics_source_label(
             "https://calendar.google.com/calendar/ical/me%40x/private-ABC123/basic.ics")
         assert "private-ABC123" not in label and "me%40x" not in label, label
         assert label.startswith("https://calendar.google.com/"), label
-        assert H._ics_source_label("/tmp/cal.ics") == "/tmp/cal.ics"
+        assert _core_calendar._ics_source_label("/tmp/cal.ics") == "/tmp/cal.ics"

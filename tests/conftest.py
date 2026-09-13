@@ -23,6 +23,8 @@ import pytest
 # developer's HOME into anything.
 from core import APP_MODULE_NAME, app_instance, app_module
 
+from core import registry as _core_registry
+
 HERE = Path(__file__).resolve().parent.parent   # the repo root
 
 
@@ -312,6 +314,79 @@ def H():
     return _import_app_with_isolated_config()
 
 
+class _CoreModule:
+    """A core submodule resolved on FIRST USE rather than at import.
+
+    Two of them — `core.tools` and `core.audio` — bake CONFIG_DIR/STATE_DIR from
+    whatever HOME is live when they are first imported, and pytest imports a
+    test module BEFORE any fixture runs. A module-scope `from core import tools`
+    therefore points the whole tool layer at the developer's real state, which
+    `TestImportStatementsCannotBypassTheSandbox` exists to catch.
+
+    Tests still want the short `_core_tools.BoundedJob` spelling, so this defers
+    the import to the first attribute access — which happens inside a test body,
+    i.e. after the autouse fixtures have loaded the app under
+    `isolated_user_dirs()`. By then `core.tools` is already in `sys.modules`, so
+    the import resolves to that sandboxed copy instead of re-executing it.
+
+    The suite has no collection-time use of either name (verified by walking the
+    ASTs for attribute reads in module and class scope), so this cannot become
+    the thing it is avoiding: there is no moment before the sandbox at which it
+    resolves.
+    """
+
+    __slots__ = ("_name", "_mod")
+
+    def __init__(self, name: str):
+        self._name = name
+        self._mod = None
+
+    def _resolve(self):
+        """The module, imported only once the sandboxed app is in place.
+
+        Refusing before then is the point: it is what makes the deferred import
+        safe by construction rather than by convention. If anything ever does
+        resolve this earlier, it fails with a sentence instead of silently
+        baking the developer's real state into the tool layer.
+        """
+        mod = self._mod
+        if mod is None:
+            if app_module() is None:
+                raise RuntimeError(
+                    f"core.{self._name} was requested before the sandboxed app "
+                    "loaded; import it inside the test body instead of at "
+                    "module scope")
+            mod = self._mod = importlib.import_module(f"core.{self._name}")
+        return mod
+
+    def __getattr__(self, attr):
+        # Dunders are answered WITHOUT resolving. pytest's collector probes
+        # every module-level object with `getattr(obj, "__test__", False)` while
+        # collecting the test module — i.e. before any fixture, with the
+        # developer's HOME live — so a proxy that resolved on a dunder lookup
+        # would bake exactly what it exists to avoid. It would also be collected
+        # as a test candidate, which it is not.
+        if attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError(attr)
+        return getattr(self._resolve(), attr)
+
+    def __setattr__(self, attr, value):
+        # Transparent for patching and for identity reads: `setattr(_core_tools,
+        # "x", …)` must reach the module, never land on this handle.
+        if attr in _CoreModule.__slots__:
+            object.__setattr__(self, attr, value)
+        else:
+            setattr(self._resolve(), attr, value)
+
+    def __repr__(self):
+        return f"<core module handle {self._name!r}>"
+
+
+def core_module(name: str):
+    """The sandboxed `core.<name>`, resolved on first use (see `_CoreModule`)."""
+    return _CoreModule(name)
+
+
 def pin_offer(H, monkeypatch, name: str):
     """Pin ONE offer object onto every path `_dep()` can resolve.
 
@@ -326,7 +401,7 @@ def pin_offer(H, monkeypatch, name: str):
 
     `name` is the bare offer name: 'kill' -> H._kill_offer.
     """
-    offer = H.Offer(name)
+    offer = _core_registry.Offer(name)
     monkeypatch.setattr(H, f"_{name}_offer", offer)
     hosts = [getattr(H, "_tool_dependencies", None)]
     tools = getattr(H, "_core_tools", None)

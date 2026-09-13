@@ -148,6 +148,16 @@ SCHEMA = _import_settings_schema()
 DEFAULT_SETTINGS = SCHEMA.DEFAULT_SETTINGS
 SETTINGS_VERSION = SCHEMA.SETTINGS_VERSION
 
+
+def _core_module(name: str):
+    """An extracted module through the shared loader, loaded on first use.
+
+    The settings app reaches core directly instead of through the bubble: the
+    bubble stopped re-exporting core's names, and going through it also meant
+    this process could only use machinery after a full bubble exec.
+    """
+    return _core.load_module(name)
+
 H = _LazyHandsoff()
 
 # Same logger name as the bubble, so a live-apply failure lands in handsoff.log
@@ -212,15 +222,10 @@ def merge_settings(data: dict) -> dict:
                 merged[k].update(v)
             else:
                 merged[k] = v
-    # Shared coercion without exec'ing the whole bubble: core.settings is the
-    # module handsoff.py itself re-exports coerce_settings from (same function
-    # object), so prefer it; the lazy bubble is only a fallback (e.g. partial
-    # installs without core/).
-    try:
-        from core.settings import coerce_settings
-    except ImportError:
-        coerce_settings = H.coerce_settings
-    return coerce_settings(merged)
+    # Shared coercion without exec'ing the whole bubble: core.settings owns it,
+    # and it is the same function the bubble calls (the bubble stopped
+    # re-exporting core's names, so there is nothing to fall back TO).
+    return _core_module("settings").coerce_settings(merged)
 
 
 def http_json(url: str, payload: dict | None = None, timeout: int = 10):
@@ -871,7 +876,7 @@ class _LiveMicProbe:
                 gate.reset()
         if utter is not None:
             audio, rate = utter
-            audio = H._resample_to_16k(audio, rate)
+            audio = _core_module("audio")._resample_to_16k(audio, rate)
             with self._lock:
                 self._start_transcribe(audio)
                 self._last_event = "speech captured (%.1fs)" % (
@@ -3275,7 +3280,8 @@ class SettingsWindow(QMainWindow):
         try:
             if H.HISTORY_FILE.exists():
                 _backup_keep_n(H.HISTORY_FILE, tag)
-            H._atomic_private_write(H.HISTORY_FILE, "[]")   # empty JSON list
+            _core_module("settings")._atomic_private_write(
+                H.HISTORY_FILE, "[]")                        # empty JSON list
         except OSError as e:
             return f"could not clear history: {e}"
         reply = self._clear_bubble_history()

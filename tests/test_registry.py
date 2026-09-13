@@ -18,6 +18,12 @@ import time
 
 import pytest
 
+from conftest import core_module
+
+from core import registry as _core_registry
+
+# Resolved on first use rather than at collection (conftest.core_module).
+_core_tools = core_module("tools")
 
 class TestBoundedRegistry:
     def test_a_held_reservation_counts_against_the_cap(self, H):
@@ -29,7 +35,7 @@ class TestBoundedRegistry:
         how eight overlapping `start_command` calls came to start seven
         processes against a cap of four.
         """
-        reg = H.BoundedRegistry("t", 1)
+        reg = _core_registry.BoundedRegistry("t", 1)
         slot = reg.reserve()
         assert slot is not None
         assert reg.reserve() is None, "the reserved slot was handed out twice"
@@ -50,7 +56,7 @@ class TestBoundedRegistry:
         counting a resource that does not exist, and after a few failed
         launches it refuses work while `job_status` lists nothing to reap.
         """
-        reg = H.BoundedRegistry("t", 1)
+        reg = _core_registry.BoundedRegistry("t", 1)
         try:
             with reg.reserve() as slot:
                 assert slot is not None
@@ -69,7 +75,7 @@ class TestBoundedRegistry:
         remember to take. Minting the key inside `commit` means two entries can
         never be handed the same id, even from eight racing callers.
         """
-        reg = H.BoundedRegistry("job", 8)
+        reg = _core_registry.BoundedRegistry("job", 8)
         barrier = threading.Barrier(8)
         keys: list = []
         guard = threading.Lock()
@@ -98,7 +104,7 @@ class TestBoundedRegistry:
         full of the other three, and the displaced entry is handed BACK so the
         caller can stop it outside the helper's lock.
         """
-        reg = H.BoundedRegistry("w", 1)
+        reg = _core_registry.BoundedRegistry("w", 1)
         key, _ = reg.reserve().commit("old")
         slot = reg.reserve(key, replace=True)
         assert slot is not None, "re-registering a name must need no room"
@@ -109,7 +115,7 @@ class TestBoundedRegistry:
 
     def test_the_cap_is_the_only_refusal_and_it_counts_reservations(self, H):
         """Eight racing reservations against a cap of four: exactly four win."""
-        reg = H.BoundedRegistry("t", 4)
+        reg = _core_registry.BoundedRegistry("t", 4)
         barrier = threading.Barrier(8)
         won: list = []
         lost: list = []
@@ -139,7 +145,7 @@ class TestBoundedRegistry:
         same lock as the decision, so the report describes the instant that was
         refused rather than a later read of len()/keys().
         """
-        reg = H.BoundedRegistry("job", 1)
+        reg = _core_registry.BoundedRegistry("job", 1)
         assert reg.refusals == 0 and reg.refusal_report() is None
         key, _ = reg.reserve().commit("a")
         assert reg.reserve() is None
@@ -155,7 +161,7 @@ class TestBoundedRegistry:
     def test_a_reservation_that_was_not_refused_is_not_counted(self, H):
         """Only a refusal is a refusal: releasing and re-reserving is normal
         traffic and must not make the report cry wolf."""
-        reg = H.BoundedRegistry("t", 1)
+        reg = _core_registry.BoundedRegistry("t", 1)
         key, _ = reg.reserve().commit("a")
         reg.release(key)
         again = reg.reserve()
@@ -164,7 +170,7 @@ class TestBoundedRegistry:
         assert reg.refusals == 0 and reg.refusal_report() is None
         # ...and the bounded-window case counts too: a replace at the cap that
         # IS allowed is not a refusal either.
-        reg2 = H.BoundedRegistry("w", 1)
+        reg2 = _core_registry.BoundedRegistry("w", 1)
         key2, _ = reg2.reserve().commit("x")
         assert reg2.reserve(key2, replace=True) is not None
         assert reg2.refusals == 0
@@ -174,7 +180,7 @@ class TestBoundedRegistry:
         refusal in three different ways, so the sentence is rendered by the
         registry that made the decision.
         """
-        reg = H.BoundedRegistry("job", 4)
+        reg = _core_registry.BoundedRegistry("job", 4)
         for i in range(4):
             reg.reserve().commit(f"j{i}")
         assert reg.reserve() is None
@@ -183,7 +189,7 @@ class TestBoundedRegistry:
                         "(nothing was created)"), line
 
     def test_the_refusal_report_hands_out_a_copy(self, H):
-        reg = H.BoundedRegistry("job", 1)
+        reg = _core_registry.BoundedRegistry("job", 1)
         reg.reserve().commit("a")
         reg.reserve()
         report = reg.refusal_report()
@@ -191,7 +197,7 @@ class TestBoundedRegistry:
         assert reg.refusal_report()["cap"] == 1, "the record was writable"
 
     def test_clear_returns_the_entries_it_dropped(self, H):
-        reg = H.BoundedRegistry("t", 2)
+        reg = _core_registry.BoundedRegistry("t", 2)
         reg.reserve().commit("a")
         reg.reserve().commit("b")
         assert sorted(reg.clear()) == ["a", "b"]
@@ -200,7 +206,7 @@ class TestBoundedRegistry:
     def test_the_read_surface_is_the_mapping_it_claims(self, H):
         """The calls that actually exist: job_status iterates and reaps by
         membership, and watch_file joins the keys into its listing."""
-        reg = H.BoundedRegistry("job", 2)
+        reg = _core_registry.BoundedRegistry("job", 2)
         k1, _ = reg.reserve().commit("a")
         k2, _ = reg.reserve().commit("b")
         assert len(reg) == 2
@@ -213,10 +219,10 @@ class TestBoundedRegistry:
         assert reg.snapshot() == {k1: "a", k2: "b"}
 
     def test_cap_and_name_are_reported(self, H):
-        reg = H.BoundedRegistry("watch-file", 4)
+        reg = _core_registry.BoundedRegistry("watch-file", 4)
         assert reg.cap == 4 and reg.name == "watch-file"
         with pytest.raises(ValueError):
-            H.BoundedRegistry("bad", -1)
+            _core_registry.BoundedRegistry("bad", -1)
 
     def test_a_dead_occupant_is_reclaimed_where_the_slot_is_handed_out(self, H):
         """The singleton whose occupant can die: a monitor that gave up, a
@@ -225,7 +231,7 @@ class TestBoundedRegistry:
         slot and both started a worker. Here the second question is asked under
         the same lock as the first, and the corpse comes back for disposal.
         """
-        reg = H.BoundedRegistry("notification-reader", 1)
+        reg = _core_registry.BoundedRegistry("notification-reader", 1)
         reg.reserve("m").commit("dead monitor")
         assert reg.reserve("m", reclaim=lambda e: False) is None, \
             "a live occupant's slot was handed out"
@@ -241,7 +247,7 @@ class TestBoundedRegistry:
         it held is genuinely free — a caller that abandons the reservation in
         between must not leave the registry counting a resource that is gone.
         """
-        reg = H.BoundedRegistry("t", 1)
+        reg = _core_registry.BoundedRegistry("t", 1)
         reg.reserve("k").commit("goneskies")
         slot = reg.reserve("k", reclaim=lambda e: True)
         assert len(reg) == 0 and not reg.room()  # held by the reservation now
@@ -254,7 +260,7 @@ class TestBoundedRegistry:
         but the occupant must still be registered, or a bug in a predicate
         would silently delete the monitor it was asked about.
         """
-        reg = H.BoundedRegistry("t", 1)
+        reg = _core_registry.BoundedRegistry("t", 1)
         reg.reserve("k").commit("precious")
 
         def boom(_entry):
@@ -270,8 +276,8 @@ class TestBoundedRegistry:
         one step, so a watcher cannot start in the gap between the two clears.
         """
         lock = threading.RLock()
-        a = H.BoundedRegistry("a", 1, lock=lock)
-        b = H.BoundedRegistry("b", 1, lock=lock)
+        a = _core_registry.BoundedRegistry("a", 1, lock=lock)
+        b = _core_registry.BoundedRegistry("b", 1, lock=lock)
         assert a._lock is b._lock
         with lock:
             assert sorted(a.clear() + b.clear()) == []
@@ -286,7 +292,7 @@ class TestOffer:
         is held open here — the clock is read while the lock is held — so the
         interleaving is certain rather than a race the test hopes to hit.
         """
-        off = H.Offer("x")
+        off = _core_registry.Offer("x")
         real = time.monotonic
         inside = threading.Event()
 
@@ -313,7 +319,7 @@ class TestOffer:
         assert seen[0].get("tool") == "wait", seen
 
     def test_state_applies_the_deadline_and_clears_a_closed_window(self, H):
-        off = H.Offer("x")
+        off = _core_registry.Offer("x")
         assert off.state() == (None, False)
         assert not off
         off.arm(-1, name="old")            # armed, window already gone
@@ -323,14 +329,14 @@ class TestOffer:
 
     def test_consume_is_the_claim(self, H):
         """Two racing confirmations: exactly one gets the offer."""
-        off = H.Offer("x")
+        off = _core_registry.Offer("x")
         off.arm(60, tool="wait")
         assert off.consume()["tool"] == "wait"
         assert off.consume() is None, "a consumed offer was claimable twice"
         assert not off
 
     def test_consume_refuses_a_closed_window(self, H):
-        off = H.Offer("x")
+        off = _core_registry.Offer("x")
         off.arm(-1, tool="wait")
         assert off.consume() is None
         assert not off
@@ -338,7 +344,7 @@ class TestOffer:
     def test_arm_unless_never_extends_a_live_window(self, H):
         """A model looping on the same call must not hold its own confirmation
         open forever, and two callers must not both decide to arm."""
-        off = H.Offer("x")
+        off = _core_registry.Offer("x")
         # The predicate asks "is the LIVE offer the same request I am making?",
         # which is how the CONFIRM path spells it (same tool, same turn).
         already_offered = lambda tool: (lambda live: live.get("tool") == tool)
@@ -351,7 +357,7 @@ class TestOffer:
 
     def test_arm_unless_does_not_match_a_closed_window(self, H):
         """An expired offer must be re-armed, not silently kept."""
-        off = H.Offer("x")
+        off = _core_registry.Offer("x")
         off.arm(-1, tool="wait")
         assert off.arm_unless(lambda live: live.get("tool") == "wait",
                               60, tool="wait") is True
@@ -363,7 +369,7 @@ class TestOffer:
         The defect was a bare dict handed to every caller, which then armed it
         by hand. There is deliberately no way to do that any more.
         """
-        off = H.Offer("x")
+        off = _core_registry.Offer("x")
         off.arm(60, tool="wait")
         assert off["tool"] == "wait"
         assert "tool" in off and "tool" in off.keys()
@@ -379,7 +385,7 @@ class TestOffer:
         assert off["tool"] == "wait", "state() handed out the live dict"
 
     def test_the_offer_read_surface_and_repr(self, H):
-        off = H.Offer("kill")
+        off = _core_registry.Offer("kill")
         assert len(off) == 0 and "empty" in repr(off)
         off.arm(60, pid=7)
         assert len(off) == 1 and "pid" in repr(off)
@@ -394,7 +400,7 @@ class TestOffer:
 
     def test_state_snapshot_and_restore(self, H):
         """The conftest isolation hook: an armed offer must not leak."""
-        off = H.Offer("x")
+        off = _core_registry.Offer("x")
         assert off.snapshot_state() is None
         off.arm(60, tool="wait")
         snap = off.snapshot_state()
@@ -410,18 +416,18 @@ class TestEveryCapAndOfferLivesInTheHelper:
 
     def test_the_belt_owns_only_helper_registries(self, H):
         belt = H.ToolBelt(on_restart_pending=lambda: None)
-        assert isinstance(belt._jobs, H.BoundedRegistry)
-        assert isinstance(belt._file_watchers, H.BoundedRegistry)
-        assert isinstance(belt._process_watchers, H.BoundedRegistry)
-        assert isinstance(belt._pending_confirm, H.Offer)
-        assert belt._jobs.cap == H.BoundedJob.MAX_JOBS
+        assert isinstance(belt._jobs, _core_registry.BoundedRegistry)
+        assert isinstance(belt._file_watchers, _core_registry.BoundedRegistry)
+        assert isinstance(belt._process_watchers, _core_registry.BoundedRegistry)
+        assert isinstance(belt._pending_confirm, _core_registry.Offer)
+        assert belt._jobs.cap == _core_tools.BoundedJob.MAX_JOBS
         assert belt._file_watchers.cap == 4 and belt._process_watchers.cap == 4
         # both watcher registries share one critical section (atomic teardown)
         assert belt._file_watchers._lock is belt._process_watchers._lock
 
     def test_the_module_offers_are_helper_instances(self, H):
-        assert isinstance(H._kill_offer, H.Offer)
-        assert isinstance(H._snooze_offer, H.Offer)
+        assert isinstance(H._kill_offer, _core_registry.Offer)
+        assert isinstance(H._snooze_offer, _core_registry.Offer)
         assert not hasattr(H, "_KILL_LOCK"), "the kill offer still has a raw lock"
         assert not hasattr(H, "_SNOOZE_LOCK"), "the snooze offer still has one"
         assert not hasattr(H, "_kill_offer_dict")

@@ -22,8 +22,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site, pin_offer, run_driver, \
-    wait_for
+from conftest import (HERE as ROOT, _load, _user_site, core_module, pin_offer,
+                      run_driver, wait_for)
+
+from core import brain as _core_brain
+from core import registry as _core_registry
+from core import settings as _core_settings
+
+# Resolved on first use rather than at collection (conftest.core_module).
+_core_tools = core_module("tools")
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -503,7 +510,7 @@ class TestHistoryTokenTrim:
     def test_fixed_prompt_tokens_count_tools(self, H):
         import json
         assert H._fixed_prompt_tokens() == \
-            (len(H.SYSTEM_PROMPT) + len(json.dumps(H.build_tools()))) \
+            (len(H.SYSTEM_PROMPT) + len(json.dumps(_core_tools.build_tools()))) \
             // H.HISTORY_CHARS_PER_TOKEN
 
     def test_warmup_loads_model(self, H, monkeypatch):
@@ -1241,13 +1248,13 @@ class TestAuditRoundTwo:
                     {"num_ctx": "32k"}):
             merged = H.json.loads(H.json.dumps(H.DEFAULT_SETTINGS))
             merged.update(bad)
-            out = H.coerce_settings(merged)
+            out = _core_settings.coerce_settings(merged)
             for k in bad:
                 assert out[k] == H.DEFAULT_SETTINGS[k], (k, out[k])
         # valid values survive untouched
         merged = H.json.loads(H.json.dumps(H.DEFAULT_SETTINGS))
         merged.update({"num_ctx": 16384, "tts_rate": 1.25})
-        out = H.coerce_settings(merged)
+        out = _core_settings.coerce_settings(merged)
         assert out["num_ctx"] == 16384 and out["tts_rate"] == 1.25
 
     def test_memory_block_never_persists_into_history(self, H, monkeypatch,
@@ -1298,8 +1305,10 @@ class TestAmbientCapabilities:
         # Both watcher registries share one lock, so their caps and their
         # teardown are enforced in the same critical section.
         tb._watch_lock = threading.RLock()
-        tb._file_watchers = H.BoundedRegistry("watch-file", 4, lock=tb._watch_lock)
-        tb._process_watchers = H.BoundedRegistry("watch-process", 4, lock=tb._watch_lock)
+        tb._file_watchers = _core_registry.BoundedRegistry(
+            "watch-file", 4, lock=tb._watch_lock)
+        tb._process_watchers = _core_registry.BoundedRegistry(
+            "watch-process", 4, lock=tb._watch_lock)
         tb._on_notification = kwargs.get("on_notification")
         tb._on_announce = kwargs.get("on_announce")
         tb._on_pomodoro = kwargs.get("on_pomodoro")
@@ -1551,19 +1560,19 @@ class TestStreamedReplyFiltering:
     """
 
     def test_unclosed_think_block_never_reaches_speech(self, H):
-        assert H.strip_thinking("Sure. <think>internal reasoning") == "Sure."
-        assert H.strip_thinking("<think>only reasoning") == ""
+        assert _core_brain.strip_thinking("Sure. <think>internal reasoning") == "Sure."
+        assert _core_brain.strip_thinking("<think>only reasoning") == ""
 
     def test_closed_think_block_still_stripped(self, H):
-        assert H.strip_thinking("a<think>b</think>c") == "ac"
+        assert _core_brain.strip_thinking("a<think>b</think>c") == "ac"
 
     def test_legitimate_less_than_replies_are_not_dropped(self, H):
         for good in ("<3 that's sweet", "it's <5 minutes away", "<html> is a tag"):
-            assert H.is_leaked_markup(good) is False, good
+            assert _core_brain.is_leaked_markup(good) is False, good
 
     def test_control_tokens_are_still_dropped(self, H):
         for bad in ("<think>", "</think>", "<tool_call>", "<|im_start|>"):
-            assert H.is_leaked_markup(bad) is True, bad
+            assert _core_brain.is_leaked_markup(bad) is True, bad
 
     def test_fallback_filter_matches_core_brain(self, H):
         """The no-core fallback must behave identically to the real filter."""

@@ -22,6 +22,8 @@ import pytest
 
 from conftest import HERE as ROOT, _load, _user_site
 
+from core import settings as _core_settings
+
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
 
@@ -871,8 +873,8 @@ class TestDictationMode:
     def test_setting_and_checkbox_wiring(self, H):
         assert H.DEFAULT_SETTINGS["dictation"] is True
         D = H.DEFAULT_SETTINGS
-        assert H.coerce_settings({**D, "dictation": 0})["dictation"] is False
-        assert H.coerce_settings(dict(D))["dictation"] is True
+        assert _core_settings.coerce_settings({**D, "dictation": 0})["dictation"] is False
+        assert _core_settings.coerce_settings(dict(D))["dictation"] is True
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
         assert 'self.cfg["dictation"] = self.dictation_chk.isChecked()' in src
         assert 'Mod+Shift+D' in src and '"dictation"' in src

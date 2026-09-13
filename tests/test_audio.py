@@ -21,7 +21,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, run_driver, wait_for
+from conftest import HERE as ROOT, _load, core_module, run_driver, wait_for
+
+from core import settings as _core_settings
+
+# Resolved on first use rather than at collection, so it cannot bake the
+# developer's HOME; see conftest.core_module.
+_core_audio = core_module("audio")
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -650,7 +656,7 @@ class TestSpeechPlaybackSerialization:
                 playback_active -= 1
 
         monkeypatch.setattr(H, "tts_to_wav", fake_tts)
-        monkeypatch.setattr(H, "play_wav", fake_play)
+        monkeypatch.setattr(_core_audio, "play_wav", fake_play)
 
         cancels = [threading.Event(), threading.Event()]
         threads = [threading.Thread(target=a._speak, args=(text, 0, cancel))
@@ -874,15 +880,15 @@ class TestNativeRateMicAndFuzzyWake:
         # 1 s of 48 kHz sine → exactly 1 s of 16 kHz
         t = np.arange(48000, dtype=np.float32) / 48000.0
         hi = (np.sin(2 * np.pi * 440 * t) * 8000).astype(np.int16)
-        out = H._resample_to_16k(hi, 48000)
+        out = _core_audio._resample_to_16k(hi, 48000)
         assert out.dtype == np.int16 and len(out) == 16000
         # 44.1 → 16 keeps duration
         t = np.arange(44100, dtype=np.float32) / 44100.0
         lo = (np.sin(2 * np.pi * 220 * t) * 8000).astype(np.int16)
-        assert len(H._resample_to_16k(lo, 44100)) == 16000
+        assert len(_core_audio._resample_to_16k(lo, 44100)) == 16000
         # 16 kHz input is a passthrough (same object, no copy)
         same = np.zeros(1600, dtype=np.int16)
-        assert H._resample_to_16k(same, 16000) is same
+        assert _core_audio._resample_to_16k(same, 16000) is same
 
     def test_resample_kills_ultrasonic_images(self, H):
         """A 12 kHz whine at 48 kHz must not fold onto 4 kHz (linear interp
@@ -894,9 +900,11 @@ class TestNativeRateMicAndFuzzyWake:
             f = np.fft.rfftfreq(len(y), 1 / 16000)
             return Y[(f >= f0) & (f < f1)].max()
 
-        voice = H._resample_to_16k((np.sin(2 * np.pi * 1000 * t) * 12000).astype(np.int16), 48000)
+        voice = _core_audio._resample_to_16k(
+            (np.sin(2 * np.pi * 1000 * t) * 12000).astype(np.int16), 48000)
         assert abs(int(np.abs(voice).max()) - 12000) < 1500
-        whine = H._resample_to_16k((np.sin(2 * np.pi * 12000 * t) * 12000).astype(np.int16), 48000)
+        whine = _core_audio._resample_to_16k(
+            (np.sin(2 * np.pi * 12000 * t) * 12000).astype(np.int16), 48000)
         assert band_peak(whine, 3900, 4100) < 0.05 * band_peak(voice, 900, 1100)
 
     def test_match_wake_fuzzy_misheard_name(self, H, monkeypatch):
@@ -1311,7 +1319,7 @@ class TestFollowupWindow:
     def _setup(self, H, monkeypatch):
         monkeypatch.setattr(H, "transcribe", lambda audio: "what is that tower")
         monkeypatch.setattr(H, "tts_to_wav", lambda text, wav: None)
-        monkeypatch.setattr(H, "play_wav", lambda wav, cancel: None)
+        monkeypatch.setattr(_core_audio, "play_wav", lambda wav, cancel: None)
         monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
         monkeypatch.setitem(H.SETTINGS, "followup_seconds", 6.0)
 
@@ -1393,9 +1401,9 @@ class TestFollowupWindow:
         # coerce_settings expects a fully-merged dict (defaults first),
         # exactly how _load_settings and the settings app call it
         s = {**H.DEFAULT_SETTINGS, "followup_seconds": "abc"}
-        assert H.coerce_settings(s)["followup_seconds"] == 6.0
+        assert _core_settings.coerce_settings(s)["followup_seconds"] == 6.0
         s2 = {**H.DEFAULT_SETTINGS, "followup_seconds": "15"}
-        assert H.coerce_settings(s2)["followup_seconds"] == 15.0
+        assert _core_settings.coerce_settings(s2)["followup_seconds"] == 15.0
 
 
 class TestHandsfreeConfirm:
@@ -1621,7 +1629,7 @@ class TestVoicePreviewSay:
         monkeypatch.setattr(
             H, "tts_to_wav",
             lambda text, wav, voice_getter=None: spoken.append(text))
-        monkeypatch.setattr(H, "play_wav", lambda wav, cancel: None)
+        monkeypatch.setattr(_core_audio, "play_wav", lambda wav, cancel: None)
         # → a loaded model, so _speak does not wait on the startup loader.
         monkeypatch.setattr(H, "_tts_model", object())
         asst = H.Assistant()
@@ -2005,10 +2013,15 @@ class TestMicSelfHeal:
     def test_setting_default_and_coercion(self, H):
         assert H.DEFAULT_SETTINGS["mic_selfheal"] is True   # on by default
         D = H.DEFAULT_SETTINGS
-        assert H.coerce_settings(dict(D))["mic_selfheal"] is True
-        assert H.coerce_settings({**D, "mic_selfheal": 1})["mic_selfheal"] is True
-        assert H.coerce_settings({**D, "mic_selfheal": ""})["mic_selfheal"] is False
-        assert H.coerce_settings({**D, "mic_selfheal": "yes"})["mic_selfheal"] is True
+        assert _core_settings.coerce_settings(dict(D))["mic_selfheal"] is True
+
+        def coerced(value):
+            return _core_settings.coerce_settings(
+                {**D, "mic_selfheal": value})["mic_selfheal"]
+
+        assert coerced(1) is True
+        assert coerced("") is False
+        assert coerced("yes") is True
 
     def test_settings_checkbox_wiring(self, H):
         """The Voice-tab checkbox exists and is loaded from / saved to cfg."""

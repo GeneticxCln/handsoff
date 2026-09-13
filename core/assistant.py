@@ -13,7 +13,11 @@ import subprocess
 import threading
 import time
 
-from .registry import BoundedRegistry
+# Absolute, not relative: `handsoff.py` loads this module through the shared
+# origin-checked loader, which exec's a bare spec (`__package__ == ""`), so a
+# relative import cannot resolve. `core.tools` already imports its siblings this
+# way, and a plain `import core.assistant` resolves to the same module object.
+from core.registry import BoundedRegistry
 
 
 class PomodoroController:

@@ -129,6 +129,13 @@ bubble.SETTINGS = copy.deepcopy(bubble.DEFAULT_SETTINGS)
 import core.settings
 bubble._SETTINGS_OBJ = core.settings.settings_object(settings_file, config_dir)
 
+# core/bubble.py owns the window size, the geometry and the palette, so the
+# tests reach them through the module that owns them. The app handle above is
+# still where the app's own globals live.
+appearance = bubble._core_bubble
+appearance.SETTINGS = bubble.SETTINGS          # the deepcopy above replaced it
+appearance.RESTART_SCRIPT = bubble.RESTART_SCRIPT
+
 settings_app.HOME = home
 settings_app.NIRI_CONFIG = NIRI
 
@@ -460,8 +467,8 @@ def bubble_designs_render_at_energy_extremes():
         sigState = _Signal()
         sigLevel = _Signal()
 
-    widget = bubble.BubbleWidget(_Stub())
-    widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    widget = appearance.BubbleWidget(_Stub())
+    widget.resize(appearance.WINDOW_PX, appearance.WINDOW_PX)
     from PySide6.QtGui import QImage
 
     def _pixels():
@@ -485,12 +492,12 @@ def bubble_designs_render_at_energy_extremes():
         bubble.SETTINGS["bubble_design"] = design
         for state in states:
             widget._state = state
-            base = bubble.STATE_COLORS[state]
+            base = appearance.STATE_COLORS[state]
             widget._color_ui = [base.redF(), base.greenF(), base.blueF()]
             for energy in (0.2, 1.0, 2.0):
-                bubble.ANIM_ENERGY = energy
+                appearance.ANIM_ENERGY = energy
                 for accent in (0.0, 1.0):
-                    bubble.BUBBLE_ACCENT = accent
+                    appearance.BUBBLE_ACCENT = accent
                     assert not widget.grab().isNull()
                     painted += 1
     assert painted == len(designs) * len(states) * 3 * 2
@@ -514,11 +521,14 @@ def bubble_designs_render_at_energy_extremes():
         widget._state = "idle"
         bubble.SETTINGS["bubble_design"] = design
         widget._energy_ui = 0.5
-        bubble.ANIM_ENERGY = 1.0
-        bubble.BUBBLE_ACCENT = 0.5
-        setattr(bubble, key, lo)
+        appearance.ANIM_ENERGY = 1.0
+        appearance.BUBBLE_ACCENT = 0.5
+        # The knobs live on the bubble module, not the app: setting them on the
+        # app left the painters reading their untouched defaults, which made
+        # every design look like it ignored both sliders.
+        setattr(appearance, key, lo)
         before = _pixels()
-        setattr(bubble, key, hi)
+        setattr(appearance, key, hi)
         after = _pixels()
         n = min(len(before), len(after))
         return sum(1 for i in range(0, n - 3, 4)
@@ -549,7 +559,7 @@ def bubble_designs_render_at_energy_extremes():
     # trap, pinned by every_design_has_its_own_preview_glyph).
     widget._clock = _FrozenClock()
     widget._level_ui = widget._level_target = 0.0
-    widget._radius_ui = bubble.BUBBLE_R0
+    widget._radius_ui = appearance.BUBBLE_R0
     widget._state = "idle"
     bubble.SETTINGS["bubble_design"] = "orb"
     orb_pixels = _pixels()
@@ -568,25 +578,25 @@ def bubble_designs_render_at_energy_extremes():
     # _energy_ui is a smoothed chase (it converges during _on_tick), so pin it
     # to the target rather than hoping the event loop got there: the frame's
     # job is to report the converged value, which is what is asserted here.
-    bubble.ANIM_ENERGY = 1.0
-    bubble.BUBBLE_ACCENT = 0.5
+    appearance.ANIM_ENERGY = 1.0
+    appearance.BUBBLE_ACCENT = 0.5
     widget._state = "idle"
-    widget._energy_ui = bubble._fx_energy("idle")
+    widget._energy_ui = appearance._fx_energy("idle")
     frame = widget._frame()
     assert frame["anim"] == 1.0
     assert frame["accent"] == 0.5
-    assert abs(frame["energy"] - bubble._fx_energy("idle")) < 1e-9
+    assert abs(frame["energy"] - appearance._fx_energy("idle")) < 1e-9
 
     # ...and the slider really moves the target every design reads: monotonic
     # in animation energy, clamped to a sane glow range. (Deliberately stated
     # as a property rather than exact numbers, so a retuned curve is fine.)
     energies = []
     for knob in (0.2, 1.0, 2.0):
-        bubble.ANIM_ENERGY = knob
-        energies.append(bubble._fx_energy("idle"))
+        appearance.ANIM_ENERGY = knob
+        energies.append(appearance._fx_energy("idle"))
     assert energies == sorted(energies), "more energy must never dim the glow"
     assert all(0.0 <= e <= 1.0 for e in energies), "glow energy must stay bounded"
-    bubble.ANIM_ENERGY = 1.0
+    appearance.ANIM_ENERGY = 1.0
 
 
 @scenario
@@ -607,8 +617,8 @@ def sauron_eye_reacts_to_voice_level():
         def elapsed(self):
             return 4000
 
-    widget = bubble.BubbleWidget(_Stub())
-    widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    widget = appearance.BubbleWidget(_Stub())
+    widget.resize(appearance.WINDOW_PX, appearance.WINDOW_PX)
     widget._clock = _FrozenClock()
     # Stop the 16 ms timer: grab() drains the event queue, so an active timer
     # runs _on_tick between setting `_level_ui` and painting it, chasing the
@@ -619,8 +629,8 @@ def sauron_eye_reacts_to_voice_level():
     widget._last_tick = 4.0
     widget._state = "idle"
     bubble.SETTINGS["bubble_design"] = "sauron"
-    bubble.ANIM_ENERGY = 1.0
-    bubble.BUBBLE_ACCENT = 0.5
+    appearance.ANIM_ENERGY = 1.0
+    appearance.BUBBLE_ACCENT = 0.5
 
     def grab(level):
         widget._level_target = level      # nothing left to chase
@@ -718,8 +728,8 @@ def every_design_reacts_to_voice_level():
         def elapsed(self):
             return self._ms
 
-    widget = bubble.BubbleWidget(_Stub())
-    widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    widget = appearance.BubbleWidget(_Stub())
+    widget.resize(appearance.WINDOW_PX, appearance.WINDOW_PX)
     widget._clock = _FrozenClock()
     # Stop the 16 ms animation timer: grab() drains the event queue, so an
     # active timer advances _on_tick's smoothed level/colour/radius BETWEEN the
@@ -731,13 +741,13 @@ def every_design_reacts_to_voice_level():
     # live it changes >100 px on EVERY design and "proves" voice reactivity for
     # designs whose painter ignores the voice entirely — a confound that made
     # this assertion pass on the unfixed code.
-    widget._radius_ui = bubble.BUBBLE_R0
+    widget._radius_ui = appearance.BUBBLE_R0
     # "listening" is when the mic is live, and it is the state the equalizer
     # meters in; idle bars deliberately breathe on their own instead
     widget._state = "listening"
     widget._energy_ui = 0.5
-    bubble.ANIM_ENERGY = 1.0
-    bubble.BUBBLE_ACCENT = 0.5
+    appearance.ANIM_ENERGY = 1.0
+    appearance.BUBBLE_ACCENT = 0.5
     designs = list(getattr(settings_app.SCHEMA, "BUBBLE_DESIGNS", ("orb",)))
 
     from PySide6.QtGui import QImage
@@ -840,8 +850,8 @@ def every_design_shows_the_state_colour():
         def elapsed(self):
             return 4000
 
-    widget = bubble.BubbleWidget(_Stub())
-    widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    widget = appearance.BubbleWidget(_Stub())
+    widget.resize(appearance.WINDOW_PX, appearance.WINDOW_PX)
     widget._clock = _FrozenClock()
     # Freeze EVERYTHING except the colour. `_on_tick` crossfades _color_ui AND
     # the state's motion terms together, so a live timer would move the swirl,
@@ -851,11 +861,11 @@ def every_design_shows_the_state_colour():
     widget._anim.stop()
     widget._last_tick = 4.0
     widget._level_ui = widget._level_target = 0.0
-    widget._radius_ui = bubble.BUBBLE_R0
+    widget._radius_ui = appearance.BUBBLE_R0
     widget._state = "idle"          # the state is NOT what this measures
-    widget._energy_ui = bubble._fx_energy("idle")
-    bubble.ANIM_ENERGY = 1.0
-    bubble.BUBBLE_ACCENT = 0.5
+    widget._energy_ui = appearance._fx_energy("idle")
+    appearance.ANIM_ENERGY = 1.0
+    appearance.BUBBLE_ACCENT = 0.5
     from PySide6.QtGui import QImage, QColor
 
     designs = list(getattr(settings_app.SCHEMA, "BUBBLE_DESIGNS", ("orb",)))
@@ -918,14 +928,14 @@ def resizing_the_bubble_keeps_its_aperture():
         sigState = _Signal()
         sigLevel = _Signal()
 
-    widget = bubble.BubbleWidget(_Stub())
+    widget = appearance.BubbleWidget(_Stub())
     widget.resize(128, 128)
     widget.show()                       # a mask is only real once the widget is
     app.processEvents()
     start = widget.mask().boundingRect()
     assert (start.width(), start.height()) == (128, 128), start
     # exactly what the live settings reload does
-    widget.setFixedSize(bubble.WINDOW_PX * 3 // 2, bubble.WINDOW_PX * 3 // 2)
+    widget.setFixedSize(appearance.WINDOW_PX * 3 // 2, appearance.WINDOW_PX * 3 // 2)
     app.processEvents()
     grown = widget.mask().boundingRect()
     rect = widget.rect()
@@ -935,10 +945,10 @@ def resizing_the_bubble_keeps_its_aperture():
         f"{rect.width()}x{rect.height()}")
     # and the shrink path, which is the same setFixedSize call with a smaller
     # number -- the stale-aperture bug is symmetric
-    widget.setFixedSize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    widget.setFixedSize(appearance.WINDOW_PX, appearance.WINDOW_PX)
     app.processEvents()
     back = widget.mask().boundingRect()
-    assert (back.width(), back.height()) == (bubble.WINDOW_PX, bubble.WINDOW_PX), back
+    assert (back.width(), back.height()) == (appearance.WINDOW_PX, appearance.WINDOW_PX), back
     # The mask is an ellipse, not the whole rect: a fix that simply widened the
     # aperture to the rectangle would pass the size assertions above.
     assert not widget.mask().contains(QPoint(1, 1)), \
@@ -1012,15 +1022,15 @@ def every_look_is_renderable_and_reacts():
         def elapsed(self):
             return 4000
 
-    widget = bubble.BubbleWidget(_Stub())
-    widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    widget = appearance.BubbleWidget(_Stub())
+    widget.resize(appearance.WINDOW_PX, appearance.WINDOW_PX)
     widget._clock = _FrozenClock()
     widget._anim.stop()
     widget._last_tick = 4.0
-    widget._radius_ui = bubble.BUBBLE_R0
+    widget._radius_ui = appearance.BUBBLE_R0
     widget._state = "idle"
-    bubble.ANIM_ENERGY = 1.0
-    bubble.BUBBLE_ACCENT = 0.5
+    appearance.ANIM_ENERGY = 1.0
+    appearance.BUBBLE_ACCENT = 0.5
 
     def _pixels(level, color):
         widget._level_target = widget._level_ui = level
@@ -1092,13 +1102,13 @@ def the_cat_keeps_its_ears_inside_its_own_mask():
         def elapsed(self):
             return self.ms
 
-    W = bubble.WINDOW_PX
-    widget = bubble.BubbleWidget(_Stub())
+    W = appearance.WINDOW_PX
+    widget = appearance.BubbleWidget(_Stub())
     widget.resize(W, W)
     widget._anim.stop()
     ellipse = QRegion(QRect(0, 0, W, W), QRegion.Ellipse)
-    cat_region = bubble.design_region("cat", W, W)
-    assert bubble.design_region("orb", W, W) == ellipse, \
+    cat_region = appearance.design_region("cat", W, W)
+    assert appearance.design_region("orb", W, W) == ellipse, \
         "the ordinary designs must keep the plain inset ellipse"
     assert ellipse.subtracted(cat_region).isEmpty(), \
         "the cat's mask must still keep the whole ellipse"
@@ -1128,11 +1138,11 @@ def the_cat_keeps_its_ears_inside_its_own_mask():
         widget._last_tick = clock_ms / 1000.0
         for state in ("idle", "listening", "thinking", "speaking"):
             widget._state = state
-            widget._energy_ui = bubble._fx_energy(state)
+            widget._energy_ui = appearance._fx_energy(state)
             for level in (0.0, 0.5, 1.0):
                 for grow in (0.0, 12.0):      # 12 = the listening peak
                     widget._level_target = widget._level_ui = level
-                    widget._radius_ui = bubble.BUBBLE_R0 + grow * bubble.GEOM_K
+                    widget._radius_ui = appearance.BUBBLE_R0 + grow * appearance.GEOM_K
                     img = QImage(W, W, QImage.Format_ARGB32)
                     img.fill(0)
                     painter = QPainter(img)
@@ -1185,30 +1195,30 @@ def every_design_keeps_ink_inside_its_aperture():
             return self.ms
 
     VISIBLE = 16
-    W = bubble.WINDOW_PX
-    assert bubble.APERTURE_R <= W / 2.0 - 1.0, (
+    W = appearance.WINDOW_PX
+    assert appearance.APERTURE_R <= W / 2.0 - 1.0, (
         "the aperture budget must stay at least a pixel inside the glass, or "
         "the guard below is measuring against a budget the mask contradicts")
-    widget = bubble.BubbleWidget(_Stub())
+    widget = appearance.BubbleWidget(_Stub())
     widget.resize(W, W)
     widget._anim.stop()
 
     worst = (0, None)
     for design in BUBBLE_DESIGNS:
-        region = bubble.design_region(design, W, W)
+        region = appearance.design_region(design, W, W)
         outside = [(x, y) for y in range(W) for x in range(W)
                    if not region.contains(QPoint(x, y))]
         for clock_ms in (0, 600, 2600, 4000):
             widget._clock = _Clock(clock_ms)
             for state in ("idle", "listening", "thinking", "speaking"):
                 widget._state = state
-                widget._energy_ui = bubble._fx_energy(state)
+                widget._energy_ui = appearance._fx_energy(state)
                 for level in (0.0, 1.0):
                     # every radius the state machine can ask for: rest, the
                     # idle breathe, the speaking pulse and the listening peak
                     for grow in (0.0, 3.5, 7.0, 12.0):
                         widget._level_target = widget._level_ui = level
-                        widget._radius_ui = bubble.BUBBLE_R0 + grow * bubble.GEOM_K
+                        widget._radius_ui = appearance.BUBBLE_R0 + grow * appearance.GEOM_K
                         img = QImage(W, W, QImage.Format_ARGB32)
                         img.fill(0)
                         painter = QPainter(img)
@@ -1244,9 +1254,9 @@ def every_design_keeps_ink_inside_its_aperture():
                                          (4000, "listening", 1.0, 12.0)):
         widget._clock = _Clock(clock_ms)
         widget._state = state
-        widget._energy_ui = bubble._fx_energy(state)
+        widget._energy_ui = appearance._fx_energy(state)
         widget._level_target = widget._level_ui = level
-        widget._radius_ui = bubble.BUBBLE_R0 + grow * bubble.GEOM_K
+        widget._radius_ui = appearance.BUBBLE_R0 + grow * appearance.GEOM_K
         img = QImage(W, W, QImage.Format_ARGB32)
         img.fill(0)
         painter = QPainter(img)

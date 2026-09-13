@@ -21,8 +21,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site, pin_offer, run_driver
+from conftest import (HERE as ROOT, _load, _user_site, core_module, pin_offer,
+                      run_driver)
 
+from core import registry as _core_registry
+
+# Resolved on first use rather than at collection (conftest.core_module).
+_core_tools = core_module("tools")
 
 def test_core_tools_is_importable_without_application_module():
     """The extracted policy/tool surface is independently importable.
@@ -442,10 +447,10 @@ class TestWhitelistWidening:
     def test_cargo_requires_confirmation_when_model_dispatches(self, H, monkeypatch):
         tb = self._tb(H, monkeypatch)
         tb._tool_times = deque()
-        tb._pending_confirm = H.Offer("confirm")
+        tb._pending_confirm = _core_registry.Offer("confirm")
         tb._confirm_running = None
         tb._user_turn_marker = 0
-        tb._policy = H.DecisionPolicy({"command_policy": {}})
+        tb._policy = _core_tools.DecisionPolicy({"command_policy": {}})
         out, err = tb.execute("run_command", {"command": "cargo build"})
         assert err and out.startswith("CONFIRM REQUIRED"), out
 
@@ -723,9 +728,10 @@ class TestConcurrencySoak:
         tb = H.ToolBelt.__new__(H.ToolBelt)
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
         tb._tool_times = deque()
-        tb._policy = H.DecisionPolicy(H.SETTINGS)
-        tb._pending_confirm = H.Offer("confirm")
-        tb._jobs = H.BoundedRegistry("job", H.BoundedJob.MAX_JOBS)
+        tb._policy = _core_tools.DecisionPolicy(H.SETTINGS)
+        tb._pending_confirm = _core_registry.Offer("confirm")
+        tb._jobs = _core_registry.BoundedRegistry(
+            "job", _core_tools.BoundedJob.MAX_JOBS)
         tb._on_restart_pending = lambda: None
         tb._on_announce = lambda _t: None
         # Several threads, one offer — including their `_dep()` path.
@@ -852,10 +858,10 @@ class TestConcurrencySoak:
         assert unexpected == [], f"an operation returned something new: {unexpected}"
 
         # The cap: never exceeded, and demonstrably reached.
-        assert max_jobs[0] <= H.BoundedJob.MAX_JOBS, (
+        assert max_jobs[0] <= _core_tools.BoundedJob.MAX_JOBS, (
             "the job registry held more than its cap", max_jobs[0])
         slots = len(tb._jobs)
-        assert slots <= H.BoundedJob.MAX_JOBS
+        assert slots <= _core_tools.BoundedJob.MAX_JOBS
         assert tb._jobs.refusals >= 1, (
             "the soak never reached the cap, so it proved nothing")
 
@@ -906,16 +912,17 @@ class TestDecisionPolicy:
         tb = H.ToolBelt.__new__(H.ToolBelt)
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
         tb._tool_times = deque()
-        tb._policy = H.DecisionPolicy(H.SETTINGS)
-        tb._pending_confirm = H.Offer("confirm")
+        tb._policy = _core_tools.DecisionPolicy(H.SETTINGS)
+        tb._pending_confirm = _core_registry.Offer("confirm")
         tb._confirm_running = None
         tb._user_turn_marker = 0
-        tb._jobs = H.BoundedRegistry("job", H.BoundedJob.MAX_JOBS)
+        tb._jobs = _core_registry.BoundedRegistry(
+            "job", _core_tools.BoundedJob.MAX_JOBS)
         tb._on_announce = None
         return tb
 
     def test_default_is_allow(self, H):
-        pol = H.DecisionPolicy({"command_policy": {}})
+        pol = _core_tools.DecisionPolicy({"command_policy": {}})
         assert pol.classify("run_command") == "ALLOW"
 
     @pytest.fixture()
@@ -1087,7 +1094,7 @@ class TestDecisionPolicy:
         tb._set_user_turn(1)
         tb.execute("wait", {"seconds": 1})
         pending_until = tb._pending_confirm.get("until")
-        tb._policy = H.DecisionPolicy({"command_policy": {"wait": "DENY"}})
+        tb._policy = _core_tools.DecisionPolicy({"command_policy": {"wait": "DENY"}})
         tb._set_user_turn(2)
         out, err = tb.execute("wait", {"seconds": 2})
         assert err and "DENIED" in out
@@ -1132,10 +1139,11 @@ class TestSplitConfirm:
         tb = H.ToolBelt.__new__(H.ToolBelt)
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
         tb._tool_times = deque()
-        tb._policy = H.DecisionPolicy(H.SETTINGS)
-        tb._pending_confirm = H.Offer("confirm")
+        tb._policy = _core_tools.DecisionPolicy(H.SETTINGS)
+        tb._pending_confirm = _core_registry.Offer("confirm")
         tb._confirm_running = None
-        tb._jobs = H.BoundedRegistry("job", H.BoundedJob.MAX_JOBS)
+        tb._jobs = _core_registry.BoundedRegistry(
+            "job", _core_tools.BoundedJob.MAX_JOBS)
         tb._on_announce = None
         return tb
 

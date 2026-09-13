@@ -1087,6 +1087,65 @@ class TestLoaderFailurePaths:
         assert core._repo_root() is None
 
 
+class TestSupportModulesNeverShadowTheStdlib:
+    """A support module may share a stdlib name; it may not TAKE that name.
+
+    `core/calendar.py` and the standard library's `calendar` are the same name,
+    and `load_module` used to register every support module under its bare name
+    as well as `core.<name>`. Two consequences, both measured: the app's
+    `sys.modules['calendar']` became `/…/core/calendar.py`, so any later
+    `from calendar import timegm` — faster_whisper and chatterbox both do it —
+    raised ImportError and the bubble reported the speech engines as "not
+    installed"; and because the bare name was bound BEFORE the module's own body
+    ran, `core/calendar.py`'s own `import calendar` resolved to the half-built
+    module itself, so the shadow was planted by the loader and then read by the
+    very file that needed the real one.
+
+    It was silent and order-dependent: at HEAD it did not fire only because
+    handsoff.py reached `core.calendar` through a `from core.calendar import …`
+    statement, whose chain imported the stdlib first. The hazard is forced here
+    rather than hoped for, so the guard cannot go vacuous on a machine where
+    something else happens to import `calendar` early.
+    """
+
+    def test_a_stdlib_named_support_module_never_takes_the_bare_name(
+            self, monkeypatch):
+        real = sys.modules.pop("calendar", None)
+        monkeypatch.delitem(sys.modules, "core.calendar", raising=False)
+        try:
+            mod = core.load_module("calendar")
+            assert Path(mod.__file__).name == "calendar.py"
+            assert Path(mod.__file__).parent.name == "core", mod.__file__
+            assert sys.modules["core.calendar"] is mod
+            # ...and the stdlib is still reachable under its own name, which is
+            # what every third-party `import calendar` from here on will get.
+            import calendar as stdlib_calendar
+            assert Path(stdlib_calendar.__file__) != Path(mod.__file__), (
+                "load_module handed the app's module to `import calendar` — a "
+                "third-party `from calendar import timegm` breaks from here")
+            assert hasattr(stdlib_calendar, "timegm"), (
+                "the stdlib calendar was replaced by one without timegm")
+        finally:
+            if real is not None:
+                sys.modules["calendar"] = real
+
+    def test_a_normal_support_module_keeps_its_bare_name(self, monkeypatch):
+        """The rule must not quietly disable bare registration altogether.
+
+        `hardware` is nobody else's name, and it is adopted by bare name today
+        (see `test_a_module_already_imported_by_its_bare_name_is_adopted`), so a
+        fix that simply stopped binding bare names would break that adoption
+        rather than fix anything.
+        """
+        assert "hardware" not in sys.stdlib_module_names
+        monkeypatch.delitem(sys.modules, "hardware", raising=False)
+        monkeypatch.delitem(sys.modules, "core.hardware", raising=False)
+        mod = core.load_module("hardware")
+        assert sys.modules.get("hardware") is mod, (
+            "a non-stdlib support module lost its bare registration")
+        assert sys.modules["core.hardware"] is mod
+
+
 class TestImportStatementsCannotBypassTheSandbox:
     def test_no_test_module_imports_a_user_dir_baking_module_at_collection(
             self):
@@ -1180,3 +1239,214 @@ class TestImportStatementsCannotBypassTheSandbox:
         # ...and the sweep really looked at the modules that bake at import.
         assert {"core.tools", "core.audio"} <= looked_at, sorted(looked_at)
         assert any(n.startswith("handsoff") for n in looked_at), sorted(looked_at)
+
+
+class TestTheBubbleModuleOwnsTheAppearance:
+    """The bubble's geometry, palette and 13 designs are their own module.
+
+    Pinned because of how this state used to fail. The window size and the
+    geometry derived from it were written from TWO places — module constants at
+    import, and the live settings path in the Assistant — and a live size change
+    left `APERTURE_R` sized for the old window while the widget resized, so
+    growing the bubble clipped the design to the previous circle and swapping
+    shapes showed each shape's scaled geometry inside a stale one. The extraction
+    answers that with one owner and one derivation (`configure()`), and the host
+    injected. So: the module must stay application-free, the app must never
+    define or assign the appearance state again, `configure()` must be the only
+    thing that writes it, and the injection must really reach the module — an
+    un-injected `SETTINGS` silently renders the fallback palette at the default
+    size, which looks like "the colours never apply".
+    """
+
+    APPEARANCE = ("WINDOW_PX", "BUBBLE_R0", "GLOW_PAD", "GEOM_K", "APERTURE_R",
+                  "BUBBLE_ACCENT", "ANIM_ENERGY", "STATE_COLORS", "_BUBBLE_FX",
+                  "design_region", "BubbleWidget")
+    # Everything the module is allowed to be handed. Anything else written onto
+    # it from the app would be a second owner.
+    HOST = ("SETTINGS", "APP_NAME", "SETTINGS_APP", "RESTART_SCRIPT", "notify")
+
+    def _app_tree(self):
+        return ast.parse((HERE / "handsoff.py").read_text(encoding="utf-8"))
+
+    def _partial_install_nodes(self, tree):
+        """The ONE exemption, and proof it is bounded to the loader's fallback.
+
+        `_MissingBubble` carries the same names as inert defaults so a
+        deployment without core/bubble.py still imports, reports and fails
+        loudly on use — the same shape `_MissingAudio` has. It is not a second
+        owner: it cannot paint anything. Confining it to the `except ImportError`
+        branch is what keeps "the app has these names" from being true of a real
+        install, so that placement is asserted rather than assumed.
+        """
+        stub = next((n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)
+                     and n.name == "_MissingBubble"), None)
+        assert stub is not None, (
+            "the partial-install stub vanished: a deployment missing "
+            "core/bubble.py must still import and report, not die at import")
+        guarded = [t for t in ast.walk(tree)
+                   if isinstance(t, ast.Try)
+                   and any(isinstance(h.type, ast.Name)
+                           and h.type.id == "ImportError" for h in t.handlers)]
+        assert any(any(n is stub for n in ast.walk(t)) for t in guarded), (
+            "_MissingBubble is no longer inside an `except ImportError` branch, "
+            "so the app may now have a reachable second copy of the appearance")
+        return {id(n) for n in ast.walk(stub)}
+
+    def test_the_module_does_not_reach_back_into_the_application(self):
+        """Application-free: no import of the app, and no bare app name.
+
+        A module that imports handsoff cannot be loaded on its own, which is the
+        whole reason the mask geometry and the painters could be measured
+        without a running bubble in the first place.
+        """
+        tree = ast.parse((HERE / "core" / "bubble.py").read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        assert "handsoff" not in imported, (
+            "core/bubble.py imports the application — it must take the host by "
+            "injection so it stays loadable and measurable on its own")
+        # The names it needs must EXIST as injectable seams, or the host has
+        # nothing to bind and the module silently runs on its own defaults.
+        defined = {n.name for n in tree.body
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef))}
+        defined |= {t.id for n in tree.body if isinstance(n, ast.Assign)
+                    for t in n.targets if isinstance(t, ast.Name)}
+        defined |= {n.target.id for n in tree.body
+                    if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)}
+        missing = sorted(set(self.HOST) - defined)
+        assert missing == [], (
+            f"core/bubble.py no longer declares the injected host seam(s) "
+            f"{missing} — handsoff.py has nothing to bind")
+        assert {"configure", "BubbleWidget"} <= defined, (
+            "the module must own its derivation and its widget")
+
+    def test_the_app_injects_the_whole_host(self, H):
+        """What the app hands over at load time is really the app's own objects."""
+        b = H._core_bubble
+        assert b.SETTINGS is H.SETTINGS, (
+            "the bubble module is rendering a different settings dict than the "
+            "app loads and saves — every colour and size it reads is stale")
+        assert b.APP_NAME == H.APP_NAME
+        assert b.SETTINGS_APP == H.SETTINGS_APP, (
+            "the context menu must open the installed settings app, not a default")
+        assert b.RESTART_SCRIPT == H.RESTART_SCRIPT
+        assert b.notify is H.notify, (
+            "an un-injected notifier is inert, so a bubble error is silent")
+
+    def test_the_app_defines_no_appearance_state_of_its_own(self):
+        """No second copy: not a constant, not a class, in any scope."""
+        tree = self._app_tree()
+        stub = self._partial_install_nodes(tree)
+        offenders = []
+        for node in ast.walk(tree):
+            if id(node) in stub:
+                continue
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) \
+                    and node.id in self.APPEARANCE:
+                offenders.append(f"line {node.lineno}: {node.id} = ...")
+            elif isinstance(node, ast.ClassDef) and node.name == "BubbleWidget":
+                offenders.append(f"line {node.lineno}: class BubbleWidget")
+        assert offenders == [], (
+            "handsoff.py still owns appearance state; it belongs to "
+            f"core/bubble.py: {offenders}")
+
+    def test_the_app_only_ever_binds_the_host(self):
+        """`configure()` writes the appearance; the app may not write it directly.
+
+        Binding the host is the app's job. Assigning the geometry, the palette or
+        the look knobs from here is how the two writers that caused the stale
+        aperture came back.
+        """
+        writes = []
+        for node in ast.walk(self._app_tree()):
+            if not isinstance(node, ast.Attribute) or \
+                    not isinstance(node.ctx, ast.Store):
+                continue
+            value = node.value
+            if isinstance(value, ast.Name) and value.id == "_core_bubble":
+                writes.append((node.lineno, node.attr))
+        bad = [(ln, a) for ln, a in writes if a not in self.HOST]
+        assert bad == [], (
+            "the application writes appearance state onto the module instead of "
+            f"letting configure() derive it: {bad}")
+        assert {a for _ln, a in writes} >= {"SETTINGS", "notify"}, (
+            "the host injection went missing entirely — the module is running "
+            "on its placeholders")
+
+    def test_configure_reads_the_dict_it_is_handed(self, H):
+        """`configure(settings)` must use THAT dict, not the injected one.
+
+        The palette reader used to reach for the module global, so passing a
+        settings dict built from a file on disk silently produced the app's
+        current colours — a size change would apply while the colours did not,
+        which is the shape of the original "I chose a colour and nothing
+        happened" report. Both lookups (explicit dict, injected dict) are
+        asserted, plus the junk-colour fallback.
+        """
+        b = H._core_bubble
+        wanted = {"idle": "#111111", "listening": "#222222",
+                  "thinking": "#333333", "speaking": "#444444"}
+        try:
+            b.configure({"bubble_size": 160, "colors": dict(wanted),
+                         "bubble_accent": 0.9, "animation_energy": 1.8})
+            assert {k: v.name() for k, v in b.STATE_COLORS.items()} == wanted, (
+                "an explicit settings dict was ignored — the palette came from "
+                "somewhere else")
+            assert b.WINDOW_PX == 160 and b.APERTURE_R == 160 / 2.0 - 1.0
+            assert (b.BUBBLE_ACCENT, b.ANIM_ENERGY) == (0.9, 1.8)
+            b.configure()          # no argument: the injected settings
+            assert b.STATE_COLORS["idle"] is not None
+            b.configure({"bubble_size": 96, "colors": {"idle": "not-a-colour"}})
+            assert b.STATE_COLORS["idle"].name() == "#2f6fed", (
+                "a colour the parser rejects must fall back, not render junk")
+        finally:
+            b.configure(H.SETTINGS)   # put the app's own geometry back
+
+    def test_a_newly_required_core_module_cannot_miss_the_installer_floor(self):
+        """The installer's required list must be derived from what the app imports.
+
+        This is the drift the project has already paid for twice: `core/theme.py`
+        shipped nowhere while doctor reported `in-sync`, and the list of modules
+        was hand-maintained in seven places. The glob is the ceiling; the floor
+        exists to fail the stage loudly, so it may not fall behind what
+        handsoff.py hard-requires. Derived here by reading handsoff.py, not by
+        repeating its list.
+        """
+        found = set()
+        for node in ast.walk(self._app_tree()):
+            if isinstance(node, ast.ImportFrom) and node.module == "core":
+                for a in node.names:
+                    if (HERE / "core" / f"{a.name}.py").exists():
+                        found.add(a.name)
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    parts = a.name.split(".")
+                    if parts[0] == "core" and len(parts) == 2 \
+                            and (HERE / "core" / f"{parts[1]}.py").exists():
+                        found.add(parts[1])
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and node.func.id == "_load_module" and node.args \
+                    and isinstance(node.args[0], ast.Constant) \
+                    and isinstance(node.args[0].value, str) \
+                    and (HERE / "core" / f"{node.args[0].value}.py").exists():
+                found.add(node.args[0].value)
+        assert len(found) >= 8, (
+            f"the derivation found only {sorted(found)} — it stopped seeing how "
+            "handsoff.py loads core modules, so it proves nothing")
+
+        text = (HERE / "install.sh").read_text(encoding="utf-8")
+        line = next(ln for ln in text.splitlines() if ln.startswith("CORE_REQUIRED="))
+        declared = set(line.split('"')[1].split())
+        assert "__init__" in declared, (
+            "the floor must name the package itself, or a partial install "
+            "missing core/__init__.py would not fail the stage")
+        missing = sorted(found - declared)
+        assert missing == [], (
+            f"handsoff.py requires core module(s) {missing} that CORE_REQUIRED "
+            "does not declare — a deployment missing one passes the floor check "
+            "and dies on import")

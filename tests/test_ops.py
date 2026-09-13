@@ -15,7 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from conftest import HERE as ROOT, run_driver, sandbox_env
+from conftest import HERE as ROOT, core_module, run_driver, sandbox_env
+
+from core import registry as _core_registry
+
+# Resolved on first use rather than at collection (conftest.core_module).
+_core_tools = core_module("tools")
 
 HERE = ROOT   # the repo root
 
@@ -262,7 +267,7 @@ class TestCapRefusalReporting:
         redirected at tmp_path so a live state file cannot decide the test."""
         monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "cap-refusals.json")
         tb, _announced = TestBoundedJobs()._belt(H, monkeypatch)
-        for _ in range(H.BoundedJob.MAX_JOBS):
+        for _ in range(_core_tools.BoundedJob.MAX_JOBS):
             slot = tb._jobs.reserve()
             assert slot is not None
             slot.commit(lambda key: None)
@@ -287,8 +292,8 @@ class TestCapRefusalReporting:
         assert doc["count"] == 1 and doc["by_registry"] == {"job": 1}
         event = doc["events"][-1]
         assert event["registry"] == "job"
-        assert event["cap"] == H.BoundedJob.MAX_JOBS
-        assert event["held"] == H.BoundedJob.MAX_JOBS
+        assert event["cap"] == _core_tools.BoundedJob.MAX_JOBS
+        assert event["held"] == _core_tools.BoundedJob.MAX_JOBS
         assert event["occupants"] == sorted(tb._jobs.keys())
         assert event["detail"].endswith("'pytest -q'")
         assert isinstance(event["at"], (int, float)) and event["at"] > 0
@@ -478,7 +483,7 @@ class TestTheHostIsOfferedEveryRefusal:
     def _belt_at_job_cap(self, H, monkeypatch, tmp_path):
         monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "cap.json")
         tb, _ = TestBoundedJobs()._belt(H, monkeypatch)
-        for _ in range(H.BoundedJob.MAX_JOBS):
+        for _ in range(_core_tools.BoundedJob.MAX_JOBS):
             slot = tb._jobs.reserve()
             assert slot is not None
             slot.commit(lambda key: None)
@@ -492,7 +497,8 @@ class TestTheHostIsOfferedEveryRefusal:
         assert err and "job limit reached" in out
         assert len(told) == 1, told
         report, detail = told[0]
-        assert report["registry"] == "job" and report["held"] == H.BoundedJob.MAX_JOBS
+        assert report["registry"] == "job"
+        assert report["held"] == _core_tools.BoundedJob.MAX_JOBS
         assert "pytest -q" in detail
 
     def test_a_belt_without_a_host_still_refuses(self, H, monkeypatch, tmp_path):
@@ -727,10 +733,11 @@ class TestBoundedJobs:
         tb = H.ToolBelt.__new__(H.ToolBelt)
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
         tb._tool_times = deque()
-        tb._policy = H.DecisionPolicy(H.SETTINGS)
-        tb._pending_confirm = H.Offer("confirm")
+        tb._policy = _core_tools.DecisionPolicy(H.SETTINGS)
+        tb._pending_confirm = _core_registry.Offer("confirm")
         tb._confirm_running = None
-        tb._jobs = H.BoundedRegistry("job", H.BoundedJob.MAX_JOBS)
+        tb._jobs = _core_registry.BoundedRegistry(
+            "job", _core_tools.BoundedJob.MAX_JOBS)
         announced: list[str] = []
         tb._on_announce = announced.append
         return tb, announced
@@ -823,7 +830,7 @@ class TestBoundedJobs:
 
     def test_job_limit_is_bounded(self, H, monkeypatch):
         tb, _ = self._belt(H, monkeypatch)
-        for _ in range(H.BoundedJob.MAX_JOBS):
+        for _ in range(_core_tools.BoundedJob.MAX_JOBS):
             slot = tb._jobs.reserve()
             assert slot is not None
             slot.commit(lambda key: None)
@@ -853,7 +860,7 @@ class TestBoundedJobs:
             return real_popen(*a, **kw)
 
         monkeypatch.setattr(H.subprocess, "Popen", counting_popen)
-        gate = threading.Barrier(H.BoundedJob.MAX_JOBS)
+        gate = threading.Barrier(_core_tools.BoundedJob.MAX_JOBS)
 
         def gated(_command):
             gate.wait(timeout=10)
@@ -869,17 +876,17 @@ class TestBoundedJobs:
         for t in threads:
             t.join()
         try:
-            assert len(tb._jobs) == H.BoundedJob.MAX_JOBS, results
+            assert len(tb._jobs) == _core_tools.BoundedJob.MAX_JOBS, results
             started = [r for r in results if r.startswith("started")]
-            assert len(started) == H.BoundedJob.MAX_JOBS, results
+            assert len(started) == _core_tools.BoundedJob.MAX_JOBS, results
             refused = [r for r in results if "job limit reached" in r]
-            assert len(refused) == 8 - H.BoundedJob.MAX_JOBS, results
+            assert len(refused) == 8 - _core_tools.BoundedJob.MAX_JOBS, results
             # A job refused at the cap never ran, so it must not leave the
             # bubble believing a restart is in flight.
-            assert len(restarts) == H.BoundedJob.MAX_JOBS, restarts
-            assert len(spawned) == H.BoundedJob.MAX_JOBS, (
+            assert len(restarts) == _core_tools.BoundedJob.MAX_JOBS, restarts
+            assert len(spawned) == _core_tools.BoundedJob.MAX_JOBS, (
                 f"spawned {len(spawned)} processes for a cap of "
-                f"{H.BoundedJob.MAX_JOBS}: a refused caller must not fork")
+                f"{_core_tools.BoundedJob.MAX_JOBS}: a refused caller must not fork")
         finally:
             for job in tb._jobs.values():
                 job.proc.kill()
@@ -922,8 +929,8 @@ class TestBoundedJobs:
 
     def test_bounded_job_poll_timeout(self, H):
         proc = subprocess.Popen(["sleep", "60"])
-        job = H.BoundedJob("j", "sleep 60", proc)
-        job.started = time.monotonic() - (H.BoundedJob.MAX_LIFETIME_S + 5)
+        job = _core_tools.BoundedJob("j", "sleep 60", proc)
+        job.started = time.monotonic() - (_core_tools.BoundedJob.MAX_LIFETIME_S + 5)
         state, done = job.poll()
         try:
             assert state == "timeout-killed" and done
@@ -1205,7 +1212,7 @@ class TestInstallerRehearsal:
                         "settings_schema.py"}
         declared_core = {"__init__.py", "registry.py", "settings.py", "audio.py",
                          "brain.py", "tools.py", "doctor.py", "lifecycle.py",
-                         "calendar.py", "assistant.py"}
+                         "calendar.py", "assistant.py", "bubble.py"}
         # A machine without git raises FileNotFoundError here rather than
         # returning non-zero, so the fallback below never applied and the test
         # errored instead of degrading — the mirror-image of the installer's
@@ -1405,7 +1412,7 @@ class TestBoundedJobBuffer:
         proc = subprocess.Popen(argv, env=sandbox_env(), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
                                 start_new_session=True)
-        return H.BoundedJob("job-buffer", " ".join(argv), proc)
+        return _core_tools.BoundedJob("job-buffer", " ".join(argv), proc)
 
     def test_output_tail_keeps_the_newest_bytes(self, H):
         """The buffer must retain the END of the output, not the beginning.
@@ -1429,7 +1436,8 @@ class TestBoundedJobBuffer:
         assert "TAIL-MARKER" in tail, tail[:200]
         assert "HEAD-MARKER" not in tail, tail[:200]
         # still bounded: at most two caps plus one chunk in flight
-        assert job._out_len <= H.BoundedJob.MAX_OUTPUT * 2 + 65536, job._out_len
+        assert job._out_len <= _core_tools.BoundedJob.MAX_OUTPUT * 2 + 65536, \
+            job._out_len
 
     def test_unreapable_kill_is_not_reported_as_done(self, H):
         """A SIGKILL that has not reaped must keep the job open.
@@ -1451,8 +1459,8 @@ class TestBoundedJobBuffer:
             def wait(self, timeout=None):
                 raise subprocess.TimeoutExpired("stuck", timeout)
 
-        job = H.BoundedJob("job-stuck", "sleep 99999", StuckProc())
-        job.started -= H.BoundedJob.MAX_LIFETIME_S + 1
+        job = _core_tools.BoundedJob("job-stuck", "sleep 99999", StuckProc())
+        job.started -= _core_tools.BoundedJob.MAX_LIFETIME_S + 1
         assert job.poll() == ("running", False)
 
         class ReapProc(StuckProc):
@@ -1463,8 +1471,8 @@ class TestBoundedJobBuffer:
                 self.returncode = -9
                 return -9
 
-        reaped = H.BoundedJob("job-killed", "sleep 99999", ReapProc())
-        reaped.started -= H.BoundedJob.MAX_LIFETIME_S + 1
+        reaped = _core_tools.BoundedJob("job-killed", "sleep 99999", ReapProc())
+        reaped.started -= _core_tools.BoundedJob.MAX_LIFETIME_S + 1
         assert reaped.poll() == ("timeout-killed", True)
 
     def test_a_blocked_drainer_is_released(self, H):
@@ -1504,7 +1512,7 @@ class TestBoundedJobBuffer:
                 raise subprocess.TimeoutExpired("blocked", timeout)
 
         proc = BlockedProc()
-        job = H.BoundedJob("job-blocked", "leaky", proc)
+        job = _core_tools.BoundedJob("job-blocked", "leaky", proc)
         assert job._drain_thread is not None
         time.sleep(0.2)
         assert job._drain_thread.is_alive(), "drainer should be blocked in read()"
@@ -1517,7 +1525,7 @@ class TestBoundedJobBuffer:
         """...and job_status is what calls it."""
         tb, _announced = TestBoundedJobs()._belt(H, monkeypatch)
         calls: list = []
-        monkeypatch.setattr(H.BoundedJob, "_unstick_drain",
+        monkeypatch.setattr(_core_tools.BoundedJob, "_unstick_drain",
                             lambda self: calls.append(self.id))
         out, err = tb.execute("start_command", {"command": "echo wiring"})
         assert not err, out

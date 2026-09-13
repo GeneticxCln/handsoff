@@ -21,7 +21,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, run_driver, sandbox_env, wait_for
+from conftest import (HERE as ROOT, _load, core_module, run_driver,
+                      sandbox_env, wait_for)
+
+# Resolved on first use rather than at collection (conftest.core_module).
+_core_tools = core_module("tools")
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -874,7 +878,7 @@ class TestBubbleMenuHoldGuard:
                 self.begin_calls += 1
 
         assistant = Assistant()
-        widget = H.BubbleWidget.__new__(H.BubbleWidget)
+        widget = H._core_bubble.BubbleWidget.__new__(H._core_bubble.BubbleWidget)
         widget._assistant = assistant
         widget._hold = Hold()
         widget._pressing = True
@@ -896,7 +900,7 @@ class TestBubbleMenuHoldGuard:
                 self.owner._hold_fired()  # simulate the queued timeout
                 return None
 
-        monkeypatch.setattr(H, "QMenu", Menu)
+        monkeypatch.setattr(H._core_bubble, "QMenu", Menu)
 
         class Event:
             def button(self):
@@ -918,8 +922,8 @@ class TestLiveSettingsReload:
         H is session-scoped: snapshot every touched global and restore it,
         or later tests inherit our values (order-dependent failures)."""
         snap_settings = dict(H.SETTINGS)
-        snap_geom = (H.WINDOW_PX, H.BUBBLE_R0, H.GLOW_PAD, H.GEOM_K)
-        snap_colors = dict(H.STATE_COLORS)
+        snap_geom = (H._core_bubble.WINDOW_PX, H._core_bubble.BUBBLE_R0, H._core_bubble.GLOW_PAD, H._core_bubble.GEOM_K)
+        snap_colors = dict(H._core_bubble.STATE_COLORS)
         cfg = dict(H.DEFAULT_SETTINGS)
         cfg.update(snap_settings)  # keep model/whisper/voice: no cache drops
         cfg.update({
@@ -957,18 +961,18 @@ class TestLiveSettingsReload:
             a._on_command("reload-settings")
             assert H.SETTINGS["bubble_size"] == 160
             assert H.SETTINGS["bubble_design"] == "halo"
-            assert H.WINDOW_PX == 160
-            assert H.BUBBLE_R0 == pytest.approx(160 * 44.0 / 128.0)
-            assert H.GEOM_K == pytest.approx(160 / 128.0)
-            assert H.STATE_COLORS["idle"].name() == "#111111"
-            assert H.STATE_COLORS["speaking"].name() == "#444444"
+            assert H._core_bubble.WINDOW_PX == 160
+            assert H._core_bubble.BUBBLE_R0 == pytest.approx(160 * 44.0 / 128.0)
+            assert H._core_bubble.GEOM_K == pytest.approx(160 / 128.0)
+            assert H._core_bubble.STATE_COLORS["idle"].name() == "#111111"
+            assert H._core_bubble.STATE_COLORS["speaking"].name() == "#444444"
             assert sizes["size"] == (160, 160) and sizes.get("updated") is True
         finally:
             H.SETTINGS.clear()
             H.SETTINGS.update(snap_settings)
-            (H.WINDOW_PX, H.BUBBLE_R0, H.GLOW_PAD, H.GEOM_K) = snap_geom
-            H.STATE_COLORS.clear()
-            H.STATE_COLORS.update(snap_colors)
+            (H._core_bubble.WINDOW_PX, H._core_bubble.BUBBLE_R0, H._core_bubble.GLOW_PAD, H._core_bubble.GEOM_K) = snap_geom
+            H._core_bubble.STATE_COLORS.clear()
+            H._core_bubble.STATE_COLORS.update(snap_colors)
 
 
 # ------------------------------------------------------------------ offscreen launch
@@ -1252,13 +1256,13 @@ class TestToolSchemaFromCode:
             assert set(fn["parameters"]["required"]) <= set(params)
 
     def test_decorator_extracts_params_from_signature_and_docstring(self, H):
-        @H.tool(description="Test tool.")
+        @_core_tools.tool(description="Test tool.")
         def sample(self, city: str, days: int = 3) -> str:
             """Do a thing.
 
             city: which city to use
             """
-        params = H._param_schema(sample)
+        params = _core_tools._param_schema(sample)
         assert params == {
             "city": {"type": "string", "description": "which city to use"},
             "days": {"type": "integer"},
@@ -1475,8 +1479,13 @@ class TestRestartResilience:
         assert "local_files_only=True" in src
 
     def test_menu_quit_stops_unit_first(self, H):
-        """Quit under Restart=always must stop the systemd unit, not get resurrected."""
-        src = (HERE / "handsoff.py").read_text()
+        """Quit under Restart=always must stop the systemd unit, not get resurrected.
+
+        The quit path belongs to the bubble's context menu, which now lives in
+        core/bubble.py — reading handsoff.py here would assert against a file
+        that no longer contains the code being ordered.
+        """
+        src = (HERE / "core" / "bubble.py").read_text()
         quit_idx = src.index("if chosen == act_quit:")
         stop_idx = src.index('"systemctl", "--user", "stop"', quit_idx)
         app_quit_idx = src.index("QApplication.quit()", quit_idx)

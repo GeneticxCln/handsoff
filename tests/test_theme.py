@@ -388,8 +388,8 @@ class TestBubbleAnimationKnobs:
         monkeypatch.setitem(H.SETTINGS, "animation_energy", 1.8)
         monkeypatch.setitem(H.SETTINGS, "bubble_accent", 0.9)
         H.reload_derived_settings()
-        assert H.ANIM_ENERGY == pytest.approx(1.8)
-        assert H.BUBBLE_ACCENT == pytest.approx(0.9)
+        assert H._core_bubble.ANIM_ENERGY == pytest.approx(1.8)
+        assert H._core_bubble.BUBBLE_ACCENT == pytest.approx(0.9)
 
     def test_neutral_defaults_match_the_historical_curve(self, H, monkeypatch):
         monkeypatch.setattr(H, "_audio", self._AudioStub())
@@ -397,21 +397,21 @@ class TestBubbleAnimationKnobs:
         monkeypatch.setitem(H.SETTINGS, "bubble_accent", 0.5)
         H.reload_derived_settings()
         for state in ("idle", "listening", "thinking", "speaking"):
-            assert H._fx_energy(state) == pytest.approx(H._BUBBLE_FX[state][3])
+            assert H._core_bubble._fx_energy(state) == pytest.approx(H._core_bubble._BUBBLE_FX[state][3])
 
     def test_energy_scales_glow_and_clamps(self, H, monkeypatch):
-        monkeypatch.setattr(H, "ANIM_ENERGY", 0.2)
-        assert H._fx_energy("thinking") < H._BUBBLE_FX["thinking"][3]
-        monkeypatch.setattr(H, "ANIM_ENERGY", 2.0)
-        assert H._fx_energy("thinking") == pytest.approx(1.0)   # clamped
+        monkeypatch.setattr(H._core_bubble, "ANIM_ENERGY", 0.2)
+        assert H._core_bubble._fx_energy("thinking") < H._core_bubble._BUBBLE_FX["thinking"][3]
+        monkeypatch.setattr(H._core_bubble, "ANIM_ENERGY", 2.0)
+        assert H._core_bubble._fx_energy("thinking") == pytest.approx(1.0)   # clamped
 
     def test_out_of_range_settings_are_clamped_on_reload(self, H, monkeypatch):
         monkeypatch.setattr(H, "_audio", self._AudioStub())
         monkeypatch.setitem(H.SETTINGS, "animation_energy", 99.0)
         monkeypatch.setitem(H.SETTINGS, "bubble_accent", -5.0)
         H.reload_derived_settings()
-        assert H.ANIM_ENERGY == 2.0
-        assert H.BUBBLE_ACCENT == 0.0
+        assert H._core_bubble.ANIM_ENERGY == 2.0
+        assert H._core_bubble.BUBBLE_ACCENT == 0.0
 
 
 class TestAppearanceCoercion:
