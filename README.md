@@ -129,7 +129,10 @@ in VRAM between questions).
 - **Looks** — the same tab's **Look** picker sets the whole appearance in one
   click: a named look (Handsoff, Midnight, Daylight, Ember, Neon, All-seeing,
   Spark, Curious) carries a shape, a size, both sliders and all four state
-  colours, and applies live like any other control. Nothing extra is stored:
+  colours, and applies live like any other control. Each look is *drawn* on its
+  own button — its silhouette on a state-coloured glyph, its other three state
+  colours as dots beneath — from the same painter the preview strip uses, so a
+  button cannot show a shape the bubble would not. Nothing extra is stored:
   the current look is *derived* from the five values, so the tab says "Custom"
   the moment you nudge a slider instead of leaving a stale name on screen, and
   `--ptt health`/`--ptt doctor` name the look the settings actually spell out.

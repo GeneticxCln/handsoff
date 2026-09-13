@@ -381,6 +381,260 @@ def _reference_note(audio, path: Path) -> str:
     return f"reference {path.name} ({seconds:.1f}s)"
 
 
+def paint_design_glyph(p, design: str, cx: float, cy: float, r: float,
+                       color: QColor, t: float, k: float) -> None:
+    """Mini silhouette of one design, in one colour.
+
+    Lives at module level because TWO widgets draw it — the Appearance
+    preview strip and the Look tiles — and a tile that drew its own copy
+    could show a shape or a palette the strip (and the bubble) would not.
+    """
+    import math as _math
+    if design == "halo":
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(color, max(2.0, r * 0.28)))
+        p.drawEllipse(QPointF(cx, cy), r * 0.86, r * 0.86)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(color))
+        p.drawEllipse(QPointF(cx, cy), r * 0.12, r * 0.12)
+    elif design == "reactor":
+        for j, (rr, spd, span) in enumerate(((0.95, 0.5, 1.8), (0.78, -0.4, 1.2), (0.62, 0.8, 2.4))):
+            a0 = t * 2 * _math.pi * spd + j
+            path = QPainterPath()
+            for i in range(17):
+                a = a0 - span / 2 + i * (span / 16)
+                x, y = cx + _math.cos(a) * r * rr, cy - _math.sin(a) * r * rr
+                path.moveTo(x, y) if i == 0 else path.lineTo(x, y)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(color, 2.2, Qt.SolidLine, Qt.RoundCap))
+            p.drawPath(path)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(color))
+        p.drawEllipse(QPointF(cx, cy), r * 0.14, r * 0.14)
+    elif design == "bloom":
+        body = QRadialGradient(cx, cy, r)
+        c = QColor(color)
+        c.setAlpha(150)
+        body.setColorAt(0.0, c)
+        c.setAlpha(0)
+        body.setColorAt(1.0, c)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(body))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+        p.setBrush(QBrush(QColor(color).lighter(160)))
+        p.drawEllipse(QPointF(cx, cy), r * 0.22, r * 0.22)
+    elif design == "droplet":
+        drop = QPainterPath()
+        for i in range(37):
+            ang = i * 2 * _math.pi / 36
+            tip = _math.exp(-((ang - _math.pi / 2) / 0.55) ** 2)
+            rr = r * 0.85 * (1.0 + 0.42 * tip)
+            x, y = cx + rr * _math.cos(ang) * 0.92, cy - rr * _math.sin(ang)
+            drop.moveTo(x, y) if i == 0 else drop.lineTo(x, y)
+        drop.closeSubpath()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(color))
+        p.drawPath(drop)
+    elif design == "cube":
+        rot = t * 0.5
+        pts = [(cx + r * 0.9 * _math.cos(rot + i * _math.pi / 3),
+                cy - r * 0.9 * _math.sin(rot + i * _math.pi / 3)) for i in range(6)]
+        p.setPen(QPen(QColor(color).lighter(140), 1.6))
+        p.setBrush(QBrush(QColor(color).darker(130)))
+        p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
+        p.setPen(QPen(QColor(255, 255, 255, 90), 1.0))
+        for x, y in pts:
+            p.drawLine(QPointF(cx, cy), QPointF(x, y))
+    elif design == "equalizer":
+        p.setBrush(Qt.NoBrush)
+        for i in range(14):
+            a = i * 2 * _math.pi / 14
+            ln = r * (0.15 + 0.5 * abs(_math.sin(t * 3 + i * 1.1)))
+            p.setPen(QPen(color, 2.4, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(cx + _math.cos(a) * r * 0.35, cy - _math.sin(a) * r * 0.35),
+                       QPointF(cx + _math.cos(a) * (r * 0.35 + ln), cy - _math.sin(a) * (r * 0.35 + ln)))
+    elif design == "crystal":
+        pts = [(cx + r * 0.9 * _math.cos(t * 0.4 + i * _math.pi / 3),
+                cy - r * 0.9 * _math.sin(t * 0.4 + i * _math.pi / 3)) for i in range(6)]
+        p.setPen(QPen(QColor(color).lighter(140), 1.6))
+        p.setBrush(QBrush(QColor(color).darker(150)))
+        p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
+    elif design == "saturn":
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(color))
+        p.drawEllipse(QPointF(cx, cy), r * 0.5, r * 0.5)
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(-20)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(color).lighter(130), 2.0))
+        p.drawEllipse(QPointF(0, 0), r * 0.95, r * 0.32)
+        p.restore()
+    elif design == "void":
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(5, 5, 8)))
+        p.drawEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(color).lighter(170), 1.8))
+        p.drawEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
+    elif design == "sauron":
+        # A slit-pupilled eye wreathed in flame: the mascot designs keep their
+        # own palette in the bubble, so the preview shows the same thing (state
+        # colour on the corona, not on the eye). The corona is drawn explicitly
+        # because without it the state colour measured **4 px** on this glyph —
+        # the look's own idle colour was invisible on its tile, the same defect
+        # the bubble-side guard found on `void` (8 px). Fire stays fire; the
+        # colour rides the corona.
+        corona = QColor(color)
+        corona.setAlpha(150)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(corona))
+        p.drawEllipse(QPointF(cx, cy), r * 0.95, r * 0.52)
+        for sign in (-1.0, 1.0):
+            flame = QPainterPath()
+            flame.moveTo(cx, cy - r * 0.30)
+            flame.quadTo(cx + sign * r * 1.10, cy - r * 0.55,
+                         cx + sign * r * 0.95, cy + r * 0.30)
+            flame.quadTo(cx + sign * r * 0.60, cy + r * 0.20, cx, cy + r * 0.30)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(255, 106, 24, 190)))
+            p.drawPath(flame)
+        p.setBrush(QBrush(QColor(color).lighter(150)))
+        p.drawEllipse(QPointF(cx, cy), r * 0.72, r * 0.30)
+        p.setBrush(QBrush(QColor(255, 214, 120)))
+        p.drawEllipse(QPointF(cx, cy), r * 0.30, r * 0.22)
+        p.setBrush(QBrush(QColor(18, 10, 4)))
+        p.drawEllipse(QPointF(cx, cy), r * 0.055, r * 0.20)
+    elif design == "pikachu":
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(color).lighter(120)))
+        p.drawEllipse(QPointF(cx, cy + r * 0.08), r * 0.74, r * 0.66)
+        for sign in (-1.0, 1.0):
+            ear = QPainterPath()
+            ear.moveTo(cx + sign * r * 0.34, cy - r * 0.16)
+            ear.lineTo(cx + sign * r * 0.62, cy - r * 0.92)
+            ear.lineTo(cx + sign * r * 0.12, cy - r * 0.44)
+            ear.closeSubpath()
+            eg = QLinearGradient(QPointF(cx + sign * r * 0.30, cy - r * 0.30),
+                                 QPointF(cx + sign * r * 0.62, cy - r * 0.92))
+            eg.setColorAt(0.0, QColor(250, 205, 42))
+            eg.setColorAt(0.55, QColor(250, 205, 42))
+            eg.setColorAt(0.60, QColor(24, 20, 12))
+            eg.setColorAt(1.0, QColor(12, 10, 8))
+            p.setBrush(QBrush(eg))
+            p.drawPath(ear)
+        p.setBrush(QBrush(QColor(236, 60, 46)))
+        for sign in (-1.0, 1.0):
+            p.drawEllipse(QPointF(cx + sign * r * 0.42, cy + r * 0.34),
+                          r * 0.15, r * 0.13)
+        p.setBrush(QBrush(QColor(26, 20, 14)))
+        for sign in (-1.0, 1.0):
+            p.drawEllipse(QPointF(cx + sign * r * 0.24, cy - r * 0.06),
+                          r * 0.10, r * 0.11)
+    elif design == "cat":
+        # Ears first, then the head over their bases, then the tail behind:
+        # the same layering the bubble uses, so the preview cannot show a
+        # shape the desktop would not.
+        p.setPen(Qt.NoPen)
+        for sign in (-1.0, 1.0):
+            ear = QPainterPath()
+            ear.moveTo(cx + sign * r * 0.20, cy - r * 0.44)
+            ear.lineTo(cx + sign * r * 0.86, cy - r * 0.96)
+            ear.lineTo(cx + sign * r * 0.64, cy - r * 0.30)
+            ear.closeSubpath()
+            p.setBrush(QBrush(QColor(color).darker(135)))
+            p.setPen(QPen(QColor(color).lighter(150), 1.2))
+            p.drawPath(ear)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(color).lighter(125)))
+        p.drawEllipse(QPointF(cx, cy + r * 0.10), r * 0.76, r * 0.68)
+        p.setBrush(QBrush(QColor(246, 242, 238, 232)))
+        p.drawEllipse(QPointF(cx, cy + r * 0.32), r * 0.20, r * 0.13)
+        p.setBrush(QBrush(QColor(26, 22, 28)))
+        for sign in (-1.0, 1.0):
+            p.drawEllipse(QPointF(cx + sign * r * 0.28, cy - r * 0.04),
+                          r * 0.13, r * 0.16)
+    else:  # orb
+        body = QRadialGradient(cx, cy - r * 0.25, r * 1.15)
+        body.setColorAt(0.0, QColor(color).lighter(140))
+        body.setColorAt(1.0, QColor(color).darker(160))
+        p.setBrush(QBrush(body))
+        p.setPen(QPen(QColor(255, 255, 255, 45), 1))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+
+
+class LookTile(QPushButton):
+    """One look, drawn: its shape, its palette, and whether it is current.
+
+    A tile is still a QPushButton — keyboard, focus, tooltips and `isChecked()`
+    behave exactly as they did when a look was a text button — but its face is
+    painted, so the choice reads as a LOOK rather than as a label. The glyph
+    comes from `paint_design_glyph`, the same painter the Appearance preview
+    strip uses, so a tile cannot advertise a shape the bubble would not draw;
+    the three dots under it are the look's other state colours, and the ring
+    marks the current one.
+
+    Animation is driven by a clock the group owns and one shared timer ticks:
+    eight tiles must not mean eight 25 Hz timers in the settings process.
+    """
+
+    W, H = 76, 62
+    TICK_MS = 40
+    GLYPH_Y = 22.0
+    GLYPH_R = 15.0
+    DOTS_Y = GLYPH_Y + 20.0
+
+    def __init__(self, entry: dict, clock: QElapsedTimer, parent=None) -> None:
+        super().__init__(parent)
+        self.entry = entry
+        self._clock = clock
+        self._design = str(entry["design"])
+        self._colors = {k: QColor(v) for k, v in entry["colors"].items()}
+        self.setCheckable(True)
+        self.setFixedSize(self.W, self.H)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def paintEvent(self, _e) -> None:          # noqa: N802 (Qt naming)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            role = QPalette.ColorRole
+            checked = self.isChecked()
+            rect = QRectF(1.5, 1.5, self.width() - 3.0, self.height() - 3.0)
+            if checked:
+                p.setBrush(QBrush(self.palette().color(role.Highlight)))
+                p.setPen(QPen(self.palette().color(role.HighlightedText), 2.0))
+            else:
+                p.setBrush(QBrush(self.palette().color(role.Button)))
+                p.setPen(QPen(self.palette().color(role.Mid), 1.0))
+            p.drawRoundedRect(rect, 6, 6)
+
+            t = self._clock.elapsed() / 1000.0
+            paint_design_glyph(p, self._design, self.width() / 2.0,
+                               self.GLYPH_Y, self.GLYPH_R,
+                               self._colors["idle"], t, 1.0)
+
+            # the rest of the palette, so the tile shows the whole look: one
+            # dot per other state, under the glyph
+            x = self.width() / 2.0 - 12.0
+            p.setPen(Qt.NoPen)
+            for key in ("listening", "thinking", "speaking"):
+                p.setBrush(QBrush(self._colors[key]))
+                p.drawEllipse(QPointF(x, self.DOTS_Y), 3.0, 3.0)
+                x += 12.0
+
+            text = (self.palette().color(role.HighlightedText) if checked
+                    else self.palette().color(role.ButtonText))
+            p.setPen(QPen(text))
+            f = QFont()
+            f.setPointSize(7)
+            p.setFont(f)
+            p.drawText(2, self.height() - 16, self.width() - 4, 14,
+                       Qt.AlignHCenter, str(self.entry["label"]))
+        finally:
+            p.end()
+
+
 class BubblePreview(QWidget):
     """Four animated glyphs previewing the state colours, size and design."""
 
@@ -399,6 +653,17 @@ class BubblePreview(QWidget):
         self._timer.setInterval(33)
         self._timer.timeout.connect(self.update)
         self._timer.start()
+
+    @staticmethod
+    def _glyph(p, design: str, cx: float, cy: float, r: float,
+               color: QColor, t: float, k: float) -> None:
+        """Draw one design's silhouette (the shared module-level painter).
+
+        Kept as a method because the strip's own paint and the offscreen tests
+        already call it here; the drawing itself lives in
+        `paint_design_glyph`, which the Look tiles use too.
+        """
+        paint_design_glyph(p, design, cx, cy, r, color, t, k)
 
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
@@ -442,174 +707,6 @@ class BubblePreview(QWidget):
             p.drawText(int(cx - 40), int(cy + orb_r + 6 * k + 16), 80, 14,
                        Qt.AlignHCenter, name)
         p.end()
-
-    def _glyph(self, p, design: str, cx: float, cy: float, r: float,
-               color: QColor, t: float, k: float) -> None:
-        """Mini silhouette of the selected design in a state colour."""
-        import math as _math
-        if design == "halo":
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(color, max(2.0, r * 0.28)))
-            p.drawEllipse(QPointF(cx, cy), r * 0.86, r * 0.86)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(color))
-            p.drawEllipse(QPointF(cx, cy), r * 0.12, r * 0.12)
-        elif design == "reactor":
-            for j, (rr, spd, span) in enumerate(((0.95, 0.5, 1.8), (0.78, -0.4, 1.2), (0.62, 0.8, 2.4))):
-                a0 = t * 2 * _math.pi * spd + j
-                path = QPainterPath()
-                for i in range(17):
-                    a = a0 - span / 2 + i * (span / 16)
-                    x, y = cx + _math.cos(a) * r * rr, cy - _math.sin(a) * r * rr
-                    path.moveTo(x, y) if i == 0 else path.lineTo(x, y)
-                p.setBrush(Qt.NoBrush)
-                p.setPen(QPen(color, 2.2, Qt.SolidLine, Qt.RoundCap))
-                p.drawPath(path)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(color))
-            p.drawEllipse(QPointF(cx, cy), r * 0.14, r * 0.14)
-        elif design == "bloom":
-            body = QRadialGradient(cx, cy, r)
-            c = QColor(color)
-            c.setAlpha(150)
-            body.setColorAt(0.0, c)
-            c.setAlpha(0)
-            body.setColorAt(1.0, c)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(body))
-            p.drawEllipse(QPointF(cx, cy), r, r)
-            p.setBrush(QBrush(QColor(color).lighter(160)))
-            p.drawEllipse(QPointF(cx, cy), r * 0.22, r * 0.22)
-        elif design == "droplet":
-            drop = QPainterPath()
-            for i in range(37):
-                ang = i * 2 * _math.pi / 36
-                tip = _math.exp(-((ang - _math.pi / 2) / 0.55) ** 2)
-                rr = r * 0.85 * (1.0 + 0.42 * tip)
-                x, y = cx + rr * _math.cos(ang) * 0.92, cy - rr * _math.sin(ang)
-                drop.moveTo(x, y) if i == 0 else drop.lineTo(x, y)
-            drop.closeSubpath()
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(color))
-            p.drawPath(drop)
-        elif design == "cube":
-            rot = t * 0.5
-            pts = [(cx + r * 0.9 * _math.cos(rot + i * _math.pi / 3),
-                    cy - r * 0.9 * _math.sin(rot + i * _math.pi / 3)) for i in range(6)]
-            p.setPen(QPen(QColor(color).lighter(140), 1.6))
-            p.setBrush(QBrush(QColor(color).darker(130)))
-            p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
-            p.setPen(QPen(QColor(255, 255, 255, 90), 1.0))
-            for x, y in pts:
-                p.drawLine(QPointF(cx, cy), QPointF(x, y))
-        elif design == "equalizer":
-            p.setBrush(Qt.NoBrush)
-            for i in range(14):
-                a = i * 2 * _math.pi / 14
-                ln = r * (0.15 + 0.5 * abs(_math.sin(t * 3 + i * 1.1)))
-                p.setPen(QPen(color, 2.4, Qt.SolidLine, Qt.RoundCap))
-                p.drawLine(QPointF(cx + _math.cos(a) * r * 0.35, cy - _math.sin(a) * r * 0.35),
-                           QPointF(cx + _math.cos(a) * (r * 0.35 + ln), cy - _math.sin(a) * (r * 0.35 + ln)))
-        elif design == "crystal":
-            pts = [(cx + r * 0.9 * _math.cos(t * 0.4 + i * _math.pi / 3),
-                    cy - r * 0.9 * _math.sin(t * 0.4 + i * _math.pi / 3)) for i in range(6)]
-            p.setPen(QPen(QColor(color).lighter(140), 1.6))
-            p.setBrush(QBrush(QColor(color).darker(150)))
-            p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
-        elif design == "saturn":
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(color))
-            p.drawEllipse(QPointF(cx, cy), r * 0.5, r * 0.5)
-            p.save()
-            p.translate(cx, cy)
-            p.rotate(-20)
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(color).lighter(130), 2.0))
-            p.drawEllipse(QPointF(0, 0), r * 0.95, r * 0.32)
-            p.restore()
-        elif design == "void":
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(5, 5, 8)))
-            p.drawEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
-            p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(color).lighter(170), 1.8))
-            p.drawEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
-        elif design == "sauron":
-            # A slit-pupilled eye wreathed in flame: the mascot designs keep
-            # their own palette in the bubble, so the preview shows the same
-            # thing (state colour on the corona, not on the eye).
-            for sign in (-1.0, 1.0):
-                flame = QPainterPath()
-                flame.moveTo(cx, cy - r * 0.30)
-                flame.quadTo(cx + sign * r * 1.10, cy - r * 0.55,
-                             cx + sign * r * 0.95, cy + r * 0.30)
-                flame.quadTo(cx + sign * r * 0.60, cy + r * 0.20, cx, cy + r * 0.30)
-                p.setPen(Qt.NoPen)
-                p.setBrush(QBrush(QColor(255, 106, 24, 190)))
-                p.drawPath(flame)
-            p.setBrush(QBrush(QColor(color).lighter(150)))
-            p.drawEllipse(QPointF(cx, cy), r * 0.72, r * 0.30)
-            p.setBrush(QBrush(QColor(255, 214, 120)))
-            p.drawEllipse(QPointF(cx, cy), r * 0.30, r * 0.22)
-            p.setBrush(QBrush(QColor(18, 10, 4)))
-            p.drawEllipse(QPointF(cx, cy), r * 0.055, r * 0.20)
-        elif design == "pikachu":
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(color).lighter(120)))
-            p.drawEllipse(QPointF(cx, cy + r * 0.08), r * 0.74, r * 0.66)
-            for sign in (-1.0, 1.0):
-                ear = QPainterPath()
-                ear.moveTo(cx + sign * r * 0.34, cy - r * 0.16)
-                ear.lineTo(cx + sign * r * 0.62, cy - r * 0.92)
-                ear.lineTo(cx + sign * r * 0.12, cy - r * 0.44)
-                ear.closeSubpath()
-                eg = QLinearGradient(QPointF(cx + sign * r * 0.30, cy - r * 0.30),
-                                     QPointF(cx + sign * r * 0.62, cy - r * 0.92))
-                eg.setColorAt(0.0, QColor(250, 205, 42))
-                eg.setColorAt(0.55, QColor(250, 205, 42))
-                eg.setColorAt(0.60, QColor(24, 20, 12))
-                eg.setColorAt(1.0, QColor(12, 10, 8))
-                p.setBrush(QBrush(eg))
-                p.drawPath(ear)
-            p.setBrush(QBrush(QColor(236, 60, 46)))
-            for sign in (-1.0, 1.0):
-                p.drawEllipse(QPointF(cx + sign * r * 0.42, cy + r * 0.34),
-                              r * 0.15, r * 0.13)
-            p.setBrush(QBrush(QColor(26, 20, 14)))
-            for sign in (-1.0, 1.0):
-                p.drawEllipse(QPointF(cx + sign * r * 0.24, cy - r * 0.06),
-                              r * 0.10, r * 0.11)
-        elif design == "cat":
-            # Ears first, then the head over their bases, then the tail behind:
-            # the same layering the bubble uses, so the preview cannot show a
-            # shape the desktop would not.
-            p.setPen(Qt.NoPen)
-            for sign in (-1.0, 1.0):
-                ear = QPainterPath()
-                ear.moveTo(cx + sign * r * 0.20, cy - r * 0.44)
-                ear.lineTo(cx + sign * r * 0.86, cy - r * 0.96)
-                ear.lineTo(cx + sign * r * 0.64, cy - r * 0.30)
-                ear.closeSubpath()
-                p.setBrush(QBrush(QColor(color).darker(135)))
-                p.setPen(QPen(QColor(color).lighter(150), 1.2))
-                p.drawPath(ear)
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(color).lighter(125)))
-            p.drawEllipse(QPointF(cx, cy + r * 0.10), r * 0.76, r * 0.68)
-            p.setBrush(QBrush(QColor(246, 242, 238, 232)))
-            p.drawEllipse(QPointF(cx, cy + r * 0.32), r * 0.20, r * 0.13)
-            p.setBrush(QBrush(QColor(26, 22, 28)))
-            for sign in (-1.0, 1.0):
-                p.drawEllipse(QPointF(cx + sign * r * 0.28, cy - r * 0.04),
-                              r * 0.13, r * 0.16)
-        else:  # orb
-            body = QRadialGradient(cx, cy - r * 0.25, r * 1.15)
-            body.setColorAt(0.0, QColor(color).lighter(140))
-            body.setColorAt(1.0, QColor(color).darker(160))
-            p.setBrush(QBrush(body))
-            p.setPen(QPen(QColor(255, 255, 255, 45), 1))
-            p.drawEllipse(QPointF(cx, cy), r, r)
-
 
 class _LiveMicProbe:
     """GUI-free core of the settings app's live mic test: continuously opens
@@ -2432,16 +2529,25 @@ class SettingsWindow(QMainWindow):
         group = QGroupBox("Look", parent)
         gl = QVBoxLayout(group)
         row = QHBoxLayout()
+        self._look_clock = QElapsedTimer()
+        self._look_clock.start()
         for entry in self._looks:
-            btn = QPushButton(f"{entry['label']}", parent)
-            btn.setCheckable(True)
-            btn.setToolTip(self._look_tooltip(entry))
-            btn.clicked.connect(
+            tile = LookTile(entry, self._look_clock, parent)
+            tile.setToolTip(self._look_tooltip(entry))
+            tile.setAccessibleName(str(entry["label"]))
+            tile.clicked.connect(
                 lambda _=False, name=str(entry["name"]): self._apply_look(name))
-            self.look_buttons[str(entry["name"])] = btn
-            row.addWidget(btn)
+            self.look_buttons[str(entry["name"])] = tile
+            row.addWidget(tile)
         row.addStretch(1)
         gl.addLayout(row)
+        # ONE timer for the whole strip (see LookTile): it exists so the tiles
+        # look alive before you click one, and it dies with the group.
+        self._look_anim = QTimer(group)
+        self._look_anim.setInterval(LookTile.TICK_MS)
+        self._look_anim.timeout.connect(
+            lambda: [tile.update() for tile in self.look_buttons.values()])
+        self._look_anim.start()
         self.look_label = QLabel("", parent)
         self.look_label.setStyleSheet("color: palette(mid);")
         gl.addWidget(self.look_label)

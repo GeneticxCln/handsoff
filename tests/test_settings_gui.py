@@ -1186,6 +1186,99 @@ def every_design_has_its_own_preview_glyph():
 
 
 @scenario
+def look_tiles_are_drawn_from_the_shared_painter():
+    # A Look used to be a text button: the picker promised a name and nothing
+    # more. Now each look is DRAWN, and a drawn face is a claim about the
+    # bubble, so three things are pinned. The whole palette must land on the
+    # tile — a face showing only its idle colour is the "nothing applies"
+    # complaint in miniature. The glyph must come from the ONE shared painter
+    # rather than a private copy, or a tile could advertise a shape the
+    # Appearance strip and the bubble would not draw. And the strip must share
+    # one timer instead of one per tile.
+    import json as _json
+    from PySide6.QtCore import QRectF, Qt, QTimer
+    from PySide6.QtGui import QBrush, QColor, QImage
+    from settings_schema import APPEARANCE_LOOKS
+
+    tiles = win.look_buttons
+    names = [str(e["name"]) for e in APPEARANCE_LOOKS]
+    assert len(APPEARANCE_LOOKS) >= 5, APPEARANCE_LOOKS   # never vacuous
+    assert sorted(tiles) == sorted(names), sorted(tiles)
+
+    def face(tile):
+        img = QImage(tile.width(), tile.height(), QImage.Format_ARGB32)
+        img.fill(0)
+        tile.render(img)
+        return img
+
+    def visible(before, after):
+        n = 0
+        for y in range(before.height()):
+            for x in range(before.width()):
+                a, b = before.pixelColor(x, y), after.pixelColor(x, y)
+                if (abs(a.red() - b.red()) + abs(a.green() - b.green())
+                        + abs(a.blue() - b.blue())) >= 24:
+                    n += 1
+        return n
+
+    for entry in APPEARANCE_LOOKS:
+        name = str(entry["name"])
+        tile = tiles[name]
+        assert isinstance(tile, settings_app.LookTile), (name, type(tile))
+        assert tile._design == entry["design"], (name, tile._design)
+        assert tile.accessibleName() == entry["label"], name
+        keep = dict(tile._colors)
+        for key in ("idle", "listening", "thinking", "speaking"):
+            before = face(tile)
+            tile._colors[key] = QColor("#00ff00")
+            moved = visible(before, face(tile))
+            tile._colors[key] = keep[key]
+            floor = 100 if key == "idle" else 20
+            assert moved >= floor, (
+                f"look {name} ({entry['design']}) shows only {moved} pixel(s) "
+                f"of its {key} colour — the tile's face is not the look")
+
+    # ONE shared painter: swap it for a sentinel and every tile must draw the
+    # sentinel instead, in catalogue order. A private copy inside LookTile
+    # would leave this list empty.
+    sentinel_designs = []
+    real_glyph = settings_app.paint_design_glyph
+
+    def _sentinel(p, design, cx, cy, r, color, t, k):
+        sentinel_designs.append(design)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(255, 0, 255, 255)))
+        p.drawRect(QRectF(0.0, 0.0, 10.0, 10.0))
+
+    settings_app.paint_design_glyph = _sentinel
+    try:
+        for entry in APPEARANCE_LOOKS:
+            face(tiles[str(entry["name"])])
+    finally:
+        settings_app.paint_design_glyph = real_glyph
+    assert sentinel_designs == [str(e["design"]) for e in APPEARANCE_LOOKS], \
+        sentinel_designs
+
+    # ONE timer for the strip, not one per tile
+    for name, tile in tiles.items():
+        assert not tile.findChildren(QTimer), (
+            f"tile {name} owns its own timer — the strip shares one")
+    assert win._look_anim.isActive()
+    assert win._look_anim.interval() == settings_app.LookTile.TICK_MS
+
+    # the TILE is the click target, not a helper called behind it
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    target = APPEARANCE_LOOKS[-1]
+    tiles[str(target["name"])].click()
+    win._apply_appearance_live()
+    on_disk = _json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["bubble_design"] == target["design"], \
+        on_disk["bubble_design"]
+    assert on_disk["colors"] == target["colors"], on_disk["colors"]
+
+
+@scenario
 def voice_tab_level_meter_reads_the_bubble_feed():
     # The Voice tab's meter shows the SAME level signal the bubble's designs
     # paint from, so the feed can be diagnosed without watching the bubble.
@@ -1721,6 +1814,7 @@ SCENARIO_NAMES = [
     "every_look_is_renderable_and_reacts",
     "the_cat_keeps_its_ears_inside_its_own_mask",
     "every_design_has_its_own_preview_glyph",
+    "look_tiles_are_drawn_from_the_shared_painter",
     "voice_tab_level_meter_reads_the_bubble_feed",
     "external_change_reloads_and_reports",
     "missing_settings_file_mtime_is_zero",

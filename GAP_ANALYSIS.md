@@ -2507,3 +2507,63 @@ voice, the cat's paint branch removed (falls through to the orb), and a preview
 missing its glyph. 1051 tests green in seven orderings (default, shuffled-test seeds
 1/424242/deadbeef/20260913, shuffled-file seeds 2/cafef00d/7), coverage
 **79.65 % ≥ 70**, `ci/compile_all.py` clean (41 files).
+
+## Addendum — drawn Appearance looks (2026-09-13)
+
+The Look picker shipped as text buttons: a name, a tooltip, and nothing that showed
+what the name meant. A picker that asks you to choose a LOOK while showing you words is
+the same complaint this tab keeps producing — "I clicked it and nothing changed" is
+hard to tell apart from "it applied something I cannot see". Each look is now a
+`LookTile`: a checkable QPushButton whose face is painted.
+
+### The glyph comes from ONE painter
+
+The tile's silhouette is drawn by `paint_design_glyph`, lifted to module level out of
+`BubblePreview._glyph` and now called by both widgets. That is the whole point of the
+move: a tile with its own copy of the drawing code could advertise a shape the
+Appearance strip — and the bubble — would not draw, which is precisely the class of
+lie the previous addendum found in the preview (sauron and pikachu falling through to
+the orb). The scenario therefore does not compare pixels against a hard-coded
+expectation; it swaps `paint_design_glyph` for a sentinel and asserts every tile drew
+the sentinel, in catalogue order, with its own design name. A private copy fails that
+loop by leaving it empty.
+
+### Every state colour has to be readable on the face
+
+The instrument is the one the bubble-side guard uses: render the tile, change ONLY one
+of the four state colours, and count pixels that differ by a visible step. Idle rides
+in the glyph; the other three are dots under it. Measured floors per look: idle
+223–732 px, and exactly 32 px for each of the three dots — floors of 100 and 20 sit
+safely below the narrowest case without being decorative.
+
+The same instrument caught a real defect in the `allseeing` tile, and it was a defect
+of the *shared* painter rather than the tile: the Eye glyph was wreathed in its own
+fire palette, so the look's idle colour measured **4 px** — the state colour was
+invisible on the tile that claims it. Against `void`'s 8 px, that is the identical bug
+one widget up. The sauron branch now draws an explicit state-coloured corona under the
+flames; fire stays fire, and the colour rides the corona. Measured 337 px after.
+
+### One timer, not eight
+
+Animation is what makes a look read as a look rather than as a snapshot, but eight
+tiles must not mean eight 25 Hz timers in the settings process. The strip owns one
+`QElapsedTimer` and one `QTimer` created against the group, so it dies with the
+section; every tile reads the shared clock. The guard asserts no tile owns a QTimer
+child at all and that the strip's timer is running at the tile's interval — a
+mutation that gives each tile its own timer, or that never starts the shared one, is
+caught.
+
+### Verified
+
+**21/21 mutations caught** — the seven new ones are: a tile that denies the design it
+stands for (hard-coded orb), the three state dots removed, the sauron corona removed
+(state colour invisible again), a per-tile timer, a never-started strip timer, the
+look demoted back to a plain text button, and the tile no longer being the thing you
+click. The fourteen earlier mutations in this sweep still pass after the painter move,
+including the one whose anchor had to be re-pointed because the glyph left the class
+body. 1052 tests green in seven orderings (default, shuffled-test seeds
+1/424242/deadbeef/20260913, shuffled-file seeds 2/cafef00d/7), coverage
+**79.73 % ≥ 70**, `ci/compile_all.py` clean (41 files); deployed `in-sync`
+(15/15 files, service restarted, `--ptt doctor` reporting `deployment: in-sync` and
+`appearance: look Custom (pikachu, 134 px)`, installed
+`handsoff-settings.py --selftest` rc 0).
