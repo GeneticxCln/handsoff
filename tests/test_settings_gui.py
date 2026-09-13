@@ -2746,7 +2746,11 @@ def the_appearance_panel_previews_a_pack_before_installing_it():
     # "nothing applies" complaint again), nothing is installed until Try it,
     # cancelling puts the strip back and removes the temporary folder a
     # previewed FILE was unpacked into, and a pack that cannot be read is
-    # refused in the sentence an install would use.
+    # refused in the sentence an install would use. The candidate is also
+    # PUSHED to the running bubble so the look can be judged on the real
+    # desktop, with a heartbeat that is what keeps it there and a clear on every
+    # way the preview ends (a window that closes without clearing is a bubble
+    # that stops previewing by itself, which the bubble's own deadline covers).
     import json as _json
     import shutil as _shutil
     import zipfile as _zipfile
@@ -2794,7 +2798,29 @@ def the_appearance_panel_previews_a_pack_before_installing_it():
     real_open = settings_app.QFileDialog.getOpenFileName
     real_dir = settings_app.QFileDialog.getExistingDirectory
     real_name = settings_app.QInputDialog.getText
+    # The preview is PUSHED to the running bubble, so the look can be judged on
+    # the real desktop rather than only in the strip. The command is recorded
+    # and `run_bg` is made SYNCHRONOUS here, so what is asserted is the panel's
+    # decisions (which folder, drawn or only-in-this-window, cleared when)
+    # rather than a worker thread's timing.
+    sent = []
+    real_cmd = settings_app._socket_command
+    real_run_bg = win.run_bg
+
+    def record(sock, payload, timeout=1.5):
+        sent.append(payload)
+        return "previewing Whatever on the bubble \u2014 nothing installed"
+
+    def run_bg_now(fn, done):
+        try:
+            ok, result = True, fn()
+        except Exception as exc:        # noqa: BLE001
+            ok, result = False, exc
+        done(ok, result)
+
     settings_app.BubblePreview._draw_image_glyph = _recording
+    settings_app._socket_command = record
+    win.run_bg = run_bg_now
     try:
         win.preview.resize(320, 200)
         win.preview._clock = _FrozenClock()
@@ -2818,6 +2844,29 @@ def the_appearance_panel_previews_a_pack_before_installing_it():
         for state, _ok, path in seen:
             assert path == str(candidate / f"{state}.png"), (state, path)
 
+        # --- ...and the BUBBLE draws it too: same folder, nothing installed,
+        # --- and the label says where it is so the panel cannot imply more
+        assert sent[-1] == f"preview-pack {candidate}", sent
+        assert win._preview_timer.isActive(), "the heartbeat holds it up"
+        assert "drawn on the bubble" in win.preview_label.text(), (
+            win.preview_label.text())
+        # the heartbeat is what keeps it up: another beat is another offer
+        beats = len(sent)
+        win._renew_live_pack_preview()
+        assert sent[beats:] == [f"preview-pack {candidate}"], sent
+
+        # --- and it must not CLAIM the desktop shows it when the bubble is not
+        # --- running: "drawn on the bubble" and "only this window" are
+        # --- different facts, and telling them apart is why it is pushed live
+        settings_app._socket_command = lambda *a, **k: None
+        win._preview_design_pack("folder")
+        assert "only this window shows it" in win.preview_label.text(), (
+            win.preview_label.text())
+        settings_app._socket_command = record
+        win._preview_design_pack("folder")
+        assert "drawn on the bubble" in win.preview_label.text(), (
+            win.preview_label.text())
+
         # --- Try it is what installs, and it is what you were shown
         win._try_design_pack()
         assert win._design_pack == "candidate", win.status_label.text()
@@ -2825,6 +2874,12 @@ def the_appearance_panel_previews_a_pack_before_installing_it():
         assert (packs_root / "candidate" / "pack.json").is_file()
         assert win.preview_try.isHidden(), "Try it goes away with the preview"
         assert win.preview_label.isHidden(), "the preview label goes with it"
+        # Taking it must take the CANDIDATE off the desktop: what is installed
+        # now draws itself, and a preview still up would be the panel and the
+        # bubble disagreeing about which pack is on screen.
+        assert sent[-1] == "preview-clear", sent
+        assert not win._preview_timer.isActive(), (
+            "the heartbeat has to stop with the preview")
 
         # --- a pack that cannot be read is refused, and there is nothing to try
         broken = folder / "broken"
@@ -2854,9 +2909,22 @@ def the_appearance_panel_previews_a_pack_before_installing_it():
             win.preview_label.text())
         scratch = str(win._preview_scratch or "")
         assert scratch and Path(scratch).is_dir(), scratch
+        # The bubble is told to draw the UNPACKED folder: it cannot read a
+        # .hpack, and the panel is what owns that temporary folder.
+        assert sent[-1] == f"preview-pack {scratch}", sent
+        assert f"preview-pack {pack_file}" not in sent, sent
         win._cancel_design_pack_preview()
         assert not Path(scratch).exists(), (
             "cancelling a file preview has to remove what it unpacked")
+        assert sent[-1] == "preview-clear", sent
+        assert win._preview_live_note == "", (
+            "the clear is sent for a preview that is already gone, so its reply "
+            "must not write a note that would be shown against the NEXT one")
+        # ...and neither may a reply that arrives late: the send is a thread and
+        # the drop is not, so this is the one that would say "drawn on the
+        # bubble" about a candidate nothing has asked the bubble to draw yet.
+        win._note_live_pack_preview(True, "previewing Stale on the bubble")
+        assert win._preview_live_note == "", win._preview_live_note
         assert "cancelled" in win.status_label.text(), win.status_label.text()
         assert win.preview_try.isHidden(), "nothing left to decide"
         assert "candidate" in sorted(p.name for p in packs_root.iterdir()), (
@@ -2906,11 +2974,15 @@ def the_appearance_panel_previews_a_pack_before_installing_it():
         win.close()
         assert not Path(scratch).exists(), (
             "closing the window has to remove the folder a preview unpacked")
+        assert sent[-1] == "preview-clear", (
+            "closing is also the last chance to take it off the desktop")
     finally:
         settings_app.BubblePreview._draw_image_glyph = real_draw
         settings_app.QFileDialog.getOpenFileName = real_open
         settings_app.QFileDialog.getExistingDirectory = real_dir
         settings_app.QInputDialog.getText = real_name
+        settings_app._socket_command = real_cmd
+        win.run_bg = real_run_bg
         _shutil.rmtree(packs_root, ignore_errors=True)
 
 

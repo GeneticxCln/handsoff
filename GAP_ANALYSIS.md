@@ -3295,3 +3295,63 @@ preview cleanup) turned both red — a failure that says "the code moved", not "
 Both now take the whole METHOD via a new `conftest.method_source`, and the proof that it is fixed is
 live: they pass with the line that broke them still in place. The third such site
 (`_refresh_health` + 900 characters) was fixed the same way.
+
+## The preview on the real desktop, not only in the strip
+
+**What was missing.** A preview could only be seen inside the settings window. The strip answers
+"what does it look like"; nothing answered "how does it look HERE" — against the wallpaper, beside
+the other windows, at the size this bubble really is — so the last question before Try it was still
+answered by taking the pack and looking at your desktop afterwards.
+
+**The panel already had the art, and the bubble already knew how to draw it; what was missing was a
+channel.** `preview-pack <folder>` and `preview-clear` are control-socket verbs, and the panel sends
+them off the GUI thread (a socket round trip with a timeout must not freeze a window that may be
+trying to close). The bubble holds the candidate in MEMORY and consults it in `design_picture`
+before the settings, so a preview beats the saved look without editing it, and `effective_art`,
+`export_pack` and the doctor note all keep reading one precedence.
+
+**A preview that only swapped the picture would change nothing on the desktop**, so
+`design_in_effect()` forces the `image` design while a preview is up, and it is now the ONE place
+that decides — the painter and the window mask both ask it, so they cannot disagree about which
+shape is on screen (the panel's strip made the same decision one commit earlier, for the same
+reason).
+
+**Its validity is the install's validity, checked where it is used.** The candidate is re-read and
+validated with `_read_pack_folder` on every request, and a refusal CLEARS whatever was being
+previewed — the caller asked for this instead, so leaving the previous candidate drawing would be
+showing art nobody asked for. Because the check happens on each renewal rather than once at the
+door, a candidate whose folder is deleted or edited mid-preview is detected and dropped instead of
+drawn from state that no longer matches the disk.
+
+**Nothing is written, so the only thing that can leak is drawing.** The bubble owns no temporary
+folder — a previewed FILE's folder stays the panel's, exactly as before — and the deadline is what
+ends a preview whose panel is gone: the panel's heartbeat renews it, and a panel that is closed,
+killed or disconnected simply stops renewing. The expiry is checked on READ rather than by a timer,
+so the answer cannot be stale between a timer and the paint that follows it. A renewal already in
+flight can still land after a clear; that is bounded on purpose (the bubble drops what nobody
+renews), so the worst case is a few more seconds of the candidate rather than a bubble stuck on it.
+The ordering that removes the rest of the race is the one the `_preview_art` guard pins: a reply
+that arrives after a preview was dropped writes nothing, so it cannot say "drawn on the bubble"
+about a candidate nothing has asked the bubble to draw yet.
+
+**The panel never claims more than it knows.** `drawn on the bubble` and `the bubble is not
+running, so only this window shows it` are different facts, and telling them apart is why the
+command is sent at all rather than assumed. The clear is sent with its reply IGNORED — its note
+would belong to a preview that is already gone — and the window's close path now drops a preview
+whether or not it had unpacked anything (a previewed FOLDER has no temporary folder, so the old
+`_preview_scratch` guard let it through).
+
+**`doctor` says it out loud.** A preview draws art the settings do not name, which is exactly where
+the appearance line would describe a look the bubble is not drawing, and do it while someone is
+staring at the difference: the line grows `— previewing Candidate (not installed)` and keeps
+describing the CONFIGURED look beside it.
+
+**Guards and evidence.** `TestLivePackPreview` (5 cases, no QApplication: the per-state precedence of
+a preview, a refusal equal to the install's own sentence, a renewal moving the deadline, lapse with
+no renewal, and a candidate that stops being a pack under a live preview), one end-to-end test over
+the REAL control socket in `TestControlSocket`, the doctor-line test in `tests/test_settings.py`, and
+the extended offscreen scenario (which records the commands and makes `run_bg` synchronous, so what
+is asserted is the panel's decisions rather than a thread's timing). **20/20 mutations** back to the
+old behaviour caught on the first pass, one per decision. The preview is also process-global state,
+so the shared `bubble` fixture now resets it: a preview left behind by one test would otherwise be
+drawn by the next one.

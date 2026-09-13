@@ -549,6 +549,61 @@ class TestControlSocket:
         H, _delivered, _app = server
         assert self._roundtrip(H.CONTROL_SOCK, "status").startswith("state=")
 
+    def test_a_previewed_pack_is_drawn_by_the_running_bubble(self, server,
+                                                             tmp_path):
+        """The Appearance panel's live preview, over the real socket.
+
+        The panel cannot draw on the desktop, so the preview is a COMMAND — and
+        what has to hold is that the bubble is what ends up drawing it, that a
+        folder which is not a pack is refused here in the very words an install
+        would use (the same reading, so a preview cannot be more forgiving than
+        the install it stands in for), and that the panel can always take it
+        back off. Nothing is installed and the settings are not touched: a
+        preview is not an edit.
+        """
+        from PySide6.QtGui import QColor, QImage
+        H, _delivered, _app = server
+        bubble = H._core_bubble
+        source = tmp_path / "cand"
+        source.mkdir()
+        img = QImage(32, 32, QImage.Format_ARGB32)
+        img.fill(QColor(20, 90, 180, 255))
+        assert img.save(str(source / "idle.png")), "a real PNG is required"
+        (source / "pack.json").write_text(
+            json.dumps({"name": "Candidate", "states": {"idle": "idle.png"},
+                        "any": "idle.png"}), encoding="utf-8")
+        before = bubble.design_picture("idle")
+        try:
+            reply = self._roundtrip(H.CONTROL_SOCK, f"preview-pack {source}")
+            assert "previewing Candidate" in reply, reply
+            assert "nothing installed" in reply, reply
+            assert Path(bubble.design_picture("idle")) == source / "idle.png"
+            assert bubble.design_in_effect() == "image", (
+                "a preview has to be drawn by the design that draws pictures")
+            assert bubble.installed_packs() == [], "a preview installs nothing"
+
+            # A folder that is not a pack is refused HERE, in the sentence an
+            # install would use — and it ends the preview that was up, because
+            # the caller asked for this instead.
+            refused = self._roundtrip(H.CONTROL_SOCK,
+                                      f"preview-pack {tmp_path}").strip()
+            assert refused == bubble.install_pack(tmp_path)[1], (
+                f"preview and install must refuse in the SAME words: {refused}")
+            assert bubble.design_picture("idle") == before
+
+            assert "previewing Candidate" in self._roundtrip(
+                H.CONTROL_SOCK, f"preview-pack {source}")
+            assert self._roundtrip(H.CONTROL_SOCK, "preview-clear").strip() == \
+                "stopped previewing Candidate"
+            assert bubble.design_picture("idle") == before
+            assert self._roundtrip(H.CONTROL_SOCK, "preview-clear").strip() == \
+                "no pack was being previewed"
+        finally:
+            # The preview is process-global state in the bubble module, and the
+            # module is shared with the rest of the suite: leaving one up would
+            # be drawing it from another test's assertions.
+            bubble.clear_pack_preview()
+
     def test_generation_bump_is_atomic_under_contention(self, H):
         """Two threads must never claim the same turn generation.
 

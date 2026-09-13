@@ -1186,3 +1186,38 @@ class TestAppearanceLooks:
                    H._core_doctor._lines(deps))
         assert not any(line.startswith("appearance:") for line in
                        H._core_doctor._lines(H._core_doctor.DoctorDeps()))
+
+    def test_the_look_doctor_reports_says_when_a_preview_is_on_screen(
+            self, H, tmp_path):
+        """A preview draws art the settings do NOT name.
+
+        That is precisely where the appearance line would describe a look the
+        bubble is not drawing — and do it while someone is staring at the
+        difference — so the line says it while a preview is up and stops saying
+        it the moment the preview is gone.
+        """
+        import json as _json
+        from PySide6.QtGui import QColor, QImage
+
+        H.SETTINGS.clear()
+        H.SETTINGS.update({"bubble_design": "orb", "design_pack": "",
+                           "design_image_path": ""})
+        assert "previewing" not in H._appearance_note()
+        source = tmp_path / "cand"
+        source.mkdir()
+        img = QImage(32, 32, QImage.Format_ARGB32)
+        img.fill(QColor(20, 90, 180, 255))
+        assert img.save(str(source / "idle.png"))
+        (source / "pack.json").write_text(_json.dumps(
+            {"name": "Candidate", "states": {"idle": "idle.png"},
+             "any": "idle.png"}), encoding="utf-8")
+        try:
+            assert H._core_bubble.set_pack_preview(source)[0] == "Candidate"
+            note = H._appearance_note()
+            assert "previewing Candidate (not installed)" in note, note
+            assert "orb" in note, (
+                "doctor describes the CONFIGURED look and then says what is "
+                "actually on screen, rather than silently rewriting it")
+        finally:
+            H._core_bubble.clear_pack_preview()
+        assert "previewing" not in H._appearance_note()

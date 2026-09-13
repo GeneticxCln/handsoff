@@ -660,6 +660,14 @@ def _appearance_note() -> str:
         # would be the line contradicting itself.
         note = (f"{note} — picture per state: {len(usable)}/"
                 f"{len(_core_bubble.PACK_STATES)}")
+    try:
+        # A live preview draws art the settings do NOT name, so this has to be
+        # said here or the line describes a look the bubble is not drawing.
+        shown = _core_bubble.preview_note()
+    except Exception:
+        shown = ""
+    if shown:
+        note = f"{note} — {shown}"
     return f"{note} — image: {problem}" if problem else note
 
 
@@ -1473,6 +1481,11 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
                               "deployment")
 
         design_region = _missing
+        # The live preview the Appearance panel drives: an ACTION on the bubble,
+        # so a partial install must refuse it loudly (see `_missing`) rather
+        # than silently draw nothing.
+        set_pack_preview = _missing
+        clear_pack_preview = _missing
 
         class BubbleWidget:
             def __init__(self, *_args, **_kwargs):
@@ -5077,6 +5090,50 @@ class Assistant(QObject):
                 pass  # widget deleted during shutdown
         log.info("settings reloaded live (no restart)")
 
+    def set_pack_preview(self, source: str) -> str:
+        """Draw a pack on the bubble WITHOUT installing it (panel preview).
+
+        Runs on the control-socket thread. The state is in memory and guarded by
+        the bubble module's own lock, and the repaint is asked for so the look
+        changes on the next frame rather than on the next state change.
+
+        Nothing here touches the settings: a preview is not an edit, which is
+        what makes Cancel a no-op instead of an undo, and what makes a panel
+        that dies leave nothing behind but a bubble that stops previewing.
+        """
+        try:
+            _name, message = _core_bubble.set_pack_preview(source)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("pack preview failed")
+            return f"error: could not preview that pack ({exc})"
+        self._repaint_bubble()
+        return message
+
+    def clear_pack_preview(self) -> str:
+        """Stop drawing a previewed pack: the bubble goes back to its own look."""
+        try:
+            message = _core_bubble.clear_pack_preview()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("clearing the pack preview failed")
+            return f"error: could not clear the pack preview ({exc})"
+        self._repaint_bubble()
+        return message
+
+    def _repaint_bubble(self) -> None:
+        """Ask the bubble widget to redraw now, not on its next state change.
+
+        The animation tick repaints within 16 ms, so this is the difference
+        between the look changing on the next frame and on the next state
+        transition — and `update()` is the one Qt call the existing live-reload
+        path already makes from this thread.
+        """
+        bw = getattr(self, "_bubble_widget", None)
+        if bw is not None:
+            try:
+                bw.update()
+            except RuntimeError:
+                pass  # widget deleted during shutdown
+
     def _on_command(self, action: str) -> None:
         if action.startswith("__timer:"):
             name, _, rep = action[len("__timer:"):].partition("\x1f")
@@ -5993,7 +6050,11 @@ PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                "handsfree", "handsfree-on", "handsfree-off",
                "handsfree-status", "dictation", "dictation-on", "dictation-off",
                "status", "health", "level", "doctor", "settings", "selftest",
-               "reload-settings", "clear-history", "say"}
+               "reload-settings", "clear-history", "say",
+               # The Appearance panel's live preview: the bubble draws a pack
+               # that is NOT installed, so a look can be judged on the real
+               # desktop before Try it takes it.
+               "preview-pack", "preview-clear"}
 
 
 def _peer_uid(conn: "socket.socket") -> "int | None":
@@ -6309,6 +6370,14 @@ class ControlServer:
                                 reply = f"error: doctor report failed: {e}"
                         elif action == "say":
                             reply = self._assistant.say_preview(action_arg)
+                        elif action == "preview-pack":
+                            # The folder is a path the CALLER chose, so the
+                            # bubble validates it itself (the same reading an
+                            # install does) instead of drawing whatever it is
+                            # pointed at.
+                            reply = self._assistant.set_pack_preview(action_arg)
+                        elif action == "preview-clear":
+                            reply = self._assistant.clear_pack_preview()
                         elif action == "settings":
                             if SETTINGS_APP.exists():
                                 subprocess.Popen(
@@ -6460,6 +6529,10 @@ commands:
   doctor         human-readable diagnostic: deployment hashes, Ollama, mic, niri, systemd
   say <text>     speak <text> now as a voice preview (Settings → Voice uses this
                  so the preview is the bubble's own voice, not a second model)
+  preview-pack <folder>  draw a design pack on the bubble WITHOUT installing it
+                 (Settings → Appearance's preview sends this; the bubble drops
+                 it by itself if nothing renews it)
+  preview-clear  stop drawing a previewed pack: back to the saved look
   selftest       run the hardware typing checks (launches scratch windows on
                  THIS desktop, types only into them, restores the clipboard)"""
 

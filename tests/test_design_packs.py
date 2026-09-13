@@ -58,6 +58,11 @@ def bubble(tmp_path, monkeypatch):
     # tests installing the same slug would otherwise share entries.
     monkeypatch.setattr(mod, "_PACK_CACHE", {})
     monkeypatch.setattr(mod, "_IMAGE_CACHE", {})
+    # ...and so is the live preview the settings panel pushes. It is what the
+    # BUBBLE is drawing, so a preview left behind by one test would be drawn by
+    # the next one — the same class of leak, in the thing that is most visible.
+    monkeypatch.setattr(mod, "_PREVIEW", {"manifest": None, "name": "",
+                                           "source": "", "at": 0.0})
     return mod
 
 
@@ -1205,6 +1210,154 @@ class TestSettingsPlumbing:
         assert coerce_settings(dict(
             DEFAULT_SETTINGS,
             design_pack="not-installed-yet"))["design_pack"] == "not-installed-yet"
+
+
+class TestLivePackPreview:
+    """A pack drawn on the BUBBLE before it is installed: the panel's preview.
+
+    The strip answers "what does it look like"; only the desktop answers "how
+    does it look HERE", which is why the candidate is handed to the bubble at
+    all. What is pinned here is that the second answer is the SAME pack (judged
+    by the reading an install would use), that it wins over the settings without
+    editing them, that it is drawn by the `image` design whatever shape the
+    settings name — a preview no one can see on the desktop is the old "nothing
+    applies" complaint again — and that it always ENDS: because the panel said
+    so, because the pack stopped being one, or because nobody renewed it.
+    """
+
+    PALETTE = {"idle": (10, 20, 30, 255), "listening": (40, 50, 60, 255),
+               "any": (200, 210, 220, 255)}
+
+    class _Clock:
+        """A monotonic clock the test advances by hand: no sleeps, no flakes.
+
+        The expiry is the whole reason a panel that dies cannot leave a look on
+        the desktop, and it is only testable if time is something the test owns.
+        """
+
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+    def art(self, folder: Path, *want: str) -> dict:
+        return {label: png(folder / f"{label}.png", self.PALETTE[label])
+                for label in want}
+
+    def test_a_previewed_pack_is_drawn_and_wins_over_the_settings(
+            self, bubble, tmp_path):
+        source = tmp_path / "cand"
+        shots = self.art(source, "idle", "listening", "any")
+        manifest(source, {"name": "Candidate",
+                          "states": {"idle": "idle.png",
+                                     "listening": "listening.png"},
+                          "any": "any.png"})
+        # The saved look, which the preview must OVERRIDE and must not change.
+        saved = png(tmp_path / "saved.png", (1, 2, 3, 255))
+        bubble.SETTINGS.update({"bubble_design": "cat",
+                                "design_image_path": str(saved)})
+
+        name, message = bubble.set_pack_preview(source)
+        assert name == "Candidate", message
+        assert "nothing installed" in message, message
+        # Every state: its own picture where the pack has one, the pack's
+        # fallback for the states it does not — the same precedence a pack has.
+        assert Path(bubble.design_picture("idle")) == shots["idle"]
+        assert Path(bubble.design_picture("listening")) == shots["listening"]
+        assert Path(bubble.design_picture("thinking")) == shots["any"]
+        assert Path(bubble.design_picture("speaking")) == shots["any"]
+        # A pack is only ever drawn by the `image` design, so the preview has to
+        # BE that design: swapping the picture alone would change nothing on the
+        # desktop of a bubble that draws a cat.
+        assert bubble.design_in_effect() == "image"
+        assert bubble.SETTINGS["bubble_design"] == "cat", (
+            "a preview is not an edit")
+        assert bubble.preview_note() == "previewing Candidate (not installed)"
+        assert bubble.installed_packs() == [], (
+            "previewing must not install or copy anything")
+
+        assert bubble.clear_pack_preview() == "stopped previewing Candidate"
+        assert bubble.design_in_effect() == "cat", "back to the saved look"
+        assert Path(bubble.design_picture("idle")) == saved
+        assert bubble.preview_note() == "", "nothing is being previewed now"
+        # ...and clearing something that was not there says exactly that, rather
+        # than claiming to have stopped a preview that never existed.
+        assert bubble.clear_pack_preview() == "no pack was being previewed"
+
+    def test_a_pack_that_would_not_install_is_refused_and_clears_the_last(
+            self, bubble, tmp_path):
+        # A preview must not be more forgiving than an install — and a REFUSAL
+        # has to take the previous candidate down: the panel asked to show this
+        # instead, so leaving the old one up would be showing art nobody asked
+        # for (and the one thing the user would then be judging).
+        good = tmp_path / "good"
+        shots = self.art(good, "idle", "any")
+        manifest(good, {"name": "Good", "states": {"idle": "idle.png"},
+                        "any": "any.png"})
+        broken = tmp_path / "broken"
+        manifest(broken, {"name": "Broken", "any": "missing.png"})
+        saved = png(tmp_path / "saved.png", (1, 2, 3, 255))
+        bubble.SETTINGS.update({"design_image_path": str(saved)})
+
+        assert bubble.set_pack_preview(good)[0] == "Good"
+        assert Path(bubble.design_picture("idle")) == shots["idle"]
+        name, problem = bubble.set_pack_preview(broken)
+        assert name == "", problem
+        assert bubble.install_pack(broken)[1] == problem, (
+            "a preview has to refuse a pack in the very words an install would")
+        assert bubble.pack_preview() is None, "a refused preview is not kept"
+        assert Path(bubble.design_picture("idle")) == saved, (
+            "the rejected candidate is gone, and the old one went with it")
+
+    def test_a_preview_stops_when_nobody_renews_it(self, bubble, tmp_path,
+                                                   monkeypatch):
+        clock = self._Clock()
+        monkeypatch.setattr(bubble, "time", clock)
+        source = tmp_path / "cand"
+        self.art(source, "idle")
+        # `any` and not only `idle`: a pack has to cover every state, one way or
+        # the other, and the validator is what says so (see TestPackRefusals).
+        manifest(source, {"name": "Candidate", "states": {"idle": "idle.png"},
+                          "any": "idle.png"})
+        saved = png(tmp_path / "saved.png", (1, 2, 3, 255))
+        bubble.SETTINGS.update({"design_image_path": str(saved)})
+        assert bubble.set_pack_preview(source)[0] == "Candidate"
+
+        # A renewal is what keeps it up: the deadline moves with each heartbeat,
+        # so a long-lived preview is many renewals rather than one long timer.
+        for _ in range(3):
+            clock.now += bubble.PREVIEW_TTL_S * 0.9
+            assert bubble.set_pack_preview(source)[0] == "Candidate"
+            assert Path(bubble.design_picture("idle")) == source / "idle.png", (
+                "a renewed preview is still being drawn")
+
+        # ...and with no renewal it lapses ON ITS OWN: this is what stops a panel
+        # that crashed, was killed, or lost its socket from leaving a look on the
+        # desktop that nothing is asking for.
+        clock.now += bubble.PREVIEW_TTL_S + 0.001
+        assert bubble.pack_preview() is None
+        assert Path(bubble.design_picture("idle")) == saved
+        assert bubble.design_in_effect() != "image", (
+            "the saved shape comes back with the saved art")
+
+    def test_a_preview_is_refused_when_the_folder_stops_being_a_pack(
+            self, bubble, tmp_path):
+        # Live, not at the door: the folder is re-read on every renewal, so a
+        # candidate that is edited or deleted WHILE it is being previewed is
+        # detected and dropped instead of drawn from state that no longer
+        # matches the disk.
+        source = tmp_path / "cand"
+        self.art(source, "idle")
+        manifest(source, {"name": "Candidate", "states": {"idle": "idle.png"},
+                          "any": "idle.png"})
+        saved = png(tmp_path / "saved.png", (1, 2, 3, 255))
+        bubble.SETTINGS.update({"design_image_path": str(saved)})
+        assert bubble.set_pack_preview(source)[0] == "Candidate"
+        shutil.rmtree(source)
+        name, problem = bubble.set_pack_preview(source)
+        assert name == "" and "is not a folder" in problem, problem
+        assert Path(bubble.design_picture("idle")) == saved
 
 
 class TestInstallOver:

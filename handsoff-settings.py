@@ -1339,6 +1339,18 @@ class SettingsWindow(QMainWindow):
         self._preview_source = ""
         self._preview_kind = ""
         self._preview_scratch = ""
+        # ...and the BUBBLE draws it too, so a look can be judged on the real
+        # desktop instead of only in the strip above. The bubble holds that in
+        # memory with a short deadline and this HEARTBEAT is what keeps it
+        # alive: the first beat starts the preview and each later one renews it,
+        # so a window that dies without clearing leaves a bubble that stops
+        # previewing on its own. `_preview_live_note` is what the label may say
+        # about it, so the panel never claims the desktop shows something it does
+        # not.
+        self._preview_live_note = ""
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(3000)
+        self._preview_timer.timeout.connect(self._renew_live_pack_preview)
         self._model_at_open = str(self.cfg.get("model") or "")
         self._state_dir_ready()
         self._live_probe: _LiveMicProbe | None = None   # live mic test (Voice tab)
@@ -1497,9 +1509,12 @@ class SettingsWindow(QMainWindow):
         """Stop the live mic test (and its stream + whisper worker) and the
         health poller on close, so the settings app never holds the mic or
         keeps polling after the window is gone."""
-        if getattr(self, "_preview_scratch", ""):
-            # A pack being previewed was unpacked into a folder nothing else
-            # knows about; closing the window is the last chance to remove it.
+        if (getattr(self, "_preview_art", None)
+                or getattr(self, "_preview_scratch", "")):
+            # A previewed pack is drawn on the BUBBLE, and a previewed FILE was
+            # unpacked into a folder nothing else knows about. Closing the window
+            # is the last chance to take it off the desktop and remove it; the
+            # bubble's own deadline is the backstop if this never runs.
             self._drop_pack_preview()
         if self._live_probe is not None:
             self._live_probe.stop()
@@ -3712,6 +3727,7 @@ class SettingsWindow(QMainWindow):
         self._preview_scratch = scratch
         self._refresh_preview_label()
         self._toggle_preview_buttons()
+        self._start_live_pack_preview()
         self._status(f"previewing {art['name']} \u2014 nothing installed yet")
 
     def _try_design_pack(self) -> None:
@@ -3755,6 +3771,7 @@ class SettingsWindow(QMainWindow):
         decode of the candidate's pictures would otherwise outlive the preview
         and let the strip draw a pack that is no longer being previewed.
         """
+        self._stop_live_pack_preview()
         scratch = str(getattr(self, "_preview_scratch", "") or "")
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -3767,6 +3784,72 @@ class SettingsWindow(QMainWindow):
             preview.drop_cached_art()
         self._refresh_preview_label()
         self._toggle_preview_buttons()
+
+    def _start_live_pack_preview(self) -> None:
+        """Draw the candidate on the real bubble too, and keep drawing it.
+
+        The strip answers "what does it look like"; the desktop answers "how
+        does it look HERE" — against the wallpaper, at the size this bubble
+        really is. The bubble keeps the candidate in memory with a short
+        deadline, so the heartbeat IS the mechanism: the first beat starts the
+        preview and every later one renews it, which is why a start and a
+        keep-alive are one code path instead of two that could disagree.
+        """
+        path = str(self._preview_scratch or self._preview_source or "")
+        if not path:
+            return
+        self._preview_timer.start()
+        self._tell_bubble_preview(f"preview-pack {path}", note=True)
+
+    def _renew_live_pack_preview(self) -> None:
+        """(Heartbeat) Offer the candidate again before its deadline runs out."""
+        if not self._preview_art:
+            self._preview_timer.stop()   # nothing is being previewed any more
+            return
+        path = str(self._preview_scratch or self._preview_source or "")
+        if path:
+            self._tell_bubble_preview(f"preview-pack {path}", note=True)
+
+    def _stop_live_pack_preview(self) -> None:
+        """Take the candidate off the bubble, stopping the heartbeat FIRST.
+
+        The heartbeat goes first so a renewal already in flight cannot resurrect
+        what this clears. One can still land after the clear — both sends are off
+        the GUI thread — and that is bounded on purpose: the bubble drops any
+        preview nobody renews, so the worst case is a few more seconds of the
+        candidate rather than a bubble stuck showing it.
+        """
+        timer = getattr(self, "_preview_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._preview_live_note = ""
+        self._tell_bubble_preview("preview-clear")
+
+    def _tell_bubble_preview(self, payload: str, note: bool = False) -> None:
+        """One preview command to the running bubble, off the GUI thread.
+
+        It is a socket round trip with a timeout, and a wedged bubble must not
+        freeze a window that may be trying to close. `note` is False for the
+        clear: its reply is about a preview that is already gone, and a stale
+        note would be shown against the NEXT preview.
+        """
+        sock = getattr(H, "CONTROL_SOCK", None)
+        done = self._note_live_pack_preview if note else (lambda *_a: None)
+        self.run_bg(lambda: _socket_command(sock, payload, timeout=1.5), done)
+
+    def _note_live_pack_preview(self, ok, result) -> None:
+        """Record whether the DESKTOP is really showing the candidate.
+
+        The label must not claim it is when the bubble is not running: "drawn on
+        the bubble" and "only this window shows it" are different facts, and
+        telling them apart is the whole reason the preview is pushed live.
+        """
+        if not self._preview_art:
+            return     # the preview was dropped while this reply was in flight
+        self._preview_live_note = (
+            "\u00b7 drawn on the bubble" if ok and result is not None else
+            "\u00b7 the bubble is not running, so only this window shows it")
+        self._refresh_preview_label()
 
     def _refresh_preview_label(self) -> None:
         """Say what is being previewed, and that it is NOT installed yet."""
@@ -3782,7 +3865,8 @@ class SettingsWindow(QMainWindow):
             f"Previewing {art['name']} from {self._preview_source} \u2014 "
             f"{len(art.get('states') or {})} state picture(s)"
             + (", plus a fallback" if art.get("any") else "")
-            + ". Not installed \u2014 Try it to keep it.")
+            + ". Not installed \u2014 Try it to keep it."
+            + (f" {self._preview_live_note}" if self._preview_live_note else ""))
 
     def _toggle_preview_buttons(self) -> None:
         """Try it and Cancel exist only while there is something to decide."""

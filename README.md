@@ -215,6 +215,24 @@ in VRAM between questions).
   moves. Previewing switches the strip to the `image` design whatever shape your
   bubble currently draws, because otherwise Preview would look as if it did
   nothing.
+- **The preview is drawn on the BUBBLE too**, so a look can be judged where it
+  will actually live — against your wallpaper, beside your other windows, at the
+  size this bubble really is — instead of only in a strip inside a settings
+  window. The panel pushes the candidate over the control socket
+  (`preview-pack <folder>`), and because that has to be revivable it is a
+  HEARTBEAT: the bubble holds the candidate in memory with a short deadline and
+  every beat renews it, so a panel that is closed, killed or disconnected stops
+  renewing and the bubble puts your real look back by itself — nothing is
+  installed and nothing is written, which is what makes Cancel a no-op rather
+  than an undo. Nothing is trusted either: the bubble re-reads the folder on
+  every beat and validates it with the same reading an install uses, so a pack
+  it would refuse is refused out loud, and a candidate whose folder is deleted
+  or edited mid-preview is dropped rather than drawn from stale state. The label
+  says which of the two you are looking at — `drawn on the bubble` or `the
+  bubble is not running, so only this window shows it` — and `doctor` grows the
+  same clause (`— previewing Candidate (not installed)`) while a preview is up,
+  because a preview draws art the settings do not name and the line would
+  otherwise describe a look the bubble is not drawing.
 - **Cat** is the first design whose outline leaves the bubble's circle: its
   ears are painted outside the inset ellipse, so the window's mask is built per
   design (`design_region`) and follows a live shape change as well as a resize.

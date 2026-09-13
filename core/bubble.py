@@ -15,12 +15,15 @@ Application-free by injection: nothing here imports or reaches into handsoff.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -49,6 +52,9 @@ from PySide6.QtWidgets import QApplication, QMenu, QWidget
 # them.
 SETTINGS: dict = {}
 APP_NAME = "handsoff"
+# Same logger name as the bubble's, so a preview that expires or is refused
+# lands in handsoff.log beside everything else (see core/audio.py).
+log = logging.getLogger("handsoff")
 SETTINGS_APP = None
 RESTART_SCRIPT = None
 IDLE, LISTENING, THINKING, SPEAKING = "idle", "listening", "thinking", "speaking"
@@ -665,7 +671,16 @@ def picture_for(pack, single, state: str = "", per_state=None) -> str:
 
 
 def design_picture(state: str = "") -> str:
-    """The picture the `image` design draws in `state`, from the settings."""
+    """The picture the `image` design draws in `state`, from the settings.
+
+    A live PREVIEW wins over the settings: while the Appearance panel is showing
+    a candidate (`pack_preview`), the bubble draws that pack's pictures — the
+    point of a preview is to be judged on the real desktop, and a desktop still
+    showing the old art would be the preview only existing in the panel.
+    """
+    live = pack_preview()
+    if live is not None:
+        return str(live["states"].get(str(state)) or live["any"] or "")
     return picture_for(SETTINGS.get("design_pack"),
                        SETTINGS.get("design_image_path"), state,
                        state_pictures(SETTINGS))
@@ -909,6 +924,128 @@ def inspect_pack(source) -> tuple:
             return built, "", scratch
     shutil.rmtree(scratch, ignore_errors=True)
     return None, problem, ""
+
+
+# ------------------------------------------------------------- live preview
+# A pack the Appearance panel is LOOKING AT, drawn by the bubble on the real
+# desktop before anything is installed.
+#
+# The panel's strip answers "what does it look like"; only the desktop answers
+# "how does it look HERE" — against the wallpaper, beside the other windows, at
+# the size this bubble actually is. Handing a look to the bubble is what makes
+# the difference between those two questions exist at all.
+#
+# The candidate is held in MEMORY and never copied: installing is still the only
+# thing that writes to the packs directory. But it is judged by the same
+# `_read_pack_folder` that `install_pack` uses, so a preview is still a pack that
+# would install — one sentence refuses both.
+#
+# The deadline is what ends it. The panel renews while it is previewing, so a
+# panel that dies, is closed, or loses its connection simply stops renewing and
+# the bubble puts the real look back by itself. Nothing needs cleaning up here
+# because nothing was written; a previewed FILE's temporary folder stays the
+# PANEL's to remove, and a leaked one is a few files in /tmp, never a wrong look
+# on the desktop.
+PREVIEW_TTL_S = 6.0
+
+_PREVIEW_LOCK = threading.Lock()
+_PREVIEW: dict = {"manifest": None, "name": "", "source": "", "at": 0.0}
+
+
+def pack_preview() -> "dict | None":
+    """The manifest of the pack the bubble is SHOWING but has not installed.
+
+    None when there is no live preview — which includes one that was live and
+    has run out of renewals, because the deadline is checked on READ rather
+    than by a timer: an answer that comes from the same read as the data cannot
+    be stale between the timer and the paint that follows it.
+    """
+    now = time.monotonic()
+    with _PREVIEW_LOCK:
+        manifest, renewals, name = (_PREVIEW["manifest"], _PREVIEW["at"],
+                                    _PREVIEW["name"])
+        if manifest is None:
+            return None
+        if now - renewals <= PREVIEW_TTL_S:
+            return manifest
+        _PREVIEW.update({"manifest": None, "name": "", "source": "",
+                         "at": 0.0})
+    log.info("pack preview expired (no renewal from the settings panel): %s",
+             name)
+    return None
+
+
+def set_pack_preview(source) -> tuple:
+    """Draw the pack folder at `source` on the bubble without installing it.
+
+    Returns (name, message) in `install_pack`'s own shape: `name` is "" when
+    `source` is not a pack that would install, and `message` says what happened
+    either way, so the panel has one line to show and no exception to catch.
+
+    A refusal CLEARS whatever was being previewed: the caller asked to show
+    this instead, so leaving the previous candidate on the desktop would be
+    showing art nobody asked for.
+
+    Called repeatedly with the same folder — that is the panel's heartbeat — so
+    it must be cheap and idempotent. Re-reading it each time is deliberate: a
+    candidate whose folder is deleted or edited mid-preview is then DETECTED and
+    dropped, instead of the bubble drawing from state that no longer matches the
+    disk.
+    """
+    built, problem = None, ""
+    try:
+        src = Path(str(source)).expanduser()
+        built, problem = ((None, f"{src} is not a folder") if not src.is_dir()
+                          else _read_pack_folder(src))
+    except (OSError, ValueError, TypeError) as exc:
+        problem = f"cannot read {source} ({exc})"
+    if built is None:
+        clear_pack_preview()
+        return "", problem or "that is not a pack folder"
+    name = str(built["name"])
+    with _PREVIEW_LOCK:
+        _PREVIEW.update({"manifest": built, "name": name, "source": str(src),
+                         "at": time.monotonic()})
+    return name, f"previewing {name} on the bubble \u2014 nothing installed"
+
+
+def clear_pack_preview() -> str:
+    """Stop drawing a previewed pack: the bubble goes back to its own look.
+
+    Says whether anything was being previewed, because "I stopped it" and
+    "there was nothing to stop" are different facts and this reply is the only
+    place a caller can learn them.
+    """
+    with _PREVIEW_LOCK:
+        name = str(_PREVIEW["name"] or "")
+        _PREVIEW.update({"manifest": None, "name": "", "source": "", "at": 0.0})
+    return (f"stopped previewing {name}" if name
+            else "no pack was being previewed")
+
+
+def preview_note() -> str:
+    """One sentence for `doctor` while a preview is live, or "".
+
+    A preview draws art the settings do not name, so without this the
+    appearance line would describe a look the bubble is NOT drawing — and would
+    do it exactly when someone is staring at the difference.
+    """
+    live = pack_preview()
+    return f"previewing {live['name']} (not installed)" if live else ""
+
+
+def design_in_effect() -> str:
+    """The design the bubble is drawing: `image` while a pack is previewed.
+
+    A pack is only ever drawn by the `image` design, so a preview that swapped
+    the PICTURE but left the shape alone would change nothing on the desktop for
+    anyone whose bubble draws an orb — the same "nothing applies" the panel's
+    own strip forces `image` to avoid. This is the ONE place that decides, so
+    the painter and the window mask cannot disagree about which shape is up.
+    """
+    if pack_preview() is not None:
+        return "image"
+    return str(SETTINGS.get("bubble_design", "orb")).strip().lower()
 
 
 def effective_art(settings=None) -> tuple:
@@ -1577,7 +1714,9 @@ class BubbleWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
         f = self._frame()
-        design = str(SETTINGS.get("bubble_design", "orb")).strip().lower()
+        # `design_in_effect`, not the setting: a live pack preview is drawn by
+        # the `image` design whatever shape the settings name.
+        design = design_in_effect()
         if design != self._mask_design:
             # the shape changed under us (settings reload / self-edit): the
             # aperture follows the DESIGN, and a size that did not change will
@@ -3106,7 +3245,7 @@ class BubbleWidget(QWidget):
         where it has one (the cat's ears), so a design with a silhouette of its
         own is not silently cut back to a circle on the desktop.
         """
-        name = str(SETTINGS.get("bubble_design", "orb")).strip().lower()
+        name = design_in_effect()
         self.setMask(design_region(name, self.width(), self.height()))
         self._mask_design = name
 
