@@ -174,7 +174,13 @@ in VRAM between questions).
   — and a selected pack is the authority: if it cannot be read, the bubble
   draws the empty slot and the reason is shown in the panel and in `doctor`
   (`appearance: look Custom (image, 144 px) — pack optimus`) rather than
-  quietly substituting another picture.
+  quietly substituting another picture. **Export pack…** is the reverse: it
+  writes the art ON SCREEN — the selected pack, or your own per-state pictures
+  with the fallback behind them — into a new folder as a pack, so a look you
+  built by hand can be handed to someone else. It refuses a folder that already
+  exists (nothing of yours is overwritten) and writes nothing at all unless the
+  result passes the same validation an install does; a refusal says why in the
+  status line and leaves no half-written folder behind.
 - **Cat** is the first design whose outline leaves the bubble's circle: its
   ears are painted outside the inset ellipse, so the window's mask is built per
   design (`design_region`) and follows a live shape change as well as a resize.

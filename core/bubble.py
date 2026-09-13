@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QElapsedTimer, QPointF, QRect, QRectF, Qt, QTimer
@@ -781,6 +782,121 @@ def install_pack(source) -> tuple:
     return slug, (f"installed pack {built['name']} as {slug} "
                   f"({len(built['states'])} state picture(s)"
                   + (", plus a fallback)" if built["any"] else ")"))
+
+
+def effective_art(settings=None) -> tuple:
+    """The art the bubble is DRAWING: (fallback path, {state: path}).
+
+    ONE definition of "what is on screen", by the precedence the renderer uses:
+    a selected pack is the authority, otherwise the per-state pictures with the
+    fallback behind them. `export_pack` reads it rather than re-deciding, so
+    sharing a look cannot export art other than the art in effect — and a pack
+    that cannot be read yields NOTHING here, like everywhere else, instead of
+    exporting the files it happened to name.
+    """
+    src = SETTINGS if settings is None else settings
+    src = src if isinstance(src, dict) else {}
+    slug = pack_slug(src.get("design_pack"))
+    if slug:
+        manifest = load_pack(slug)
+        if manifest is None:
+            return "", {}
+        return (str(manifest.get("any") or ""),
+                {s: str(p) for s, p in (manifest.get("states") or {}).items()})
+    return (str(src.get("design_image_path") or "").strip(),
+            state_pictures(src))
+
+
+def export_pack(parent, name, settings=None) -> tuple:
+    """Write the art in effect as a NEW pack folder under `parent`.
+
+    Returns (folder, message): folder is "" when nothing was written, and the
+    message says what happened either way, so a caller has one thing to show and
+    no exception to catch. What is written is the art the bubble is drawing —
+    the selected pack's pictures, or your own per-state pictures with the
+    fallback behind them — so a look built by hand becomes a folder that can be
+    handed to someone else.
+
+    Two rules keep a one-click write safe. `parent/<slug>` must not already
+    exist: an export never eats a folder the user already has. And the pack is
+    assembled in a hidden staging folder and checked by `_validate_pack`, the
+    SAME authority `install_pack` uses, BEFORE it is moved into place — so a
+    folder this writes is one install will accept, and a refusal (an unreadable
+    picture, a state left uncovered with no fallback) removes what it wrote
+    instead of leaving half a pack in the user's directory.
+    """
+    slug = pack_slug(name)
+    if not slug:
+        return "", "the pack needs a name with at least one letter or digit"
+    try:
+        root = Path(str(parent)).expanduser()
+        if not root.is_dir():
+            return "", f"{root} is not a folder"
+    except (OSError, ValueError, TypeError):
+        return "", "that destination is not a folder"
+    target = root / slug
+    if target.exists():
+        return "", (f"{target} already exists — export into a folder that does "
+                    f"not, so nothing you already have is overwritten")
+    fallback, states = effective_art(settings)
+    if not fallback and not states:
+        return "", ("no pictures to export — give a state a picture (or select "
+                    "a pack) first")
+    used: dict = {}
+
+    def _inside(label: str, path: str) -> str:
+        """A file name for `path` that no other picture in this pack uses.
+
+        Two states may name the same file — that is one copy, named once — but
+        two DIFFERENT files called `idle.png` must not overwrite each other, so a
+        collision is prefixed with the state it belongs to.
+        """
+        base = Path(path).name or f"{label}.png"
+        candidate, n = base, 0
+        while candidate in used and used[candidate] != path:
+            n += 1
+            candidate = f"{label if n == 1 else f'{label}{n}'}-{base}"
+        used[candidate] = path
+        return candidate
+
+    manifest: dict = {"name": str(name).strip() or slug}
+    named: dict = {}
+    copies: list = []
+    for state in PACK_STATES:
+        path = str(states.get(state) or "").strip()
+        if not path:
+            continue
+        source = os.path.expanduser(path)
+        file_name = _inside(state, source)
+        named[state] = file_name
+        copies.append((source, file_name))
+    if fallback:
+        source = os.path.expanduser(fallback)
+        file_name = _inside("any", source)
+        manifest["any"] = file_name
+        copies.append((source, file_name))
+    if named:
+        manifest["states"] = named
+    staging = None
+    built = None
+    try:
+        staging = tempfile.mkdtemp(dir=str(root), prefix=f".{slug}-")
+        for source, file_name in copies:
+            shutil.copy2(source, Path(staging) / file_name)
+        (Path(staging) / PACK_MANIFEST).write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        problem, built = _validate_pack(staging, manifest, slug)
+        if problem:
+            return "", f"{slug}: {problem}"
+        Path(staging).rename(target)
+    except OSError as exc:
+        return "", f"cannot export {slug} ({exc.strerror or exc})"
+    finally:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
+    return str(target), (f"exported {built['name']} to {target} "
+                         f"({len(built['states'])} state picture(s)"
+                         + (", plus a fallback)" if built["any"] else ")"))
 
 
 def _image_lights(color: QColor, glow: float, energy: float, level: float):

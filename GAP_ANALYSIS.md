@@ -3115,3 +3115,58 @@ quota 291/300), hn untried, github untried, wikipedia untried` and `reader: loca
 text in 8427 bytes of markup, 2s ago), Jina fallback refused (network security block, 0s ago)`,
 with the deployed copy `in-sync` and the running bubble healthy (`health` ok, `design: pikachu`,
 the user's own appearance untouched). Nothing committed.
+
+## A look you built by hand is a folder you can hand on
+
+**What was missing.** The `image` design's art could be one picture per state, and a PACK could
+supply several pictures that switch together — but only in one direction. A pack was something
+you INSTALL; the art you assembles by hand (a picture per state, a fallback behind them) lived
+only in `settings.json`, and handing it to someone else meant describing which file went in which
+slot. So the panel had a way IN and no way OUT.
+
+**The export writes the art in EFFECT, by the renderer's own precedence.** `effective_art()`
+returns the fallback and the per-state pictures that are on screen: a selected pack when there is
+one, otherwise the per-state settings — one definition, read by the export rather than
+re-decided, so sharing a look cannot export something other than what is drawn. A pack that
+cannot be read yields NOTHING here, exactly as it does everywhere else, instead of exporting the
+files its manifest happened to name.
+
+**Two rules make a one-click write safe, and both are pinned.** `parent/<slug>` must not already
+exist, so an export can never eat a folder the user already has. And the pack is assembled in a
+hidden staging folder and checked by `_validate_pack` — the SAME authority `install_pack` uses —
+BEFORE it is moved into place, so a folder this writes is one install accepts, and a refusal (a
+per-state look that leaves a state uncovered with no fallback, an unreadable picture) removes what
+it wrote instead of leaving half a pack in the user's directory. File names inside the pack are
+made unique per SOURCE: two states naming the same file are one copy named once, and two
+different files called `idle.png` are prefixed with the state they belong to rather than
+overwriting each other.
+
+**The panel passes the FORM's choices, not the saved file's.** A chosen picture applies live
+through a debounce, so an export reading `settings.json` a moment after a picture was picked would
+write the PREVIOUS one. The scenario pins that directly (a picture set on the form but never
+saved is what lands in the folder), along with a cancelled name dialog that must write nothing —
+Qt hands back the typed text with `ok=False`, so the guard has to be `ok`, not "is the name
+empty", which the slug check would have masked.
+
+**Guards and gates.** `tests/test_design_packs.py` gains `TestExportPack` (11 cases, no
+QApplication: export → install → the same BYTES for every state, plus an existing folder left
+untouched, a non-folder destination, a basename collision, an incomplete look refused with the
+install sentence, a pack selected, a broken pack, and the settings argument beating the module
+state) and the offscreen scenario `the_appearance_panel_exports_the_art_as_a_pack` covers the
+wiring. **13/13 mutations** back to the old behaviour caught, one per decision — and three of the
+first sweep's misses were weak GUARDS, not bad mutations: two artefacts written with the same
+fixed palette were byte-identical, so "was this the art I passed in?" was unanswerable; the
+broken-pack case only covered a manifest that was not JSON, missing the valid-JSON-naming-a-file-
+that-is-not-there case a lenient reader would "export"; and the cancelled-dialog check used an
+empty name, which the slug rule caught anyway. **1193 tests green** in three orderings (default,
+shuffled-test seed 20260913, shuffled-file seed 7); coverage **81.48% ≥ 70** with `core/bubble.py`
+at **93%**; `ci/compile_all.py` clean (45 files).
+
+**Live proof on the DEPLOYED module, not a fixture.** `~/.local/bin/core/bubble.py`, against the
+`prism` pack really installed in the user's config: `export_pack` wrote `prism-shared` with
+`pack.json` naming the four pictures, `install_pack` of that export produced `prism-shared`, and
+every state then drew **byte-identical** picture data to the original (4/4), with the three
+refusals speaking their own sentences (`no pictures to export — give a state a picture (or select
+a pack) first`, `… already exists — export into a folder that does not, so nothing you already
+have is overwritten`, `the pack needs a name with at least one letter or digit`). Nothing was
+written outside a temporary directory.

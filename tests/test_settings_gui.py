@@ -2567,6 +2567,81 @@ def the_image_design_can_use_an_installed_pack():
 
 
 @scenario
+def the_appearance_panel_exports_the_art_as_a_pack():
+    # Install's reverse: the art ON SCREEN -- the selected pack, or the pictures
+    # chosen by hand -- is written into a new folder as a pack that can be handed
+    # to someone else. What this pins is the wiring the user touches: WHICH art is
+    # exported (the form's, because a picture chosen a moment ago applies through
+    # a debounce and settings.json may still hold the previous one), that a
+    # cancelled dialog writes nothing, and that a refusal is REPORTED rather than
+    # leaving the panel looking as if the click did nothing.
+    import json as _json
+    from PySide6.QtGui import QColor, QImage
+
+    folder = settings_file.parent
+    destination = folder / "exported"
+    destination.mkdir(parents=True, exist_ok=True)
+
+    def art(name, rgba):
+        p = folder / name
+        img = QImage(48, 48, QImage.Format_ARGB32)
+        img.fill(QColor(*rgba))
+        assert img.save(str(p)), name
+        return p
+
+    fallback = art("fallback.png", (200, 200, 200, 255))
+    idle = art("idle-shot.png", (30, 60, 200, 255))
+
+    seed({"model": "testmodel:latest", "design_image_path": str(fallback)})
+    win.reload_from_disk()
+    assert win._design_image == str(fallback)
+
+    real_name = settings_app.QInputDialog.getText
+    real_dir = settings_app.QFileDialog.getExistingDirectory
+    try:
+        # --- a cancelled NAME writes nothing at all. Qt hands back the text that
+        # --- was typed with ok=False, so the guard has to be `ok` — an empty
+        # --- name alone would be caught by the slug check and hide the bug.
+        settings_app.QInputDialog.getText = (
+            lambda *a, **k: ("Typed But Cancelled", False))
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: str(destination))
+        win._export_design_pack()
+        assert list(destination.iterdir()) == [], "a cancelled export wrote files"
+
+        # --- a cancelled DESTINATION writes nothing either
+        settings_app.QInputDialog.getText = lambda *a, **k: ("Shared", True)
+        settings_app.QFileDialog.getExistingDirectory = lambda *a, **k: ("", "")
+        win._export_design_pack()
+        assert list(destination.iterdir()) == []
+
+        # --- the art is exported, and an UNSAVED form choice goes with it
+        settings_app.QInputDialog.getText = lambda *a, **k: ("My Look", True)
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: str(destination))
+        win._design_image = str(fallback)
+        win._design_images["idle"] = str(idle)
+        win._export_design_pack()
+        exported = destination / "my-look"
+        assert exported.is_dir(), sorted(p.name for p in destination.iterdir())
+        body = _json.loads((exported / "pack.json").read_text(encoding="utf-8"))
+        assert body["name"] == "My Look", body
+        assert body["states"] == {"idle": "idle-shot.png"}, body
+        assert body["any"] == "fallback.png", body
+        assert "exported" in win.status_label.text(), win.status_label.text()
+        assert win._design_pack == "", "an export is not an install"
+
+        # --- exporting the same name again is REFUSED and says so: the folder
+        # is the user's, and a one-click write must not eat what is in it.
+        win._export_design_pack()
+        assert "already exists" in win.status_label.text(), win.status_label.text()
+        assert (exported / "pack.json").is_file(), "the first export must survive"
+    finally:
+        settings_app.QInputDialog.getText = real_name
+        settings_app.QFileDialog.getExistingDirectory = real_dir
+
+
+@scenario
 def the_image_design_takes_one_picture_per_state():
     # One picture for idle/listening/thinking/speaking, chosen in the Shape card,
     # with `design_image_path` behind them as the fallback. What this pins is the
@@ -2791,6 +2866,7 @@ SCENARIO_NAMES = [
     "every_design_has_its_own_preview_glyph",
     "the_image_design_draws_the_users_picture",
     "the_image_design_can_use_an_installed_pack",
+    "the_appearance_panel_exports_the_art_as_a_pack",
     "the_image_design_takes_one_picture_per_state",
     "appearance_panel_is_a_scrolling_column_of_cards",
     "look_tiles_are_drawn_from_the_shared_painter",

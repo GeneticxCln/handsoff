@@ -193,7 +193,8 @@ from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QRectF, Qt, QTimer  #
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPalette, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
-    QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QTabWidget,
     QVBoxLayout, QWidget,
@@ -2740,9 +2741,19 @@ class SettingsWindow(QMainWindow):
         self.pack_clear = QPushButton("Clear", card)
         self.pack_clear.setToolTip("Stop using a pack; go back to one picture")
         self.pack_clear.clicked.connect(self._clear_design_pack)
+        # The reverse of Install: write the art ON SCREEN \u2014 the selected
+        # pack, or the pictures chosen above \u2014 into a new folder as a pack,
+        # so a look built by hand can be handed to someone else.
+        self.pack_export = QPushButton("Export pack\u2026", card)
+        self.pack_export.setToolTip(
+            "Write the art on screen (this pack, or your own per-state "
+            "pictures and fallback) into a new folder as a pack you can share. "
+            "Nothing is installed and nothing on screen changes.")
+        self.pack_export.clicked.connect(self._export_design_pack)
         box.addLayout(self._field("Pack", self.pack_combo))
         pack_row = QHBoxLayout()
         pack_row.addWidget(self.pack_install)
+        pack_row.addWidget(self.pack_export)
         pack_row.addWidget(self.pack_clear)
         pack_row.addStretch(1)
         box.addLayout(pack_row)
@@ -3439,6 +3450,44 @@ class SettingsWindow(QMainWindow):
         self._refresh_pack_combo()
         self._refresh_design_image_label()
         self._schedule_appearance_live()
+
+    def _export_design_pack(self) -> None:
+        """Write the art on screen as a pack folder, reported either way.
+
+        A name and a destination are asked for, then handed to the bubble
+        module, which writes nothing until the folder it built passes the SAME
+        validation an install uses. The FORM's choices are passed as the
+        settings rather than the saved file's, because a chosen picture applies
+        live and a debounced write must not decide whether the export is
+        current. Nothing is selected or installed afterwards: the result is a
+        folder to hand on, not a change to this desktop.
+        """
+        try:
+            bubble = _core_module("bubble")
+        except Exception:
+            self._status("design packs are unavailable in this install")
+            return
+        default = str(self._design_pack or "my-look")
+        name, ok = QInputDialog.getText(
+            self, "Export pack", "Pack name (letters, digits, dash):",
+            text=default)
+        if not ok or not str(name).strip():
+            return                  # cancelled: not an edit
+        parent = QFileDialog.getExistingDirectory(
+            self, "Choose the folder to write the pack into", str(Path.home()))
+        if not parent:
+            return                  # cancelled: nothing written
+        art = dict(self.cfg)
+        art["design_pack"] = str(self._design_pack or "")
+        art["design_image_path"] = str(self._design_image or "")
+        for state, key in STATE_IMAGE_KEYS:
+            art[key] = str(self._design_images.get(state) or "")
+        try:
+            _folder, message = bubble.export_pack(parent, name, art)
+        except Exception as exc:    # a data folder must never crash the panel
+            self._status(f"could not export that pack ({exc})")
+            return
+        self._status(message)
 
     def _refresh_design_image_label(self) -> None:
         """What the art in effect is \u2014 or WHY it cannot be drawn.

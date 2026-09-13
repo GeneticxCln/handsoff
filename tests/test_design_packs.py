@@ -400,6 +400,202 @@ class TestPerStatePictures:
             "panel that shows it")
 
 
+class TestExportPack:
+    """A look built by hand becomes a folder someone else can install.
+
+    The export writes the art that is ON SCREEN and hands it to the SAME
+    validator an install uses, so the round trip is the assertion that matters:
+    export, install what was exported, and the pictures must be the ones you
+    had. Everything else here is a way that could quietly write the wrong thing
+    — an empty pack, a half pack, a clobbered folder.
+    """
+
+    # One colour per slot, fixed, so two slots cannot accidentally be the same
+    # picture — `test_..._same_basename_do_not_collide` depends on the bytes
+    # differing, and a helper that let the caller pick would let that slip.
+    PALETTE = {"idle": (10, 20, 30, 255), "listening": (40, 50, 60, 255),
+               "thinking": (70, 80, 90, 255), "speaking": (100, 110, 120, 255),
+               "any": (200, 210, 220, 255)}
+
+    def art(self, folder: Path, *want: str, rgba=None) -> dict:
+        """{slot: path} for the named slots, as real PNGs with distinct bytes.
+
+        `rgba` overrides the slot colour, which a test needs when it must tell
+        two runs of the SAME slot apart ("was this the art I passed in, or the
+        art sitting in the module state?"); with one fixed palette those two
+        exports would be byte-identical and the question unanswerable.
+        """
+        return {label: png(folder / f"{label}.png",
+                           rgba or self.PALETTE[label]) for label in want}
+
+    def settings_for(self, files: dict) -> dict:
+        body = dict(DEFAULT_SETTINGS)
+        body["design_image_path"] = str(files.get("any") or "")
+        for state in BUBBLE_STATES:
+            body[f"design_image_{state}"] = str(files.get(state) or "")
+        return body
+
+    def test_a_hand_built_look_round_trips_through_install(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "idle", "listening", "thinking",
+                         "speaking", "any")
+        art = self.settings_for(files)
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "My Look", art)
+        assert folder, message
+        assert Path(folder).name == "my-look", folder
+        assert "exported" in message and "state picture" in message, message
+        # ...and what was written is a pack INSTALL accepts, drawing the SAME
+        # bytes for every state: that is the whole point of the format.
+        slug, installed = bubble.install_pack(folder)
+        assert slug == "my-look", installed
+        bubble.SETTINGS.update({"design_pack": slug, "design_image_path": ""})
+        for state in BUBBLE_STATES:
+            drawn = Path(bubble.design_picture(state))
+            assert drawn.read_bytes() == Path(files[state]).read_bytes(), (
+                f"{state} drew {drawn}, not the picture that was exported")
+
+    def test_the_manifest_names_the_states_and_the_fallback(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "idle", "any")
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "look",
+                                             self.settings_for(files))
+        assert folder, message
+        body = json.loads((Path(folder) / "pack.json").read_text(encoding="utf-8"))
+        assert body["name"] == "look", body
+        assert body["states"] == {"idle": "idle.png"}, body
+        assert body["any"] == "any.png", body
+        # The manifest must be READABLE by a human who received the folder.
+        assert "\n    " in (Path(folder) / "pack.json").read_text(encoding="utf-8")
+
+    def test_no_art_at_all_is_refused_rather_than_writing_an_empty_pack(
+            self, bubble, tmp_path):
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "empty",
+                                             dict(DEFAULT_SETTINGS))
+        assert folder == "", folder
+        assert "no pictures to export" in message, message
+        assert list(parent.iterdir()) == [], "a refusal must write nothing"
+
+    def test_a_name_with_no_folder_in_it_is_refused(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "any")
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "///", self.settings_for(files))
+        assert folder == "", folder
+        assert "name with at least one letter or digit" in message, message
+        assert list(parent.iterdir()) == []
+
+    def test_an_existing_folder_is_never_overwritten(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "any")
+        parent = tmp_path / "share"
+        (parent / "look").mkdir(parents=True)
+        sentinel = parent / "look" / "mine.txt"
+        sentinel.write_text("keep me", encoding="utf-8")
+        folder, message = bubble.export_pack(parent, "look", self.settings_for(files))
+        assert folder == "", folder
+        assert "already exists" in message, message
+        assert sentinel.read_text(encoding="utf-8") == "keep me", (
+            "an export must not touch a folder that was already there")
+
+    def test_a_destination_that_is_not_a_folder_is_refused(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "any")
+        nowhere = tmp_path / "nope"
+        folder, message = bubble.export_pack(nowhere, "look",
+                                             self.settings_for(files))
+        assert folder == "", folder
+        assert "is not a folder" in message, message
+        assert not nowhere.exists(), "a refusal must not create the destination"
+
+    def test_two_states_naming_the_same_basename_do_not_collide(
+            self, bubble, tmp_path):
+        first = png(tmp_path / "one" / "photo.png", (1, 2, 3, 255))
+        second = png(tmp_path / "two" / "photo.png", (9, 8, 7, 255))
+        art = self.settings_for({"idle": first, "speaking": second, "any": first})
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "look", art)
+        assert folder, message
+        body = json.loads((Path(folder) / "pack.json").read_text(encoding="utf-8"))
+        assert body["states"]["idle"] != body["states"]["speaking"], body
+        assert body["states"]["idle"] == body["any"], (
+            "one file used twice is one copy, named once")
+        slug, installed = bubble.install_pack(folder)
+        assert slug, installed
+        bubble.SETTINGS.update({"design_pack": slug, "design_image_path": ""})
+        assert Path(bubble.design_picture("idle")).read_bytes() == first.read_bytes()
+        assert Path(bubble.design_picture("speaking")).read_bytes() == second.read_bytes()
+
+    def test_an_incomplete_look_is_refused_with_the_install_sentence(
+            self, bubble, tmp_path):
+        art = self.settings_for(self.art(tmp_path / "art", "idle"))
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "half", art)
+        assert folder == "", folder
+        for state in ("listening", "thinking", "speaking"):
+            assert state in message, message
+        assert list(parent.iterdir()) == [], (
+            "the staging folder must be removed, or a refusal leaves half a pack")
+
+    def test_a_selected_pack_exports_the_art_that_is_on_screen(
+            self, bubble, tmp_path):
+        source = tmp_path / "prism"
+        shots = {s: png(source / f"{s}.png") for s in BUBBLE_STATES}
+        manifest(source, {"name": "Prism", "states": {
+            s: f"{s}.png" for s in BUBBLE_STATES}})
+        slug, message = bubble.install_pack(source)
+        assert slug, message
+        bubble.SETTINGS.update({"design_pack": slug, "design_image_path": ""})
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "shared", None)
+        assert folder, message
+        body = json.loads((Path(folder) / "pack.json").read_text(encoding="utf-8"))
+        assert set(body["states"]) == set(BUBBLE_STATES), body
+        for state, name in body["states"].items():
+            got = (Path(folder) / name).read_bytes()
+            assert got == shots[state].read_bytes(), state
+
+    def test_a_broken_selected_pack_exports_nothing(self, bubble, tmp_path):
+        root = Path(bubble.PACKS_DIR)
+        # TWO ways a pack is broken, because they fail differently: a manifest
+        # that is not JSON at all, and one that is VALID JSON naming a picture
+        # which is not there. The second is the one a lenient reader would
+        # "export" — copying a file that does not exist — so it has to be here.
+        (root / "ghost").mkdir(parents=True)
+        (root / "ghost" / "pack.json").write_text("not json", encoding="utf-8")
+        (root / "gone").mkdir(parents=True)
+        (root / "gone" / "pack.json").write_text(
+            json.dumps({"name": "Gone", "any": "missing.png"}), encoding="utf-8")
+        parent = tmp_path / "share"
+        parent.mkdir()
+        for slug in ("ghost", "gone"):
+            bubble.SETTINGS.update({"design_pack": slug})
+            folder, message = bubble.export_pack(parent, "look", None)
+            assert folder == "", f"{slug}: {folder}"
+            assert "no pictures to export" in message, f"{slug}: {message}"
+        assert list(parent.iterdir()) == []
+
+    def test_the_settings_it_is_handed_beat_the_module_state(
+            self, bubble, tmp_path):
+        given = self.art(tmp_path / "given", "any", rgba=(1, 2, 3, 255))
+        module = self.art(tmp_path / "module", "any", rgba=(9, 9, 9, 255))
+        assert Path(given["any"]).read_bytes() != Path(module["any"]).read_bytes(), (
+            "the two artefacts must differ, or the export's source is untestable")
+        bubble.SETTINGS.update(self.settings_for(module))
+        parent = tmp_path / "share"
+        parent.mkdir()
+        folder, message = bubble.export_pack(parent, "look",
+                                             self.settings_for(given))
+        assert folder, message
+        name = json.loads((Path(folder) / "pack.json").read_text(encoding="utf-8"))["any"]
+        assert (Path(folder) / name).read_bytes() == Path(given["any"]).read_bytes(), (
+            "the panel's unsaved choices must be what is exported")
+
+
 class TestSettingsPlumbing:
     """The setting itself: defaulted, coerced, and never validated away."""
 
