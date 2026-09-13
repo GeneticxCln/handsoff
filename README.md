@@ -109,9 +109,9 @@ in VRAM between questions).
 ### The bubble
 
 - **Hold left button** → talk; release → send. Drag to move the bubble.
-- **Shape & feel** — the Appearance tab picks one of thirteen designs (orb,
+- **Shape & feel** — the Appearance tab picks one of fourteen designs (orb,
   halo, reactor, bloom, droplet, cube, equalizer, crystal, saturn, void, Eye of
-  Sauron, Pikachu, Cat), bubble size, an animation-energy scale (orbit speed,
+  Sauron, Pikachu, Cat, Image), bubble size, an animation-energy scale (orbit speed,
   swirl, comet brightness) and a colour-accent punch; one click of **Match
   wallpaper** retunes all four state colours for a dark or light backdrop.
   Every control on the tab — shape, size, both sliders, the four state colours,
@@ -139,6 +139,42 @@ in VRAM between questions).
   The two looks built on Pikachu and the Eye of Sauron say so in their
   tooltips: those designs keep their own palettes, so a look's colours tint
   their aura/corona rather than repainting the character.
+- **Image** — the last design's art is a FILE of yours, not a painter: click
+  **Choose image…** beside the Shape combo and the bubble draws that picture,
+  fitted to the glass (its diagonal is fitted to the aperture, so nothing can
+  cross the rim), tinted by the state colour with a luminance floor, and lit by
+  your voice. No file — or one that will not decode — draws a dashed empty slot
+  in the state colour rather than silently falling back to the orb, and
+  `--ptt doctor` names the reason either way.
+- **One picture per state** — the four fields under **Choose image…** let the
+  Image design show a *different picture per state* without a pack folder: set
+  **idle**/**listening**/**thinking**/**speaking** and each state draws its own
+  file, live. A state you leave empty uses the fallback picture beside them; a
+  state with a file that will not decode draws the empty slot and the panel
+  names *which* state it was ("listening: ⚠ no file at …"), because with four
+  slots "which one is broken" is the whole question.
+- **Design packs** — instead of four loose files, a **Pack** can give the Image
+  design a *different picture per state*, all switched together as the bubble
+  changes state. A pack is a folder with a `pack.json` beside its pictures:
+
+  ```json
+  {"name": "Optimus",
+   "any": "base.png",
+   "states": {"idle": "idle.png", "listening": "listen.png",
+              "thinking": "think.png", "speaking": "speak.png"}}
+  ```
+
+  `states` may name any subset of the four; a state it does not name uses
+  `any`; a pack that leaves a state uncovered with no `any` is refused with the
+  missing names in the message. Click **Install pack…** and pick the folder: it
+  is COPIED into `~/.config/handsoff/design-packs/<name>/`, so it keeps working
+  when the folder it came from moves, and installing over the same name keeps
+  the old copy as `<name>.previous` for one generation. Every picture must sit
+  inside the pack folder — an absolute path, a `..` or a symlink out is refused
+  — and a selected pack is the authority: if it cannot be read, the bubble
+  draws the empty slot and the reason is shown in the panel and in `doctor`
+  (`appearance: look Custom (image, 144 px) — pack optimus`) rather than
+  quietly substituting another picture.
 - **Cat** is the first design whose outline leaves the bubble's circle: its
   ears are painted outside the inset ellipse, so the window's mask is built per
   design (`design_region`) and follows a live shape change as well as a resize.

@@ -217,6 +217,18 @@ def coerce_settings(s: dict) -> dict:
     _num("animation_energy", float, 0.2, 2.0)
     _bd = str(s.get("bubble_design", "orb")).strip().lower()
     s["bubble_design"] = _bd if _bd in _schema.BUBBLE_DESIGNS else DEFAULT_SETTINGS["bubble_design"]
+    # The `image` design's art. Expanded, never validated here: the file may be
+    # created later or deleted at any time, and DROPPING it to "" on a missing
+    # file would silently erase the user's choice the first time they moved a
+    # folder. The renderer reports why it cannot draw (`design_image_problem`).
+    s["design_image_path"] = os.path.expanduser(
+        str(s.get("design_image_path") or "").strip())
+    # The `image` design's pack: ONE installed folder name. Stripped here and
+    # nothing more, for the same reason the path above is not validated: a pack
+    # that is temporarily moved or not yet installed must not erase the user's
+    # choice. The renderer reports why it cannot draw (`pack_problem`), and the
+    # settings app writes the slug it read from `installed_packs()`.
+    s["design_pack"] = str(s.get("design_pack") or "").strip()
     # The local SearXNG the search router prefers. Stripped and de-slashed, not
     # validated: a user who has not started one yet gets the keyless backends and
     # a doctor line saying `searxng not running`, which is more useful than

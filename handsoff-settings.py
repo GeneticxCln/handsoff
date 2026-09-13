@@ -537,6 +537,23 @@ def paint_design_glyph(p, design: str, cx: float, cy: float, r: float,
         for sign in (-1.0, 1.0):
             p.drawEllipse(QPointF(cx + sign * r * 0.24, cy - r * 0.06),
                           r * 0.10, r * 0.11)
+    elif design == "image":
+        # The empty slot: a dashed ring with a diagonal mark. The real picture
+        # is drawn by the preview itself (it has to be decoded and tinted, and
+        # the Look tiles have no picture to show), so this glyph is the SHAPE of
+        # the design — a slot a picture goes in — and deliberately not the orb,
+        # which is what an unknown design name falls through to.
+        ring = QColor(color).lighter(150)
+        pen = QPen(ring, max(1.6, r * 0.13))
+        pen.setCapStyle(Qt.FlatCap)
+        pen.setDashPattern([3.0, 1.6])
+        p.setBrush(Qt.NoBrush)
+        p.setPen(pen)
+        p.drawEllipse(QPointF(cx, cy), r * 0.86, r * 0.86)
+        mark = QColor(color).lighter(190)
+        p.setPen(QPen(mark, max(1.2, r * 0.075), Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx - r * 0.30, cy + r * 0.30),
+                   QPointF(cx + r * 0.30, cy - r * 0.30))
     elif design == "cat":
         # Ears first, then the head over their bases, then the tail behind:
         # the same layering the bubble uses, so the preview cannot show a
@@ -645,13 +662,19 @@ class BubblePreview(QWidget):
     """Four animated glyphs previewing the state colours, size and design."""
 
     def __init__(self, colors_fn, size_fn, design_fn=None,
-                 energy_fn=None, accent_fn=None) -> None:
+                 energy_fn=None, accent_fn=None, image_fn=None) -> None:
         super().__init__()
         self._colors_fn = colors_fn
         self._size_fn = size_fn
         self._design_fn = design_fn or (lambda: "orb")
         self._energy_fn = energy_fn or (lambda: 1.0)
         self._accent_fn = accent_fn or (lambda: 0.5)
+        # The `image` design's art, as a `state -> path` resolver, and the cache
+        # for its decoded layers: the strip repaints at 30 Hz and this is a
+        # user's 4000x4000 photo.
+        self._image_fn = image_fn or (lambda _state="": "")
+        self._image_cache: dict = {}
+        self._bubble_module = None
         self.setMinimumHeight(150)
         self._clock = QElapsedTimer()
         self._clock.start()
@@ -670,6 +693,67 @@ class BubblePreview(QWidget):
         `paint_design_glyph`, which the Look tiles use too.
         """
         paint_design_glyph(p, design, cx, cy, r, color, t, k)
+
+    def _draw_image_glyph(self, p, cx: float, cy: float, r: float,
+                          color: QColor, state: str = "") -> bool:
+        """Draw the picture in effect for `state`; False when there is none.
+
+        Takes the STATE because a pack names a different picture per state: the
+        four slots must show the four pictures a pack ships, which is the whole
+        point of one choice switching several together. The decode and the tint
+        come from the bubble module itself (`image_layers` / `tinted_image`),
+        so the panel cannot render a picture the desktop would render
+        differently — and the fit rule is the same one the painter uses (the
+        picture's CIRCUMSCRIBED circle, scaled down to the glyph radius). One
+        decode per revision, because this runs from paintEvent.
+        """
+        path = str(self._image_fn(state) or "")
+        if not path:
+            return False
+        bubble = self._bubble_module
+        if bubble is None:
+            try:
+                bubble = self._bubble_module = _core_module("bubble")
+            except Exception:
+                log.debug("preview: bubble module unavailable", exc_info=True)
+                return False
+        try:
+            st = Path(path).stat()
+            key = (path, st.st_mtime_ns, st.st_size)
+        except OSError:
+            return False
+        if key not in self._image_cache:
+            # Keyed by the FILE, not by "the last one": a pack gives the strip
+            # four different pictures, and a single slot would re-decode all
+            # four on every painted frame at 30 Hz. A failed revision is
+            # remembered as None so an unreadable file costs one attempt.
+            layers = None
+            try:
+                layers = bubble.image_layers(path)
+            except Exception:
+                log.debug("preview: image decode failed", exc_info=True)
+            while len(self._image_cache) >= 8:
+                self._image_cache.pop(next(iter(self._image_cache)))
+            self._image_cache[key] = layers
+        layers = self._image_cache.get(key)
+        if not layers:
+            return False
+        img = layers[0]
+        try:
+            picture = bubble.tinted_image(img, layers[1], color)
+        except Exception:
+            log.debug("preview: image tint failed", exc_info=True)
+            return False
+        half = 0.5 * math.hypot(float(img.width()), float(img.height()))
+        if half <= 0.0:
+            return False
+        scale = r * 0.96 / half
+        w, h = float(img.width()) * scale, float(img.height()) * scale
+        p.save()
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawImage(QRectF(cx - w / 2.0, cy - h / 2.0, w, h), picture)
+        p.restore()
+        return True
 
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
@@ -705,7 +789,17 @@ class BubblePreview(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(grad))
             p.drawEllipse(QPointF(cx, cy), r + 6 * k, r + 6 * k)
-            self._glyph(p, self._design_fn(), cx, cy, r, QColor(color), tt, k)
+            design = self._design_fn()
+            # The `image` design shows the user's OWN picture here — the one
+            # for THIS slot's state, because a pack names a picture per state.
+            # A preview that showed the empty slot while the bubble drew the
+            # photo would be lying about the one thing the combo above it
+            # selects, so the picture goes through the bubble module's own
+            # decode and tint (see _draw_image_glyph) and the slot glyph is
+            # only the no-file case.
+            if design != "image" or not self._draw_image_glyph(
+                    p, cx, cy, r, QColor(color), name):
+                self._glyph(p, design, cx, cy, r, QColor(color), tt, k)
             p.setPen(QPen(QColor(140, 140, 140)))
             f = QFont()
             f.setPointSize(8)
@@ -1180,8 +1274,16 @@ class SettingsWindow(QMainWindow):
     # colour-only edit was skipped as "this was a load, not an edit" and the
     # new colour never reached settings.json — the tab's "the colours don't
     # apply" complaint.
+    # `design_image_path` belongs in this tuple for the same reason `colors`
+    # does: a change that moves ONLY it would otherwise be read as a load rather
+    # than an edit, and the picture the user just chose would never reach disk —
+    # the defect that produced "the colours don't apply", one control along.
+    # `design_pack` is in for exactly the same reason: picking a pack moves no
+    # other control, and a pack that never reached disk would look like a picker
+    # that does nothing.
     APPEARANCE_KEYS = ("bubble_design", "bubble_size", "animation_energy",
-                       "bubble_accent", "colors")
+                       "bubble_accent", "colors", "design_image_path",
+                       "design_pack")
 
     def __init__(self) -> None:
         super().__init__()
@@ -1189,6 +1291,12 @@ class SettingsWindow(QMainWindow):
         self.resize(780, 600)
         import copy
         self.cfg = copy.deepcopy(H.SETTINGS)
+        # The `image` design's art, held as form values like every other
+        # control, and seeded from settings so a reload shows the picture (or
+        # pack) in use rather than the empty slot the form would otherwise
+        # claim.
+        self._design_image = str(self.cfg.get("design_image_path") or "")
+        self._design_pack = str(self.cfg.get("design_pack") or "")
         self._model_at_open = str(self.cfg.get("model") or "")
         self._state_dir_ready()
         self._live_probe: _LiveMicProbe | None = None   # live mic test (Voice tab)
@@ -2522,6 +2630,59 @@ class SettingsWindow(QMainWindow):
             "seconds. No Save needed.")
         self.design_combo.currentIndexChanged.connect(self._schedule_appearance_live)
         box.addLayout(self._field("Design", self.design_combo))
+        # The picture the `Image` design draws. It lives in the Shape card
+        # rather than a card of its own because a shape whose art comes from a
+        # file is still a shape; it is always visible (a picture may be chosen
+        # before the design is switched to it) and it applies live like the
+        # combo, which is the contract this tab promises.
+        # The picture the `Image` design draws. It lives in the Shape card
+        # rather than a card of its own because a shape whose art comes from a
+        # file is still a shape; it is always visible (a picture may be chosen
+        # before the design is switched to it) and it applies live like the
+        # combo, which is the contract this tab promises.
+        pick_row = QHBoxLayout()
+        self.image_button = QPushButton("Choose image\u2026", card)
+        self.image_button.setToolTip(
+            "The picture the \"Image\" design draws: fitted to the glass, "
+            "tinted by the state colour and lit by the voice.")
+        self.image_button.clicked.connect(self._pick_design_image)
+        self.image_clear = QPushButton("Clear", card)
+        self.image_clear.setToolTip("Go back to the empty-slot frame")
+        self.image_clear.clicked.connect(self._clear_design_image)
+        pick_row.addWidget(self.image_button)
+        pick_row.addWidget(self.image_clear)
+        pick_row.addStretch(1)
+        box.addLayout(pick_row)
+        self.image_label = self._muted("", card)
+        box.addWidget(self.image_label)
+        # A PACK is the same art as several pictures that switch with the state,
+        # so it sits beside the single file as an alternative SOURCE for this
+        # shape's art. When one is chosen it is the AUTHORITY and the picture
+        # above it is ignored — which the label under the row says out loud,
+        # because "I picked a pack and nothing changed" is the complaint this
+        # whole card exists to answer.
+        self.pack_combo = QComboBox(card)
+        self.pack_combo.setToolTip(
+            "An installed design pack: one picture per state, chosen together "
+            "and switched as the bubble changes state.")
+        self.pack_combo.currentIndexChanged.connect(self._on_pack_changed)
+        self.pack_install = QPushButton("Install pack\u2026", card)
+        self.pack_install.setToolTip(
+            "Copy a folder holding a pack.json and its pictures into this "
+            "install, so the pack keeps working when the folder it came from "
+            "moves. Pictures may live in subfolders.")
+        self.pack_install.clicked.connect(self._install_design_pack)
+        self.pack_clear = QPushButton("Clear", card)
+        self.pack_clear.setToolTip("Stop using a pack; go back to one picture")
+        self.pack_clear.clicked.connect(self._clear_design_pack)
+        box.addLayout(self._field("Pack", self.pack_combo))
+        pack_row = QHBoxLayout()
+        pack_row.addWidget(self.pack_install)
+        pack_row.addWidget(self.pack_clear)
+        pack_row.addStretch(1)
+        box.addLayout(pack_row)
+        self.pack_label = self._muted("", card)
+        box.addWidget(self.pack_label)
         self.size_slider = QSlider(Qt.Horizontal, card)
         self.size_slider.setRange(96, 192)
         self.size_label = QLabel("", card)
@@ -2634,6 +2795,7 @@ class SettingsWindow(QMainWindow):
             lambda: self.design_combo.currentData() or "orb",
             lambda: self.energy_slider.value() / 100.0,
             lambda: self.accent_slider.value() / 100.0,
+            self._design_picture,
         )
         self.preview.setMinimumHeight(168)
         box.addWidget(self.preview)
@@ -2883,7 +3045,253 @@ class SettingsWindow(QMainWindow):
         click.
         """
         self._refresh_look_buttons()
+        # ...and the pack label follows the SHAPE too: switching away from the
+        # Image design turns a pack's "in use" into a statement about what is
+        # actually on screen.
+        self._refresh_pack_label()
         self._live_timer.start()
+
+    # ------------------------------------------------- the `image` design's art
+
+    def _pick_design_image(self) -> None:
+        """Choose the file the `image` design draws, and apply it live.
+
+        Written straight into the form and the live timer is armed, so a chosen
+        picture reaches the bubble with no Save — the same contract the shape
+        combo has, because this IS picking a shape's art. A cancelled dialog
+        writes nothing at all: closing the picker is not an edit.
+        """
+        start = str(self._design_image or "")
+        try:
+            start_dir = str(Path(start).parent) if start else str(Path.home())
+        except (OSError, ValueError):
+            start_dir = str(Path.home())
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Choose the bubble's picture", start_dir,
+            "Images (*.png *.jpg *.jpeg *.webp *.gif *.bmp *.svg *.xpm);;"
+            "All files (*)")
+        if not chosen:
+            return                  # cancelled: no write, no live apply
+        self._design_image = chosen
+        self._refresh_design_image_label()
+        self._use_image_design()
+        self._schedule_appearance_live()
+
+    def _clear_design_image(self) -> None:
+        """Back to the empty slot — a real edit, and applied live like one."""
+        if not self._design_image:
+            return
+        self._design_image = ""
+        self._refresh_design_image_label()
+        self._schedule_appearance_live()
+
+    def _use_image_design(self) -> None:
+        """Point the Design combo at `image`, so chosen art is on screen.
+
+        Every other control in this card applies itself; art that was chosen
+        and silently NOT drawn — because the shape is still a painter — is the
+        "I picked it and nothing happened" complaint in a new costume. Switching
+        the combo arms the live apply itself, so the change reaches the bubble
+        the same way a manual pick does.
+        """
+        combo = getattr(self, "design_combo", None)
+        if combo is None:
+            return
+        index = combo.findData("image")
+        if index >= 0 and combo.currentIndex() != index:
+            combo.setCurrentIndex(index)
+
+    def _design_picture(self, state: str = "") -> str:
+        """The picture in effect for `state`, resolved the way the BUBBLE does.
+
+        The precedence (a pack when one is chosen, otherwise the single picture)
+        lives in the bubble module's `picture_for`, so the panel and the desktop
+        cannot disagree about which picture a state draws — which is the
+        preview's whole job, and exactly where two implementations would drift.
+        """
+        try:
+            bubble = _core_module("bubble")
+        except Exception:
+            log.debug("design picture: bubble module unavailable", exc_info=True)
+            return ""
+        try:
+            return str(bubble.picture_for(self._design_pack,
+                                          self._design_image, state) or "")
+        except Exception:
+            log.debug("design picture resolution failed", exc_info=True)
+            return ""
+
+    def _on_pack_changed(self, *_args) -> None:
+        """The user picked a pack: mirror it into the form, then apply live."""
+        combo = getattr(self, "pack_combo", None)
+        if combo is None:
+            return
+        self._design_pack = str(combo.currentData() or "")
+        self._refresh_pack_label()
+        self._refresh_design_image_label()
+        if self._design_pack:
+            # Same rule as choosing a picture or installing a pack: art that is
+            # selected has to be the art that is DRAWN, so the shape follows.
+            self._use_image_design()
+        self._schedule_appearance_live()
+
+    def _refresh_pack_combo(self) -> None:
+        """Fill the Pack combo from what is installed, keeping the selection.
+
+        Rebuilt rather than appended to: an install lands a NEW folder, so the
+        list has to be able to grow without a restart, and rebuilding is what
+        lets the combo show a saved pack that is currently missing instead of
+        quietly falling back to "no pack".
+        """
+        combo = getattr(self, "pack_combo", None)
+        if combo is None:
+            return
+        chosen = str(self._design_pack or "")
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("(no pack \u2014 one picture)", "")
+            listed = set()
+            try:
+                packs = _core_module("bubble").installed_packs()
+            except Exception:
+                log.debug("pack listing failed", exc_info=True)
+                packs = []
+            for slug, name in packs:
+                listed.add(slug)
+                combo.addItem(f"{name} ({slug})" if name != slug else slug, slug)
+            if chosen and chosen not in listed:
+                # A saved pack that is no longer installed is LISTED under its
+                # slug, so the combo shows what settings actually say; the
+                # label beneath explains why nothing is drawn.
+                combo.addItem(f"{chosen} (not installed)", chosen)
+            index = combo.findData(chosen)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+        self._refresh_pack_label()
+
+    def _refresh_pack_label(self) -> None:
+        """What the pack is doing — or WHY it cannot draw anything.
+
+        The sentence comes from the bubble module (`pack_problem`), the same one
+        `doctor` prints, so the panel and the desktop describe one pack with one
+        wording instead of two GUIs disagreeing about one folder.
+        """
+        label = getattr(self, "pack_label", None)
+        if label is None:
+            return
+        slug = str(self._design_pack or "")
+        if not slug:
+            label.setText(
+                "No pack \u2014 the Image design draws the single picture above.")
+            return
+        problem = ""
+        try:
+            problem = _core_module("bubble").pack_problem(slug)
+        except Exception:
+            log.debug("pack check failed", exc_info=True)
+        if problem:
+            label.setText(f"\u26a0 {problem}")
+            return
+        # A pack can be SELECTED and still not draw anything: choose one (the
+        # shape follows it to `image`), then pick a painter from the combo, and
+        # the art is off screen while a label claiming "in use" lies about which
+        # source is drawing \u2014 the same class of lie the preview's glyph
+        # guards against one card up. So the sentence follows the SHAPE too.
+        combo = getattr(self, "design_combo", None)
+        design = str(combo.currentData() or "") if combo is not None else ""
+        if design != "image":
+            label.setText(
+                f"Pack {slug} is selected, but the bubble is drawing "
+                f"{design or 'another shape'} \u2014 the pack's pictures are not "
+                f"on screen.")
+            return
+        label.setText(f"Pack {slug} is in use \u2014 one picture per state.")
+
+    def _install_design_pack(self) -> None:
+        """Copy a pack folder into this install and select it.
+
+        Validation happens in the bubble module BEFORE anything is copied, so a
+        refused folder leaves the installed packs untouched. The message shown
+        either way is that module's own sentence, in the status line and the
+        pack label, so a refusal cannot be mistaken for a success.
+        """
+        try:
+            bubble = _core_module("bubble")
+        except Exception:
+            self._status("design packs are unavailable in this install")
+            return
+        try:
+            start_dir = str(Path(self._design_pack or "").expanduser())
+            if not Path(start_dir).is_dir():
+                start_dir = str(Path.home())
+        except (OSError, ValueError):
+            start_dir = str(Path.home())
+        source = QFileDialog.getExistingDirectory(
+            self, "Choose a design pack folder", start_dir)
+        if not source:
+            return                  # cancelled: not an edit
+        try:
+            slug, message = bubble.install_pack(source)
+        except Exception as exc:    # a data folder must never crash the panel
+            self._status(f"could not install that pack ({exc})")
+            return
+        # The status line carries the OUTCOME (installed, or why not) while the
+        # label always describes the CURRENT state: writing the outcome into the
+        # label would leave a refusal's sentence describing a pack that is no
+        # longer what is selected, and the next refresh would overwrite it
+        # anyway.
+        self._status(message)
+        if not slug:
+            self._refresh_pack_label()   # nothing changed: describe the state
+            return                  # refused: nothing selected, nothing written
+        self._design_pack = slug
+        self._refresh_pack_combo()
+        self._refresh_design_image_label()
+        self._use_image_design()
+        self._schedule_appearance_live()
+
+    def _clear_design_pack(self) -> None:
+        """Stop using a pack \u2014 a real edit, and applied live like one."""
+        if not self._design_pack:
+            return
+        self._design_pack = ""
+        self._refresh_pack_combo()
+        self._refresh_design_image_label()
+        self._schedule_appearance_live()
+
+    def _refresh_design_image_label(self) -> None:
+        """What the art in effect is \u2014 or WHY it cannot be drawn.
+
+        A pack is the authority when one is selected, so the label describes the
+        pack and then the single picture. Each explanation is the bubble
+        module's own (`pack_problem` / `design_image_problem`), the sentences
+        `doctor` prints and the reasons the bubble draws its empty slot, so the
+        panel and the desktop describe one thing with one wording. The path is
+        shown in full rather than as a file name: a truncated path is how "it
+        points somewhere I did not mean" stays invisible.
+        """
+        pack = str(self._design_pack or "")
+        if pack:
+            self.image_label.setText(
+                f"A pack is selected ({pack}) \u2014 it draws the pictures, and "
+                f"the file above is not used while it is.")
+            return
+        path = str(self._design_image or "")
+        if not path:
+            self.image_label.setText(
+                "No fallback picture \u2014 the empty-slot frame is drawn.")
+            return
+        problem = ""
+        try:
+            problem = _core_module("bubble").design_image_problem(path)
+        except Exception:
+            log.debug("design image check failed", exc_info=True)
+        if problem:
+            self.image_label.setText(f"\u26a0 {problem}")
+        else:
+            self.image_label.setText(path)
 
     def _apply_appearance_live(self) -> None:
         """Write the Appearance values to settings.json and notify the bubble.
@@ -2898,8 +3306,15 @@ class SettingsWindow(QMainWindow):
             log.exception("live appearance apply: could not collect settings")
             return
         wanted = {k: self.cfg.get(k) for k in self.APPEARANCE_KEYS}
+        # Compared against the disk through the SAME defaults-and-coercion path a
+        # load uses, not against the raw JSON. A settings.json written before a
+        # key existed has no entry for it, and `raw.get(k)` then differs from the
+        # widget's default for a reason that is not an edit — so a plain reload
+        # announced "Applied live: shape, size, ..." and rewrote the file, a
+        # message describing an edit nobody made.
         try:
-            on_disk = json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8"))
+            on_disk = merge_settings(
+                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8")))
         except (OSError, ValueError):
             on_disk = {}
         changed = [k for k in self.APPEARANCE_KEYS
@@ -2915,7 +3330,9 @@ class SettingsWindow(QMainWindow):
             # tuned set that happens to match also reports itself as that look.
             pretty = {"bubble_design": "shape", "bubble_size": "size",
                       "animation_energy": "animation energy",
-                      "bubble_accent": "colour accent", "colors": "state colours"}
+                      "bubble_accent": "colour accent", "colors": "state colours",
+                      "design_image_path": "fallback image",
+                      "design_pack": "design pack"}
             name = self._current_look()
             entry = (SCHEMA.look(name) if name and hasattr(SCHEMA, "look")
                      else None)
@@ -3109,6 +3526,10 @@ class SettingsWindow(QMainWindow):
                 "\n".join(f"{k} = {v}" for k, v in sorted(pol.items())))
         _di = self.design_combo.findData(str(self.cfg.get("bubble_design", "orb")))
         self.design_combo.setCurrentIndex(_di if _di >= 0 else 0)
+        self._design_image = str(self.cfg.get("design_image_path") or "")
+        self._design_pack = str(self.cfg.get("design_pack") or "")
+        self._refresh_pack_combo()
+        self._refresh_design_image_label()
         self.energy_slider.setValue(int(round(min(
             2.0, max(0.2, float(self.cfg.get("animation_energy", 1.0)))) * 100)))
         self.accent_slider.setValue(int(round(min(
@@ -3219,6 +3640,8 @@ class SettingsWindow(QMainWindow):
         self.cfg["workspace_aliases"] = alias_map
         self.cfg["bubble_size"] = self.size_slider.value()
         self.cfg["bubble_design"] = self.design_combo.currentData() or "orb"
+        self.cfg["design_image_path"] = str(self._design_image or "")
+        self.cfg["design_pack"] = str(self._design_pack or "")
         self.cfg["animation_energy"] = self.energy_slider.value() / 100.0
         self.cfg["bubble_accent"] = self.accent_slider.value() / 100.0
         self.cfg["colors"] = dict(self._colors)

@@ -1262,8 +1262,12 @@ class TestTheBubbleModuleOwnsTheAppearance:
                   "BUBBLE_ACCENT", "ANIM_ENERGY", "STATE_COLORS", "_BUBBLE_FX",
                   "design_region", "BubbleWidget")
     # Everything the module is allowed to be handed. Anything else written onto
-    # it from the app would be a second owner.
-    HOST = ("SETTINGS", "APP_NAME", "SETTINGS_APP", "RESTART_SCRIPT", "notify")
+    # it from the app would be a second owner. PACKS_DIR is a PATH the host owns,
+    # like SETTINGS_APP and RESTART_SCRIPT — not appearance state: the module
+    # still derives everything it draws from `configure()`, and the settings app
+    # resolves the same tree through the module's own XDG fallback.
+    HOST = ("SETTINGS", "APP_NAME", "SETTINGS_APP", "RESTART_SCRIPT", "notify",
+            "PACKS_DIR")
 
     def _app_tree(self):
         return ast.parse((HERE / "handsoff.py").read_text(encoding="utf-8"))

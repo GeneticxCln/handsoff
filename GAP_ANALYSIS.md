@@ -2868,6 +2868,120 @@ loaded; stt: whisper loaded`, `health` reports `tts.ready: true, device: cuda`, 
 `timegm` errors are gone. **2/2 mutations caught** (the stdlib check removed; bare
 registration disabled outright).
 
+## A design whose art is a FILE (the fourteenth shape)
+
+**What was missing.** Every shape in `BUBBLE_DESIGNS` is a Python painter, so a new shape
+costs code in four places (the painter, the dispatch, the preview glyph, the aperture fit)
+and none of it can be authored by the person using the bubble. `image` is the same
+contract with the art moved into data: a file the user picks, drawn to the rules the
+painters obey rather than pasted over them.
+
+**Three rules make an imported picture behave like a painted design.** (1) *Fit*: what
+gets fitted to the aperture is the picture's CIRCUMSCRIBED circle — its diagonal, not its
+width — so the voice can tilt it and no corner can cross the glass, because a circle does
+not change under rotation. (2) *Colour*: the state colour owns every opaque pixel, the
+picture contributing silhouette and luminance through a 0.45 floor, so a black photo
+cannot hide the state — the `void` defect (8 visible px of 45 796) wearing a user's own
+file. (3) *No orb fallback*: with no picture chosen, or one that will not decode, the
+design draws a dashed empty slot in the state colour, because an orb there is
+indistinguishable from a design name with no dispatch branch — a bug this tree has already
+shipped once.
+
+**The seam.** Decode and tint are functions of a PATH (`_decoded_image`, `image_layers`,
+`tinted_image`), so the settings preview and the bubble share one idea of one file: the
+preview calls them with its own one-entry cache instead of reimplementing the fit, and a
+panel that showed the empty slot while the bubble drew the photo is a preview lying about
+the thing the combo above it selects.
+
+**Two real defects found while verifying — by the new guard, not by reading.** First, a
+path that could not be stat'ed left the last picture that *did* decode in `_IMAGE`, so a
+moved or deleted file kept drawing the old art: "it ignores what I choose" in a new
+costume, caught because the guard compares a broken path's ink against the empty slot's.
+Second, and worse, the tint was built per painted frame at the SOURCE size — a 3000x2000
+photo meant a 24 MB allocation plus a QPainter over it at 25-60 Hz, and the aperture sweep
+(160 renders) segfaulted on it. The decode now downscales ONCE to a bounded working canvas
+(`_IMAGE_WORK = 384`, still oversampled against a drawn diagonal of at most ~169 px at the
+largest window), and both `_shading_layer` and `tinted_image` refuse to paint on a null
+QImage instead of trusting an allocation to succeed.
+
+**Evidence.** 14/14 mutations back to the old behaviour caught, one per decision (missing
+dispatch branch, width instead of diagonal, the 0.45 floor removed, a transparent picture
+treated as drawable, the stale-picture clear dropped, the canvas cap removed, the doctor
+reason blanked, the live-apply key removed, the form no longer collecting the file, the
+reload not picking it back up, the cancelled-picker guard dropped, the apply message not
+naming the change, the preview call site removed, the preview glyph falling back to the
+orb). 1082 tests green in three orderings; coverage **80.72% ≥ 70**; `ci/compile_all.py`
+clean (42 files). Live proof, on the running bubble rather than in a test: settings swapped
+to the new design → `--ptt health` reports `design: image`, doctor prints
+`appearance: look Custom (image, 144 px)`, the journal records two
+`settings reloaded live (no restart)` lines with zero tracebacks, and the user's own
+settings were restored byte-for-byte afterwards (`design: pikachu`, look `spark`).
+
+## A design's art as several pictures: the design-pack format
+
+**What was missing.** `image` drew ONE file for all four states, so the only way to show a
+different picture while listening than while thinking was to edit the setting between
+states. A PACK is that art as data: a folder holding `pack.json` beside its pictures, one
+picture per state, installed from the Appearance tab so by ONE choice several pictures
+switch together as the bubble changes state.
+
+**The format is a contract about a folder someone else wrote.** `{"name", "any", "states"}`;
+`states` may name any subset of the four, a state it does not name uses `any`, and a pack
+that leaves a state uncovered with no `any` is REPORTED rather than silently drawing an empty
+slot for it. Two rules make a foreign folder safe to install, both of them the same rule
+`read_file`'s denylist applies: every name resolves INSIDE its own folder through
+`_pack_file` (an absolute path, a `..` segment, or a symlink whose target is outside is
+refused — `resolve()` is what catches the symlink), and installing COPIES the folder into
+`~/.config/handsoff/design-packs/<slug>/` instead of referencing it, so a pack keeps working
+when the folder it came from moves. Installing over the same name moves the old copy to
+`<slug>.previous` — one generation, replaced next time, never listed as a pack of its own.
+`pack_slug()` reduces any name to letters/digits/dash/underscore, so a name can never become
+a path.
+
+**One authority, three consumers.** `_validate_pack` decides whether a folder is usable, and
+`install_pack` refuses it, `load_pack` resolves it to NOTHING (art assembled from the parts
+that happened to check out is the silent half-working this tree keeps deleting) and
+`pack_problem` NAMES it — three implementations of "is this pack good" would drift, and the
+drift would be invisible: a pack half-drawn while doctor reports it fine. `picture_for` owns
+the precedence (a selected pack is the AUTHORITY, so a pack that cannot be read returns `""`
+rather than falling back to the single picture — art from a source the user did not choose is
+worse than no art), and the settings preview calls it rather than reimplementing it, which is
+how the panel and the desktop cannot disagree. `PACKS_DIR` is injected by the host like every
+other path (`tests/test_sandbox.py`'s HOST tuple gained it as a PATH, not appearance state)
+while the module keeps an XDG fallback, so the settings app — which loads the module on its
+own — resolves the same tree without being told.
+
+**A real defect the verification found, not a reading.** A folder whose manifest reached
+outside itself (`"any": "../outside.png"`, or an absolute `/etc/hostname`) was refused with
+**"names no picture"** — the wrong reason, pointing the user at their JSON syntax instead of
+at the entry that escaped; `install_pack` was validating through the lenient builder that
+silently DROPS such an entry. Both paths now go through `_validate_pack` and the message names
+the offending entry. The sweep also exposed a line of my own as dead: `if problem: built =
+None` in `load_pack` could never fire, because `_validate_pack` already returns `None` as its
+`built` on every problem path — the guarantee is now stated in that function's contract and
+the unreachable branch is gone rather than left as decoration.
+
+**Evidence.** **24/24 mutations** back to the old behaviour caught, one per decision (the
+escape check, the symlink containment check, the slug sanitiser, the transparent-picture
+refusal, the uncovered-state refusal, the half-built-pack refusal, the pack-has-no-authority
+fallback, doctor reporting the single picture for a pack, `.previous` listed as a pack,
+generations stacked instead of replaced, a missing pack unnamed, install skipping its own
+validation, the setting not stripped, the coercion validating the pack away, the choice not
+pointing the shape at the design that draws it, the choice not a live key, the preview
+ignoring which state a slot is, doctor not naming the pack, a saved-but-uninstalled pack
+hidden from the picker, a refused install selecting the pack, Clear leaving it selected, the
+panel claiming a pack is "in use" while the shape is a painter, and the pack dropped from the
+preview's resolution). 1107 tests green in three orderings
+(default, shuffled-test seed 20260913, shuffled-file seed 7); coverage **80.76% ≥ 70**
+measured the gate's own way (`COVERAGE_PROCESS_START`); `ci/compile_all.py` clean (43 files).
+Live proof on the RUNNING bubble rather than in a test: a four-picture pack installed through
+the DEPLOYED module, settings moved to `design: image` / `design_pack: prism`, `--ptt
+reload-settings` → `--ptt health` reports `{'look': 'Custom', 'design': 'image', 'size': 144}`
+and doctor prints `appearance: look Custom (image, 144 px) — pack prism`, with two `settings
+reloaded live (no restart)` journal lines and zero tracebacks — then the user's own settings
+restored byte-for-byte (`design: pikachu`, look `spark`). Nothing committed.
+
+
 ## Online lookups: a probed search router and a page reader
 
 **What was missing.** `web_search` scraped `lite.duckduckgo.com` with a regex that required a

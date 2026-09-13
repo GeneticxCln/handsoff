@@ -618,14 +618,37 @@ def _appearance_look() -> str:
 
 
 def _appearance_note() -> str:
-    """One doctor line: the look, the design and the window size."""
+    """One doctor line: the look, the design and the window size.
+
+    The `image` design draws the user's own file, and the only thing that can
+    go wrong there IS the file: a path that no longer exists, a folder, a
+    format this Qt cannot decode, or a picture that is entirely transparent.
+    The bubble draws its dashed empty slot for every one of those, which is
+    deliberately indistinguishable from "no picture chosen yet" — so the
+    REASON has to be readable here. The sentence comes from the bubble module's
+    own `design_image_problem`, the same one the settings picker shows, so
+    doctor and the desktop cannot disagree about one file.
+    """
     look = _core_settings.look_label(_appearance_look()) or "Custom"
     design = str(SETTINGS.get("bubble_design", "orb"))
     try:
         size = int(SETTINGS.get("bubble_size", _core_bubble.WINDOW_PX))
     except (TypeError, ValueError):
         size = _core_bubble.WINDOW_PX
-    return f"look {look} ({design}, {size} px)"
+    note = f"look {look} ({design}, {size} px)"
+    pack = str(SETTINGS.get("design_pack") or "").strip()
+    if pack:
+        # Named rather than implied: a pack is the AUTHORITY over the single
+        # picture, so "which pictures are on screen" has to be answerable here
+        # without opening the settings app.
+        note = f"{note} — pack {pack}"
+    try:
+        # `art_problem` owns the precedence, so doctor cannot describe a
+        # different source than the renderer draws from.
+        problem = _core_bubble.art_problem()
+    except Exception:
+        problem = ""
+    return f"{note} — image: {problem}" if problem else note
 
 
 def _web_lines() -> list:
@@ -1425,6 +1448,8 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
         APP_NAME = "handsoff"
         SETTINGS_APP = None
         RESTART_SCRIPT = None
+        PACK_DIR_NAME = "design-packs"
+        PACKS_DIR = None
 
         @staticmethod
         def configure(*_args, **_kwargs):
@@ -1447,6 +1472,10 @@ _core_bubble.SETTINGS = SETTINGS
 _core_bubble.APP_NAME = APP_NAME
 _core_bubble.SETTINGS_APP = SETTINGS_APP
 _core_bubble.RESTART_SCRIPT = RESTART_SCRIPT
+# Where installed design packs live. The host owns every path this module needs;
+# the module's own fallback follows the same XDG rule, so the settings app —
+# which loads the module on its own — resolves the SAME tree without being told.
+_core_bubble.PACKS_DIR = CONFIG_DIR / _core_bubble.PACK_DIR_NAME
 # The palette and the geometry have to exist before anything can paint, so the
 # appearance is derived from the loaded settings right here — the same import
 # time derivation the module-level constants used to do.

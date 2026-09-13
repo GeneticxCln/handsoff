@@ -404,6 +404,21 @@ def loading_the_form_is_still_not_an_edit():
     win.save = real_save
     assert writes == [], "a reload must not be mistaken for an edit"
     assert settings_file.read_text(encoding="utf-8") == before
+    # ...and that must hold for a file written by an OLDER build, which has no
+    # entry at all for the appearance keys added since. Compared against the raw
+    # JSON such a key differs from the widget's default for a reason that is not
+    # an edit, so a plain reload announced "Applied live: ..." and rewrote the
+    # file — a message describing an edit nobody made.
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    raw = settings_file.read_text(encoding="utf-8")
+    writes = []
+    win.save = lambda: (writes.append(1), real_save())[1]
+    win._apply_appearance_live()
+    win.save = real_save
+    assert writes == [], (
+        "a settings.json without the newer keys was read as an edit")
+    assert settings_file.read_text(encoding="utf-8") == raw
 
 
 @scenario
@@ -971,6 +986,13 @@ def a_look_sets_every_appearance_control():
     for entry in APPEARANCE_LOOKS:
         notified = []
         win._notify_bubble_reloaded = lambda: (notified.append(1), True)[1]
+        # Land the form on something this look CANNOT already be, so "the click
+        # reached disk" is a real assertion. Without it the first look happens
+        # to match the seeded defaults, the live apply correctly finds nothing
+        # changed and writes nothing — and the scenario would be measuring the
+        # seed rather than the click.
+        win.size_slider.setValue(96 if entry["bubble_size"] != 96 else 192)
+        win._apply_appearance_live()
         win._apply_look(entry["name"])
         win._apply_appearance_live()      # what the debounce timer calls
         on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
@@ -1959,6 +1981,591 @@ def decision_log_renders_and_tolerates_garbage():
     assert "no decisions logged yet" in win.decisions_view.toPlainText()
 
 
+@scenario
+def the_image_design_draws_the_users_picture():
+    # The `image` design's art is a FILE, so everything that can go wrong is
+    # about the file: absent, unreadable, a folder, the wrong bytes, or
+    # invisible. Three properties are load-bearing and this pins all three.
+    #
+    #   the picture really reaches the surface — decoding, tinting and fitting
+    #     are three separate steps, and a silent failure in any one of them
+    #     leaves the empty slot, which reads as "my picture was ignored";
+    #   the state colour still wins over it — the picture contributes its
+    #     silhouette and luminance, and the 0.45 floor is what stops a black
+    #     picture from erasing the colour the user chose;
+    #   none of it leaves the aperture, at every radius and voice level, which
+    #     is the whole return on fitting the picture's DIAGONAL rather than its
+    #     width.
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QColor, QImage, QPainter
+
+    class _Signal:
+        def connect(self, *_a, **_k):
+            return None
+
+    class _Stub:
+        sigState = _Signal()
+        sigLevel = _Signal()
+
+    class _Clock:
+        def __init__(self, ms):
+            self.ms = ms
+
+        def elapsed(self):
+            return self.ms
+
+    W = appearance.WINDOW_PX
+    widget = appearance.BubbleWidget(_Stub())
+    widget.resize(W, W)
+    widget._anim.stop()
+    widget._clock = _Clock(4000)
+    widget._state = "idle"
+    widget._level_ui = widget._level_target = 0.0
+    widget._radius_ui = appearance.BUBBLE_R0
+    widget._energy_ui = appearance._fx_energy("idle")
+    appearance.ANIM_ENERGY = 1.0
+    appearance.BUBBLE_ACCENT = 0.5
+    bubble.SETTINGS["bubble_design"] = "image"
+
+    def shot(color="#2f6fed"):
+        c = QColor(color)
+        widget._color_ui = [c.redF(), c.greenF(), c.blueF()]
+        img = QImage(W, W, QImage.Format_ARGB32)
+        img.fill(0)
+        widget.render(img)
+        return img
+
+    def opaque_pixels(img, alpha=200):
+        return sum(1 for y in range(W) for x in range(W)
+                   if img.pixelColor(x, y).alpha() > alpha)
+
+    def reach_of(img, alpha=200):
+        return max(((x + 0.5 - W / 2.0) ** 2 + (y + 0.5 - W / 2.0) ** 2) ** 0.5
+                   for y in range(W) for x in range(W)
+                   if img.pixelColor(x, y).alpha() > alpha)
+
+    folder = settings_file.parent
+
+    # --- no picture chosen: the empty slot, and NOT the orb. An orb here is
+    # --- indistinguishable from a design name with no dispatch branch.
+    bubble.SETTINGS["design_image_path"] = ""
+    slot = shot()
+    slot_px = opaque_pixels(slot)
+    assert 100 < slot_px < 2500, slot_px
+    assert appearance.design_image() is None
+    assert appearance.design_image_problem() == "", (
+        "an unchosen picture is the starting state, not a problem")
+
+    # --- a real picture draws, and fills the glass
+    art = folder / "art.png"
+    black = QImage(180, 120, QImage.Format_ARGB32)
+    black.fill(QColor(0, 0, 0, 255))
+    assert black.save(str(art))
+    bubble.SETTINGS["design_image_path"] = str(art)
+    assert appearance.design_image_problem() == "", (
+        appearance.design_image_problem())
+    drawn = shot()
+    drawn_px = opaque_pixels(drawn)
+    assert drawn_px > slot_px * 5, (
+        f"the picture never reached the surface: {drawn_px} opaque pixels "
+        f"against the empty slot's {slot_px} — decode, tint and fit are three "
+        f"steps and any one of them failing silently looks like this")
+    reach = reach_of(drawn)
+    assert reach <= appearance.APERTURE_R, (reach, appearance.APERTURE_R)
+    assert reach > appearance.APERTURE_R * 0.75, (
+        f"the picture collapsed to {reach:.1f} px instead of filling the "
+        f"glass — the fit is shrinking it away")
+
+    # --- ink stays inside the aperture for BOTH revisions, at every radius the
+    # --- state machine can ask for and both voice extremes. Direct paint, the
+    # --- same instrument the generic aperture guard uses.
+    region = appearance.design_region("image", W, W)
+    outside = [(x, y) for y in range(W) for x in range(W)
+               if not region.contains(QPoint(x, y))]
+
+    def worst_outside():
+        worst = (0, None)
+        for clock_ms in (0, 600, 2600, 4000, 9000):
+            widget._clock = _Clock(clock_ms)
+            for state in ("idle", "listening", "thinking", "speaking"):
+                widget._state = state
+                widget._energy_ui = appearance._fx_energy(state)
+                for level in (0.0, 1.0):
+                    for grow in (0.0, 3.5, 7.0, 12.0):
+                        widget._level_target = widget._level_ui = level
+                        widget._radius_ui = (appearance.BUBBLE_R0
+                                             + grow * appearance.GEOM_K)
+                        img = QImage(W, W, QImage.Format_ARGB32)
+                        img.fill(0)
+                        painter = QPainter(img)
+                        widget._paint_image(painter, widget._frame())
+                        painter.end()
+                        n = peak = 0
+                        for x, y in outside:
+                            a = img.pixelColor(x, y).alpha()
+                            if a >= 16:
+                                n += 1
+                                peak = max(peak, a)
+                        if n > worst[0]:
+                            worst = (n, (clock_ms, state, level, grow, peak))
+        return worst
+
+    assert worst_outside() == (0, None), worst_outside()
+    white = QImage(3000, 2000, QImage.Format_ARGB32)   # big AND bright
+    white.fill(QColor(255, 255, 255, 255))
+    assert white.save(str(art))
+    assert worst_outside() == (0, None), worst_outside()
+    # ...and the working canvas is BOUNDED, whatever the file's dimensions: a
+    # 3000x2000 photo is 24 MB and the tint is a copy per painted frame, so
+    # this is a memory ceiling, not a nicety. The drawn rect's diagonal is at
+    # most ~169 px at the largest window, so 384 is still oversampled.
+    layers = appearance.image_layers(str(art))
+    assert layers is not None, "the big picture must still decode"
+    assert max(layers[0].width(), layers[0].height()) <= 384, (
+        f"the working canvas grew to {layers[0].width()}x{layers[0].height()} "
+        f"for a 3000x2000 file — every frame after this one pays for it")
+
+    # --- the state colour still wins over the picture, and the voice still
+    # --- moves it: the two channels the Appearance tab promises.
+
+    def frame_at(level, color, clock):
+        widget._clock = _Clock(clock)
+        widget._level_target = widget._level_ui = level
+        return bytes(shot(color).constBits())
+
+    def changed(before, after):
+        n = min(len(before), len(after))
+        return sum(1 for i in range(0, n - 3, 4)
+                   if any(x != y for x, y in zip(before[i:i + 3],
+                                                 after[i:i + 3])))
+
+    def visible(before, after):
+        n = min(len(before), len(after))
+        out = 0
+        for i in range(0, n - 3, 4):
+            if before[i + 3] == 0 and after[i + 3] == 0:
+                continue
+            if max(abs(x - y) for x, y in zip(before[i:i + 3],
+                                              after[i:i + 3])) >= 48:
+                out += 1
+        return out
+
+    base = frame_at(0.0, "#2f6fed", 4000)
+    steps = [visible(base, frame_at(0.0, other, 4000))
+             for other in ("#e0435c", "#c8781f", "#1fae62")]
+    assert max(steps) >= 400, (
+        f"the state colour changes only {max(steps)} pixel(s) by a visible "
+        f"step over a BLACK picture — the colour picker is disabled on the "
+        f"design whose art the user chose")
+    # ...and the PICTURE ITSELF carries the colour, not only its rim. A rim
+    # alone would satisfy the whole-window bar above while the body stayed
+    # black: that is the `void` defect (8 visible px of 45 796) with the user's
+    # own file as the dark body, and it is what the 0.45 luminance floor in
+    # `_shading_layer` exists to prevent. Measured on the CENTRE of the fit
+    # circle, which is where the picture is and the rim is not.
+    centre = [(x, y) for y in range(W // 2 - 20, W // 2 + 20)
+              for x in range(W // 2 - 20, W // 2 + 20)]
+
+    def shot_at(level, color):
+        widget._clock = _Clock(4000)
+        widget._level_target = widget._level_ui = level
+        c = QColor(color)
+        widget._color_ui = [c.redF(), c.greenF(), c.blueF()]
+        img = QImage(W, W, QImage.Format_ARGB32)
+        img.fill(0)
+        widget.render(img)
+        return img
+
+    ref = shot_at(0.0, "#2f6fed")
+    other = shot_at(0.0, "#e0435c")
+    lit = 0
+    for x, y in centre:
+        a, b = ref.pixelColor(x, y), other.pixelColor(x, y)
+        if a.alpha() == 0 and b.alpha() == 0:
+            continue
+        if max(abs(a.red() - b.red()), abs(a.green() - b.green()),
+               abs(a.blue() - b.blue())) >= 48:
+            lit += 1
+    assert lit >= 200, (
+        f"only {lit} of the {len(centre)} pixels at the CENTRE of the picture "
+        f"show the state colour — the rim is carrying it while the user's own "
+        f"picture stays black, which is the `void` defect in a new costume")
+    assert changed(frame_at(0.0, "#2f6fed", 4000),
+                   frame_at(1.0, "#2f6fed", 4000)) >= 100, (
+        "the voice does not reach the picture")
+
+    # --- every way the file can fail is NAMED, and each failure draws the slot
+    # --- rather than a blank window.
+    missing = folder / "nope.png"
+    junk = folder / "junk.png"
+    junk.write_text("this is not an image", encoding="utf-8")
+    clear = QImage(64, 64, QImage.Format_ARGB32)
+    clear.fill(QColor(0, 0, 0, 0))
+    invisible = folder / "clear.png"
+    assert clear.save(str(invisible))
+
+    cases = {
+        str(missing): "no file at",
+        str(folder): "is a folder",
+        str(junk): "not an image this build can read",
+        str(invisible): "transparent",
+    }
+    for path, phrase in cases.items():
+        problem = appearance.design_image_problem(path)
+        assert phrase in problem, (path, phrase, problem)
+        bubble.SETTINGS["design_image_path"] = path
+        assert appearance.design_image() is None, path
+        # compared against the no-picture render AT THIS SAME FRAME: the slot's
+        # dashes turn with the animation energy, so a capture from earlier in
+        # the scenario would differ for reasons that have nothing to do with
+        # the broken path
+        broken = opaque_pixels(shot())
+        bubble.SETTINGS["design_image_path"] = ""
+        empty = opaque_pixels(shot())
+        # Compared by INK rather than by bytes: rendering a translucent widget
+        # differs in a handful of antialiased pixels between two identical
+        # frames, which a byte comparison reads as a failure. The stale picture
+        # this pins is ~5x the slot's ink, so the tolerance is not blind.
+        assert abs(broken - empty) <= 20, (
+            f"{path} draws {broken} ink pixels against the empty slot's "
+            f"{empty} — a broken path must fall back to the slot instead of "
+            f"leaving the last picture that decoded on screen")
+    assert opaque_pixels(shot()) > 100, "the empty slot must still be visible"
+
+    # --- doctor says the same sentence the picker shows, and says nothing when
+    # --- there is nothing wrong (a partial deps object must not grow a line).
+    bubble.SETTINGS["design_image_path"] = str(missing)
+    assert "no file at" in bubble._appearance_note(), bubble._appearance_note()
+    bubble.SETTINGS["design_image_path"] = ""
+    assert "image:" not in bubble._appearance_note(), bubble._appearance_note()
+
+    # --- editing the file on disk repaints without a restart: the revision key
+    # --- exists so that a re-export is picked up, not so it is cached forever.
+    mid = QImage(180, 120, QImage.Format_ARGB32)
+    mid.fill(QColor(128, 128, 128, 255))
+    assert mid.save(str(art))
+    bubble.SETTINGS["design_image_path"] = str(art)
+    first = bytes(shot().constBits())
+    bright = QImage(180, 120, QImage.Format_ARGB32)
+    bright.fill(QColor(255, 255, 255, 255))
+    assert bright.save(str(art))
+    assert bytes(shot().constBits()) != first, (
+        "an edited picture is still cached: the key must carry mtime/size")
+
+    # --- the Appearance tab reaches the art: it is one of the live keys (the
+    # --- defect that made a colour-only edit invisible to the tab), it writes
+    # --- to disk without Save, and the name of what moved says so.
+    assert "design_image_path" in win.APPEARANCE_KEYS, win.APPEARANCE_KEYS
+    assert win.design_combo.findData("image") >= 0, "no picker for the design"
+    # ...and a reload picks the saved file up, rather than showing the empty
+    # slot the form would otherwise claim while the bubble draws a picture
+    # (the shape of "the GUI says one thing and the bubble does another").
+    seed({"model": "testmodel:latest", "design_image_path": str(art)})
+    win.reload_from_disk()
+    assert win._design_image == str(art), win._design_image
+    assert win.image_label.text() == str(art), win.image_label.text()
+
+    # the picker itself: a cancelled dialog writes NOTHING (closing a file
+    # chooser is not an edit), and a chosen file lands in the form
+    real_open = settings_app.QFileDialog.getOpenFileName
+    try:
+        # cancelling with a picture ALREADY chosen must leave it alone: an
+        # unguarded picker reads the empty answer as "clear it", so closing a
+        # file chooser silently drops the art (and the live apply writes that)
+        settings_app.QFileDialog.getOpenFileName = lambda *a, **k: ("", "")
+        win._design_image = str(art)
+        win._refresh_design_image_label()
+        win._pick_design_image()
+        assert win._design_image == str(art), (
+            "a cancelled picker changed the chosen picture")
+        assert win.image_label.text() == str(art), win.image_label.text()
+        settings_app.QFileDialog.getOpenFileName = (
+            lambda *a, **k: (str(art), ""))
+        win._design_image = ""
+        win._pick_design_image()
+        assert win._design_image == str(art), win._design_image
+        assert "No fallback picture" not in win.image_label.text()
+    finally:
+        settings_app.QFileDialog.getOpenFileName = real_open
+
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    win._design_image = str(art)
+    win._refresh_design_image_label()
+    assert win.image_label.text() == str(art), win.image_label.text()
+    win._apply_appearance_live()
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["design_image_path"] == str(art), on_disk.get(
+        "design_image_path")
+    assert "fallback image" in win.status_label.text(), win.status_label.text()
+    win._clear_design_image()
+    win._apply_appearance_live()
+    assert json.loads(settings_file.read_text())["design_image_path"] == ""
+    assert "No fallback picture" in win.image_label.text(), win.image_label.text()
+
+    # --- and the PREVIEW shows the picture, not the slot: a panel showing the
+    # --- empty slot while the bubble draws the photo is the preview lying about
+    # --- the one thing the combo above it selects.
+    surface = QImage(120, 120, QImage.Format_ARGB32)
+    surface.fill(0)
+    painter = QPainter(surface)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    win._design_image = str(art)
+    assert win.preview._draw_image_glyph(
+        painter, 60.0, 60.0, 40.0, QColor("#4f8cff")) is True
+    painter.end()
+    assert opaque_pixels(surface, 8) > 0
+    win._design_image = str(junk)
+    painter = QPainter(surface)
+    assert win.preview._draw_image_glyph(
+        painter, 60.0, 60.0, 40.0, QColor("#4f8cff")) is False, (
+        "an unreadable file must fall back to the slot glyph, not draw junk")
+    painter.end()
+    # ...and the preview's PAINT actually takes that path. Without this the
+    # strip could hold a correct `_draw_image_glyph` and simply never call it:
+    # the panel would show the empty slot while the bubble drew the photo,
+    # which is the lie the glyph exists to prevent.
+    class _FrozenClock:
+        def elapsed(self):
+            return 4000
+
+    win.preview.resize(240, 200)
+    calls = []
+    real_draw = settings_app.BubblePreview._draw_image_glyph
+
+    def _recording_draw(self, painter, cx, cy, r, color, state=""):
+        out = real_draw(self, painter, cx, cy, r, color, state)
+        calls.append(out)
+        return out
+
+    def preview_frame(image_path):
+        win.design_combo.setCurrentIndex(win.design_combo.findData("image"))
+        win._design_image = image_path
+        win.preview._clock = _FrozenClock()
+        img = QImage(win.preview.width(), win.preview.height(),
+                     QImage.Format_ARGB32)
+        img.fill(0)
+        win.preview.render(img)
+        return img
+
+    settings_app.BubblePreview._draw_image_glyph = _recording_draw
+    try:
+        preview_frame(str(art))
+        with_picture = list(calls)
+        del calls[:]
+        preview_frame(str(junk))
+        with_slot = list(calls)
+    finally:
+        settings_app.BubblePreview._draw_image_glyph = real_draw
+    assert len(with_picture) == 4 and all(with_picture), (
+        f"the strip's paint did not draw the picture in its four slots "
+        f"({with_picture}) — a correct glyph that is never called is a preview "
+        f"that lies about the thing the combo above it selects")
+    assert len(with_slot) == 4 and not any(with_slot), (
+        f"the strip drew an unreadable file instead of falling back "
+        f"({with_slot})")
+
+    win._design_image = ""
+    assert "No fallback picture" in win.image_label.text()
+    art.unlink(missing_ok=True)
+    junk.unlink(missing_ok=True)
+    invisible.unlink(missing_ok=True)
+
+
+@scenario
+def the_image_design_can_use_an_installed_pack():
+    # A PACK is the Image design's art as a FOLDER: a pack.json naming one
+    # picture per state, installed from the Appearance tab so ONE choice
+    # switches several pictures together. The pack layer is unit-tested in
+    # tests/test_design_packs.py; what this pins is the wiring the user touches
+    # — the picker lists what is installed, the choice reaches disk and the
+    # bubble live, the preview shows the four pictures rather than one, and the
+    # reason a pack cannot draw is the same sentence doctor prints.
+    import json as _json
+    import shutil as _shutil
+    from PySide6.QtGui import QColor, QImage
+
+    from settings_schema import BUBBLE_DESIGNS
+
+    folder = settings_file.parent
+    packs_root = config_dir / "design-packs"
+    appearance.PACKS_DIR = packs_root
+    _shutil.rmtree(packs_root, ignore_errors=True)
+
+    # --- a real pack: one distinctly coloured picture per state, so "which
+    # --- picture is drawn" is answerable by looking rather than by trusting a
+    # --- path (all four being the same file would pass a path check).
+    source = folder / "pack-src"
+    source.mkdir(parents=True, exist_ok=True)
+    tints = {"idle": (220, 60, 60, 255), "listening": (60, 220, 60, 255),
+             "thinking": (60, 60, 220, 255), "speaking": (220, 220, 60, 255)}
+    for state, rgba in tints.items():
+        img = QImage(64, 64, QImage.Format_ARGB32)
+        img.fill(QColor(*rgba))
+        assert img.save(str(source / (state + ".png")))
+    (source / "pack.json").write_text(_json.dumps({
+        "name": "Prism",
+        "states": {s: s + ".png" for s in tints},
+    }), encoding="utf-8")
+
+    slug, message = appearance.install_pack(source)
+    assert slug == "prism", (slug, message)
+    assert appearance.pack_problem(slug) == ""
+    assert (slug, "Prism") in appearance.installed_packs(), (
+        appearance.installed_packs())
+
+    # --- one picture per state, and the pack beats the single file: a chosen
+    # --- pack is the AUTHORITY, so the file the user picked earlier must not
+    # --- stand in for it.
+    single = folder / "single.png"
+    solo = QImage(40, 40, QImage.Format_ARGB32)
+    solo.fill(QColor(255, 255, 255, 255))
+    assert solo.save(str(single))
+    for state in tints:
+        resolved = appearance.picture_for(slug, str(single), state)
+        assert os.path.basename(resolved) == state + ".png", (state, resolved)
+
+    # --- the picker lists it, and picking it is an EDIT that reaches disk.
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    win._refresh_pack_combo()
+    index = win.pack_combo.findData(slug)
+    assert index >= 0, [win.pack_combo.itemText(i)
+                        for i in range(win.pack_combo.count())]
+    win.pack_combo.setCurrentIndex(index)
+    assert win._design_pack == slug, win._design_pack
+    assert "image" in BUBBLE_DESIGNS
+    assert win.design_combo.currentData() == "image", (
+        "choosing art must point the shape at the design that draws it, or the "
+        "pick lands on a painter and nothing appears")
+    win._apply_appearance_live()
+    on_disk = _json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["design_pack"] == slug, on_disk.get("design_pack")
+    assert "design pack" in win.status_label.text(), win.status_label.text()
+    # ...and the KEY the panel writes is the key the BUBBLE reads: a renamed
+    # setting would leave the picker saving a value nothing resolves, which is
+    # the same defect one name along.
+    bubble.SETTINGS["design_pack"] = slug
+    assert os.path.basename(appearance.design_picture("listening")) == (
+        "listening.png")
+    bubble.SETTINGS["design_pack"] = ""
+
+    # --- the panel tells the truth about which source is drawing it
+    assert "is in use" in win.pack_label.text(), win.pack_label.text()
+    assert "not used while it is" in win.image_label.text(), (
+        win.image_label.text())
+    # ...and it stops claiming that the moment the shape is moved back to a
+    # painter: a label still saying "in use" while the bubble draws an orb lies
+    # about which source is on screen.
+    win.design_combo.setCurrentIndex(win.design_combo.findData("orb"))
+    assert "not on screen" in win.pack_label.text(), win.pack_label.text()
+    assert win._design_pack == slug, "a shape change must not clear the pack"
+    win.design_combo.setCurrentIndex(win.design_combo.findData("image"))
+    assert "is in use" in win.pack_label.text(), win.pack_label.text()
+
+    # --- the PREVIEW shows the pack's four pictures, not one picture four
+    # --- times. The slot's state must reach the glyph, or a pack looks like a
+    # --- single image and the whole format is a lie in the panel.
+    seen = []
+    real_draw = settings_app.BubblePreview._draw_image_glyph
+
+    def _recording(self, painter, cx, cy, r, color, state=""):
+        out = real_draw(self, painter, cx, cy, r, color, state)
+        seen.append((state, out))
+        return out
+
+    class _FrozenClock:
+        def elapsed(self):
+            return 4000
+
+    settings_app.BubblePreview._draw_image_glyph = _recording
+    try:
+        win.preview.resize(320, 200)
+        win.preview._clock = _FrozenClock()
+        img = QImage(win.preview.width(), win.preview.height(),
+                     QImage.Format_ARGB32)
+        img.fill(0)
+        win.preview.render(img)
+    finally:
+        settings_app.BubblePreview._draw_image_glyph = real_draw
+    assert [s for s, ok in seen] == ["idle", "listening", "thinking",
+                                     "speaking"], seen
+    assert all(ok for _s, ok in seen), seen
+    for state in tints:
+        assert win._design_picture(state) == appearance.picture_for(
+            slug, win._design_image, state), state
+
+    # --- installing through the GUI: the dialog answers, the copy lands, the
+    # --- form and the combo follow, and the message is the module's own.
+    second = folder / "pack-src-2"
+    second.mkdir(parents=True, exist_ok=True)
+    img = QImage(48, 48, QImage.Format_ARGB32)
+    img.fill(QColor(10, 200, 240, 255))
+    assert img.save(str(second / "base.png"))
+    (second / "pack.json").write_text(_json.dumps(
+        {"name": "Solo", "any": "base.png"}), encoding="utf-8")
+    real_dir = settings_app.QFileDialog.getExistingDirectory
+    try:
+        # Closing the chooser is not an edit: nothing selected, nothing copied.
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: "")
+        win._design_pack = slug
+        win._install_design_pack()
+        assert win._design_pack == slug, (
+            "a cancelled folder chooser is not an edit")
+        assert not (packs_root / "solo").exists(), (
+            "a cancelled chooser installed the pack anyway")
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: str(second))
+        win._install_design_pack()
+        assert "installed pack" in win.status_label.text(), (
+            win.status_label.text())
+        assert "is in use" in win.pack_label.text(), win.pack_label.text()
+        # ...and a folder that is NOT a pack is REFUSED with the module's own
+        # sentence, leaving the selection alone rather than selecting a dud
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: str(folder))
+        win._install_design_pack()
+        assert win._design_pack == "solo", "a refused install must not select"
+        assert "no pack.json" in win.status_label.text(), win.status_label.text()
+    finally:
+        settings_app.QFileDialog.getExistingDirectory = real_dir
+    assert win._design_pack == "solo", win._design_pack
+    assert win.pack_combo.findData("solo") >= 0, (
+        "an install must appear in the picker without a restart")
+    win._apply_appearance_live()
+    assert _json.loads(settings_file.read_text())["design_pack"] == "solo"
+    # ...and the pack is now the preview's source, for every state
+    for state in tints:
+        assert win._design_picture(state).endswith("base.png"), state
+
+    # --- Clearing goes back to the single picture, live, like every control.
+    win._clear_design_pack()
+    win._apply_appearance_live()
+    assert _json.loads(settings_file.read_text())["design_pack"] == ""
+    assert "No pack" in win.pack_label.text(), win.pack_label.text()
+
+    # --- a pack that cannot draw: named in the panel AND in doctor, with ONE
+    # --- sentence, and never silently substituted by the single file.
+    seed({"model": "testmodel:latest", "design_pack": "ghost"})
+    win.reload_from_disk()
+    assert win.pack_combo.currentData() == "ghost", (
+        "a saved pack that is not installed must still be shown")
+    assert "not installed" in win.pack_combo.currentText(), (
+        win.pack_combo.currentText())
+    assert win._design_picture("idle") == "", "a missing pack must not fall back"
+    assert "no installed pack named ghost" in win.pack_label.text(), (
+        win.pack_label.text())
+    bubble.SETTINGS["design_pack"] = "ghost"
+    note = bubble._appearance_note()
+    assert "pack ghost" in note, note
+    assert "no installed pack named ghost" in note, note
+    bubble.SETTINGS["design_pack"] = ""
+    assert "pack ghost" not in bubble._appearance_note()
+
+    _shutil.rmtree(packs_root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     name = sys.argv[1]
     try:
@@ -2009,6 +2616,8 @@ SCENARIO_NAMES = [
     "the_cat_keeps_its_ears_inside_its_own_mask",
     "every_design_keeps_ink_inside_its_aperture",
     "every_design_has_its_own_preview_glyph",
+    "the_image_design_draws_the_users_picture",
+    "the_image_design_can_use_an_installed_pack",
     "appearance_panel_is_a_scrolling_column_of_cards",
     "look_tiles_are_drawn_from_the_shared_painter",
     "voice_tab_level_meter_reads_the_bubble_feed",

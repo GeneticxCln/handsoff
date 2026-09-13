@@ -14,20 +14,26 @@ Application-free by injection: nothing here imports or reaches into handsoff.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
-from PySide6.QtCore import QElapsedTimer, QPointF, QRect, Qt, QTimer
+from PySide6.QtCore import QElapsedTimer, QPointF, QRect, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QConicalGradient,
+    QImage,
     QLinearGradient,
     QPainter,
     QPainterPath,
     QPainterPathStroker,
     QPen,
+    QPixmap,
     QPolygonF,
     QRadialGradient,
     QRegion,
@@ -146,6 +152,630 @@ def configure(settings: dict | None = None) -> None:
     for key, fallback in (("idle", "#2f6fed"), ("listening", "#e0435c"),
                           ("thinking", "#c8781f"), ("speaking", "#1fae62")):
         STATE_COLORS[key] = _state_color(key, fallback, colors)
+
+
+# ------------------------------------------------------- the `image` design
+# `image` is a design whose art is the user's own file. These rules are what
+# make an imported picture behave like a painted design instead of a sticker
+# pasted over one, and every one of them is pinned by a scenario in
+# tests/test_settings_gui.py:
+#
+#   fit     the image's CIRCUMSCRIBED circle is fitted inside the aperture, so
+#           the voice can rotate it as hard as it likes without pushing a corner
+#           past the glass — a circle does not change under rotation. That makes
+#           the ink guard pass by construction instead of by luck, and it is why
+#           a square image is not simply scaled to the diameter.
+#   colour  the state colour owns every opaque pixel: the image contributes its
+#           silhouette (alpha) and its luminance (shading) through a 0.45 floor,
+#           so a dark picture cannot make the state colour invisible — that is
+#           the `void` defect (8 visible px of 45 796) wearing a user's file,
+#           and the Appearance colour picker has to keep meaning something.
+#   voice   its own reaction, neutral at silence like every other painter.
+#   no file a dashed frame in the state colour, NEVER a fall back to the orb: an
+#           orb there is indistinguishable from a design name with no dispatch
+#           branch, which is a bug this tree has already shipped once.
+#
+# The art may come from one file (`design_image_path`) or from a PACK — a folder
+# with a manifest and one picture per state, installed from the Appearance tab,
+# so a single choice switches several pictures together. See the pack section
+# below; the resolution order lives in `picture_for()`.
+#
+# The picture cache: revision key -> {"image", "shade", "pixmap"}. A DICT rather
+# than one slot, because with a pack the bubble draws a DIFFERENT FILE per state
+# and a single slot would re-decode a photo every time the state changed. Capped
+# at the number of states a pack can name, so the ceiling stays a constant.
+_IMAGE_CACHE: dict = {}
+_IMAGE_CACHE_MAX = 4
+
+# The working canvas for the picture, in pixels. A user's 3000x2000 photo is
+# 24 MB, and this module builds a TINTED COPY of it per painted frame while the
+# bubble repaints at 25-60 Hz — that is how a bubble becomes a space heater, and
+# it is a memory ceiling that grows with whatever file someone points at. At the
+# largest window the bubble allows (192 px) the drawn rect's diagonal is at most
+# ~169 px, so 384 keeps the picture oversampled at every size while capping both
+# the memory and the per-frame work at a constant.
+_IMAGE_WORK = 384
+
+
+def _decoded_image(path):
+    """The file as a bounded ARGB32 image, or None when it will not decode.
+
+    Downscaling happens HERE, at the source, rather than at every paint: that is
+    what makes an enormous photo cost the same as a small one at every frame
+    after the first, and what keeps the memory ceiling a constant instead of a
+    function of whatever file someone points at (see `_IMAGE_WORK`).
+    """
+    try:
+        p = Path(str(path)).expanduser()
+        if not p.is_file():
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    img = QImage(str(p))
+    if img.isNull():
+        return None
+    img = img.convertToFormat(QImage.Format_ARGB32)
+    if max(img.width(), img.height()) > _IMAGE_WORK:
+        img = img.scaled(_IMAGE_WORK, _IMAGE_WORK, Qt.KeepAspectRatio,
+                         Qt.SmoothTransformation)
+        img = img.convertToFormat(QImage.Format_ARGB32)
+    return img
+
+
+def image_layers(path):
+    """(image, luminance) for a file, or None when there is nothing to draw.
+
+    The DECODE half of the `image` design, expressed as a function of a path
+    rather than of the setting, because two processes need it: the bubble, and
+    the settings app's preview. The preview keeps its own one-entry cache and
+    calls this, so the picture the panel shows and the picture on the desktop
+    cannot drift into two different ideas of one file.
+
+    "Nothing to draw" deliberately covers BOTH a file that will not decode and
+    one whose every pixel is transparent: a picture that renders as literally
+    nothing is indistinguishable on the desktop from a design that failed to
+    paint, so both come back as None and the painter draws its empty slot. The
+    alpha scan is done once per revision here rather than once per frame.
+    Neither layer depends on the state colour, so a caller may hold them across
+    a colour change.
+    """
+    img = _decoded_image(path)
+    if img is None or not _has_ink(img):
+        return None
+    shade = _shading_layer(img)
+    if shade is None:
+        return None
+    return img, shade
+
+
+def _image_entry(path):
+    """The decoded layers for ONE revision of `path`, or None when unusable.
+
+    Keyed by (path, mtime, size): the mtime is what makes editing the file on
+    disk repaint without a restart, and a FAILED revision is remembered as an
+    empty entry so an unreadable file costs one decode attempt rather than one
+    per frame.
+
+    The key carries the PATH, which is what makes this safe where a single-slot
+    cache was not: a broken path returns None instead of whatever picture
+    happened to be decoded last, so a moved file cannot leave stale art on
+    screen. A repaint runs at 25-60 Hz, and re-reading a picture there is how a
+    bubble becomes a disk hog.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    try:
+        p = Path(raw).expanduser()
+        st = p.stat()
+        key = (str(p), st.st_mtime_ns, st.st_size)
+    except (OSError, ValueError, TypeError):
+        return None
+    cached = _IMAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    entry = {"image": None, "shade": None, "pixmap": None}
+    layers = image_layers(raw)
+    if layers is not None:
+        entry["image"], entry["shade"] = layers
+        entry["pixmap"] = QPixmap.fromImage(layers[0])
+    while len(_IMAGE_CACHE) >= _IMAGE_CACHE_MAX:
+        _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
+    _IMAGE_CACHE[key] = entry
+    return entry
+
+
+def design_image(state: str = ""):
+    """The picture in effect for `state` as a QPixmap, or None."""
+    entry = _image_entry(design_picture(state))
+    return None if entry is None else entry["pixmap"]
+
+
+def design_image_tinted(color: QColor, glow: float = 1.0,
+                        energy: float = 0.12, level: float = 0.0,
+                        state: str = ""):
+    """The picture in effect for `state`, in the state colour, or None.
+
+    None is the ONE signal a painter uses to draw the empty slot instead, so
+    "there is nothing to draw here" has a single cause and a single
+    consequence — whether the cause is no picture at all, an unreadable one, or
+    a pack with nothing for this state.
+    """
+    entry = _image_entry(design_picture(state))
+    if entry is None or entry["image"] is None or entry["shade"] is None:
+        return None
+    return tinted_image(entry["image"], entry["shade"], color,
+                        glow, energy, level)
+
+
+def _shading_layer(img) -> QImage:
+    """Luminance with the 0.45 floor — the layer that shades the state colour.
+
+    SourceOver with white at 45% is exactly `v + 0.45 * (255 - v)`, which is the
+    floor: no opaque pixel can come out darker than 45% of the state colour, so
+    the picture can never hide which state the bubble is in. Computed once per
+    file revision rather than per frame.
+    """
+    grey = img.convertToFormat(QImage.Format_Grayscale8)
+    out = QImage(grey.size(), QImage.Format_ARGB32)
+    if out.isNull():
+        # A failed allocation: say so, because a QPainter over a null QImage is
+        # undefined behaviour rather than an exception. Callers treat a missing
+        # shade as "nothing to draw" and fall back to the empty slot.
+        return None
+    out.fill(Qt.transparent)
+    q = QPainter(out)
+    q.drawImage(0, 0, grey)
+    q.setOpacity(0.45)
+    q.fillRect(out.rect(), Qt.white)
+    q.end()
+    return out.convertToFormat(QImage.Format_Grayscale8)
+
+
+def _has_ink(img) -> bool:
+    """Whether any pixel is visible at all — read from the alpha channel.
+
+    Byte-sliced rather than sampled: a 1-px figure in a 4000-px picture is
+    exactly what a stride would miss, and bytes()[3::4] is the alpha plane of an
+    ARGB32 image with no Python loop over pixels.
+    """
+    data = bytes(img.convertToFormat(QImage.Format_ARGB32).constBits())
+    return len(data) >= 4 and max(data[3::4]) > 8
+
+
+def design_image_problem(path: str | None = None) -> str:
+    """Why the chosen image will not render, or "" when it will.
+
+    This module is the only thing in the tree that decodes an image, so the
+    sentence the settings picker shows and the reason the bubble falls back to
+    its placeholder are the same sentence — two GUIs disagreeing about one file
+    is the failure this shape avoids. An empty setting is not a problem (it is
+    the state every install starts in); a *missing* file is a problem, because
+    it means the bug is the path rather than the choice.
+    """
+    raw = str(path if path is not None
+              else (SETTINGS.get("design_image_path") or "")).strip()
+    if not raw:
+        return ""
+    p = Path(raw).expanduser()
+    try:
+        if not p.exists():
+            return f"no file at {p}"
+        if not p.is_file():
+            return f"{p} is a folder, not an image"
+    except OSError as exc:
+        return f"cannot read {p} ({exc.strerror or exc})"
+    img = _decoded_image(p)
+    if img is None:
+        return (f"{p.name} is not an image this build can read "
+                "(PNG, JPEG, WebP, GIF and SVG all work)")
+    if not _has_ink(img):
+        return f"every pixel of {p.name} is transparent — it would be invisible"
+    return ""
+
+
+# --------------------------------------------------- the `image` design's packs
+# A PACK is a folder with a `pack.json` beside its pictures, one picture per
+# state, so ONE choice switches several pictures together as the bubble changes
+# state:
+#
+#     {"name": "Optimus",
+#      "any": "base.png",
+#      "states": {"idle": "idle.png", "listening": "listen.png",
+#                 "thinking": "think.png", "speaking": "speak.png"}}
+#
+# `states` may name any subset of the four; a state it does not name uses `any`.
+# A pack that leaves a state uncovered AND has no `any` is REPORTED and those
+# states draw the empty slot — the same answer either way rather than a silent
+# one. `any` is the ONE fallback key — one documented name rather than a list of
+# synonyms to keep in step.
+#
+# `_validate_pack` is the single authority on whether a folder is usable, and
+# all three consumers go through it: `install_pack` refuses to copy it,
+# `load_pack` refuses to resolve it (so the bubble draws its empty slot rather
+# than art assembled from the parts that happened to check out), and
+# `pack_problem` NAMES it. Three implementations of "is this pack good" would
+# drift, and the drift would be invisible — a pack half-drawn while doctor
+# reports it fine.
+#
+# Installing COPIES the folder into the packs directory instead of referencing
+# it: a pack keeps working when the folder it came from moves, and the bubble
+# only ever reads one known tree. Installing over a pack of the same name moves
+# the old one to `<slug>.previous` (one generation, replaced next time) rather
+# than deleting it.
+#
+# Every name in a manifest resolves INSIDE its own folder and nowhere else: an
+# absolute path or a `..` segment is refused rather than resolved. A pack is
+# data someone else wrote — possibly someone else entirely — and it must not be
+# able to point the bubble at arbitrary files, the same reason `read_file`
+# carries a denylist.
+PACK_MANIFEST = "pack.json"
+PACK_STATES = (IDLE, LISTENING, THINKING, SPEAKING)
+PACK_DIR_NAME = "design-packs"
+PACKS_DIR = None        # set by the host; see packs_dir() for the fallback
+_PACK_CACHE: dict = {}  # (slug, mtime_ns, size) -> manifest or None
+_PACK_CACHE_MAX = 4
+
+
+def packs_dir():
+    """Where installed packs live, or None when nothing can name a directory.
+
+    The host sets `PACKS_DIR`, as it does every other path this module needs.
+    The fallback exists so a module-only import still resolves packs instead of
+    silently reporting "none installed" — and it follows the same XDG rule the
+    host uses, so the two cannot disagree about where a pack was installed.
+    """
+    if PACKS_DIR is not None:
+        try:
+            return Path(PACKS_DIR)
+        except (TypeError, ValueError):
+            return None
+    try:
+        base = (os.environ.get("XDG_CONFIG_HOME")
+                or str(Path.home() / ".config"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return Path(base) / (APP_NAME or "handsoff") / PACK_DIR_NAME
+
+
+def pack_slug(value) -> str:
+    """`value` as ONE directory name: letters, digits, dash and underscore.
+
+    Anything else becomes a dash, so a pack called "Optimus Prime / v2" installs
+    as `optimus-prime-v2`, and a name can never become a path.
+    """
+    slug = "".join(ch if (ch.isalnum() or ch in "-_") else "-"
+                   for ch in str(value or "").strip().lower())
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-")[:48]
+
+
+def _pack_file(folder, rel):
+    """`rel` resolved inside `folder`, or None when it would leave it."""
+    text = str(rel or "").strip()
+    if not text:
+        return None
+    named = Path(text)
+    if named.is_absolute() or ".." in named.parts:
+        return None
+    try:
+        root = Path(folder).resolve()
+        full = (root / named).resolve()
+        if full != root and root not in full.parents:
+            return None          # a symlink out of the pack is still out
+    except (OSError, ValueError):
+        return None
+    return str(full)
+
+
+def _build_manifest(slug: str, folder, raw):
+    """Validate one parsed manifest; None when it names nothing drawable."""
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or "").strip() or slug
+    fallback = _pack_file(folder, raw.get("any"))
+    states = {}
+    named = raw.get("states")
+    if isinstance(named, dict):
+        for state in PACK_STATES:
+            found = _pack_file(folder, named.get(state))
+            if found:
+                states[state] = found
+    if not fallback and not states:
+        return None
+    return {"slug": slug, "name": name, "any": fallback, "states": states}
+
+
+def _validate_pack(folder, raw, slug: str = "") -> tuple:
+    """Check one parsed manifest against its folder: (problem, built).
+
+    `problem` is "" when the pack can draw, and otherwise ONE sentence naming
+    the first thing wrong and the entry it is wrong about. `built` is the
+    manifest `load_pack` returns, and it is None whenever `problem` is
+    non-empty — a caller must never draw a half-built pack. The single
+    authority behind install, load and report (see the section comment).
+    """
+    if not isinstance(raw, dict):
+        return f"{PACK_MANIFEST} must be a JSON object", None
+    named = raw.get("states") if isinstance(raw.get("states"), dict) else {}
+    checked = []
+    for where, rel in (("any", raw.get("any")),) + tuple(
+            (state, named.get(state)) for state in PACK_STATES):
+        if not rel:
+            continue
+        found = _pack_file(folder, rel)
+        if not found:
+            return (f"{PACK_MANIFEST} names '{rel}' for {where}, which is "
+                    f"outside the pack — a picture has to sit beside it", None)
+        checked.append((where, found))
+    if not checked:
+        return "the pack names no pictures", None
+    for where, found in checked:
+        p = Path(found)
+        if not p.exists():
+            return f"no file at {p} (the {where} picture)", None
+        if not p.is_file():
+            return f"{p} is a folder, not an image (the {where} picture)", None
+        img = _decoded_image(p)
+        if img is None:
+            return (f"{p.name} is not an image this build can read "
+                    f"(the {where} picture)", None)
+        if not _has_ink(img):
+            return (f"every pixel of {p.name} is transparent — the {where} "
+                    f"picture would be invisible", None)
+    if not raw.get("any"):
+        missing = [s for s in PACK_STATES if s not in named or not named.get(s)]
+        if missing:
+            return (f"no picture for {', '.join(missing)} and no 'any' — "
+                    f"those states would draw the empty slot", None)
+    return "", _build_manifest(slug, folder, raw)
+
+
+def _forget_pack(slug: str) -> None:
+    """Drop cached manifests for `slug` — an install replaces what they say."""
+    for key in [k for k in _PACK_CACHE if k[0] == slug]:
+        _PACK_CACHE.pop(key, None)
+
+
+def load_pack(pack):
+    """An installed pack's manifest, or None. Cached per manifest revision.
+
+    Returns {"slug", "name", "any", "states"} with ABSOLUTE picture paths; a
+    manifest that names nothing usable is None. The cache key carries the
+    manifest's mtime and size, so editing `pack.json` — or installing over a
+    pack — takes effect without a restart.
+    """
+    slug = pack_slug(pack)
+    root = packs_dir()
+    if not slug or root is None:
+        return None
+    folder = Path(root) / slug
+    manifest = folder / PACK_MANIFEST
+    try:
+        st = manifest.stat()
+        key = (slug, st.st_mtime_ns, st.st_size)
+    except (OSError, ValueError, TypeError):
+        return None
+    if key in _PACK_CACHE:
+        return _PACK_CACHE[key]
+    try:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = None
+    # A pack with ANY problem resolves to nothing (`_validate_pack`'s contract:
+    # `built` is None whenever `problem` is non-empty): art assembled from the
+    # parts that happened to check out is the silent half-working this tree
+    # keeps having to delete. `pack_problem` names what is wrong instead.
+    _problem, built = _validate_pack(folder, raw, slug)
+    while len(_PACK_CACHE) >= _PACK_CACHE_MAX:
+        _PACK_CACHE.pop(next(iter(_PACK_CACHE)))
+    _PACK_CACHE[key] = built
+    return built
+
+
+def picture_for(pack, single, state: str = "") -> str:
+    """The picture in effect for `state`, by precedence, or "" for the slot.
+
+    A pack is the AUTHORITY: setting one means its pictures are the art, so a
+    pack that cannot be read returns "" (the empty slot) rather than silently
+    substituting a picture the user did not choose; `pack_problem()` names the
+    reason. Without a pack, `single` is the art.
+
+    Takes the values the CALLER already holds rather than reading the settings,
+    because two processes need it: the bubble (which reads settings) and the
+    settings app's preview (which reads its own form). ONE implementation of the
+    precedence, instead of two that can disagree about which picture is on
+    screen.
+    """
+    slug = pack_slug(pack)
+    if slug:
+        manifest = load_pack(slug)
+        if manifest is None:
+            return ""
+        return str(manifest["states"].get(str(state)) or manifest["any"] or "")
+    return str(single or "").strip()
+
+
+def design_picture(state: str = "") -> str:
+    """The picture the `image` design draws in `state`, from the settings."""
+    return picture_for(SETTINGS.get("design_pack"),
+                       SETTINGS.get("design_image_path"), state)
+
+
+def installed_packs() -> list:
+    """[(slug, display name)] for everything installed, name-sorted.
+
+    A pack whose manifest is broken is LISTED, under its folder name, rather
+    than hidden: it is exactly the one the user needs to be told about.
+    """
+    root = packs_dir()
+    if root is None:
+        return []
+    try:
+        folders = sorted((p for p in Path(root).iterdir() if p.is_dir()),
+                         key=lambda p: p.name.lower())
+    except OSError:
+        return []
+    out = []
+    for folder in folders:
+        if folder.name.endswith(".previous"):
+            continue
+        manifest = load_pack(folder.name)
+        out.append((folder.name, manifest["name"] if manifest else folder.name))
+    return out
+
+
+def pack_problem(pack=None) -> str:
+    """Why a pack will not render what it promises, or "" when it will.
+
+    One sentence naming the first thing wrong and the file it is wrong about —
+    the sentence the picker shows and the reason the bubble draws its empty
+    slot, so the panel, the desktop and `doctor` cannot disagree. No pack
+    selected is not a problem: it is the state every install starts in.
+    """
+    slug = pack_slug(SETTINGS.get("design_pack") if pack is None else pack)
+    if not slug:
+        return ""
+    root = packs_dir()
+    if root is None:
+        return "design packs are not available in this install"
+    folder = Path(root) / slug
+    manifest = folder / PACK_MANIFEST
+    try:
+        if not folder.is_dir():
+            return f"no installed pack named {slug}"
+        if not manifest.is_file():
+            return f"{slug} has no {PACK_MANIFEST} — a pack needs one"
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return f"{slug}/{PACK_MANIFEST} is not valid JSON ({exc})"
+    except OSError as exc:
+        return f"cannot read {slug}/{PACK_MANIFEST} ({exc.strerror or exc})"
+    problem, _built = _validate_pack(folder, raw, slug)
+    return f"{slug}: {problem}" if problem else ""
+
+
+def art_problem() -> str:
+    """Why the `image` design will not render what is chosen, or "".
+
+    ONE sentence for `doctor`, by the same precedence the renderer uses: the
+    selected pack when there is one (it is the authority), otherwise the
+    single fallback picture.
+    """
+    if pack_slug(SETTINGS.get("design_pack")):
+        return pack_problem()
+    return design_image_problem()
+
+
+def install_pack(source) -> tuple:
+    """Copy the pack folder at `source` into the packs directory.
+
+    Returns (slug, message): slug is "" when nothing was installed, and the
+    message says what happened in the same words either way, so a caller has one
+    thing to show and no exception to catch. The source is validated BEFORE
+    anything is copied, so a refusal leaves the installed packs untouched.
+    """
+    root = packs_dir()
+    if root is None:
+        return "", "design packs are not available in this install"
+    src = Path(str(source)).expanduser()
+    try:
+        if not src.is_dir():
+            return "", f"{src} is not a folder"
+        manifest = src / PACK_MANIFEST
+        if not manifest.is_file():
+            return "", f"{src.name} has no {PACK_MANIFEST} — a pack needs one"
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return "", f"{src.name}/{PACK_MANIFEST} is not valid JSON ({exc})"
+    except OSError as exc:
+        return "", f"cannot read {src} ({exc.strerror or exc})"
+    if not isinstance(raw, dict):
+        return "", f"{PACK_MANIFEST} must be a JSON object"
+    slug = pack_slug(raw.get("name")) or pack_slug(src.name)
+    if not slug:
+        return "", "the pack needs a name with at least one letter or digit"
+    # The SAME validator the renderer uses, so a folder this refuses would not
+    # have drawn anything anyway — and it is refused with the sentence a broken
+    # installed pack is reported with, not a second wording.
+    problem, built = _validate_pack(src, raw, slug)
+    if problem:
+        return "", f"{src.name}: {problem}"
+    target = Path(root) / slug
+    try:
+        Path(root).mkdir(parents=True, exist_ok=True)
+        previous = Path(root) / f"{slug}.previous"
+        if target.exists():
+            if previous.exists():
+                shutil.rmtree(previous)
+            target.rename(previous)
+        shutil.copytree(src, target)
+    except OSError as exc:
+        return "", f"cannot install {slug} ({exc.strerror or exc})"
+    _forget_pack(slug)                 # the install replaced what the cache says
+    if load_pack(slug) is None:
+        return "", (f"{slug} installed, but its pictures could not be read — "
+                    f"check {PACK_MANIFEST} and the files it names")
+    return slug, (f"installed pack {built['name']} as {slug} "
+                  f"({len(built['states'])} state picture(s)"
+                  + (", plus a fallback)" if built["any"] else ")"))
+
+
+def _image_lights(color: QColor, glow: float, energy: float, level: float):
+    """The two ends of the tint gradient: accent, animation energy, voice.
+
+    `glow` carries the accent slider, `energy` carries animation energy (the one
+    frame value both sliders reach), `level` is the voice. Both sliders and the
+    voice are neutral at their defaults — accent 0.5, silence — so a quiet
+    bubble at the default settings renders one fixed tint of the picture, which
+    is the rule every painter in this file follows.
+    """
+    hue = max(color.hueF(), 0.0)
+    sat, lit = color.hslSaturationF(), color.lightnessF()
+    lift = 0.30 * (glow - 1.0) + 0.22 * level + 0.55 * (energy - 0.12)
+    top = QColor.fromHslF(hue, sat, min(0.94, max(0.32, lit + 0.36 + lift)), 1.0)
+    bottom = QColor.fromHslF(hue, sat,
+                             min(0.82, max(0.14, lit - 0.04 + 0.55 * lift)), 1.0)
+    return top, bottom
+
+
+def tinted_image(img, shade, color: QColor, glow: float = 1.0,
+                 energy: float = 0.12, level: float = 0.0):
+    """An image as a state-coloured silhouette that keeps its own luminance.
+
+    Composition ops only — SourceIn to lay the state colour into the image's
+    alpha, Multiply to shade that colour with the picture's luminance, then
+    DestinationIn to put the silhouette back (Multiply's own alpha is opaque, so
+    without the last step the window would fill with the picture's bounding
+    rectangle). All three run in C++, which is what makes this safe per frame; a
+    per-pixel Python loop over a user's 4000x4000 photo at 25 Hz is how a bubble
+    becomes a space heater.
+
+    Takes the two layers rather than reading the cache, because two processes
+    want this: the bubble, and the settings app's preview.
+    """
+    if img is None or shade is None or img.isNull():
+        return None
+    out = QImage(img.size(), QImage.Format_ARGB32_Premultiplied)
+    if out.isNull():
+        return None
+    out.fill(Qt.transparent)
+    q = QPainter(out)
+    q.drawImage(0, 0, img)
+    q.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    grad = QLinearGradient(0.0, 0.0, 0.0, float(img.height()))
+    top, bottom = _image_lights(color, glow, energy, level)
+    grad.setColorAt(0.0, top)
+    grad.setColorAt(1.0, bottom)
+    q.fillRect(out.rect(), QBrush(grad))
+    q.setCompositionMode(QPainter.CompositionMode_Multiply)
+    q.drawImage(0, 0, shade)
+    q.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+    q.drawImage(0, 0, img)
+    q.end()
+    return out
+
 
 # The cat's limbs, as fractions of the animated radius. One definition, used by
 # the painter and by the mask builder: a mask derived separately from the
@@ -269,6 +899,10 @@ def design_region(name: str, w: int, h: int) -> QRegion:
     with its widget).
     """
     w, h = int(w), int(h)
+    # The inscribed ellipse is the aperture for every design painted inside it,
+    # `image` included: that design fits its picture's CIRCUMSCRIBED circle to
+    # the aperture budget, so its tank of ink is a circle strictly smaller than
+    # this ellipse and no union is needed (a rotation cannot change a circle).
     region = QRegion(QRect(0, 0, w, h), QRegion.Ellipse)
     if str(name or "").strip().lower() == "cat":
         # A 2 px slack on the ellipse, for this design only: its halo is the
@@ -428,6 +1062,8 @@ class BubbleWidget(QWidget):
             self._paint_pikachu(p, f)
         elif design == "cat":
             self._paint_cat(p, f)
+        elif design == "image":
+            self._paint_image(p, f)
         else:
             self._paint_orb(p, f)
         p.end()
@@ -1650,6 +2286,138 @@ class BubbleWidget(QWidget):
             mouth.quadTo(QPointF(hx + sign * R * 0.10, hy + R * (0.36 + 0.05 * lv)),
                          QPointF(hx + sign * R * 0.17, hy + R * 0.30))
             p.drawPath(mouth)
+
+    def _paint_image(self, p: QPainter, f: dict) -> None:
+        """The user's own picture as the bubble: fitted, tinted, voice-lit.
+
+        The rules stated at the top of this section are enforced here. What
+        gets fitted to the aperture is the picture's CIRCUMSCRIBED circle — its
+        DIAGONAL, not its width — which is why the voice can tilt it without a
+        corner crossing the glass: a circle does not change under rotation. So
+        `budget` (the aperture) is respected by construction rather than by
+        luck, for the picture, its tilt, the rim's pen and the rim glow alike.
+
+        This design deliberately ignores the state RADIUS pulse the other
+        painters follow (`f["radius"]`): it fills the glass, because a picture
+        that swells and shrinks on every state change reads as a glitch rather
+        than as a mood. The state is carried by the colour and the rim, the
+        voice by breath, tilt and ignition — the same division of labour, less
+        the jiggle.
+        """
+        cx, cy, t = f["cx"], f["cy"], f["t"]
+        color = f["color"]
+        lv = min(1.0, max(0.0, float(f["level"])))
+        energy = float(f["energy"])
+        glow = float(f.get("glow", 1.0))
+        anim = float(f.get("anim", 1.0))
+        budget = APERTURE_R
+        if budget <= 0.0:
+            return
+        # The picture BREATHES: the voice lifts its scale and the animation
+        # energy sets how far the idle sway travels. The 0.88 base with a 1.09
+        # ceiling is what leaves the rim (the outermost element drawn) inside
+        # the aperture at every value either slider can hold. Neutral at
+        # silence: lv contributes none of the 5%, and the sway is 2% of radius.
+        breath = 1.0 + 0.05 * lv + 0.02 * anim * math.sin(t * 2.4 * anim)
+        fit = budget * 0.88 * breath
+        picture = design_image_tinted(color, glow, energy, lv, self._state)
+        if picture is not None and not picture.isNull():
+            self._draw_image_art(p, picture, cx, cy, fit, t, lv, anim)
+        else:
+            self._draw_image_slot(p, cx, cy, fit, t, lv, anim, color, glow)
+        self._draw_image_rim(p, cx, cy, fit, lv, color, glow)
+
+    @staticmethod
+    def _draw_image_art(p: QPainter, picture, cx: float, cy: float, fit: float,
+                        t: float, lv: float, anim: float) -> None:
+        """The picture, scaled to the fit circle and tilted by the voice.
+
+        The scale comes from the DIAGONAL, so the drawn rect's own corners
+        touch the fit circle exactly and cannot leave it at any angle — the
+        tilt really is free, which is the whole return on fitting the diagonal
+        instead of the width. 3.5 degrees at full voice is small on purpose: a
+        tilt you notice as rotation is a tilt that fights the picture.
+        """
+        iw, ih = float(picture.width()), float(picture.height())
+        half = 0.5 * math.hypot(iw, ih)          # circumscribed radius
+        if half <= 0.0:
+            return
+        scale = fit / half
+        w, h = iw * scale, ih * scale
+        p.save()
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.translate(cx, cy)
+        p.rotate(3.5 * lv * math.sin(t * 1.9 * anim))
+        p.drawImage(QRectF(-w / 2.0, -h / 2.0, w, h), picture)
+        p.restore()
+
+    @staticmethod
+    def _draw_image_slot(p: QPainter, cx: float, cy: float, fit: float,
+                         t: float, lv: float, anim: float, color: QColor,
+                         glow: float) -> None:
+        """The empty slot: a dashed ring in the state colour, never an orb.
+
+        A fall back to the orb here would be indistinguishable from a design
+        name with no dispatch branch — a defect this tree has already shipped
+        once — so "no picture chosen" is drawn as an empty slot, and the actual
+        REASON is named by `doctor` and by the settings picker. The dashes
+        march with the voice and turn with the animation energy, so the slot
+        reacts like every other design rather than sitting there as decoration.
+        """
+        width = max(2.0, fit * 0.062)
+        ring = QColor(color).lighter(150)
+        ring.setAlpha(int(min(255.0, (150 + 90 * lv) * glow)))
+        pen = QPen(ring, width)
+        pen.setCapStyle(Qt.FlatCap)
+        pen.setDashPattern([3.0, 1.6])
+        pen.setDashOffset(6.0 * lv)              # the voice marches the dashes
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(t * 12.0 * anim)                # ...and the energy turns them
+        rr = fit - width * 0.5
+        p.setBrush(Qt.NoBrush)
+        p.setPen(pen)
+        p.drawEllipse(QPointF(0.0, 0.0), rr, rr)
+        p.restore()
+        # the slot's own mark: a diagonal dash, so the frame reads as EMPTY
+        # rather than as a design whose painter failed to run
+        mark = QColor(color).lighter(190)
+        mark.setAlpha(int(min(255.0, (110 + 120 * lv) * glow)))
+        d = fit * 0.34
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(mark, max(1.6, width * 0.55), Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QPointF(cx - d, cy + d), QPointF(cx + d, cy - d))
+
+    @staticmethod
+    def _draw_image_rim(p: QPainter, cx: float, cy: float, fit: float,
+                        lv: float, color: QColor, glow: float) -> None:
+        """The state-colour rim: why a photo can never hide which state it is.
+
+        A picture may be any colour at all — that is the point of choosing one
+        — so the state colour is carried by a ring around the fit circle whose
+        alpha grows with the voice, exactly like the orb's halo and for the
+        same reason (a body of the user's choosing on a wallpaper of the
+        user's choosing). The glow is painted first so the pen lands on it, and
+        the pen's outer edge is the outermost ink this design puts down — the
+        one thing the aperture budget has to hold.
+        """
+        width = max(1.5, APERTURE_R * 0.030)
+        r = fit - width * 0.5                   # the pen's centreline
+        outer = min(APERTURE_R, r + width)
+        halo = QRadialGradient(QPointF(cx, cy), outer)
+        hc = QColor(color)
+        hc.setAlpha(int(min(255.0, (70 + 130 * lv) * glow)))
+        halo.setColorAt(max(0.0, min(1.0, (r - width) / outer)), hc)
+        hc.setAlpha(0)
+        halo.setColorAt(1.0, hc)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(halo))
+        p.drawEllipse(QPointF(cx, cy), outer, outer)
+        pen = QColor(color).lighter(170)
+        pen.setAlpha(int(min(255.0, (150 + 105 * lv) * glow)))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(pen, width + 0.7 * lv))
+        p.drawEllipse(QPointF(cx, cy), r, r)
 
     @staticmethod
     def _wobble_path(cx: float, cy: float, r0: float, t: float, amt: float = 1.0) -> QPainterPath:

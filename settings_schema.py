@@ -25,7 +25,27 @@ SETTINGS_VERSION: int = 2   # bumped on incompatible settings.json layout change
 # learns a newer build wrote them.
 RETIRED_SETTINGS = ("piper_voice",)
 
-BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void", "sauron", "pikachu", "cat")
+# The bubble shapes. `image` is the odd one out and deliberately so: it is not a
+# painter, it is the user's own file, drawn to the SAME rules as the painters so
+# that importing a picture does not mean leaving the design contract:
+#
+#   fit      the image's circumscribed circle is fitted inside the aperture, so
+#            a rotation cannot push a corner past the glass (a circle does not
+#            change under rotation) and the ink guard passes by construction;
+#   colour   the state colour owns every opaque pixel — the image contributes
+#            alpha and luminance, with a 0.45 floor so a dark picture can never
+#            make the state colour invisible (the `void` defect, 8 visible px of
+#            45 796, in a new costume);
+#   voice    its own reaction (breath, ignite, wobble, rim glow), neutral at
+#            silence like every other painter;
+#   no file  a dashed frame in the state colour, never a fall back to the orb —
+#            an orb there is indistinguishable from a missing dispatch branch.
+#
+# `design_image_path` and `design_pack` below are what it draws: one file, or a
+# pack (a folder with a `pack.json` and one picture per state) when several
+# pictures should switch together as the bubble changes state.
+BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void", "sauron", "pikachu", "cat", "image")
+
 
 # ------------------------------------------------------------------ looks
 # One-click whole looks for the Appearance tab: a look sets the five keys the
@@ -167,6 +187,15 @@ DEFAULT_SETTINGS: dict = {
     "bubble_size": 128,
     "bubble_design": "orb",  # Appearance tab; must be one of BUBBLE_DESIGNS above
                               # (APPEARANCE_LOOKS below sets this with the rest)
+    "design_image_path": "",   # the `image` design's art: any file Qt can decode
+                               # (PNG/JPEG/WebP/SVG). Empty or unreadable = a
+                               # dashed placeholder frame, and the reason is
+                               # reported by `design_image_problem()`.
+    "design_pack": "",         # the same art as a PACK: one folder name under
+                               # design-packs/ naming a picture per state. When
+                               # set it is the authority and the single picture
+                               # above is ignored; the reason it cannot draw is
+                               # reported by `pack_problem()`.
     "bubble_accent": 0.5,      # 0..1 accent punch: how hard each shape leans on its
                                # state colour (glow alpha, saturation, comet light)
     "animation_energy": 1.0,   # 0.2..2.0 global animation scale: orbit speed, swirl
