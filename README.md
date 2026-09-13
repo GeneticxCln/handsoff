@@ -200,6 +200,21 @@ in VRAM between questions).
   wrapper folder (`a zip that wraps the pack in a folder` is accepted, because
   that is how people actually zip things; two candidates is refused, because
   picking one would install a look you did not choose).
+- **Preview pack…** — look before you leap. **Preview folder…** and **Preview
+  pack file…** draw a pack you have not installed in the same four-state strip
+  the rest of the card uses, through the same resolver, decode and tint, so what
+  you see is what an install would give you. Nothing is written: a folder is
+  read where it already sits, and a `.hpack` is unpacked into a temporary folder
+  that belongs to the panel — removed on cancel, on **Try it**, on a second
+  preview, on any other pack action and when the window closes. A pack that
+  cannot be read is refused in the sentence an INSTALL would use (and the same
+  sentence `doctor` prints), because a preview that were more forgiving than the
+  install would be showing you something you cannot have. **Try it** is the step
+  that writes: it installs the pack you were shown and switches to it, so the
+  copy in `design-packs/` keeps working after the folder or file it came from
+  moves. Previewing switches the strip to the `image` design whatever shape your
+  bubble currently draws, because otherwise Preview would look as if it did
+  nothing.
 - **Cat** is the first design whose outline leaves the bubble's circle: its
   ears are painted outside the inset ellipse, so the window's mask is built per
   design (`design_region`) and follows a live shape change as well as a resize.

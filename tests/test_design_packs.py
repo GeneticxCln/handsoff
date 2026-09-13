@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -1000,6 +1001,173 @@ class TestPackFile:
         loaded = bubble.load_pack(slug)
         assert loaded is not None, message
         assert Path(loaded["any"]).read_bytes() == Path(files["any"]).read_bytes()
+
+
+class TestInspectPack:
+    """Looking at a pack without taking it: what the panel previews.
+
+    The property that makes a preview worth having is that it cannot LIE — the
+    pack it draws has to be the pack an install would accept, judged by the same
+    validator and refused in the same words. So the assertions that matter here
+    are the equalities: the preview's refusal sentence IS the install's refusal
+    sentence, and the pictures it hands the strip are the pictures an install
+    would copy. Everything else is about owning a temporary folder honestly when
+    the candidate arrived as a file.
+    """
+
+    PALETTE = {"idle": (10, 20, 30, 255), "listening": (40, 50, 60, 255),
+               "thinking": (70, 80, 90, 255), "speaking": (100, 110, 120, 255),
+               "any": (200, 210, 220, 255)}
+
+    def art(self, folder: Path, *want: str) -> dict:
+        """{slot: path} for the named slots, as real PNGs with distinct bytes."""
+        return {label: png(folder / f"{label}.png", self.PALETTE[label])
+                for label in want}
+
+    @staticmethod
+    def archive(path: Path, *entries) -> Path:
+        """A zip with the given (name, bytes) entries — whatever was sent."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w") as zf:
+            for name, data in entries:
+                zf.writestr(name, data)
+        return path
+
+    @staticmethod
+    def installed(bubble) -> list:
+        """What is in the packs directory — "nothing was installed" as a list."""
+        root = Path(bubble.PACKS_DIR)
+        return sorted(p.name for p in root.iterdir()) if root.is_dir() else []
+
+    def test_a_folder_is_read_where_it_already_sits(self, bubble, tmp_path):
+        files = self.art(tmp_path / "art", "idle", "any")
+        source = tmp_path / "look"
+        manifest(source, {"name": "Look", "states": {"idle": "idle.png"},
+                          "any": "any.png"})
+        shutil.copy2(files["idle"], source / "idle.png")
+        shutil.copy2(files["any"], source / "any.png")
+        art, problem, scratch = bubble.inspect_pack(source)
+        assert problem == "", problem
+        assert scratch == "", "a folder needs no copy to be looked at"
+        assert Path(art["any"]) == source / "any.png", art["any"]
+        assert Path(art["states"]["idle"]) == source / "idle.png", art["states"]
+        assert self.installed(bubble) == [], "looking installs nothing"
+
+    def test_a_pack_file_is_unpacked_somewhere_the_CALLER_owns(
+            self, bubble, tmp_path):
+        """A previewed file has to live somewhere while it is drawn.
+
+        The module does not keep that folder — it cannot know when the panel is
+        done with it — so it hands it back and the property tested here is that
+        the art really is inside it, which is what makes removing it a complete
+        cleanup rather than a hopeful one.
+        """
+        files = self.art(tmp_path / "art", "idle", "any")
+        source = self.archive(
+            tmp_path / "sent.hpack",
+            ("pack.json",
+             json.dumps({"name": "Sent", "states": {"idle": "idle.png"},
+                         "any": "any.png"})),
+            ("idle.png", Path(files["idle"]).read_bytes()),
+            ("any.png", Path(files["any"]).read_bytes()))
+        art, problem, scratch = bubble.inspect_pack(source)
+        assert problem == "", problem
+        assert scratch and Path(scratch).is_dir(), scratch
+        assert str(scratch) in art["states"]["idle"], (
+            "the art the strip draws has to be inside the folder the caller "
+            "is told to remove, or removing it does not remove the art")
+        for state, path in (("idle", files["idle"]), ("any", files["any"])):
+            drawn = art["states"].get(state) or art["any"]
+            assert Path(drawn).read_bytes() == Path(path).read_bytes(), state
+        assert self.installed(bubble) == []
+        shutil.rmtree(scratch)
+        assert not Path(scratch).exists(), "the caller has to be able to remove it"
+
+    def test_the_preview_refuses_in_the_sentence_an_install_would_use(
+            self, bubble, tmp_path):
+        """The whole point: a preview cannot be more forgiving than an install.
+
+        If the panel drew a pack the install would then turn down, the preview
+        would be a lie and Try it would be the moment it was found out. Both
+        doors read a pack through one function, so the sentences are not merely
+        similar — they are the same string.
+        """
+        broken = tmp_path / "broken"
+        manifest(broken, {"name": "Broken", "any": "missing.png"})
+        art, problem, scratch = bubble.inspect_pack(broken)
+        assert art is None and scratch == "", (art, scratch)
+        assert "no file at" in problem and "missing.png" in problem, problem
+        assert bubble.install_pack(broken)[1] == problem, (
+            "preview and install have to refuse a pack in the SAME words")
+
+    def test_a_previewed_file_is_refused_exactly_as_an_installed_one_is(
+            self, bubble, tmp_path):
+        """...and that has to hold for the file door too, entry names and all.
+
+        The two doors unpack into DIFFERENT temporary folders, so their
+        sentences can only match if the paths are spoken relative to the pack —
+        which is also what stops a refusal naming a folder the user has never
+        seen.
+        """
+        source = self.archive(
+            tmp_path / "broken.hpack",
+            ("pack.json",
+             json.dumps({"name": "Broken", "any": "missing.png"})))
+        art, preview_problem, scratch = bubble.inspect_pack(source)
+        assert art is None and scratch == "", (art, scratch)
+        assert "missing.png" in preview_problem, preview_problem
+        assert "handsoff-preview" not in preview_problem, (
+            f"the refusal has to name the ENTRY, not the folder it unpacked "
+            f"into: {preview_problem!r}")
+        assert bubble.install_pack_file(source)[1] == preview_problem, (
+            "preview and install have to refuse a pack file in the SAME words")
+
+    def test_a_refused_file_preview_removes_what_it_unpacked(
+            self, bubble, tmp_path, monkeypatch):
+        """A refusal must not leave the folder it made behind.
+
+        The scratch folder is the module's only lasting effect, and a REFUSAL is
+        exactly the case where nobody takes ownership of it — the caller is
+        handed "" precisely because there is nothing to look at.
+        """
+        made = []
+        real = tempfile.mkdtemp
+
+        def recording_mkdtemp(*args, **kwargs):
+            path = real(*args, **kwargs)
+            made.append(path)
+            return path
+
+        monkeypatch.setattr(tempfile, "mkdtemp", recording_mkdtemp)
+        junk = tmp_path / "junk.hpack"
+        junk.write_bytes(b"not a zip")
+        art, problem, scratch = bubble.inspect_pack(junk)
+        assert art is None and scratch == "", (art, scratch)
+        assert "not a zip archive" in problem, problem
+        assert made, "the preview has to have had a folder to clean up"
+        assert not any(Path(p).exists() for p in made), (
+            "a refused preview must not leave its temporary folder behind")
+
+    def test_the_file_names_the_slug_when_the_manifest_has_none(
+            self, bubble, tmp_path):
+        """What you would GET has to be what you were shown, name included."""
+        files = self.art(tmp_path / "art", "any")
+        source = self.archive(
+            tmp_path / "Handed To Me.hpack",
+            ("pack.json", json.dumps({"any": "any.png"})),
+            ("any.png", Path(files["any"]).read_bytes()))
+        art, problem, scratch = bubble.inspect_pack(source)
+        assert problem == "", problem
+        assert art["slug"] == "handed-to-me", art["slug"]
+        assert bubble.install_pack_file(source)[0] == art["slug"], (
+            "the preview must name the pack the install will create")
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_something_that_is_neither_a_folder_nor_a_file_is_refused(
+            self, bubble, tmp_path):
+        art, problem, scratch = bubble.inspect_pack(tmp_path / "nope")
+        assert art is None and scratch == "", (art, scratch)
+        assert "not a pack folder or file" in problem, problem
 
 
 class TestSettingsPlumbing:

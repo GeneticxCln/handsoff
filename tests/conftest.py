@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -219,6 +220,36 @@ def sandbox_env(home=None) -> dict:
     return env
 
 
+def method_source(source: str, name: str) -> str:
+    """The whole body of the method `name` in `source`, and nothing else.
+
+    Several tests assert that a WIRING exists — "closeEvent stops the mic probe",
+    "_refresh_health runs the fetch off the GUI thread" — and the honest way to
+    ask that is about the METHOD. It runs from its `def` to the first line that
+    begins a new member at the same indentation (or the end of the file).
+
+    Slicing a fixed number of CHARACTERS instead — `src[index("def closeEvent"):
+    index(...) + 500]` — makes the test fail the day somebody adds a line above
+    the one it is looking for. That failure says "the code moved", not "the
+    wiring is gone", and it happened for real: adding the preview cleanup at the
+    top of `closeEvent` pushed `_live_probe.stop()` past a 400-character window
+    and turned two honest tests red for no reason.
+    """
+    lines = source.splitlines()
+    start = next((i for i, line in enumerate(lines)
+                  if re.match(rf"\s*def {re.escape(name)}\s*\(", line)), None)
+    if start is None:
+        return ""
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    for i in range(start + 1, len(lines)):
+        if not lines[i].strip():
+            continue
+        here = len(lines[i]) - len(lines[i].lstrip())
+        if here <= indent and not lines[i].lstrip().startswith("#"):
+            return "\n".join(lines[start:i])
+    return "\n".join(lines[start:])
+
+
 def run_driver(argv, *, home=None, cwd=None, env_extra=None, **kwargs):
     """Run a driver that LOADS a monolith, in a sandboxed child process.
 
@@ -229,7 +260,10 @@ def run_driver(argv, *, home=None, cwd=None, env_extra=None, **kwargs):
     at the next (the shape the in-process loader had).
 
     `env_extra` is for the driver's own switches (offscreen Qt, its home
-    variable); `**kwargs` go to `subprocess.run`.
+    variable); `**kwargs` go to `subprocess.run`. A driver whose SOURCE is long
+    belongs on STDIN (`["-", ...]` plus `input=`): `-c` is capped by
+    MAX_ARG_STRLEN, which turns a growing driver into an `Argument list too
+    long` failure that has nothing to do with what the tests test.
     """
     env = sandbox_env(home)
     if env_extra:

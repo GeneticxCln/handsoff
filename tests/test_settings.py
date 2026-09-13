@@ -21,7 +21,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site, run_driver
+from conftest import (HERE as ROOT, _load, _user_site, method_source,
+                      run_driver)
 
 from core import settings as _core_settings
 
@@ -918,11 +919,13 @@ class TestSettingsHealthBar:
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
         assert "_health_timer.setInterval(3000)" in src
         assert "_refresh_health" in src
-        ce = src[src.index("def closeEvent"):src.index("def closeEvent") + 500]
+        # Whole methods, not windows of characters: a window makes these fail
+        # when a line is ADDED above the one they look for, which says the code
+        # moved rather than that the wiring is gone.
+        ce = method_source(src, "closeEvent")
         assert "_health_timer.stop()" in ce
         # the fetch must run off the GUI thread (run_bg), not inline
-        rf = src[src.index("def _refresh_health"):
-                 src.index("def closeEvent")]
+        rf = method_source(src, "_refresh_health")
         assert "self.run_bg(fetch, done)" in rf
 
 
@@ -956,8 +959,7 @@ class TestHealthTooltip:
     def test_refresh_wires_the_tooltip(self):
         mod = self._mod()
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
-        rf = src[src.index("def _refresh_health"):
-                 src.index("def _refresh_health") + 900]
+        rf = method_source(src, "_refresh_health")
         assert "self.health_label.setToolTip(_health_tooltip(result))" in rf
 
 

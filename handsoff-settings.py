@@ -701,6 +701,10 @@ class BubblePreview(QWidget):
         self._timer.timeout.connect(self.update)
         self._timer.start()
 
+    def drop_cached_art(self) -> None:
+        """Forget every decoded picture — a different pack is about to be drawn."""
+        self._image_cache.clear()
+
     @staticmethod
     def _glyph(p, design: str, cx: float, cy: float, r: float,
                color: QColor, t: float, k: float) -> None:
@@ -1324,6 +1328,17 @@ class SettingsWindow(QMainWindow):
             state: str(self.cfg.get(key) or "")
             for state, key in STATE_IMAGE_KEYS}
         self._design_pack = str(self.cfg.get("design_pack") or "")
+        # A pack can be LOOKED AT before it is taken. `_preview_art` is the
+        # candidate's manifest while the strip above is showing it, and
+        # `_preview_scratch` is the temporary folder a pack FILE had to be
+        # unpacked into for the strip to draw it (a folder needs no copy). This
+        # panel is the only owner of that folder, so `_drop_pack_preview` — which
+        # runs on a cancel, on Try it, on a second preview and on close — is the
+        # only thing that has to remember it exists.
+        self._preview_art: dict | None = None
+        self._preview_source = ""
+        self._preview_kind = ""
+        self._preview_scratch = ""
         self._model_at_open = str(self.cfg.get("model") or "")
         self._state_dir_ready()
         self._live_probe: _LiveMicProbe | None = None   # live mic test (Voice tab)
@@ -1482,6 +1497,10 @@ class SettingsWindow(QMainWindow):
         """Stop the live mic test (and its stream + whisper worker) and the
         health poller on close, so the settings app never holds the mic or
         keeps polling after the window is gone."""
+        if getattr(self, "_preview_scratch", ""):
+            # A pack being previewed was unpacked into a folder nothing else
+            # knows about; closing the window is the last chance to remove it.
+            self._drop_pack_preview()
         if self._live_probe is not None:
             self._live_probe.stop()
         if getattr(self, "_health_timer", None) is not None:
@@ -2788,6 +2807,47 @@ class SettingsWindow(QMainWindow):
         box.addLayout(pack_row)
         self.pack_label = self._muted("", card)
         box.addWidget(self.pack_label)
+        # Look before you leap: a pack can be shown in the strip above WITHOUT
+        # being installed, so the choice gets made with the look in front of you
+        # instead of blind. Two buttons because a pack arrives in two shapes, the
+        # same pairing Install/Import already teaches.
+        preview_row = QHBoxLayout()
+        self.pack_preview_dir = QPushButton("Preview folder\u2026", card)
+        self.pack_preview_dir.setToolTip(
+            "Show what a pack FOLDER would look like in all four states, drawn "
+            "in the strip above. Nothing is installed and nothing is copied.")
+        self.pack_preview_dir.clicked.connect(
+            lambda: self._preview_design_pack("folder"))
+        self.pack_preview_file = QPushButton("Preview pack file\u2026", card)
+        self.pack_preview_file.setToolTip(
+            "Show what a .hpack someone sent you would look like in all four "
+            "states. The file is unpacked to a temporary folder so the strip "
+            "can draw it; nothing is installed.")
+        self.pack_preview_file.clicked.connect(
+            lambda: self._preview_design_pack("file"))
+        preview_row.addWidget(self.pack_preview_dir)
+        preview_row.addWidget(self.pack_preview_file)
+        preview_row.addStretch(1)
+        box.addLayout(preview_row)
+        self.preview_label = self._muted("", card)
+        box.addWidget(self.preview_label)
+        follow_row = QHBoxLayout()
+        self.preview_try = QPushButton("Try it", card)
+        self.preview_try.setToolTip(
+            "Install the previewed pack and switch to it. THIS is the step that "
+            "writes: everything before it only showed you the look.")
+        self.preview_try.clicked.connect(self._try_design_pack)
+        self.preview_cancel = QPushButton("Cancel preview", card)
+        self.preview_cancel.setToolTip(
+            "Stop previewing \u2014 nothing was installed, and the strip goes "
+            "back to the look you actually have.")
+        self.preview_cancel.clicked.connect(self._cancel_design_pack_preview)
+        follow_row.addWidget(self.preview_try)
+        follow_row.addWidget(self.preview_cancel)
+        follow_row.addStretch(1)
+        box.addLayout(follow_row)
+        self.preview_label.setVisible(False)
+        self._toggle_preview_buttons()
         self.size_slider = QSlider(Qt.Horizontal, card)
         self.size_slider.setRange(96, 192)
         self.size_label = QLabel("", card)
@@ -2897,10 +2957,10 @@ class SettingsWindow(QMainWindow):
         self.preview = BubblePreview(
             lambda: {k: QColor(c) for k, c in self._colors.items()},
             lambda: self.size_slider.value(),
-            lambda: self.design_combo.currentData() or "orb",
+            self._preview_design,
             lambda: self.energy_slider.value() / 100.0,
             lambda: self.accent_slider.value() / 100.0,
-            self._design_picture,
+            self._preview_picture,
         )
         self.preview.setMinimumHeight(168)
         box.addWidget(self.preview)
@@ -3492,6 +3552,7 @@ class SettingsWindow(QMainWindow):
         label would leave a refusal's sentence describing a pack that is no
         longer what is selected, and the next refresh would overwrite it anyway.
         """
+        self._drop_pack_preview()       # an install supersedes anything shown
         self._status(message)
         if not slug:
             self._refresh_pack_label()   # nothing changed: describe the state
@@ -3575,6 +3636,7 @@ class SettingsWindow(QMainWindow):
         except Exception:
             self._status("design packs are unavailable in this install")
             return
+        self._drop_pack_preview()       # an export reads the art, not a preview
         asked = self._ask_export_target(title)
         if asked is None:
             return                  # cancelled: not an edit
@@ -3586,6 +3648,149 @@ class SettingsWindow(QMainWindow):
             self._status(f"could not export that pack ({exc})")
             return
         self._status(message)
+
+    def _preview_design(self) -> str:
+        """The design the strip draws: the previewed pack's, while previewing one.
+
+        A pack is only ever drawn by the `image` design, so previewing one has to
+        show `image` whatever the combo above currently says \u2014 otherwise
+        Preview would look as if it did nothing at all to someone whose bubble
+        draws an orb, which is precisely the "nothing applies" complaint this
+        card exists to answer rather than repeat.
+        """
+        if self._preview_art:
+            return "image"
+        return str(self.design_combo.currentData() or "orb")
+
+    def _preview_picture(self, state: str = "") -> str:
+        """The picture the strip draws for `state`: the previewed pack's, or yours."""
+        art = self._preview_art
+        if art:
+            return str((art.get("states") or {}).get(state)
+                       or art.get("any") or "")
+        return self._design_picture(state)
+
+    def _preview_design_pack(self, kind: str) -> None:
+        """Show a pack folder or pack FILE in the strip WITHOUT installing it.
+
+        The candidate is read by the bubble module (`inspect_pack`) and drawn by
+        the same strip, through the same resolver and the same decode and tint,
+        so what is shown is what an install would give you. A pack that cannot be
+        read is refused here in the sentence an INSTALL would use, because a
+        preview more forgiving than the install would be showing you something
+        you cannot have.
+        """
+        try:
+            bubble = _core_module("bubble")
+        except Exception:
+            self._status("design packs are unavailable in this install")
+            return
+        if kind == "file":
+            chosen, _chosen_filter = QFileDialog.getOpenFileName(
+                self, "Choose a pack file to preview", str(Path.home()),
+                "Handsoff pack (*.hpack);;Zip archive (*.zip);;All files (*)")
+        else:
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Choose a pack folder to preview", str(Path.home()))
+        if not chosen:
+            return                  # cancelled: not an edit
+        try:
+            art, problem, scratch = bubble.inspect_pack(chosen)
+        except Exception as exc:    # a data folder must never crash the panel
+            self._status(f"could not read that pack ({exc})")
+            return
+        self._drop_pack_preview()   # a second preview replaces the first
+        if problem or not art:
+            sentence = problem or "that pack cannot be read"
+            self._status(sentence)
+            self.preview_label.setText(f"\u26a0 {sentence}")
+            self.preview_label.setVisible(True)
+            return
+        self._preview_art = art
+        self._preview_source = chosen
+        self._preview_kind = kind
+        self._preview_scratch = scratch
+        self._refresh_preview_label()
+        self._toggle_preview_buttons()
+        self._status(f"previewing {art['name']} \u2014 nothing installed yet")
+
+    def _try_design_pack(self) -> None:
+        """Install the previewed pack and switch to it.
+
+        A preview is not a second install path: this hands the SAME source to the
+        same function Install pack\u2026 uses, so what was shown is what lands, and
+        it is COPIED into the install \u2014 which is what keeps it working after
+        the folder or file it came from moves.
+        """
+        source, kind = self._preview_source, self._preview_kind
+        if not source:
+            return
+        try:
+            bubble = _core_module("bubble")
+        except Exception:
+            self._status("design packs are unavailable in this install")
+            return
+        try:
+            slug, message = (bubble.install_pack_file(source) if kind == "file"
+                             else bubble.install_pack(source))
+        except Exception as exc:    # a data folder must never crash the panel
+            self._status(f"could not install that pack ({exc})")
+            return
+        self._drop_pack_preview()
+        self._adopt_design_pack(slug, message)
+
+    def _cancel_design_pack_preview(self) -> None:
+        """Stop previewing: nothing was installed, and the strip goes back."""
+        if not self._preview_art:
+            return
+        self._drop_pack_preview()
+        self._status("preview cancelled \u2014 nothing was installed")
+
+    def _drop_pack_preview(self) -> None:
+        """Forget the previewed pack and remove the art it had to unpack.
+
+        Nothing else owns that temporary folder, so it goes here \u2014 on a
+        cancel, on Try it, on a second preview, on any other pack action, and on
+        close \u2014 and the strip's decode cache goes with it, because a cached
+        decode of the candidate's pictures would otherwise outlive the preview
+        and let the strip draw a pack that is no longer being previewed.
+        """
+        scratch = str(getattr(self, "_preview_scratch", "") or "")
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+        self._preview_scratch = ""
+        self._preview_art = None
+        self._preview_source = ""
+        self._preview_kind = ""
+        preview = getattr(self, "preview", None)
+        if preview is not None:
+            preview.drop_cached_art()
+        self._refresh_preview_label()
+        self._toggle_preview_buttons()
+
+    def _refresh_preview_label(self) -> None:
+        """Say what is being previewed, and that it is NOT installed yet."""
+        label = getattr(self, "preview_label", None)
+        if label is None:
+            return
+        art = self._preview_art
+        if not art:
+            label.setVisible(False)
+            return
+        label.setVisible(True)
+        label.setText(
+            f"Previewing {art['name']} from {self._preview_source} \u2014 "
+            f"{len(art.get('states') or {})} state picture(s)"
+            + (", plus a fallback" if art.get("any") else "")
+            + ". Not installed \u2014 Try it to keep it.")
+
+    def _toggle_preview_buttons(self) -> None:
+        """Try it and Cancel exist only while there is something to decide."""
+        showing = bool(self._preview_art)
+        for name in ("preview_try", "preview_cancel"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setVisible(showing)
 
     def _refresh_design_image_label(self) -> None:
         """What the art in effect is \u2014 or WHY it cannot be drawn.

@@ -2737,6 +2737,184 @@ def the_appearance_panel_moves_a_look_as_one_file():
 
 
 @scenario
+def the_appearance_panel_previews_a_pack_before_installing_it():
+    # Look before you leap: a pack folder or a .hpack can be drawn in the strip
+    # WITHOUT being installed, and Try it is the step that actually takes it.
+    # What this pins is the sequence a user gets -- the strip follows the
+    # candidate rather than the saved selection (including for someone whose
+    # bubble draws an orb, where a preview that did nothing would be the old
+    # "nothing applies" complaint again), nothing is installed until Try it,
+    # cancelling puts the strip back and removes the temporary folder a
+    # previewed FILE was unpacked into, and a pack that cannot be read is
+    # refused in the sentence an install would use.
+    import json as _json
+    import shutil as _shutil
+    import zipfile as _zipfile
+    from PySide6.QtGui import QColor, QImage
+
+    from settings_schema import BUBBLE_STATES
+
+    folder = settings_file.parent
+    packs_root = config_dir / "design-packs"
+    appearance.PACKS_DIR = packs_root
+    _shutil.rmtree(packs_root, ignore_errors=True)
+    candidate = folder / "candidate"
+    candidate.mkdir(parents=True, exist_ok=True)
+
+    def art(path, rgba):
+        img = QImage(48, 48, QImage.Format_ARGB32)
+        img.fill(QColor(*rgba))
+        assert img.save(str(path)), path
+        return path
+
+    shots = {s: art(candidate / f"{s}.png", (20 + 50 * i, 90, 180, 255))
+             for i, s in enumerate(BUBBLE_STATES)}
+    (candidate / "pack.json").write_text(_json.dumps({
+        "name": "Candidate",
+        "states": {s: f"{s}.png" for s in BUBBLE_STATES}}), encoding="utf-8")
+
+    seed({"model": "testmodel:latest", "design_image_path": ""})
+    win.reload_from_disk()
+    assert win.design_combo.currentData() != "image", (
+        "the shape must NOT already be `image`, or previewing would prove "
+        "nothing about a preview that has to show its own art")
+
+    class _FrozenClock:
+        def elapsed(self):
+            return 4000
+
+    seen = []
+    real_draw = settings_app.BubblePreview._draw_image_glyph
+
+    def _recording(self, painter, cx, cy, r, color, state=""):
+        out = real_draw(self, painter, cx, cy, r, color, state)
+        seen.append((state, out, str(self._image_fn(state) or "")))
+        return out
+
+    real_open = settings_app.QFileDialog.getOpenFileName
+    real_dir = settings_app.QFileDialog.getExistingDirectory
+    real_name = settings_app.QInputDialog.getText
+    settings_app.BubblePreview._draw_image_glyph = _recording
+    try:
+        win.preview.resize(320, 200)
+        win.preview._clock = _FrozenClock()
+
+        # --- preview a FOLDER: the strip draws the candidate, nothing installed
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: str(candidate))
+        win._preview_design_pack("folder")
+        assert "Previewing Candidate" in win.preview_label.text(), (
+            win.preview_label.text())
+        assert not win.preview_try.isHidden(), "Try it appears with a preview"
+        assert not packs_root.is_dir() or not list(packs_root.iterdir()), (
+            "previewing a folder must not install or copy anything")
+        seen.clear()
+        img = QImage(win.preview.width(), win.preview.height(),
+                     QImage.Format_ARGB32)
+        img.fill(0)
+        win.preview.render(img)
+        assert [s for s, _ok, _p in seen] == list(BUBBLE_STATES), seen
+        assert all(ok for _s, ok, _p in seen), seen
+        for state, _ok, path in seen:
+            assert path == str(candidate / f"{state}.png"), (state, path)
+
+        # --- Try it is what installs, and it is what you were shown
+        win._try_design_pack()
+        assert win._design_pack == "candidate", win.status_label.text()
+        assert "installed pack" in win.status_label.text(), win.status_label.text()
+        assert (packs_root / "candidate" / "pack.json").is_file()
+        assert win.preview_try.isHidden(), "Try it goes away with the preview"
+        assert win.preview_label.isHidden(), "the preview label goes with it"
+
+        # --- a pack that cannot be read is refused, and there is nothing to try
+        broken = folder / "broken"
+        broken.mkdir(parents=True, exist_ok=True)
+        (broken / "pack.json").write_text(_json.dumps(
+            {"name": "Broken", "any": "missing.png"}), encoding="utf-8")
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: str(broken))
+        win._preview_design_pack("folder")
+        assert "missing.png" in win.preview_label.text(), win.preview_label.text()
+        assert "missing.png" in win.status_label.text(), win.status_label.text()
+        assert win.preview_try.isHidden(), (
+            "a pack that cannot be read offers nothing to try")
+
+        # --- a FILE preview unpacks to a folder, and cancelling removes it
+        pack_file = folder / "sent.hpack"
+        with _zipfile.ZipFile(pack_file, "w") as zf:
+            zf.writestr("pack.json", _json.dumps({
+                "name": "From A File",
+                "states": {s: f"{s}.png" for s in BUBBLE_STATES}}))
+            for state, path in shots.items():
+                zf.writestr(f"{state}.png", Path(path).read_bytes())
+        settings_app.QFileDialog.getOpenFileName = (
+            lambda *a, **k: (str(pack_file), "Handsoff pack (*.hpack)"))
+        win._preview_design_pack("file")
+        assert "Previewing From A File" in win.preview_label.text(), (
+            win.preview_label.text())
+        scratch = str(win._preview_scratch or "")
+        assert scratch and Path(scratch).is_dir(), scratch
+        win._cancel_design_pack_preview()
+        assert not Path(scratch).exists(), (
+            "cancelling a file preview has to remove what it unpacked")
+        assert "cancelled" in win.status_label.text(), win.status_label.text()
+        assert win.preview_try.isHidden(), "nothing left to decide"
+        assert "candidate" in sorted(p.name for p in packs_root.iterdir()), (
+            "cancelling a preview must not touch what was already installed")
+
+        # --- Try it on a FILE preview installs the pack that file holds, and
+        # --- cleans up what the preview had to unpack to draw it
+        settings_app.QFileDialog.getOpenFileName = (
+            lambda *a, **k: (str(pack_file), "Handsoff pack (*.hpack)"))
+        win._preview_design_pack("file")
+        scratch = str(win._preview_scratch or "")
+        assert scratch and Path(scratch).is_dir(), scratch
+        win._try_design_pack()
+        assert win._design_pack == "from-a-file", win.status_label.text()
+        assert (packs_root / "from-a-file" / "pack.json").is_file()
+        assert not Path(scratch).exists(), (
+            "Try it has to remove the folder the preview unpacked")
+        assert not win.preview._image_cache, (
+            "the strip must not keep decoded copies of a pack it no longer "
+            "shows \u2014 that is what would let it draw the wrong art")
+
+        # --- a preview is not a mode: any other pack action ends it, because
+        # --- the panel must never show one pack while acting on another
+        settings_app.QFileDialog.getExistingDirectory = (
+            lambda *a, **k: str(candidate))
+        win._preview_design_pack("folder")
+        assert not win.preview_try.isHidden()
+        win._install_design_pack()
+        assert win._design_pack == "candidate", win.status_label.text()
+        assert win.preview_try.isHidden(), (
+            "installing another pack has to end the preview")
+        win._preview_design_pack("folder")
+        assert not win.preview_try.isHidden()
+        settings_app.QInputDialog.getText = lambda *a, **k: ("Typed", False)
+        win._export_design_pack()      # cancelled at the name prompt
+        assert win.preview_try.isHidden(), (
+            "an export writes the art on screen, so a preview has to end "
+            "before it asks where to write")
+
+        # --- and closing the window is the last chance to remove it, because
+        # --- nothing else knows that folder exists
+        settings_app.QFileDialog.getOpenFileName = (
+            lambda *a, **k: (str(pack_file), "Handsoff pack (*.hpack)"))
+        win._preview_design_pack("file")
+        scratch = str(win._preview_scratch or "")
+        assert scratch and Path(scratch).is_dir(), scratch
+        win.close()
+        assert not Path(scratch).exists(), (
+            "closing the window has to remove the folder a preview unpacked")
+    finally:
+        settings_app.BubblePreview._draw_image_glyph = real_draw
+        settings_app.QFileDialog.getOpenFileName = real_open
+        settings_app.QFileDialog.getExistingDirectory = real_dir
+        settings_app.QInputDialog.getText = real_name
+        _shutil.rmtree(packs_root, ignore_errors=True)
+
+
+@scenario
 def the_image_design_takes_one_picture_per_state():
     # One picture for idle/listening/thinking/speaking, chosen in the Shape card,
     # with `design_image_path` behind them as the fallback. What this pins is the
@@ -2930,10 +3108,18 @@ def _run_scenario(name: str, tmp_path: Path) -> subprocess.CompletedProcess:
     # the bubble's constants afterwards — belt and braces, but it was the only
     # belt). The runner keeps the real user site-packages on PYTHONPATH, because
     # a redirected HOME hides PySide6.
+    #
+    # The driver goes on STDIN rather than into a `-c` argument. `-c` is capped
+    # by MAX_ARG_STRLEN (128 KiB on Linux) and GUI_DRIVER is the source of every
+    # scenario in this file, so the day that text grew past the cap the whole
+    # suite broke with `[Errno 7] Argument list too long` — a failure with
+    # nothing to do with what the tests test, and one that gets likelier every
+    # time a scenario is added. Python treats `-` exactly as it treats `-c` for
+    # `sys.path[0]` (the cwd), which is what the driver's imports rely on.
     return run_driver(
-        ["-c", GUI_DRIVER, name], home=tmp_path,
+        ["-", name], home=tmp_path,
         env_extra={"SGUI_HOME": str(tmp_path), "SGUI_HERE": str(HERE)},
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, input=GUI_DRIVER,
     )
 
 
@@ -2963,6 +3149,7 @@ SCENARIO_NAMES = [
     "the_image_design_can_use_an_installed_pack",
     "the_appearance_panel_exports_the_art_as_a_pack",
     "the_appearance_panel_moves_a_look_as_one_file",
+    "the_appearance_panel_previews_a_pack_before_installing_it",
     "the_image_design_takes_one_picture_per_state",
     "appearance_panel_is_a_scrolling_column_of_cards",
     "look_tiles_are_drawn_from_the_shared_painter",

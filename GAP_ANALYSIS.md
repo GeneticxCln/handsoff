@@ -3241,3 +3241,57 @@ It now asserts the PROPERTY that has to hold in all of them — the answer names
 asked and gives a reason in the module's own vocabulary — because the challenge DETECTION it was
 trying to cover is already pinned deterministically by
 `test_a_bot_challenge_is_a_failure_not_an_empty_web`, which a live test cannot make happen.
+
+## Looking at a pack before taking it
+
+**What was missing.** Every door into a pack — a folder, a `.hpack` — installed first and let you
+look afterwards, so the only way to find out whether a look suited the bubble was to take it,
+switch to it and then undo. The choice was made blind.
+
+**The preview is the same reading, and that is what makes it safe to believe.** `inspect_pack`
+reads a pack with `_read_pack_folder` — the function `install_pack` now also calls — so the panel
+cannot draw a pack the install would then turn down. The property is not "similar sentences": for
+both shapes the refusal strings are EQUAL, which two tests assert directly (and the file case can
+only match because refusals speak paths relative to the pack, so a failure names the ENTRY rather
+than a temporary folder). Nothing reaches `design-packs/` while previewing: a folder is read where
+it already sits, and a file is unpacked into a temporary folder that the CALLER owns.
+
+**Try it is the only step that writes**, and it is not a second install path: it hands the same
+source to the same function `Install pack…` uses, so what was shown is what lands and it is copied
+in rather than linked to.
+
+**Owning the temporary folder is the whole risk.** A previewed FILE has to be unpacked for the
+strip to draw it, and nothing else knows that folder exists, so `_drop_pack_preview` is the single
+place that removes it and it runs on a cancel, on Try it, on a second preview, on any other pack
+action (an install supersedes it, and an export reads the art on screen so it must not be running
+while a preview is showing another), and on window close. It also clears the strip's decode cache,
+because a cached decode would otherwise let the strip keep drawing a pack that is no longer being
+previewed.
+
+**Two decisions that look wrong and are not.** Previewing forces the strip to the `image` design
+whatever shape the combo says, because a pack is only ever drawn by that design — otherwise Preview
+would appear to do nothing at all to someone whose bubble draws an orb, which is the same "nothing
+applies" complaint this card exists to answer. And a refusal shows no Try it button at all, because
+there is nothing to try: the pack cannot be read, so installing it would produce the same sentence.
+
+**Guards and evidence.** `TestInspectPack` (7 cases) plus the offscreen scenario
+`the_appearance_panel_previews_a_pack_before_installing_it`. **20/20 mutations** back to the old
+behaviour caught on the first pass, one per decision, including the four ways the temporary folder
+could be lost (not handed back, not removed on refusal, not removed on Try it, not removed on
+close).
+
+Two things found while running the gates, neither of them the feature:
+
+  * **The GUI test harness had a latent size cliff.** `_run_scenario` handed the whole scenario
+driver to `python -c`, which is capped by `MAX_ARG_STRLEN` (128 KiB); the driver was 130 KiB and
+adding one scenario crossed it, so the suite failed with `[Errno 7] Argument list too long` — a
+failure about the size of a string, not about any test. The driver now goes on STDIN (`["-",
+name]`, which Python treats identically for `sys.path[0]`), and `run_driver`'s docstring says so,
+because the next person to add a scenario should not have to rediscover it.
+  * **Two wiring tests asserted on fixed CHARACTER windows.** `tests/test_audio.py` and
+`tests/test_settings.py` sliced 400 and 500 characters after `def closeEvent` and asserted the
+probe/health timer was stopped inside it, so adding one line at the top of `closeEvent` (the
+preview cleanup) turned both red — a failure that says "the code moved", not "the wiring is gone".
+Both now take the whole METHOD via a new `conftest.method_source`, and the proof that it is fixed is
+live: they pass with the line that broke them still in place. The third such site
+(`_refresh_health` + 900 characters) was fixed the same way.

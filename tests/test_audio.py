@@ -21,7 +21,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, core_module, run_driver, wait_for
+from conftest import (HERE as ROOT, _load, core_module, method_source,
+                      run_driver, wait_for)
 
 from core import settings as _core_settings
 
@@ -1305,7 +1306,10 @@ class TestLiveMicProbe:
                          "mic_live_btn.setCheckable(True)",
                          "currentIndexChanged.connect", "valueChanged.connect"):
             assert fragment in src, fragment
-        ce = src[src.index("def closeEvent"):src.index("def closeEvent") + 400]
+        # The whole method, not a fixed window of characters: a window turns
+        # "is the probe stopped on close" into "is the line still where it was",
+        # so any line added above it fails the test for no reason.
+        ce = method_source(src, "closeEvent")
         assert "_live_probe.stop()" in ce
 
 

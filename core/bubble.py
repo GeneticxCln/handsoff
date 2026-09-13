@@ -509,7 +509,25 @@ def _build_manifest(slug: str, folder, raw):
     return {"slug": slug, "name": name, "any": fallback, "states": states}
 
 
-def _validate_pack(folder, raw, slug: str = "") -> tuple:
+def _shown(path, root) -> str:
+    """`path` as a message should say it: relative to `root` when one was given.
+
+    A pack that arrived as a FILE is unpacked into a temporary folder before it
+    can be judged, and a sentence naming `/tmp/.handsoff-preview-ab12/missing.png`
+    tells the user nothing they can act on. The caller passes the folder it
+    unpacked into, so the refusal names the ENTRY instead — `missing.png` — which
+    is what is actually wrong with the archive in their hand. A pack read where
+    it sits keeps its full path, because there the path IS the information.
+    """
+    if root is None:
+        return str(path)
+    try:
+        return str(Path(path).relative_to(root))
+    except (ValueError, TypeError):
+        return str(path)
+
+
+def _validate_pack(folder, raw, slug: str = "", display_root=None) -> tuple:
     """Check one parsed manifest against its folder: (problem, built).
 
     `problem` is "" when the pack can draw, and otherwise ONE sentence naming
@@ -517,6 +535,10 @@ def _validate_pack(folder, raw, slug: str = "") -> tuple:
     manifest `load_pack` returns, and it is None whenever `problem` is
     non-empty — a caller must never draw a half-built pack. The single
     authority behind install, load and report (see the section comment).
+
+    `display_root` only changes how a path is SPOKEN (see `_shown`); it can
+    never change the verdict, so the same pack is refused and accepted by the
+    same rules whether it is being installed or only looked at.
     """
     if not isinstance(raw, dict):
         return f"{PACK_MANIFEST} must be a JSON object", None
@@ -536,9 +558,11 @@ def _validate_pack(folder, raw, slug: str = "") -> tuple:
     for where, found in checked:
         p = Path(found)
         if not p.exists():
-            return f"no file at {p} (the {where} picture)", None
+            return (f"no file at {_shown(p, display_root)} "
+                    f"(the {where} picture)", None)
         if not p.is_file():
-            return f"{p} is a folder, not an image (the {where} picture)", None
+            return (f"{_shown(p, display_root)} is a folder, not an image "
+                    f"(the {where} picture)", None)
         img = _decoded_image(p)
         if img is None:
             return (f"{p.name} is not an image this build can read "
@@ -746,7 +770,56 @@ def art_problem() -> str:
     return problem or design_image_problem()
 
 
-def install_pack(source, fallback_name="") -> tuple:
+def _read_pack_folder(folder, fallback_name="", label="", relative=False) -> tuple:
+    """Read and judge a folder that already holds a pack: (manifest, problem).
+
+    ONE reading of what a pack CONTAINS — the manifest, the slug it installs
+    under, and the validation every consumer has to agree on. `install_pack`
+    calls it and then copies; `inspect_pack` calls it and then draws. That is
+    what stops a PREVIEW being more forgiving than an install: the same sentence
+    refuses both, so a pack you were shown is a pack that will install.
+
+    `label` names the thing the USER chose, which is not always the folder: a
+    pack that arrived as an archive is unpacked into a temporary directory whose
+    name means nothing to anyone, so the caller passes the file's own name and
+    every sentence names something the user has heard of.
+
+    `relative` speaks a picture's path relative to the pack instead of in full.
+    That is what an unpacked ARCHIVE wants, because the full path is a temporary
+    folder the user has never seen; a folder being installed keeps full paths,
+    where the path is the information.
+
+    Returns (None, problem) when the pack cannot draw, and the manifest
+    `load_pack` returns when it can — never a half-built one.
+    """
+    folder = Path(folder)
+    where = str(label or folder.name)
+    try:
+        manifest = folder / PACK_MANIFEST
+        if not manifest.is_file():
+            return None, f"{where} has no {PACK_MANIFEST} — a pack needs one"
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        return None, f"{where}/{PACK_MANIFEST} is not valid JSON ({exc})"
+    except OSError as exc:
+        return None, f"cannot read {folder} ({exc.strerror or exc})"
+    if not isinstance(raw, dict):
+        return None, f"{PACK_MANIFEST} must be a JSON object"
+    slug = (pack_slug(raw.get("name")) or pack_slug(fallback_name)
+            or pack_slug(folder.name))
+    if not slug:
+        return None, "the pack needs a name with at least one letter or digit"
+    # The SAME validator the renderer uses, so a folder this refuses would not
+    # have drawn anything anyway — and it is refused with the sentence a broken
+    # installed pack is reported with, not a second wording.
+    problem, built = _validate_pack(folder, raw, slug,
+                                    folder if relative else None)
+    if problem:
+        return None, f"{where}: {problem}"
+    return built, ""
+
+
+def install_pack(source, fallback_name="", label="", relative=False) -> tuple:
     """Copy the pack folder at `source` into the packs directory.
 
     Returns (slug, message): slug is "" when nothing was installed, and the
@@ -758,7 +831,9 @@ def install_pack(source, fallback_name="") -> tuple:
     own. A folder installs under its own folder name; a pack that arrived as an
     ARCHIVE is unpacked into a private temporary folder whose name means nothing
     to anyone, so `install_pack_file` passes the file's own stem here and the
-    pack ends up named after the file the user chose.
+    pack ends up named after the file the user chose. `label` and `relative`
+    likewise make its refusals speak about what the user chose — see
+    `_read_pack_folder`.
     """
     root = packs_dir()
     if root is None:
@@ -767,26 +842,12 @@ def install_pack(source, fallback_name="") -> tuple:
     try:
         if not src.is_dir():
             return "", f"{src} is not a folder"
-        manifest = src / PACK_MANIFEST
-        if not manifest.is_file():
-            return "", f"{src.name} has no {PACK_MANIFEST} — a pack needs one"
-        raw = json.loads(manifest.read_text(encoding="utf-8"))
-    except ValueError as exc:
-        return "", f"{src.name}/{PACK_MANIFEST} is not valid JSON ({exc})"
     except OSError as exc:
         return "", f"cannot read {src} ({exc.strerror or exc})"
-    if not isinstance(raw, dict):
-        return "", f"{PACK_MANIFEST} must be a JSON object"
-    slug = (pack_slug(raw.get("name")) or pack_slug(fallback_name)
-            or pack_slug(src.name))
-    if not slug:
-        return "", "the pack needs a name with at least one letter or digit"
-    # The SAME validator the renderer uses, so a folder this refuses would not
-    # have drawn anything anyway — and it is refused with the sentence a broken
-    # installed pack is reported with, not a second wording.
-    problem, built = _validate_pack(src, raw, slug)
+    built, problem = _read_pack_folder(src, fallback_name, label, relative)
     if problem:
-        return "", f"{src.name}: {problem}"
+        return "", problem
+    slug = str(built["slug"])
     target = Path(root) / slug
     try:
         Path(root).mkdir(parents=True, exist_ok=True)
@@ -805,6 +866,49 @@ def install_pack(source, fallback_name="") -> tuple:
     return slug, (f"installed pack {built['name']} as {slug} "
                   f"({len(built['states'])} state picture(s)"
                   + (", plus a fallback)" if built["any"] else ")"))
+
+
+def inspect_pack(source) -> tuple:
+    """Read a pack FOLDER or pack FILE without installing it: what it would be.
+
+    Returns (art, problem, scratch). `art` is the manifest shape `load_pack`
+    returns — {"slug", "name", "any", "states"} with absolute picture paths —
+    and it is None when nothing can be drawn; `problem` is then the sentence an
+    INSTALL would refuse with, because a preview that were more forgiving than an
+    install would be a preview of something you cannot have. `scratch` is a
+    temporary folder holding the art when it had to be unpacked out of a FILE,
+    and the CALLER owns it: it removes it when it stops showing that pack. A
+    folder is read where it already sits, so its scratch is "" and looking at a
+    folder never copies, moves or writes anything.
+
+    Nothing reaches the install, which is the whole point: the panel can show
+    you a pack — drawing the very pictures an install would copy, judged by the
+    very validator that governs it — before you decide to take it.
+    """
+    try:
+        src = Path(str(source)).expanduser()
+    except (OSError, ValueError, TypeError):
+        return None, "that is not a pack folder or file", ""
+    try:
+        if src.is_dir():
+            built, problem = _read_pack_folder(src)
+            return (None, problem, "") if problem else (built, "", "")
+        if not src.is_file():
+            return None, f"{src.name or src} is not a pack folder or file", ""
+    except OSError as exc:
+        return None, f"cannot read {src} ({exc.strerror or exc})", ""
+    try:
+        scratch = tempfile.mkdtemp(prefix=".handsoff-preview-")
+    except OSError as exc:
+        return None, f"cannot unpack {src.name} ({exc.strerror or exc})", ""
+    problem, folder = _extract_pack_archive(src, scratch, src.name)
+    if not problem:
+        built, problem = _read_pack_folder(folder, src.stem, src.name,
+                                          relative=True)
+        if not problem:
+            return built, "", scratch
+    shutil.rmtree(scratch, ignore_errors=True)
+    return None, problem, ""
 
 
 def effective_art(settings=None) -> tuple:
@@ -1158,7 +1262,7 @@ def install_pack_file(source) -> tuple:
         problem, folder = _extract_pack_archive(src, staging, label)
         if problem:
             return "", problem
-        return install_pack(folder, src.stem)
+        return install_pack(folder, src.stem, label, relative=True)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
