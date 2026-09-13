@@ -24,17 +24,28 @@ from pathlib import Path
 # Raster extensions worth looking for in a wallpaper command line.
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
+# Video wallpapers are first-class here: this desktop's wallpaper is an mp4
+# looped by the shell, and "match wallpaper" that can only read a still image
+# is a button that can never do anything for the people who use one. A video is
+# sampled by extracting a frame first (ImageMagick cannot read mp4).
+_VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".gif")
+_MEDIA_EXTS = _IMAGE_EXTS + _VIDEO_EXTS
+
 # Lines that plausibly set or spawn a wallpaper.  `background`/`wallpaper`
 # cover niri's own block and the common shell wrappers.
 _WALLPAPER_HINTS = ("swaybg", "swww", "hyprpaper", "feh", "nitrogen",
                     "background", "wallpaper")
 
-_HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})")
+# EXACTLY six digits, anchored at both ends (fullmatch, not match): the old
+# unanchored prefix match accepted '#4f8cffXYZ' and silently TRUNCATED an
+# 8-digit '#RRGGBBAA' to its first six, so a malformed or alpha colour
+# validated as a good 6-digit one and then lost its alpha without a word.
+_HEX_RE = re.compile(r"#?([0-9a-fA-F]{6})")
 
 
 def hex_to_rgb(value: str) -> tuple[int, int, int] | None:
     """'#4f8cff' -> (79, 140, 255); None when the string is not a hex colour."""
-    m = _HEX_RE.match(str(value or "").strip())
+    m = _HEX_RE.fullmatch(str(value or "").strip())
     if not m:
         return None
     h = m.group(1)
@@ -70,7 +81,7 @@ def _retune(rgb: tuple[int, int, int], shift: float, sat: float) -> tuple[int, i
     return out[0], out[1], out[2]
 
 
-def tune_colors_for_background(colors: dict[str, str], luminance: float,
+def tune_colors_for_background(colors: dict[str, str], luminance: float | None,
                                *, strength: float = 1.0) -> dict[str, str]:
     """Retune `colors` so they stand out against a backdrop of `luminance`.
 
@@ -82,7 +93,15 @@ def tune_colors_for_background(colors: dict[str, str], luminance: float,
     strength = max(0.0, min(1.0, float(strength)))
     if strength == 0.0:
         return dict(colors)
-    dark = float(luminance) < 0.5
+    try:
+        lum = float(luminance)
+    except (TypeError, ValueError):
+        # detect_wallpaper_luminance returns None on EVERY failure path (no
+        # config, no wallpaper file, no ImageMagick, unparseable output), and
+        # that None used to reach float() and raise TypeError — breaking the
+        # contract this function's own docstring states. Junk is a no-op too.
+        return dict(colors)
+    dark = lum < 0.5
     shift = (26.0 if dark else -30.0) * strength
     sat = 1.0 + (0.18 if dark else 0.22) * strength
     out: dict[str, str] = {}
@@ -111,18 +130,68 @@ def wallpaper_path_from_config(text: str, *, exists=os.path.isfile) -> str | Non
     return None
 
 
-def sample_image_luminance(path: str, *, runner=subprocess.run) -> float | None:
-    """Average colour of one image via ImageMagick -> relative luminance.
+def _is_video(path: str) -> bool:
+    return str(path).lower().endswith(_VIDEO_EXTS)
 
-    Returns None when ImageMagick is missing, the file is unreadable or the
-    output is not a colour: detection is a convenience, never a hard failure.
+
+def _video_frame(path: str, *, runner=subprocess.run) -> str | None:
+    """One frame of a video wallpaper as a temp PNG, or None.
+
+    `-ss 1` matters: frame 0 of a looping wallpaper is usually a fade-in to
+    black, whose "average colour" would tune the palette for a black backdrop.
+    A second in, the loop is showing what the user actually looks at, and a
+    clip shorter than that still yields its first frame.
     """
-    cmd = ["magick", str(path), "-resize", "1x1", "-format", "%[hex:p{0,0}]", "info:"]
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix="handsoff-wallpaper-", suffix=".png")
+    os.close(fd)
+    cmd = ["ffmpeg", "-v", "error", "-y", "-ss", "1", "-i", str(path),
+           "-frames:v", "1", tmp]
     try:
-        result = runner(cmd, capture_output=True, text=True, timeout=10)
+        result = runner(cmd, capture_output=True, text=True, timeout=25)
     except (OSError, subprocess.SubprocessError):
+        result = None
+    ok = getattr(result, "returncode", 1) == 0
+    try:
+        ok = ok and os.path.getsize(tmp) > 0
+    except OSError:
+        ok = False
+    if not ok:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         return None
-    if getattr(result, "returncode", 1) != 0:
+    return tmp
+
+
+def sample_image_luminance(path: str, *, runner=subprocess.run) -> float | None:
+    """Average colour of one image or video -> relative luminance.
+
+    Returns None when ImageMagick (or ffmpeg, for a video) is missing, the file
+    is unreadable or the output is not a colour: detection is a convenience,
+    never a hard failure.
+    """
+    frame = None
+    target = str(path)
+    if _is_video(target):
+        frame = _video_frame(target, runner=runner)
+        if frame is None:
+            return None
+        target = frame
+    cmd = ["magick", target, "-resize", "1x1", "-format", "%[hex:p{0,0}]",
+           "info:"]
+    try:
+        result = runner(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    finally:
+        if frame is not None:
+            try:
+                os.unlink(frame)
+            except OSError:
+                pass
+    if result is None or getattr(result, "returncode", 1) != 0:
         return None
     raw = (getattr(result, "stdout", "") or "").strip()
     hexcol = raw[:6]
@@ -131,15 +200,114 @@ def sample_image_luminance(path: str, *, runner=subprocess.run) -> float | None:
     return relative_luminance("#" + hexcol)
 
 
-def detect_wallpaper_luminance(config_file: Path | str, *,
-                               runner=subprocess.run,
-                               exists=os.path.isfile) -> float | None:
-    """Luminance of the configured wallpaper, or None when undetectable."""
+def _newest_media(directory, *, exists=os.path.isfile) -> str | None:
+    """Newest image/video in a directory tree level, or None."""
+    best, best_mtime = None, -1.0
     try:
-        text = Path(config_file).read_text(encoding="utf-8", errors="replace")
+        entries = list(os.scandir(directory))
     except OSError:
         return None
-    path = wallpaper_path_from_config(text, exists=exists)
-    if not path:
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        if not entry.name.lower().endswith(_MEDIA_EXTS):
+            continue
+        if not exists(entry.path):
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best, best_mtime = entry.path, mtime
+    return best
+
+
+def _noctalia_directory(home: Path) -> str | None:
+    """`wallpaper.directory` from the shell's own settings, if it names one."""
+    import json
+    try:
+        doc = json.loads((home / ".config" / "noctalia" / "settings.json")
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
-    return sample_image_luminance(path, runner=runner)
+    directory = (doc.get("wallpaper") or {}).get("directory") if isinstance(
+        doc.get("wallpaper"), dict) else None
+    return str(directory) if directory else None
+
+
+def wallpaper_candidates(config_file: Path | str | None = None, *,
+                         home: Path | str | None = None,
+                         exists=os.path.isfile) -> list[str]:
+    """Every place this desktop could be keeping its wallpaper, in order.
+
+    A niri config names a wallpaper only when something like swaybg is spawned
+    from it; a shell-owned wallpaper (noctalia here) is a directory in the
+    shell's settings plus caches, and the wallpaper itself may be a VIDEO.
+    Returns existing candidates only, and every candidate is filtered through
+    the injected `exists`, so a test can drive the order without touching the
+    real filesystem.
+    """
+    home = Path(home) if home is not None else Path.home()
+    found: list[str] = []
+
+    def add(path) -> None:
+        if not path:
+            return
+        text = os.path.expanduser(str(path))
+        if exists(text) and text not in found:
+            found.append(text)
+
+    if config_file:
+        try:
+            text = Path(config_file).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        add(wallpaper_path_from_config(text, exists=exists))
+
+    add(_newest_media(_noctalia_directory(home) or "", exists=exists))
+    for sub in ("large", "thumbnails"):
+        add(_newest_media(home / ".cache" / "noctalia" / "images" /
+                          "wallpapers" / sub, exists=exists))
+    # swww keeps one file per output; the newest is the one on screen now.
+    try:
+        for entry in os.scandir(home / ".cache" / "swww"):
+            if entry.is_dir():
+                add(_newest_media(entry.path, exists=exists))
+    except OSError:
+        pass
+    try:
+        hypr = (home / ".config" / "hypr" / "hyprpaper.conf").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        hypr = ""
+    add(wallpaper_path_from_config(hypr, exists=exists))
+    return found
+
+
+def wallpaper_report(config_file: Path | str | None = None, *,
+                     runner=subprocess.run, home: Path | str | None = None,
+                     exists=os.path.isfile) -> dict:
+    """What "match wallpaper" found: path, luminance, and everything tried.
+
+    A single luminance cannot explain itself: a user who clicks the button and
+    sees nothing needs to know WHICH file was sampled (or that none was found),
+    so `checked` is part of the answer rather than a log line somewhere.
+    """
+    checked = wallpaper_candidates(config_file, home=home, exists=exists)
+    for path in checked:
+        luminance = sample_image_luminance(path, runner=runner)
+        if luminance is not None:
+            return {"path": path, "luminance": luminance, "checked": checked}
+    return {"path": None, "luminance": None, "checked": checked}
+
+
+def detect_wallpaper_luminance(config_file: Path | str | None = None, *,
+                               runner=subprocess.run, home=None,
+                               exists=os.path.isfile) -> float | None:
+    """Luminance of the current wallpaper, or None when undetectable."""
+    return wallpaper_report(config_file, runner=runner, home=home,
+                            exists=exists)["luminance"]

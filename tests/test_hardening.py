@@ -12,12 +12,11 @@ import socket
 import subprocess
 import sys
 import textwrap
-import threading
 from pathlib import Path
 
 import pytest
 
-from conftest import HERE as ROOT, _user_site
+from conftest import HERE as ROOT, run_driver
 
 HERE = ROOT   # the repo root
 
@@ -267,11 +266,10 @@ class TestRuntimePrepareStartupIntegration:
         """ControlServer._serve must bail out cleanly, not bind an insecure
         socket, when _prepare_runtime refuses the runtime."""
         (sandbox / "cfg").symlink_to(sandbox / "elsewhere")
-        srv = H.ControlServer.__new__(H.ControlServer)
-        srv._assistant = None
-        srv._stop = threading.Event()
-        srv._server = None
-        srv._thread = None
+        # Built through the real constructor: the accept slot now lives in the
+        # shared registry, so a __new__-built server has no slot to start into
+        # and would fail for the wrong reason. _serve uses no assistant.
+        srv = H.ControlServer(None)
         srv._serve()                              # must not raise
         assert srv._server is None
         assert not (sandbox / "state" / "control.sock").exists()
@@ -369,6 +367,12 @@ class TestMissingAudioFallback:
         spec = importlib.util.spec_from_file_location(
             "handsoff_no_audio", os.path.join(sys.argv[1], "handsoff.py"))
         mod = importlib.util.module_from_spec(spec)
+        # Name it BEFORE executing it: the app refuses to run unregistered,
+        # because an unnamed load cannot be told apart from a second copy. A
+        # local name is right here — this child wants ONE app, not the
+        # deployed identity — and the canonical name is claimed by the app
+        # itself as it loads.
+        sys.modules["handsoff_no_audio"] = mod
         spec.loader.exec_module(mod)
         audio = mod._audio
         report = {
@@ -414,20 +418,12 @@ class TestMissingAudioFallback:
     def test_partial_install_imports_and_fails_loudly(self, tmp_path):
         home = tmp_path / "home"
         home.mkdir()
-        env = dict(os.environ)
-        # a redirected HOME hides user site-packages (sounddevice + PySide6 live
-        # there), so keep the real one on PYTHONPATH: this test is about the
-        # missing core/audio.py, not about missing dependencies
-        env.update({
-            "HOME": str(home),
-            "XDG_STATE_HOME": str(home / ".local" / "state"),
-            "XDG_CONFIG_HOME": str(home / ".config"),
-            "PYTHONPATH": os.pathsep.join(
-                p for p in (str(HERE), _user_site(), env.get("PYTHONPATH", "")) if p),
-        })
-        proc = subprocess.run(
-            [sys.executable, "-c", self.DRIVER, str(HERE)],
-            env=env, capture_output=True, text=True, timeout=180, cwd=str(HERE),
+        # sandbox_env: the driver loads the monolith, and a redirected HOME
+        # hides user site-packages (sounddevice + PySide6 live there) — this
+        # test is about the missing core/audio.py, not about missing deps.
+        proc = run_driver(
+            ["-c", self.DRIVER, str(HERE)], home=home,
+            capture_output=True, text=True, timeout=180,
         )
         assert proc.returncode == 0, proc.stderr[-2000:]
         report = json.loads(proc.stdout.strip().splitlines()[-1])

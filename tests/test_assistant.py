@@ -56,6 +56,21 @@ def test_pomodoro_shutdown_is_idempotent():
     pomo.shutdown()
 
 
+class _FakeProc:
+    """A dbus-monitor stand-in: live until told to die, with empty stdout."""
+
+    stdout: tuple = ()
+
+    def __init__(self, *a, **k):
+        self.terminated = False
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+
 def _reader(spoken: list, **kw):
     from core.assistant import NotificationReader
     args = dict(spawn=lambda *a, **k: None, is_closed=lambda: False,
@@ -370,6 +385,82 @@ def test_reader_disable_joins_so_a_restart_cannot_orphan_it():
     assert reader.set_enabled(True) == "notification reader enabled"
     assert len(started) == 2, started        # exactly one new worker, no orphan
     reader.set_enabled(False)
+
+
+def test_two_overlapping_enables_start_exactly_one_reader():
+    """The reader owns ONE slot, and the registry hands it out.
+
+    "Is a worker already alive?" and "start one" were two separate reads with a
+    process spawn between them, so two overlapping enables both saw a free slot
+    and both spawned — two dbus-monitors, two loops, one of them holding the
+    other's stop event, every notification spoken twice. The spawn is held open
+    here so both callers are genuinely inside the window at once.
+    """
+    spoken: list = []
+    procs: list = []
+    started: list = []
+    entered = threading.Barrier(2, timeout=5)
+
+    def spawn(target, args=(), name="t"):
+        # The old shape assigned its thread attribute only AFTER this returned,
+        # so a second caller arriving here still saw a free slot.
+        time.sleep(0.2)
+        started.append(args)
+        return threading.current_thread()
+
+    reader = _reader(
+        spoken, spawn=spawn,
+        popen_factory=lambda *a, **k: procs.append(_FakeProc()) or procs[-1])
+    results: list = []
+    guard = threading.Lock()
+
+    def enable():
+        entered.wait(timeout=5)
+        out = reader.set_enabled(True)
+        with guard:
+            results.append(out)
+
+    threads = [threading.Thread(target=enable) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(procs) == 1, f"{len(procs)} readers were started"
+    assert len(started) == 1, f"{len(started)} worker threads were spawned"
+    assert sorted(results) == ["notification reader enabled",
+                               "notification reader is already on"], results
+
+
+def test_a_reader_that_will_not_die_keeps_its_slot():
+    """`off` must not free the slot while the worker is still running.
+
+    The slot is the only thing standing between a restart and two readers, so
+    a worker that outlived its join budget keeps it, and the reclaim predicate
+    frees it the moment it actually dies.
+    """
+    import types
+    reader = _reader([],
+                     spawn=lambda *a, **k: types.SimpleNamespace(
+                         is_alive=lambda: True),
+                     popen_factory=lambda *a, **k: _FakeProc())
+    assert reader.set_enabled(True) == "notification reader enabled"
+    assert reader.set_enabled(False) == "notification reader disabled"
+    assert reader.set_enabled(True) == "notification reader is already on", \
+        "the slot was freed while its worker was still alive"
+
+
+def test_a_reader_whose_worker_is_gone_is_restarted_not_refused():
+    """A corpse in the slot must not make "on" a lie: the reclaim predicate
+    takes the dead occupant back under the same lock that grants the slot."""
+    procs: list = []
+    reader = _reader([])
+    reader._popen_factory = lambda *a, **k: procs.append(_FakeProc()) or procs[-1]
+    reader.set_enabled(True)
+    assert reader._thread is None          # the default spawn starts nothing
+    assert reader.set_enabled(True) == "notification reader enabled", \
+        "a dead worker stranded its slot"
+    assert len(procs) == 2, "the dead monitor's slot was not reused"
+    assert procs[0].terminated is True, "the dead monitor was never disposed"
 
 
 def test_reader_gives_up_loudly_instead_of_claiming_to_be_on():

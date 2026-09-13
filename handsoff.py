@@ -141,6 +141,25 @@ CONTROL_SOCK = STATE_DIR / "control.sock"
 MIC_EVENTS_FILE = STATE_DIR / "mic-health.json"   # mic transitions + last briefing
 MIC_EVENTS_MAX = 200                              # hard cap on recorded transitions
 _MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
+# Cap refusals: the bubble turning real work away because a bounded registry
+# was full. Kept on disk as well as in the journal, so `--ptt doctor` can still
+# report it once the process that refused it is gone — the point is that a
+# refusal is never only in the model's reply.
+CAP_EVENTS_FILE = STATE_DIR / "cap-refusals.json"
+CAP_EVENTS_MAX = 50                   # bounded: a refusal storm must not grow state
+_CAP_EVENTS_LOCK = threading.Lock()
+# A refusal is also SPOKEN, because the journal and the durable record are both
+# things the user has to go and read. Rate-limited for the same reason the
+# reader has a per-app cooldown: the refusal path is retried by nature (a model
+# re-calling the same tool, a keybind being hammered) and an audio loop is worse
+# than the invisibility it replaces.
+CAP_ANNOUNCE_COOLDOWN = 60.0
+CAP_ANNOUNCE_MAX = 8                  # bounded: a registry name cannot grow it
+_CAP_EVENT_FIELDS = ("registry", "cap", "held", "reserved", "occupants",
+                     "at", "detail")
+_CAP_LABELS = {"job": "background-job", "watch-file": "file-watcher",
+               "watch-process": "process-watcher",
+               "diagnostic": "diagnostic-worker"}
 _SETTINGS_WRITE_LOCK = threading.Lock()
 SELF_MARKER = "# handsoff-self-marker: this line must be preserved across self-edits"
 
@@ -249,6 +268,76 @@ def _load_core_package():
 
 _core_settings = _load_core_package()
 from core import load_module as _load_module
+from core import registry as _core_registry
+from core import APP_MODULE_NAME as _canonical_app_name
+from core import claim_app_instance as _claim_app_instance
+
+
+# -------------------------------------------------------------------- identity
+# ONE canonical name, claimed by the app ITSELF, and the name is NOT this file's
+# business to invent: `core.APP_MODULE_NAME` owns it so the settings app, the
+# test harness and any embedder compare against the same string.
+#
+# Every loader used to give the module a name of its own — "handsoff_core" and a
+# bare "handsoff" alias in the tests, "handsoff_core" in the settings app,
+# "handsoff_core_gui" in the offscreen GUI driver, "handsoff_no_audio" in the
+# hardening driver — so "is the app already loaded in this process?" had no
+# answer anyone could ask, and each of those paths could exec a SECOND app: its
+# own CONFIG_DIR/STATE_DIR/SETTINGS, its own model mirrors, and a module body
+# that calls `core.audio.configure(...)` below, repointing the SHARED core.audio
+# at the copy that ran last.
+#
+# The claim happens HERE: as soon as `core` is importable, and BEFORE anything
+# this body can do to shared state (the earliest such call is
+# `_audio.configure(...)` far below). A second copy is therefore refused before
+# it can do damage rather than after it.
+def _claim_app_name() -> str:
+    """Register this running module under the one canonical name, or refuse.
+
+    Two refusals, for the two ways two apps could otherwise run silently:
+
+    * **Unnamed.** `module_from_spec(...)` + `exec_module(...)` without a
+      `sys.modules` entry executes the app into a namespace nothing can see,
+      which is indistinguishable from a duplicate — so the loader must name it
+      first. `core.load_app_module` is that implementation, and it is the one
+      every loader in this tree uses.
+    * **Second copy.** The canonical name already holds a DIFFERENT live module.
+      That is a second app; it is refused here, by name, instead of being
+      discovered later as a repointed `core.audio` or a diverged SETTINGS.
+    """
+    me = sys.modules.get(__name__)
+    if me is None or getattr(me, "__dict__", None) is not globals():
+        raise ImportError(
+            "handsoff: executing without a sys.modules registration "
+            f"({__name__!r}) — register the module under its spec name BEFORE "
+            "executing it (core.load_app_module does), because an unnamed load "
+            "cannot be told apart from a second copy of the app")
+    # Two records of one fact: the out-of-band instance in `core` (which
+    # survives a test popping the registration) and the canonical name in
+    # `sys.modules` (which is what every loader looks up). Either one being a
+    # different module is a second app, and this is where it is refused.
+    _claim_app_instance(me)
+    holder = sys.modules.get(_canonical_app_name)
+    if holder is not None and holder is not me:
+        raise ImportError(
+            "handsoff: refusing to run a SECOND copy of the app in this "
+            f"process — {_canonical_app_name} already holds "
+            f"{getattr(holder, '__file__', '?')}; reuse it (core.app_module()) "
+            "instead of loading another")
+    sys.modules[_canonical_app_name] = me
+    return _canonical_app_name
+
+
+#: The name this module is registered under (same string as
+#: `core.APP_MODULE_NAME`, published here for callers that reach the app
+#: through `H.*`).
+APP_MODULE_NAME = _claim_app_name()
+
+# Admission control for every bounded registry and every expiring offer. The
+# classes are re-exported here because tests and the settings app reach them
+# through H.* — the same seam as every other extracted core module.
+BoundedRegistry = _core_registry.BoundedRegistry
+Offer = _core_registry.Offer
 
 # Phase 4c compatibility facade: core.tools owns the extracted runtime; this
 # host supplies the existing globals and callbacks so historical monkeypatch
@@ -689,6 +778,8 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         systemd_unit_file=SYSTEMD_UNIT_FILE,
         control_sock=CONTROL_SOCK,
         crash_log=CRASH_LOG,
+        cap_refusal_note=_cap_refusal_note,
+        cap_refusals=_cap_refusal_summary,
         remote_ollama_allowed=_ollama_remote_opted_in,
         remote_ollama_optin_source=_remote_ollama_optin_source,
         shutil=shutil,
@@ -932,7 +1023,7 @@ def _secure_runtime_files() -> bool:
     earlier one is bad, and the AND of the results is returned."""
     paths = [SETTINGS_FILE, HISTORY_FILE, MEMORY_FILE, CRASH_LOG,
              PENDING_FILE, LOCK_FILE, LOG_FILE, CONTROL_SOCK, MIC_EVENTS_FILE,
-             REMINDERS_FILE]
+             CAP_EVENTS_FILE, REMINDERS_FILE]
     # Backups hold the SAME secrets as the files they copy (a transcript, the
     # settings), and `shutil.copy2` inherits the SOURCE's mode at copy time —
     # so any sidecar written while the source was still loose stays loose
@@ -2469,6 +2560,92 @@ def _recent_mic_problems(since: float = 0.0) -> str:
             f"({_fmt_dur(time.time() - last_t)} ago)")
 
 
+def _cap_label(name) -> str:
+    """Human name for a registry in the refusal record."""
+    return _CAP_LABELS.get(str(name or ""), str(name or "unknown"))
+
+
+def _record_cap_refusal(report: dict) -> None:
+    """Append one cap refusal to the state file (best effort).
+
+    Best effort for the same reason the mic recorder is: a diagnostic must
+    never be able to fail the path it describes, and this one runs inside a
+    refusal that has already told the model nothing was created.
+    """
+    try:
+        entry = {k: report.get(k) for k in _CAP_EVENT_FIELDS}
+        with _CAP_EVENTS_LOCK:
+            doc = _load_cap_refusals()
+            events = doc.get("events")
+            events = list(events) if isinstance(events, list) else []
+            events.append(entry)
+            doc["events"] = events[-CAP_EVENTS_MAX:]
+            doc["count"] = int(doc.get("count") or 0) + 1
+            by = doc.get("by_registry")
+            by = dict(by) if isinstance(by, dict) else {}
+            name = str(entry.get("registry") or "?")
+            by[name] = int(by.get(name) or 0) + 1
+            doc["by_registry"] = by
+            _atomic_private_write(CAP_EVENTS_FILE, json.dumps(doc))
+    except Exception:
+        log.exception("cannot record cap refusal")
+
+
+def _load_cap_refusals() -> dict:
+    """Read the cap-refusal state file; corruption or absence -> {}."""
+    try:
+        doc = json.loads(CAP_EVENTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _cap_refusal_summary() -> dict:
+    """Structured view of past refusals: totals per cap + the most recent.
+
+    `count` is cumulative; `events` in the file is a bounded ring, so the
+    totals survive refusals the ring has since dropped.
+    """
+    doc = _load_cap_refusals()
+    events = [e for e in (doc.get("events") or []) if isinstance(e, dict)]
+    by = doc.get("by_registry") if isinstance(doc.get("by_registry"), dict) else {}
+    return {
+        "count": int(doc.get("count") or 0),
+        "by_registry": {str(k): int(v or 0) for k, v in by.items()},
+        "last": events[-1] if events else None,
+    }
+
+
+def _cap_refusal_note(registry: str = "") -> str:
+    """One human line about refusals at a cap; '' when there have been none.
+
+    `registry` narrows it to one cap ('job'); empty covers every cap. The
+    journal, job_status and the doctor all render from here, so three surfaces
+    cannot end up describing the same refusals differently.
+    """
+    summary = _cap_refusal_summary()
+    if not summary["count"]:
+        return ""
+    last = summary["last"] or {}
+    at = last.get("at")
+    age = ""
+    if isinstance(at, (int, float)) and at > 0:
+        age = f" ({_fmt_dur(max(0.0, time.time() - at))} ago)"
+    detail = str(last.get("detail") or "a request")
+    if registry:
+        total = int(summary["by_registry"].get(registry) or 0)
+        if not total:
+            return ""
+        return (f"the {_cap_label(registry)} cap has refused {total} request(s) "
+                f"— most recent {detail}{age} with "
+                f"{last.get('held', '?')}/{last.get('cap', '?')} held. A "
+                f"refused call starts nothing.")
+    parts = ", ".join(f"{n}x {_cap_label(k)}"
+                      for k, n in sorted(summary["by_registry"].items()))
+    return (f"cap refusals: {summary['count']} recorded ({parts}); most recent "
+            f"{_cap_label(last.get('registry'))} — {detail}{age}")
+
+
 def _mark_briefing_delivered() -> None:
     """Stamp the mic-health state file with the briefing time, so the next
     briefing reports only problems since then (best effort)."""
@@ -2548,10 +2725,15 @@ def _take_missed_reminders() -> list[dict]:
 
 
 # -- snooze: while this offer is live, a bare "snooze" re-arms the just-fired
-# one-off reminder without any LLM round-trip
-_snooze_offer: dict = {}        # {"name": str, "until": time.monotonic()}
-_SNOOZE_LOCK = threading.Lock()
-_kill_offer: dict = {}          # pending kill confirmation: {"pid", "name", "until"}
+# one-off reminder without any LLM round-trip.
+#
+# Both offers are core.registry.Offer objects, which own the arm/read/consume
+# sequence AND the lock behind it. They used to be bare dicts armed with
+# clear()+update(): two steps, and a reader landing between them saw an EMPTY
+# offer for one that exists (or paired one call's payload with another's
+# deadline). There is deliberately no lock here to reach for any more.
+_snooze_offer = _core_registry.Offer("snooze")
+_kill_offer = _core_registry.Offer("kill")
 SNOOZE_WINDOW_S = 90.0
 
 
@@ -3339,7 +3521,10 @@ class Assistant(QObject):
             on_notification=self._set_notification_reader,
             on_announce=self._announce_now,
             on_pomodoro=self._set_pomodoro,
+            on_cap_refusal=self.announce_cap_refusal,
         )
+        # (the refusal announcement shares this channel with job completions,
+        # reminders and hands-free confirmations — one serializer, no overlap)
         if bool(SETTINGS.get("notification_reader", False)):
             # Opt-in persistence means the reader should resume after restart;
             # a missing dbus-monitor simply reports an error and leaves it off.
@@ -3362,6 +3547,10 @@ class Assistant(QObject):
         # crossing, then re-arm only after usage falls below the threshold.
         self._resource_alerted = {"ram": False, "vram": False}
         self._resource_last = {"ram": None, "vram": None}
+        # {registry: (last spoken at, cumulative refusals then)}. Per-registry so
+        # a full job cap and a wedged diagnostic do not silence each other, and
+        # per-INSTANCE so it cannot outlive the bubble that did the refusing.
+        self._cap_spoken: dict[str, tuple[float, int]] = {}
         self._world_last_announce = 0.0  # monotonic: last proactive warning
         self._hardware_note = ""       # 1-2 line change note for the next turn
         self._hardware_last = {}       # change-detection state (in-memory only)
@@ -3645,6 +3834,65 @@ class Assistant(QObject):
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 log.debug("nvidia-smi telemetry unavailable", exc_info=True)
         return {"ram": ram, "vram": vram}
+
+    def announce_cap_refusal(self, report: dict, detail: str = "") -> None:
+        """Say out loud that a cap turned work away — and not once per refusal.
+
+        A refusal already reaches the journal and the durable record, but both
+        are things the user has to go and read. The point of a cap turning work
+        away is that something was ASKED for and did not happen, so the bubble
+        says so on the channel job completions already use instead of waiting to
+        be asked (core/tools._announce_job speaks through the same hook).
+
+        Rate-limited, because the refusal path is retried by nature: a model
+        re-calling `start_command`, a health keybind being hammered. An audio
+        loop is worse than the invisibility this replaces. The first refusal at
+        a cap speaks in full; after that a cap speaks again only once the
+        cooldown has passed, and then says how many more requests were turned
+        away in the meantime, so a storm is legible without being chatty.
+
+        Never raises: it runs inside a refusal that has already told the model
+        nothing was created, and announcing must never be a reason a refusal
+        takes a different path.
+        """
+        try:
+            report = report or {}
+            registry = str(report.get("registry") or "")
+            if not registry or self._is_closed():
+                return
+            table = getattr(self, "_cap_spoken", None)
+            if table is None:
+                table = self._cap_spoken = {}
+            last, spoken_at = table.get(registry, (0.0, 0))
+            if last and not _announce_ok(last, CAP_ANNOUNCE_COOLDOWN):
+                # Inside the cooldown: still journalled and still durable, just
+                # not repeated out loud.
+                log.info("cap refusal not repeated (%s within %.0fs)",
+                         registry, CAP_ANNOUNCE_COOLDOWN)
+                return
+            cap = int(report.get("cap") or 0)
+            held = int(report.get("held") or 0)
+            seen = int(report.get("count") or 0)
+            label = _cap_label(registry)
+            where = f" ({held} of {cap})" if cap else ""
+            if last:
+                missed = max(1, seen - spoken_at)
+                text = (f"I still can't do that: the {label} limit is full"
+                        f"{where} — {missed} more request"
+                        f"{'' if missed == 1 else 's'} turned away since I last"
+                        f" said so.")
+            else:
+                text = (f"I couldn't do that: the {label} limit is full"
+                        f"{where}. Nothing was started.")
+            table[registry] = (time.monotonic(), seen)
+            if len(table) > CAP_ANNOUNCE_MAX:
+                for stale in sorted(table, key=lambda k: table[k][0] \
+                                    )[0:len(table) - CAP_ANNOUNCE_MAX]:
+                    table.pop(stale, None)
+            log.warning("cap refusal announced: %s [%s]", text, detail or "-")
+            self._announce_now(text)
+        except Exception:
+            log.exception("cap refusal announcement failed")
 
     def _resource_tick(self) -> None:
         """Announce RAM/VRAM threshold *crossings* once, and re-arm after
@@ -3976,10 +4224,7 @@ class Assistant(QObject):
         if not repeat_hours:
             # one-off: open the snooze window — a bare "snooze" within 90 s
             # re-arms it from now, no brain round-trip
-            with _SNOOZE_LOCK:
-                _snooze_offer.clear()
-                _snooze_offer.update(name=name,
-                                     until=time.monotonic() + SNOOZE_WINDOW_S)
+            _snooze_offer.arm(SNOOZE_WINDOW_S, name=name)
             log.info("snooze window open for %.0fs", SNOOZE_WINDOW_S)
 
     # -- crash report & recovery -------------------------------------------------
@@ -4943,11 +5188,7 @@ class Assistant(QObject):
         Runs BEFORE the wake-word gate: a snooze is a direct answer to our own
         announcement and must not require the wake name. Returns True when the
         utterance was consumed."""
-        with _SNOOZE_LOCK:
-            offer = dict(_snooze_offer) if _snooze_offer else None
-            if offer and time.monotonic() >= offer["until"]:
-                _snooze_offer.clear()
-                offer = None
+        offer, _expired = _snooze_offer.state()
         if offer is None:
             return False
         m = re.fullmatch(
@@ -4965,8 +5206,7 @@ class Assistant(QObject):
         out, _err = self._tools.execute(
             "snooze_reminder", {"name": offer["name"], "minutes": minutes})
         if not out.startswith(("ERROR", "REFUSED")):
-            with _SNOOZE_LOCK:
-                _snooze_offer.clear()
+            _snooze_offer.clear()
         self._set(gen, IDLE)
         threading.Thread(target=lambda: self._speak(out, gen, cancel),
                          name="snooze-tts", daemon=True).start()
@@ -6560,16 +6800,39 @@ class BubbleWidget(QWidget):
         lv = min(1.0, max(0.0, float(level)))
         R = radius * 0.9
         p.setPen(Qt.NoPen)
+        # A broad state-coloured halo, the same answer the orb uses for the same
+        # problem (a dark body on a dark wallpaper). Without it this design's
+        # only state-coloured pixels were the ~2px streaks and the hairline rim:
+        # swapping the state colour changed EIGHT pixels by a visible step out
+        # of 45796, so the Appearance colour picker was, in effect, disabled on
+        # this design while working on every other one.
+        glow0 = float(f.get("glow", 1.0))
+        halo = QRadialGradient(QPointF(cx, cy), R + GLOW_PAD)
+        hc = QColor(color)
+        hc.setAlpha(int(min(255.0, (96 + 74 * lv) * glow0)))
+        halo.setColorAt(R / (R + GLOW_PAD), hc)
+        hc.setAlpha(0)
+        halo.setColorAt(1.0, hc)
+        p.setBrush(QBrush(halo))
+        p.drawEllipse(QPointF(cx, cy), R + GLOW_PAD, R + GLOW_PAD)
         p.setBrush(QBrush(QColor(3, 3, 5)))
         p.drawEllipse(QPointF(cx, cy), R, R)
         # the disc itself is deliberately black, so the accent has only these
         # thin elements to act on: without this the slider measured 16 changed
         # pixels out of 45796 — i.e. nothing. `glow` is 1.0 at the default.
+        #
+        # The alpha FLOORS are raised for the same reason sauron's and
+        # pikachu's are: at rest this design's state colour measured **10**
+        # pixels above a visible step out of 45796, because the streaks were
+        # drawn at 22/255 behind a black disc and the rim at 40/255. Picking a
+        # colour therefore looked like it did nothing on the one design with no
+        # body colour to carry it — measured against the least-visible design
+        # in the set (equalizer, 804 px) as the bar.
         glow = float(f.get("glow", 1.0))
         # infalling spiral streaks
         for k, (rr, spd, span) in enumerate(((0.80, 1.2, 1.2), (0.66, -0.9, 1.0), (0.52, 1.6, 0.8))):
             c = QColor(color).lighter(160)
-            c.setAlpha(int(min(255.0, (22 + 45 * energy + 80 * lv) * glow)))
+            c.setAlpha(int(min(255.0, (86 + 54 * energy + 80 * lv) * glow)))
             self._arc(p, cx, cy, R * rr, t * 2 * math.pi * spd * 0.25 + k * 2.1, span, c,
                       max(1.0, R * 0.03 * (1.0 + 0.5 * lv)))
         # spiralling infall sparks, sweeping inward faster the louder it is
@@ -6578,7 +6841,7 @@ class BubbleWidget(QWidget):
             rr = R * (0.88 - ph)
             a = i * 2.4 + t * (1.0 + i * 0.1)
             s = QColor(color).lighter(170)
-            s.setAlpha(int(min(255.0, (1.0 - ph) * (60 + 80 * energy + 90 * lv) * glow)))
+            s.setAlpha(int(min(255.0, (1.0 - ph) * (110 + 80 * energy + 90 * lv) * glow)))
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(s))
             p.drawEllipse(QPointF(cx + math.cos(a) * rr, cy - math.sin(a) * rr), 1.6, 1.6)
@@ -6586,7 +6849,7 @@ class BubbleWidget(QWidget):
         # runs faster as the level rises (13 Hz at rest, ~24 Hz at full voice)
         flicker = 0.7 + 0.3 * math.sin(t * (13.0 + 11.0 * lv))
         rim_c = QColor(color).lighter(180)
-        rim_c.setAlpha(int(min(255.0, (40 + 15 * math.sin(t * 0.8)
+        rim_c.setAlpha(int(min(255.0, (120 + 15 * math.sin(t * 0.8)
                                         + 190 * min(1.0, level * flicker + energy * 0.15)) * glow)))
         p.setBrush(Qt.NoBrush)
         p.setPen(QPen(rim_c, max(1.0, R * (0.02 + 0.10 * level * flicker) * (0.6 + 0.4 * glow)),
@@ -6977,8 +7240,27 @@ class BubbleWidget(QWidget):
         else:
             notify(f"handsoff: settings app not installed at {SETTINGS_APP}")
 
-    def showEvent(self, _e) -> None:
+    def _apply_mask(self) -> None:
+        """Re-shape the window to its CURRENT rect — a mask does not resize.
+
+        A QRegion mask is in widget coordinates and Qt keeps it exactly as it
+        was when the widget is resized, so the mask set at show time stayed the
+        size the bubble was born at. Every live size change then drew the new,
+        scaled design through the OLD aperture: growing it clipped the design to
+        the previous circle, and swapping shapes while big showed each shape's
+        scaled geometry inside a smaller stale one — the "bigger breaks it, and
+        then the shapes don't match" report. Measured: mask 128x128 while the
+        widget was 192x192.
+        """
         self.setMask(QRegion(self.rect(), QRegion.Ellipse))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt spelling
+        super().resizeEvent(event)
+        self._apply_mask()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt spelling
+        super().showEvent(event)
+        self._apply_mask()
 
     def closeEvent(self, _e) -> None:
         self._assistant.shutdown()
@@ -7025,11 +7307,21 @@ class ControlServer:
     startup and making a failed launch look like a live bubble.
     """
 
+    # The accept loop is a SINGLETON slot in the shared registry, not a plain
+    # attribute. "Is one already running?" then "start one" was the last
+    # hand-rolled check-then-act in the project: two overlapping start() calls
+    # both saw no live thread and both spawned an accept loop, so one path had
+    # two servers — the loser's bind replacing the winner's socket, leaving a
+    # loop accepting on an inode no client could reach. The registry hands the
+    # slot out under one lock, with a reclaim predicate for a loop that DIED,
+    # so "the old one is gone" and "may I have its slot?" are one decision.
+    ACCEPT_SLOT = "accept"
+
     def __init__(self, assistant: "Assistant") -> None:
         self._assistant = assistant
         self._stop = threading.Event()
         self._server: socket.socket | None = None
-        self._thread: threading.Thread | None = None
+        self._runs = BoundedRegistry("control", 1)
         # Latch for the orphaned-path reports so a path that cannot be
         # reclaimed cannot fill the journal with one line per idle second.
         self._orphan_reported = False
@@ -7043,18 +7335,104 @@ class ControlServer:
         # touch OUR path, or a server left running from earlier would create a
         # socket at whatever path the global now names (measured: it did).
         self._bound_path: str | None = None
-        # The last slow diagnostic worker (health/doctor). A timed-out worker
+        # The slow diagnostic workers (health/doctor). A timed-out worker
         # cannot be cancelled — it is blocked in an Ollama or nvidia-smi call —
-        # so without this the accept loop would start a fresh one per request
-        # and pile them up against a wedged backend.
-        self._diag_worker: threading.Thread | None = None
+        # so without a cap the accept loop would start a fresh one per request
+        # and pile them up against a wedged backend. One slot, handed out by
+        # the registry: "is the previous worker alive?" and "may I start one?"
+        # used to be two reads with a thread spawn between them.
+        self._diag = BoundedRegistry("diagnostic", 1)
+
+    def _diagnostic_call(self, fn, timeout_s: float):
+        """Run slow diagnostics off the accept thread: the accept loop must stay
+        responsive (1s accept timeout) even when Ollama/nvidia-smi wedge.
+
+        At most one such worker exists at a time. A timed-out worker keeps
+        running (it is blocked in the backend call; nothing here can cancel
+        it), so spawning another per request is how repeated `health`/`doctor`
+        against a wedged Ollama piles up threads that never return. A second
+        request is refused fast and by name instead of adding to the pile —
+        through the same registry that owns every other cap, so the refusal is
+        counted, logged in the shared wording, and durable.
+        """
+        slot = self._diag.reserve("diagnostic",
+                                  reclaim=lambda t: not t.is_alive())
+        if slot is None:
+            detail = "previous diagnostic still running"
+            log.warning("cap refusal: %s", self._diag.refusal_line(detail))
+            try:
+                _record_cap_refusal({**(self._diag.refusal_report() or {}),
+                                     "detail": detail})
+            except Exception:
+                log.exception("cap-refusal recorder failed")
+            # ...and say it: a refusal the user asked for by pressing the
+            # health keybind must not be discoverable only in the journal.
+            try:
+                self._assistant.announce_cap_refusal(
+                    self._diag.refusal_report() or {}, detail)
+            except Exception:
+                log.exception("cap-refusal announcement failed")
+            raise TimeoutError(
+                "a previous diagnostic is still running "
+                "(the backend is not answering)")
+        box: dict = {}
+
+        def _run() -> None:
+            try:
+                box["out"] = fn()
+            except Exception as e:  # noqa: BLE001
+                box["err"] = e
+
+        # Start INSIDE the reservation and commit after, so a worker that
+        # cannot be started gives the slot back instead of occupying it with a
+        # thread that does not exist.
+        with slot:
+            worker = threading.Thread(target=_run, daemon=True,
+                                      name="diag-worker")
+            worker.start()
+            slot.commit(worker)
+        worker.join(timeout_s)
+        if worker.is_alive():
+            raise TimeoutError(f"timed out after {timeout_s:.1f}s")
+        if "err" in box:
+            raise box["err"]
+        return box.get("out")
+
+    @property
+    def _thread(self):
+        """The accept thread, or ``None``: a view onto the registered slot.
+
+        Kept as a property because the slot's occupant IS the thread — the
+        reclaim predicate asks it whether it is still alive — and because
+        stop() must never be able to join a thread the registry does not know
+        about.
+        """
+        return self._runs.get(self.ACCEPT_SLOT)
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
+        """Start the accept loop, idempotently, through the registry slot.
+
+        A repeated start is the documented no-op it always was: the occupant
+        is alive, the reservation is refused, and nothing is spawned. That is
+        deliberately NOT reported as a cap refusal worth shouting about —
+        nothing the user asked for was turned away — but the registry counts
+        it all the same.
+        """
+        slot = self._runs.reserve(
+            self.ACCEPT_SLOT, reclaim=lambda t: not t.is_alive())
+        if slot is None:
+            log.info("control socket already accepting")
             return
+        # A dead accept loop the predicate just reclaimed needs no disposal:
+        # _serve's finally already closed its socket and removed the path. The
+        # stop event is cleared only on the path that actually starts a loop,
+        # so a refused start cannot re-arm a server that is shutting down.
         self._stop.clear()
-        self._thread = threading.Thread(target=self._serve, name="control", daemon=True)
-        self._thread.start()
+        with slot:
+            thread = threading.Thread(target=self._serve, name="control",
+                                      daemon=True)
+            thread.start()
+            slot.commit(thread)
 
     def stop(self) -> None:
         """Stop the accept loop and remove only our owner-owned socket."""
@@ -7068,6 +7446,12 @@ class ControlServer:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2.0)
+        # Free the slot only once the loop is actually gone. A thread that
+        # outlived its join budget keeps the slot, so a restart cannot get a
+        # second acceptor beside the old one; the reclaim predicate frees it
+        # the moment it really dies.
+        if thread is not None and not thread.is_alive():
+            self._runs.release(self.ACCEPT_SLOT)
         try:
             _remove_stale_control_socket()
         except OSError:
@@ -7162,41 +7546,9 @@ class ControlServer:
                         continue
 
                     def _with_timeout(fn, timeout_s: float):
-                        """Run slow diagnostics off the accept thread: the
-                        accept loop must stay responsive (1s accept timeout)
-                        even when Ollama/nvidia-smi wedge.
-
-                        At most one such worker exists at a time. A timed-out
-                        worker keeps running (it is blocked in the backend
-                        call; nothing here can cancel it), so spawning another
-                        per request is how repeated `health`/`doctor` against a
-                        wedged Ollama piles up threads that never return. A
-                        second request is refused fast and by name instead of
-                        adding to the pile.
-                        """
-                        prev = self._diag_worker
-                        if prev is not None and prev.is_alive():
-                            raise TimeoutError(
-                                "a previous diagnostic is still running "
-                                "(the backend is not answering)")
-                        box: dict = {}
-
-                        def _run() -> None:
-                            try:
-                                box["out"] = fn()
-                            except Exception as e:  # noqa: BLE001
-                                box["err"] = e
-
-                        t = threading.Thread(target=_run, daemon=True,
-                                             name="diag-worker")
-                        self._diag_worker = t
-                        t.start()
-                        t.join(timeout_s)
-                        if t.is_alive():
-                            raise TimeoutError(f"timed out after {timeout_s:.1f}s")
-                        if "err" in box:
-                            raise box["err"]
-                        return box.get("out")
+                        """Slow diagnostics, off the accept thread (see
+                        ControlServer._diagnostic_call)."""
+                        return self._diagnostic_call(fn, timeout_s)
 
                     if action in PTT_ACTIONS:
                         if action == "status":
@@ -7586,6 +7938,14 @@ def main() -> int:
             lock.close()
         except OSError:
             pass
+
+
+# The app is WHOLE: every name above exists. The canonical registration was
+# published at the top (`_claim_app_name`) so that a second copy is refused
+# before it can touch shared state, and this flag is what tells a loader the
+# module it found is finished rather than still executing its own body — see
+# `core.app_module`, which hands out only a ready app.
+__app_ready__ = True
 
 
 if __name__ == "__main__":

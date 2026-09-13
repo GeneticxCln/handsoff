@@ -16,6 +16,26 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 
+# ---------------------------------------------------------------- app identity
+# The ONE name the application registers ITSELF under, and the only name any
+# loader in the tree should have to know. It lives here, beside the other
+# module-identity rules (`_origin_ok`, `load_module`), because the app, the
+# settings app and every test harness compare against the same string instead of
+# each repeating one — and repeated names are how "is the app already loaded?"
+# stopped having an answer, so each loader exec'd its own copy:
+#
+#   conftest            -> "handsoff_core" + a bare "handsoff" alias
+#   handsoff-settings   -> "handsoff_core" (its own spec load)
+#   offscreen GUI driver-> "handsoff_core_gui"
+#   hardening driver    -> "handsoff_no_audio"
+#
+# Two copies in one process is not two views of one app: it is two apps, each
+# with its own CONFIG_DIR/STATE_DIR/SETTINGS and model mirrors, and each module
+# body calls `core.audio.configure(...)` — which repoints the SHARED core.audio
+# at whichever copy ran last. `handsoff.py` claims this name before it can do
+# that, and refuses to run when the name is already held by a live module.
+APP_MODULE_NAME = "handsoff_core"
+
 
 def _repo_root() -> Path | None:
     """The source checkout dir, if discoverable (explicit env or a handsoff.py
@@ -68,6 +88,118 @@ def _origin_ok(mod: object) -> bool:
     except OSError:
         return False
     return parent in _allowed_dirs()
+
+
+#: The app module running in THIS process, recorded out of band from
+#: `sys.modules`. A registration can be popped — the suite's extraction tests do
+#: it deliberately — and the app is still running; the lazy loader that exec'd a
+#: second bubble got in through exactly that window. Two records of one fact,
+#: and either one is enough to refuse a duplicate.
+_APP_INSTANCE = None
+
+
+def app_instance():
+    """The app module recorded for this process, ready or not, or None."""
+    return _APP_INSTANCE
+
+
+def claim_app_instance(mod):
+    """Record `mod` as this process's app, refusing a DIFFERENT live one.
+
+    Called by the app itself as it loads. The refusal is the guarantee the
+    project keeps re-deriving: two copies in one process are two apps — separate
+    SETTINGS, separate model mirrors, and a module body each that calls
+    `core.audio.configure(...)`, repointing the SHARED core.audio at whichever
+    copy ran last.
+    """
+    global _APP_INSTANCE
+    existing = _APP_INSTANCE
+    if existing is not None and existing is not mod:
+        raise ImportError(
+            "handsoff: refusing to run a SECOND copy of the app in this "
+            f"process — the app is already running from "
+            f"{getattr(existing, '__file__', '?')}; reuse it "
+            "(core.app_instance() / core.app_module()) instead of loading "
+            "another")
+    _APP_INSTANCE = mod
+    return mod
+
+
+def app_module():
+    """The FINISHED app module for this process, or None.
+
+    Anything that needs the app asks here instead of exec'ing the file. A module
+    that is still executing its own body is deliberately not returned: a
+    half-built app is not a second view of one app, it is a way to read
+    `SETTINGS` before the module that owns it has one.
+    """
+    for mod in (_APP_INSTANCE, sys.modules.get(APP_MODULE_NAME)):
+        if mod is None or not _origin_ok(mod):
+            continue
+        if getattr(mod, "__app_ready__", False):
+            return mod
+    return None
+
+
+def load_app_module(candidates):
+    """Return the process's ONE app module, exec'ing a candidate at most once.
+
+    `candidates` are tried in order and only existing files are considered.
+    The concrete guarantees, because each one is a way the old loaders could
+    produce a second app:
+
+    * **An app that is already running is returned, never re-exec'd.** This is
+      the whole point: the running copy owns CONFIG_DIR/STATE_DIR/SETTINGS and
+      the model mirrors, and a second exec is a second app.
+    * **The slot is claimed BEFORE the module executes.** The module therefore
+      finds itself in `sys.modules` — `handsoff.py` refuses to run unregistered,
+      because an unnamed load cannot be told apart from a duplicate — and two
+      racing loaders admit exactly one copy (`setdefault`), the loser receiving
+      the winner's module without executing anything.
+    * **A load that raises gives the slot back**, so a failed exec cannot leave
+      a half-initialised app behind for the next caller to find.
+    * **A foreign occupant is refused by name**, using the same origin rule as
+      `load_module`, so a module planted under the canonical name can never
+      satisfy a loader.
+    """
+    ready = app_module()
+    if ready is not None:
+        return ready
+    running = _APP_INSTANCE if _APP_INSTANCE is not None \
+        else sys.modules.get(APP_MODULE_NAME)
+    if running is not None:
+        if not _origin_ok(running):
+            raise ImportError(
+                f"handsoff core: refusing to reuse a foreign "
+                f"{APP_MODULE_NAME} ({getattr(running, '__file__', '?')})")
+        raise ImportError(
+            f"handsoff core: the app is still initialising "
+            f"({getattr(running, '__file__', '?')}) — it refuses to load twice")
+    for cand in candidates:
+        try:
+            cand = Path(cand)
+            if not cand.is_file():
+                continue
+        except (OSError, TypeError, ValueError):
+            continue
+        spec = importlib.util.spec_from_file_location(APP_MODULE_NAME, cand)
+        if spec is None or spec.loader is None:
+            continue
+        fresh = importlib.util.module_from_spec(spec)
+        winner = sys.modules.setdefault(APP_MODULE_NAME, fresh)
+        if winner is not fresh:
+            return winner              # another loader admitted first
+        try:
+            spec.loader.exec_module(fresh)
+        except BaseException:
+            if sys.modules.get(APP_MODULE_NAME) is fresh:
+                sys.modules.pop(APP_MODULE_NAME, None)
+            raise
+        return fresh
+    raise ImportError(
+        "handsoff core: cannot find the application — expected handsoff.py "
+        "beside this package, in the checkout root or in ~/.local/bin "
+        f"(tried {[str(c) for c in candidates]})")
 
 
 def load_module(mod_name: str):

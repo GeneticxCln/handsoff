@@ -84,6 +84,7 @@ class DoctorDeps:
         "sys_version_info", "restart_script", "systemd_unit_file",
         "control_sock", "crash_log", "remote_ollama_allowed",
         "remote_ollama_optin_source",
+        "cap_refusal_note", "cap_refusals",
         "shutil", "sounddevice", "log",
     )
 
@@ -115,6 +116,11 @@ class DoctorDeps:
         self.crash_log: Path = Path("/nonexistent/crash.log")
         self.remote_ollama_allowed: Callable[[], bool] | None = None
         self.remote_ollama_optin_source: Callable[[], str] | None = None
+        # Cap refusals: how often a bounded registry has turned real work away.
+        # A host that does not record them reports none, which is also the
+        # truthful answer for a host that has no registries to bound.
+        self.cap_refusal_note: Callable[[], str] = lambda: ""
+        self.cap_refusals: Callable[[], dict] = lambda: {}
         self.shutil = shutil
         self.sounddevice = None
         self.log = log
@@ -393,6 +399,22 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append("control socket: not created yet (bubble not running?)")
     except OSError as e:
         lines.append(f"control socket: lstat failed ({e})")
+
+    # Did a cap ever turn real work away? That refusal is the one in-the-wild
+    # signal that the bubble met its own limits, and it used to live only in the
+    # model's reply — invisible to anyone reading the journal or the state, and
+    # the overshoot this module's sibling bug was ABOUT was found by reading the
+    # source instead. Reported last, and reported even when there is nothing to
+    # report, so "none" is a positive finding rather than a missing line.
+    note = ""
+    cap_note = getattr(deps, "cap_refusal_note", None)
+    if cap_note is not None:
+        try:
+            note = str(cap_note() or "")
+        except Exception:
+            note = ""
+    lines.append(note or
+                 "cap refusals: none recorded — no cap has turned work away")
     return lines
 
 
@@ -418,6 +440,17 @@ def doctor_json() -> dict:
         except OSError:
             pass
     out["restart_script"] = deps.restart_script.exists()
+    try:
+        refusals = deps.cap_refusals() or {}
+    except Exception:
+        refusals = {}
+    if not isinstance(refusals, dict):
+        refusals = {}
+    out["cap_refusals"] = {
+        "count": refusals.get("count", 0),
+        "by_registry": refusals.get("by_registry", {}),
+        "last": refusals.get("last"),
+    }
     out["systemd_unit"] = {
         "present": deps.systemd_unit_file.exists(),
         "auto_restart": False,

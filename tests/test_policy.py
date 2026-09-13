@@ -4,7 +4,8 @@ from __future__ import annotations
 import base64
 import importlib.util
 import inspect
-from collections import deque
+import itertools
+from collections import Counter, deque
 import threading
 import io
 import json
@@ -20,28 +21,29 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site
+from conftest import HERE as ROOT, _load, _user_site, pin_offer, run_driver
 
 
 def test_core_tools_is_importable_without_application_module():
-    """The extracted policy/tool surface is independently importable."""
-    import subprocess, sys
+    """The extracted policy/tool surface is independently importable.
+
+    `run_driver`: even this child resolves `core.tools`' own CONFIG_DIR/
+    STATE_DIR from HOME at import, so it has to run in the sandbox like every
+    other load — the suite must never resolve the developer's real config.
+    """
     code = ("from core import tools; assert tools.ToolBelt and "
             "tools.DecisionPolicy and tools.tool; "
             "assert 'handsoff' not in tools.__dict__")
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                            text=True, cwd=HERE)
+    result = run_driver(["-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
 
 def test_core_tools_policy_boundary_is_deny_before_dispatch():
-    import subprocess, sys
     code = ("from core import tools; p=tools.DecisionPolicy({"
             "'command_policy': {'run_command': 'DENY'}}); "
             "assert p.classify('run_command') == 'DENY' and "
             "p.is_denied('run_command')")
-    result = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                            text=True, cwd=HERE)
+    result = run_driver(["-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
@@ -160,7 +162,7 @@ class TestToolBelt:
         out, err = belt.execute("edit_file", {
             "path": str(fake_self), "content": "print('no marker')\n"})
         assert err and out.startswith("REFUSED") and "marker" in out
-        assert belt._pending_confirm is None
+        assert not belt._pending_confirm
 
     def test_permission_switch_disables_tool(self, tb, H):
         belt, _ = tb
@@ -440,7 +442,7 @@ class TestWhitelistWidening:
     def test_cargo_requires_confirmation_when_model_dispatches(self, H, monkeypatch):
         tb = self._tb(H, monkeypatch)
         tb._tool_times = deque()
-        tb._pending_confirm = None
+        tb._pending_confirm = H.Offer("confirm")
         tb._confirm_running = None
         tb._user_turn_marker = 0
         tb._policy = H.DecisionPolicy({"command_policy": {}})
@@ -502,7 +504,9 @@ class TestKillProcess:
         tb = H.ToolBelt.__new__(H.ToolBelt)
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
         tb._tool_times = deque()          # execute() rate-limit deque
-        H._kill_offer.clear()
+        # One offer on every path `_dep()` can take — including a worker
+        # thread's, which resolves `_DEFAULT_DEPS` rather than `_CURRENT`.
+        pin_offer(H, monkeypatch, "kill")
         return tb
 
     # NOTE: the two-step tests below pin discovery to their own child rather
@@ -613,18 +617,278 @@ class TestKillProcess:
         finally:
             srv.kill(); srv.wait()
 
+    def test_confirm_kill_never_reads_a_half_armed_offer(self, H, monkeypatch):
+        """Arming an offer is ONE assignment under the offer's own lock.
+
+        It used to be clear() then update() on a bare dict, so a reader landing
+        between the two steps saw an EMPTY offer and answered 'nothing to
+        confirm' for an offer that exists (or paired one call's pid with
+        another's deadline). The arm is held open deliberately here — the
+        offer's clock is read while it holds its lock — so the interleaving is
+        certain rather than a race the test hopes to hit.
+        """
+        tb = self._tb(H, monkeypatch)
+        real_clock = H.time.monotonic
+        inside = threading.Event()
+
+        def slow_clock():
+            inside.set()
+            time.sleep(0.4)          # the window the old code exposed
+            return real_clock()
+
+        monkeypatch.setattr(H._kill_offer, "_clock", slow_clock)
+        monkeypatch.setattr(tb, "_same_user_procs", lambda: [(4242, "sleep")])
+        results: dict[str, str] = {}
+        arm = threading.Thread(target=lambda: results.__setitem__(
+            "arm", tb.kill_process("sleep")))
+        arm.start()
+        assert inside.wait(5), "the arm never reached its clock"
+        confirm = threading.Thread(target=lambda: results.__setitem__(
+            "confirm", tb.confirm_kill("no")))
+        confirm.start()
+        arm.join(timeout=10)
+        confirm.join(timeout=10)
+        assert "About to stop" in results.get("arm", ""), results
+        assert "Cancelled" in results.get("confirm", ""), results
+        assert not H._kill_offer
+
     def test_expired_and_absent_offers(self, H, monkeypatch):
         tb = self._tb(H, monkeypatch)
         assert "nothing to confirm" in tb.confirm_kill("yes")
-        H._kill_offer.update({"pid": 1, "name": "x",
-                              "until": time.monotonic() - 10})
+        H._kill_offer.arm(-10, pid=1, name="x")      # armed, window closed
         assert "expired" in tb.confirm_kill("yes")
-        assert not H._kill_offer
+        assert not H._kill_offer, "a closed window must be cleared on read"
 
     def test_registered_and_gated(self, H):
         reg = H.ToolBelt(on_restart_pending=lambda: None)
         names = set(reg._tool_methods().keys())
         assert {"kill_process", "confirm_kill"} <= names
+
+
+class TestConcurrencySoak:
+    """Drive the caps and the offer under real overlap for a bounded slice.
+
+    The barrier-pinned tests prove ONE interleaving is safe. They cannot show
+    the guard holds under the schedules a running bubble actually sees, so
+    this drives genuine overlapping traffic and asserts only INVARIANTS —
+    never a count, never an ordering. A green run therefore means the guard
+    held, not that the scheduler happened to cooperate.
+
+    Time-bounded on purpose: the property is overlap, not duration, so the
+    suite's runtime cannot become a lottery on a slow machine.
+
+    The teeth are three identities that hold for every interleaving:
+
+    * every `start_command` attempt is either started or refused, and the
+      refused ones equal the registry's own refusal count — the cap is never
+      overshot AND work is never silently dropped;
+    * no job id is ever issued twice — keys are minted inside the inserting
+      lock, not by a caller that read the counter and raced;
+    * a kill offer is claimed at most once per arm. This is asserted the only
+      way it can be: unique pids are armed and every claim is recorded, so a
+      `consume()` that does not clear would hand one pid to two callers.
+      Arming and consuming in ONE loop would not catch it (each loop re-arms
+      before it consumes, so the counts move together) — real claim contention
+      needs separate armer and consumer traffic.
+    """
+    SOAK_SECONDS = 1.2
+    JOB_THREADS = 6      # strictly more than MAX_JOBS, so refusals are certain
+    OFFER_THREADS = 6
+    CLAIM_THREADS = 4
+
+    class _FakeProc:
+        """Enough of a Popen for BoundedJob, and NOTHING that can fork.
+
+        `stdout=None` means the job owns no drain thread: this soak is about
+        admission under contention, so a real `echo` (or a drainer per job)
+        would only add process churn the assertions never look at.
+        """
+        stdout = None
+        pid = 0
+
+        def poll(self):
+            return None
+
+    class _Quiet:
+        """A logger that discards: the soak refuses a job thousands of times,
+        and each refusal journals a WARNING by design. Recording every one
+        here would measure the logging, not the guard."""
+
+        def _noop(self, *a, **k):
+            pass
+        debug = info = warning = error = exception = _noop
+
+    def _belt(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
+        tb._tool_times = deque()
+        tb._policy = H.DecisionPolicy(H.SETTINGS)
+        tb._pending_confirm = H.Offer("confirm")
+        tb._jobs = H.BoundedRegistry("job", H.BoundedJob.MAX_JOBS)
+        tb._on_restart_pending = lambda: None
+        tb._on_announce = lambda _t: None
+        # Several threads, one offer — including their `_dep()` path.
+        pin_offer(H, monkeypatch, "kill")
+        # No fork, no pipe, no child: only admission is under test.
+        monkeypatch.setattr(H._core_tools, "subprocess", types.SimpleNamespace(
+            Popen=lambda *a, **k: self._FakeProc(),
+            PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT))
+        # Discovery pinned to one exact match: a stray `sleep` on the machine
+        # would turn every arm into an ambiguity error instead of an offer.
+        monkeypatch.setattr(tb, "_same_user_procs", lambda: [(4242, "sleep")])
+        # The durable record is elsewhere's test; this one wants the registry's
+        # in-memory count and no disk write per refusal.
+        monkeypatch.setattr(H._tool_dependencies, "log", self._Quiet(),
+                            raising=False)
+        monkeypatch.setattr(H._tool_dependencies, "_record_cap_refusal",
+                            lambda _report: None, raising=False)
+        return tb
+
+    def test_the_caps_and_offers_hold_under_overlapping_traffic(
+            self, H, monkeypatch):
+        tb = self._belt(H, monkeypatch)
+        stop = threading.Event()
+        guard = threading.Lock()
+        errors: list = []
+        observations: list = []
+        attempts: list = []
+        started: list = []
+        refused: list = []
+        arms: list = []
+        cancels: list = []
+        claimed: list = []
+        claimed_lock = threading.Lock()
+        pid_seq = itertools.count(1)
+        unexpected: list = []
+        max_jobs = [0]
+
+        def job_worker():
+            try:
+                while not stop.is_set():
+                    out = tb.start_command("echo soak")
+                    with guard:
+                        attempts.append(1)
+                        if out.startswith("started"):
+                            started.append(out.split(":", 1)[0].split()[-1])
+                        elif "job limit reached" in out:
+                            refused.append(1)
+                        else:
+                            unexpected.append(out)
+            except Exception as e:              # noqa: BLE001 - reported below
+                with guard:
+                    errors.append(repr(e))
+
+        def offer_worker():
+            try:
+                while not stop.is_set():
+                    arm = tb.kill_process("sleep")
+                    cancel = tb.confirm_kill("no")
+                    with guard:
+                        if "About to stop" in arm:
+                            arms.append(1)
+                        elif "ERROR" not in arm:
+                            unexpected.append(arm)
+                        if "Cancelled" in cancel:
+                            cancels.append(1)
+                        elif not ("nothing to confirm" in cancel
+                                  or "expired" in cancel):
+                            unexpected.append(cancel)
+            except Exception as e:              # noqa: BLE001 - reported below
+                with guard:
+                    errors.append(repr(e))
+
+        def claim_worker():
+            """Arm a UNIQUE pid, then race to claim whatever is live.
+
+            The pid is the witness: with a real claim each one is handed out at
+            most once, so a duplicate can only mean `consume()` failed to
+            clear — the bug that lets two confirmations act on one offer.
+            """
+            try:
+                while not stop.is_set():
+                    pid = next(pid_seq)
+                    H._kill_offer.arm(30.0, pid=pid, name="racer")
+                    got = H._kill_offer.consume()
+                    if got is not None and got.get("name") == "racer":
+                        with claimed_lock:
+                            claimed.append(got.get("pid"))
+            except Exception as e:              # noqa: BLE001 - reported below
+                with guard:
+                    errors.append(repr(e))
+
+        def monitor():
+            """Sample the invariants between operations, which is the only
+            vantage point from which an overshoot is visible at all."""
+            try:
+                while not stop.is_set():
+                    live = len(tb._jobs)
+                    offer, _expired = H._kill_offer.state()
+                    with guard:
+                        max_jobs[0] = max(max_jobs[0], live)
+                        if offer is not None and not ({"pid", "name"}
+                                                      <= set(offer)):
+                            observations.append(dict(offer))
+            except Exception as e:              # noqa: BLE001 - reported below
+                with guard:
+                    errors.append(repr(e))
+
+        threads = ([threading.Thread(target=job_worker)
+                    for _ in range(self.JOB_THREADS)]
+                   + [threading.Thread(target=offer_worker)
+                      for _ in range(self.OFFER_THREADS)]
+                   + [threading.Thread(target=claim_worker)
+                      for _ in range(self.CLAIM_THREADS)]
+                   + [threading.Thread(target=monitor)])
+        for t in threads:
+            t.start()
+        time.sleep(self.SOAK_SECONDS)
+        stop.set()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not any(t.is_alive() for t in threads), "a soak worker never exited"
+        assert errors == [], f"a worker raised: {errors}"
+        assert unexpected == [], f"an operation returned something new: {unexpected}"
+
+        # The cap: never exceeded, and demonstrably reached.
+        assert max_jobs[0] <= H.BoundedJob.MAX_JOBS, (
+            "the job registry held more than its cap", max_jobs[0])
+        slots = len(tb._jobs)
+        assert slots <= H.BoundedJob.MAX_JOBS
+        assert tb._jobs.refusals >= 1, (
+            "the soak never reached the cap, so it proved nothing")
+
+        # The accounting: nothing is dropped and nothing is invented.
+        assert len(started) + len(refused) == len(attempts), (
+            len(started), len(refused), len(attempts))
+        assert len(refused) == tb._jobs.refusals, (
+            "refusals the callers saw and refusals the registry counted disagree")
+
+        # Keys are minted inside the inserting lock, so no two jobs collide.
+        assert len(set(started)) == len(started), "two jobs were handed one id"
+
+        # The offer, through the belt: armed for real, and consumed at most
+        # once per arm — `cancels > arms` would mean two confirmations claimed
+        # one arm.
+        assert arms, "the soak never armed the kill offer, so it proved nothing"
+        assert len(cancels) <= len(arms), (
+            f"{len(cancels)} confirmations consumed {len(arms)} arms — a second "
+            "confirmation claimed an offer that was already taken")
+
+        # The claim, under real contention: one pid, one claimant.
+        assert claimed, "the soak never claimed an offer, so it proved nothing"
+        duplicates = sorted(p for p, n in Counter(claimed).items() if n > 1)
+        assert not duplicates, (
+            f"offer(s) {duplicates} were claimed by more than one caller — "
+            "consume() is not the claim")
+
+        # And no reader ever saw a half-armed offer. `state()` cannot report
+        # the old clear()-then-update() window as a partial dict (an empty one
+        # reads as "nothing armed"), so a white-box observation is what pins
+        # that mechanism — this only asserts the shape never became partial.
+        assert observations == [], (
+            f"a reader saw a half-armed offer: {observations}")
 
 
 # ------------------------------------------------------- P1: reliable desktop actions
@@ -643,12 +907,10 @@ class TestDecisionPolicy:
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
         tb._tool_times = deque()
         tb._policy = H.DecisionPolicy(H.SETTINGS)
-        tb._pending_confirm = None
+        tb._pending_confirm = H.Offer("confirm")
         tb._confirm_running = None
         tb._user_turn_marker = 0
-        tb._jobs = {}
-        tb._job_seq = 0
-        tb._job_lock = threading.Lock()
+        tb._jobs = H.BoundedRegistry("job", H.BoundedJob.MAX_JOBS)
         tb._on_announce = None
         return tb
 
@@ -680,7 +942,7 @@ class TestDecisionPolicy:
         out, err = tb.execute("confirm_action", {"answer": "yes"})
         assert not err, out
         assert "waited" in out
-        assert tb._pending_confirm is None
+        assert not tb._pending_confirm
 
     def test_confirm_cancelled(self, H, monkeypatch, _fast_wait):
         tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
@@ -689,16 +951,17 @@ class TestDecisionPolicy:
         tb._set_user_turn(2)
         out = tb.confirm_action("no")     # plain string return (direct call)
         assert "Cancelled" in out
-        assert tb._pending_confirm is None
+        assert not tb._pending_confirm
 
     def test_confirm_expired(self, H, monkeypatch, _fast_wait):
         tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
         tb._set_user_turn(1)
         tb.execute("wait", {"seconds": 1})
-        tb._pending_confirm["until"] = time.monotonic() - 1
+        tb._pending_confirm.expire()
         tb._set_user_turn(2)
         out = tb.confirm_action("yes")
         assert "expired" in out
+        assert not tb._pending_confirm, "a closed window must be cleared"
 
     def test_concurrent_confirms_run_the_tool_once(self, H, monkeypatch, _fast_wait):
         """The claimed CONFIRM TOCTOU does not exist — and must not start to.
@@ -741,7 +1004,7 @@ class TestDecisionPolicy:
             t.join(5.0)
         assert sum(1 for r in results if "waited" in r) == 1, results
         assert runs.count("wait") == 1, runs
-        assert tb._pending_confirm is None
+        assert not tb._pending_confirm
 
     def test_kill_flow_bypasses_generic_confirm(self, H, monkeypatch):
         """kill_process manages its own two-step confirm; the generic one
@@ -781,10 +1044,29 @@ class TestDecisionPolicy:
         tb.execute("wait", {"seconds": 1})
         out = tb.confirm_action("yes")
         assert "same turn" in out.lower()
-        assert tb._pending_confirm is not None
+        assert tb._pending_confirm, "an unusable answer must not consume the offer"
         tb._set_user_turn(8)
         out, err = tb.execute("confirm_action", {"answer": "yes"})
         assert not err and "waited" in out
+
+    def test_repeat_offer_does_not_extend_the_window(self, H, monkeypatch,
+                                                     _fast_wait):
+        """A model looping on the SAME call must not push its own deadline out.
+
+        Re-arming on every repeat would let a stuck turn hold its confirmation
+        open indefinitely, so a later 'yes' answers a request the user may
+        never have heard. Repeating the call re-offers it; the window it was
+        given is what it keeps.
+        """
+        tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        tb._set_user_turn(1)
+        tb.execute("wait", {"seconds": 1})
+        first = tb._pending_confirm.get("until")
+        for _ in range(3):
+            out, err = tb.execute("wait", {"seconds": 1})
+            assert err and "CONFIRM REQUIRED" in out
+        assert tb._pending_confirm.get("until") == first, "the window was extended"
+        assert tb._pending_confirm["args"] == {"seconds": 1}
 
     def test_confirm_replacement_uses_newer_pending_action(self, H, monkeypatch,
                                                             _fast_wait):
@@ -804,12 +1086,13 @@ class TestDecisionPolicy:
         tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
         tb._set_user_turn(1)
         tb.execute("wait", {"seconds": 1})
-        pending = tb._pending_confirm
+        pending_until = tb._pending_confirm.get("until")
         tb._policy = H.DecisionPolicy({"command_policy": {"wait": "DENY"}})
         tb._set_user_turn(2)
         out, err = tb.execute("wait", {"seconds": 2})
         assert err and "DENIED" in out
-        assert tb._pending_confirm is pending
+        # A DENY must not arm, replace or extend the offer that is pending.
+        assert tb._pending_confirm.get("until") == pending_until
 
     def test_dry_run_does_not_touch_non_desktop_tools(self, H, monkeypatch):
         tb = self._belt(H, monkeypatch, dry_run=True)
@@ -850,11 +1133,9 @@ class TestSplitConfirm:
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
         tb._tool_times = deque()
         tb._policy = H.DecisionPolicy(H.SETTINGS)
-        tb._pending_confirm = None
+        tb._pending_confirm = H.Offer("confirm")
         tb._confirm_running = None
-        tb._jobs = {}
-        tb._job_seq = 0
-        tb._job_lock = threading.Lock()
+        tb._jobs = H.BoundedRegistry("job", H.BoundedJob.MAX_JOBS)
         tb._on_announce = None
         return tb
 
@@ -883,7 +1164,7 @@ class TestSplitConfirm:
             assert "DIFF PREVIEW" in out
             # no write until confirmed
             assert target.read_text(encoding="utf-8") == old
-            tb._pending_confirm = None  # reset for next target
+            tb._pending_confirm.clear()  # reset for next target
 
     def test_deny_wins_over_split_floor(self, H, tmp_path, monkeypatch):
         tb = self._belt(H, monkeypatch, policy={"edit_file": "DENY"})
@@ -892,7 +1173,7 @@ class TestSplitConfirm:
         out, err = tb.execute("edit_file", {
             "path": str(hw), "content": old + "# tweak\n"})
         assert err and "DENIED" in out and not out.startswith("CONFIRM"), out
-        assert tb._pending_confirm is None
+        assert not tb._pending_confirm
         assert hw.read_text(encoding="utf-8") == old
 
     def test_garbage_py_outside_roots_refused(self, H, tmp_path, monkeypatch):
@@ -903,7 +1184,7 @@ class TestSplitConfirm:
             out, err = tb.execute("edit_file", {
                 "path": str(evil), "content": "print('x')\n"})
             assert err and out.startswith("REFUSED"), out
-            assert tb._pending_confirm is None
+            assert not tb._pending_confirm
             # direct kind pin
             assert tb._edit_confirm_kind(
                 {"path": str(evil), "content": "x"}) == ""
@@ -1033,6 +1314,18 @@ class TestStrictArgumentCoercion:
     def test_bool_junk_raises_instead_of_guessing(self):
         from core.tools import coerce_bool_arg
         for raw in ("maybe", "2", "nope"):
+            with pytest.raises(ValueError):
+                coerce_bool_arg(raw)
+
+    def test_numbers_other_than_zero_and_one_are_not_flags(self):
+        """bool(2) is True, so any number at all passed as a flag the model
+        never actually asked for; only 0/1 are meaningful."""
+        from core.tools import coerce_bool_arg
+        assert coerce_bool_arg(0) is False
+        assert coerce_bool_arg(1) is True
+        assert coerce_bool_arg(0.0) is False
+        assert coerce_bool_arg(1.0) is True
+        for raw in (2, -1, 0.5, 7):
             with pytest.raises(ValueError):
                 coerce_bool_arg(raw)
 

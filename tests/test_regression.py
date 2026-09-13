@@ -22,7 +22,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site, wait_for
+from conftest import HERE as ROOT, _load, _user_site, pin_offer, run_driver, \
+    wait_for
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -1111,8 +1112,8 @@ class TestAuditNineFindings:
         monkeypatch.setattr(H, "REMINDERS_FILE", tmp_path / "reminders.json")
         monkeypatch.setattr(H, "REMINDERS_LOCK", H.threading.RLock())
         H.REMINDERS_FILE.write_text("[]")
-        H._snooze_offer.clear()
-        H._snooze_offer.update(name="tea", until=H.time.monotonic() + 90)
+        pin_offer(H, monkeypatch, "snooze")   # one offer, on _dep()'s path
+        H._snooze_offer.arm(90, name="tea")
         a = H.Assistant.__new__(H.Assistant)
         a._tools = H.ToolBelt(on_restart_pending=lambda: None)
         a._set = lambda *x: None
@@ -1294,9 +1295,11 @@ class TestAmbientCapabilities:
         tb = H.ToolBelt.__new__(H.ToolBelt)
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"], "notifications": True,
                     "pomodoro": True, "watchers": True}
+        # Both watcher registries share one lock, so their caps and their
+        # teardown are enforced in the same critical section.
         tb._watch_lock = threading.RLock()
-        tb._file_watchers = {}
-        tb._process_watchers = {}
+        tb._file_watchers = H.BoundedRegistry("watch-file", 4, lock=tb._watch_lock)
+        tb._process_watchers = H.BoundedRegistry("watch-process", 4, lock=tb._watch_lock)
         tb._on_notification = kwargs.get("on_notification")
         tb._on_announce = kwargs.get("on_announce")
         tb._on_pomodoro = kwargs.get("on_pomodoro")
@@ -1613,13 +1616,17 @@ class TestWatcherPatternSafety:
         every added character doubles the work — so a watcher handed this
         pattern would pin a core and stop watching for good. Measured in a
         subprocess so the suite stays fast.
+
+        Through `run_driver` like every other interpreter child: it imports
+        only `re`, but one constructor for all of them means the sandbox
+        cannot be remembered at one call site and forgotten at the next.
         """
         probe = ("import re\n"
                  "re.compile(r'(a+)+$').search('a' * 28 + '!' + ' ' * 100)\n"
                  "print('returned')\n")
         with pytest.raises(subprocess.TimeoutExpired):
-            subprocess.run([sys.executable, "-c", probe], timeout=2.0,
-                           check=True, capture_output=True)
+            run_driver(["-c", probe], timeout=2.0,
+                       check=True, capture_output=True)
 
     def test_watch_file_refuses_exponential_patterns(self, H, tmp_path):
         p = tmp_path / "x.log"

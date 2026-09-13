@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import HERE
+from conftest import HERE, run_driver
 
 GUI_DRIVER = """
 import copy
@@ -86,15 +86,23 @@ import importlib.util
 
 
 def load(name, path):
+    # The app goes through its own loader, so this child ends up with ONE bubble
+    # under the canonical name the settings app also looks for. A hand-built
+    # spec plus exec_module would leave the module unnamed, which the app now
+    # refuses (an unnamed load is indistinguishable from a second copy).
+    if os.path.basename(path) == "handsoff.py":
+        from core import load_app_module
+        return load_app_module([path])
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod          # named BEFORE exec: never an unnamed load
     spec.loader.exec_module(mod)
     return mod
 
 
 HERE = os.environ["SGUI_HERE"]
 settings_app = load("handsoff_settings_gui", os.path.join(HERE, "handsoff-settings.py"))
-bubble = load("handsoff_core_gui", os.path.join(HERE, "handsoff.py"))
+bubble = load("handsoff_core", os.path.join(HERE, "handsoff.py"))
 
 # --- point the settings app's lazy H proxy at THIS bubble exec, then
 # --- rebind every path constant to tmp BEFORE any window is built
@@ -330,6 +338,36 @@ def colour_change_applies_without_save():
 
 
 @scenario
+def malformed_state_colours_rejected_at_entry():
+    # A hand-edited settings.json is the only way a malformed state colour can
+    # arrive (the dialog yields '#rrggbb'). It used to be drawn on the swatch
+    # as though it were in effect while the bubble's parser discarded it, so
+    # the GUI said one thing and the bubble did another. Admission now uses the
+    # parser's own predicate: a refusal is named out loud and the default is
+    # used, and a valid colour is normalised to the form the swatch can render.
+    seed({"model": "testmodel:latest",
+          "colors": {"idle": "blue", "listening": "#4f8cffXYZ",
+                     "thinking": "#12345", "speaking": "00ff00"}})
+    win.reload_from_disk()
+    defaults = settings_app.DEFAULT_SETTINGS["colors"]
+    assert win._colors["idle"] == defaults["idle"], win._colors
+    assert win._colors["listening"] == defaults["listening"], win._colors
+    assert win._colors["thinking"] == defaults["thinking"], win._colors
+    assert win._colors["speaking"] == "#00ff00", win._colors
+    message = win.status_label.text()
+    assert "rejected 3 malformed state colour(s)" in message, message
+    assert "#rrggbb" in message, message
+    assert "listening='#4f8cffXYZ'" in message, message
+    # The refused value never rides along into the file: the next save writes
+    # the default, so the mismatch cannot be rediscovered on every reload.
+    assert win.save() is True
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["colors"]["idle"] == defaults["idle"], on_disk["colors"]
+    assert on_disk["colors"]["thinking"] == defaults["thinking"]
+    assert on_disk["colors"]["speaking"] == "#00ff00", on_disk["colors"]
+
+
+@scenario
 def size_slider_applies_without_save():
     # The size slider only ever relabelled itself: valueChanged was wired to a
     # label update and nothing else, so the bubble never resized live.
@@ -370,7 +408,11 @@ def wallpaper_tuning_buttons_retune_palette():
     win.reload_from_disk()
     before = dict(win._colors)
     win._match_wallpaper()
-    assert "could not detect the wallpaper" in win.status_label.text()
+    # The refusal must say what it LOOKED AT, not just that it failed: the
+    # button used to consult the niri config alone and blame ImageMagick, which
+    # was installed all along, while the real wallpaper was a shell-owned video.
+    assert "could not sample the wallpaper" in win.status_label.text()
+    assert "looked at" in win.status_label.text()
     assert win._colors == before
     win._apply_wallpaper_tuning(0.05)
     assert win._colors != before
@@ -383,12 +425,18 @@ def wallpaper_tuning_buttons_retune_palette():
     real = settings_app._THEME
     settings_app._THEME = types.SimpleNamespace(
         tune_colors_for_background=real.tune_colors_for_background,
-        detect_wallpaper_luminance=lambda *_a, **_k: 0.02)
+        wallpaper_report=lambda *_a, **_k: {"path": "/w/from-shell.mp4",
+                                            "luminance": 0.02,
+                                            "checked": ["/w/from-shell.mp4"]})
     try:
         win._colors = dict(before)
         win._match_wallpaper()
         assert win._colors != before
-        assert "dark backdrop" in win.status_label.text()
+        # ...and it NAMES the file it sampled, so "nothing happened" and
+        # "it read the wrong wallpaper" cannot look the same.
+        assert "from-shell.mp4" in win.status_label.text(), \
+            win.status_label.text()
+        assert "0.02" in win.status_label.text()
     finally:
         settings_app._THEME = real
     # and the retuned palette persists through save
@@ -744,6 +792,136 @@ def every_design_reacts_to_voice_level():
     a = _frame_at("equalizer", 0.6, _FrozenClock(4000))
     b = _frame_at("equalizer", 0.6, _FrozenClock(9000))
     assert a == b, "equalizer bars still render from a timer, not the shared level"
+
+
+@scenario
+def every_design_shows_the_state_colour():
+    # "on Appearance only the shapes apply" was reported twice, and the second
+    # time named pikachu and the Eye of Sauron. The voice test above proves the
+    # LEVEL reaches every painter; this proves the STATE COLOUR does — a
+    # separate channel, read from `f["color"]`.
+    #
+    # Counting changed PIXELS is not enough here: a 15% veil changes bytes on
+    # thousands of pixels while staying a colour change nobody can see, which is
+    # exactly why the old floors looked fine to a pixel count. So a pixel only
+    # counts when it differs by a visible step in some channel.
+    import sys as _sys
+
+    class _Signal:
+        def connect(self, *_a, **_k):
+            return None
+
+    class _Stub:
+        sigState = _Signal()
+        sigLevel = _Signal()
+
+    class _FrozenClock:
+        def elapsed(self):
+            return 4000
+
+    widget = bubble.BubbleWidget(_Stub())
+    widget.resize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    widget._clock = _FrozenClock()
+    # Freeze EVERYTHING except the colour. `_on_tick` crossfades _color_ui AND
+    # the state's motion terms together, so a live timer would move the swirl,
+    # the orbit and the wobble between the two grabs and "prove" the colour
+    # reaches a painter that ignores it entirely -- the confound the voice test
+    # documents for the radius.
+    widget._anim.stop()
+    widget._last_tick = 4.0
+    widget._level_ui = widget._level_target = 0.0
+    widget._radius_ui = bubble.BUBBLE_R0
+    widget._state = "idle"          # the state is NOT what this measures
+    widget._energy_ui = bubble._fx_energy("idle")
+    bubble.ANIM_ENERGY = 1.0
+    bubble.BUBBLE_ACCENT = 0.5
+    from PySide6.QtGui import QImage, QColor
+
+    designs = list(getattr(settings_app.SCHEMA, "BUBBLE_DESIGNS", ("orb",)))
+
+    def _pixels(design, color):
+        bubble.SETTINGS["bubble_design"] = design
+        c = QColor(color)
+        widget._color_ui = [c.redF(), c.greenF(), c.blueF()]
+        img = QImage(widget.size(), QImage.Format_ARGB32)
+        img.fill(0)
+        widget.render(img)
+        return bytes(img.constBits())
+
+    def _visible(before, after):
+        n = min(len(before), len(after))
+        out = 0
+        for i in range(0, n - 3, 4):
+            if (before[i + 3] == 0) and (after[i + 3] == 0):
+                continue
+            if max(abs(x - y) for x, y in zip(before[i:i + 3], after[i:i + 3])) >= 48:
+                out += 1
+        return out
+
+    IDLE = "#2f6fed"
+    worst = {}
+    for d in designs:
+        base = _pixels(d, IDLE)
+        counts = [_visible(base, _pixels(d, other))
+                  for other in ("#e0435c", "#c8781f", "#1fae62")]
+        worst[d] = max(counts)
+    # 400 px is deliberately between the broken and working measurements: the
+    # design with no body colour (void, black disc + 2px streaks) measured 8
+    # when only the rim/streak alphas carried the tint, and the least-visible
+    # working design measures ~800. A higher bar would flag real designs as
+    # broken; a lower one would let a near-invisible tint through.
+    weak = [f"{d}={n}" for d, n in worst.items() if n < 400]
+    if weak:
+        raise AssertionError(
+            "the state colour is invisible on: " + ", ".join(weak)
+            + f" | qt {_sys.version_info[:2]}"
+            + f" | widget {widget.size().width()}x{widget.size().height()}"
+            + f" | all designs: {sorted(worst.items(), key=lambda kv: kv[1])}")
+
+
+@scenario
+def resizing_the_bubble_keeps_its_aperture():
+    # "if you make it bigger the design breaks; if you keep it bigger and swap
+    # shapes the design mismatches" -- one cause. The mask is set in WIDGET
+    # coordinates and Qt keeps it exactly as it was; the bubble set it only in
+    # showEvent, so every live size change drew the new, scaled design through
+    # the OLD aperture. Measured on the unfixed code: mask 128x128 while the
+    # widget was 192x192.
+    from PySide6.QtCore import QPoint
+
+    class _Signal:
+        def connect(self, *_a, **_k):
+            return None
+
+    class _Stub:
+        sigState = _Signal()
+        sigLevel = _Signal()
+
+    widget = bubble.BubbleWidget(_Stub())
+    widget.resize(128, 128)
+    widget.show()                       # a mask is only real once the widget is
+    app.processEvents()
+    start = widget.mask().boundingRect()
+    assert (start.width(), start.height()) == (128, 128), start
+    # exactly what the live settings reload does
+    widget.setFixedSize(bubble.WINDOW_PX * 3 // 2, bubble.WINDOW_PX * 3 // 2)
+    app.processEvents()
+    grown = widget.mask().boundingRect()
+    rect = widget.rect()
+    assert (grown.width(), grown.height()) == (rect.width(), rect.height()), (
+        "the mask did not follow the widget: mask "
+        f"{grown.width()}x{grown.height()} vs widget "
+        f"{rect.width()}x{rect.height()}")
+    # and the shrink path, which is the same setFixedSize call with a smaller
+    # number -- the stale-aperture bug is symmetric
+    widget.setFixedSize(bubble.WINDOW_PX, bubble.WINDOW_PX)
+    app.processEvents()
+    back = widget.mask().boundingRect()
+    assert (back.width(), back.height()) == (bubble.WINDOW_PX, bubble.WINDOW_PX), back
+    # The mask is an ellipse, not the whole rect: a fix that simply widened the
+    # aperture to the rectangle would pass the size assertions above.
+    assert not widget.mask().contains(QPoint(1, 1)), \
+        "mask is no longer elliptical"
 
 
 @scenario
@@ -1248,14 +1426,16 @@ if __name__ == "__main__":
 
 
 def _run_scenario(name: str, tmp_path: Path) -> subprocess.CompletedProcess:
-    env = dict(os.environ)
-    env.update({
-        "SGUI_HOME": str(tmp_path),
-        "SGUI_HERE": str(HERE),
-    })
-    return subprocess.run(
-        [sys.executable, "-c", GUI_DRIVER, name],
-        env=env, capture_output=True, text=True, timeout=120, cwd=str(HERE),
+    # run_driver, not dict(os.environ): the driver LOADS two monoliths, and the
+    # HOME they resolve their CONFIG_DIR/STATE_DIR from must be the tmp one from
+    # the first line of the child, not the developer's (the driver also rebinds
+    # the bubble's constants afterwards — belt and braces, but it was the only
+    # belt). The runner keeps the real user site-packages on PYTHONPATH, because
+    # a redirected HOME hides PySide6.
+    return run_driver(
+        ["-c", GUI_DRIVER, name], home=tmp_path,
+        env_extra={"SGUI_HOME": str(tmp_path), "SGUI_HERE": str(HERE)},
+        capture_output=True, text=True, timeout=120,
     )
 
 
@@ -1267,12 +1447,15 @@ SCENARIO_NAMES = [
     "appearance_energy_and_accent_roundtrip",
     "appearance_changes_apply_without_save",
     "colour_change_applies_without_save",
+    "malformed_state_colours_rejected_at_entry",
     "size_slider_applies_without_save",
     "loading_the_form_is_still_not_an_edit",
     "wallpaper_tuning_buttons_retune_palette",
     "bubble_designs_render_at_energy_extremes",
     "sauron_eye_reacts_to_voice_level",
     "every_design_reacts_to_voice_level",
+    "every_design_shows_the_state_colour",
+    "resizing_the_bubble_keeps_its_aperture",
     "voice_tab_level_meter_reads_the_bubble_feed",
     "external_change_reloads_and_reports",
     "missing_settings_file_mtime_is_zero",

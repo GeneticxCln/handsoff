@@ -787,6 +787,10 @@ class TestWorkspaceAliasesAndBriefing:
         a = self._brief_stub(H, tools)
         monkeypatch.setitem(H.SETTINGS, "briefing", True)
         monkeypatch.setitem(H.SETTINGS, "home_place", "Berlin")
+        # The world-headline half of the briefing is a live DuckDuckGo fetch;
+        # stubbing it keeps this test's runtime off a third party's uptime (it
+        # measured 10 s under throttling and ~0 s otherwise).
+        monkeypatch.setattr(H, "_world_events", lambda *a, **k: ([], False))
         p1 = a._maybe_briefing_prefix("good morning")
         assert "weather: 20C" in p1
         assert a._briefing_done_date  # marked done

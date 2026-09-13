@@ -18,7 +18,6 @@ Add `--selftest` to run a headless smoke test (no window is shown).
 """
 from __future__ import annotations
 
-import importlib.util
 import copy
 import html
 import json
@@ -38,6 +37,14 @@ import wave
 from datetime import datetime as _dt
 from pathlib import Path
 
+# `core` owns the app's canonical module name and the one loader that can admit
+# it (core.load_app_module). Imported rather than restated: two spellings of the
+# name is how "is the bubble already loaded?" stopped having an answer. It is a
+# light package (stdlib-only at import), so this does not pull the bubble, which
+# is exactly what `_LazyHandsoff` exists to defer. An install with no core/
+# cannot run this window at all — every helper below comes through the bubble.
+import core as _core
+
 HOME = Path.home()
 
 
@@ -46,16 +53,29 @@ def _import_handsoff():
 
     ONE shared order everywhere: beside-this-file first, then the installed
     copy — so a repo checkout never silently runs installed code (or vice
-    versa) when both exist."""
-    for cand in (Path(__file__).resolve().parent / "handsoff.py",
-                 HOME / ".local/bin/handsoff.py"):
-        if cand.exists():
-            spec = importlib.util.spec_from_file_location("handsoff_core", cand)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod
-    sys.stderr.write("handsoff-settings: cannot find handsoff.py — install handsoff first\n")
-    sys.exit(1)
+    versa) when both exist.
+
+    A bubble ALREADY loaded in this process wins over both, and that is the only
+    correct answer: exec'ing a second copy is not a second view of one app, it is
+    a second app — its own CONFIG_DIR/STATE_DIR/SETTINGS, its own model mirrors —
+    and its module body calls `core.audio.configure(...)`, which repoints the
+    SHARED core.audio at the second copy's paths. Measured: loading this app
+    in-process next to a bubble repointed `core.audio.WHISPER_MODEL_DIR` at that
+    copy's (real) config dir, so the rest of the process silently used another
+    app's paths.
+
+    The name and the admission rule are NOT restated here: `core` owns both, and
+    `handsoff.py` claims its own name as it loads — the single definition is what
+    stops the app and its callers drifting onto different names, which is exactly
+    how the second copy used to happen.
+    """
+    try:
+        return _core.load_app_module(
+            (Path(__file__).resolve().parent / "handsoff.py",
+             HOME / ".local/bin/handsoff.py"))
+    except ImportError as e:
+        sys.stderr.write(f"handsoff-settings: {e}\n")
+        sys.exit(1)
 
 
 class _LazyHandsoff:
@@ -106,22 +126,22 @@ class _LazyHandsoff:
 
 
 def _import_settings_schema():
-    """Load settings_schema.py (the single source of DEFAULT_SETTINGS) directly.
+    """Load settings_schema.py (the single source of DEFAULT_SETTINGS).
 
-    The settings GUI must not pull its defaults through the bubble module:
-    that forced a full bubble exec (audio imports, Qt globals) just to merge
-    defaults, and duplicated the schema in the pre-2026-09 monolith. The
-    schema is a dependency-free dict.
+    The settings GUI must not pull its defaults through the bubble module: that
+    forced a full bubble exec (audio imports, Qt globals) just to merge defaults,
+    and duplicated the schema in the pre-2026-09 monolith. The schema is a
+    dependency-free dict — and it is a SUPPORT module, so it goes through the
+    same loader as every other one (`core.load_module`), which returns the copy
+    already in `sys.modules` instead of exec'ing a second one. Loading it by hand
+    under a private name gave this process two schema dicts whenever the bubble
+    was loaded first, the same defect shape as two apps.
     """
-    for cand in (Path(__file__).resolve().parent / "settings_schema.py",
-                 HOME / ".local/bin/settings_schema.py"):
-        if cand.exists():
-            spec = importlib.util.spec_from_file_location("handsoff_settings_schema", cand)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod
-    sys.stderr.write("handsoff-settings: cannot find settings_schema.py — install handsoff first\n")
-    sys.exit(1)
+    try:
+        return _core.load_module("settings_schema")
+    except ImportError as e:
+        sys.stderr.write(f"handsoff-settings: {e}\n")
+        sys.exit(1)
 
 
 SCHEMA = _import_settings_schema()
@@ -2162,11 +2182,66 @@ class SettingsWindow(QMainWindow):
 
     # -------------------------------------------------------------- appearance
 
+    # ------------------------------------------------- state-colour admission
+    # The four state colours are parsed by the bubble with `theme.hex_to_rgb`,
+    # which requires a FULL '#rrggbb': an 8-digit value is not truncated and
+    # trailing junk is not tolerated. `coerce_settings` filters those values
+    # only for type, so a hand-edited "blue" or "#4f8cffXYZ" survived the load,
+    # was drawn on the swatch as though it were live, and was then silently
+    # discarded by the parser — the bubble kept the old colour while the GUI
+    # said otherwise. Admission now uses the parser's own predicate, and a
+    # refusal is said out loud instead of being left to be discovered later.
+    COLOR_KEYS = ("idle", "listening", "thinking", "speaking")
+    _HEX6 = re.compile(r"#?[0-9a-fA-F]{6}")
+
+    @classmethod
+    def _color_ok(cls, value) -> bool:
+        """Whether the bubble's parser would accept this as a state colour."""
+        if not isinstance(value, str):
+            return False
+        if _THEME is not None:
+            return _THEME.hex_to_rgb(value) is not None
+        # Partial install without core/: fall back to the same anchored shape.
+        return cls._HEX6.fullmatch(value.strip()) is not None
+
+    def _adopt_colors(self, raw) -> list:
+        """Load the four state colours, refusing anything the bubble discards.
+
+        Returns the (key, value) pairs that were rejected; each is replaced by
+        its default, so the swatches show exactly what the bubble will use.
+        """
+        raw = raw if isinstance(raw, dict) else {}
+        defaults = DEFAULT_SETTINGS["colors"]
+        clean: dict[str, str] = {}
+        rejected: list = []
+        for key in self.COLOR_KEYS:
+            value = raw.get(key, defaults[key])
+            if self._color_ok(value):
+                text = str(value).strip()
+                # The parser accepts '#rrggbb' or 'rrggbb'; the swatch's Qt
+                # stylesheet needs the '#', so store the canonical form.
+                clean[key] = text if text.startswith("#") else f"#{text}"
+            else:
+                clean[key] = defaults[key]
+                rejected.append((key, value))
+        self._colors = clean
+        return rejected
+
+    def _report_rejected_colors(self, rejected, action: str) -> None:
+        """Say which colours were refused and what was used instead."""
+        detail = ", ".join(f"{key}={value!r}" for key, value in rejected)
+        message = (f"rejected {len(rejected)} malformed state colour(s) "
+                   f"({detail}) — a colour must be #rrggbb; {action}")
+        log.warning("appearance: %s", message)
+        self._status(message)
+
     def _appearance_tab(self) -> QWidget:
         w = QWidget(self)
         lay = QVBoxLayout(w)
         self.color_buttons: dict[str, QPushButton] = {}
-        self._colors: dict[str, str] = dict(self.cfg["colors"])
+        # Adopt before the status bar exists; `_load_values` reports the
+        # refusals once it does, so the message is not lost or shown twice.
+        self._adopt_colors(self.cfg.get("colors"))
 
         size_row = QHBoxLayout()
         self.size_slider = QSlider(Qt.Horizontal, self)
@@ -2284,21 +2359,36 @@ class SettingsWindow(QMainWindow):
         self._schedule_appearance_live()
 
     def _match_wallpaper(self) -> None:
-        """One click: sample the configured wallpaper and retune for it."""
+        """One click: sample the current wallpaper and retune for it.
+
+        Discovery covers what this desktop actually uses — a shell-owned
+        wallpaper directory and its caches, an image OR a video (`ffmpeg` takes
+        one frame), and the niri config's spawned-image form — because the
+        button used to consult the niri config alone, which names a wallpaper
+        only when something like swaybg is spawned from it. Measured on this
+        machine: luminance came back None every time, so the click was a no-op
+        with a message about ImageMagick, which was installed all along. The
+        status line now says which file it sampled, or what it looked at.
+        """
         if _THEME is None:
             self._status("theme helpers unavailable in this install")
             return
         try:
-            luminance = _THEME.detect_wallpaper_luminance(NIRI_CONFIG)
+            report = _THEME.wallpaper_report(NIRI_CONFIG)
         except OSError as e:
             self._status(f"could not read the wallpaper: {e}")
             return
+        luminance = report.get("luminance")
         if luminance is None:
-            self._status(
-                "could not detect the wallpaper (need an image path in the niri "
-                "config + ImageMagick) — use Dark/Light tuning")
+            checked = report.get("checked") or []
+            where = (", ".join(Path(p).name for p in checked[:3])
+                     if checked else "nothing (no image path in the niri config, "
+                     "no shell wallpaper directory and no swww/hyprpaper cache)")
+            self._status(f"could not sample the wallpaper — looked at: {where}")
             return
         self._apply_wallpaper_tuning(luminance)
+        self._status(f"state colours matched {Path(str(report['path'])).name}"
+                     f" (backdrop luminance {float(luminance):.2f})")
 
     def _paint_color_buttons(self) -> None:
         for key, btn in self.color_buttons.items():
@@ -2311,7 +2401,15 @@ class SettingsWindow(QMainWindow):
     def _pick_color(self, key: str) -> None:
         col = QColorDialog.getColor(QColor(self._colors[key]), self, f"{key} colour")
         if col.isValid():
-            self._colors[key] = col.name()
+            chosen = col.name()
+            if not self._color_ok(chosen):
+                # The dialog yields '#rrggbb', so this is a guard on the
+                # invariant rather than an expected path: nothing may enter
+                # `_colors` that the bubble's parser would throw away.
+                self._report_rejected_colors([(key, chosen)],
+                                             "keeping the current colour")
+                return
+            self._colors[key] = chosen
             self._paint_color_buttons()
             self.preview.update()
             self._schedule_appearance_live()
@@ -2586,8 +2684,14 @@ class SettingsWindow(QMainWindow):
         self.extra_edit.setPlainText("\n".join(self.cfg["extra_allowed_commands"]))
         for key, chk in self.perm_checks.items():
             chk.setChecked(bool(self.cfg["permissions"].get(key, True)))
-        self._colors = dict(self.cfg["colors"])
+        # `self.cfg` is left as read: `_collect` is what writes the cleaned
+        # palette (it always did), and mutating cfg here would leave it
+        # disagreeing with `_loaded_cfg` — a reload would then look like an
+        # unsaved edit the moment a malformed colour was refused.
+        rejected = self._adopt_colors(self.cfg.get("colors"))
         self._paint_color_buttons()
+        if rejected:
+            self._report_rejected_colors(rejected, "using the default")
 
     def _collect(self) -> list[str]:
         problems: list[str] = []

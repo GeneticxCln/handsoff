@@ -1698,3 +1698,729 @@ the dual-monitor setup (data-level verified in `ACCEPTANCE.md`), unsupported/unu
 D-Bus Notify layouts, and the six human-only acceptance items. Process note: files
 churned mid-audit while the other agent worked; all findings above were confirmed
 against the settled tree.
+
+## Addendum — 2026-09-12 fifth-review-batch audit (job cap, theme maths, offer atomicity, self-mute)
+
+A seven-item list was checked against the tree before any edit: **six real and
+fixed, one disproved by measurement (for the second time).** Every fix is pinned
+by a guard that was verified to fail on the mutated code — 8/8 in this batch.
+
+**(1) The background-job cap could be overshot.** `start_command` checked
+`len(self._jobs) >= MAX_JOBS` under `_job_lock`, released the lock across
+`_validate_command` + `Popen` (slow on purpose — fork/exec must not run under
+the lock), then re-acquired it and inserted **without re-checking**. Measured
+with eight threads parked inside that window by a `threading.Barrier`: **7 jobs
+started against a cap of 4.** The cap is now enforced inside the critical
+section that mutates the dict, and the surplus process — already spawned but
+never registered, so nothing would ever poll, reap or kill it — is terminated,
+reaped (SIGTERM, then SIGKILL with a wait) and has its stdout closed, because an
+unread pipe with no drain thread attached wedges the child on write instead of
+letting the signal land. The same window carried a second, quieter defect: the
+`_on_restart_pending()` callback fired *before* admission, so a job refused at
+the cap still left the bubble believing a restart was in flight; it now fires
+after insertion, and the guard asserts the callback count equals the number of
+jobs actually admitted.
+
+**(2) `core.theme.hex_to_rgb` prefix-matched.** `re.match(r"^#?([0-9a-fA-F]{6})")`
+is unanchored at the end: `'#4f8cffXYZ'` returned `(79, 140, 255)` instead of
+`None`, and an 8-digit `#RRGGBBAA` was silently **truncated to its first six**,
+so a malformed or alpha colour validated as a good 6-digit one and lost its
+alpha without a word. Now `fullmatch` with exactly six digits — the convention
+`theme.py` already used twelve lines below for ImageMagick output.
+
+**(3) `tune_colors_for_background(colors, None)` raised.** `float(luminance)` was
+unguarded while `detect_wallpaper_luminance` returns `None` on **every** failure
+path (no config, no wallpaper file, no ImageMagick, unparseable output), and the
+function's own docstring promises "a bad detection can never corrupt the user's
+palette". Reproduced: `TypeError: float() argument must be … not 'NoneType'`. The
+GUI caller guards it, so the defect was latent — but the contract was the
+function's, not the caller's to uphold. `None` and junk are now a no-op.
+
+**(4) `coerce_bool_arg(2)` was `True`.** The numeric branch was `bool(raw)`, so
+any number at all passed as a flag the model never asked for. Only `0`/`1` are
+meaningful; anything else now raises like the other junk shapes.
+
+**(5) The kill offer could be read half-armed.** Arming is `clear()` then
+`update()` — two steps on a module-global — while `confirm_kill` copied the dict
+and then cleared it. A dict *copy* is atomic under the GIL, but it is the
+clear/update *pair* that is not: a reader landing between them saw an **empty**
+dict and answered "nothing to confirm" for an offer that exists, or paired one
+call's pid with another's deadline. Both sides now share `_KILL_LOCK`, the same
+shape `_snooze_offer` already used. Pinned deterministically with a dict
+subclass that holds the arm window open, rather than by hoping a stress test
+lands in it.
+
+**(6) The self-mute matched substrings.** `notification_muted` muted any
+notification whose summary or body merely *contained* the app name, so an app
+named `assist` muted "assistant manager update". It now matches on word
+boundaries (regex-escaped, so a name full of regex characters stays literal),
+while our own popups — `handsoff: started`, `Handsoff says` — still self-mute.
+
+**(7) The ydotool probe — disproved again, with a second harness.** The finding
+claims `connect()` on a SOCK_DGRAM unix socket succeeds with no server, so a
+dead daemon reads as reachable. Measured with the daemon as a real **exited
+child process** (the case the claim describes): a stale socket inode returns
+**`ECONNREFUSED (111)` on both DGRAM and STREAM**, so the probe cannot report a
+dead daemon as alive. What is true is narrower and already documented: a daemon
+that is alive but *wedged* connects successfully, because the probe is a connect
+and not a round-trip — and that case still fails loudly at use time, when
+`ydotool` itself times out with `ERROR: ydotool timed out`. Closing it would
+take a real protocol round-trip; a `/proc`-inode check was already measured to
+break a root-owned daemon, so the bounds are stated rather than traded for a
+false negative.
+
+Verified: 944 tests green in six orderings (default, shuffled-test seeds
+1/424242/deadbeef, shuffled-file seeds 2/cafef00d), coverage **78.02% ≥ 70**,
+`ci/compile_all.py` clean (38 files), and `core/theme.py` at 100%.
+
+## Addendum — 2026-09-12 admission control: one owner for every cap and offer
+
+The fifth-review batch fixed the job cap by re-checking the limit inside the
+lock that inserts. That was correct, and it was also the fifth time the same
+shape had been fixed in a different registry — so the next registry to grow a
+cap would have grown the same defect. The shape:
+
+    check the cap while holding the lock  ->  release the lock  ->  do the
+    slow thing that creates the resource (fork/exec, spawn a thread, resolve
+    a path)  ->  insert WITHOUT re-checking.
+
+`core/registry.py` now owns it. Two primitives, and nothing else in the tree
+enforces a capacity or arms an offer.
+
+### `BoundedRegistry` — the cap is enforced on ADMISSION
+
+`reserve()` checks the cap while holding the registry's own lock and counts a
+reservation against it immediately; the slow prepare runs holding that
+reservation; `commit()` is the only way an entry appears. A second caller is
+therefore refused rather than told there is room the first is about to take —
+the "check, release, act, insert" window does not exist to be mis-implemented.
+There is no caller-visible lock to release at the wrong moment, because there
+is no caller-visible lock.
+
+Two consequences worth naming:
+
+* **The surplus-process case is gone by construction.** `start_command` never
+  spawns a process it cannot admit, so `_abandon_job` (SIGTERM → SIGKILL →
+  close stdout, on a Popen nothing would ever poll, reap or kill) had no case
+  left to handle and is deleted. The old test asserted that recovery worked;
+  the new one asserts **Popen is called exactly MAX_JOBS times** for eight
+  racing callers — a stronger statement of the same property.
+* **A failed prepare cannot shrink the cap.** A reservation is a context
+  manager: leaving the block without committing cancels it, so a `Popen` that
+  cannot exec leaves the registry exactly as it found it. A leaked reservation
+  would be silent — the registry counting a job that does not exist, refusing
+  work while `job_status` listed nothing to reap.
+
+Keys are minted inside the lock that inserts (`commit(build)` hands the key to
+a factory), replacing `self._job_seq += 1` under a lock every caller had to
+remember to take.
+
+All three caps are now `BoundedRegistry`: background jobs (`MAX_JOBS`), and the
+file and process watchers (4 each). The two watcher registries **share one
+lock** on purpose — `stop_watchers()` clears both as a single step, so a
+watcher cannot be admitted between the two clears and outlive the shutdown.
+
+### `Offer` — armed, read and consumed in one place
+
+The kill offer's `clear()` + `update()` pair was fixed with a lock in the same
+batch. That lock protected one dict. `Offer` protects the shape:
+
+* `arm(window, **fields)` is ONE assignment under its own lock, so a reader can
+  never see a half-armed offer — the bug that prompted the lock, now true by
+  construction rather than by every future caller remembering.
+* `state()` / `consume()` apply the deadline themselves. No call site can
+  forget it: `state()` returns `(offer, expired)` and clears a stale offer, so
+  even a caller that only checks for `None` cannot act on a closed window.
+* `consume()` is the **claim**: the second of two racing confirmations gets
+  `None` and must refuse.
+* `arm_unless(predicate, ...)` arms only when no live offer matches. A model
+  looping on the same call cannot keep pushing its own confirmation deadline
+  out, and the read-then-maybe-write pair is one step, so two callers cannot
+  both decide to arm.
+* The `bool`/`len`/`[]`/`in`/`keys`/`get` surface is read-only observability,
+  and reads hand out **copies**. There is deliberately no mutator, so the old
+  bare dict — convenient *and* unsafe, because every caller could arm it — has
+  no equivalent.
+
+All three offers are `Offer` objects: the kill confirmation, the snooze window,
+and the CONFIRM-class tool offer (`ToolBelt._pending_confirm`).
+
+Truncating bounders are deliberately NOT routed through it: reminders keep the
+newest 64, the notification coalescer keeps the newest 64 distinct texts, and
+memory keeps 24 facts. Those evict, they never refuse, so they are not
+admission decisions and sharing the helper would only blur what it means.
+
+### What the refactor found on the way
+
+* **An expired CONFIRM offer could not be re-armed.** The old code decided
+  "is this the same call?" by reading the offer and comparing, then armed only
+  when it was different; an offer whose window had closed still carried its
+  `tool` and `turn`, so a repeat of the same call compared as "still waiting"
+  and the offer was left expired. The user's next `yes` was answered with
+  "the offer expired". The stale offer is now cleared and re-armed as part of
+  that same step, which is what the log line always claimed.
+* **`_dep()` resolves per-thread.** It is `_CURRENT` in the calling thread but
+  `_DEFAULT_DEPS` in a NEW thread (a thread starts with an empty context). With
+  one monolith those are the same object; with two loaded — the settings-GUI
+  suite loads a second — a test that arms an offer from a worker thread and
+  reads it from the main thread exercises two different offers, and passes or
+  fails depending on which monolith imported last. `tests/conftest.py:pin_offer`
+  installs one offer on every path. The shuffled order found it; the default
+  order had not.
+
+Verified: 966 tests green in six orderings (default, shuffled-test seeds
+1/424242/deadbeef, shuffled-file seeds 2/cafef00d), the coverage gate green at
+**78.41% ≥ 70** (`--cov=. --cov-config=.coveragerc` with the offscreen-GUI
+subprocesses measured, exactly as CI runs it) with `core/registry.py` at
+**100%**, `ci/compile_all.py` clean (40 files), and **22/22** mutations of the
+new guards back to their old behaviour caught.
+
+## Addendum — 2026-09-12 what a cap refusal leaves behind, and a soak that proves the guard
+
+Three requests in one batch: make a refused job visible after the fact, soak the
+caps and offers beyond the barrier-pinned cases, and stop the Appearance tab
+accepting colours the parser will later discard. Auditing the suite for the
+second and third also turned up two ways the suite had been touching things it
+should not: **it loaded a real whisper model during one test and wrote the
+developer's real state file during another.**
+
+### 1. A cap refusal is now evidence, not a sentence in a chat reply
+
+The job cap was fixed structurally (admission in `BoundedRegistry`), but the
+*event* of a refusal still existed only in the string handed back to the model:
+not in the journal, not in the state, not in `--ptt doctor`. That is exactly
+backwards — a cap turning real work away is the one in-the-wild signal that the
+bubble met its own limits, and the overshoot bug it belongs to had only ever
+been found by reading the source, never by anything the running bubble said.
+
+* `BoundedRegistry` now counts refusals and remembers **the shape of the
+  moment** (cap, how many held, how many reserved, which occupants, when). The
+  count lives there because that is the only place that knows the decision was
+  made — so a future registry cannot forget to report one.
+* `_refused_at_cap` shouts at WARNING and hands the report to the host, which
+  keeps a bounded ring in `~/.local/state/handsoff/cap-refusals.json`
+  (`CAP_EVENTS_MAX = 50`, with a cumulative `count` and per-registry totals that
+  survive ring eviction, and `_atomic_private_write` 0600 like every other
+  state file).
+* `job_status` and `--ptt doctor` (text *and* `doctor_json`) render from one
+  formatter, so three surfaces cannot describe the same refusals differently.
+  The doctor line is printed even when there is nothing to report — "none
+  recorded" is a positive finding, not a missing line.
+* Every step is best-effort: reporting must never be a reason a refusal takes a
+  different path.
+
+### 2. A soak that drives the caps and offers under real overlap
+
+The barrier-pinned tests prove ONE interleaving is safe; they say nothing about
+the schedules a running bubble sees. `TestConcurrencySoak` drives genuine
+overlapping traffic — six job threads against a cap of four, six
+`kill_process`/`confirm_kill` threads, four threads racing one offer's claim, and
+a sampler — for a bounded 1.2 s, and asserts only invariants:
+
+* every `start_command` attempt is started **or** refused, and the refusals the
+  callers saw equal the registry's own count (the cap is neither overshot nor
+  silently dropping work);
+* no job id is ever issued twice (keys are minted inside the inserting lock);
+* a pid armed by a claim racer is claimed **at most once** — arming and
+  consuming in one loop would *not* catch a `consume()` that fails to clear,
+  because the counts move together, so claim contention needs separate armer and
+  consumer traffic.
+
+The first version of this test missed two of four mutations, which is how the
+loop-shape problem above was found. After the fix it catches 3/4 — and the
+fourth is not a gap in the test: a `clear()`-then-`update()` arm is invisible
+through the public API (`state()` reports an empty offer as *nothing armed*, not
+as a partial one), so no black-box test can see it. The deterministic test that
+holds the offer's clock open is the instrument that pins that mechanism. That is
+stated in the soak's own docstring rather than left as a false sense of
+coverage.
+
+### 3. Two ways the suite was leaving the sandbox (found by running it a lot)
+
+* **A real 3 GB whisper load during one test.** `_whisper_model` was found
+  holding a live `faster_whisper.transcribe.WhisperModel` for every test after
+  `test_settings_gui` — which made `--ptt doctor`'s own test read
+  `stt: whisper loaded`. Traced with a teardown hook on thread names: a
+  `stop-probe` daemon spawned by `submit_audio` outlived
+  `test_fault_injection.py::TestMicReturnsNothing::test_a_good_press_still_reaches_the_brain`
+  (which stubs nothing), finished after its own monkeypatch was reverted, and
+  published the loaded model into the shared mirror. Fixed at the source (that
+  class's `_bare` stubs the probe, which is not what it tests), made structural
+  (`stop-probe` and `loader` joined `_WORKER_THREADS`, so a leaked model-loading
+  thread now fails its own test), and made harmless (`_whisper_model`,
+  `_tts_model`, `TTS_REFERENCE`, `TTS_ENGINE`, `WHISPER_SIZE`, `WHISPER_DEVICE`
+  joined `_STATE_GLOBALS`; the snapshot restores non-containers by identity, so a
+  model is never deep-copied).
+* **The suite was writing the developer's real state file.** One full run grew
+  `~/.local/state/handsoff/cap-refusals.json` by four entries, all synthetic
+  (`start_command 'echo x'`), written by a refusal raised in `test_ops` but
+  *recorded* through a foreign host: `core.tools._DEFAULT_DEPS` is process-wide
+  and is replaced by whichever monolith wires it last, and the settings-app
+  suites load a second monolith **with the real HOME** (the session fixture
+  isolates HOME only for the import of `handsoff_core`). conftest now **pins**
+  the tool DI host to the test's own monolith — `_CURRENT` for the calling
+  thread and `_DEFAULT_DEPS` for worker threads, which start with an empty
+  context — instead of only restoring the previous value. `_core_doctor._CURRENT`
+  is deliberately not pinned: it holds a DoctorDeps, not a tool host. Verified by
+  before/after counts across a full default run, the coverage run and all six
+  orderings: 136 → 136.
+
+### 4. The briefing tests were paying DuckDuckGo
+
+Three briefing tests call `_maybe_briefing_prefix`, which fetches live world
+headlines. Measured on the same tree, same day: **20.5 s when the endpoint
+throttled, 0.4 s when it did not** — the suite's runtime was a fact about a third
+party, which is also why an earlier "why is the suite 45 s slower" question had
+a network answer. All three now stub `_world_events`; the class took 0.87 s
+after, and the live fetch is not what any of them assert.
+
+### 5. The Appearance tab refuses colours the parser would discard
+
+`coerce_settings` filters state colours only for *type*, so a hand-edited
+`"blue"`, `"#4f8cffXYZ"` or `"#12345"` survived the load, was drawn on the
+swatch as though it were live, and was then silently dropped by
+`theme.hex_to_rgb` — the GUI said one thing and the bubble did another. Admission
+now uses the parser's own predicate: a malformed value is replaced by its default
+and named out loud in the status bar (`rejected 3 malformed state colour(s)
+(idle='blue', …) — a colour must be #rrggbb; using the default`), a valid
+`#`-less colour is normalised to the form the swatch's stylesheet can render, and
+the colour dialog's result is checked too so nothing can enter `_colors` that the
+parser would throw away. `self.cfg` is deliberately *not* mutated at load (it
+would then disagree with `_loaded_cfg` and make a plain reload look like an
+unsaved edit); `_collect` — which always wrote the palette — carries the cleaned
+value into the file on the next save. Pinned by a new offscreen scenario and
+**5/5** mutations of the new guards back to the old behaviour caught.
+
+## Addendum — 2026-09-12 the last two caps enforced by hand (reader slot, diagnostic worker)
+
+The previous addendum centralised admission control in `core/registry.py` and said
+plainly what was left: the notification reader's thread slot and the control
+server's diagnostic-worker cap were still decided by hand. Both are now on the
+same primitive, and nothing in the project enforces a capacity itself.
+
+### The shape they were left in
+
+    if self._thread is not None and self._thread.is_alive():   # check
+        return "already on"
+    proc = self._popen_factory(...)                            # slow prepare
+    self._thread = self._spawn(self.run, ...)                  # insert
+
+Two overlapping enables both read a free slot and both started a reader — two
+`dbus-monitor` processes, two loops, one of them holding the other's stop event,
+every notification spoken twice. The diagnostic cap had the identical shape
+(`prev is not None and prev.is_alive()` then spawn), which is why a repeated
+`health` against a wedged Ollama piled up threads that can never be cancelled.
+Both are now `BoundedRegistry(name, 1)`.
+
+### `reserve(reclaim=...)` — the third shape of the same question
+
+A singleton whose occupant can *die* needs a third answer: "is it still alive?"
+and "may I take its slot?" must be ONE step, or two callers both see a corpse and
+both start a worker. That predicate is evaluated under the lock that hands the
+slot out; a judged-dead occupant leaves the registry and is returned on the
+reservation (`.reclaimed`) for the caller to dispose of **outside** the lock —
+`core/registry.py` still never touches a process or a thread itself. A predicate
+that raises leaves the occupant exactly where it was: the registry is the last
+place that should quietly delete something a caller asked about, and a failed
+`reserve` is not a refusal (neither is counted).
+
+The reader keeps its slot until its worker is actually gone, which is a fix and
+not just a refactor: `off` used to clear `_thread` *before* the join, so a restart
+arriving during an unresponsive worker's shutdown could still start a second
+reader beside the old one. A worker that outlives its join budget now keeps the
+slot, and the reclaim predicate frees it the moment it dies.
+
+### Measured, not assumed
+
+* the reader: two enables released together with the spawn held open started
+  **1** reader (before: 2), and the loser is answered "already on" — the
+  documented reply, deliberately NOT shouted about as a cap refusal, because a
+  repeated toggle is not a cap turning work away (the registry still counts it);
+* the diagnostic cap: **8 racing callers → 1 worker, 1 result, 7 refused by
+  name**, each refusal durable (`cap refusals: diagnostic-worker`) and logged;
+* the refusal sentence is now rendered by the registry (`refusal_line`), so the
+  journal, `core/tools.py`'s reply path and the doctor cannot drift into three
+  accounts of one event — the existing `"cap refusal: job at 4/4 held"` assertion
+  is what pinned that the wording survived the move;
+* **13/13 mutations of the new guards back to the old behaviour were caught**,
+  including "give the slot back before the slow part" (the original defect),
+  "reclaim a live worker", "free the slot before the worker is gone", "never
+  dispose of the corpse", "drop the diagnostic record", and "ignore the
+  reservation when counting the cap".
+
+988 tests green in six orderings, coverage 78.26 % (≥ 70), `ci/compile_all.py`
+clean (40 files), deployed `in-sync` (three-way TRUE, 15/15 files) with
+`--ptt health` answering through the new `_diagnostic_call`.
+
+## Addendum — 2026-09-12 a refusal the user can hear (spoken cap refusals)
+
+The refusal record was the previous step's answer to "a refusal is invisible":
+counted in the registry, journaled at WARNING, kept in `cap-refusals.json`,
+rendered by `job_status` and `--ptt doctor`. All four are things a person has to
+go and *read*. The refusal itself happened because something was ASKED for — a
+command to run, a file to watch, a health keybind — and did not happen, so the
+bubble now says so on the channel job completions, reminders and hands-free
+confirmations already use (`Assistant._announce_now`).
+
+### Where the decision lives
+
+`Assistant.announce_cap_refusal(report, detail)` owns the wording and the rate
+limit; the belt only knows a cap turned work away. Two call sites feed it:
+
+* `ToolBelt._refused_at_cap` (jobs, file watchers, process watchers) hands the
+  refusal to a new `on_cap_refusal` hook — the same seam as `on_announce`, and a
+  belt built without a host (tests, embedding) logs exactly as before;
+* `ControlServer._diagnostic_call` calls it directly for the diagnostic cap,
+  which the user provokes by pressing a health keybind.
+
+### Not once per refusal
+
+The refusal path is retried by nature: a model re-calling `start_command`, a
+keybind being hammered, a wedged backend being polled. An audio loop is worse
+than the invisibility this replaces, so the announcement is rate-limited like
+the reader's per-app cooldown — and, crucially, the *stamp is what was said*,
+not the latest attempt: the first refusal at a cap speaks in full ("I couldn't do
+that: the background-job limit is full (4 of 4). Nothing was started."), and when
+the cooldown has passed the cap speaks again with the delta the cooldown
+swallowed ("… 6 more requests turned away since I last said so."). Per registry,
+so a full job cap cannot silence a wedged diagnostic; per instance, so it cannot
+outlive the bubble; bounded (`CAP_ANNOUNCE_MAX`), so a new registry name cannot
+grow the map; never raising, because announcing must not become a reason a
+refusal takes a different path.
+
+### Measured
+
+* unit: first refusal speaks with the label and counts; six in a row are one
+  sentence; the delayed sentence carries the delta (and "1 more request", not
+  "1 requests"); each cap speaks for itself; a closed bubble stays silent; junk
+  reports are neither spoken nor raised; a broken speaker is survivable; the map
+  is bounded and keeps the NEWEST caps;
+* integration, through the real `ControlServer`: **8 racing diagnostics → 1
+  worker, 7 refusals, 7 durable records, exactly ONE spoken line**;
+* the seam itself: the app's own belt must carry the hook (a mutation removing
+  the wiring would otherwise leave the whole suite green);
+* **10/10 mutations of the new guards back to the old behaviour were caught.**
+
+### Two things this found in the suite
+
+Adding `announce` to conftest's `_WORKER_THREADS` guard exposed a real leak that
+had nothing to do with refusals: `test_handsfree_status_roundtrip` sent
+`handsfree-status` over the socket and never processed the Qt event loop, so the
+confirmation was delivered during whichever test next called `processEvents()`
+— where it *really* spoke, starting a TTS worker for a test that had already
+finished. The test now delivers and asserts its own command, and the leak guard
+(which had blamed an unrelated test) is honest. Second: an announcement worker
+waits up to 30 s on the models-ready event, so a lingering one is a leak with a
+fuse — which is why it is a named worker rather than an anonymous thread.
+
+1000 tests green in six orderings (default, shuffled-test seeds
+1/424242/deadbeef, shuffled-file seeds 2/cafef00d), coverage 78.38 % (≥ 70),
+`ci/compile_all.py` clean (40 files), deployed `in-sync` (15/15 files, three-way
+TRUE). A *live* audible refusal needs a stalled backend (the diagnostic cap only
+refuses while a previous worker is still running, and `run_doctor` caches its
+Ollama probe), so the live claim is the deployment check plus the control-server
+integration test rather than a sentence on a healthy bubble.
+
+---
+
+## Accept-loop admission: the last hand-rolled cap
+
+`ControlServer.start()` decided this by hand — `if self._thread is not None and
+self._thread.is_alive(): return`, then spawn, then assign the attribute. Two
+overlapping `start()` calls both read "no live thread", both cleared the stop
+event and both bound a server: the loser's `_remove_stale_control_socket()` +
+`bind()` replaced the winner's socket, leaving one accept loop serving an inode
+no client could reach — `--ptt` said "not running" while the bubble believed it
+was reachable.
+
+The accept loop is now a singleton slot in the same `BoundedRegistry` every
+other cap uses. `reserve(..., reclaim=...)` is evaluated under the lock that
+hands the slot out, so "the old loop is gone" and "may I have its slot?" are one
+decision instead of two reads with a spawn between them, and `_thread` is a view
+onto the registered slot rather than a second source of truth. A loop that died
+(failed bind, refused runtime) is reclaimed by that same predicate, so "already
+running" can never be read off a thread that is gone.
+
+`stop()` gives the slot back only once the loop is actually gone. Freeing it
+before the join is how a restart gets a second acceptor beside the old one — the
+orphan this class exists to avoid — so a loop that outlived its join budget
+keeps the slot and the predicate frees it when it really dies. A repeated
+`start()` on a live loop stays the documented no-op it always was: refused by
+admission, deliberately not shouted about as a cap refusal (nothing the user
+asked for was turned away), though the registry counts it like the reader's
+"already on".
+
+### Measured
+
+* eight callers racing `start()` with the spawn held open: **one loop started,
+one `control` thread alive, one slot occupied** — on the old check-then-act all
+eight spawn;
+* a loop that died gets its slot back; a live one keeps it through `stop()`;
+* **4/4 mutations caught** — the old check-then-act `start()`, the cap raised to
+  8, the reclaim predicate removed, and `stop()` freeing the slot without
+  checking.
+
+### A leak the guard then found
+
+Adding `control` to conftest's `_WORKER_THREADS` guard failed four fixtures that
+started a real `ControlServer` and never stopped it. The accept loop is a named
+worker with a stop path, so each left a live idle thread (and a bound socket)
+behind: test_lifecycle's `server` fixture, the local copies in test_audio and
+test_settings, and `_health_query`'s real-server test now stop before the socket
+path is restored. Same shape as the announce worker the previous batch exposed —
+the guard is what keeps a named worker honest.
+
+1016 tests green in seven orderings (default, shuffled-test seeds
+1/424242/deadbeef/20260913, shuffled-file seeds 2/cafef00d/7), coverage 78.26 %
+(≥ 70), `ci/compile_all.py` clean (41 files), deployed `in-sync` (15/15 files,
+three-way TRUE, `--ptt status`/`health` answering). Nothing committed.
+
+---
+
+## HOME isolation: the load no loader can wrap
+
+The sandbox belongs to the LOAD (`conftest._load` enters `isolated_user_dirs`,
+and the autouse fixtures load the bubble before any test body runs). Everything
+in-process that could resolve the developer's CONFIG_DIR/STATE_DIR went through
+that one door — except an **import statement**. A module-scope import runs while
+pytest is collecting the test module, so it resolves with the developer's HOME,
+and nothing in the load complains: the module works, it is just pointed at the
+real config. It is also machine-dependent, because it only shows up where real
+config exists.
+
+The four modules that bake user paths at import are now *discovered* from the
+source rather than listed (`core/tools.py`'s CONFIG_DIR/STATE_DIR, 
+`core/audio.py`'s WHISPER_MODEL_DIR, the bubble, the settings app), and three
+guards close the door:
+
+* **no collection-time import** of a discovered module — `from core.tools
+  import X`, `from core import tools` and `import core.tools` all resolve to the
+  same banned name, and a rename that emptied the discovered set fails the
+  guard instead of making it vacuous;
+* **the loader refuses to hand back a real-home module**: after `exec_module`,
+  `_load` checks the module's own path constants and raises naming every one
+  that points into the developer's home. The failure lands on the load, not on
+  whichever test later compares paths — or on the developer's disk;
+* **a sweep of the live process**: whatever a test loaded and however it loaded
+  it, no app module alive in `sys.modules` may hold a path constant under the
+  developer's home. This is the assertion the request is actually about, and it
+  found two real leaks no structural guard could see.
+
+### What the sweep found
+
+**The settings app exec'd a second bubble.** `_LazyHandsoff` exec's `handsoff.py`
+on first attribute use — a moment no loader wraps, because the caller decides
+when — and a second bubble is not a second view of one app: it is a second app
+with its own CONFIG_DIR/SETTINGS, and its module body calls
+`core.audio.configure(...)`, which repointed the SHARED core.audio at that
+copy's `WHISPER_MODEL_DIR` (the developer's real one). Two causes, one fix each:
+`_import_handsoff()` now returns a bubble already registered in this process
+(the name the bubble hashes itself under, which is also the name an embedder
+registers it under), and conftest hands the session's registration back around
+every test, because two extraction tests deliberately empty `handsoff*` from
+`sys.modules` to prove `core/doctor` imports without the monolith — and nothing
+put it back. Only the shuffled order caught it: in collection order the eviction
+happened before the app's first lazy load, so the key was still there.
+
+### The incident this pass caused, and the guard that now prevents it
+
+One mutation in the sweep removed the sandbox from `_load`, and the write-
+through test — which proves a write through a loaded module lands in the
+sandbox — wrote where the un-sandboxed load pointed it: **the developer's real
+`~/.config/niri/config.kdl`**, 24 bytes of `// written by the suite`. The include
+files (keybinds, rules, monitor) were untouched. Recovered from the newest
+`nimod` backup and validated with `niri validate` (`config is valid`); the
+damaged file is kept as `config.kdl.written-by-suite`. Two changes follow from
+it: the test now **refuses to write** when the target is inside the real home
+(checking after the write is one write too late — the assertion that noticed was
+the report, not the safety catch), and the loader's post-exec refusal means an
+unsandboxed load fails before any test body can act on the module.
+
+### Measured
+
+* **6/6 mutations of the isolation caught**, including the one that caused the
+  incident — and the real niri config's mtime is byte-for-byte unchanged across
+  a sweep that runs it (the safety catch, measured rather than asserted);
+* 18 sandbox guards, among them: XDG pinned for the in-process half as well as
+  the child env, `run_driver`'s child proving its own HOME is a temp dir, a
+  loaded app not exec'ing a second bubble, and the live-process sweep.
+
+1022 tests green in seven orderings (default, shuffled-test seeds
+1/424242/deadbeef/20260913, shuffled-file seeds 2/cafef00d/7), coverage 78.21 %
+(≥ 70), `ci/compile_all.py` clean (41 files), deployed `in-sync` (15/15 files,
+three-way TRUE, `--ptt status`/`health` answering). The shipped change is
+`handsoff-settings.py` (a no-op in production, where no process has loaded a
+bubble before the app starts). Nothing committed.
+
+## Addendum — 2026-09-13 appearance: the mask, the wallpaper and the black design
+
+Three complaints, reported twice: *the bubble breaks if you make it bigger*, *if
+you keep it bigger and swap shapes the design mismatches*, and *colours never
+apply when you click "match wallpaper" — they look hardcoded for pikachu and the
+Eye of Sauron*. Measured before editing, one cause each; **both designs the user
+named do read the palette**, which the fourth item below settles with numbers.
+
+**(1) The mask never followed the widget.** `BubbleWidget.showEvent` set
+`setMask(QRegion(self.rect(), QRegion.Ellipse))` — a QRegion mask is in WIDGET
+coordinates and Qt keeps it exactly as it was, so the aperture stayed the size
+the bubble was born at. Measured: **mask 128×128 while the widget was 192×192**.
+That is one cause for both reports: a size change drew the new, scaled design
+through the old circle ("bigger breaks it"), and at the larger size every
+shape's own scaled geometry was clipped by the same stale smaller ellipse
+("swap shapes and it mismatches"). `_apply_mask()` is now called from
+`resizeEvent` and `showEvent`, so the aperture is always the current rect; the
+live settings reload (`setFixedSize`) goes through the same path. Pinned by
+`resizing_the_bubble_keeps_its_aperture`, which grows AND shrinks and also
+asserts the mask is still an ellipse (a fix that widened the aperture to the
+rectangle would pass the size assertions).
+
+**(2) "Match wallpaper" could never do anything here.** The button consulted the
+niri config alone, and a niri config names a wallpaper only when something like
+`swaybg` is spawned from it — this desktop's wallpaper is a shell-owned VIDEO in
+a cache directory, so `detect_wallpaper_luminance` returned `None` **every
+time** and the click was a no-op with a message blaming ImageMagick, which was
+installed all along. Discovery now covers what the desktop actually uses: the
+niri config (quoted and bare forms), the shell's `wallpaper.directory` setting,
+its `large`/`thumbnails` caches, the `swayg` per-output cache and
+`hyprpaper.conf`, newest-first, deduplicated, and a **video is sampled by
+extracting a frame a second in** (frame 0 of a looped wallpaper is a fade-in to
+black, whose "average colour" would tune the palette for a black backdrop).
+`wallpaper_report()` returns the path, the luminance and every location tried,
+and the status line now names the file it sampled or says what it looked at, so
+"nothing happened" and "it read the wrong wallpaper" cannot look the same. Pinned
+by five `TestWallpaperDiscovery` tests plus the GUI scenario.
+
+**(3) One design really was colour-blind, and it was not one of the two named.**
+Rendering every design offscreen with everything frozen at idle — state, level,
+radius, clock — and changing ONLY `self._color_ui` (the colour `_frame()`
+publishes as `f["color"]`), then counting pixels that differ by a visible step
+(≥ 48 in some channel): **void reported 8 pixels of 45 796** — the black disc is
+deliberately black and its only state-coloured elements were ~2 px spiral streaks
+at 22/255 and a hairline rim at 40/255. Picking a colour was, in effect,
+disabled on that design while working on every other one (next weakest:
+equalizer, 804). Void now draws the same broad state-coloured halo the orb uses
+for its own dark body: **8 → 1856 px**, mean delta on the band 8.4 → 148.2. The
+same instrument measured `pikachu` at **4296** and `sauron` at **2104** visible
+pixels *before* any change — they are not hardcoded, and the alpha floors I first
+raised on their auras measured as no-ops (annulus mean delta +0.2 on pikachu), so
+those speculative edits were **reverted rather than shipped**. Pinned by
+`every_design_shows_the_state_colour`; the bar is 400, deliberately between the
+broken measurement (8) and the least-visible working design (~800).
+
+**(4) The Appearance tab refuses colours the bubble would discard.**
+`coerce_settings` filters state colours only for type, so a hand-edited `"blue"`,
+`"#4f8cffXYZ"` or `"#12345"` was drawn on the swatch as though live and then
+silently dropped by the parser — the bubble kept the old colour while the GUI
+said otherwise. Admission now uses `hex_to_rgb` itself, replaces a rejected value
+with its default and says so in the status bar, normalises a `#`-less but valid
+colour for the swatch, and checks the dialog's own result; `self.cfg` is
+deliberately not mutated at load so a plain reload cannot look like an unsaved
+edit.
+
+Two smaller defects were fixed with them: `hex_to_rgb` prefix-matched, so
+`'#4f8cffXYZ'` returned `(79,140,255)` and an 8-digit `#RRGGBBAA` was silently
+truncated to its first six (now `fullmatch`), and
+`tune_colors_for_background(colors, None)` raised `TypeError` while
+`detect_wallpaper_luminance` returns `None` on **every** failure path — breaking
+that function's own documented promise (now a no-op).
+
+**10/10 mutations back to the old behaviour are caught**: the check-then-act mask,
+a rectangular mask, no halo on void, the niri-config-only detector, no video
+frame extraction, prefix `hex_to_rgb`, the raising `None` path, a report that
+forgets which file it used, and the two colour-admission reversions. 1035 tests
+green in seven orderings (default, shuffled-test seeds 1/424242/deadbeef/
+20260913, shuffled-file seeds 2/cafef00d/7), coverage **78.56 % ≥ 70** with
+`core/theme.py` back at **100 %** after the new discovery branches were covered
+(rather than the claim being lowered), `ci/compile_all.py` clean (41 files),
+deployed `in-sync`. Nothing committed.
+
+## Addendum — 2026-09-13 one app per process: the canonical module name
+
+The app had no identity. Every loader in the tree invented a name of its own —
+`conftest` registered the bubble as `handsoff_core` **and** a bare `handsoff`
+alias, `handsoff-settings.py` spec-loaded its own copy under `handsoff_core`, the
+offscreen GUI driver used `handsoff_core_gui`, the hardening driver
+`handsoff_no_audio` — and the *running* bubble (`python handsoff.py`) was
+`__main__`, reachable under no name at all. So "is the app already loaded in this
+process?" had no answer anything could ask, and each of those paths could exec a
+**second app**: its own CONFIG_DIR/STATE_DIR/SETTINGS and model mirrors, and a
+module body that calls `core.audio.configure(...)` — which repoints the SHARED
+`core.audio` at whichever copy loaded last. A previous batch fixed one instance
+of this (the settings app's lazy loader) by caching under the very name
+`conftest` happened to use; that was a coincidence holding the line, not a rule.
+
+### One name, owned by `core`
+
+`core.APP_MODULE_NAME` ("handsoff_core") is the single definition — `core` already
+owns module identity (`_origin_ok`, `load_module`) — and `handsoff.py` imports it
+rather than respelling it. `handsoff.py` then **registers itself** in
+`_claim_app_name()`, at the earliest point the name is available: immediately
+after the `core` package loads and *before* anything the body can do to shared
+state (the earliest such call, `_audio.configure(...)`, is ~1000 lines below). It
+refuses in the two cases that would otherwise run two apps quietly:
+
+* **unnamed** — `module_from_spec(...)` + `exec_module(...)` with no `sys.modules`
+  entry executes the app into a namespace nothing can see, which cannot be told
+  apart from a duplicate, so the loader is required to name it first;
+* **a second copy** — the canonical name already holds a different live module.
+  Refused by name, instead of being discovered later as a repointed `core.audio`
+  or a diverged SETTINGS.
+
+Two records of one fact back this: the canonical `sys.modules` entry (what every
+loader looks up) and an out-of-band `core._APP_INSTANCE`. The second is not
+belt-and-braces for its own sake — the suite's extraction tests pop `handsoff*`
+from `sys.modules` on purpose, and a lazy loader exec'ing a second bubble through
+exactly that window is a bug this repo has already had once.
+
+### One loader, in `core`
+
+`core.load_app_module(candidates)` replaces every hand-built load:
+
+* an app that is already running is **returned, never re-exec'd**;
+* the slot is claimed with `sys.modules.setdefault` **before** the module
+  executes, so the module finds itself in `sys.modules` (which is what lets the
+  app refuse an unnamed load) and two racing loaders execute at most one copy —
+  the loser receives the winner's module having exec'd nothing;
+* a load that raises **gives the slot back**, so a failed exec cannot leave a
+  half-initialised app for the next caller;
+* a foreign occupant is refused using the same origin rule as `load_module`.
+
+`__app_ready__`, set as the last statement of `handsoff.py`'s body, is what makes
+"already running" mean *finished*: `core.app_module()` hands out only a whole app,
+so a caller cannot read `SETTINGS` off a module that is still executing.
+
+### What went with it
+
+* The **bare `handsoff` alias is retired** (`conftest._APP_MODULE_NAMES` is one
+  name). Two names for one app is the ambiguity being removed, and a stray
+  `import handsoff` now fails loudly rather than silently satisfying itself from
+  an alias. `core.doctor`'s "must not import the monolith" test was asserting on
+  that bare name, i.e. it would have passed while looking at nothing; it now
+  asserts the canonical one.
+* `conftest._load` **reuses** the running app for `handsoff.py` instead of
+  overwriting the canonical entry — the overwrite would have defeated the whole
+  guarantee while still looking like a load.
+* The offscreen GUI driver and the hardening driver **name their modules before
+  executing them** (the hardening driver keeps a local name on purpose: it wants
+  one app in a child, not the deployed identity).
+* The settings app's `_import_settings_schema` now goes through
+  `core.load_module` like every other support module. Loading it by hand under a
+  private name gave that process **two schema dicts** whenever the bubble was
+  loaded first — the same defect shape, one size smaller.
+
+### Verified
+
+**9/9 mutations back to the old behaviour are caught**, each at behaviour level
+(where two mechanisms guarantee one property, the mutation removes both rather
+than pretending to test a layer): a second copy allowed to run, an unnamed load
+allowed, the app not publishing its own name, the bare alias restored, the
+instance record dropped, the loader exec'ing even when an app is running, a failed
+exec not returning the slot, the settings app building the module by hand again,
+and the test loader exec'ing the app again. 1042 tests green in seven orderings
+(default, shuffled-test seeds 1/424242/deadbeef/20260913, shuffled-file seeds
+2/cafef00d/7), coverage **78.57 % ≥ 70**, `ci/compile_all.py` clean (41 files),
+deployed `in-sync`. The production path is covered rather than assumed: one guard
+child does a plain `import handsoff` and asserts the canonical registration, the
+instance record, `__app_ready__` and `app_module()`; another starts the real
+bubble as a script (`__main__`) and talks to it over the control socket. Nothing
+committed.

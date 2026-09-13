@@ -32,6 +32,8 @@ from collections import deque
 from pathlib import Path
 from contextvars import ContextVar
 
+from core import registry as _registry
+
 
 class _InjectedProxy:
     def __init__(self, fallback):
@@ -77,9 +79,14 @@ _DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
 _MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
 _WMO = {}
 _SPLIT_EDIT_FILES = frozenset({"settings_schema.py", "hardware.py", "handsoff-settings.py"})
-_SNOOZE_LOCK = threading.Lock()
-_snooze_offer = {}
-_kill_offer = {}
+# Every cap and every offer goes through core.registry, which owns BOTH the
+# arm/read/consume (or reserve/commit) sequence and the lock behind it. These
+# were hand-rolled here: a bare dict armed with clear()+update(), where a
+# reader landing between the two steps saw an EMPTY offer for one that exists
+# and answered "nothing to confirm"; and the _kill_offer lock that only fixed
+# that one dict while the next registry grew the same defect.
+_snooze_offer = _registry.Offer("snooze")
+_kill_offer = _registry.Offer("kill")
 _DEFAULT_DEPS._log_metadata = _default_log_metadata
 _DEFAULT_DEPS.log = log = logging.getLogger("handsoff.tools")
 _DEFAULT_DEPS.STATE_DIR = STATE_DIR
@@ -563,7 +570,11 @@ def coerce_bool_arg(raw) -> bool:
     if isinstance(raw, bool):
         return raw
     if isinstance(raw, (int, float)):
-        return bool(raw)
+        # Only 0 and 1 are meaningful: bool(2) is True, so any number at all
+        # used to pass as a flag the model never actually asked for.
+        if raw in (0, 1):
+            return bool(raw)
+        raise ValueError(f"expected true or false, got {raw!r}")
     token = str(raw).strip().lower()
     if token in _BOOL_TRUE:
         return True
@@ -617,7 +628,7 @@ class ToolBelt:
     MAX_SELF_EDIT = 500000  # self/split whole-file replace cap (handsoff.py ~270KB)
     TIMEOUT = 15
 
-    def __init__(self, on_restart_pending: 'callable', permissions: dict | None=None, on_timer: 'callable | None'=None, on_notification: 'callable | None'=None, on_announce: 'callable | None'=None, on_pomodoro: 'callable | None'=None, dependencies=None) -> None:
+    def __init__(self, on_restart_pending: 'callable', permissions: dict | None=None, on_timer: 'callable | None'=None, on_notification: 'callable | None'=None, on_announce: 'callable | None'=None, on_pomodoro: 'callable | None'=None, on_cap_refusal: 'callable | None'=None, dependencies=None) -> None:
         self._dependencies = dependencies or _DEFAULT_DEPS
         self._deps = self._dependencies
         _CURRENT.set(self._dependencies)
@@ -625,35 +636,35 @@ class ToolBelt:
         self._on_timer = on_timer
         self._on_notification = on_notification
         self._on_announce = on_announce
+        # The host decides whether a refusal is worth SAYING out loud (and how
+        # often); this belt only knows that a cap turned work away.
+        self._on_cap_refusal = on_cap_refusal
         self._on_pomodoro = on_pomodoro
         self._policy = DecisionPolicy()
-        self._jobs: dict[str, BoundedJob] = {}
-        self._job_seq = 0
-        self._job_lock = threading.Lock()
-        self._pending_confirm: dict | None = None
-        self._confirm_lock = threading.RLock()
+        # One admission owner per bounded resource. The cap is enforced while
+        # the registry's own lock is held, and the slow prepare (fork/exec,
+        # thread spawn) runs holding a reservation — so two overlapping calls
+        # cannot both be told there is room, which is how this used to start
+        # seven jobs against a cap of four.
+        self._jobs = _registry.BoundedRegistry("job", BoundedJob.MAX_JOBS)
+        self._pending_confirm = _registry.Offer("confirm")
         self._user_turn_marker = 0
         self._last_confirmation_offer = False
         self._confirm_running: str | None = None
         self._last_images: list[str] = []
         self._elements_ts: float = 0.0
         self._pointer_scale: float = 1.0
+        # The two watcher registries share one lock on purpose: stop_watchers()
+        # clears both as a single step, so a watcher cannot start in the gap.
         self._watch_lock = threading.RLock()
-        self._file_watchers: dict[str, tuple[threading.Event, threading.Thread]] = {}
-        self._process_watchers: dict[str, tuple[threading.Event, threading.Thread]] = {}
+        self._file_watchers = _registry.BoundedRegistry("watch-file", 4, lock=self._watch_lock)
+        self._process_watchers = _registry.BoundedRegistry("watch-process", 4, lock=self._watch_lock)
         self._tool_times: deque[float] = deque(maxlen=60)
         self._perm = {'run_command': True, 'read_file': True, 'edit_file': True, 'self_restart': True, **(permissions or {})}
 
     def _set_user_turn(self, marker: int) -> None:
         """Stamp tool calls belonging to one explicit user utterance."""
         self._user_turn_marker = max(getattr(self, '_user_turn_marker', 0), int(marker))
-
-    def _confirmation_lock(self):
-        lock = getattr(self, '_confirm_lock', None)
-        if lock is None:
-            lock = threading.RLock()
-            self._confirm_lock = lock
-        return lock
 
     def _is_self_edit(self, args: dict) -> bool:
         """True when this edit_file call targets handsoff.py itself."""
@@ -789,22 +800,21 @@ class ToolBelt:
             log_decision(name, target, 'DENY', 'refused: command_policy DENY')
             return (f"REFUSED: '{name}' is DENIED by the user's command policy (handsoff settings) — do not retry this turn", True)
         if verdict == 'CONFIRM' and getattr(self, '_confirm_running', None) != name:
-            with self._confirmation_lock():
-                # Whole offer decision inside one lock: previously the snapshot
-                # was taken here and re-read after the release, which reads like
-                # a check-then-act TOCTOU even though the only thing the second
-                # read did was add a log line.
-                pending = self._pending_confirm
-                marker = getattr(self, '_user_turn_marker', 0)
-                repeat = (pending is not None and pending.get('tool') == name
-                          and pending.get('turn') == marker)
-                if not repeat:
-                    self._pending_confirm = {'tool': name, 'args': dict(args),
-                                             'until': time.monotonic() + self._policy.confirm_seconds(),
-                                             'turn': marker}
-                log_decision(name, target, 'CONFIRM',
-                             'still awaiting confirm_action' if repeat
-                             else 'offered; awaiting confirm_action')
+            # "Is there already an offer for this call?" and "arm one" are a
+            # single step: a model looping on the same call in the same turn
+            # must not keep extending its own confirmation window, and two
+            # callers must not both decide to arm. An EXPIRED offer does not
+            # match, so it is re-armed instead of leaving the user with a
+            # window that has already closed.
+            marker = getattr(self, '_user_turn_marker', 0)
+            armed = self._pending_confirm.arm_unless(
+                lambda live: (live.get('tool') == name
+                              and live.get('turn') == marker),
+                self._policy.confirm_seconds(),
+                tool=name, args=dict(args), turn=marker)
+            log_decision(name, target, 'CONFIRM',
+                         'offered; awaiting confirm_action' if armed
+                         else 'still awaiting confirm_action')
             self._last_confirmation_offer = True
             extra = ''
             if name == 'edit_file' and self._is_self_edit(args):
@@ -1512,10 +1522,10 @@ class ToolBelt:
         key = str(p)
         if action == 'list':
             with self._watch_lock:
-                return 'file watchers: ' + (', '.join(self._file_watchers) or 'none')
+                return 'file watchers: ' + (', '.join(self._file_watchers.keys()) or 'none')
         if action == 'stop':
             with self._watch_lock:
-                item = self._file_watchers.pop(key, None)
+                item = self._file_watchers.release(key)
             if item:
                 item[0].set()
                 return f'stopped watching {p}'
@@ -1538,16 +1548,20 @@ class ToolBelt:
         if risky:
             return (f'REFUSED: {risky}. Use a simpler pattern — a watcher runs '
                     f'your regex on every appended line, once a second.')
-        with self._watch_lock:
-            if key not in self._file_watchers and len(self._file_watchers) >= 4:
-                return 'ERROR: maximum of four file watchers reached'
-            old = self._file_watchers.pop(key, None)
-            if old:
-                old[0].set()
-            stop = threading.Event()
-            thread = threading.Thread(target=self._file_watch_loop, args=(p, rx, stop, self._watch_emit), name='watch-file', daemon=True)
-            self._file_watchers[key] = (stop, thread)
-            thread.start()
+        # reserve/commit, not check-then-insert. `replace=True` is what makes
+        # re-watching the same path cost no second slot: an existing key is
+        # room even at the cap, and the entry it displaces is handed back for
+        # the caller to stop OUTSIDE the registry's lock.
+        slot = self._file_watchers.reserve(key, replace=True)
+        if slot is None:
+            self._refused_at_cap(self._file_watchers, f'watch_file {p}')
+            return 'ERROR: maximum of four file watchers reached'
+        stop = threading.Event()
+        thread = threading.Thread(target=self._file_watch_loop, args=(p, rx, stop, self._watch_emit), name='watch-file', daemon=True)
+        _key, displaced = slot.commit((stop, thread))
+        if displaced:
+            displaced[0].set()
+        thread.start()
         return f'watching {p} for /{rx.pattern}/ (starts at the current end)'
 
     @tool(gates='watchers', description='Watch one exact same-user process name and announce when it exits. action=start/stop/list; max four process watchers.')
@@ -1556,35 +1570,36 @@ class ToolBelt:
         name = str(name or '').strip()
         if action == 'list':
             with self._watch_lock:
-                return 'process watchers: ' + (', '.join(self._process_watchers) or 'none')
+                return 'process watchers: ' + (', '.join(self._process_watchers.keys()) or 'none')
         if not name or len(name) > 128 or (not re.fullmatch('[A-Za-z0-9_.@+-]+', name)):
             return 'ERROR: process name must be an exact simple name'
         if action == 'stop':
             with self._watch_lock:
-                item = self._process_watchers.pop(name.lower(), None)
+                item = self._process_watchers.release(name.lower())
             if item:
                 item[0].set()
                 return f'stopped watching process {name}'
             return f'no process watcher for {name}'
         if action != 'start':
             return 'ERROR: action must be start, stop or list'
-        with self._watch_lock:
-            if name.lower() not in self._process_watchers and len(self._process_watchers) >= 4:
-                return 'ERROR: maximum of four process watchers reached'
-            old = self._process_watchers.pop(name.lower(), None)
-            if old:
-                old[0].set()
-            stop = threading.Event()
-            thread = threading.Thread(target=self._process_watch_loop, args=(name, stop, self._watch_emit), name='watch-process', daemon=True)
-            self._process_watchers[name.lower()] = (stop, thread)
-            thread.start()
+        slot = self._process_watchers.reserve(name.lower(), replace=True)
+        if slot is None:
+            self._refused_at_cap(self._process_watchers, f'watch_process {name}')
+            return 'ERROR: maximum of four process watchers reached'
+        stop = threading.Event()
+        thread = threading.Thread(target=self._process_watch_loop, args=(name, stop, self._watch_emit), name='watch-process', daemon=True)
+        _key, displaced = slot.commit((stop, thread))
+        if displaced:
+            displaced[0].set()
+        thread.start()
         return f'watching process {name} for exit'
 
     def stop_watchers(self) -> None:
+        # Both registries share one lock, so both clears — and therefore the
+        # whole teardown — are a single step: a watcher cannot be admitted
+        # between them and survive the stop.
         with self._watch_lock:
-            items = list(self._file_watchers.values()) + list(self._process_watchers.values())
-            self._file_watchers.clear()
-            self._process_watchers.clear()
+            items = self._file_watchers.clear() + self._process_watchers.clear()
         for stop, _thread in items:
             stop.set()
 
@@ -2092,9 +2107,10 @@ class ToolBelt:
         items = _dep()._load_reminders()
         matches = [r for r in items if r['name'].lower() == name or (len(name) >= 3 and r['name'].lower().startswith(name))]
         if not matches:
-            with _dep()._SNOOZE_LOCK:
-                offer = dict(_dep()._snooze_offer) if _dep()._snooze_offer else None
-            if offer and time.monotonic() < offer['until'] and (name == offer['name'].lower() or offer['name'].lower().startswith(name)):
+            # state() applies the window itself: no call site can forget the
+            # deadline and act on a snooze offer that has already closed.
+            offer, _expired = _dep()._snooze_offer.state()
+            if offer and (name == offer['name'].lower() or offer['name'].lower().startswith(name)):
                 return self._snooze(offer['name'], minutes, 0)
             return f"no reminder matching {name!r} — if it already fired, say 'snooze' within 90 seconds of the announcement"
         if len(matches) > 1:
@@ -2533,28 +2549,31 @@ class ToolBelt:
             return 'REFUSED: that is me — for a restart of the assistant, ask me to restart myself instead'
         if name == 'systemd':
             return 'REFUSED: systemd --user manages your whole session — killing it would stop every user service, including me'
-        _dep()._kill_offer.clear()
-        _dep()._kill_offer.update({'pid': pid, 'name': name, 'until': time.monotonic() + self.KILL_CONFIRM_S})
+        _dep()._kill_offer.arm(self.KILL_CONFIRM_S, pid=pid, name=name)
         _dep().log.info('kill_process: offered pid %d (%s), awaiting confirm', pid, name)
         return f"About to stop {name} (pid {pid}). Nothing happened yet — call confirm_kill('yes') to stop it, or confirm_kill('no') to cancel."
 
     @tool(gates='run_command', description="Second step of kill_process: confirm_kill('yes') stops the offered process; confirm_kill('no') cancels the offer.")
     def confirm_kill(self, answer: str='yes') -> str:
-        offer = dict(_dep()._kill_offer) if _dep()._kill_offer else None
-        if not offer:
+        # The offer owns its own lock. Arming is ONE assignment, so no reader
+        # can see it half-armed; `consume()` is the claim, so two racing
+        # confirmations cannot both send SIGTERM for one offer.
+        offer, expired = _dep()._kill_offer.state()
+        if offer is None:
+            if expired:
+                return 'ERROR: the kill offer expired — run kill_process again'
             return 'ERROR: nothing to confirm — call kill_process first'
-        if time.monotonic() >= offer['until']:
-            _dep()._kill_offer.clear()
-            return 'ERROR: the kill offer expired — run kill_process again'
         ans = str(answer or 'yes').strip().lower()
         if ans not in ('yes', 'no', 'y', 'n'):
+            # NOT consumed: an unusable answer leaves the offer open.
             return 'ERROR: answer with yes or no'
+        claimed = _dep()._kill_offer.consume()
+        if claimed is None:
+            return 'ERROR: nothing to confirm — call kill_process first'
         if ans in ('no', 'n'):
-            _dep()._kill_offer.clear()
             _dep().log.info('kill_process: cancelled by user/model')
             return 'Cancelled — nothing was stopped.'
-        pid, name = (offer['pid'], offer['name'])
-        _dep()._kill_offer.clear()
+        pid, name = (claimed['pid'], claimed['name'])
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -2566,27 +2585,32 @@ class ToolBelt:
 
     @tool(description="Second step for a CONFIRM-offered tool: 'yes' runs, 'no' cancels.", gates='', aliases={'answer': ('confirm', 'reply')})
     def confirm_action(self, answer: str='yes') -> str:
-        with self._confirmation_lock():
-            offer = self._pending_confirm
-            if not offer:
-                return 'ERROR: nothing to confirm — no CONFIRM-class tool call is pending'
-            if time.monotonic() >= offer['until']:
-                self._pending_confirm = None
+        # `state()` applies the deadline itself and clears a window that has
+        # closed, so neither error path can be reached with a stale offer.
+        # `consume()` is the CLAIM: the second of two racing confirmations gets
+        # None and refuses, instead of both running the tool.
+        offer, expired = self._pending_confirm.state()
+        if offer is None:
+            if expired:
                 return 'ERROR: the confirmation offer expired — make the request again'
-            current_turn = getattr(self, '_user_turn_marker', 0)
-            if current_turn <= offer.get('turn', 0):
-                return 'ERROR: confirmation was requested in the same turn; try again in a later user turn'
-            ans = str(answer or 'yes').strip().lower()
-            if ans not in ('yes', 'no', 'y', 'n'):
-                return 'ERROR: answer with yes or no'
-            if ans in ('no', 'n'):
-                tool = offer['tool']
-                self._pending_confirm = None
-                _dep().log_decision(tool, '', 'CONFIRM', 'cancelled by user')
-                _dep().log.info('confirm_action: %s cancelled', tool)
-                return f'Cancelled — {tool} was not run.'
-            self._pending_confirm = None
-            tool, args = (offer['tool'], offer['args'])
+            return 'ERROR: nothing to confirm — no CONFIRM-class tool call is pending'
+        current_turn = getattr(self, '_user_turn_marker', 0)
+        if current_turn <= offer.get('turn', 0):
+            return 'ERROR: confirmation was requested in the same turn; try again in a later user turn'
+        ans = str(answer or 'yes').strip().lower()
+        if ans not in ('yes', 'no', 'y', 'n'):
+            # Deliberately NOT consumed: an unusable answer leaves the offer
+            # open so the user can answer again.
+            return 'ERROR: answer with yes or no'
+        claimed = self._pending_confirm.consume()
+        if claimed is None:
+            return 'ERROR: nothing to confirm — no CONFIRM-class tool call is pending'
+        tool = claimed['tool']
+        if ans in ('no', 'n'):
+            _dep().log_decision(tool, '', 'CONFIRM', 'cancelled by user')
+            _dep().log.info('confirm_action: %s cancelled', tool)
+            return f'Cancelled — {tool} was not run.'
+        args = claimed['args']
         _dep().log_decision(tool, _log_target(args, 120), 'CONFIRM', 'confirmed; running')
         self._confirm_running = tool
         try:
@@ -2597,29 +2621,99 @@ class ToolBelt:
         return out
     JOB_ANNOUNCE_S = 20.0
 
+    def _refused_at_cap(self, registry, detail: str) -> None:
+        """Shout about — and record — a cap turning real work away.
+
+        A refusal used to exist only in the string handed back to the model, so
+        a run that hit its own cap left no trace anywhere a later diagnosis
+        could look: not the journal, not the state, not the doctor. That is
+        backwards — a cap refusing work is exactly the event worth keeping, and
+        the shape that let the job cap be OVERSHOT was only ever found by
+        reading the source, never by anything the running bubble said.
+
+        Logged at WARNING (the journal is what an audit reads) and handed to the
+        host, which keeps a durable record so the report survives the process
+        that refused it. Both steps are best-effort: reporting must never be a
+        reason a refusal takes a different path.
+        """
+        report = registry.refusal_report() or {}
+        # The sentence is rendered by the registry so this log line and the
+        # control server's read identically — one event, one wording.
+        _dep().log.warning("cap refusal: %s", registry.refusal_line(detail))
+        recorder = getattr(_dep(), "_record_cap_refusal", None)
+        if recorder is not None:
+            try:
+                recorder({**report, "detail": detail})
+            except Exception:
+                _dep().log.exception("cap-refusal recorder failed")
+        # The journal and the durable record are both things the user has to go
+        # and read, so the host is offered the refusal to SPEAK. It owns the
+        # wording and the rate limit; a belt without a host (tests, embedding)
+        # simply logs, which is what it did before.
+        teller = getattr(self, "_on_cap_refusal", None)
+        if teller is not None:
+            try:
+                teller(report, detail)
+            except Exception:
+                _dep().log.exception("cap-refusal announcement failed")
+
+    def _cap_refusal_note(self, registry: str) -> str:
+        """Host-rendered note about past refusals at `registry`, or ''.
+
+        The wording lives in the host so the journal, the conversation and the
+        doctor cannot drift into three different accounts of the same event.
+        """
+        render = getattr(_dep(), "_cap_refusal_note", None)
+        if render is None:
+            return ""
+        try:
+            return str(render(registry) or "")
+        except Exception:
+            _dep().log.exception("cannot render the cap-refusal note")
+            return ""
+
     @tool(description='Run a whitelisted command as a background job.', gates='run_command')
     def start_command(self, command: str) -> str:
         """Run a whitelisted command as a bounded background job.
 
         command: same single whitelisted command run_command accepts
         """
-        with self._job_lock:
-            if len(self._jobs) >= BoundedJob.MAX_JOBS:
-                return f"ERROR: job limit reached ({BoundedJob.MAX_JOBS}) — check or reap with job_status first: {', '.join(sorted(self._jobs))}"
-        argv, _exe, err, is_restart = self._validate_command(command)
-        if err:
-            return err
-        _dep().log.info('start_command: %s', _dep()._log_metadata(command, 'command'))
-        try:
-            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
-        except OSError as e:
-            return f'ERROR: launch failed: {e}'
+        # Reservation FIRST, then the slow part.
+        #
+        # The slot counts against the cap the moment it is taken, so there is
+        # no window in which two callers both see room: the "is there room?"
+        # check and the "make it so" insert are the same step. That is the
+        # whole difference from the shape this replaces — check under the
+        # lock, release it across validate+Popen (slow on purpose, fork/exec
+        # must not run under it), then insert and hope nobody took the slot.
+        # Measured with eight threads parked in that window: seven jobs
+        # against a cap of four.
+        #
+        # Because nothing is spawned that could later be refused, the surplus
+        # case (a Popen nobody would ever poll, reap or kill) no longer
+        # exists — so there is no SIGTERM/SIGKILL/close-stdout recovery path
+        # hanging off the end of this method, and no way to leak one.
+        slot = self._jobs.reserve()
+        if slot is None:
+            self._refused_at_cap(self._jobs, f"start_command {command.strip()!r}")
+            return f"ERROR: job limit reached ({BoundedJob.MAX_JOBS}) — check or reap with job_status first: {', '.join(self._jobs.keys())}"
+        with slot:
+            argv, _exe, err, is_restart = self._validate_command(command)
+            if err:
+                return err
+            _dep().log.info('start_command: %s', _dep()._log_metadata(command, 'command'))
+            try:
+                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            except OSError as e:
+                return f'ERROR: launch failed: {e}'
+            # The key is minted inside the same lock that inserts, so two
+            # jobs can never be handed the same id.
+            job_id, _displaced = slot.commit(
+                lambda key: BoundedJob(key, command.strip(), proc))
         if is_restart:
+            # AFTER admission: a job refused at the cap never ran, so it must
+            # not leave the bubble believing a restart is in flight.
             self._on_restart_pending()
-        with self._job_lock:
-            self._job_seq += 1
-            job_id = f'job-{self._job_seq}'
-            self._jobs[job_id] = BoundedJob(job_id, command.strip(), proc)
         return f'started {job_id}: {command.strip()} — it runs in the background; call job_status to check it. I will announce when it finishes.'
 
     @tool(description='State/output of start_command jobs; finished announced', gates='run_command', aliases={'job_id': ('id', 'job')})
@@ -2628,8 +2722,7 @@ class ToolBelt:
 
         job_id: a specific job id, or empty for all jobs
         """
-        with self._job_lock:
-            jobs = dict(self._jobs)
+        jobs = self._jobs.snapshot()
         if job_id:
             job = jobs.get(job_id.strip())
             if job is None:
@@ -2637,7 +2730,9 @@ class ToolBelt:
                 return f'ERROR: no job {job_id!r} (jobs: {known})'
             jobs = {job_id.strip(): job}
         if not jobs:
-            return 'no background jobs'
+            # 'no background jobs' is also what a run that hit the cap looks
+            # like from here, so the refusal is reported alongside it.
+            return self._with_job_cap_note('no background jobs')
         lines: list[str] = []
         reaped: list[str] = []
         for jid, job in sorted(jobs.items()):
@@ -2661,10 +2756,13 @@ class ToolBelt:
                     reaped.append(jid)
             else:
                 lines.append(status)
-        with self._job_lock:
-            for jid in reaped:
-                self._jobs.pop(jid, None)
-        return '\n\n'.join(lines)
+        for jid in reaped:
+            self._jobs.release(jid)
+        return self._with_job_cap_note('\n\n'.join(lines))
+
+    def _with_job_cap_note(self, text: str) -> str:
+        note = self._cap_refusal_note('job')
+        return f'{text}\n\n{note}' if note else text
 
     @tool(description='Self-diagnostic: deployment hashes, Ollama, TTS/STT, mic, niri, systemd. Read-only', gates='')
     def handsoff_doctor(self) -> str:

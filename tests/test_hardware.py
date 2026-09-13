@@ -5,7 +5,6 @@ for the ydotool connectability unit tests). Style mirrors
 test_hardening.py (module loaded by path, tmp sandbox dirs)."""
 from __future__ import annotations
 
-import importlib.util
 import json
 import socket
 import types
@@ -13,17 +12,16 @@ from pathlib import Path
 
 import pytest
 
-from conftest import HERE as ROOT
+from conftest import HERE as ROOT, _load as _load_module
 
 HERE = ROOT   # the repo root
 
 
 def _load_hw():
-    spec = importlib.util.spec_from_file_location(
-        "hardware_mod", HERE / "hardware.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    # Through conftest's loader, so this in-process load resolves its user
+    # directories in the same throw-away HOME as every other one. It is not a
+    # hand-built spec: that is how the sandbox gets lost without a word.
+    return _load_module("hardware_mod", HERE / "hardware.py")
 
 
 @pytest.fixture(scope="module")

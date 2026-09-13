@@ -2,10 +2,12 @@
 monolithic test_handsoff.py; see test_*.py modules for the areas)."""
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
 import os
 import random
+import subprocess
 import sys
 import tempfile
 import threading
@@ -14,6 +16,12 @@ from pathlib import Path
 
 import numpy as np   # noqa: F401  (test modules rely on it being imported)
 import pytest
+
+# The app's canonical module name, from its ONE definition. Imported at conftest
+# import time (before any sandbox): core/__init__.py resolves no user directory
+# while it is imported — only inside its functions — so this cannot bake the
+# developer's HOME into anything.
+from core import APP_MODULE_NAME, app_instance, app_module
 
 HERE = Path(__file__).resolve().parent.parent   # the repo root
 
@@ -102,26 +110,177 @@ def _user_site() -> str:
         return ""
 
 
-def _load(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    # Register the module in sys.modules. Without this it is absent, so a later
-    # `import handsoff` built a SECOND instance with its own SETTINGS, locks and
-    # caches — divergence that surfaces as order-dependent flakes rather than as
-    # an error. Only handsoff.py gets the bare-name alias: doing it for every
-    # module would put `core/audio.py` into sys.modules as "audio" and shadow
-    # real imports.
-    bare = "handsoff" if Path(path).name == "handsoff.py" else None
-    sys.modules[name] = mod
-    if bare:
-        sys.modules.setdefault(bare, mod)
+# ------------------------------------------------------------ user-dir sandbox
+# Every module that resolves CONFIG_DIR/STATE_DIR at import bakes whatever HOME
+# it sees into module constants. That was guaranteed for the FIRST load only:
+# several suites load a SECOND monolith in-process (the settings app, which also
+# derives `NIRI_CONFIG` — the file `apply_autostart` writes), with the
+# developer's real HOME. So their paths were the developer's: a test read the
+# real settings.json, and the answer depended on whose machine ran the suite.
+# The sandbox therefore belongs to the LOAD, not to one fixture, so it covers
+# whatever a test loads, however many times.
+_SANDBOX_VARS = ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME")
+
+# The developer's real home, captured while conftest is IMPORTED — before any
+# sandbox runs, and therefore still the real one whenever a later check needs to
+# ask "is this path the developer's?".
+_REAL_HOME = Path(os.path.expanduser("~"))
+
+# Path constants a loaded module bakes from HOME/XDG at import. `_load` uses
+# them to REFUSE a load that kept the developer's real ones, so the property is
+# enforced by the one thing every load goes through rather than by each test
+# remembering to look.
+_SANDBOX_PATH_ATTRS = (
+    "HOME", "CONFIG_DIR", "STATE_DIR", "SETTINGS_FILE", "HISTORY_FILE",
+    "MEMORY_FILE", "DECISIONS_FILE", "LOG_FILE", "CONTROL_SOCK",
+    "CAP_EVENTS_FILE", "MIC_EVENTS_FILE", "REMINDERS_FILE", "NIRI_CONFIG",
+    "WHISPER_MODEL_DIR",
+)
+
+
+def _assert_load_stayed_in_the_sandbox(mod, name: str) -> None:
+    """Refuse a loaded module that kept the developer's real user dirs.
+
+    A load that resolves CONFIG_DIR/STATE_DIR outside the sandbox is the leak
+    the sandbox exists to prevent AND the one nothing else notices: the module
+    works perfectly, it just reads and writes the developer's real config and
+    state. Checking it here, at the load, means the failure lands on the load
+    (with the attribute named) instead of on whichever test later happens to
+    compare paths — or, worse, on the developer's disk.
+
+    Measured motivation: a mutation that removed the sandbox from this loader
+    let the settings app write its `NIRI_CONFIG` — the developer's real
+    ~/.config/niri/config.kdl — from a test that only *believed* it was writing
+    into a temp home.
+    """
+    offenders = []
+    for attr in _SANDBOX_PATH_ATTRS:
+        value = getattr(mod, attr, None)
+        if not isinstance(value, (str, Path)):
+            continue
+        try:
+            resolved = Path(value)
+        except (TypeError, ValueError):
+            continue
+        if resolved.is_relative_to(_REAL_HOME):
+            offenders.append(f"{attr}={value}")
+    if offenders:
+        raise AssertionError(
+            f"conftest._load: {name} resolved the developer's real user dirs "
+            f"({'; '.join(offenders)}) — the load was not sandboxed")
+
+
+@contextlib.contextmanager
+def isolated_user_dirs(prefix: str = "handsoff-testhome-"):
+    """Point HOME/XDG at a throw-away directory for the duration of a load.
+
+    Restored on the way out, so nothing else in the suite (subprocess
+    environments, path helpers like `_user_site`) moves. Not deleted: the
+    loaded module's constants point into it for the rest of the session, and a
+    test that writes through them is writing into the sandbox — which is the
+    point.
+    """
+    home = tempfile.mkdtemp(prefix=prefix)
+    saved = {k: os.environ.get(k) for k in _SANDBOX_VARS}
+    os.environ.update({
+        "HOME": home,
+        "XDG_STATE_HOME": str(Path(home) / ".local" / "state"),
+        "XDG_CONFIG_HOME": str(Path(home) / ".config"),
+    })
     try:
-        spec.loader.exec_module(mod)
+        yield Path(home)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def sandbox_env(home=None) -> dict:
+    """A child-process environment whose user dirs are a throw-away directory.
+
+    A driver that loads a monolith in a SUBPROCESS resolves the same paths, so
+    it needs the same sandbox — and a redirected HOME hides user site-packages,
+    which is where PySide6 and sounddevice live, so the real user-site path is
+    kept on PYTHONPATH alongside the repo root.
+    """
+    env = dict(os.environ)
+    home = Path(home or tempfile.mkdtemp(prefix="handsoff-testhome-"))
+    env.update({
+        "HOME": str(home),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+    })
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(HERE), _user_site(), env.get("PYTHONPATH", "")) if p)
+    return env
+
+
+def run_driver(argv, *, home=None, cwd=None, env_extra=None, **kwargs):
+    """Run a driver that LOADS a monolith, in a sandboxed child process.
+
+    The child resolves CONFIG_DIR/STATE_DIR from HOME exactly like an in-process
+    load, so it needs the same sandbox — and no import-level guard can see it,
+    because a driver is a string handed to `python -c`. One constructor for all
+    of them, so the sandbox cannot be remembered at one call site and forgotten
+    at the next (the shape the in-process loader had).
+
+    `env_extra` is for the driver's own switches (offscreen Qt, its home
+    variable); `**kwargs` go to `subprocess.run`.
+    """
+    env = sandbox_env(home)
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run([sys.executable, *argv], env=env,
+                          cwd=str(cwd or HERE), **kwargs)
+
+
+def _load(name: str, path: Path):
+    """Load a module by path, sandboxed, under the ONE name the app knows.
+
+    `handsoff.py` is special by design, not by convention: it registers ITSELF
+    under the canonical name (`core.APP_MODULE_NAME`) as it loads and refuses to
+    run a second copy, so this loader registers it under that same name rather
+    than one of its own. The bare `handsoff` alias is deliberately NOT set any
+    more: two names for one app is what made "is it already loaded?" ambiguous,
+    and a stray `import handsoff` now fails loudly (the app refuses a duplicate)
+    instead of silently building a second app with its own SETTINGS and caches.
+    """
+    is_app = Path(path).name == "handsoff.py"
+    if is_app:
+        # ONE app per process, so "load the app again" is "hand back the app":
+        # executing the file a second time is a second app (its own SETTINGS,
+        # its own model mirrors, and a module body that repoints the SHARED
+        # core.audio) — which the app itself now refuses. Asking for it here
+        # returns the running module instead, whatever name the caller used.
+        running = app_module() or app_instance()
+        if running is not None:
+            return running
+    spec = importlib.util.spec_from_file_location(
+        APP_MODULE_NAME if is_app else name, path)
+    mod = importlib.util.module_from_spec(spec)
+    # Register the module in sys.modules BEFORE executing it. Without this it is
+    # absent, so a later load built a SECOND instance with its own SETTINGS,
+    # locks and caches — divergence that surfaces as order-dependent flakes
+    # rather than as an error — and the app cannot find itself. Only the app and
+    # its own modules: doing it for every module would put `core/audio.py` into
+    # sys.modules as "audio" and shadow real imports.
+    sys.modules[name if not is_app else APP_MODULE_NAME] = mod
+    try:
+        # The sandbox is part of the LOAD, not of a fixture: whatever a test
+        # loads — the settings app, the bubble, a core module, thirty times —
+        # resolves its user directories inside a throw-away HOME.
+        with isolated_user_dirs():
+            spec.loader.exec_module(mod)
+            # ...and the load may not KEEP the developer's paths either: the
+            # sandbox moved HOME, but only the module knows whether it read it.
+            _assert_load_stayed_in_the_sandbox(mod, name)
     except BaseException:
         # never leave a half-initialised module behind for the next test
-        sys.modules.pop(name, None)
-        if bare and sys.modules.get(bare) is mod:
-            sys.modules.pop(bare, None)
+        for key in {name, APP_MODULE_NAME if is_app else name}:
+            if sys.modules.get(key) is mod:
+                sys.modules.pop(key, None)
         raise
     return mod
 
@@ -141,24 +300,46 @@ def _import_app_with_isolated_config():
     ~/.local/state and control socket. HOME is restored immediately afterwards,
     so nothing else in the suite (subprocess environments, path helpers) moves.
     """
-    home = tempfile.mkdtemp(prefix="handsoff-testhome-")
-    saved = {k: os.environ.get(k) for k in ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME")}
-    os.environ["HOME"] = home
-    os.environ["XDG_STATE_HOME"] = str(Path(home) / ".local" / "state")
-    os.environ["XDG_CONFIG_HOME"] = str(Path(home) / ".config")
-    try:
+    # One sandbox implementation, used by this load and by every other in-process
+    # load in the suite (`_load`), so the property cannot be true here and false
+    # for the next monolith a test happens to import.
+    with isolated_user_dirs():
         return _load("handsoff_core", HERE / "handsoff.py")
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 @pytest.fixture(scope="session")
 def H():
     return _import_app_with_isolated_config()
+
+
+def pin_offer(H, monkeypatch, name: str):
+    """Pin ONE offer object onto every path `_dep()` can resolve.
+
+    The tools reach the module-level offers through `_dep()`, which is
+    `_CURRENT` in the calling thread but `_DEFAULT_DEPS` in a NEW thread (a
+    thread starts with an empty context) — and once a second handsoff instance
+    has been imported, those two can belong to DIFFERENT modules, each with its
+    own `_kill_offer`. Patching the global on one module therefore made a test
+    pass or fail depending on which monolith imported last, which the shuffled
+    test order caught. Shadowing the slot on each host leaves exactly one
+    offer, on the single path both the main thread and workers take.
+
+    `name` is the bare offer name: 'kill' -> H._kill_offer.
+    """
+    offer = H.Offer(name)
+    monkeypatch.setattr(H, f"_{name}_offer", offer)
+    hosts = [getattr(H, "_tool_dependencies", None)]
+    tools = getattr(H, "_core_tools", None)
+    if tools is not None:
+        hosts.append(getattr(tools, "_DEFAULT_DEPS", None))
+        try:
+            hosts.append(tools._CURRENT.get())
+        except Exception:
+            pass
+    for host in hosts:
+        if host is not None and host is not offer:
+            monkeypatch.setattr(host, f"_{name}_offer", offer)
+    return offer
 
 
 # ---------------------------------------------------------------- isolation
@@ -173,13 +354,44 @@ def H():
 _STATE_GLOBALS = (
     "SETTINGS", "_kill_offer", "_snooze_offer", "_NOTIFY_STATE",
     "OLLAMA_BASE", "OLLAMA_MODEL", "_READER_APP_LAST",
+    # The loaded-model mirrors. A daemon worker that outlives its test (the
+    # stop-probe transcribes audio; the loader warms whisper/tts) can finish
+    # AFTER the monkeypatch that stubbed it has been reverted, load the real
+    # model and publish it here — measured: `stt: whisper loaded` in `--ptt
+    # doctor` for every test that ran later. Restoring the mirror around each
+    # test means a leaked load cannot change what the NEXT test observes.
+    "_whisper_model", "_tts_model", "TTS_REFERENCE", "TTS_ENGINE",
+    "WHISPER_SIZE", "WHISPER_DEVICE",
 )
 
 # Worker threads that always have an explicit stop path. Anything here still
 # running after the test that started it has finished is a leak, not a slow
 # exit: the settle loop below waits for a legitimate unwind first.
 _WORKER_THREADS = ("watch-file", "watch-process", "pomodoro",
-                   "notification-reader", "drain-")
+                   "notification-reader", "control", "drain-",
+                   # Speaks on its own channel (job completions, resource
+                   # crossings, cap refusals). A test that lets one run waits
+                   # 30s on the models-ready event before it even synthesizes,
+                   # so a lingering announce worker is a leak with a fuse.
+                   "announce",
+                   # Both load or transcribe models on a daemon thread. A test
+                   # that leaves one running can finish a load after its own
+                   # monkeypatch is gone — a real multi-GB load in the suite,
+                   # writing into globals the next test reads. Waiting here
+                   # fails that test instead of the one that follows it.
+                   "stop-probe", "loader")
+
+
+def _is_restorable(obj) -> bool:
+    """A registry/offer restores itself.
+
+    `core.registry.Offer` carries a lock, so it cannot be deep-copied — and the
+    identity fallback below would then leave one test's armed offer live for
+    every test after it. Snapshotting its CONTENTS is the only way to hand the
+    next test the same state its neighbours saw.
+    """
+    return (callable(getattr(obj, "snapshot_state", None))
+            and callable(getattr(obj, "restore_state", None)))
 
 
 def _snapshot_state(H) -> dict:
@@ -188,10 +400,19 @@ def _snapshot_state(H) -> dict:
         if not hasattr(H, name):
             continue
         obj = getattr(H, name)
-        try:
-            snap[name] = (obj, copy.deepcopy(obj))
-        except Exception:
-            snap[name] = (obj, obj)      # uncopyable: identity restore only
+        if _is_restorable(obj):
+            snap[name] = (obj, obj.snapshot_state())
+            continue
+        if isinstance(obj, (dict, list)):
+            try:
+                snap[name] = (obj, copy.deepcopy(obj))
+                continue
+            except Exception:
+                pass
+        # Scalars restore by identity, and a loaded whisper/chatterbox model
+        # MUST: deep-copying one would clone gigabytes for no benefit, since
+        # `_restore_state` re-assigns the original object anyway.
+        snap[name] = (obj, obj)
     return snap
 
 
@@ -199,7 +420,9 @@ def _restore_state(H, snap: dict) -> None:
     for name, (obj, value) in snap.items():
         if getattr(H, name, None) is not obj:
             setattr(H, name, obj)        # a test swapped the object out
-        if isinstance(obj, dict) and isinstance(value, dict):
+        if _is_restorable(obj):
+            obj.restore_state(value)
+        elif isinstance(obj, dict) and isinstance(value, dict):
             obj.clear()
             obj.update(value)
         elif isinstance(obj, list) and isinstance(value, list):
@@ -230,14 +453,69 @@ _DI_CONTEXTVARS = (("_core_tools", "_CURRENT"), ("_core_doctor", "_CURRENT"))
 
 @pytest.fixture(autouse=True)
 def _di_host_is_restored(H):
+    """Hand every test THIS monolith as the tool DI host, then restore.
+
+    Restoring the previous value was not enough. A monolith loaded here (the
+    settings app, say) can be dropped from `sys.modules` while its deps object
+    lives on inside `_DEFAULT_DEPS` — and, if it was imported with the real
+    HOME, so do its STATE paths. Measured: `test_ops`' cap-overlap test had its
+    four refusals recorded through such an orphan, which appended four entries
+    to the developer's real ~/.local/state/handsoff/cap-refusals.json.
+
+    Pinning `_CURRENT` covers the calling thread; worker threads start with an
+    empty context and fall through to `_DEFAULT_DEPS`, so that is pinned too.
+    
+    `_core_doctor` is deliberately NOT pinned: its `_CURRENT` holds a
+    DoctorDeps, not a tool host, and only its previous value is restored.
+    """
     saved = []
     for mod_name, attr in _DI_CONTEXTVARS:
         var = getattr(getattr(H, mod_name, None), attr, None)
         if var is not None:
             saved.append((var, var.get()))
+    tools = getattr(H, "_core_tools", None)
+    host = getattr(H, "_tool_dependencies", None)
+    prior_default = getattr(tools, "_DEFAULT_DEPS", None) if tools else None
+    if tools is not None and host is not None:
+        tools._DEFAULT_DEPS = host
+        var = getattr(tools, "_CURRENT", None)
+        if var is not None:
+            var.set(host)
     yield
     for var, value in saved:
         var.set(value)
+    if tools is not None and prior_default is not None:
+        tools._DEFAULT_DEPS = prior_default
+
+
+# The ONE name the app is registered under. `core` owns the string (the app,
+# the settings app and this harness all compare against the same constant), so
+# it is imported rather than respelled here.
+_APP_MODULE_NAMES = (APP_MODULE_NAME,)
+
+
+@pytest.fixture(autouse=True)
+def _app_registration_is_restored(H):
+    """Put the session's app modules back if a test evicted them.
+
+    Two extraction tests deliberately empty every `handsoff*` entry from
+    `sys.modules` to prove `core/doctor` imports without the monolith, and
+    nothing put the registration back. The next thing that lazily loads a
+    bubble — the settings app's `_LazyHandsoff`, which exec's handsoff.py on
+    first attribute use, a moment no loader wraps — then built its OWN copy
+    with the developer's real HOME, and that copy's module body calls
+    `core.audio.configure(...)`, repointing the SHARED core.audio at the real
+    ~/.config/handsoff/whisper-model. Measured under a shuffled order.
+
+    Restoring around every test is the same rule the module-globals and DI-host
+    fixtures apply: shared process state a test hand-edits is handed back the
+    way it was found.
+    """
+    present = {name: sys.modules.get(name) for name in _APP_MODULE_NAMES}
+    yield
+    for name, mod in present.items():
+        if mod is not None and sys.modules.get(name) is not mod:
+            sys.modules[name] = mod
 
 
 @pytest.fixture(autouse=True)

@@ -257,3 +257,28 @@ class TestReaderCooldown:
         reader.loop(proc, threading.Event())
         assert len(said) == 2, said
         assert "Slack" in said[0] and "Mail" in said[1]
+
+
+class TestSelfMuteIsWholeWord:
+    """Our own popups echo the app name in summary/body, so they self-mute.
+
+    Plain substring containment swallowed unrelated notifications that merely
+    spelled the name inside a longer word: with app_name "assist", a summary
+    of "assistant manager update" was muted as if it were ours.
+    """
+
+    def _muted(self, app, summary="", body="", app_name="handsoff"):
+        from core import assistant as assist_mod
+        return assist_mod.notification_muted(
+            app, summary, body, mute_apps=[], app_name=app_name)
+
+    def test_our_own_popups_are_still_muted(self):
+        assert self._muted("handsoff", "handsoff: started") is True
+        assert self._muted("mail", "Handsoff says", "handsoff finished") is True
+        assert self._muted("handsoff", "anything at all") is True
+
+    def test_a_longer_word_containing_the_name_is_not_muted(self):
+        assert self._muted("slack", "handsoffd daemon started") is False
+        assert self._muted("slack", "", "prehandsoff work") is False
+        assert self._muted("slack", "assistant manager update",
+                           app_name="assist") is False

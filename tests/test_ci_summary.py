@@ -8,7 +8,6 @@ app code, but this is the code a maintainer reads first when the gate fails.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import pathlib
 import re
@@ -17,17 +16,17 @@ import sys
 
 import pytest
 
+from conftest import _load as _load_module
+
 HERE = pathlib.Path(__file__).resolve().parent.parent
 
 
 def _load(name: str, filename: str):
-    spec = importlib.util.spec_from_file_location(name, HERE / "ci" / filename)
-    mod = importlib.util.module_from_spec(spec)
-    # dataclasses resolves string annotations through sys.modules, so the
-    # module has to be registered before it executes.
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    # conftest's loader registers the module in sys.modules before executing it
+    # (dataclasses resolves string annotations through sys.modules) and runs the
+    # load inside the suite's user-dir sandbox — one loader for every in-process
+    # load, so a new one cannot quietly miss the isolation.
+    return _load_module(name, HERE / "ci" / filename)
 
 
 @pytest.fixture(scope="module")

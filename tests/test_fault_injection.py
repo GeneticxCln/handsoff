@@ -230,6 +230,12 @@ class TestMicReturnsNothing:
         queued: list = []
         a._enqueue_pipeline_turn = lambda item: (queued.append(item), True)[-1]
         a.interrupt = lambda: None
+        # The stop-probe transcribes the capture on a daemon thread. Nothing
+        # in this class is about transcription, and leaving the real seam here
+        # made the good-press case load whisper from the host's model dir on a
+        # thread that outlived the test — a multi-GB load whose result was
+        # published into a global the NEXT test then read.
+        a._maybe_instant_stop = lambda audio, gen: None
         return a, states, queued
 
     def test_a_dead_press_is_loud_and_says_why(self, H, caplog):

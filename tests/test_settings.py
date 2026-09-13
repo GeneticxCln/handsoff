@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site
+from conftest import HERE as ROOT, _load, _user_site, run_driver
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -800,6 +800,7 @@ class TestHealthCommand:
         try:
             yield H, None, None
         finally:
+            srv.stop()                  # the accept loop is a named worker
             monkey.undo()
             try:
                 sock_path.unlink(missing_ok=True)
@@ -885,6 +886,7 @@ class TestSettingsHealthBar:
                     time.sleep(0.05)
             assert isinstance(snap, dict) and "mic" in snap and "brain" in snap
         finally:
+            srv.stop()
             monkey.undo()
             asst.deleteLater()
 
@@ -943,13 +945,6 @@ class TestPerToolPolicyUI:
     def test_policy_rows_built_from_registry_and_roundtrip(self):
         """Offscreen construct, flip a policy, collect, reload: the GUI must
         persist per-tool policy without hand-editing settings.json."""
-        env = dict(os.environ)
-        env.update({
-            "QT_QPA_PLATFORM": "offscreen",
-            "QT_QPA_PLATFORMTHEME": "",
-            "NO_AT_BRIDGE": "1",
-            "QT_ACCESSIBILITY": "0",
-        })
         code = (
             "import importlib.util;"
             "spec = importlib.util.spec_from_file_location("
@@ -972,9 +967,16 @@ class TestPerToolPolicyUI:
             "assert rows['open_app'].currentData() == 'CONFIRM';"
             "print('policy rows:', len(rows))"
         )
-        out = subprocess.run(
-            [sys.executable, "-c", code],
-            env=env, capture_output=True, text=True, timeout=120, cwd=str(HERE),
+        # run_driver: the child loads the settings monolith, so it needs the
+        # same user-dir sandbox the parent's in-process loads get. Built from
+        # `dict(os.environ)` it resolved the developer's HOME — which is what
+        # its CONFIG_DIR/SETTINGS_FILE were read from.
+        out = run_driver(
+            ["-c", code], env_extra={"QT_QPA_PLATFORM": "offscreen",
+                                     "QT_QPA_PLATFORMTHEME": "",
+                                     "NO_AT_BRIDGE": "1",
+                                     "QT_ACCESSIBILITY": "0"},
+            capture_output=True, text=True, timeout=120,
         )
         assert out.returncode == 0, out.stderr[-2000:]
         assert "policy rows:" in out.stdout
@@ -993,13 +995,6 @@ class TestSettingsHistoryTab:
     def test_window_constructs_with_history_tab_offscreen(self):
         """Build the window in a subprocess under offscreen Qt (in-process
         construction aborts when earlier tests already hold a QCoreApplication)."""
-        env = dict(os.environ)
-        env.update({
-            "QT_QPA_PLATFORM": "offscreen",
-            "QT_QPA_PLATFORMTHEME": "",
-            "NO_AT_BRIDGE": "1",
-            "QT_ACCESSIBILITY": "0",
-        })
         code = (
             "import importlib.util;"
             "spec = importlib.util.spec_from_file_location("
@@ -1013,9 +1008,12 @@ class TestSettingsHistoryTab:
             "assert 'History' in texts, texts;"
             "print('tabs:', ','.join(texts))"
         )
-        out = subprocess.run(
-            [sys.executable, "-c", code],
-            env=env, capture_output=True, text=True, timeout=60, cwd=str(HERE),
+        out = run_driver(
+            ["-c", code], env_extra={"QT_QPA_PLATFORM": "offscreen",
+                                     "QT_QPA_PLATFORMTHEME": "",
+                                     "NO_AT_BRIDGE": "1",
+                                     "QT_ACCESSIBILITY": "0"},
+            capture_output=True, text=True, timeout=60,
         )
         assert out.returncode == 0, out.stderr[-2000:]
         assert "History" in out.stdout

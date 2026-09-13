@@ -13,6 +13,8 @@ import subprocess
 import threading
 import time
 
+from .registry import BoundedRegistry
+
 
 class PomodoroController:
     """Bounded pomodoro worker: work/break phases with spoken transitions.
@@ -140,20 +142,30 @@ def dbus_strings(line: str) -> list[str]:
     return re.findall(r'(?<!\\)"((?:\\.|[^"\\])*)"', line)
 
 
+def _mute_word(needle: str, haystack: str) -> bool:
+    """Whole-word containment; a needle full of regex characters is literal."""
+    if not needle or not haystack:
+        return False
+    return re.search(r"\b" + re.escape(needle) + r"\b", haystack) is not None
+
+
 def notification_muted(app: str, summary: str, body: str, *,
                        mute_apps, app_name: str) -> bool:
     """New mute contract: user list matches app (+summary) with word-ish
     semantics (app substring, summary whole word, never body); self-mute
-    when app==app_name or app_name appears in summary/body."""
+    when app==app_name or app_name appears as a WORD in summary/body."""
     try:
         a = (app or "").lower()
         s = (summary or "").lower()
         b = (body or "").lower()
         me = (app_name or "").lower()
-        # SELF first: our own popups echo the app name in summary/body.
+        # SELF first: our own popups echo the app name in summary/body. Word
+        # boundaries, because plain substring containment swallowed unrelated
+        # notifications that merely happened to spell the name inside a longer
+        # word -- "assistant manager update" was muted by an "assistant" app.
         if a.strip() == me:
             return True
-        if me and (me in s or me in b):
+        if _mute_word(me, s) or _mute_word(me, b):
             return True
         for raw in mute_apps or []:
             m = str(raw or "").strip().lower()
@@ -172,6 +184,43 @@ def notification_muted(app: str, summary: str, body: str, *,
         return False
 
 
+class _MonitorRun:
+    """One monitor + worker pair, registered while it owns the reader slot.
+
+    The slot's occupant is a record rather than three attributes on the reader
+    because the reader must be able to hand a DEAD occupant back to the
+    registry and have it disposed of, without the registry ever touching a
+    process or a thread itself.
+    """
+
+    __slots__ = ("thread", "proc", "stop")
+
+    def __init__(self, thread, proc, stop) -> None:
+        self.thread = thread
+        self.proc = proc
+        self.stop = stop
+
+    def alive(self) -> bool:
+        thread = self.thread
+        return thread is not None and thread.is_alive()
+
+    def dispose(self) -> None:
+        """Signal stop, kill the monitor, join the worker — best effort.
+
+        Used for both a live run (disable) and a reclaimed corpse (the worker
+        already gave up, so this is usually just closing its pipe).
+        """
+        if self.stop is not None:
+            self.stop.set()
+        proc = self.proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except (AttributeError, OSError):
+                pass
+        _join_worker(self.thread, "notification reader")
+
+
 class NotificationReader:
     """Session D-Bus notification monitor with mute list and per-app cooldown.
 
@@ -180,9 +229,19 @@ class NotificationReader:
     body)` filters, `popen_factory(*args, **kwargs)` spawns dbus-monitor,
     `persist(key, value)` records setting changes, `is_closed()` reports
     assistant shutdown.
+
+    The reader owns exactly ONE slot, and the slot is handed out by
+    ``BoundedRegistry``: "is a worker already alive?" and "may I start one?"
+    used to be two separate reads with a process spawn between them, so two
+    overlapping enables both saw a free slot and both started a reader — two
+    dbus-monitors, two loops, one holding the other's stop event, every
+    notification spoken twice. A worker that gave up is a corpse in the slot:
+    the ``reclaim`` predicate takes it back under the same lock that grants the
+    slot, which is what keeps "restart a dead reader" atomic too.
     """
 
     APP_COOLDOWN = 60.0  # one spoken digest per app per minute, max
+    SLOT = "dbus-monitor"  # the one name the reader slot is registered under
 
     def __init__(self, *, spawn, is_closed, announce, muted, popen_factory,
                  persist) -> None:
@@ -192,62 +251,90 @@ class NotificationReader:
         self._muted = muted
         self._popen_factory = popen_factory
         self._persist = persist
-        self._proc = None
-        self._stop: threading.Event | None = None
-        self._thread = None
+        self._runs = BoundedRegistry("notification-reader", 1)
         self._cooldown_lock = threading.Lock()
         self._app_last: dict[str, float] = {}
+
+    # -- the live run, as views onto the registered slot -----------------------
+    # Kept as attributes' names because the assistant, the doctor and the tests
+    # all ask "is a reader running, and on which monitor?".
+    @property
+    def _thread(self):
+        run = self._runs.get(self.SLOT)
+        return run.thread if run is not None else None
+
+    @property
+    def _proc(self):
+        run = self._runs.get(self.SLOT)
+        return run.proc if run is not None else None
+
+    @property
+    def _stop(self):
+        run = self._runs.get(self.SLOT)
+        return run.stop if run is not None else None
 
     def set_enabled(self, enabled: bool):
         """Start/stop the monitor; muted apps are filtered before TTS."""
         if enabled:
             if self._is_closed():
                 return "ERROR: assistant is shut down"
-            # A worker that gave up (or crashed) leaves _thread pointing at a
-            # dead thread; clearing it here keeps "already on" honest instead
-            # of refusing to restart a reader that is not actually reading.
-            if self._thread is not None and not self._thread.is_alive():
-                self._thread = None
-            if self._thread is not None and self._thread.is_alive():
+            slot = self._runs.reserve(
+                self.SLOT, reclaim=lambda run: not run.alive())
+            if slot is None:
+                # Not a cap refusal worth shouting about: "already on" is the
+                # documented answer to a repeated toggle, unlike a job the user
+                # asked for being turned away. The registry still counts it.
+                log.info("notification reader already on")
                 return "notification reader is already on"
+            corpse = slot.reclaimed
             try:
-                self._proc = self._popen_factory(
-                    ["dbus-monitor", "--session",
-                     "interface='org.freedesktop.Notifications',member='Notify'"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, bufsize=1, start_new_session=True)
-            except FileNotFoundError:
-                self._proc = None
-                self._persist("notification_reader", False)
-                return "ERROR: dbus-monitor is not installed"
-            except OSError as e:
-                self._proc = None
-                self._persist("notification_reader", False)
-                return f"ERROR: notification monitor failed: {e}"
-            stop = threading.Event()
-            self._stop = stop
-            self._thread = self._spawn(
-                self.run, args=(stop,), name="notification-reader")
-            log.info("desktop notification reader enabled")
-            return "notification reader enabled"
-        stop = self._stop
-        proc = self._proc
-        thread = self._thread
-        self._stop = None
-        self._proc = None
-        self._thread = None
-        if stop is not None:
-            stop.set()
-        if proc is not None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
-        # Join the worker. Without this, "off" was only a promise: the old
-        # loop could still be parked on the dead process's stdout, and enabling
-        # again immediately started a second loop beside it — two readers, one
-        # of them holding the previous stop event, both speaking notifications.
-        _join_worker(thread, "notification reader")
+                with slot:
+                    try:
+                        proc = self._popen_factory(
+                            ["dbus-monitor", "--session",
+                             "interface='org.freedesktop.Notifications',"
+                             "member='Notify'"],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, bufsize=1, start_new_session=True)
+                    except FileNotFoundError:
+                        self._persist("notification_reader", False)
+                        return "ERROR: dbus-monitor is not installed"
+                    except OSError as e:
+                        self._persist("notification_reader", False)
+                        return f"ERROR: notification monitor failed: {e}"
+                    stop = threading.Event()
+                    run = _MonitorRun(None, proc, stop)
+                    try:
+                        run.thread = self._spawn(
+                            self.run, args=(stop, run),
+                            name="notification-reader")
+                    except Exception:
+                        # A monitor nothing is reading must not be left
+                        # running: its pipe would fill and it would outlive the
+                        # reader that owns it.
+                        run.proc = None
+                        try:
+                            proc.terminate()
+                        except (AttributeError, OSError):
+                            pass
+                        log.exception("notification reader worker failed to start")
+                        return "ERROR: notification reader failed to start"
+                    slot.commit(run)
+                log.info("desktop notification reader enabled")
+                return "notification reader enabled"
+            finally:
+                if corpse is not None:
+                    corpse.dispose()
+        run = self._runs.get(self.SLOT)
+        if run is not None:
+            run.dispose()
+            # Only now is the slot free. Releasing it before the worker is gone
+            # is how a restart gets a second reader beside the old one — the
+            # orphan the join exists to prevent — so a worker that outlived its
+            # join budget keeps the slot, and the reclaim predicate frees it the
+            # moment it actually dies.
+            if not run.alive():
+                self._runs.release(self.SLOT)
         log.info("desktop notification reader disabled")
         return "notification reader disabled"
 
@@ -314,14 +401,21 @@ class NotificationReader:
                 except (AttributeError, OSError):
                     pass
 
-    def run(self, stop: threading.Event) -> None:
+    def run(self, stop: threading.Event, run=None) -> None:
         """Production wrapper: run loop(), respawning dbus-monitor with
         bounded backoff when its stdout is exhausted. At most 5 respawns,
-        1s→30s exponential backoff; gives up quietly when disabled."""
+        1s→30s exponential backoff; gives up quietly when disabled.
+
+        `run` is the registered slot record when this worker was started by
+        set_enabled(); a direct call (tests, embedding) has none, and then there
+        is no registered monitor to keep in step.
+        """
+        if run is None:
+            run = self._runs.get(self.SLOT)
         backoff = 1.0
         attempts = 0
         while not stop.is_set() and attempts < 5:
-            proc = self._proc
+            proc = run.proc if run is not None else None
             if proc is None or (hasattr(proc, "poll") and proc.poll() is not None):
                 # previous monitor died — respawn it under backoff
                 if stop.wait(backoff):
@@ -332,7 +426,8 @@ class NotificationReader:
                          "interface='org.freedesktop.Notifications',member='Notify'"],
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                         text=True, bufsize=1, start_new_session=True)
-                    self._proc = proc
+                    if run is not None:
+                        run.proc = proc
                     log.warning("notification reader respawned (attempt %d)", attempts + 1)
                 except Exception:
                     log.exception("notification reader respawn failed")
@@ -356,7 +451,11 @@ class NotificationReader:
         if not stop.is_set():
             log.error("notification reader gave up after %d monitor respawns — "
                       "turning it off", attempts)
-            self._proc = None
+            if run is not None:
+                # The corpse stays registered: the slot is still occupied by
+                # this (still-running) worker, and the reclaim predicate frees
+                # it the instant it exits.
+                run.proc = None
             try:
                 self._persist("notification_reader", False)
             except Exception:

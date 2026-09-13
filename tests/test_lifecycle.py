@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site
+from conftest import HERE as ROOT, _load, run_driver, sandbox_env, wait_for
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -261,11 +261,86 @@ class TestControlSocket:
         try:
             yield H, delivered, app
         finally:
+            # Stop the accept loop BEFORE the socket path is restored: the
+            # loop is a named worker with a stop path, so leaving it running
+            # is a leak the suite's worker guard now fails on.
+            srv.stop()
             monkey.undo()
             try:
                 sock_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def test_overlapping_diagnostics_cannot_start_two_workers(self, H, tmp_path,
+                                                              monkeypatch):
+        """One slot for slow diagnostics, and the losers are refused by name.
+
+        A timed-out health/doctor worker cannot be cancelled — it is blocked in
+        an Ollama or nvidia-smi call — so "is the previous worker alive?" then
+        "start one" is how repeated requests against a wedged backend pile up
+        threads that never return. The worker is parked until every caller has
+        been through, so the assertions are about the invariant rather than
+        about winning a race.
+
+        The thread census counts the workers THIS test started, not every
+        `diag-worker` in the process: a wedged worker another test is still
+        winding down is not this cap's pile-up, and counting it made the
+        result depend on which test ran first (the shuffled ordering probe
+        caught it).
+        """
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.instance() or QCoreApplication([])
+        monkeypatch.setattr(H, "CONTROL_SOCK", tmp_path / "diag.sock")
+        asst = H.Assistant()
+        # The refusal speaks through the real announcement path, which would
+        # start a TTS worker in a test; the channel is what is stubbed, not the
+        # decision to speak.
+        said: list = []
+        asst._announce_now = said.append
+        srv = H.ControlServer(asst)
+        before = H._cap_refusal_summary()["by_registry"].get("diagnostic") or 0
+        release = threading.Event()
+        ran: list = []
+
+        def slow_diagnostic():
+            ran.append(1)
+            release.wait(10)
+            return "snapshot"
+
+        barrier = threading.Barrier(8, timeout=10)
+        results: list = []
+
+        def call():
+            barrier.wait(timeout=10)
+            try:
+                results.append(srv._diagnostic_call(slow_diagnostic, 5.0))
+            except Exception as e:  # noqa: BLE001
+                results.append(f"{type(e).__name__}: {e}")
+
+        started_before = {t.ident for t in threading.enumerate()
+                          if t.name == "diag-worker"}
+        threads = [threading.Thread(target=call) for _ in range(8)]
+        for t in threads:
+            t.start()
+        deadline = time.time() + 5
+        while len(results) < 7 and time.time() < deadline:
+            time.sleep(0.01)
+        workers = [t for t in threading.enumerate()
+                   if t.name == "diag-worker" and t.ident not in started_before]
+        assert len(workers) == 1, f"{len(workers)} diagnostic workers piled up"
+        assert len(ran) == 1, f"the backend call ran {len(ran)} times"
+        release.set()
+        for t in threads:
+            t.join(10)
+        assert results.count("snapshot") == 1, results
+        refused = [r for r in results if "still running" in r]
+        assert len(refused) == 7, results
+        # ...and a refused diagnostic is durable evidence, not just a reply.
+        after = H._cap_refusal_summary()["by_registry"].get("diagnostic") or 0
+        assert after - before == 7, (before, after)
+        # ...and it is SAID, once, rather than seven times.
+        assert len(said) == 1, said
+        assert "diagnostic-worker" in said[0], said
 
     @staticmethod
     def _roundtrip(sock_path: Path, action: str) -> str:
@@ -282,6 +357,151 @@ class TestControlSocket:
             reply += part
         s.close()
         return reply.decode()
+
+    @pytest.fixture()
+    def held_serve(self, H, monkeypatch):
+        """A `_serve` that announces itself and then blocks.
+
+        Holding the spawn open is what makes the concurrency assertion about
+        the INVARIANT instead of about winning a race: on the fixed code the
+        loser cannot even reach the spawn, because the winner's reservation is
+        already counted against the cap.
+        """
+        gate = threading.Event()
+        release = threading.Event()
+        started: list[int] = []
+
+        def serve(_self):
+            started.append(1)
+            gate.set()
+            release.wait(10)
+
+        monkeypatch.setattr(H.ControlServer, "_serve", serve)
+        try:
+            yield started, gate, release
+        finally:
+            release.set()
+
+    def test_overlapping_starts_cannot_start_two_accept_loops(
+            self, H, tmp_path, monkeypatch, held_serve):
+        """One acceptor, decided at admission. The last hand-rolled cap.
+
+        "Is one already running?" then "start one" were two reads with a thread
+        spawn between them, so two overlapping start() calls both saw nothing
+        running and both bound a server: the loser's bind replaced the winner's
+        socket, leaving a loop accepting on an inode no client could reach —
+        `--ptt` says "not running" while the bubble believes it is reachable.
+        """
+        monkeypatch.setattr(H, "CONTROL_SOCK", tmp_path / "control.sock")
+        srv = H.ControlServer(H.Assistant())
+        started, gate, release = held_serve
+        before = {t.ident for t in threading.enumerate() if t.name == "control"}
+        barrier = threading.Barrier(8, timeout=10)
+
+        def call() -> None:
+            barrier.wait(timeout=10)
+            srv.start()
+
+        callers = [threading.Thread(target=call) for _ in range(8)]
+        try:
+            for t in callers:
+                t.start()
+            for t in callers:
+                t.join(10)
+            assert gate.wait(5), "no accept loop ever started"
+            assert started == [1], f"{len(started)} accept loops were started"
+            live = [t for t in threading.enumerate()
+                    if t.name == "control" and t.ident not in before]
+            assert len(live) == 1, f"{len(live)} control threads are running"
+            # ...and the slot is the bookkeeper, exactly as for every other cap
+            assert len(srv._runs) == 1
+            assert srv._runs.get(H.ControlServer.ACCEPT_SLOT) is not None
+        finally:
+            release.set()          # let the held spawn return...
+            srv.stop()             # ...then stop it through the real path
+
+    def test_a_dead_accept_loop_frees_its_slot(self, H, tmp_path, monkeypatch):
+        """A loop that gave up must not wedge the server forever.
+
+        `_serve` returns without binding when the runtime refuses or the bind
+        fails. The slot then holds a corpse; the reclaim predicate — evaluated
+        where the slot is handed out — is what lets the next start() take it,
+        instead of "already running" being read off a thread that is gone.
+        """
+        monkeypatch.setattr(H, "CONTROL_SOCK", tmp_path / "control.sock")
+        calls: list[int] = []
+
+        def one_shot(_self):
+            calls.append(1)          # returns at once: the loop dies
+
+        monkeypatch.setattr(H.ControlServer, "_serve", one_shot)
+        srv = H.ControlServer(H.Assistant())
+        srv.start()
+        first = srv._runs.get(H.ControlServer.ACCEPT_SLOT)
+        assert first is not None and wait_for(lambda: not first.is_alive()), \
+            "the stubbed accept loop never finished"
+        srv.start()
+        assert wait_for(lambda: len(calls) == 2), \
+            "a dead accept loop kept the accept slot"
+
+    def test_stop_frees_the_slot_so_a_restart_rebinds(self, H, tmp_path,
+                                                     monkeypatch):
+        """stop() hands the slot back, and only once the loop is really gone.
+
+        Releasing it before the join is how a restart gets a second acceptor
+        beside the old one, which is the orphan this class exists to avoid.
+        """
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.instance() or QCoreApplication([])
+        sock_path = tmp_path / "restart.sock"
+        monkeypatch.setattr(H, "CONTROL_SOCK", sock_path)
+        srv = H.ControlServer(H.Assistant())
+
+        def answers() -> bool:
+            try:
+                return self._roundtrip(sock_path, "status").startswith("state=")
+            except OSError:
+                return False
+
+        try:
+            srv.start()
+            assert wait_for(answers, timeout=5), "the server never answered"
+            srv.stop()
+            assert srv._runs.get(H.ControlServer.ACCEPT_SLOT) is None, \
+                "a stopped accept loop kept the slot"
+            assert not sock_path.exists(), "stop() left its socket behind"
+            srv.start()
+            assert wait_for(answers, timeout=5), "the restart never answered"
+        finally:
+            srv.stop()
+
+    def test_stop_keeps_the_slot_while_the_loop_is_still_alive(
+            self, H, tmp_path, monkeypatch):
+        """Only a loop that is actually gone frees the accept slot.
+
+        Freeing it before the join is how a restart gets a second acceptor
+        beside the old one — the orphan this class exists to avoid. A
+        thread-like stand-in pins the rule without spending a 2s join budget
+        inside the suite.
+        """
+        monkeypatch.setattr(H, "CONTROL_SOCK", tmp_path / "control.sock")
+        started: list[int] = []
+        monkeypatch.setattr(H.ControlServer, "_serve",
+                            lambda _self: started.append(1))
+        srv = H.ControlServer(H.Assistant())
+        alive = {"yes": True}
+        fake = types.SimpleNamespace(is_alive=lambda: alive["yes"],
+                                     join=lambda timeout=None: None)
+        srv._runs.reserve(H.ControlServer.ACCEPT_SLOT).commit(fake)
+        srv.stop()
+        assert srv._runs.get(H.ControlServer.ACCEPT_SLOT) is fake, \
+            "stop() freed a slot whose accept loop was still alive"
+        # ...and the moment it really dies the next start() reclaims it
+        alive["yes"] = False
+        srv.start()
+        assert wait_for(lambda: started == [1]), \
+            "the dead accept loop's slot was never reclaimed"
+        assert srv._runs.get(H.ControlServer.ACCEPT_SLOT) is not fake
 
     def test_status_roundtrip(self, server):
         H, _delivered, _app = server
@@ -760,9 +980,12 @@ class TestOffscreenLaunch:
         with tempfile.TemporaryDirectory(prefix="handsoff-test-") as tmp:
             home = Path(tmp)
             state = home / "state"
-            env = dict(os.environ)
+            # sandbox_env, not a hand-built dict: the throw-away HOME/XDG pair
+            # and the real user-site PYTHONPATH (a redirected HOME hides the
+            # PySide6 installed there) belong to one constructor. The launch's
+            # own switches go on top of it.
+            env = sandbox_env(home)
             env.update({
-                "HOME": str(home),
                 "XDG_STATE_HOME": str(state),
                 "QT_QPA_PLATFORM": "offscreen",
                 # an empty theme stops Qt from loading the GTK theme, which
@@ -772,8 +995,6 @@ class TestOffscreenLaunch:
                 "QT_ACCESSIBILITY": "0",
                 "OLLAMA_HOST": "http://127.0.0.1:9",  # unreachable: loader logs, ok
                 "HF_HUB_OFFLINE": "1",                # no model download in tests
-                # sandboxed HOME hides the user site-packages that hold PySide6
-                "PYTHONPATH": ".".join(p for p in (_user_site(), env.get("PYTHONPATH", "")) if p),
             })
             for var in ("NIRI_CONFIG", "DISPLAY", "WAYLAND_DISPLAY"):
                 env.pop(var, None)
@@ -793,9 +1014,13 @@ class TestOffscreenLaunch:
                     + proc.stderr.read().decode(errors="replace")[-2000:]
                 )
                 # the --ptt client from the test process must reach the bubble
-                out = subprocess.run(
-                    [sys.executable, str(HERE / "handsoff.py"), "--ptt", "status"],
-                    env=env, capture_output=True, text=True, timeout=10,
+                # (run_driver: same HOME as the bubble it talks to, and the
+                # user-site PYTHONPATH the throw-away HOME would otherwise
+                # hide)
+                out = run_driver(
+                    [str(HERE / "handsoff.py"), "--ptt", "status"],
+                    home=home, env_extra=env,
+                    capture_output=True, text=True, timeout=10,
                 )
                 assert out.returncode == 0, out.stderr
                 assert out.stdout.startswith("state=idle")
@@ -839,8 +1064,11 @@ class TestStreamingChat:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
+        # sandbox_env: every interpreter child gets the throw-away HOME and the
+        # user-site PYTHONPATH, whether or not it loads the app today — a
+        # child that grows an app import must not silently read the real one.
         proc = sp.Popen([sys.executable, str(HERE / "tests" / "fake_ollama.py"), str(port)],
-                        stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+                        env=sandbox_env(), stdout=sp.DEVNULL, stderr=sp.DEVNULL)
         base = f"http://127.0.0.1:{port}"
         deadline = time.monotonic() + 15
         ready = False
@@ -1276,8 +1504,8 @@ class TestPrecommitHook:
         broken = HERE / "zz_hook_probe_broken.py"
         broken.write_text("def broken(:\n    pass\n", encoding="utf-8")
         try:
-            r = sp.run([sys.executable, "-m", "py_compile", str(broken)],
-                       capture_output=True)
+            r = run_driver(["-m", "py_compile", str(broken)],
+                           capture_output=True)
             assert r.returncode != 0, "py_compile must fail on broken syntax"
         finally:
             broken.unlink(missing_ok=True)

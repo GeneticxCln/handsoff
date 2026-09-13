@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import HERE as ROOT, _user_site
+from conftest import HERE as ROOT, run_driver, sandbox_env
 
 HERE = ROOT   # the repo root
 
@@ -246,6 +246,285 @@ class TestDeploymentReporting:
             "installed-missing", "running-missing")
 
 
+class TestCapRefusalReporting:
+    """A cap turning work away must be visible AFTER the fact.
+
+    A refusal used to exist only in the string handed back to the model: a run
+    that hit its own job cap left no trace in the journal, in the state, or in
+    the doctor. The shape that let the cap be OVERSHOT was found by reading the
+    source, never by anything the running bubble said — which is the gap these
+    tests close. They also pin that the good news is reported: "none" is a
+    finding, not a missing line.
+    """
+
+    def _belt_at_cap(self, H, monkeypatch, tmp_path):
+        """A belt whose job registry is already full, with the refusal record
+        redirected at tmp_path so a live state file cannot decide the test."""
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "cap-refusals.json")
+        tb, _announced = TestBoundedJobs()._belt(H, monkeypatch)
+        for _ in range(H.BoundedJob.MAX_JOBS):
+            slot = tb._jobs.reserve()
+            assert slot is not None
+            slot.commit(lambda key: None)
+        return tb
+
+    def test_a_refusal_reaches_the_journal_not_just_the_reply(
+            self, H, monkeypatch, tmp_path, caplog):
+        tb = self._belt_at_cap(H, monkeypatch, tmp_path)
+        with caplog.at_level("WARNING"):
+            out, err = tb.execute("start_command", {"command": "pytest -q"})
+        assert err and "job limit reached" in out
+        assert "cap refusal: job at 4/4 held" in caplog.text
+        assert "start_command 'pytest -q'" in caplog.text
+        assert "nothing was created" in caplog.text
+
+    def test_the_refusal_is_persisted_with_the_shape_of_the_moment(
+            self, H, monkeypatch, tmp_path):
+        """So the diagnosis survives the process that refused."""
+        tb = self._belt_at_cap(H, monkeypatch, tmp_path)
+        tb.execute("start_command", {"command": "pytest -q"})
+        doc = json.loads(H.CAP_EVENTS_FILE.read_text())
+        assert doc["count"] == 1 and doc["by_registry"] == {"job": 1}
+        event = doc["events"][-1]
+        assert event["registry"] == "job"
+        assert event["cap"] == H.BoundedJob.MAX_JOBS
+        assert event["held"] == H.BoundedJob.MAX_JOBS
+        assert event["occupants"] == sorted(tb._jobs.keys())
+        assert event["detail"].endswith("'pytest -q'")
+        assert isinstance(event["at"], (int, float)) and event["at"] > 0
+
+    def test_a_clean_record_reports_nothing_for_the_job_cap(
+            self, H, monkeypatch, tmp_path):
+        """Full is not the same as refused: an at-cap belt that never had a
+        request turned away must not report a refusal."""
+        tb = self._belt_at_cap(H, monkeypatch, tmp_path)
+        assert tb._jobs.refusals == 0
+        assert tb._cap_refusal_note("job") == ""
+        assert H._cap_refusal_summary()["count"] == 0
+        assert not H.CAP_EVENTS_FILE.exists(), "a non-refusal wrote a record"
+        # and the clean status line carries no refusal note
+        clean, _ = TestBoundedJobs()._belt(H, monkeypatch)
+        out, err = clean.execute("job_status", {})
+        assert not err and out == "no background jobs", out
+
+    def test_job_status_reports_the_refusal(self, H, monkeypatch, tmp_path):
+        """The tool the user would actually ask is where the answer has to be.
+
+        'no background jobs' is exactly what a run that hit the cap sees, so
+        the case that matters most is the one with nothing listed.
+        """
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "cap-refusals.json")
+        tb, _ = TestBoundedJobs()._belt(H, monkeypatch)
+        H._record_cap_refusal({"registry": "job", "cap": 4, "held": 4,
+                               "occupants": ["job-1", "job-2", "job-3", "job-4"],
+                               "detail": "start_command 'pytest -q'"})
+        out, err = tb.execute("job_status", {})
+        assert not err
+        assert out.startswith("no background jobs")
+        assert "background-job cap has refused 1 request" in out
+        assert "pytest -q" in out
+        assert "A refused call starts nothing." in out
+
+    def test_watcher_refusals_are_recorded_too(self, H, monkeypatch, tmp_path):
+        """The counting lives in the registry, so the watcher caps cannot be
+        the silent ones left behind."""
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "cap-refusals.json")
+        tb = H.ToolBelt(on_restart_pending=lambda: None)
+        for i in range(4):
+            slot = tb._file_watchers.reserve(f"/tmp/watched-{i}", replace=True)
+            assert slot is not None
+            slot.commit((threading.Event(), None))
+        target = tmp_path / "watched.txt"
+        target.write_text("hi\n")
+        out = tb.watch_file(str(target), "hi")
+        assert out.startswith("ERROR") and "maximum of four" in out
+        doc = json.loads(H.CAP_EVENTS_FILE.read_text())
+        assert doc["by_registry"] == {"watch-file": 1}
+        assert "file-watcher cap has refused 1 request" in \
+            H._cap_refusal_note("watch-file")
+
+    def test_the_record_is_bounded_but_the_totals_survive(
+            self, H, monkeypatch, tmp_path):
+        """A refusal storm must not grow the state file without limit, while
+        the cumulative count keeps telling the truth."""
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "cap-refusals.json")
+        n = H.CAP_EVENTS_MAX + 12
+        for i in range(n):
+            H._record_cap_refusal({"registry": "job", "cap": 4, "held": 4,
+                                   "detail": f"start_command 'cmd-{i}'"})
+        doc = json.loads(H.CAP_EVENTS_FILE.read_text())
+        assert len(doc["events"]) == H.CAP_EVENTS_MAX
+        assert doc["count"] == n and doc["by_registry"] == {"job": n}
+        assert doc["events"][-1]["detail"].endswith(f"'cmd-{n - 1}'")
+        assert f"refused {n} request" in H._cap_refusal_note("job")
+
+    def test_an_unreadable_record_is_not_an_error(self, H, monkeypatch, tmp_path):
+        """Diagnostics must never be able to fail the path they describe."""
+        bad = tmp_path / "cap-refusals.json"
+        bad.write_text("{not json")
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", bad)
+        assert H._cap_refusal_summary() == {
+            "count": 0, "by_registry": {}, "last": None}
+        assert H._cap_refusal_note() == ""
+        H._record_cap_refusal({"registry": "job", "cap": 4, "held": 4})
+        assert H._cap_refusal_summary()["count"] == 1   # recovers and rewrites
+
+
+class TestCapRefusalIsSpoken:
+    """A refused request must be SAID, not only written down.
+
+    The journal and the durable record are both things the user has to go and
+    read — while the refusal itself happened because something was ASKED for and
+    did not happen. So the bubble says it out loud, on the channel job
+    completions already use, once per cap and then at most once a cooldown: the
+    refusal path is retried by nature (a model re-calling the same tool, a
+    health keybind being hammered) and an audio loop is worse than the
+    invisibility this replaces.
+    """
+
+    def _assistant(self, H, monkeypatch):
+        """A minimal Assistant: no Qt, the speech channel stubbed."""
+        said: list = []
+        a = H.Assistant.__new__(H.Assistant)
+        monkeypatch.setattr(a, "_is_closed", lambda: False)
+        a._announce_now = said.append
+        return a, said
+
+    def test_a_refused_request_is_spoken_out_loud(self, H, monkeypatch):
+        a, said = self._assistant(H, monkeypatch)
+        a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4,
+                                "count": 1}, "start_command 'pytest -q'")
+        assert len(said) == 1, said
+        assert said[0].startswith("I couldn't do that")
+        assert "background-job" in said[0] and "4 of 4" in said[0]
+        assert "Nothing was started" in said[0], said
+
+    def test_the_same_cap_is_not_repeated_inside_the_cooldown(self, H, monkeypatch):
+        """Six refusals in a row must not be six sentences."""
+        a, said = self._assistant(H, monkeypatch)
+        for i in range(1, 7):
+            a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4,
+                                    "count": i}, "start_command 'x'")
+        assert len(said) == 1, said
+        # The stamp is what was SAID (count 1), not the latest attempt — which
+        # is what makes the next thing heard the delta of the whole storm rather
+        # than a repeat of the first sentence.
+        assert a._cap_spoken["job"][1] == 1, a._cap_spoken
+        monkeypatch.setattr(H, "CAP_ANNOUNCE_COOLDOWN", 0.0)
+        a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4,
+                                "count": 7})
+        assert "6 more requests turned away" in said[1], said
+
+    def test_a_storm_is_summarised_once_the_cooldown_passes(self, H, monkeypatch):
+        monkeypatch.setattr(H, "CAP_ANNOUNCE_COOLDOWN", 0.0)
+        a, said = self._assistant(H, monkeypatch)
+        a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4, "count": 1})
+        a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4, "count": 4})
+        assert len(said) == 2, said
+        assert "still can't" in said[1] and "3 more requests" in said[1]
+        # ...and one more request is one request, not "1 requests"
+        a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4, "count": 5})
+        assert "1 more request turned away" in said[2], said[2]
+
+    def test_each_cap_speaks_for_itself(self, H, monkeypatch):
+        """A full job cap must not silence a wedged diagnostic."""
+        a, said = self._assistant(H, monkeypatch)
+        a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4, "count": 1})
+        a.announce_cap_refusal({"registry": "watch-file", "cap": 4,
+                                "held": 4, "count": 1})
+        a.announce_cap_refusal({"registry": "diagnostic", "cap": 1,
+                                "held": 1, "count": 1})
+        assert len(said) == 3, said
+        assert "file-watcher" in said[1] and "diagnostic-worker" in said[2]
+
+    def test_a_closed_bubble_does_not_speak(self, H, monkeypatch):
+        a, said = self._assistant(H, monkeypatch)
+        monkeypatch.setattr(a, "_is_closed", lambda: True)
+        a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4, "count": 1})
+        assert said == []
+
+    def test_junk_reports_never_raise_and_never_speak_nonsense(self, H, monkeypatch):
+        a, said = self._assistant(H, monkeypatch)
+        for junk in (None, {}, {"registry": ""}, {"cap": "x", "held": None}, "nope"):
+            a.announce_cap_refusal(junk)
+        assert said == [], "an unidentified refusal was spoken"
+        # an unknown registry still says something legible rather than nothing
+        a.announce_cap_refusal({"registry": "mystery", "cap": 2, "held": 2,
+                                "count": 1})
+        assert len(said) == 1 and "mystery" in said[0], said
+
+    def test_a_broken_speaker_is_survivable(self, H, monkeypatch):
+        """Announcing must never be a reason a refusal takes another path."""
+        a, _said = self._assistant(H, monkeypatch)
+
+        def boom(_text):
+            raise RuntimeError("no speaker")
+
+        a._announce_now = boom
+        a.announce_cap_refusal({"registry": "job", "cap": 4, "held": 4, "count": 1})
+
+    def test_the_spoken_map_is_bounded(self, H, monkeypatch):
+        a, _said = self._assistant(H, monkeypatch)
+        for i in range(H.CAP_ANNOUNCE_MAX + 5):
+            a.announce_cap_refusal({"registry": f"reg-{i}", "cap": 1,
+                                    "held": 1, "count": 1})
+        assert len(a._cap_spoken) == H.CAP_ANNOUNCE_MAX
+        assert "reg-0" not in a._cap_spoken, "the newest caps were dropped"
+
+
+class TestTheHostIsOfferedEveryRefusal:
+    """The belt only knows a cap turned work away; the host owns the wording."""
+
+    def _belt_at_job_cap(self, H, monkeypatch, tmp_path):
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "cap.json")
+        tb, _ = TestBoundedJobs()._belt(H, monkeypatch)
+        for _ in range(H.BoundedJob.MAX_JOBS):
+            slot = tb._jobs.reserve()
+            assert slot is not None
+            slot.commit(lambda key: None)
+        return tb
+
+    def test_the_belt_offers_the_refusal_to_the_host(self, H, monkeypatch, tmp_path):
+        tb = self._belt_at_job_cap(H, monkeypatch, tmp_path)
+        told: list = []
+        tb._on_cap_refusal = lambda report, detail: told.append((report, detail))
+        out, err = tb.execute("start_command", {"command": "pytest -q"})
+        assert err and "job limit reached" in out
+        assert len(told) == 1, told
+        report, detail = told[0]
+        assert report["registry"] == "job" and report["held"] == H.BoundedJob.MAX_JOBS
+        assert "pytest -q" in detail
+
+    def test_a_belt_without_a_host_still_refuses(self, H, monkeypatch, tmp_path):
+        """Tests and embedding build bare belts: no hook, same refusal."""
+        tb = self._belt_at_job_cap(H, monkeypatch, tmp_path)
+        out, err = tb.execute("start_command", {"command": "pytest -q"})
+        assert err and "job limit reached" in out
+
+    def test_the_bubble_connects_the_refusal_channel_to_its_belt(self, H, monkeypatch):
+        """The seam is only worth anything if the real bubble wires it.
+
+        Every other test here builds its own belt, so a belt handed the hook by
+        the APP is what makes a refusal speak in production — and its absence
+        would leave the whole suite green.
+        """
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.instance() or QCoreApplication([])
+        a = H.Assistant()
+        assert a._tools._on_cap_refusal == a.announce_cap_refusal, \
+            "the bubble's own belt is not connected to the announcement"
+
+    def test_a_broken_host_cannot_change_the_refusal(self, H, monkeypatch, tmp_path):
+        tb = self._belt_at_job_cap(H, monkeypatch, tmp_path)
+
+        def boom(_report, _detail):
+            raise RuntimeError("host broke")
+
+        tb._on_cap_refusal = boom
+        out, err = tb.execute("start_command", {"command": "pytest -q"})
+        assert err and "job limit reached" in out
+
+
 class TestDoctor:
     """The doctor report: one pass over deployment + dependencies."""
 
@@ -278,10 +557,32 @@ class TestDoctor:
         assert "whisper: revision unknown; sha256 unknown" in text
         assert "python: " in text
 
-    def test_doctor_json_shape(self, H):
+    def test_doctor_json_shape(self, H, monkeypatch, tmp_path):
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "none.json")
         d = H.doctor_json()
         assert "deployment" in d and "restart_script" in d
         assert set(d["systemd_unit"]) == {"present", "auto_restart"}
+        assert d["cap_refusals"] == {"count": 0, "by_registry": {}, "last": None}
+
+    def test_a_clean_bubble_says_so_about_cap_refusals(self, H, monkeypatch,
+                                                       tmp_path):
+        """'none' is a positive finding: a missing line would be
+        indistinguishable from a doctor that stopped reporting them."""
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "none.json")
+        assert "cap refusals: none recorded" in H.run_doctor()
+
+    def test_the_doctor_reports_a_recorded_refusal(self, H, monkeypatch,
+                                                   tmp_path):
+        monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "cap-refusals.json")
+        H._record_cap_refusal({"registry": "job", "cap": 4, "held": 4,
+                               "occupants": ["job-1", "job-2", "job-3", "job-4"],
+                               "detail": "start_command 'pytest -q'"})
+        text = H.run_doctor()
+        assert "cap refusals: 1 recorded (1x background-job)" in text
+        assert "pytest -q" in text
+        refusal = H.doctor_json()["cap_refusals"]
+        assert refusal["count"] == 1 and refusal["by_registry"] == {"job": 1}
+        assert refusal["last"]["detail"].endswith("'pytest -q'")
 
     def test_tool_registered(self, H):
         names = {t["function"]["name"] for t in H.TOOLS}
@@ -337,17 +638,21 @@ class TestDoctorModuleExtraction:
         assert callable(doctor.doctor_json)
 
     def test_core_doctor_does_not_import_handsoff(self):
-        """`import handsoff` must NOT be a transitive side effect of
-        `from core import doctor`. host-side deps arrive via DI, not globals."""
+        """Loading the app must NOT be a transitive side effect of
+        `from core import doctor`. host-side deps arrive via DI, not globals.
+
+        The app's entry is the CANONICAL name (`core.APP_MODULE_NAME`), not the
+        bare `handsoff` this used to check: the bare alias is retired, so
+        asserting on it would pass without looking at anything.
+        """
         import sys as _sys
+        from core import APP_MODULE_NAME
         for mod in list(_sys.modules):
-            if mod == "core.doctor":
-                _sys.modules.pop(mod, None)
-            if mod == "handsoff":
+            if mod == "core.doctor" or mod == APP_MODULE_NAME:
                 _sys.modules.pop(mod, None)
         from core import doctor  # noqa: F401
-        assert "handsoff" not in _sys.modules, (
-            "core.doctor must not pull in handsoff; use a DoctorDeps object "
+        assert APP_MODULE_NAME not in _sys.modules, (
+            "core.doctor must not pull in the app; use a DoctorDeps object "
             "for all host-side state")
 
     def test_legacy_fallback_byte_stable(self, monkeypatch, tmp_path, H):
@@ -423,11 +728,9 @@ class TestBoundedJobs:
         tb._perm = {**H.DEFAULT_SETTINGS["permissions"]}
         tb._tool_times = deque()
         tb._policy = H.DecisionPolicy(H.SETTINGS)
-        tb._pending_confirm = None
+        tb._pending_confirm = H.Offer("confirm")
         tb._confirm_running = None
-        tb._jobs = {}
-        tb._job_seq = 0
-        tb._job_lock = threading.Lock()
+        tb._jobs = H.BoundedRegistry("job", H.BoundedJob.MAX_JOBS)
         announced: list[str] = []
         tb._on_announce = announced.append
         return tb, announced
@@ -520,9 +823,102 @@ class TestBoundedJobs:
 
     def test_job_limit_is_bounded(self, H, monkeypatch):
         tb, _ = self._belt(H, monkeypatch)
-        tb._jobs = {f"job-{i}": None for i in range(H.BoundedJob.MAX_JOBS)}
+        for _ in range(H.BoundedJob.MAX_JOBS):
+            slot = tb._jobs.reserve()
+            assert slot is not None
+            slot.commit(lambda key: None)
         out, err = tb.execute("start_command", {"command": "echo x"})
         assert err and "job limit reached" in out
+
+    def test_cap_holds_when_calls_overlap(self, H, monkeypatch):
+        """Eight overlapping calls against a cap of four: four run, four are
+        refused — and the four refusals happen BEFORE the fork.
+
+        The cap used to be checked before the (slow) validate+Popen window with
+        the lock released across it, so every caller saw room, every caller
+        spawned, and every caller inserted: seven jobs against a cap of four,
+        measured with eight threads parked in that window by a barrier. Now the
+        slot is reserved before the spawn, so the barrier only admits the four
+        callers that actually hold a slot — the other four are refused without
+        ever reaching validate or Popen, which `spawned` proves directly.
+        """
+        tb, _ = self._belt(H, monkeypatch)
+        restarts: list = []
+        tb._on_restart_pending = lambda: restarts.append(1)
+        spawned: list = []
+        real_popen = H.subprocess.Popen
+
+        def counting_popen(*a, **kw):
+            spawned.append(a)
+            return real_popen(*a, **kw)
+
+        monkeypatch.setattr(H.subprocess, "Popen", counting_popen)
+        gate = threading.Barrier(H.BoundedJob.MAX_JOBS)
+
+        def gated(_command):
+            gate.wait(timeout=10)
+            return (["echo", "x"], "echo", None, True)
+
+        monkeypatch.setattr(tb, "_validate_command", gated)
+        results: list[str] = []
+        threads = [threading.Thread(
+            target=lambda: results.append(tb.start_command("echo x")))
+            for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        try:
+            assert len(tb._jobs) == H.BoundedJob.MAX_JOBS, results
+            started = [r for r in results if r.startswith("started")]
+            assert len(started) == H.BoundedJob.MAX_JOBS, results
+            refused = [r for r in results if "job limit reached" in r]
+            assert len(refused) == 8 - H.BoundedJob.MAX_JOBS, results
+            # A job refused at the cap never ran, so it must not leave the
+            # bubble believing a restart is in flight.
+            assert len(restarts) == H.BoundedJob.MAX_JOBS, restarts
+            assert len(spawned) == H.BoundedJob.MAX_JOBS, (
+                f"spawned {len(spawned)} processes for a cap of "
+                f"{H.BoundedJob.MAX_JOBS}: a refused caller must not fork")
+        finally:
+            for job in tb._jobs.values():
+                job.proc.kill()
+                job.proc.wait()
+
+    def test_a_refused_spawn_is_abandoned_before_registration(self, H, monkeypatch):
+        """Raising inside the prepare step must give the slot back.
+
+        A reservation that leaked on failure would shrink the cap silently: the
+        registry would keep counting a job that does not exist, and after a few
+        failed launches the bubble would refuse work while `job_status` lists
+        nothing to reap. The context-manager form of the reservation is what
+        makes that impossible — leaving the block without committing cancels.
+        """
+        tb, _ = self._belt(H, monkeypatch)
+        monkeypatch.setattr(tb, "_validate_command",
+                            lambda _c: (["echo", "x"], "echo", None, False))
+        boom = {"n": 0}
+        real_popen = H.subprocess.Popen
+
+        def flaky_popen(*a, **kw):
+            boom["n"] += 1
+            if boom["n"] <= 2:
+                raise OSError("no exec for you")
+            return real_popen(*a, **kw)
+
+        monkeypatch.setattr(H.subprocess, "Popen", flaky_popen)
+        assert "launch failed" in tb.start_command("echo x")
+        assert "launch failed" in tb.start_command("echo x")
+        assert not tb._jobs, "a failed launch must not hold a slot"
+        assert tb._jobs.room(), "the cap shrank after two failed launches"
+        out, err = tb.execute("start_command", {"command": "echo x"})
+        assert not err, out
+        try:
+            assert len(tb._jobs) == 1, tb._jobs.keys()
+        finally:
+            for job in tb._jobs.values():
+                job.proc.kill()
+                job.proc.wait()
 
     def test_bounded_job_poll_timeout(self, H):
         proc = subprocess.Popen(["sleep", "60"])
@@ -559,9 +955,11 @@ class TestInstalledCopySmoke:
             (core_dir / src.name).write_bytes(src.read_bytes())
         (bin_dir / "handsoff-restart").chmod(0o755)
         state = home / "state"
-        env = dict(os.environ)
+        # sandbox_env: one place knows that a launch needs a throw-away
+        # HOME/XDG pair AND the real user-site PYTHONPATH, because redirecting
+        # HOME hides the PySide6 installed there.
+        env = sandbox_env(home)
         env.update({
-            "HOME": str(home),
             "XDG_STATE_HOME": str(state),
             "QT_QPA_PLATFORM": "offscreen",
             "QT_QPA_PLATFORMTHEME": "",
@@ -569,7 +967,6 @@ class TestInstalledCopySmoke:
             "QT_ACCESSIBILITY": "0",
             "OLLAMA_HOST": "http://127.0.0.1:9",
             "HF_HUB_OFFLINE": "1",
-            "PYTHONPATH": ".".join(p for p in (_user_site(), env.get("PYTHONPATH", "")) if p),
         })
         for var in ("NIRI_CONFIG", "DISPLAY", "WAYLAND_DISPLAY"):
             env.pop(var, None)
@@ -587,10 +984,12 @@ class TestInstalledCopySmoke:
             assert sock.exists(), (
                 f"installed copy exited early (rc={proc.poll()}):\n"
                 + proc.stderr.read().decode(errors="replace")[-2000:])
-            out = subprocess.run(
-                [sys.executable, str(bin_dir / "handsoff.py"),
-                 "--ptt", "status"],
-                env=env, capture_output=True, text=True, timeout=10,
+            # run_driver: the client half of the same sandbox (same HOME as
+            # the bubble it is talking to)
+            out = run_driver(
+                [str(bin_dir / "handsoff.py"), "--ptt", "status"],
+                home=home, env_extra=env,
+                capture_output=True, text=True, timeout=10,
             )
             assert out.returncode == 0, out.stderr
             assert out.stdout.startswith("state=idle")
@@ -804,9 +1203,9 @@ class TestInstallerRehearsal:
         """
         declared_top = {"handsoff.py", "handsoff-settings.py", "hardware.py",
                         "settings_schema.py"}
-        declared_core = {"__init__.py", "settings.py", "audio.py", "brain.py",
-                         "tools.py", "doctor.py", "lifecycle.py", "calendar.py",
-                         "assistant.py"}
+        declared_core = {"__init__.py", "registry.py", "settings.py", "audio.py",
+                         "brain.py", "tools.py", "doctor.py", "lifecycle.py",
+                         "calendar.py", "assistant.py"}
         # A machine without git raises FileNotFoundError here rather than
         # returning non-zero, so the fallback below never applied and the test
         # errored instead of degrading — the mirror-image of the installer's
@@ -994,8 +1393,16 @@ class TestBoundedJobBuffer:
     a job dies in a way it cannot reap."""
 
     @staticmethod
-    def _job(H, argv):
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+    def _job(H, *args):
+        """A real child for the drain buffer.
+
+        The argv is built HERE, in the function that takes its environment from
+        the sandbox — which is what keeps the child from inheriting the
+        developer's HOME (the suite's own guard enforces that on every
+        `[sys.executable, …]` in the tests).
+        """
+        argv = [sys.executable, *args]
+        proc = subprocess.Popen(argv, env=sandbox_env(), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
                                 start_new_session=True)
         return H.BoundedJob("job-buffer", " ".join(argv), proc)
@@ -1012,7 +1419,7 @@ class TestBoundedJobBuffer:
                   "sys.stdout.write('HEAD-MARKER\\n')\n"
                   "sys.stdout.write('x' * 1500000)\n"
                   "sys.stdout.write('\\nTAIL-MARKER\\n')\n")
-        job = self._job(H, [sys.executable, "-c", script])
+        job = self._job(H, "-c", script)
         deadline = time.time() + 30
         while time.time() < deadline and not job.poll()[1]:
             time.sleep(0.05)

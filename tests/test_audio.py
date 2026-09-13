@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site, wait_for
+from conftest import HERE as ROOT, _load, run_driver, wait_for
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -146,27 +146,20 @@ def test_importing_the_app_never_pulls_in_torch_or_chatterbox():
     that fails for reasons unrelated to the change. Checked in a SUBPROCESS on
     purpose — torch IS importable on a developer box, so an in-process check
     would pass locally and fail only where it matters.
+
+    `run_driver`, not a hand-built environment: the child LOADS the monolith,
+    so it resolves CONFIG_DIR/STATE_DIR from HOME like any other load, and the
+    throw-away HOME plus the real user-site PYTHONPATH (where a `pip install
+    --user` PySide6 lives) are precisely what that constructor exists to apply
+    together. This call site used to spell both out by hand, which is the way
+    the next one gets forgotten.
     """
-    env = dict(os.environ)
-    with tempfile.TemporaryDirectory() as home:
-        # A throw-away HOME: an import must not be graded against the
-        # developer's own settings.json (the suite's isolation rule).
-        env.update({"HOME": home,
-                    "XDG_CONFIG_HOME": str(Path(home) / ".config"),
-                    "XDG_STATE_HOME": str(Path(home) / ".local" / "state")})
-        # Python resolves the user site-packages from HOME at interpreter
-        # startup, so a throw-away HOME hides a `pip install --user` tree and
-        # the import would fail for the wrong reason. Pass it explicitly.
-        user_site = _user_site()
-        if user_site:
-            env["PYTHONPATH"] = os.pathsep.join(
-                filter(None, [user_site, env.get("PYTHONPATH", "")]))
-        proc = subprocess.run(
-            [sys.executable, "-c",
-             "import sys, json; import handsoff; print(json.dumps(sorted("
-             "m for m in sys.modules if m.split('.')[0] in "
-             "{'torch', 'chatterbox', 'transformers'})))"],
-            cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=180)
+    proc = run_driver(
+        ["-c",
+         "import sys, json; import handsoff; print(json.dumps(sorted("
+         "m for m in sys.modules if m.split('.')[0] in "
+         "{'torch', 'chatterbox', 'transformers'})))"],
+        capture_output=True, text=True, timeout=180)
     assert proc.returncode == 0, proc.stderr[-3000:]
     loaded = json.loads(proc.stdout.strip().splitlines()[-1])
     assert loaded == [], (
@@ -1472,6 +1465,7 @@ class TestHandsfreeConfirm:
         try:
             yield H, None, None
         finally:
+            srv.stop()                  # the accept loop is a named worker
             monkey.undo()
             try:
                 sock_path.unlink(missing_ok=True)
@@ -1489,17 +1483,41 @@ class TestHandsfreeConfirm:
         """
         sock_path = H.CONTROL_SOCK
         from test_lifecycle import TestControlSocket
+        # The wedged backend is RELEASED at the end instead of being left to
+        # time out: a worker parked in a 10s sleep outlives its own test, and
+        # the next test's thread census then depends on the clock — which is
+        # exactly what the shuffled ordering probe caught.
+        release = threading.Event()
         monkeypatch.setattr(H.Assistant, "mic_health",
-                            lambda self: time.sleep(10) or {})
+                            lambda self: release.wait(10) or {})
+        # The refusal is announced through the speech channel; stub the channel
+        # so this test is about the cap, and pin that it DOES speak.
+        said: list = []
+        monkeypatch.setattr(H.Assistant, "_announce_now",
+                            lambda self, text: said.append(text))
 
+        # Counted as "new since here": a wedged worker another test is still
+        # winding down is not this cap's pile-up.
+        before = {t.ident for t in threading.enumerate() if t.name == "diag-worker"}
         first = TestControlSocket._roundtrip(sock_path, "health")
         assert "timed out" in first, first
 
         second = TestControlSocket._roundtrip(sock_path, "health")
         assert "still running" in second, (
             f"a second diagnostic was started instead of being refused: {second}")
-        workers = [t for t in threading.enumerate() if t.name == "diag-worker"]
+        workers = [t for t in threading.enumerate()
+                   if t.name == "diag-worker" and t.ident not in before]
         assert len(workers) == 1, f"{len(workers)} diagnostic workers piled up"
+        assert len(said) == 1, f"a refused diagnostic was announced {len(said)}x"
+        assert "diagnostic-worker" in said[0] and "Nothing was started" in said[0]
+        # ...and the worker this test did start is gone before the next test:
+        # the backend answers and the worker is joined, not abandoned.
+        release.set()
+        deadline = time.time() + 5
+        while time.time() < deadline and any(t.is_alive() for t in workers):
+            time.sleep(0.01)
+        leaked = [t.name for t in workers if t.is_alive()]
+        assert not leaked, f"the wedged diagnostic leaked past its test: {leaked}"
 
     def test_healthy_toggle_on_confirms(self, H, _no_ollama_probe):
         a, spoken = self._mk(H, "listening")
@@ -1554,9 +1572,26 @@ class TestHandsfreeConfirm:
             if expected_on is not None:
                 assert a._handsfree is expected_on
 
-    def test_handsfree_status_roundtrip(self, server):
+    def test_handsfree_status_roundtrip(self, server, monkeypatch):
+        """The keybind's status action reaches the bubble AND speaks the state.
+
+        Delivered inside this test instead of left queued: the confirmation runs
+        on the Qt event loop, so a command still sitting in the queue is
+        executed during whichever test next calls processEvents() — measured: it
+        spoke there, starting a TTS worker for a test that had already finished,
+        and the leak guard then blamed an unrelated test.
+        """
+        from PySide6.QtCore import QCoreApplication
         H, _delivered, _app = server
+        app = QCoreApplication.instance()
+        said: list = []
+        monkeypatch.setattr(H.Assistant, "_announce_now",
+                            lambda self, text: said.append(text))
         assert H.ptt_client(["handsfree-status"]) == 0
+        deadline = time.time() + 3
+        while not said and time.time() < deadline:
+            app.processEvents()
+        assert said and said[0].startswith("Hands-free off"), said
 
     def test_keybind_snippet_carries_status_bind(self):
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
@@ -1713,6 +1748,11 @@ class TestMicHistory:
         empty, and the stamp advances so yesterday's problems don't repeat."""
         monkeypatch.setitem(H.SETTINGS, "briefing", True)
         monkeypatch.setitem(H.SETTINGS, "home_place", "Berlin")
+        # The briefing's world-headline source is a live DuckDuckGo fetch. It is
+        # not what this test is about, and it made the test's RUNTIME depend on
+        # a third party: measured 20.5 s when the endpoint throttled, 0.4 s
+        # when it did not — the same suite, same day.
+        monkeypatch.setattr(H, "_world_events", lambda *a, **k: ([], False))
 
         class _Tools:
             @staticmethod
@@ -1747,6 +1787,9 @@ class TestMicHistory:
         a._briefing_done_date = ""
         monkeypatch.setitem(H.SETTINGS, "briefing", True)
         monkeypatch.setitem(H.SETTINGS, "home_place", "Berlin")
+        # No live world-news fetch: this asserts the MIC section is absent, and
+        # the headline source would otherwise make its runtime a network fact.
+        monkeypatch.setattr(H, "_world_events", lambda *a, **k: ([], False))
         assert "Microphone problems" not in a._maybe_briefing_prefix("hi")
         # commands never trigger a briefing
         a._briefing_done_date = ""

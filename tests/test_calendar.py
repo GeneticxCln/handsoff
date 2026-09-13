@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site, wait_for
+from conftest import HERE as ROOT, _load, _user_site, pin_offer, wait_for
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -255,12 +255,16 @@ class TestSnooze:
         due = H.json.loads(rf.read_text())[0]["due"]
         assert 14.5 * 60 < due - H.time.time() <= 15.5 * 60
 
+    # The offers are core.registry.Offer objects now: arm(window) replaces
+    # clear()+update() in one step under the offer's own lock, and state()
+    # applies the deadline itself.
+
     def test_snooze_after_fire_within_window(self, H, monkeypatch, tmp_path):
         rf = tmp_path / "reminders.json"
         monkeypatch.setattr(H, "REMINDERS_FILE", rf)
         belt = H.ToolBelt(on_restart_pending=lambda: None)
-        H._snooze_offer.clear()
-        H._snooze_offer.update(name="tea", until=H.time.monotonic() + 90)
+        pin_offer(H, monkeypatch, "snooze")     # one offer, on _dep()'s path
+        H._snooze_offer.arm(90, name="tea")
         out, err = belt.execute("snooze_reminder", {"name": "tea", "minutes": 5})
         assert not err and "snoozed until" in out, out   # re-armed although pruned
         assert H.json.loads(rf.read_text())[0]["name"] == "tea"
@@ -269,8 +273,8 @@ class TestSnooze:
         rf = tmp_path / "reminders.json"
         monkeypatch.setattr(H, "REMINDERS_FILE", rf)
         belt = H.ToolBelt(on_restart_pending=lambda: None)
-        H._snooze_offer.clear()
-        H._snooze_offer.update(name="old", until=H.time.monotonic() - 1)
+        pin_offer(H, monkeypatch, "snooze")
+        H._snooze_offer.arm(-1, name="old")      # armed, window already closed
         out, err = belt.execute("snooze_reminder", {"name": "old", "minutes": 5})
         assert not err and "no reminder matching" in out, out
 
@@ -304,8 +308,7 @@ class TestSnooze:
 
     def test_try_snooze_fastpath_consumes_utterance(self, H, monkeypatch):
         calls = {}
-        monkeypatch.setattr(H, "_snooze_offer",
-                            {"name": "tea", "until": H.time.monotonic() + 90})
+        H._snooze_offer.arm(90, name="tea")
         a = H.Assistant.__new__(H.Assistant)
         a._tools = H.ToolBelt(on_restart_pending=lambda: None)
         a._tools.execute = lambda name, args: ("snoozed!", False)
@@ -317,8 +320,7 @@ class TestSnooze:
         assert not H._snooze_offer, "offer window must close after use"
 
     def test_try_snooze_ignores_normal_speech(self, H):
-        H._snooze_offer.clear()
-        H._snooze_offer.update(name="tea", until=H.time.monotonic() + 90)
+        H._snooze_offer.arm(90, name="tea")
         a = H.Assistant.__new__(H.Assistant)
         assert a._try_snooze("what's the weather", 1, H.threading.Event()) is False
 
