@@ -45,6 +45,15 @@ RETIRED_SETTINGS = ("piper_voice",)
 # pack (a folder with a `pack.json` and one picture per state) when several
 # pictures should switch together as the bubble changes state.
 BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void", "sauron", "pikachu", "cat", "image")
+# The four states the bubble paints, in the order the Appearance tab shows
+# them. `colors` is keyed by these names, the preview draws one slot per name,
+# and the `image` design takes one picture per name — so the vocabulary exists
+# once, here, instead of being respelled in the schema, the renderer and the GUI.
+BUBBLE_STATES = ("idle", "listening", "thinking", "speaking")
+
+# The `image` design's per-state settings, derived from the names above so a
+# rename cannot desync the setting from the state it belongs to.
+DESIGN_IMAGE_KEYS = tuple(f"design_image_{state}" for state in BUBBLE_STATES)
 
 
 # ------------------------------------------------------------------ looks
@@ -190,11 +199,21 @@ DEFAULT_SETTINGS: dict = {
     "design_image_path": "",   # the `image` design's art: any file Qt can decode
                                # (PNG/JPEG/WebP/SVG). Empty or unreadable = a
                                # dashed placeholder frame, and the reason is
-                               # reported by `design_image_problem()`.
+                               # reported by `design_image_problem()`. This is
+                               # the FALLBACK state's picture: a state below with
+                               # a picture of its own uses that instead.
+    # One picture per state, chosen in the same card. A state with its own file
+    # draws it; a state with none uses `design_image_path`; a state with neither
+    # draws the empty slot. This is the per-state form of the art WITHOUT a pack
+    # folder (DESIGN_IMAGE_KEYS above names the four).
+    "design_image_idle": "",
+    "design_image_listening": "",
+    "design_image_thinking": "",
+    "design_image_speaking": "",
     "design_pack": "",         # the same art as a PACK: one folder name under
                                # design-packs/ naming a picture per state. When
-                               # set it is the authority and the single picture
-                               # above is ignored; the reason it cannot draw is
+                               # set it is the authority and every picture above
+                               # is ignored; the reason it cannot draw is
                                # reported by `pack_problem()`.
     "bubble_accent": 0.5,      # 0..1 accent punch: how hard each shape leans on its
                                # state colour (glow alpha, saturation, comet light)

@@ -28,7 +28,7 @@ import pytest
 from PySide6.QtGui import QColor, QImage
 
 from conftest import core_module
-from settings_schema import DEFAULT_SETTINGS
+from settings_schema import BUBBLE_STATES, DEFAULT_SETTINGS, DESIGN_IMAGE_KEYS
 
 
 def png(path: Path, rgba=(90, 140, 255, 255)) -> Path:
@@ -301,6 +301,105 @@ class TestArtProblem:
             "pack would need a restart")
 
 
+class TestPerStatePictures:
+    """One picture per state, the fallback behind them, and the precedence."""
+
+    def test_the_two_modules_name_the_same_four_settings(self, bubble):
+        # `core/bubble.py` derives its keys from the state names and cannot
+        # import the schema (the settings app loads it without Qt); the schema
+        # writes them literally. If they ever disagree, the panel would save a
+        # setting nothing reads and the bubble would draw the empty slot for a
+        # picture the user chose — silently.
+        assert set(bubble.STATE_IMAGE_KEY.values()) == set(DESIGN_IMAGE_KEYS)
+        assert set(bubble.STATE_IMAGE_KEY) == set(BUBBLE_STATES)
+
+    def test_only_the_states_with_a_picture_of_their_own_are_reported(self, bubble):
+        bubble.SETTINGS.update({k: "" for k in DESIGN_IMAGE_KEYS})
+        assert bubble.state_pictures() == {}
+        bubble.SETTINGS["design_image_thinking"] = "  /th.png  "
+        assert bubble.state_pictures() == {"thinking": "/th.png"}, (
+            "a blank setting is not a picture, and a path is stripped")
+
+    def test_the_counted_pictures_are_the_ones_that_will_render(self, bubble, tmp_path):
+        # `doctor` counts this map, and it prints the count on the SAME line as
+        # the sentence naming a broken picture — so a count of chosen settings
+        # could read 4/4 beside "the thinking picture: no file", which scans as
+        # a clean bill of health. Two questions, two answers: `state_pictures`
+        # is what is CHOSEN (what the resolver draws from), this is what renders.
+        bubble.SETTINGS.update({k: "" for k in DESIGN_IMAGE_KEYS})
+        good = png(tmp_path / "good.png")
+        gone = tmp_path / "gone.png"
+        bubble.SETTINGS["design_image_idle"] = str(good)
+        bubble.SETTINGS["design_image_thinking"] = str(gone)
+        assert bubble.state_pictures() == {
+            "idle": str(good), "thinking": str(gone)}
+        assert bubble.usable_state_pictures() == {"idle": str(good)}
+
+    def test_a_state_uses_its_own_picture_and_the_rest_fall_back(self, bubble):
+        pics = {"idle": "/idle.png"}
+        assert bubble.picture_for("", "/fallback.png", "idle", pics) == "/idle.png"
+        for state in ("listening", "thinking", "speaking"):
+            assert bubble.picture_for("", "/fallback.png", state, pics) == \
+                "/fallback.png", state
+
+    def test_a_state_with_neither_draws_the_empty_slot(self, bubble):
+        assert bubble.picture_for("", "", "idle", {}) == ""
+        assert bubble.picture_for("", "/f.png", "idle", {"idle": ""}) == \
+            "/f.png", "a blank per-state value is not an own picture"
+
+    def test_a_pack_still_wins_over_a_per_state_picture(self, bubble, tmp_path):
+        src = tmp_path / "src"
+        for state in bubble.PACK_STATES:
+            png(src / f"{state}.png")
+        manifest(src, {"name": "Win",
+                       "states": {s: f"{s}.png" for s in bubble.PACK_STATES}})
+        slug = bubble.install_pack(src)[0]
+        pics = {s: "/mine.png" for s in bubble.PACK_STATES}
+        assert Path(bubble.picture_for(slug, "/f.png", "idle", pics)).name == \
+            "idle.png", (
+            "a pack is the authority: its pictures win over the files, or the "
+            "two sources would silently mix")
+        # ...and a pack that cannot be read draws NOTHING, not the files
+        bubble._forget_pack(slug)
+        (Path(bubble.PACKS_DIR) / slug / "pack.json").unlink()
+        assert bubble.picture_for(slug, "/f.png", "idle", pics) == ""
+
+    def test_design_picture_reads_every_key_of_the_precedence(self, bubble):
+        bubble.SETTINGS.update({k: "" for k in DESIGN_IMAGE_KEYS})
+        bubble.SETTINGS["design_image_path"] = "/fallback.png"
+        bubble.SETTINGS["design_image_listening"] = "/listen.png"
+        assert bubble.design_picture("listening") == "/listen.png"
+        assert bubble.design_picture("idle") == "/fallback.png"
+
+    def test_the_problem_names_the_state_it_belongs_to(self, bubble, tmp_path):
+        good = png(tmp_path / "good.png")
+        pics = {"idle": str(good), "speaking": str(tmp_path / "gone.png")}
+        problem = bubble.state_image_problem(pics)
+        assert "the speaking picture" in problem and "no file at" in problem, (
+            "with four slots, WHICH state is broken is the whole question")
+        assert bubble.state_image_problem({"idle": str(good)}) == ""
+        assert bubble.state_image_problem({}) == ""
+
+    def test_art_problem_follows_pack_then_state_then_fallback(self, bubble,
+                                                              tmp_path):
+        bubble.SETTINGS.update({k: "" for k in DESIGN_IMAGE_KEYS})
+        gone = str(tmp_path / "gone.png")
+        good = str(png(tmp_path / "good.png"))
+        # the fallback is what speaks when nothing else is chosen
+        bubble.SETTINGS["design_image_path"] = gone
+        assert "no file at" in bubble.art_problem()
+        # a per-state picture speaks AHEAD of it, naming its state
+        bubble.SETTINGS["design_image_idle"] = gone
+        bubble.SETTINGS["design_image_path"] = good
+        assert "the idle picture" in bubble.art_problem()
+        # ...and a pack speaks ahead of both
+        bubble.SETTINGS["design_pack"] = "ghost"
+        assert "no installed pack named ghost" in bubble.art_problem()
+        assert bubble.state_image_problem({"idle": gone}) != "", (
+            "the per-state sentence must still exist behind a pack, for the "
+            "panel that shows it")
+
+
 class TestSettingsPlumbing:
     """The setting itself: defaulted, coerced, and never validated away."""
 
@@ -314,6 +413,19 @@ class TestSettingsPlumbing:
         assert coerce_settings(without)["design_pack"] == "", (
             "an older settings.json has no design_pack: the coercion must "
             "supply it rather than leave a key the renderer cannot read")
+
+    def test_every_per_state_key_is_defaulted_and_expanded(self):
+        from core.settings import coerce_settings
+        for key in DESIGN_IMAGE_KEYS:
+            assert DEFAULT_SETTINGS[key] == ""
+        # ~ is expanded and whitespace stripped, and a key a settings.json
+        # written before this feature omits is supplied rather than left out.
+        out = coerce_settings(dict(DEFAULT_SETTINGS, design_image_idle=" ~/a.png "))
+        assert out["design_image_idle"].endswith("/a.png")
+        assert not out["design_image_idle"].startswith("~")
+        for key in DESIGN_IMAGE_KEYS:
+            if key != "design_image_idle":
+                assert out[key] == "", key
 
     def test_a_pack_this_install_has_never_seen_is_kept(self):
         # coerce must NOT check the packs directory: a folder that is

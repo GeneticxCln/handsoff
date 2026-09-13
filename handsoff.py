@@ -643,11 +643,23 @@ def _appearance_note() -> str:
         # without opening the settings app.
         note = f"{note} — pack {pack}"
     try:
-        # `art_problem` owns the precedence, so doctor cannot describe a
+        # Pack first, then the per-state pictures, then the single file —
+        # `art_problem` owns that precedence, so doctor cannot describe a
         # different source than the renderer draws from.
         problem = _core_bubble.art_problem()
+        own = _core_bubble.state_pictures(SETTINGS)
+        usable = _core_bubble.usable_state_pictures(SETTINGS)
     except Exception:
-        problem = ""
+        problem, own, usable = "", {}, {}
+    if own and not pack:
+        # Named as a COUNT rather than by listing four paths: the line is a
+        # summary, and "which states have their own picture" is what is
+        # actionable (the settings panel shows each one in full). The count is
+        # of pictures that will RENDER, not of settings that are set — the
+        # `image:` clause below names the broken one, and 4/4 beside that name
+        # would be the line contradicting itself.
+        note = (f"{note} — picture per state: {len(usable)}/"
+                f"{len(_core_bubble.PACK_STATES)}")
     return f"{note} — image: {problem}" if problem else note
 
 

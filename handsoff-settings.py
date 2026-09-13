@@ -149,6 +149,23 @@ DEFAULT_SETTINGS = SCHEMA.DEFAULT_SETTINGS
 SETTINGS_VERSION = SCHEMA.SETTINGS_VERSION
 
 
+def _state_image_keys() -> tuple:
+    """[(state, setting key)] for the `image` design's pictures per state.
+
+    Derived from the schema's `DESIGN_IMAGE_KEYS`, so the four buttons, the four
+    settings this panel writes and the four the bubble reads are ONE list rather
+    than three that can drift apart. Empty on an older schema, in which case the
+    card simply shows no per-state row instead of raising.
+    """
+    prefix = "design_image_"
+    return tuple((key[len(prefix):], key)
+                 for key in getattr(SCHEMA, "DESIGN_IMAGE_KEYS", ())
+                 if key.startswith(prefix))
+
+
+STATE_IMAGE_KEYS = _state_image_keys()
+
+
 def _core_module(name: str):
     """An extracted module through the shared loader, loaded on first use.
 
@@ -1283,7 +1300,11 @@ class SettingsWindow(QMainWindow):
     # that does nothing.
     APPEARANCE_KEYS = ("bubble_design", "bubble_size", "animation_energy",
                        "bubble_accent", "colors", "design_image_path",
-                       "design_pack")
+                       "design_pack",
+                       # ...and one key per STATE: a picture chosen for one
+                       # state moves no other control, so without these the
+                       # live apply would read it as "a load, not an edit".
+                       ) + tuple(key for _state, key in STATE_IMAGE_KEYS)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1296,6 +1317,11 @@ class SettingsWindow(QMainWindow):
         # pack) in use rather than the empty slot the form would otherwise
         # claim.
         self._design_image = str(self.cfg.get("design_image_path") or "")
+        # One picture per state, held as form values like everything else. A
+        # state missing from this map has no picture of its own and falls back.
+        self._design_images = {
+            state: str(self.cfg.get(key) or "")
+            for state, key in STATE_IMAGE_KEYS}
         self._design_pack = str(self.cfg.get("design_pack") or "")
         self._model_at_open = str(self.cfg.get("model") or "")
         self._state_dir_ready()
@@ -2635,19 +2661,58 @@ class SettingsWindow(QMainWindow):
         # file is still a shape; it is always visible (a picture may be chosen
         # before the design is switched to it) and it applies live like the
         # combo, which is the contract this tab promises.
-        # The picture the `Image` design draws. It lives in the Shape card
-        # rather than a card of its own because a shape whose art comes from a
-        # file is still a shape; it is always visible (a picture may be chosen
-        # before the design is switched to it) and it applies live like the
-        # combo, which is the contract this tab promises.
+        # One picture PER STATE first, then a fallback for the states that have
+        # none: a state with its own file draws it, a state without one draws the
+        # fallback, and a state with neither draws the empty slot. That is the
+        # same rule a pack follows (`states` then `any`), so the two ways of
+        # giving this design several pictures obey one precedence instead of two.
+        self.state_image_buttons: dict[str, QPushButton] = {}
+        if STATE_IMAGE_KEYS:
+            holder = QWidget(card)
+            grid = QGridLayout(holder)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(4)
+            for i, (state, _key) in enumerate(STATE_IMAGE_KEYS):
+                btn = QPushButton(state.capitalize(), holder)
+                btn.setMinimumHeight(30)
+                btn.clicked.connect(
+                    lambda _=False, s=state: self._pick_state_image(s))
+                self.state_image_buttons[state] = btn
+                # TWO to a row, not four: the row's width is the sum of its
+                # buttons, and four full state names made this card demand more
+                # width than a narrow window's viewport — a card you cannot
+                # reach. Two rows of two fit, and read the same.
+                grid.addWidget(btn, i // 2, i % 2)
+            grid.setColumnStretch(2, 1)
+            box.addLayout(self._field("Picture per state", holder))
+            state_row = QHBoxLayout()
+            self.state_image_clear = QPushButton("Clear all states", card)
+            self.state_image_clear.setToolTip(
+                "Drop every per-state picture; each state goes back to the "
+                "fallback picture below")
+            self.state_image_clear.clicked.connect(self._clear_state_images)
+            state_row.addWidget(self.state_image_clear)
+            state_row.addStretch(1)
+            box.addLayout(state_row)
+            self.state_image_label = self._muted("", card)
+            box.addWidget(self.state_image_label)
+        # The FALLBACK picture: what a state with no picture of its own draws.
+        # It lives in the Shape card rather than a card of its own because a
+        # shape whose art comes from a file is still a shape; it is always
+        # visible (a picture may be chosen before the design is switched to it)
+        # and it applies live like the combo, which is the contract this tab
+        # promises.
         pick_row = QHBoxLayout()
-        self.image_button = QPushButton("Choose image\u2026", card)
+        self.image_button = QPushButton("Choose fallback\u2026", card)
         self.image_button.setToolTip(
-            "The picture the \"Image\" design draws: fitted to the glass, "
-            "tinted by the state colour and lit by the voice.")
+            "The picture the \"Image\" design draws in every state that has no "
+            "picture of its own: fitted to the glass, tinted by the state "
+            "colour and lit by the voice.")
         self.image_button.clicked.connect(self._pick_design_image)
         self.image_clear = QPushButton("Clear", card)
-        self.image_clear.setToolTip("Go back to the empty-slot frame")
+        self.image_clear.setToolTip(
+            "Go back to the empty-slot frame for the states that fall back")
         self.image_clear.clicked.connect(self._clear_design_image)
         pick_row.addWidget(self.image_button)
         pick_row.addWidget(self.image_clear)
@@ -3073,6 +3138,9 @@ class SettingsWindow(QMainWindow):
         if not chosen:
             return                  # cancelled: no write, no live apply
         self._design_image = chosen
+        # The per-state rows inherit this picture, so their tooltips and the
+        # summary line change with it even though no state's OWN choice did.
+        self._refresh_state_image_buttons()
         self._refresh_design_image_label()
         self._use_image_design()
         self._schedule_appearance_live()
@@ -3082,8 +3150,118 @@ class SettingsWindow(QMainWindow):
         if not self._design_image:
             return
         self._design_image = ""
+        self._refresh_state_image_buttons()
         self._refresh_design_image_label()
         self._schedule_appearance_live()
+
+    # ------------------------------------------------------ one per STATE
+
+    def _pick_state_image(self, state: str) -> None:
+        """Choose the file THIS state draws, and apply it live.
+
+        The dialog starts in the folder of the picture that state already uses
+        (its own, else the fallback), because choosing four pictures usually means
+        four files from one folder. A cancelled dialog writes nothing: closing a
+        file chooser is not an edit.
+        """
+        start = str(self._design_images.get(state)
+                    or self._design_image or "")
+        try:
+            start_dir = str(Path(start).parent) if start else str(Path.home())
+        except (OSError, ValueError):
+            start_dir = str(Path.home())
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, f"Picture the bubble draws while {state}", start_dir,
+            "Images (*.png *.jpg *.jpeg *.webp *.gif *.bmp *.svg *.xpm);;"
+            "All files (*)")
+        if not chosen:
+            return                  # cancelled: no write, no live apply
+        self._design_images[state] = chosen
+        self._refresh_state_image_buttons()
+        self._refresh_design_image_label()
+        self._use_image_design()
+        self._schedule_appearance_live()
+
+    def _clear_state_images(self) -> None:
+        """Drop every per-state picture; each state falls back. One edit."""
+        if not any(self._design_images.get(state) for state, _k in STATE_IMAGE_KEYS):
+            return
+        for state, _key in STATE_IMAGE_KEYS:
+            self._design_images[state] = ""
+        self._refresh_state_image_buttons()
+        self._refresh_design_image_label()
+        self._schedule_appearance_live()
+
+    def _refresh_state_image_buttons(self) -> None:
+        """Each state's button names what it draws, or says it falls back.
+
+        The button's TEXT is the state and its TOOLTIP is what that state draws
+        right now — the full path, or the fallback it inherits, or that it would
+        draw the empty slot. A row of four buttons that only said "Choose" would
+        leave "which states have their own picture" unanswerable without
+        clicking them.
+        """
+        buttons = getattr(self, "state_image_buttons", None)
+        if not buttons:
+            return
+        for state, _key in STATE_IMAGE_KEYS:
+            btn = buttons.get(state)
+            if btn is None:
+                continue
+            path = str(self._design_images.get(state) or "")
+            if path:
+                btn.setText(f"{state.capitalize()} \u2713")
+                btn.setToolTip(f"{state} draws {path}\nClick to change it.")
+            elif self._design_image:
+                btn.setText(state.capitalize())
+                btn.setToolTip(
+                    f"{state} has no picture of its own — it draws the "
+                    f"fallback: {self._design_image}\nClick to give it one.")
+            else:
+                btn.setText(state.capitalize())
+                btn.setToolTip(
+                    f"{state} has no picture: it draws the empty slot.\n"
+                    f"Click to give it one.")
+        self._refresh_state_image_label()
+
+    def _refresh_state_image_label(self) -> None:
+        """One line per state: the picture in effect, or WHY it cannot draw.
+
+        A per-state picker makes "which of the four is wrong" the whole
+        question, so the reason is printed next to the state it belongs to and
+        it is the bubble module's own sentence (`design_image_problem`) — the one
+        `doctor` prints. A pack overrides all four, and the pack label says so,
+        so this line says what the files WOULD draw instead of pretending to
+        describe the desktop.
+        """
+        label = getattr(self, "state_image_label", None)
+        if label is None or not STATE_IMAGE_KEYS:
+            return
+        bubble = None
+        try:
+            bubble = _core_module("bubble")
+        except Exception:
+            log.debug("state image check: bubble module unavailable",
+                      exc_info=True)
+        rows = []
+        for state, _key in STATE_IMAGE_KEYS:
+            path = str(self._design_images.get(state) or "")
+            if not path:
+                # Shown in FULL, like an own picture: a state drawing the
+                # fallback is exactly the case where "which file is that?" is
+                # the question, and a bare file name cannot answer it.
+                rows.append(f"{state}: {self._design_image} (fallback)"
+                            if self._design_image else f"{state}: empty slot")
+                continue
+            problem = ""
+            if bubble is not None:
+                try:
+                    problem = bubble.design_image_problem(path)
+                except Exception:
+                    log.debug("state image check failed", exc_info=True)
+            rows.append(f"{state}: \u26a0 {problem}" if problem
+                        else f"{state}: {path}")
+        label.setText("\n".join(rows))
 
     def _use_image_design(self) -> None:
         """Point the Design combo at `image`, so chosen art is on screen.
@@ -3104,7 +3282,7 @@ class SettingsWindow(QMainWindow):
     def _design_picture(self, state: str = "") -> str:
         """The picture in effect for `state`, resolved the way the BUBBLE does.
 
-        The precedence (a pack when one is chosen, otherwise the single picture)
+        The precedence (pack, then this state's own picture, then the fallback)
         lives in the bubble module's `picture_for`, so the panel and the desktop
         cannot disagree about which picture a state draws — which is the
         preview's whole job, and exactly where two implementations would drift.
@@ -3116,7 +3294,8 @@ class SettingsWindow(QMainWindow):
             return ""
         try:
             return str(bubble.picture_for(self._design_pack,
-                                          self._design_image, state) or "")
+                                          self._design_image, state,
+                                          self._design_images) or "")
         except Exception:
             log.debug("design picture resolution failed", exc_info=True)
             return ""
@@ -3278,10 +3457,16 @@ class SettingsWindow(QMainWindow):
                 f"A pack is selected ({pack}) \u2014 it draws the pictures, and "
                 f"the file above is not used while it is.")
             return
+        own = sum(1 for state, _key in STATE_IMAGE_KEYS
+                  if self._design_images.get(state))
+        every = bool(STATE_IMAGE_KEYS) and own == len(STATE_IMAGE_KEYS)
         path = str(self._design_image or "")
         if not path:
             self.image_label.setText(
-                "No fallback picture \u2014 the empty-slot frame is drawn.")
+                "No fallback picture \u2014 every state has its own picture above."
+                if every else
+                "No fallback picture \u2014 a state with no picture of its own "
+                "draws the empty slot.")
             return
         problem = ""
         try:
@@ -3290,6 +3475,12 @@ class SettingsWindow(QMainWindow):
             log.debug("design image check failed", exc_info=True)
         if problem:
             self.image_label.setText(f"\u26a0 {problem}")
+        elif every:
+            # Set but not in use: saying so is the difference between "this file
+            # is ignored" and "this file is broken", and clearing one state's
+            # picture brings it straight back.
+            self.image_label.setText(
+                f"{path} \u2014 unused while every state has its own picture.")
         else:
             self.image_label.setText(path)
 
@@ -3333,6 +3524,11 @@ class SettingsWindow(QMainWindow):
                       "bubble_accent": "colour accent", "colors": "state colours",
                       "design_image_path": "fallback image",
                       "design_pack": "design pack"}
+            # A per-state choice reports the STATE it was made for, not the
+            # setting's own name: "idle picture" says what moved, and
+            # "design_image_idle" does not.
+            pretty.update({key: f"{state} picture"
+                           for state, key in STATE_IMAGE_KEYS})
             name = self._current_look()
             entry = (SCHEMA.look(name) if name and hasattr(SCHEMA, "look")
                      else None)
@@ -3527,7 +3723,11 @@ class SettingsWindow(QMainWindow):
         _di = self.design_combo.findData(str(self.cfg.get("bubble_design", "orb")))
         self.design_combo.setCurrentIndex(_di if _di >= 0 else 0)
         self._design_image = str(self.cfg.get("design_image_path") or "")
+        self._design_images = {
+            state: str(self.cfg.get(key) or "")
+            for state, key in STATE_IMAGE_KEYS}
         self._design_pack = str(self.cfg.get("design_pack") or "")
+        self._refresh_state_image_buttons()
         self._refresh_pack_combo()
         self._refresh_design_image_label()
         self.energy_slider.setValue(int(round(min(
@@ -3641,6 +3841,8 @@ class SettingsWindow(QMainWindow):
         self.cfg["bubble_size"] = self.size_slider.value()
         self.cfg["bubble_design"] = self.design_combo.currentData() or "orb"
         self.cfg["design_image_path"] = str(self._design_image or "")
+        for state, key in STATE_IMAGE_KEYS:
+            self.cfg[key] = str(self._design_images.get(state) or "")
         self.cfg["design_pack"] = str(self._design_pack or "")
         self.cfg["animation_energy"] = self.energy_slider.value() / 100.0
         self.cfg["bubble_accent"] = self.accent_slider.value() / 100.0

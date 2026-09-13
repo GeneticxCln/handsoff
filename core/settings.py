@@ -223,6 +223,12 @@ def coerce_settings(s: dict) -> dict:
     # folder. The renderer reports why it cannot draw (`design_image_problem`).
     s["design_image_path"] = os.path.expanduser(
         str(s.get("design_image_path") or "").strip())
+    # The same art one picture PER STATE (idle/listening/thinking/speaking).
+    # Expanded and stripped for exactly the reasons above — a file that is moved
+    # or not yet drawn must not erase the choice — and the keys come from the
+    # schema so the setting name and the state it belongs to cannot drift.
+    for _key in _schema.DESIGN_IMAGE_KEYS:
+        s[_key] = os.path.expanduser(str(s.get(_key) or "").strip())
     # The `image` design's pack: ONE installed folder name. Stripped here and
     # nothing more, for the same reason the path above is not validated: a pack
     # that is temporarily moved or not yet installed must not erase the user's

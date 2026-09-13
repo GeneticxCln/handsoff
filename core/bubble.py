@@ -411,6 +411,11 @@ def design_image_problem(path: str | None = None) -> str:
 # carries a denylist.
 PACK_MANIFEST = "pack.json"
 PACK_STATES = (IDLE, LISTENING, THINKING, SPEAKING)
+# The setting that holds one picture PER STATE, derived from the state names so
+# a rename cannot desync the setting from the state it belongs to. The schema's
+# `DESIGN_IMAGE_KEYS` is the same four names (it cannot import this module — the
+# settings app loads it without Qt — and a test asserts the two agree).
+STATE_IMAGE_KEY = {state: f"design_image_{state}" for state in PACK_STATES}
 PACK_DIR_NAME = "design-packs"
 PACKS_DIR = None        # set by the host; see packs_dir() for the fallback
 _PACK_CACHE: dict = {}  # (slug, mtime_ns, size) -> manifest or None
@@ -574,13 +579,33 @@ def load_pack(pack):
     return built
 
 
-def picture_for(pack, single, state: str = "") -> str:
+def state_pictures(settings=None) -> dict:
+    """{state: path} for the states with a picture of their OWN, others omitted.
+
+    Reads the per-state settings (`design_image_<state>`) and drops the empty
+    ones, so "does this state have its own picture" is one question with one
+    answer — asked by the resolver, by `doctor` and by the settings panel, which
+    is what stops the three describing the same settings differently.
+    """
+    src = SETTINGS if settings is None else settings
+    out = {}
+    for state in PACK_STATES:
+        raw = str((src or {}).get(STATE_IMAGE_KEY[state]) or "").strip()
+        if raw:
+            out[state] = raw
+    return out
+
+
+def picture_for(pack, single, state: str = "", per_state=None) -> str:
     """The picture in effect for `state`, by precedence, or "" for the slot.
 
     A pack is the AUTHORITY: setting one means its pictures are the art, so a
     pack that cannot be read returns "" (the empty slot) rather than silently
     substituting a picture the user did not choose; `pack_problem()` names the
-    reason. Without a pack, `single` is the art.
+    reason. Without a pack, a state that has its OWN picture uses it, and a state
+    that has none falls back to `single` — the same shape as a pack's `states`
+    plus its `any`, so the two ways of giving one design several pictures obey
+    one rule instead of two.
 
     Takes the values the CALLER already holds rather than reading the settings,
     because two processes need it: the bubble (which reads settings) and the
@@ -594,13 +619,15 @@ def picture_for(pack, single, state: str = "") -> str:
         if manifest is None:
             return ""
         return str(manifest["states"].get(str(state)) or manifest["any"] or "")
-    return str(single or "").strip()
+    own = str((per_state or {}).get(str(state)) or "").strip()
+    return own or str(single or "").strip()
 
 
 def design_picture(state: str = "") -> str:
     """The picture the `image` design draws in `state`, from the settings."""
     return picture_for(SETTINGS.get("design_pack"),
-                       SETTINGS.get("design_image_path"), state)
+                       SETTINGS.get("design_image_path"), state,
+                       state_pictures(SETTINGS))
 
 
 def installed_packs() -> list:
@@ -656,16 +683,50 @@ def pack_problem(pack=None) -> str:
     return f"{slug}: {problem}" if problem else ""
 
 
+def state_image_problem(per_state=None) -> str:
+    """Why the per-state picture in effect will not render, or "".
+
+    Reports the FIRST state whose own picture cannot be drawn, NAMING the state:
+    with four picture slots, "which one is broken" is the entire question, and a
+    sentence without the state name would send the user through four rows
+    looking for it. One sentence, the same one the panel shows.
+    """
+    pics = state_pictures(SETTINGS) if per_state is None else per_state
+    for state in PACK_STATES:
+        path = str(pics.get(state) or "")
+        if not path:
+            continue
+        problem = design_image_problem(path)
+        if problem:
+            return f"the {state} picture: {problem}"
+    return ""
+
+
+def usable_state_pictures(settings=None) -> dict:
+    """{state: path} for the states whose OWN picture will actually be drawn.
+
+    `state_pictures` answers "which states have a picture of their own" — a
+    settings question. This answers "which of those will render", which is what
+    a COUNT has to be if it is honest: reporting 4/4 on the same line that names
+    a broken picture is a count of intentions, not of pictures, and the whole
+    point of the per-state sentence is that it cannot disagree with the bubble.
+    """
+    return {state: path
+            for state, path in state_pictures(settings).items()
+            if not design_image_problem(path)}
+
+
 def art_problem() -> str:
     """Why the `image` design will not render what is chosen, or "".
 
     ONE sentence for `doctor`, by the same precedence the renderer uses: the
-    selected pack when there is one (it is the authority), otherwise the
-    single fallback picture.
+    selected pack when there is one (it is the authority), otherwise the first
+    broken per-state picture, otherwise the single fallback picture.
     """
     if pack_slug(SETTINGS.get("design_pack")):
         return pack_problem()
-    return design_image_problem()
+    problem = state_image_problem()
+    return problem or design_image_problem()
 
 
 def install_pack(source) -> tuple:

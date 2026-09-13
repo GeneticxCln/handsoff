@@ -2566,6 +2566,179 @@ def the_image_design_can_use_an_installed_pack():
     _shutil.rmtree(packs_root, ignore_errors=True)
 
 
+@scenario
+def the_image_design_takes_one_picture_per_state():
+    # One picture for idle/listening/thinking/speaking, chosen in the Shape card,
+    # with `design_image_path` behind them as the fallback. What this pins is the
+    # wiring: the four settings the panel writes are the four the bubble reads,
+    # the preview shows the picture of the state it is drawing, a state with no
+    # picture of its own really falls back, and the reason one of them cannot
+    # draw names WHICH state — with four slots that is the entire question.
+    import json as _json
+    from PySide6.QtGui import QColor, QImage
+
+    from settings_schema import DESIGN_IMAGE_KEYS
+
+    folder = settings_file.parent
+    states = [key[len("design_image_"):] for key in DESIGN_IMAGE_KEYS]
+    assert states == ["idle", "listening", "thinking", "speaking"], states
+
+    def art(name, rgba):
+        p = folder / name
+        img = QImage(64, 64, QImage.Format_ARGB32)
+        img.fill(QColor(*rgba))
+        assert img.save(str(p)), name
+        return p
+
+    files = {s: art(f"{s}.png", (30 + 40 * i, 60, 200, 255))
+             for i, s in enumerate(states)}
+    fallback = art("fallback.png", (200, 200, 200, 255))
+
+    # --- the panel offers a slot per state, seeded from disk
+    for state in states:
+        assert state in win.state_image_buttons, win.state_image_buttons.keys()
+    assert all(key in win.APPEARANCE_KEYS for key in DESIGN_IMAGE_KEYS), (
+        "a picture chosen for ONE state moves no other control, so a state key "
+        "missing from APPEARANCE_KEYS would be read as a load, not an edit")
+
+    seed({"model": "testmodel:latest", "design_image_path": str(fallback)})
+    win.reload_from_disk()
+    assert win._design_image == str(fallback)
+    assert not any(win._design_images.values()), win._design_images
+    assert str(fallback) in win.state_image_label.text(), (
+        win.state_image_label.text())
+
+    # --- choosing a picture for ONE state: the form, the disk, the shape
+    real_open = settings_app.QFileDialog.getOpenFileName
+    try:
+        settings_app.QFileDialog.getOpenFileName = lambda *a, **k: ("", "")
+        win._pick_state_image("idle")
+        assert not win._design_images.get("idle"), (
+            "a cancelled chooser is not an edit")
+        settings_app.QFileDialog.getOpenFileName = (
+            lambda *a, **k: (str(files["idle"]), ""))
+        win._pick_state_image("idle")
+        # a SECOND state, so "the state the row belongs to" is proven rather
+        # than assumed from one call
+        settings_app.QFileDialog.getOpenFileName = (
+            lambda *a, **k: (str(files["speaking"]), ""))
+        win._pick_state_image("speaking")
+    finally:
+        settings_app.QFileDialog.getOpenFileName = real_open
+    assert win._design_images["idle"] == str(files["idle"])
+    assert win._design_images["speaking"] == str(files["speaking"])
+    assert not win._design_images["listening"], (
+        "picking one state must not fill the others")
+    assert win.design_combo.currentData() == "image", (
+        "choosing art must point the shape at the design that draws it")
+    win._apply_appearance_live()
+    on_disk = _json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["design_image_idle"] == str(files["idle"]), on_disk.get(
+        "design_image_idle")
+    assert on_disk["design_image_speaking"] == str(files["speaking"]), (
+        on_disk.get("design_image_speaking"))
+    assert "idle picture" in win.status_label.text(), win.status_label.text()
+    assert "speaking picture" in win.status_label.text(), (
+        win.status_label.text())
+
+    # --- the bubble resolves it the same way: idle has its own, the rest fall
+    # --- back, and the KEY the panel wrote is the key the renderer reads
+    assert win._design_picture("idle") == str(files["idle"])
+    assert win._design_picture("speaking") == str(files["speaking"])
+    assert win._design_picture("thinking") == str(fallback)
+    assert "(fallback)" in win.state_image_label.text(), (
+        "a state inheriting the fallback must say so, or the readout looks "
+        "like it has its own picture")
+    bubble.SETTINGS["design_image_path"] = str(fallback)
+    bubble.SETTINGS["design_image_idle"] = str(files["idle"])
+    assert appearance.design_picture("idle") == str(files["idle"])
+    assert appearance.design_picture("thinking") == str(fallback)
+    assert appearance.art_problem() == ""
+
+    # --- all four, and the slots really draw four DIFFERENT pictures: the
+    # --- preview's whole job is answering "what will the bubble show".
+    win._design_images.update({s: str(files[s]) for s in states})
+    win._refresh_state_image_buttons()
+    win._refresh_design_image_label()
+    assert "unused while every state has its own picture" in (
+        win.image_label.text()), win.image_label.text()
+    # ...and with the states covered, the fallback only has to say WHAT it is:
+    # set-but-unused and absent are two different sentences.
+    swap = win._design_image
+    win._design_image = ""
+    win._refresh_design_image_label()
+    assert "No fallback picture" in win.image_label.text(), (
+        win.image_label.text())
+    win._design_image = swap
+    win._refresh_design_image_label()
+    seen = []
+    real_draw = settings_app.BubblePreview._draw_image_glyph
+
+    def _recording(self, painter, cx, cy, r, color, state=""):
+        out = real_draw(self, painter, cx, cy, r, color, state)
+        seen.append((state, out))
+        return out
+
+    class _FrozenClock:
+        def elapsed(self):
+            return 4000
+
+    settings_app.BubblePreview._draw_image_glyph = _recording
+    try:
+        win.preview.resize(320, 200)
+        win.preview._clock = _FrozenClock()
+        img = QImage(win.preview.width(), win.preview.height(),
+                     QImage.Format_ARGB32)
+        img.fill(0)
+        win.preview.render(img)
+    finally:
+        settings_app.BubblePreview._draw_image_glyph = real_draw
+    assert [s for s, ok in seen] == states, seen
+    assert all(ok for _s, ok in seen), seen
+    for state in states:
+        assert win._design_picture(state) == str(files[state]), state
+
+    # --- a state's picture that cannot be drawn is reported FOR THAT STATE,
+    # --- in the panel and in doctor, with the bubble module's own sentence.
+    ghost = folder / "ghost.png"
+    win._design_images["listening"] = str(ghost)
+    win._refresh_state_image_buttons()
+    line = win.state_image_label.text()
+    assert "listening: \u26a0 no file at" in line, line
+    assert f"idle: {files['idle']}" in line, line
+    bubble.SETTINGS["design_image_listening"] = str(ghost)
+    note = bubble._appearance_note()
+    assert "the listening picture" in note, note
+    # The count is of pictures that will RENDER, out of the four states — two
+    # keys are set here and one of them cannot be drawn, so 1/4 is the honest
+    # number and it cannot contradict the sentence naming the broken one. It is
+    # derived from the settings, not from how many the panel is showing.
+    assert "picture per state: 1/4" in note, note
+    assert "picture per state: 2/4" not in note, note
+    win._design_images["listening"] = str(files["listening"])
+    win._refresh_state_image_buttons()
+
+    # --- clearing goes back to the fallback for every state, live and on disk
+    win._clear_state_images()
+    win._apply_appearance_live()
+    on_disk = _json.loads(settings_file.read_text(encoding="utf-8"))
+    for key in DESIGN_IMAGE_KEYS:
+        assert on_disk[key] == "", (key, on_disk[key])
+    assert not any(win._design_images.values())
+    assert str(fallback) in win.state_image_label.text()
+    assert "No fallback picture" not in win.image_label.text(), (
+        "the fallback is still set, so the label must describe it")
+    win._clear_design_image()
+    win._apply_appearance_live()
+    assert "No fallback picture" in win.image_label.text(), (
+        win.image_label.text())
+    for state in states:
+        assert f"{state}: empty slot" in win.state_image_label.text(), (
+            state, win.state_image_label.text())
+    bubble.SETTINGS["design_image_idle"] = ""
+    bubble.SETTINGS["design_image_path"] = ""
+
+
 if __name__ == "__main__":
     name = sys.argv[1]
     try:
@@ -2618,6 +2791,7 @@ SCENARIO_NAMES = [
     "every_design_has_its_own_preview_glyph",
     "the_image_design_draws_the_users_picture",
     "the_image_design_can_use_an_installed_pack",
+    "the_image_design_takes_one_picture_per_state",
     "appearance_panel_is_a_scrolling_column_of_cards",
     "look_tiles_are_drawn_from_the_shared_painter",
     "voice_tab_level_meter_reads_the_bubble_feed",

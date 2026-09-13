@@ -2981,6 +2981,64 @@ and doctor prints `appearance: look Custom (image, 144 px) — pack prism`, with
 reloaded live (no restart)` journal lines and zero tracebacks — then the user's own settings
 restored byte-for-byte (`design: pikachu`, look `spark`). Nothing committed.
 
+## One picture per state, without a pack folder
+
+**What was missing.** The `image` design drew ONE file for all four states, so the only way to
+show a different picture while listening than while thinking was to edit the setting between
+states — and a pack was the only way to get per-state art, which meant authoring and
+installing a folder for what is often just two pictures.
+
+**The four settings are derived, not respelled.** `settings_schema.DESIGN_IMAGE_KEYS` is built
+from `BUBBLE_STATES`, and `core/bubble.py` derives its own `STATE_IMAGE_KEY` from the same
+tuple, with a guard asserting the two modules name the same four settings — the failure that
+would otherwise hide is a panel saving a key nothing reads, i.e. *"I chose a picture and the
+bubble ignored it"* with no error anywhere. Precedence is the SAME rule a pack uses, so there
+is one rule instead of two: a state with its own picture draws it, a state without one uses
+the fallback (`design_image_path`), a state with neither draws the empty slot, and a selected
+pack remains the authority over all of it. `picture_for()` is that rule — called by the
+bubble AND by the settings preview, which is what stops the panel describing a different
+picture than the desktop draws.
+
+**Every failure names the STATE.** `state_image_problem()` reports the first state whose own
+picture cannot be drawn, with the state's name in the sentence, because with four slots
+"which one is broken" is the entire question; the panel shows it per row and `doctor` prints
+the same sentence, from the same function.
+
+**A real defect the verification found, not a reading.** `doctor` counted the pictures that
+were CHOSEN, not the ones that render — so a run with four configured pictures and one broken
+file printed `picture per state: 4/4` on the very same line as `image: the thinking picture:
+no file at …`. A count of intentions reading as a clean bill of health is precisely the class
+of lie this project keeps finding, so the count is now `usable_state_pictures()` (both
+questions, both answers: `state_pictures` is what the resolver draws from and keeps a
+chosen-but-broken path, `usable_state_pictures` is what will actually render), and the live
+proof below is what exposed it.
+
+**Evidence.** **44/44 mutations** back to the old behaviour caught, one per decision — the 20
+pack + image ones plus 3 new for this set (a per-state picture dropped when it cannot be read,
+the count including pictures that do not render, and `doctor` counting chosen pictures).
+**1118 tests green** in three orderings (default, shuffled-test seed 20260913, shuffled-file
+seed 7); coverage **80.99% ≥ 70** measured the gate's own way (`COVERAGE_PROCESS_START`);
+`ci/compile_all.py` clean (43 files). New guards: the per-state unit cases in
+`tests/test_design_packs.py` (34 cases now) and the offscreen scenario
+`the_image_design_takes_one_picture_per_state`. Deployed `in-sync` (installed == checkout for
+all five touched files) and verified against the RUNNING bubble with four distinct per-state
+pictures plus a fallback: doctor prints `appearance: look Custom (image, 144 px) — picture per
+state: 4/4`, then pointing `thinking` at a missing file makes it print `… — picture per state:
+3/4 — image: the thinking picture: no file at /tmp/pack/live/does-not-exist.png` (the corrected
+count doing its job), with `settings reloaded live (no restart)` in the journal and the user's
+settings restored **byte-for-byte** (sha256 equal before and after, `design: pikachu`, look
+`spark`).
+
+**One flake observed and NOT chased to ground (recorded, not described as a fix).** The
+tests-shuffled ordering (seed 20260913) failed once in four attempts with
+`ERROR tests/test_hardware.py::TestPromptContext::test_token_cap — PytestUnhandledThreadExceptionWarning`,
+while the same file passes in isolation under that same seed and the run passes on re-run.
+That warning is reported against whichever test is RUNNING when some other test's thread
+dies — `hardware.snapshot` is single-threaded, so the raising thread is not this test's —
+which makes it the same class as the `test_audio.py::TestMicHealth` flake recorded with the
+pack set: a leak whose blame lands on an innocent bystander. It did not reproduce in the
+two full re-runs (one with the message captured to a log) or the three seeded subset runs, so
+it is recorded as an open question rather than a closed one. Nothing committed.
 
 ## Online lookups: a probed search router and a page reader
 

@@ -190,8 +190,19 @@ class TestSettingsCoercion:
         # Deliberately passed through: written by the installer, read by
         # nothing in the runtime (a dead schema entry, noted in GAP_ANALYSIS).
         free_form = {"autostart"}
+        # Keys validated in a LOOP over the schema's own list cannot appear here
+        # as literals — the `image` design's four per-state pictures are one of
+        # them, and the loop is what keeps each setting name in step with the
+        # state it belongs to. The exemption is granted only while that loop is
+        # present and names the schema, so it cannot outlive the code it stands
+        # for: delete the loop and the four keys are reported missing again.
+        derived = set()
+        if "DESIGN_IMAGE_KEYS" in body:
+            from settings_schema import DESIGN_IMAGE_KEYS
+            derived = set(DESIGN_IMAGE_KEYS)
         missing = sorted(k for k in H.DEFAULT_SETTINGS
-                         if f'"{k}"' not in body and k not in free_form)
+                         if f'"{k}"' not in body and k not in free_form
+                         and k not in derived)
         assert missing == [], (
             f"these settings are never coerced: {missing} — validate them in "
             "coerce_settings, or add them to free_form with a reason")
@@ -432,9 +443,18 @@ class TestSchemaWiring:
 
     def test_every_schema_key_reaches_the_settings_app(self, H):
         source = (HERE / "handsoff-settings.py").read_text()
+        # The four per-state picture keys are wired by a LOOP that derives them
+        # from the schema (`STATE_IMAGE_KEYS`), so their literals are absent by
+        # design. Exempted only while that derivation is present, so removing it
+        # brings all four back as missing rather than passing silently.
+        derived = set()
+        if '"DESIGN_IMAGE_KEYS"' in source:
+            from settings_schema import DESIGN_IMAGE_KEYS
+            derived = set(DESIGN_IMAGE_KEYS)
         missing = sorted(k for k in H.DEFAULT_SETTINGS
                          if f'"{k}"' not in source
-                         and k not in self.NO_GUI_CONTROL)
+                         and k not in self.NO_GUI_CONTROL
+                         and k not in derived)
         assert missing == [], (
             f"these settings have no settings-app wiring: {missing} — add a "
             "control, or list them in NO_GUI_CONTROL with a reason")
