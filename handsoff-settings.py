@@ -165,10 +165,11 @@ import sounddevice as sd  # noqa: E402
 from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QRectF, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPalette, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
+    QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
+    QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 # Spoken by Settings → Voice "Test voice". Kept short: the answer comes back
@@ -2400,30 +2401,97 @@ class SettingsWindow(QMainWindow):
         log.warning("appearance: %s", message)
         self._status(message)
 
+    # ------------------------------------------------------------ appearance
+    # The panel is one scrolling column of titled cards. Before this it was a
+    # flat stack of unlabelled rows pinned to a page that did not scroll, so a
+    # section that grew (the Look row) pushed the live preview past the bottom
+    # edge with no scrollbar and nothing on screen to say it was ever there.
+    # Two rules now hold it together: nothing is ever unreachable (the page
+    # scrolls) and every control says what it is (a card heading, a shared
+    # label column, a shared value column).
+
+    FIELD_W = 84          # label column: every field name lines up
+    VALUE_W = 74          # readout column: no slider jumps as its value changes
+
+    def _panel_stylesheet(self) -> str:
+        """Card and heading look, derived from the LIVE palette.
+
+        Built from QPalette rather than hard-coded colours (and not from CSS
+        `palette(...)`, which Qt's stylesheet parser does not honour), so the
+        panel reads the same on a light and a dark desktop theme.
+        """
+        role = QPalette.ColorRole
+        pal = self.palette()
+        return (
+            f"QFrame#card {{ background: {pal.color(role.Base).name()};"
+            f" border: 1px solid {pal.color(role.Mid).name()};"
+            f" border-radius: 10px; }}"
+            "QLabel#cardTitle { font-weight: 600; }"
+            f"QLabel#muted {{ color: {pal.color(role.PlaceholderText).name()}; }}"
+        )
+
+    def _card(self, title: str, hint: str = ""):
+        """One titled card: the panel's only section unit."""
+        frame = QFrame(self)
+        frame.setObjectName("card")
+        box = QVBoxLayout(frame)
+        box.setContentsMargins(14, 12, 14, 14)
+        box.setSpacing(10)
+        head = QLabel(title, frame)
+        head.setObjectName("cardTitle")
+        box.addWidget(head)
+        if hint:
+            sub = QLabel(hint, frame)
+            sub.setObjectName("muted")
+            sub.setWordWrap(True)
+            box.addWidget(sub)
+        return frame, box
+
+    def _field(self, label: str, widget: QWidget, value: QLabel | None = None):
+        """A labelled control row: name column, control, optional readout."""
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        name = QLabel(label, self)
+        name.setObjectName("muted")
+        name.setFixedWidth(self.FIELD_W)
+        name.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row.addWidget(name)
+        row.addWidget(widget, 1)
+        if value is not None:
+            value.setFixedWidth(self.VALUE_W)
+            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            row.addWidget(value)
+        return row
+
+    def _muted(self, text: str, parent: QWidget) -> QLabel:
+        lab = QLabel(text, parent)
+        lab.setObjectName("muted")
+        lab.setWordWrap(True)
+        return lab
+
     def _appearance_tab(self) -> QWidget:
-        w = QWidget(self)
-        lay = QVBoxLayout(w)
+        page = QWidget(self)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(page)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget(scroll)
+        content.setStyleSheet(self._panel_stylesheet())
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(14)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         self.color_buttons: dict[str, QPushButton] = {}
+        self.color_swatches: dict[str, QLabel] = {}
         # Adopt before the status bar exists; `_load_values` reports the
         # refusals once it does, so the message is not lost or shown twice.
         self._adopt_colors(self.cfg.get("colors"))
 
-        size_row = QHBoxLayout()
-        self.size_slider = QSlider(Qt.Horizontal, self)
-        self.size_slider.setRange(96, 192)
-        self.size_label = QLabel("", self)
-        self.size_slider.valueChanged.connect(
-            lambda v: self.size_label.setText(f"{v} px window  ≈  {int(v * 0.69)} px bubble"))
-        # ...and actually apply it: this slider used to only relabel itself, so
-        # the bubble size never changed without pressing Save.
-        self.size_slider.valueChanged.connect(self._schedule_appearance_live)
-        size_row.addWidget(QLabel("Bubble size", self))
-        size_row.addWidget(self.size_slider, 1)
-        size_row.addWidget(self.size_label)
-        lay.addLayout(size_row)
-
-        design_row = QHBoxLayout()
-        self.design_combo = QComboBox(self)
+        # -- Shape ---------------------------------------------------------
+        card, box = self._card("Shape")
+        self.design_combo = QComboBox(card)
         # display names for designs a bare .capitalize() would flatten
         design_labels = {"sauron": "Eye of Sauron"}
         for name in getattr(SCHEMA, "BUBBLE_DESIGNS", ("orb",)):
@@ -2433,72 +2501,113 @@ class SettingsWindow(QMainWindow):
             "Bubble shape — applies immediately; the bubble repaints within "
             "seconds. No Save needed.")
         self.design_combo.currentIndexChanged.connect(self._schedule_appearance_live)
-        design_row.addWidget(QLabel("Bubble design", self))
-        design_row.addWidget(self.design_combo, 1)
-        lay.addLayout(design_row)
+        box.addLayout(self._field("Design", self.design_combo))
+        self.size_slider = QSlider(Qt.Horizontal, card)
+        self.size_slider.setRange(96, 192)
+        self.size_label = QLabel("", card)
+        self.size_slider.valueChanged.connect(
+            lambda v: self.size_label.setText(f"{v} px"))
+        # ...and actually apply it: this slider used to only relabel itself, so
+        # the bubble size never changed without pressing Save.
+        self.size_slider.valueChanged.connect(self._schedule_appearance_live)
+        box.addLayout(self._field("Size", self.size_slider, self.size_label))
+        box.addWidget(self._muted(
+            "Window size in pixels — the drawn bubble is about 69% of it.", card))
+        lay.addWidget(card)
 
-        # one global animation scale + one accent punch, both applied by every
-        # design in the bubble's shared frame state (no per-shape tuning)
-        energy_row = QHBoxLayout()
-        self.energy_slider = QSlider(Qt.Horizontal, self)
+        # -- Motion: one global animation scale + one accent punch, both
+        # applied by every design in the bubble's shared frame state
+        card, box = self._card(
+            "Motion",
+            "Energy scales every design's speed; accent scales how hard it "
+            "leans on the state colour.")
+        self.energy_slider = QSlider(Qt.Horizontal, card)
         self.energy_slider.setRange(20, 200)
         self.energy_slider.setToolTip(
             "Scales orbit speed, swirl speed, hue sweep and comet brightness "
             "for every design. 1.0 is the original feel.")
-        self.energy_label = QLabel("", self)
+        self.energy_label = QLabel("", card)
         self.energy_slider.valueChanged.connect(
-            lambda v: self.energy_label.setText(f"{v / 100:.1f}×"))
+            lambda v: self.energy_label.setText(f"{v / 100:.1f}\u00d7"))
         self.energy_slider.valueChanged.connect(self._schedule_appearance_live)
-        energy_row.addWidget(QLabel("Animation energy", self))
-        energy_row.addWidget(self.energy_slider, 1)
-        energy_row.addWidget(self.energy_label)
-        lay.addLayout(energy_row)
-
-        accent_row = QHBoxLayout()
-        self.accent_slider = QSlider(Qt.Horizontal, self)
+        box.addLayout(self._field("Energy", self.energy_slider,
+                                  self.energy_label))
+        self.accent_slider = QSlider(Qt.Horizontal, card)
         self.accent_slider.setRange(0, 100)
         self.accent_slider.setToolTip(
             "How hard each shape leans on its state colour: saturation and "
             "glow punch. 50% is the original look.")
-        self.accent_label = QLabel("", self)
+        self.accent_label = QLabel("", card)
         self.accent_slider.valueChanged.connect(
             lambda v: self.accent_label.setText(f"{v}%"))
         self.accent_slider.valueChanged.connect(self._schedule_appearance_live)
-        accent_row.addWidget(QLabel("Colour accent", self))
-        accent_row.addWidget(self.accent_slider, 1)
-        accent_row.addWidget(self.accent_label)
-        lay.addLayout(accent_row)
+        box.addLayout(self._field("Accent", self.accent_slider,
+                                  self.accent_label))
+        lay.addWidget(card)
 
-        colors_row = QHBoxLayout()
-        for key, title in (("idle", "Idle"), ("listening", "Listening"),
-                           ("thinking", "Thinking"), ("speaking", "Speaking")):
-            btn = QPushButton(title, self)
-            btn.setFixedHeight(30)
+        # -- State colours --------------------------------------------------
+        card, box = self._card(
+            "State colours",
+            "One colour per state. Click a swatch to change it.")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
+        for i, (key, title) in enumerate((
+                ("idle", "Idle"), ("listening", "Listening"),
+                ("thinking", "Thinking"), ("speaking", "Speaking"))):
+            cell = QWidget(card)
+            column = QVBoxLayout(cell)
+            column.setContentsMargins(0, 0, 0, 0)
+            column.setSpacing(3)
+            btn = QPushButton(title, cell)
+            btn.setMinimumHeight(34)
             btn.clicked.connect(lambda _=False, k=key: self._pick_color(k))
             self.color_buttons[key] = btn
-            colors_row.addWidget(btn)
-        reset = QPushButton("Reset", self)
+            swatch = self._muted("", cell)
+            swatch.setAlignment(Qt.AlignHCenter)
+            self.color_swatches[key] = swatch
+            column.addWidget(btn)
+            column.addWidget(swatch)
+            grid.addWidget(cell, i // 4, i % 4)
+        reset = QPushButton("Reset", card)
+        reset.setToolTip("Restore the four default state colours")
         reset.clicked.connect(self._reset_colors)
-        colors_row.addWidget(reset)
-        lay.addLayout(colors_row)
+        reset_row = QHBoxLayout()
+        reset_row.addStretch(1)
+        reset_row.addWidget(reset)
+        box.addLayout(grid)
+        box.addLayout(reset_row)
+        lay.addWidget(card)
 
+        # -- Match your desktop ---------------------------------------------
+        card, box = self._card(
+            "Match your desktop",
+            "Samples your wallpaper and retunes all four colours so the bubble "
+            "reads clearly against it.")
         tune_row = QHBoxLayout()
-        match_btn = QPushButton("Match wallpaper", self)
+        match_btn = QPushButton("Match wallpaper", card)
         match_btn.setToolTip(
             "Sample the configured wallpaper and retune all four state colours "
             "so the bubble reads clearly against it")
         match_btn.clicked.connect(self._match_wallpaper)
-        dark_btn = QPushButton("Dark tuning", self)
+        dark_btn = QPushButton("Dark tuning", card)
         dark_btn.setToolTip("Retune the palette for a dark backdrop (no detection)")
         dark_btn.clicked.connect(lambda: self._apply_wallpaper_tuning(0.05))
-        light_btn = QPushButton("Light tuning", self)
+        light_btn = QPushButton("Light tuning", card)
         light_btn.setToolTip("Retune the palette for a light backdrop (no detection)")
         light_btn.clicked.connect(lambda: self._apply_wallpaper_tuning(0.95))
         tune_row.addWidget(match_btn)
         tune_row.addWidget(dark_btn)
         tune_row.addWidget(light_btn)
-        lay.addLayout(tune_row)
+        tune_row.addStretch(1)
+        box.addLayout(tune_row)
+        lay.addWidget(card)
 
+        # The preview is the hero of the panel, so it is created here (the
+        # combo and sliders it reads must exist first) but shown at the TOP.
+        card, box = self._card(
+            "Preview",
+            "Idle \u00b7 listening \u00b7 thinking \u00b7 speaking — live, no Save needed.")
         self.preview = BubblePreview(
             lambda: {k: QColor(c) for k, c in self._colors.items()},
             lambda: self.size_slider.value(),
@@ -2506,57 +2615,69 @@ class SettingsWindow(QMainWindow):
             lambda: self.energy_slider.value() / 100.0,
             lambda: self.accent_slider.value() / 100.0,
         )
-        lay.addWidget(self.preview)
+        self.preview.setMinimumHeight(168)
+        box.addWidget(self.preview)
+        lay.insertWidget(0, card)
+
+        # A look is one click for everything under it, so it sits directly
+        # beneath the preview that shows what the click did.
+        card, box = self._card(
+            "Look", "One click sets the shape, the size, the motion and all "
+            "four colours.")
+        self._build_look_group(card, box)
+        lay.insertWidget(1, card)
+
+        lay.addStretch(1)
         self._paint_color_buttons()
-        # Built LAST (all the controls exist by now) but shown FIRST: a look is
-        # a one-click way to set everything under it, so it belongs on top.
-        self._build_look_group(w, lay)
-        return w
+        return page
 
     # ------------------------------------------------------------------ looks
 
-    def _build_look_group(self, parent: QWidget, lay) -> None:
-        """The named-look picker: one button per catalogue entry.
+    def _build_look_group(self, parent: QWidget, box) -> None:
+        """The named-look picker: one tile per catalogue entry, wrapped.
 
         The catalogue is DATA in settings_schema (a look only names the five
         keys the tab already owns), and "which look is current" is DERIVED from
         the widgets — there is no stored name to fall out of step with them.
-        That is why the checked button is recomputed after every change instead
+        That is why the checked tile is recomputed after every change instead
         of being set once and trusted.
+
+        The tiles WRAP four to a row. In one long row they were the widest
+        thing on the page and set the panel's minimum width, which is how a
+        section ends up dictating the size of the window around it.
         """
         self.look_buttons: dict[str, QPushButton] = {}
         self._looks = tuple(getattr(SCHEMA, "APPEARANCE_LOOKS", ()))
-        group = QGroupBox("Look", parent)
-        gl = QVBoxLayout(group)
-        row = QHBoxLayout()
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
         self._look_clock = QElapsedTimer()
         self._look_clock.start()
-        for entry in self._looks:
+        for i, entry in enumerate(self._looks):
             tile = LookTile(entry, self._look_clock, parent)
             tile.setToolTip(self._look_tooltip(entry))
             tile.setAccessibleName(str(entry["label"]))
             tile.clicked.connect(
                 lambda _=False, name=str(entry["name"]): self._apply_look(name))
             self.look_buttons[str(entry["name"])] = tile
-            row.addWidget(tile)
-        row.addStretch(1)
-        gl.addLayout(row)
+            grid.addWidget(tile, i // 4, i % 4)
+        grid.setColumnStretch(4, 1)
+        box.addLayout(grid)
         # ONE timer for the whole strip (see LookTile): it exists so the tiles
-        # look alive before you click one, and it dies with the group.
-        self._look_anim = QTimer(group)
+        # look alive before you click one, and it dies with the card.
+        self._look_anim = QTimer(parent)
         self._look_anim.setInterval(LookTile.TICK_MS)
         self._look_anim.timeout.connect(
             lambda: [tile.update() for tile in self.look_buttons.values()])
         self._look_anim.start()
         self.look_label = QLabel("", parent)
-        self.look_label.setStyleSheet("color: palette(mid);")
-        gl.addWidget(self.look_label)
+        self.look_label.setObjectName("muted")
+        box.addWidget(self.look_label)
         if not self._looks:
             # an older settings_schema in a partial install: say so rather than
-            # showing an empty box with no explanation
-            group.setTitle("Look (unavailable in this install)")
-            group.setEnabled(False)
-        lay.insertWidget(0, group)
+            # showing an empty card with no explanation
+            self.look_label.setText(
+                "Look presets are unavailable in this install.")
         self._refresh_look_buttons()
 
     def _look_tooltip(self, entry: dict) -> str:
@@ -2693,10 +2814,21 @@ class SettingsWindow(QMainWindow):
     def _paint_color_buttons(self) -> None:
         for key, btn in self.color_buttons.items():
             hexcol = self._colors[key]
+            # Readable label on ANY state colour. White was hard-coded, so a
+            # light swatch (a daylight idle, a yellow) had an invisible name on
+            # it — the one control in the panel you could not read.
+            col = QColor(hexcol)
+            luma = (0.299 * col.red() + 0.587 * col.green()
+                    + 0.114 * col.blue()) / 255.0
+            ink = "#101014" if luma > 0.6 else "#ffffff"
             btn.setStyleSheet(
-                f"QPushButton {{ background-color: {hexcol}; color: white; "
-                f"border: 1px solid #555; border-radius: 4px; }}")
+                f"QPushButton {{ background-color: {hexcol}; color: {ink}; "
+                f"border: 1px solid #555; border-radius: 6px; }}"
+                f"QPushButton:hover {{ border: 1px solid {ink}; }}")
             btn.setToolTip(hexcol)
+            swatch = getattr(self, "color_swatches", {}).get(key)
+            if swatch is not None:
+                swatch.setText(hexcol.upper())
 
     def _pick_color(self, key: str) -> None:
         col = QColorDialog.getColor(QColor(self._colors[key]), self, f"{key} colour")

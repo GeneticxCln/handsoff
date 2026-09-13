@@ -1186,6 +1186,70 @@ def every_design_has_its_own_preview_glyph():
 
 
 @scenario
+def appearance_panel_is_a_scrolling_column_of_cards():
+    # The panel used to be a flat stack of unlabelled rows pinned to a page that
+    # did not scroll, so a section that grew pushed the live preview past the
+    # bottom edge with no scrollbar and nothing on screen to say it had been
+    # there. Two properties are load-bearing, and they are what this pins: the
+    # page scrolls, and no section dictates the width of the panel around it.
+    from PySide6.QtWidgets import QFrame, QScrollArea
+
+    names = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+    # the page has to be CURRENT and the window shown: an unraised tab is never
+    # laid out, so a geometry check against it would measure nothing at all
+    win.tabs.setCurrentIndex(names.index("Appearance"))
+    win.show()
+    settings_app.QApplication.processEvents()
+    page = win.tabs.widget(names.index("Appearance"))
+    scroll = page.findChild(QScrollArea)
+    assert scroll is not None, "the Appearance page must scroll"
+    assert scroll.widgetResizable(), "the panel must resize with the window"
+    content = scroll.widget()
+
+    titles, cards = [], []
+    lay = content.layout()
+    for i in range(lay.count()):
+        card = lay.itemAt(i).widget()
+        if card is None or card.objectName() != "card":
+            continue
+        head = card.findChildren(settings_app.QLabel)
+        titles.append(head[0].text() if head else "")
+        cards.append(card)
+    assert cards, "the panel is a column of cards"
+    assert len(titles) == len(set(titles)), titles
+    for expected in ("Preview", "Look", "Shape", "Motion", "State colours",
+                     "Match your desktop"):
+        assert expected in titles, (expected, titles)
+    assert all(isinstance(c, QFrame) for c in cards)
+
+    # narrow window: the panel must stay reachable rather than running off the
+    # side, and a value too tall for the viewport must become scrollable
+    win.setFixedSize(520, 430)
+    settings_app.QApplication.processEvents()
+    view = scroll.viewport()
+    assert content.minimumSizeHint().width() <= view.width(), (
+        f"the panel demands {content.minimumSizeHint().width()}px inside a "
+        f"{view.width()}px viewport — a card you cannot reach")
+    assert content.height() > view.height(), (
+        "this window should need scrolling; nothing may be clipped instead")
+    assert scroll.verticalScrollBar().isVisible()
+    for card in cards:
+        assert card.width() <= view.width(), (titles[cards.index(card)],
+                                              card.width(), view.width())
+
+    # the look tiles WRAP. In one long row they set the panel's minimum width
+    # (8 tiles + spacing); wrapped four to a row they cannot.
+    n = len(win.look_buttons)
+    assert n >= 5, n
+    rows = {tile.mapTo(content, tile.rect().topLeft()).y()
+            for tile in win.look_buttons.values()}
+    assert len(rows) == (n + 3) // 4, (n, sorted(rows))
+    assert content.minimumSizeHint().width() < 8 * settings_app.LookTile.W, (
+        "the tiles still dictate the panel width: "
+        f"{content.minimumSizeHint().width()}px")
+
+
+@scenario
 def look_tiles_are_drawn_from_the_shared_painter():
     # A Look used to be a text button: the picker promised a name and nothing
     # more. Now each look is DRAWN, and a drawn face is a claim about the
@@ -1814,6 +1878,7 @@ SCENARIO_NAMES = [
     "every_look_is_renderable_and_reacts",
     "the_cat_keeps_its_ears_inside_its_own_mask",
     "every_design_has_its_own_preview_glyph",
+    "appearance_panel_is_a_scrolling_column_of_cards",
     "look_tiles_are_drawn_from_the_shared_painter",
     "voice_tab_level_meter_reads_the_bubble_feed",
     "external_change_reloads_and_reports",
