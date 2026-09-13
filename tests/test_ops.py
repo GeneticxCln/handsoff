@@ -1210,9 +1210,12 @@ class TestInstallerRehearsal:
         """
         declared_top = {"handsoff.py", "handsoff-settings.py", "hardware.py",
                         "settings_schema.py"}
+        # Mirrors install.sh's CORE_REQUIRED floor: a module listed here is one
+        # the project DECLARES it ships, which is also what keeps this test
+        # meaningful in a tree where a new file is not committed yet.
         declared_core = {"__init__.py", "registry.py", "settings.py", "audio.py",
                          "brain.py", "tools.py", "doctor.py", "lifecycle.py",
-                         "calendar.py", "assistant.py", "bubble.py"}
+                         "calendar.py", "assistant.py", "bubble.py", "web.py"}
         # A machine without git raises FileNotFoundError here rather than
         # returning non-zero, so the fallback below never applied and the test
         # errored instead of degrading — the mirror-image of the installer's

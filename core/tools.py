@@ -2323,25 +2323,53 @@ class ToolBelt:
             _dep().log.warning('get_weather failed: %s', e)
             return f'ERROR: weather lookup failed ({type(e).__name__})'
 
-    @tool(description='Search the public web for current information (news, prices, scores, facts that may have changed recently). Returns result titles with snippets.', gates='web_access', aliases={'query': ('q',)})
-    def web_search(self, query: str) -> str:
+    # One search tool, not five: the backend is chosen by the QUERY (technical
+    # questions go to Stack Exchange, repositories to GitHub, general questions
+    # to SearXNG/DuckDuckGo) and the walk falls back when one is unavailable, so
+    # the model does not have to know which source knows what — and the fixed
+    # prompt does not carry five more schemas it already struggles to afford.
+    # `read_top` is the two-stage lift: snippets find a page, this READS it, and
+    # it is off by default because each read can be a third-party request.
+    @tool(description=('Search the web for current information (news, prices, scores, technical problems, facts that may have changed recently). '
+                       'Returns titles, snippets and addresses; set read_top=1-3 to also fetch the first results as full text when the user asks what a page SAYS, not just to find it.'),
+          gates='web_access', aliases={'query': ('q',)})
+    def web_search(self, query: str, source: str='auto', read_top: int=0) -> str:
         if not query:
             return 'REFUSED: empty query'
+        web = _dep()._web
         try:
-            results = _dep()._ddg_lite(query)
-            source = 'web'
-            if not results:
-                results = _dep()._wiki_search(query)
-                source = 'wikipedia'
-            if not results:
-                return f'ERROR: no results for {query!r}'
-            lines = [f"Results for '{query}' ({source}):"]
-            for t, s in results[:4]:
-                lines.append(f'- {t}: {s[:220]}')
-            return '\n'.join(lines)
+            results, notes = web.search(query, source, limit=4)
         except Exception as e:
             _dep().log.warning('web_search failed: %s', e)
             return f'ERROR: web search failed ({type(e).__name__})'
+        out = web.format_results(results, notes, query)
+        if read_top and results:
+            blocks, read_notes = web.read_results(results, read_top, max_chars=6000)
+            out = '\n'.join([out] + blocks)
+            if read_notes:
+                out += '\nnote: ' + '; '.join(read_notes)
+        return out
+
+    # The reader is its own tool because reading is a different ACT from
+    # searching: it is slower, it puts one page's full text into the context, and
+    # the address itself leaves the machine when the hosted fallback is used. The
+    # description says so, so the model can tell the user rather than quietly
+    # doing it.
+    @tool(description=('Read a web page and return its text (the page for a link the user pasted, or the article behind a search result). '
+                       'The page is fetched on this machine first; if that yields nothing usable it is fetched through a third-party reader service instead, and the text says which was used. '
+                       'Refuses addresses on this machine or a private network.'),
+          gates='web_access', aliases={'url': ('link', 'address')})
+    def read_page(self, url: str, max_chars: int=6000) -> str:
+        if not url:
+            return 'REFUSED: no address given'
+        try:
+            text, _via, problem = _dep()._web.read_page(url, max_chars=max_chars)
+        except Exception as e:
+            _dep().log.warning('read_page failed: %s', e)
+            return f'ERROR: could not read that page ({type(e).__name__})'
+        if problem:
+            return f'ERROR: {problem}'
+        return text or 'ERROR: nothing readable at that address'
 
     @tool(description='World news headlines.', gates='web_access', aliases={'count': ('n', 'limit')})
     def world_events(self, count: int=4) -> str:

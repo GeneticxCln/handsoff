@@ -85,7 +85,7 @@ class DoctorDeps:
         "control_sock", "crash_log", "remote_ollama_allowed",
         "remote_ollama_optin_source",
         "cap_refusal_note", "cap_refusals",
-        "appearance_look",
+        "appearance_look", "web_lines",
         "shutil", "sounddevice", "log",
     )
 
@@ -126,6 +126,12 @@ class DoctorDeps:
         # reports "", and the line is then omitted entirely, so this cannot
         # change the output of a partial deps object.
         self.appearance_look: Callable[[], str] = lambda: ""
+        # What the host has OBSERVED online: one line per capability, or none at
+        # all for a host that does not look anything up. Deliberately a callable
+        # returning LINES rather than a status the doctor formats itself — the
+        # host owns the vocabulary (which backends exist, which reader was used)
+        # and the doctor owns the placement, so the two cannot disagree.
+        self.web_lines: Callable[[], list] = lambda: []
         self.shutil = shutil
         self.sounddevice = None
         self.log = log
@@ -200,6 +206,22 @@ def _appearance_lines(deps: "DoctorDeps") -> list[str]:
     except Exception:
         note = ""
     return [f"appearance: {note}"] if note else []
+
+
+def _web_lookup_lines(deps: "DoctorDeps") -> list[str]:
+    """The search and reader lines, when the host looks things up online.
+
+    Empty for a host without them, so a partial deps object prints exactly what
+    it printed before. The lines are produced by the host (see `core/web.py`):
+    they name what has actually been OBSERVED, including `untried` for a
+    backend nothing has asked yet — a doctor line that says `ok` because a
+    backend is configured is the false-positive this project keeps removing.
+    """
+    try:
+        lines = deps.web_lines() or []
+    except Exception:
+        lines = []
+    return [str(line) for line in lines if line]
 
 
 def _remote_brain_lines(deps: "DoctorDeps") -> list[str]:
@@ -289,6 +311,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
         lines.extend(_appearance_lines(deps))
+        lines.extend(_web_lookup_lines(deps))
 
         audio = snap["audio"]
         if audio.get("ok") and audio.get("count"):
@@ -331,6 +354,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
         lines.extend(_appearance_lines(deps))
+        lines.extend(_web_lookup_lines(deps))
 
         sd = deps.sounddevice
         if sd is not None:

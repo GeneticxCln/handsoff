@@ -176,6 +176,13 @@ DEFAULT_SETTINGS: dict = {
         "idle": "#4f8cff", "listening": "#ff4d5e",
         "thinking": "#ff9e2c", "speaking": "#3ecf6e",
     },
+    # The local SearXNG the search router prefers when one answers. A local
+    # instance is the only way to search the whole web keylessly without a
+    # hosted middleman: public instances answer non-browsers with a Cloudflare
+    # challenge (measured), so "just use a public one" is not an option. Empty
+    # disables the attempt — the router still has the keyless backends — and the
+    # instance is probed by a localhost connect, never assumed from this string.
+    "searxng_url": "http://127.0.0.1:8888",
     "permissions": {
         "run_command": True, "read_file": True,
         "edit_file": True, "self_restart": True,

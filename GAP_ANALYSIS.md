@@ -2867,3 +2867,79 @@ its bare name, since "stop binding bare names at all" would be a different bug.
 loaded; stt: whisper loaded`, `health` reports `tts.ready: true, device: cuda`, and the
 `timegm` errors are gone. **2/2 mutations caught** (the stdlib check removed; bare
 registration disabled outright).
+
+## Online lookups: a probed search router and a page reader
+
+**What was missing.** `web_search` scraped `lite.duckduckgo.com` with a regex that required a
+double-quoted `class="result-link"`, and the live page uses **single** quotes
+(`class='result-link'`). The parser therefore matched nothing, returned an empty list, and the
+tool fell through to Wikipedia and reported `(wikipedia)` — every web search has been answering
+from the encyclopedia, which is what "DuckDuckGo is kinda limited" actually was. Nothing caught
+it because every test stubbed `_http_get`: the fixtures were written by the same person as the
+parser, in the same quoting style. The fix accepts either quoting and any attribute order, and
+the pin is a fixture **taken from the real response** plus a live check.
+
+**The pieces.** `core/web.py` (application-free, host-injected like `core/bubble.py`) owns the
+backends, the router, the reader, a TTL cache and one failure vocabulary. `handsoff.py`'s
+`_ddg_lite` / `_wiki_search` became one-line delegations, so `_world_events` (proactive
+briefings, severe-weather warnings) upgraded through the same seam — which immediately caught a
+regression: the delegation defaulted to the router's four-item limit while the briefing consumed
+five, and a guard failed on the shortened feed.
+
+**One tool added, not five.** The tool schema is generated from each signature and the fixed
+prompt is the scarce resource, so the four domains live behind `web_search(source=…, read_top=…)`
+selected by deterministic regexes over the query (error/API shapes start at Stack Exchange, repo
+shapes at GitHub, news at the general pair) and the reader is the one new tool. Measured: 48
+tools, `_fixed_prompt_tokens` 6327 of 32768, the two web schemas costing 265 tokens together.
+
+**Backends are keyless, and every one of them was verified live before being relied on.** What
+the survey ruled OUT matters as much: Jina's search endpoint answers `401 Unauthorized` without
+a token; Mojeek captcha-walls scripts (`JavaScript is required`); a public SearXNG instance
+(`searx.be`) answers a non-browser with Cloudflare's `Verifying your browser…` — so "just use a
+public one" is not an option and a local instance is the only route to aggregate, private,
+keyless web search. Stack Exchange, HN and GitHub answered keyless JSON; the Stack Exchange
+payload even carries its own quota (`quota_remaining 299/300`).
+
+**Nothing reports healthy because it is configured.** The record doctor reads is written by
+USE: a backend that answered is `ok (<when>, quota …)`, one that failed keeps its reason and
+time, one nothing has asked is `untried`, and the SearXNG entry — the single entry whose
+availability is a local service — is probed with a localhost connect. This is a deliberate
+departure from the plan's "probe every backend on every doctor call": six network probes in a
+diagnostic the model can call mid-conversation buys nothing that the router's own observations
+do not, and the property that matters (no invented health) is preserved exactly.
+
+**A first real defect the live proof found, in the first live call.** A burst of queries made
+DuckDuckGo serve its anti-bot page (`anomaly.js`, `cc=botnet`, a `challenge-form`) — and the code
+reported that as **"no results"**. A blocked search and an empty web are different facts, and the
+user cannot tell them apart from a bare sentence; the backend now raises a named failure
+("DuckDuckGo served a bot challenge — try again later or run a local SearXNG"), the router keeps
+it in the record, and a test pins all three outcomes (results / an honest empty / a page that is
+not a result page at all).
+
+**A second one, about privacy rather than honesty.** The reader's fallback rule was "local text
+under 200 characters", so `example.com` — sixty characters, perfectly readable here — was sent to
+a third-party reader for nothing. A page is judged useless locally only when the site blocked us
+or when there is a LOT of markup and almost no text (a JavaScript shell); a short page is short.
+
+**Guards and gates.** `tests/test_web.py` (63 cases) drives every backend, the router's order and
+fallback, the cache (a repeat makes no request), the cap (one in-flight request per backend —
+asserted with a held fetch and a second caller), the failure vocabulary, the reader's extraction,
+every anti-bot signature, the local-first/fallback decision in both directions, the disclosure
+prefix, the cached-snapshot passthrough, truncation, and the URL refusals including a public name
+that RESOLVES to this machine. **35/35 mutations** back to the old behaviour caught, one per
+decision — and three of the misses in the first sweep were weak guards rather than bad mutations,
+which is the sweep doing its job: the challenge-page fixture was short enough that the useless-page
+rule alone triggered the fallback, the resolver guard did not check the searxng setting, and the
+`lookup_fact` fake answered the endpoint that made the delegation untestable. **1181 tests green**
+in three orderings (default, shuffled-test seed 20260913, shuffled-file seed 7); coverage
+**81.49% ≥ 70** with `core/web.py` at **93%**; `ci/compile_all.py` clean (45 files).
+
+**Live proof on the DEPLOYED module, not a fixture.** `~/.local/bin/core/web.py`: Stack Exchange
+returned 2 real hits (`quota 291/300`), DuckDuckGo 2 real hits with real URLs, `example.com` read
+`via local fetch`, a Reddit thread answered `the site refuses automated readers (network security
+block)`, `http://192.168.1.1/` was refused (`is on this machine or a private network`), and
+`--ptt doctor` printed `search: searxng not running, ddg ok (2s ago), stackexchange ok (3s ago,
+quota 291/300), hn untried, github untried, wikipedia untried` and `reader: local fetch FAILED (no
+text in 8427 bytes of markup, 2s ago), Jina fallback refused (network security block, 0s ago)`,
+with the deployed copy `in-sync` and the running bubble healthy (`health` ok, `design: pikachu`,
+the user's own appearance untouched). Nothing committed.

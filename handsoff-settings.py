@@ -2297,6 +2297,21 @@ class SettingsWindow(QMainWindow):
             chk = QCheckBox(f"{title} — {desc}", self)
             self.perm_checks[key] = chk
             form.addRow(chk)
+        # The local SearXNG the search router prefers when one answers. A real
+        # field rather than a key only editable by hand in settings.json:
+        # pointing at another port (or another machine) is a reasonable thing to
+        # want, and hiding it is the support trap the installer notes warn about.
+        # Empty means the keyless backends only. It is PROBED, never assumed —
+        # `--ptt doctor` says whether an instance actually answered.
+        self.searxng_edit = QLineEdit(self)
+        self.searxng_edit.setPlaceholderText(
+            "http://127.0.0.1:8888   (empty: keyless backends only)")
+        self.searxng_edit.setToolTip(
+            "A local SearXNG to search through, if you run one. Best results and "
+            "your queries stay on this machine; without it the AI uses the "
+            "keyless backends (Stack Exchange, Hacker News, GitHub, Wikipedia, "
+            "DuckDuckGo).")
+        form.addRow("SearXNG address", self.searxng_edit)
         lay.addWidget(group)
 
         extra_group = QGroupBox("Extra whitelisted commands (one per line)", w)
@@ -3135,6 +3150,7 @@ class SettingsWindow(QMainWindow):
         self.extra_edit.setPlainText("\n".join(self.cfg["extra_allowed_commands"]))
         for key, chk in self.perm_checks.items():
             chk.setChecked(bool(self.cfg["permissions"].get(key, True)))
+        self.searxng_edit.setText(str(self.cfg.get("searxng_url") or ""))
         # `self.cfg` is left as read: `_collect` is what writes the cleaned
         # palette (it always did), and mutating cfg here would leave it
         # disagreeing with `_loaded_cfg` — a reload would then look like an
@@ -3151,6 +3167,9 @@ class SettingsWindow(QMainWindow):
         self.cfg["ollama_host"] = self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]
         self.cfg["allow_remote_ollama"] = self.remote_ollama_chk.isChecked()
         self.cfg["model"] = self._selected_model() or self.cfg["model"]
+        # Normalised the same way the bubble's coercion does it, so the two
+        # cannot disagree about whether a trailing slash is part of the address.
+        self.cfg["searxng_url"] = self.searxng_edit.text().strip().rstrip("/")
         self.cfg["num_ctx"] = self.ctx_spin.value()
         self.cfg["history_tokens"] = self.hist_spin.value()
         self.cfg["max_tool_calls"] = self.toolrate_spin.value()

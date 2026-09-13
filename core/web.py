@@ -1,0 +1,838 @@
+"""Online lookups: a probed search router and a page reader.
+
+Two capabilities, and a rule that shapes both: **a backend is described by what
+this process has OBSERVED, never by what it is assumed to be.** A channel that
+answers `ok` because its command exists (or because it is "always available") is
+how a dead daemon gets reported as reachable — this tree has that bug in the
+ydotool probe and does not want a second one here. So the router records the
+outcome of every backend it uses and `doctor` reports that record, with `untried`
+for a backend nothing has asked yet.
+
+Why a module and not five more tools
+------------------------------------
+The tool surface is generated from each method's signature and the fixed prompt
+is tight, so the four domains live behind ONE tool (`web_search`) selected by a
+deterministic, keyword-based route instead of four schemas the model has to
+choose between. The reader is the one genuinely new tool (`read_page`).
+
+The pieces
+----------
+* **Backends** are keyless: `searxng` (local, opt-in), `ddg` (Lite scrape, the
+  general fallback), `stackexchange`, `hn`, `github`, `wikipedia`. Each returns
+  `Result`s and may raise; the router records and names the failure.
+* **The route** (`_route`) is regexes over the query, not model judgment:
+  an error/API/install shape starts at Stack Exchange, a repo shape at GitHub,
+  a news shape at the general pair. The route is the ORDER of a fallback walk,
+  so a failing primary degrades to the next backend instead of to nothing.
+* **One in-flight request per backend**, admitted through the shared
+  `core/registry.py` helper — the cap is not hand-rolled (`_has_room` is the
+  only place a capacity exists). A refused request is a named skip, not a
+  silent drop.
+* **A TTL cache** keyed by source+limit+query, so a repeated question makes no
+  second request to anybody.
+* **The reader** fetches on THIS machine first (`local fetch`) and uses the
+  hosted reader (`Jina Reader (third-party)`) only when the local fetch yields
+  nothing usable — and the text it returns says which one served it, because
+  the address of a page is the user's business. Loopback, link-local, private
+  and `.local` targets are refused: an assistant that reads a URL on request
+  must not be talked into reading the router's admin page or a cloud metadata
+  endpoint into its transcript.
+
+Host seams
+----------
+`configure()` takes RESOLVERS, not values: a callable is called on every use, so
+the host can pass `lambda: _http_get` and keep a monkeypatched function or a
+reloaded setting live (the alternative — binding the function object once —
+makes every test seam and every settings reload silently stale).
+"""
+from __future__ import annotations
+
+import html as _html
+import inspect
+import ipaddress
+import json
+import re
+import socket
+import threading
+import time
+import urllib.parse
+from html.parser import HTMLParser
+from typing import NamedTuple
+
+from core import registry as _registry
+
+__all__ = [
+    "BACKENDS", "Result", "cache_clear", "configure", "doctor_lines",
+    "read_page", "read_results", "reader_note", "search", "search_note",
+]
+
+# ----------------------------------------------------------------- limits
+SEARCH_TIMEOUT = 6.0        # per backend; a search must not stall a turn
+SEARCH_LIMIT = 4            # results kept per backend
+READ_TIMEOUT = 8.0
+MIN_LOCAL_TEXT = 200        # below this the local fetch is judged thin
+MIN_LOCAL_BYTES = 2000      # ...but only a BIG thin page is a JavaScript shell
+READ_MAX_CHARS = 40_000     # what `read_page` will hand back at most
+TOOL_MAX_CHARS = 6_000      # what a tool puts into the model's context per page
+READ_TOP_MAX = 3
+CACHE_TTL = 300.0
+SEARXNG_PROBE_TIMEOUT = 0.3     # localhost: connect-or-refuse, no external traffic
+JINA_READER = "https://r.jina.ai/"   # the hosted reader, used only as a fallback
+VIA_LOCAL = "local fetch"
+VIA_JINA = "Jina Reader (third-party)"
+UA = "Mozilla/5.0 (X11; Linux x86_64) handsoff"
+
+# ----------------------------------------------------------------- host seams
+_HTTP_GET = None            # callable(url, timeout) -> bytes, or a resolver
+_HTTP_IS_FN = True          # decided by configure(): see `_takes_a_url`
+_SEARXNG_URL = None         # resolver or plain str ("" disables the local backend)
+_LOG = None
+
+
+def _warn(msg: str, *args) -> None:
+    if _LOG is None:
+        return
+    try:
+        _LOG.warning(msg, *args)
+    except Exception:       # a logger must never break a lookup
+        pass
+
+
+def _resolve(value):
+    """A callable is a RESOLVER (called per use); anything else is the value."""
+    return value() if callable(value) else value
+
+
+def _takes_a_url(fn) -> bool:
+    """True when `fn` is the FETCH ITSELF rather than a zero-argument resolver.
+
+    `configure(http_get=...)` accepts both, because both are natural to write and
+    guessing wrong is silent: a resolver passed as a function is called with no
+    address (a confusing TypeError at the first lookup), and a function treated
+    as a resolver does nothing at all. The signature decides, once, here.
+    """
+    try:
+        params = [p for p in inspect.signature(fn).parameters.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD,
+                                p.VAR_POSITIONAL)]
+    except (TypeError, ValueError):
+        return True         # a C callable: assume the URL-passing form
+    return bool(params)
+
+
+def configure(http_get=None, searxng_url=None, logger=None) -> None:
+    """Inject the host's seams. See the module docstring: pass resolvers."""
+    global _HTTP_GET, _HTTP_IS_FN, _SEARXNG_URL, _LOG
+    if http_get is not None:
+        _HTTP_GET = http_get
+        _HTTP_IS_FN = _takes_a_url(http_get)
+    if searxng_url is not None:
+        _SEARXNG_URL = searxng_url
+    if logger is not None:
+        _LOG = logger
+
+
+def _http(url: str, timeout: float = SEARCH_TIMEOUT) -> bytes:
+    """The host's fetch. ONE network seam for search AND reading, so patching
+    `handsoff._http_get` in a test covers the whole feature."""
+    target = _HTTP_GET
+    if target is None:
+        raise RuntimeError("no http_get injected")
+    if not _HTTP_IS_FN:
+        target = _resolve(target)    # a resolver: re-read the host's function
+    if target is None:
+        raise RuntimeError("no http_get injected")
+    return target(url, timeout)
+
+
+def _searxng_url() -> str:
+    return str(_resolve(_SEARXNG_URL) or "").strip().rstrip("/")
+
+
+# ----------------------------------------------------------------- results
+class Result(NamedTuple):
+    """One search hit. `url` is "" when the backend's payload carried none."""
+
+    title: str
+    snippet: str
+    url: str
+    backend: str
+
+
+# ------------------------------------------------------------------ backends
+# name -> human label used in failures, so a message never says a bare key.
+BACKENDS = ("searxng", "ddg", "stackexchange", "hn", "github", "wikipedia")
+_LABEL = {
+    "searxng": "SearXNG",
+    "ddg": "DuckDuckGo",
+    "stackexchange": "Stack Exchange",
+    "hn": "Hacker News",
+    "github": "GitHub",
+    "wikipedia": "Wikipedia",
+}
+
+
+def _clean(markup: str) -> str:
+    return _html.unescape(re.sub(r"<[^>]+>", "", markup or "")).strip()
+
+
+def _unwrap(href: str) -> str:
+    """A scraped href to a real URL: protocol-relative and DDG's redirector."""
+    href = _html.unescape(str(href or "").strip())
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    if "duckduckgo.com/l/" in href:
+        try:
+            query = urllib.parse.urlparse(href).query
+            target = urllib.parse.parse_qs(query).get("uddg", [""])[0]
+            if target:
+                return target
+        except Exception:
+            return ""
+    return href if re.match(r"^https?://", href, re.I) else ""
+
+
+# DuckDuckGo Lite's markup: the class attribute is quoted with SINGLE quotes
+# (`class='result-link'`) as of this writing, and the attributes are not in a
+# fixed order. The parser that read only double quotes matched NOTHING on the
+# live page and returned an empty list, which the tool reported as "no results"
+# — so every web search quietly fell through to Wikipedia. Pinned by a fixture
+# taken from the real response, and by one in the other quoting style.
+_ANCHOR = re.compile(r"<a\b[^>]*>", re.I)
+_HREF = re.compile(r"href=[\"']([^\"']+)[\"']", re.I)
+_RESULT_LINK = re.compile(r"class=[\"']result-link[\"']", re.I)
+_RESULT_TITLE = re.compile(r"class=[\"']result-link[\"'][^>]*>(.*?)</a>", re.S | re.I)
+_RESULT_SNIPPET = re.compile(r"class=[\"']result-snippet[\"'][^>]*>(.*?)</td>", re.S | re.I)
+# DuckDuckGo's anti-bot page: an iframe/form posting to `anomaly.js` with
+# `cc=botnet`. Named here rather than folded into the generic signatures so the
+# failure says which engine turned us away and why.
+_DDG_CHALLENGE = re.compile(r"anomaly\.js|challenge-form|cc=botnet", re.I)
+
+
+def _result_hrefs(html_text: str) -> list:
+    """Every result anchor's href, whatever the attribute order or quoting."""
+    out = []
+    for tag in _ANCHOR.findall(html_text):
+        if not _RESULT_LINK.search(tag):
+            continue
+        match = _HREF.search(tag)
+        out.append(_unwrap(match.group(1)) if match else "")
+    return out
+
+
+def ddg_search(query: str, limit: int = SEARCH_LIMIT) -> list:
+    """DuckDuckGo Lite, scraped. The general fallback: keyless, no account.
+
+    Three outcomes are told apart, because they are three different things:
+    results, a page that says there are none, and a page that is not a result
+    page at all. The third is the one that matters — DuckDuckGo answers a burst
+    of queries from one address with a bot challenge (`anomaly.js`, `cc=botnet`,
+    a `challenge-form`), and reporting THAT as "no results" is a lie the user
+    cannot see through. It raises, so the router names it and doctor keeps it.
+    """
+    page = _http("https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote(query))
+    text = page.decode("utf-8", "replace")
+    if _DDG_CHALLENGE.search(text):
+        label = _antibot(text)
+        raise RuntimeError("DuckDuckGo served a bot challenge"
+                           + (f" ({label[0]})" if label else "")
+                           + " — try again later or run a local SearXNG")
+    titles = _RESULT_TITLE.findall(text)
+    if not titles:
+        if "no results" in text.casefold():
+            return []          # the site answering "nothing matched" — honest
+        if "result-link" not in text:
+            raise RuntimeError(
+                f"unrecognised reply ({len(text)} bytes, no result markup) — "
+                "the page may have changed shape")
+    snippets = _RESULT_SNIPPET.findall(text)
+    hrefs = _result_hrefs(text)
+    out = []
+    for i, title in enumerate(titles[:limit]):
+        snippet = snippets[i] if i < len(snippets) else ""
+        url = hrefs[i] if i < len(hrefs) else ""
+        out.append(Result(_clean(title), _clean(snippet), url, "ddg"))
+    return out
+
+
+def wikipedia_search(query: str, limit: int = SEARCH_LIMIT) -> list:
+    """The MediaWiki search API — stable facts, and a URL we can build exactly."""
+    data = json.loads(_http(
+        "https://en.wikipedia.org/w/api.php?action=query&list=search"
+        "&format=json&srlimit=%d&srsearch=%s" % (limit, urllib.parse.quote(query))))
+    out = []
+    for hit in (data.get("query") or {}).get("search") or []:
+        title = str(hit.get("title", ""))
+        out.append(Result(title, _clean(str(hit.get("snippet", ""))),
+                          "https://en.wikipedia.org/wiki/" + urllib.parse.quote(
+                              title.replace(" ", "_")), "wikipedia"))
+    return out
+
+
+def stackexchange_search(query: str, limit: int = SEARCH_LIMIT) -> list:
+    """Stack Exchange: the backend for error text and API shapes.
+
+    Reports no key and its own daily quota, which the caller records — a quota
+    that is running out is visible BEFORE an empty answer is mistaken for
+    "nothing exists".
+    """
+    url = ("https://api.stackexchange.com/2.3/search/advanced"
+           "?order=desc&sort=relevance&site=stackoverflow&pagesize=%d&q=%s"
+           % (limit, urllib.parse.quote(query)))
+    data = json.loads(_http(url))
+    if data.get("error_message"):
+        raise RuntimeError(str(data["error_message"]))
+    if data.get("backoff"):
+        raise RuntimeError(f"rate limited (backoff {data['backoff']}s)")
+    quota = ""
+    if data.get("quota_max"):
+        quota = f"quota {data.get('quota_remaining')}/{data['quota_max']}"
+    _QUOTA["stackexchange"] = quota
+    out = []
+    for item in (data.get("items") or [])[:limit]:
+        tags = ", ".join(item.get("tags") or [])
+        score = item.get("score", 0)
+        title = _clean(str(item.get("title", "")))
+        out.append(Result(title, f"{tags} — score {score}", str(item.get("link", "")),
+                          "stackexchange"))
+    return out
+
+
+def hn_search(query: str, limit: int = SEARCH_LIMIT) -> list:
+    """HN via Algolia: keyless JSON, good for releases and discussion."""
+    data = json.loads(_http(
+        "https://hn.algolia.com/api/v1/search?tags=story&hitsPerPage=%d&query=%s"
+        % (limit, urllib.parse.quote(query))))
+    out = []
+    for hit in (data.get("hits") or [])[:limit]:
+        url = str(hit.get("url") or "")
+        if not url:
+            url = "https://news.ycombinator.com/item?id=" + str(hit.get("objectID", ""))
+        snippet = _clean(str(hit.get("story_text") or "")) or (
+            f"{hit.get('points', 0)} points, {hit.get('num_comments', 0)} comments")
+        out.append(Result(_clean(str(hit.get("title", ""))), snippet, url, "hn"))
+    return out
+
+
+def github_search(query: str, limit: int = SEARCH_LIMIT) -> list:
+    """Repository search. Unauthenticated: 10 requests a minute, no key."""
+    data = json.loads(_http(
+        "https://api.github.com/search/repositories?per_page=%d&q=%s"
+        % (limit, urllib.parse.quote(query))))
+    out = []
+    for item in (data.get("items") or [])[:limit]:
+        stars = item.get("stargazers_count", 0)
+        out.append(Result(str(item.get("full_name", "")),
+                          f"{item.get('description') or 'no description'} — "
+                          f"{stars} stars",
+                          str(item.get("html_url", "")), "github"))
+    return out
+
+
+def searxng_search(query: str, limit: int = SEARCH_LIMIT) -> list:
+    """A local SearXNG, when one is running. Preferred for general queries: it
+    aggregates the engines and the query never leaves this machine."""
+    base = _searxng_url()
+    if not base:
+        raise RuntimeError("no SearXNG configured")
+    url = (base + "/search?format=json&q=" + urllib.parse.quote(query))
+    data = json.loads(_http(url, timeout=SEARCH_TIMEOUT))
+    if data.get("error"):
+        raise RuntimeError(str(data["error"]))
+    out = []
+    for item in (data.get("results") or [])[:limit]:
+        out.append(Result(_clean(str(item.get("title", ""))),
+                          _clean(str(item.get("content", ""))),
+                          str(item.get("url", "")), "searxng"))
+    return out
+
+
+_SEARCH = {
+    "searxng": searxng_search,
+    "ddg": ddg_search,
+    "stackexchange": stackexchange_search,
+    "hn": hn_search,
+    "github": github_search,
+    "wikipedia": wikipedia_search,
+}
+
+# ------------------------------------------------------------------- routing
+# The route is an ORDER, not a filter: every hit below is reachable, and the
+# walk stops as soon as enough results exist. Regexes rather than a model
+# judgment, because "which backend" must be testable and reproducible.
+_TECH = re.compile(
+    r"\b(error|traceback|exception|api|sdk|pip|install|cuda|gpu|driver|segfault|"
+    r"docker|regex|import|traceback|bug|compile|library|version|package|"
+    r"whisper|python|javascript|rust|sql|json|http|crash)\b", re.I)
+_CODE = re.compile(
+    r"\b(repo|repository|github|gitlab|changelog|release|framework|toolkit|"
+    r"plugin|sdk|release notes)\b", re.I)
+_NEWS = re.compile(
+    r"\b(news|today|latest|current|now|breaking|price|score|weather|forecast|"
+    r"stock|market|election)\b", re.I)
+_ROUTES = (
+    (_TECH, ("stackexchange", "hn", "github", "searxng", "ddg", "wikipedia")),
+    (_CODE, ("github", "hn", "searxng", "ddg", "wikipedia")),
+    (_NEWS, ("searxng", "ddg", "hn", "wikipedia")),
+)
+_GENERAL = ("searxng", "ddg", "wikipedia")
+
+
+def _route(query: str) -> tuple:
+    """The ordered backends for `query`. First match wins; general otherwise."""
+    for pattern, order in _ROUTES:
+        if pattern.search(query or ""):
+            return order
+    return _GENERAL
+
+
+# ---------------------------------------------------------------- the record
+# backend -> {"ok": bool, "at": float, "why": str}. Written whenever a backend
+# is actually used, read by `search_note()`. Empty means "untried", which is
+# what doctor says instead of inventing a healthy answer.
+_SEEN: dict = {}
+_QUOTA: dict = {}
+_READER_SEEN: dict = {}     # "local"/"jina" -> {"ok", "at", "why"}
+_RECORD_LOCK = threading.Lock()
+
+
+def _record(store: dict, name: str, ok: bool, why: str = "") -> None:
+    with _RECORD_LOCK:
+        store[name] = {"ok": bool(ok), "why": why, "at": time.time()}
+
+
+# One in-flight request per backend, admitted by the shared registry helper —
+# the project's rule is that no capacity is enforced by hand anywhere. A
+# refusal here is a NAMED skip ("busy"), never a silent drop.
+_CAPS = {name: _registry.BoundedRegistry(f"web-{name}", 1) for name in BACKENDS}
+
+
+def _run(name: str, fn, query: str) -> list:
+    """Run one backend under its cap, recording success OR the reason it failed."""
+    reservation = _CAPS[name].reserve(key=name)
+    if reservation is None:
+        raise RuntimeError("busy — a request to this backend is already in flight")
+    try:
+        results = fn(query, SEARCH_LIMIT)
+    except Exception as exc:
+        _record(_SEEN, name, False, _reason(exc))
+        _warn("web backend %s failed: %s", name, exc)
+        raise
+    finally:
+        reservation.cancel()        # transient: the slot is free the moment we are
+    _record(_SEEN, name, True)
+    return results
+
+
+def _reason(exc: Exception) -> str:
+    """The shortest honest reason: a status if there is one, else what it SAID.
+
+    The message matters for the cases with no status to report — a refused
+    admission says "busy", a rate limit says "rate limited (backoff 30s)", a
+    connection says "Connection refused". Falling back to the exception's type
+    name for those would make every skip read `RuntimeError`, which is the same
+    as saying nothing.
+    """
+    status = getattr(exc, "code", None)
+    if status:
+        return f"HTTP {status}"
+    text = " ".join(str(exc).split())[:70]
+    return text or type(exc).__name__
+
+
+# ------------------------------------------------------------------- caching
+_CACHE: dict = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def cache_clear() -> None:
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def _cached(key: str):
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+    if hit is None:
+        return None
+    expires, results, notes = hit
+    return (results, notes) if expires > time.time() else None
+
+
+def _store(key: str, results: list, notes: list) -> None:
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.time() + CACHE_TTL, results, notes)
+
+
+# -------------------------------------------------------------------- search
+def search(query: str, source: str = "auto", limit: int = SEARCH_LIMIT):
+    """(results, notes) for `query`.
+
+    `source` is a backend name or "auto" (the route). `notes` names every
+    backend that was tried and did not deliver, so a caller can say WHY an
+    answer is thin instead of reporting "no results" as if the web had none.
+    Never raises: a source that cannot even be looked up comes back as a note.
+    """
+    query = str(query or "").strip()
+    if not query:
+        return [], ["nothing to search for"]
+    try:
+        limit = max(1, min(int(limit or SEARCH_LIMIT), 10))
+    except (TypeError, ValueError):
+        limit = SEARCH_LIMIT
+    source = str(source or "auto").strip().lower()
+    if source in ("", "auto", "any"):
+        order = _route(query)
+    elif source in _SEARCH:
+        order = (source,)
+    else:
+        return [], [f"unknown source {source!r} — try one of {', '.join(BACKENDS)}"]
+    key = f"{source}|{limit}|{query}"
+    hit = _cached(key)
+    if hit is not None:
+        return hit
+    results, notes = [], []
+    for name in order:
+        if len(results) >= limit:
+            break
+        try:
+            found = _run(name, _SEARCH[name], query)
+        except Exception as exc:
+            notes.append(f"{name} failed ({_reason(exc)})")
+            continue
+        if not found:
+            notes.append(f"{name} no results")
+            continue
+        results.extend(found[:limit - len(results)])
+    if not results:
+        tried = ", ".join(f"{n} ({_LABEL[n]}): {_why(notes, n)}" for n in order)
+        notes = [f"nothing found — {tried}"]
+    _store(key, results[:limit], notes)
+    return results[:limit], notes
+
+
+def _why(notes: list, name: str) -> str:
+    for note in notes:
+        if note.startswith(name + " "):
+            return note[len(name) + 1:]
+    return "no results"
+
+
+def format_results(results: list, notes: list, query: str) -> str:
+    """The model-facing rendering, shared by the tool and by tests."""
+    if not results:
+        return "ERROR: " + ("; ".join(notes) if notes else f"no results for {query!r}")
+    lines = [f"Results for {query!r} ({results[0].backend}, {len(results)} shown):"]
+    for item in results:
+        lines.append(f"- {item.title}: {item.snippet[:220]}")
+        if item.url:
+            lines.append(f"  {item.url}")
+    if notes:
+        # Named even on success: a backend that failed this time is the reason a
+        # second search may answer differently.
+        lines.append("note: " + "; ".join(notes))
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------- reading
+class _Text(HTMLParser):
+    """HTML -> text. Stdlib only: a third-party parser is a dependency this
+    feature does not need, and the output only has to be readable."""
+
+    _SKIP = {"script", "style", "noscript", "svg", "head", "template", "iframe"}
+    _BREAK = {"p", "div", "br", "li", "tr", "td", "th", "h1", "h2", "h3", "h4",
+              "h5", "h6", "section", "article", "blockquote", "pre", "ul", "ol",
+              "table", "header", "footer", "nav", "form", "main", "aside", "dl",
+              "dt", "dd", "figure", "figcaption", "hr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip += 1
+        elif tag in self._BREAK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP and self._skip:
+            self._skip -= 1
+        elif tag in self._BREAK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def html_to_text(markup: str) -> str:
+    """Readable text from HTML: entities decoded, media dropped, blanks collapsed."""
+    parser = _Text()
+    try:
+        parser.feed(markup or "")
+        parser.close()
+    except Exception:       # a malformed page is not an error, just a short one
+        _warn("html parse failed", exc_info=True)
+    raw = "".join(parser.parts)
+    lines = [re.sub(r"[ \t\xa0]+", " ", line).strip() for line in raw.splitlines()]
+    out, blank = [], False
+    for line in lines:
+        if line:
+            out.append(line)
+            blank = False
+        elif not blank:
+            out.append("")
+            blank = True
+    return "\n".join(out).strip()
+
+
+# Signatures of a page that is NOT the page. Each carries the words it matched,
+# because "the site blocked us" is only useful with the reason attached.
+_ANTIBOT = (
+    ("just a moment", "Cloudflare challenge"),
+    ("checking your browser", "browser verification"),
+    ("verifying your browser", "browser verification"),
+    ("attention required! | cloudflare", "Cloudflare block"),
+    ("javascript is required", "JavaScript required"),
+    ("enable javascript", "JavaScript required"),
+    ("blocked by network security", "network security block"),
+    ("log in to your reddit account", "login wall"),
+    ("returned error 403", "upstream 403"),
+    ("are you a robot", "bot check"),
+    ("access denied", "access denied"),
+)
+_CACHED_SNAPSHOT = "cached snapshot"
+
+
+def _antibot(text: str) -> tuple:
+    """(label, phrase) when `text` is a block page, else ()."""
+    sample = (text or "")[:4000].casefold()
+    for phrase, label in _ANTIBOT:
+        if phrase in sample:
+            return label, phrase
+    return ()
+
+
+def _is_private_ip(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _public_url(url: str) -> tuple:
+    """(url, problem): `url` only when it is a public http(s) address.
+
+    The reader is asked for addresses by a language model, so the address is
+    untrusted input: this machine's own services, the LAN, link-local metadata
+    endpoints and mDNS names are refused rather than fetched into a transcript.
+    A name that RESOLVES to such an address is refused too, which is what makes
+    this a check on the destination and not on the spelling.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return "", "no address given"
+    if not re.match(r"^https?://", raw, re.I):
+        return "", f"{raw!r} is not an http(s) address"
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return "", f"{raw!r} is not a usable address"
+    host = (parts.hostname or "").strip()
+    if not host:
+        return "", "the address has no host"
+    if parts.username or parts.password:
+        return "", "addresses with credentials are not fetched"
+    if _is_private_ip(host):
+        return "", f"{host} is on this machine or a private network"
+    if (host.casefold() == "localhost" or host.casefold().endswith(".local")
+            or host.casefold().endswith(".internal")
+            or host.casefold().endswith(".home.arpa") or "." not in host):
+        return "", f"{host} is not a public host"
+    try:
+        infos = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80),
+                                   proto=socket.IPPROTO_TCP)
+    except Exception as exc:
+        return "", f"{host} cannot be resolved ({type(exc).__name__})"
+    for info in infos:
+        if _is_private_ip(str(info[4][0])):
+            return "", f"{host} resolves to a private address ({info[4][0]})"
+    return urllib.parse.urlunsplit(parts), ""
+
+
+def read_page(url: str, max_chars: int = READ_MAX_CHARS) -> tuple:
+    """(text, via, problem) for `url`.
+
+    Local fetch first; the hosted reader only when the page cannot be read
+    locally (nothing usable, or a block page) — and `text` starts with the
+    backend that served it, so a third-party fetch is never invisible. `text` is
+    "" on failure and `problem` says why, in one sentence a caller can speak.
+    """
+    clean, problem = _public_url(url)
+    if problem:
+        return "", "", problem
+    try:
+        max_chars = max(500, min(int(max_chars or READ_MAX_CHARS), READ_MAX_CHARS))
+    except (TypeError, ValueError):
+        max_chars = READ_MAX_CHARS
+    cached = ""
+    local_why = "nothing usable"
+    try:
+        raw = _http(clean, timeout=READ_TIMEOUT)
+        local = html_to_text(raw.decode("utf-8", "replace"))
+        # A page is "useless locally" when the site blocked us, or when there is
+        # a LOT of HTML and almost no text — that is a JavaScript shell. A page
+        # that is simply SHORT is short: sending it to a third-party reader would
+        # put the address on someone else's server for nothing (example.com did
+        # exactly that until this check), and it is the user's address.
+        thin_shell = len(local) < MIN_LOCAL_TEXT and len(raw) > MIN_LOCAL_BYTES
+        if not thin_shell and len(local) >= 1 and not _antibot(local):
+            _record(_READER_SEEN, "local", True)
+            return _prefixed(local, VIA_LOCAL, max_chars), VIA_LOCAL, ""
+        blocked_locally = _antibot(local)
+        if blocked_locally:
+            local_why = f"blocked by the site ({blocked_locally[0]})"
+        elif not local.strip():
+            local_why = f"no text in {len(raw)} bytes of markup"
+        else:
+            local_why = f"only {len(local)} characters of text in {len(raw)} bytes"
+        _record(_READER_SEEN, "local", False, local_why)
+    except Exception as exc:
+        local_why = f"fetch failed ({_reason(exc)})"
+        _record(_READER_SEEN, "local", False, local_why)
+        _warn("local fetch of %s failed: %s", clean, exc)
+    # Fallback: the hosted reader. Only now, and the caller is told below — the
+    # failure sentence names BOTH attempts, because "nothing readable" on its
+    # own would hide which half of the pipeline gave up.
+    try:
+        body = _http(JINA_READER + clean, timeout=READ_TIMEOUT).decode("utf-8", "replace")
+    except Exception as exc:
+        _record(_READER_SEEN, "jina", False, _reason(exc))
+        return "", "", (f"nothing readable at {clean} — local fetch: {local_why}; "
+                         f"the third-party reader failed too ({_reason(exc)})")
+    blocked = _antibot(body)
+    if blocked:
+        _record(_READER_SEEN, "jina", False, blocked[0])
+        return "", "", (f"the site refuses automated readers ({blocked[0]}); "
+                         f"local fetch: {local_why}")
+    _record(_READER_SEEN, "jina", True)
+    if _CACHED_SNAPSHOT in body[:2000].casefold():
+        cached = " — a cached snapshot, so it may be out of date"
+    label = VIA_JINA + cached
+    return _prefixed(body, label, max_chars), label, ""
+
+
+def _prefixed(text: str, via: str, max_chars: int) -> str:
+    body = text[:max_chars]
+    if len(text) > max_chars:
+        body += f"\n[truncated — {len(text) - max_chars} more characters]"
+    return f"via {via}\n{body}"
+
+
+def read_results(results: list, count: int = 0, max_chars: int = TOOL_MAX_CHARS):
+    """(blocks, notes) fetching the top `count` results that carry a URL.
+
+    Kept here rather than in the tool so the reader's own rules — the public-URL
+    check, the disclosure line, the truncation — are the ones used on every path
+    that reads a page.
+    """
+    try:
+        count = max(0, min(int(count or 0), READ_TOP_MAX))
+    except (TypeError, ValueError):
+        return [], ["read_top must be a number"]
+    blocks, notes = [], []
+    for item in results:
+        if len(blocks) >= count:
+            break
+        if not item.url:
+            continue
+        text, via, problem = read_page(item.url, max_chars=max_chars)
+        if problem:
+            notes.append(f"could not read {item.url}: {problem}")
+            continue
+        blocks.append(f"--- page {len(blocks) + 1}: {item.url} ({via})\n{text}")
+    if count and not blocks and not notes:
+        notes.append("no result carried a URL to read")
+    return blocks, notes
+
+
+# ------------------------------------------------------------------ reporting
+def _ago(at: float, now: float) -> str:
+    secs = max(0, int(now - at))
+    if secs < 90:
+        return f"{secs}s ago"
+    if secs < 5400:
+        return f"{secs // 60}m ago"
+    return f"{secs // 3600}h ago"
+
+
+def _searxng_alive(url: str) -> bool:
+    """TCP connect to the configured instance. Cheap, LOCAL, and a real answer:
+    a port that is not listening is how "SearXNG is running" would otherwise be
+    assumed from a setting that merely names it."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        if not host:
+            return False
+        with socket.create_connection((host, port), timeout=SEARXNG_PROBE_TIMEOUT):
+            return True
+    except Exception:
+        return False
+
+
+def search_note(now: float = None) -> str:
+    """One doctor line: what this process has OBSERVED, per backend."""
+    now = time.time() if now is None else now
+    parts = []
+    for name in BACKENDS:
+        if name == "searxng":
+            url = _searxng_url()
+            if not url:
+                parts.append("searxng off")
+            else:
+                parts.append("searxng ok" if _searxng_alive(url) else "searxng not running")
+            continue
+        seen = _SEEN.get(name)
+        if not seen:
+            parts.append(f"{name} untried")
+        elif seen["ok"]:
+            quota = _QUOTA.get(name) or ""
+            parts.append(f"{name} ok ({_ago(seen['at'], now)}"
+                         + (f", {quota}" if quota else "") + ")")
+        else:
+            parts.append(f"{name} FAILED ({seen['why']}, {_ago(seen['at'], now)})")
+    return ", ".join(parts)
+
+
+def reader_note(now: float = None) -> str:
+    """One doctor line: which reader served pages, and how it went."""
+    now = time.time() if now is None else now
+    out = []
+    local = _READER_SEEN.get("local")
+    if not local:
+        out.append("local fetch untried")
+    elif local["ok"]:
+        out.append(f"local fetch ok ({_ago(local['at'], now)})")
+    else:
+        out.append(f"local fetch FAILED ({local['why']}, {_ago(local['at'], now)})")
+    jina = _READER_SEEN.get("jina")
+    if not jina:
+        out.append("Jina fallback unused")
+    elif jina["ok"]:
+        out.append(f"Jina fallback used ({_ago(jina['at'], now)})")
+    else:
+        out.append(f"Jina fallback refused ({jina['why']}, {_ago(jina['at'], now)})")
+    return ", ".join(out)
+
+
+def doctor_lines() -> list:
+    """The lines `doctor` splices in. Two, one per capability."""
+    return [f"search: {search_note()}", f"reader: {reader_note()}"]

@@ -628,6 +628,23 @@ def _appearance_note() -> str:
     return f"look {look} ({design}, {size} px)"
 
 
+def _web_lines() -> list:
+    """Two doctor lines: which search backends and reader are actually usable.
+
+    The content is the bubble module's own record of what it has OBSERVED —
+    never a probe that assumes a backend is healthy because it is configured,
+    which is the false-positive shape the ydotool probe infamously has. A
+    backend nothing has asked says `untried`; the SearXNG entry is the one real
+    probe (a localhost connect, no external traffic), because that backend's
+    availability is a local service rather than a remote site.
+    """
+    try:
+        return _web.doctor_lines()
+    except Exception:
+        log.exception("web doctor lines failed")
+        return []
+
+
 def _deployment_snapshot() -> dict:
     """Describe the code actually running and whether it matches the checkout.
 
@@ -809,6 +826,7 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         control_sock=CONTROL_SOCK,
         crash_log=CRASH_LOG,
         appearance_look=_appearance_note,
+        web_lines=_web_lines,
         cap_refusal_note=_cap_refusal_note,
         cap_refusals=_cap_refusal_summary,
         remote_ollama_allowed=_ollama_remote_opted_in,
@@ -2093,6 +2111,20 @@ def _http_get(url: str, timeout: float = 10.0) -> bytes:
         return r.read(2_000_000)
 
 
+# `core.web` owns the search router and the page reader. It is application-free
+# and takes RESOLVERS rather than values, which is not decoration: `_http_get` is
+# monkeypatched by the whole suite and `searxng_url` changes on a live settings
+# save, so binding the function object or the string once would leave both
+# silently stale — a patched fetch would be ignored and a reloaded setting would
+# never be read. One network seam for searching AND reading.
+_web = _load_module("web")
+_web.configure(
+    http_get=lambda url, timeout=10.0: _http_get(url, timeout),
+    searxng_url=lambda: str(SETTINGS.get("searxng_url") or ""),
+    logger=log,
+)
+
+
 _WMO = {
     0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
     45: "fog", 48: "freezing fog",
@@ -2119,25 +2151,21 @@ def _geocode(place: str) -> tuple[float, float, str] | None:
 
 
 def _ddg_lite(query: str) -> list[tuple[str, str]]:
-    q = urllib.parse.quote(query)
-    page = _http_get("https://lite.duckduckgo.com/lite/?q=" + q, timeout=10).decode("utf-8", "replace")
-    titles = re.findall(r'class="result-link"[^>]*>(.*?)</a>', page, flags=re.S)
-    snips = re.findall(r'class="result-snippet"[^>]*>(.*?)</td>', page, flags=re.S)
-    clean = lambda s: _html_mod.unescape(re.sub(r"<[^>]+>", "", s)).strip()
-    return [(clean(t), clean(s)) for t, s in zip(titles, snips)][:5]
+    """(title, snippet) pairs from DuckDuckGo Lite — the general fallback.
+
+    A thin delegation to the backend in `core.web`, so the search tool, the
+    proactive briefing and the severe-weather queries all read one page with one
+    parser. The tuple shape and the FIVE-item cap are kept because that is what
+    the callers consume: the router's own limit is four, and the briefing's
+    count was silently cut to four until a guard caught it.
+    """
+    return [(r.title, r.snippet) for r in _web.ddg_search(query, limit=5)]
 
 
 def _wiki_search(query: str) -> list[tuple[str, str]]:
-    q = urllib.parse.quote(query)
-    data = json.loads(_http_get(
-        "https://en.wikipedia.org/w/api.php?action=query&list=search"
-        "&format=json&srlimit=4&srsearch=" + q))
-    out = []
-    for hit in (data.get("query") or {}).get("search") or []:
-        title = str(hit.get("title", ""))
-        snippet = re.sub(r"<[^>]+>", "", str(hit.get("snippet", "")))
-        out.append((title, _html_mod.unescape(snippet)))
-    return out
+    """(title, snippet) pairs from the MediaWiki search API — same delegation,
+    same reason: one implementation of "ask Wikipedia" instead of two."""
+    return [(r.title, r.snippet) for r in _web.wikipedia_search(query)]
 
 
 # -- world events: breaking news + severe-weather headlines -------------------

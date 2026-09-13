@@ -192,6 +192,43 @@ Example things to say:
 - *"what's on my calendar today?"*
 - *"make your bubble pink"* — it edits its own source and restarts
 
+### Looking things up online
+
+Ask *what does this page say*, *why is CUDA failing on Python 3.13*, *what is
+this repo* — the AI searches and reads, keylessly, through backends chosen by
+the shape of the question:
+
+| backend | what it is for | needs |
+|---|---|---|
+| SearXNG | general web (aggregated) | a local instance, **probed** not assumed |
+| DuckDuckGo (Lite) | general web, the fallback | nothing |
+| Stack Exchange | errors, APIs, libraries | nothing (reports its daily quota) |
+| Hacker News | releases, discussion | nothing |
+| GitHub | repositories, packages | nothing (10 searches/min) |
+| Wikipedia | stable facts | nothing |
+
+A failing backend **falls through** to the next one, and every failure is named:
+an empty answer reads `nothing found — stackexchange (Stack Exchange): quota
+exhausted, ddg (DuckDuckGo): HTTP 503`, never a bare "no results". `--ptt
+doctor` reports what has actually been **observed** — `search: ddg ok (2s ago),
+stackexchange ok (3s ago, quota 291/300), hn untried …` — so a backend nothing
+has asked says `untried` instead of being assumed healthy.
+
+Set a **SearXNG address** in **Settings → Permissions** if you run one (default
+`http://127.0.0.1:8888`; empty uses the keyless backends only). Nothing is sent
+to a third party for a search: the keyless backends are called directly, and a
+local SearXNG keeps the query on this machine.
+
+**Reading a page** (`read_page`, or `web_search` with *read the top results*)
+fetches on **this machine first**; the text says which was used — `via local
+fetch` or `via Jina Reader (third-party) — a cached snapshot`. The hosted reader
+is only used when the local fetch yields nothing usable (the site blocked us, or
+a big page with no text, i.e. a JavaScript shell) — a page that is simply short
+is read here. Loopback, link-local, private-range and `.local` addresses are
+refused, including a public name that **resolves** to one, so a pasted or
+injected URL cannot read your router's admin page or a cloud metadata endpoint
+into the conversation.
+
 ### Remote control (CLI)
 
 Any of these work from a script or keybind, even while the bubble runs:

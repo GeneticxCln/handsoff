@@ -217,6 +217,11 @@ def coerce_settings(s: dict) -> dict:
     _num("animation_energy", float, 0.2, 2.0)
     _bd = str(s.get("bubble_design", "orb")).strip().lower()
     s["bubble_design"] = _bd if _bd in _schema.BUBBLE_DESIGNS else DEFAULT_SETTINGS["bubble_design"]
+    # The local SearXNG the search router prefers. Stripped and de-slashed, not
+    # validated: a user who has not started one yet gets the keyless backends and
+    # a doctor line saying `searxng not running`, which is more useful than
+    # erasing the address they typed. An empty value disables the attempt.
+    s["searxng_url"] = str(s.get("searxng_url") or "").strip().rstrip("/")
     _num("mic_threshold", int, 50, 10_000)
     _num("tts_rate", float, 0.5, 2.0)
     _num("tts_volume", float, 0.1, 2.0)
