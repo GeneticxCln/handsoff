@@ -152,11 +152,19 @@ class _Result:
     stderr = ""
 
 
+# The REAL helper, kept before the stub replaces the module attribute: the
+# round-trip scenario has to call something that actually opens a socket, and
+# reaching for `settings_app.http_json` after the stub is reaching for the stub.
+real_http_json = settings_app.http_json
 settings_app.http_json = _no_http
 settings_app.systemd_owns_autostart = lambda: False
 settings_app._reload_niri = lambda: None
 settings_app.subprocess.run = lambda *a, **k: _Result()
 settings_app.subprocess.Popen = lambda *a, **k: None
+
+# The app's own line, so a change to what the bubble is asked to say cannot
+# leave this driver asserting a sentence the app no longer sends.
+_VOICE_TEST_LINE = settings_app._VOICE_TEST_LINE
 
 # --- seed disk state the scenarios read
 
@@ -170,6 +178,7 @@ def seed(settings=None, history=None):
 
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
 
 app = QApplication([])
 win = settings_app.SettingsWindow()
@@ -3473,17 +3482,536 @@ def the_live_mic_probe_closes_a_stream_that_fails_to_start():
     assert "device busy" in probe.snapshot().get("error", ""), probe.snapshot()
 
 
-if __name__ == "__main__":
-    name = sys.argv[1]
+@scenario
+def refresh_models_lists_pins_and_survives_a_dead_server():
+    # refresh_models was only ever driven through the selftest's happy path:
+    # the capability badges, the current-model pinning and the dead-server
+    # row were the parts nothing executed.
+    calls = []
+
+    def fake_http(url, payload=None, timeout=10):
+        calls.append(url)
+        if url.endswith("/api/tags"):
+            return {"models": [{"name": "gemma4:latest"},
+                                {"model": "qwen3:8b"}]}
+        # /api/show per model: the first answers, the second is broken —
+        # one dead capability endpoint must not lose the model from the list.
+        # The probe posts the model NAME in the body (the URL is the same for
+        # every model), so this matches on the payload — matching on the URL
+        # meant the "broken" probe never broke and the model came back badged.
+        if "qwen3" in str((payload or {}).get("model", "")):
+            raise urllib.error.URLError("show exploded")
+        return {"capabilities": ["tools"]}
+
+    settings_app.http_json = fake_http
+    win.host_edit.setText("127.0.0.1:11434")     # no scheme: prefix required
+    win.cfg["model"] = "gemma4:latest"
+    win.refresh_models()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and win.model_list.count() < 2:
+        app.processEvents()
+        time.sleep(0.02)
+    names = [win.model_list.item(i).text()
+             for i in range(win.model_list.count())]
+    assert any(n.startswith("gemma4:latest") and "tools" in n for n in names), names
+    assert any(n.startswith("qwen3:8b") and "\u00b7" not in n for n in names), \
+        "a model whose capability probe failed must still be listed, badgeless"
+    assert calls[0] == "http://127.0.0.1:11434/api/tags", calls
+    it = win.model_list.currentItem()
+    assert it is not None and it.data(Qt.UserRole) == "gemma4:latest", \
+        "the configured model must be the selected one"
+
+    # and an unreachable server is a readable row, not an empty list
+    def dead_http(url, payload=None, timeout=10):
+        raise urllib.error.URLError(f"refused ({url})")
+
+    settings_app.http_json = dead_http
+    win.refresh_models()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and "cannot reach" not in \
+            (win.model_list.item(0).text() if win.model_list.count() else ""):
+        app.processEvents()
+        time.sleep(0.02)
+    assert win.model_list.count() == 1
+    # Asked as a FLAG TEST, not a number comparison. PySide6's flag enums do not
+    # compare equal to ints, so `(flags() & ItemIsEnabled) == 0` is False even
+    # when no flag is set — the truth test below is the one that answers the
+    # question ("is this row selectable?") on a disabled row AND an enabled one.
+    assert not (win.model_list.item(0).flags() & Qt.ItemFlag.ItemIsEnabled), \
+        "the unreachable-server row must not be selectable"
+    settings_app.http_json = _no_http
+
+
+@scenario
+def tts_reference_pick_clear_and_report():
+    # _pick_reference/_clear_reference/refresh_tts: the reference-clip row's
+    # whole surface, none of it previously executed.
+    from PySide6.QtWidgets import QFileDialog
+
+    seed({"model": "testmodel:latest",
+          "tts_reference": str(clip_dir / "optimus.wav")})
+    win.reload_from_disk()
+    picked = []
+
+    def fake_pick(*_a, **_k):
+        picked.append(1)
+        return str(clip_dir / "optimus.wav"), ""
+
+    real_pick = QFileDialog.getOpenFileName
+    QFileDialog.getOpenFileName = staticmethod(fake_pick)
     try:
-        SCENARIOS[name]()
-    except SystemExit as e:   # pytest.exit / aborts re-raised cleanly
-        sys.exit(int(e.code or 0))
-    except BaseException as e:
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    sys.exit(0)
+        win._pick_reference()
+    finally:
+        QFileDialog.getOpenFileName = real_pick
+    assert picked and win.tts_ref_edit.text().endswith("optimus.wav")
+    assert win.tts_ref_status.text(), "the clip report must render"
+    win._clear_reference()
+    assert win.tts_ref_edit.text() == ""
+
+
+@scenario
+def the_live_probe_gate_captures_and_transcribes_a_utterance():
+    # _on_frames is the probe's audio path: gate the frames, accumulate the
+    # utterance, hand it to whisper in a worker. Every branch below was
+    # uncovered — including the two guards (a superseded worker's answer is
+    # discarded; a failing transcribe is reported, not swallowed).
+    import threading as _th
+    import numpy as _np
+
+    probe = settings_app._LiveMicProbe()
+    probe._running = True
+    probe._stream = object()
+    probe._gate = bubble._SpeechGate(300)
+    probe._capture_rate = 16000
+    probe._device = "test"
+    probe._threshold = 300
+
+    quiet = _np.zeros((1024, 1), dtype=_np.int16)
+    loud = _np.full((1024, 1), 9000, dtype=_np.int16)
+
+    # The whisper fake is installed BEFORE the frames, not after: the hangover
+    # below ends an utterance and hands it straight to a worker thread, so a
+    # fake installed afterwards races the real whisper — which is what made this
+    # scenario assert against a transcript the real model had produced.
+    results = {"n": 0}
+
+    def fake_transcribe(audio):
+        results["n"] += 1
+        return f"heard {results['n']}"
+
+    settings_app.H.transcribe = fake_transcribe
+
+    for _ in range(3):                      # room tone: floor tracks, no event
+        probe._on_frames(quiet, object(), 234)
+    assert probe._last_event == ""
+    for _ in range(4):                      # speech starts, frames collect
+        probe._on_frames(loud, object(), 234)
+    # The frame that OPENS speech is spent on the transition (the gate answers
+    # 'start' and the buffer resets), so four loud frames collect three: two
+    # trip the gate and the rest are recorded with them.
+    assert probe._gate.in_speech and len(probe._frames) >= 3, \
+        (probe._gate.in_speech, len(probe._frames))
+    for _ in range(16):                     # hangover elapses → captured
+        probe._on_frames(quiet, object(), 234)
+    assert "speech captured" in probe._last_event, probe._last_event
+
+    # the whisper worker: success, then failure, then supersession
+    deadline = time.time() + 5.0
+    while time.time() < deadline and probe._last_transcript != "heard 1":
+        time.sleep(0.02)
+    assert probe._last_transcript == "heard 1"
+    assert probe._last_event == "transcribed"
+
+    def boom(audio):
+        raise RuntimeError("whisper weights vanished")
+
+    settings_app.H.transcribe = boom
+    probe._start_transcribe(quiet.reshape(-1))
+    deadline = time.time() + 5.0
+    while time.time() < deadline and "transcribe failed" not in probe._last_event:
+        time.sleep(0.02)
+    assert "whisper weights vanished" in probe._last_event
+
+    # a superseded worker's late answer must NOT overwrite the newer one
+    gate_ev = _th.Event()
+    settings_app.H.transcribe = lambda a: (gate_ev.wait(5.0), "slow answer")[1]
+    probe._start_transcribe(quiet.reshape(-1))
+    old_thread = probe._transcribe_thread
+    settings_app.H.transcribe = lambda a: "fast answer"
+    probe._start_transcribe(quiet.reshape(-1))
+    deadline = time.time() + 5.0
+    while time.time() < deadline and probe._last_transcript != "fast answer":
+        time.sleep(0.02)
+    gate_ev.set()
+    old_thread.join(5)
+    assert probe._last_transcript == "fast answer", \
+        "the stale worker's result must be discarded"
+    assert probe.snapshot()["transcript"] == "fast answer"
+
+
+@scenario
+def the_mic_live_tick_renders_every_probe_state():
+    # _toggle_mic_live / _mic_live_restart_if_on / _mic_live_tick: the labels
+    # are the feature — opening, device, gate-open, error, event age-out,
+    # transcript age-out and the off reset all had no test.
+    assert win.mic_live_state.text() == "idle"
+    started = []
+    stopped = []
+
+    class _FakeProbe:
+        def __init__(self):
+            self.snap = {}
+
+        def start(self, device, threshold):
+            started.append((device, threshold))
+
+        def stop(self):
+            stopped.append(1)
+
+        def snapshot(self):
+            return self.snap
+
+    fake = _FakeProbe()
+    win._live_probe = fake
+    win.mic_live_btn.setChecked(True)
+    assert started and started[0] == (win.mic_combo.currentData(),
+                                      win.thresh_spin.value())
+
+    def render(snap):
+        fake.snap = snap
+        win._mic_live_tick()
+
+    render({"peak": 0.0, "error": "", "rate": 0, "device": "x",
+            "gate_open": False, "last_event": "", "last_event_age": None,
+            "frames": 0, "transcript": "", "transcript_age": None})
+    assert win.mic_live_state.text() == "opening \u2026"
+    render({"peak": 12.0, "error": "", "rate": 16000, "device": "USB Mic",
+            "gate_open": False, "last_event": "", "last_event_age": None,
+            "frames": 9, "transcript": "", "transcript_age": None})
+    assert "USB Mic @ 16000 Hz" in win.mic_live_state.text()
+    assert "hearing speech" not in win.mic_live_state.text()
+    render({"peak": 40.0, "error": "", "rate": 16000, "device": "USB Mic",
+            "gate_open": True, "last_event": "speech captured",
+            "last_event_age": 5.0, "frames": 42, "transcript": "hello there",
+            "transcript_age": 3.0})
+    assert "hearing speech" in win.mic_live_state.text()
+    assert "speech captured \u00b7 5s ago \u00b7 42 frames" in win.mic_live_event.text()
+    assert "hello there" in win.mic_live_transcript.text()
+    render({"peak": 0.0, "error": "device busy", "rate": 16000, "device": "x",
+            "gate_open": False, "last_event": "", "last_event_age": None,
+            "frames": 0, "transcript": "", "transcript_age": None})
+    assert "error \u2014 device busy" in win.mic_live_state.text()
+    render({"peak": 0.0, "error": "", "rate": 16000, "device": "x",
+            "gate_open": False, "last_event": "speech started",
+            "last_event_age": 120.0, "frames": 7, "transcript": "old",
+            "transcript_age": 700.0})
+    assert win.mic_live_event.text() == "", "a >90 s event must age out"
+    assert win.mic_live_transcript.text() == "\u2014", "a >600 s transcript ages out"
+
+    # a device/threshold change while live restarts the capture
+    win._mic_live_restart_if_on()
+    assert len(started) == 2
+    win.mic_live_btn.setChecked(False)
+    assert stopped, "the off branch must stop the probe"
+    assert win.mic_live_state.text() == "idle"
+    assert win.mic_live_event.text() == ""
+    assert win.mic_live_transcript.text() == ""
+    win._live_probe = None
+
+
+@scenario
+def mic_test_reports_peak_and_verdict():
+    # test_mic's worker + poll: the bar and the good/too-quiet verdict, over
+    # a stubbed InputStream (no device) and a fast-forwarded clock (no 3 s).
+    import numpy as _np
+
+    real_time = settings_app.time.time
+    settings_app.time.time = lambda: real_time() + 3600.0   # past any deadline
+    captured = {}
+
+    class _FakeStream:
+        def __init__(self, **kw):
+            captured["cb"] = kw["callback"]
+
+        def __enter__(self):
+            captured["cb"](_np.full((1024, 1), 9000, dtype=_np.int16),
+                           1024, None, None)
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    real_stream = settings_app.sd.InputStream
+    settings_app.sd.InputStream = _FakeStream
+    try:
+        win.mic_test_btn.setEnabled(True)
+        win.test_mic()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and "mic peak" not in win.status_label.text():
+            app.processEvents()
+            time.sleep(0.02)
+        assert win.mic_test_btn.isEnabled()
+        text = win.status_label.text()
+        assert "mic peak" in text and "good signal" in text, text
+
+        captured2 = {}
+
+        class _SilentStream(_FakeStream):
+            def __init__(self, **kw):
+                captured2["cb"] = kw["callback"]
+
+            def __enter__(self):
+                captured2["cb"](_np.zeros((1024, 1), dtype=_np.int16),
+                                1024, None, None)
+                return self
+
+        settings_app.sd.InputStream = _SilentStream
+        win.test_mic()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and "too quiet" not in win.status_label.text():
+            app.processEvents()
+            time.sleep(0.02)
+        assert "too quiet" in win.status_label.text()
+    finally:
+        settings_app.sd.InputStream = real_stream
+        settings_app.time.time = real_time
+
+
+@scenario
+def voice_test_asks_the_running_bubble():
+    # test_voice must speak the control socket's `say` protocol — with the
+    # bubble's dead/busy cases reported in the status line, not raised.
+    seen = []
+
+    # The status STREAM is recorded, not the label. The label is one mutable
+    # slot: `run_bg` delivers `done` through a 120 ms QTimer poll, so a late
+    # `done` from the previous call can overwrite the sentence this phase is
+    # waiting for — which made this scenario the flakiest in the file, asserting
+    # the final widget state instead of what was actually said.
+    said: list[str] = []
+    real_status = win._status
+    win._status = lambda text: (said.append(text), real_status(text))[1]
+
+    def fake_sock(path, command, timeout=1.5):
+        seen.append(command)
+        return "ok queued"
+
+    settings_app._socket_command = fake_sock
+    win.test_voice()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not any("ok queued" in s for s in said):
+        app.processEvents()
+        time.sleep(0.02)
+    assert seen == [f"say {_VOICE_TEST_LINE}"], seen
+    assert any("ok queued" in s for s in said), said
+    assert win.voice_test_btn.isEnabled()
+
+    settings_app._socket_command = lambda *a, **k: None
+    win.test_voice()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not any("not running" in s for s in said):
+        app.processEvents()
+        time.sleep(0.02)
+    assert any("voice test failed" in s and "not running" in s for s in said), said
+
+    settings_app._socket_command = lambda *a, **k: "ERR overloaded"
+    win.test_voice()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and not any("overloaded" in s for s in said):
+        app.processEvents()
+        time.sleep(0.02)
+    assert "voice test failed: ERR overloaded" in said, said
+    settings_app._socket_command = lambda *a, **k: None
+
+
+@scenario
+def model_switch_backup_cycle_is_bounded_and_clears():
+    # _backup_keep_n's prune (the cap was only ever exercised with < keep
+    # files) and the model-switch wipe that backs up before truncating.
+    history_file.write_text(json.dumps(
+        [{"role": "user", "content": "remember me"}]), encoding="utf-8")
+    note = win._clear_history_for_model_switch()
+    assert "Memory cleared" in note and "backup saved" in note
+    assert history_file.read_text(encoding="utf-8") == "[]"
+    baks = sorted(history_file.parent.glob("history.json.bak-modelswitch.*"))
+    assert len(baks) == 1 and baks[0].stat().st_mode & 0o777 == 0o600
+    assert "remember me" in baks[0].read_text(encoding="utf-8")
+
+    # six more backups: only `keep` (5) survive, oldest pruned
+    for i in range(6):
+        history_file.write_text(f"gen {i}", encoding="utf-8")
+        settings_app._backup_keep_n(history_file, "bak-modelswitch")
+        baks = sorted(history_file.parent.glob("history.json.bak-modelswitch.*"),
+                      key=lambda p: p.stat().st_mtime_ns)
+        assert len(baks) <= 5, len(baks)
+    baks = sorted(history_file.parent.glob("history.json.bak-modelswitch.*"),
+                  key=lambda p: p.stat().st_mtime_ns)
+    assert len(baks) == 5, len(baks)
+    # the newest backup holds the LAST generation, not the first
+    assert "gen 5" in baks[-1].read_text(encoding="utf-8")
+
+
+@scenario
+def autostart_set_unset_migrate_and_double_start_guard():
+    # apply_autostart/set_autostart: create, idempotence, systemd ownership,
+    # old-line migration and removal — the module-level half of the toggle.
+    import os as _os
+
+    cfg = home / ".config" / "niri" / "config.kdl"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("// niri config\\n", encoding="utf-8")
+    real_niri = settings_app.NIRI_CONFIG
+    real_owns = settings_app.systemd_owns_autostart
+    settings_app.NIRI_CONFIG = cfg
+    settings_app._reload_niri = lambda: None
+    try:
+        assert settings_app.set_autostart(True) == "autostart line added to niri config"
+        text = cfg.read_text(encoding="utf-8")
+        assert settings_app.AUTOSTART_LINE in text
+        assert settings_app.set_autostart(True) == "autostart unchanged"
+
+        settings_app.systemd_owns_autostart = lambda: True
+        msg = settings_app.apply_autostart(True)
+        assert "NOT added" in msg and "systemd" in msg, msg
+        settings_app.systemd_owns_autostart = real_owns
+
+        # the OLD form must migrate to the sh -c line, not duplicate
+        cfg.write_text(
+            f'// niri config\\n{settings_app.AUTOSTART_LINE_OLD}\\n', encoding="utf-8")
+        msg = settings_app.set_autostart(True)
+        assert "migrated" in msg, msg
+        text = cfg.read_text(encoding="utf-8")
+        assert settings_app.AUTOSTART_LINE in text
+        assert settings_app.AUTOSTART_LINE_OLD not in text
+
+        assert settings_app.set_autostart(False) == "autostart line removed from niri config"
+        assert settings_app.AUTOSTART_LINE not in cfg.read_text(encoding="utf-8")
+        assert (cfg.parent / "config.kdl.bak-handsoff").exists()
+
+        # autostart_enabled reads the same line back
+        cfg.write_text(f"{settings_app.AUTOSTART_LINE}\\n", encoding="utf-8")
+        assert settings_app.autostart_enabled() is True
+        cfg.write_text("// niri config\\n", encoding="utf-8")
+        assert settings_app.autostart_enabled() is False
+    finally:
+        settings_app.NIRI_CONFIG = real_niri
+        settings_app.systemd_owns_autostart = real_owns
+
+
+@scenario
+def the_panel_installs_a_previewed_pack():
+    # _try_design_pack: the SAME source a preview showed goes to the SAME
+    # installer Install pack\u2026 uses, copied; failures and refusals are
+    # status lines, never crashes.
+    # The app reaches the pack installer through core.bubble (its own
+    # `_core_module("bubble")`), NOT through the monolith's name space — which
+    # no longer re-exports those functions. Patching the monolith left the real
+    # installer to run against a file that does not exist, so this scenario
+    # could not pass once it actually ran.
+    packs = settings_app._core_module("bubble")
+    real_install_file = packs.install_pack_file
+    real_install = packs.install_pack
+    scratch = home / "pack-scratch"
+    scratch.mkdir(exist_ok=True)
+    seen = []
+
+    def fake_inspect(path):
+        return ({"name": "Demo Pack"}, None, str(scratch))
+
+    def fake_install_file(src):
+        seen.append(("file", src))
+        return "demo", "pack demo installed"
+
+    def fake_install(src):
+        seen.append(("folder", src))
+        return "demo", "pack demo installed"
+
+    packs.inspect_pack = fake_inspect
+    packs.install_pack_file = fake_install_file
+    packs.install_pack = fake_install
+    try:
+        win._try_design_pack()
+        assert win.status_label.text() == "", "no preview \u2192 silent no-op"
+
+        win._preview_art = {"name": "Demo Pack"}
+        win._preview_source = str(home / "demo.hpack")
+        win._preview_kind = "file"
+        win._preview_scratch = str(scratch)
+        win._try_design_pack()
+        assert seen == [("file", str(home / "demo.hpack"))], seen
+        assert "pack demo installed" in win.status_label.text()
+        assert win._preview_source == "" and win._preview_art is None, \
+            "a successful install forgets the preview"
+
+        def broken_install(src):
+            raise RuntimeError("disk full")
+
+        packs.install_pack_file = broken_install
+        win._preview_art = {"name": "Demo Pack"}
+        win._preview_source = str(home / "demo.hpack")
+        win._preview_kind = "file"
+        win._preview_scratch = ""
+        win._try_design_pack()
+        assert "could not install that pack (disk full)" in win.status_label.text()
+        assert win._preview_art == {"name": "Demo Pack"}, \
+            "a failed install keeps the preview for another Try"
+    finally:
+        packs.install_pack_file = real_install_file
+        packs.install_pack = real_install
+        win._drop_pack_preview()
+
+
+@scenario
+def http_json_parses_a_plain_reply():
+    # the settings app's only HTTP helper: a real loopback round-trip, through
+    # the reference the driver kept before the module attribute was stubbed.
+    import threading as _th
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"models": [1, 2]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), _H)
+    _th.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        doc = real_http_json(
+            f"http://127.0.0.1:{srv.server_port}/api/tags", timeout=5)
+        assert doc == {"models": [1, 2]}
+    finally:
+        srv.shutdown()
+
+SCENARIO_NAME = sys.argv[1]
+if SCENARIO_NAME not in SCENARIOS:
+    print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
+          file=sys.stderr)
+    sys.exit(2)
+try:
+    SCENARIOS[SCENARIO_NAME]()
+except SystemExit as e:   # pytest.exit / aborts re-raised cleanly
+    sys.exit(int(e.code or 0))
+except BaseException:
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+
+# The run is ANNOUNCED, at module level, and the parent asserts this line.
+# This dispatch once sat INDENTED INSIDE the last scenario, so no scenario ever
+# executed: every child built the window, exited 0, and all 65 tests passed
+# having tested nothing — which is also where the GUI module's coverage went.
+# A token plus the registry size makes that shape unrepresentable: an unreachable
+# dispatch prints nothing, and a name with no matching @scenario prints a
+# registry count the parent does not expect.
+print(f"SCENARIO-RAN {SCENARIO_NAME} registry={len(SCENARIOS)}", flush=True)
+sys.exit(0)
 """
 
 
@@ -3565,6 +4093,16 @@ SCENARIO_NAMES = [
     "model_picker_and_tts_reference",
     "tabs_and_colors",
     "clear_history_via_stubbed_dialog",
+    "refresh_models_lists_pins_and_survives_a_dead_server",
+    "tts_reference_pick_clear_and_report",
+    "the_live_probe_gate_captures_and_transcribes_a_utterance",
+    "the_mic_live_tick_renders_every_probe_state",
+    "mic_test_reports_peak_and_verdict",
+    "voice_test_asks_the_running_bubble",
+    "model_switch_backup_cycle_is_bounded_and_clears",
+    "autostart_set_unset_migrate_and_double_start_guard",
+    "the_panel_installs_a_previewed_pack",
+    "http_json_parses_a_plain_reply",
 ]
 
 
@@ -3576,3 +4114,11 @@ class TestSettingsGui:
         r = _run_scenario(name, tmp_path)
         assert r.returncode == 0, (
             f"scenario {name} failed:\n{r.stderr[-3000:]}")
+        # Exit 0 is not proof that anything ran: the child must SAY it ran the
+        # scenario, and say how many the driver registered. Without this, a
+        # dispatch that is unreachable (indented into a scenario, or dropped)
+        # makes every child exit 0 and this whole file pass vacuously — which is
+        # what happened, and what silently cost the GUI module its coverage.
+        assert f"SCENARIO-RAN {name} registry={len(SCENARIO_NAMES)}" in r.stdout, (
+            f"scenario {name} never ran — the child exited 0 without saying so. "
+            f"stdout={r.stdout[-400:]!r} stderr={r.stderr[-800:]!r}")

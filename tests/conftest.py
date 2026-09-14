@@ -487,6 +487,14 @@ _STATE_GLOBALS = (
     # test means a leaked load cannot change what the NEXT test observes.
     "_whisper_model", "_tts_model", "TTS_REFERENCE", "TTS_ENGINE",
     "WHISPER_SIZE", "WHISPER_DEVICE",
+    # The tool-support memory and the prompt-token cache derived from it. A turn
+    # against a model that refuses a tools payload records the refusal HERE, on
+    # the module, for the rest of the process — so a test that drove such a turn
+    # decided for every later test whether "the model already knows tools".
+    # Measured: with HANDSOFF_TEST_ORDER_SEED=20260914,
+    # test_a_model_that_refuses_tools_is_remembered_not_re_probed asserted a
+    # fresh True and got a False recorded by an earlier file.
+    "_BRAIN_STATE", "_TOOLS_SUPPORTED", "_FIXED_PROMPT_TOKENS",
 )
 
 # Worker threads that always have an explicit stop path. Anything here still

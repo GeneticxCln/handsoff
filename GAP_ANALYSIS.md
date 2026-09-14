@@ -3714,3 +3714,44 @@ Work left uncovered on purpose: the ~30 defensive `except`/`pass` lines inside
 those blocks, the Qt `main()` startup paths, and hardware-specific branches
 that need real devices. Remaining gap to the next ceiling is the settings GUI
 internals, which the offscreen scenarios already drive at the behavior level.
+
+## The guards behind the watchdog and the include-walk are now proved
+
+The mutation sweep over the two newest test blocks (15 mutants: thresholds
+removed, sensors short-circuited, markers left stale, supersession ignored,
+streams leaked, includes dropped, caps removed, escapes allowed) went 15/15
+after hardening three guards the sweep exposed as weak. One planned mutant —
+removing the include dedupe — is an equivalent mutant (the walk is one level
+deep) and is documented as untestable through the public seam. Remaining
+uncovered ceiling: the Qt `main()` startup paths and hardware-specific
+branches that need real devices.
+
+## A whole test file that tested nothing (found while chasing a coverage drop)
+
+**What was missing.** The settings-GUI suite was a no-op from the commit that
+created it. Its driver is one big string, and the block that reads the scenario
+name and calls the scenario sat at four spaces of indentation — inside the last
+`@scenario` function — so nothing ran, every child built the window and exited
+0, and all 65 tests passed on `assert returncode == 0`. The tell was
+architectural, not textual: `coverage combine` skipped 64 of 67 child data files
+as duplicates because every child recorded the same lines, and the GUI module
+measured 51% where an earlier pass had measured 86% — the scenarios were where
+that coverage came from. Fixed by putting the dispatch back at module level,
+refusing an unknown scenario name (exit 2), and having the child PRINT
+`SCENARIO-RAN <name> registry=<n>`, which the runner now asserts — the guard,
+not the fix, is what makes the shape unreachable: a swallowed dispatch prints
+nothing and fails 65 tests. The plan for this class of defect is the same
+everywhere: a child process must SAY what it did, because "exit 0" is also what
+crashing-in-a-different-way looks like from the outside.
+
+Running the scenarios for the first time found six defects in them, all now
+fixed: a capability probe matched on the request URL instead of the model name
+in the body, an IntFlag compared to a number, patch targets on the monolith for
+functions the app resolves through `core.bubble`, an undefined name
+(`_VOICE_TEST_LINE`), a stub called in place of the real helper, and a frame
+count off by the transition frame plus a whisper fake installed after the
+worker had already started.
+
+**Ceiling note.** The remaining uncovered lines in `handsoff-settings.py` (86%)
+are almost entirely `main()` startup and hardware-specific branches; the same is
+true of `handsoff.py` (73%).
