@@ -165,9 +165,22 @@ shell:
         echo "$bad"
         exit 1
       fi
-    - bash -n install.sh
-    - bash -n handsoff-restart
-    - bash -n ci/apt_deps.sh
+    # Every shell script DISCOVERED, not listed, and discovered by SHEBANG:
+    # `handsoff-restart` has no extension, so an extension glob misses exactly
+    # the file the old hand-written list remembered — and the two workflows'
+    # lists had already drifted apart (this one checked ci/apt_deps.sh, the
+    # GitHub one did not), the same hand-maintained-list shape that let
+    # core/theme.py escape the installer. `ci/gates.sh` runs this loop locally.
+    - |
+      for f in $(find . -type f -not -path './.git/*' -not -path './attic/*' | sort); do
+        first=$(head -1 "$f")
+        case "$first" in
+          '#!'*bash*|'#!'*'/sh'*) ;;
+          *) continue ;;
+        esac
+        echo "--- bash -n $f"
+        bash -n "$f" || exit 1
+      done
 
 # --- Installer smoke (GH: `smoke` job) --------------------------------------
 # --help must parse and print usage without touching the system.

@@ -3755,3 +3755,19 @@ worker had already started.
 **Ceiling note.** The remaining uncovered lines in `handsoff-settings.py` (86%)
 are almost entirely `main()` startup and hardware-specific branches; the same is
 true of `handsoff.py` (73%).
+
+## A gate that only exists in a remote pipeline
+
+**What was missing.** The gates were the definition of "green" and they lived
+only in `.gitlab-ci.yml`, which draws on a finite quota: once the minutes are
+gone, the answer to "is this push green?" stops existing, and the next best
+thing — a developer's ad-hoc pytest run — silently disagrees (it reports ~62%
+instead of 84% without `COVERAGE_PROCESS_START`, skips both ordering probes, and
+checks no pins). `ci/gates.sh` is that pipeline, runnable here: the same six
+jobs in the same order, the same environment, the same failure digest, and the
+SAME shell-discovery rule — by shebang, because both workflows had enumerated
+their own scripts and drifted apart, and `handsoff-restart` has no extension for
+a glob to catch. The pre-commit hook was in the same family of lie: it promised
+"~10s" and really takes ~2.5 min, so a commit that was correctly running the
+suite looked hung. Gates that cannot run, or that misreport their cost, are the
+same defect wearing different clothes: the check is real, and nobody trusts it.

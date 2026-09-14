@@ -127,10 +127,21 @@ jobs:
             exit 1
           fi
           echo 'all action refs are immutable SHAs'
-      - name: bash -n
+      - name: bash -n (every shell script, discovered)
         run: |
-          bash -n install.sh
-          bash -n handsoff-restart
+          # Discovered by SHEBANG, not by a list or an extension glob: the two
+          # workflows' enumerated lists had already drifted apart (GitLab's
+          # checked ci/apt_deps.sh, this one did not), and `handsoff-restart`
+          # has no extension, so `*.sh` misses exactly it.
+          for f in $(find . -type f -not -path './.git/*' -not -path './attic/*' | sort); do
+            first=$(head -1 "$f")
+            case "$first" in
+              '#!'*bash*|'#!'*'/sh'*) ;;
+              *) continue ;;
+            esac
+            echo "--- bash -n $f"
+            bash -n "$f" || exit 1
+          done
 
   # Installer smoke test: --help must parse and print usage without touching
   # the system. Catches installer drift (syntax rot, broken early flow) even

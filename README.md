@@ -33,7 +33,7 @@ voice clip you pick. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 1051 tests pin the behavior (`python -m pytest tests/`),
+automatically. 1317 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
 regression, ops, and fault injection — including offscreen-Qt scenarios that
 drive the settings GUI itself.
@@ -621,8 +621,22 @@ instead of starting by hand; it waits for the lock.
 
 ## Development
 
+The gates CI runs are also one command here — same jobs, same order, same
+environment, and the same failure digest the pipeline prints. It is the local
+answer to "is this push green?", for when the pipeline's minutes are spent or
+you would rather know before pushing:
+
 ```bash
-python -m pytest tests/ -q              # 1051 tests
+bash ci/gates.sh                        # every gate, in CI's order (~10 min)
+bash ci/gates.sh --no-order             # skip the two ordering re-runs (~5 min)
+bash ci/gates.sh shell compile smoke    # only the fast gates (seconds)
+```
+
+Each gate is the pipeline's job, run against your own interpreter and the
+dependencies the bubble already uses (it installs nothing):
+
+```bash
+python -m pytest tests/ -q              # 1317 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 
@@ -642,7 +656,7 @@ nothing is broken:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70     # 1051 tests, 79.7%
+  --cov-report=term-missing --cov-fail-under=70     # 1317 tests, 83.7%
 ```
 
 The suite is self-contained: it imports the bubble against a throw-away
@@ -671,7 +685,11 @@ floor job, an ordering-dependence probe (the suite re-run with the tests
 shuffled, then with only the file order shuffled), byte-compilation of every
 source file, shell syntax checks with supply-chain pin guards, and an installer
 smoke test. Background-thread exceptions fail the run via `pytest.ini` rather
-than passing silently.
+than passing silently. Every shell script is checked by SHEBANG rather than by a
+list or an extension glob — the two workflows' lists had already drifted apart,
+and `handsoff-restart` has no extension to glob. The same gates run locally as
+`bash ci/gates.sh`: the pipeline is a finite resource, and a gate that cannot
+run is not a gate.
 
 **When the pipeline goes red, read the summary before the log.** Each suite job
 writes a junit report (GitLab's native *Test summary* tab and merge-request test

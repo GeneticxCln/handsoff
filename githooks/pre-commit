@@ -22,18 +22,27 @@ while IFS= read -r f; do
     fi
 done < <(echo "$changed" | grep '\.py$' || true)
 
-# 2. Shell syntax for staged shell scripts.
+# 2. Shell syntax for staged shell scripts — by SHEBANG, so an extensionless
+# one (`handsoff-restart`, this hook itself) cannot slip past the check the
+# way `*.sh` alone would miss it. Only the first line is read.
 while IFS= read -r f; do
-    if [ -f "$f" ]; then
-        bash -n "$f" || fail=1
-    fi
-done < <(echo "$changed" | grep -E '(^|/)[^/]+\.sh$|^install\.sh$|^handsoff-restart$' || true)
+    [ -f "$f" ] || continue
+    case "$(head -1 "$f")" in
+        '#!'*bash*|'#!'*'/sh'*) ;;
+        *) continue ;;
+    esac
+    bash -n "$f" || fail=1
+done < <(echo "$changed" || true)
 
 # 3. The full suite whenever shipped sources changed. Deliberately broad:
 # handsoff.py is both app and self-edit target, and the suite pins prompt
 # text, tool census, and restart-script internals — narrow filters miss rot.
-if echo "$changed" | grep -qE '\.(py|sh)$|^install\.sh$|^handsoff-restart$|^pytest\.ini$|\.github/'; then
-    echo "pre-commit: running the test suite (~10s)…"
+# Measured, not guessed: the suite is ~2.5 min (this line used to say ~10s, and
+# the discrepancy is what makes a commit look HUNG — a 60s tool timeout kills a
+# commit that is running the gate it is supposed to run). Either wait for it, or
+# bypass deliberately with --no-verify and know what you skipped.
+if echo "$changed" | grep -qE '\.(py|sh)$|^install\.sh$|^handsoff-restart$|^pytest\.ini$|\.github/|\.gitlab-ci\.yml$'; then
+    echo "pre-commit: running the test suite (~2.5 min)…"
     python3 -m pytest tests/ -q || fail=1
 fi
 
