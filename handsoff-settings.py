@@ -339,13 +339,25 @@ def set_autostart(enable: bool) -> str:
 
 def _atomic_text_write(path: Path, text: str) -> None:
     """Atomically replace a text file via a unique temp file in the same
-    directory (no predictable .tmp name); existing permissions are kept."""
+    directory (no predictable .tmp name); existing permissions are kept.
+
+    "Kept" is now true: `mkstemp` creates the temp 0600 and `os.replace` would
+    carry that mode onto the destination, silently tightening (or loosening) a
+    file the user had chmod'ed. The destination's own mode is copied onto the
+    temp BEFORE the replace.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = path.stat().st_mode & 0o7777
+    except OSError:
+        mode = None            # new file: leave mkstemp's 0600 alone
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
                                     dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+        if mode is not None:
+            os.chmod(tmp_name, mode)
         os.replace(tmp_name, path)
     except Exception:
         try:
@@ -680,13 +692,19 @@ class BubblePreview(QWidget):
     """Four animated glyphs previewing the state colours, size and design."""
 
     def __init__(self, colors_fn, size_fn, design_fn=None,
-                 energy_fn=None, accent_fn=None, image_fn=None) -> None:
+                 energy_fn=None, accent_fn=None, image_fn=None,
+                 deco_fn=None) -> None:
         super().__init__()
         self._colors_fn = colors_fn
         self._size_fn = size_fn
         self._design_fn = design_fn or (lambda: "orb")
         self._energy_fn = energy_fn or (lambda: 1.0)
         self._accent_fn = accent_fn or (lambda: 0.5)
+        # The Decoration card's two choices as the FORM holds them: the ring's
+        # name and the value its colour row would write. A callable rather than
+        # a saved setting, because the strip shows what is on screen in the
+        # window, not what is on disk.
+        self._deco_fn = deco_fn or (lambda: ("off", "state"))
         # The `image` design's art, as a `state -> path` resolver, and the cache
         # for its decoded layers: the strip repaints at 30 Hz and this is a
         # user's 4000x4000 photo.
@@ -729,7 +747,14 @@ class BubblePreview(QWidget):
         picture's CIRCUMSCRIBED circle, scaled down to the glyph radius). One
         decode per revision, because this runs from paintEvent.
         """
-        path = str(self._image_fn(state) or "")
+        value = self._image_fn(state)
+        # An ANIMATED pack state is a spec dict: the strip shows its FIRST
+        # frame (a decision aid, not a projector) through the same decode and
+        # tint as a still, so what it shows is what the desktop will draw.
+        if isinstance(value, dict):
+            frames = value.get("frames") or []
+            value = frames[0] if frames else ""
+        path = str(value or "")
         if not path:
             return False
         bubble = self._bubble_module
@@ -777,6 +802,48 @@ class BubblePreview(QWidget):
         p.restore()
         return True
 
+    def _bubble(self):
+        """The bubble module, loaded on first use (None if it cannot load)."""
+        if self._bubble_module is None:
+            try:
+                self._bubble_module = _core_module("bubble")
+            except Exception:
+                log.debug("preview: bubble module unavailable", exc_info=True)
+        return self._bubble_module
+
+    def _draw_deco_glyph(self, p, design, cx, cy, r, color, t, energy) -> None:
+        """The ring the Decoration card picks, drawn in the strip.
+
+        The card exists in this window for one reason — to choose what the
+        avatar wears — and until now the strip never drew a ring at all, so
+        every choice it offered (and the colour row under it) had NO visible
+        effect where the user was looking. That is the same "I changed it and
+        nothing happened" defect one layer up from the settings keys.
+
+        The geometry mirrors the bubble's own and says so: the band runs from
+        the picture's fit (x1.03) to the aperture (x0.94), and the picture's fit
+        is 0.76 of the aperture while a ring is on — the constant `_paint_image`
+        uses — so the strip cannot show a band the bubble would not draw. The
+        colour comes from the bubble's own resolver with the form's value, so
+        the preview is not a second implementation of the choice.
+        """
+        if design != "image" or r <= 1.0:
+            return
+        name, value = self._deco_fn()
+        if not name or name == "off":
+            return
+        bubble = self._bubble()
+        if bubble is None:
+            return
+        try:
+            fit_k = 0.76                 # `_paint_image`'s ring-on fit
+            deco = bubble.avatar_deco_colour(color, t, 0.0, energy, value)
+            bubble.BubbleWidget._draw_avatar_deco(
+                p, cx, cy, r * 1.03, (r / fit_k) * 0.94, name, t, 0.0,
+                deco, 1.0, energy)
+        except Exception:
+            log.debug("preview: decoration draw failed", exc_info=True)
+
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
@@ -812,6 +879,10 @@ class BubblePreview(QWidget):
             p.setBrush(QBrush(grad))
             p.drawEllipse(QPointF(cx, cy), r + 6 * k, r + 6 * k)
             design = self._design_fn()
+            # The ring goes UNDER the picture, exactly as the bubble paints it
+            # (decoration, then stage, then art, then rim) — a light behind a
+            # person is the whole reading of the decoration.
+            self._draw_deco_glyph(p, design, cx, cy, r, QColor(color), tt, e)
             # The `image` design shows the user's OWN picture here — the one
             # for THIS slot's state, because a pack names a picture per state.
             # A preview that showed the empty slot while the bubble drew the
@@ -929,10 +1000,20 @@ class _LiveMicProbe:
                 if gen != self._gen or not self._running or self._device != device \
                         or self._threshold != threshold:
                     return
+            st = None
             try:
                 st, rate = H._open_input(device, H.SAMPLE_RATE, self.FRAME, cb)
                 st.start()
             except Exception as e:
+                # A stream that OPENED but failed to start was dropped here
+                # without a close: PortAudio holds the device until the object
+                # is collected, so a flapping device leaked one stream per
+                # retry. Close it before backing off.
+                if st is not None:
+                    try:
+                        st.close()
+                    except Exception:
+                        pass
                 with self._lock:
                     self._error = f"cannot open device: {e}"
                     self._stream = None
@@ -1303,9 +1384,18 @@ class SettingsWindow(QMainWindow):
     # `design_pack` is in for exactly the same reason: picking a pack moves no
     # other control, and a pack that never reached disk would look like a picker
     # that does nothing.
+    # Every key this tab can move. A key MISSING from here is not a cosmetic
+    # omission: `_apply_appearance_live` compares these against the disk and
+    # reads a difference it is not watching as "a load, not an edit", so the
+    # control applies nothing and saves nothing — the exact "I changed it and
+    # nothing happened" defect, one layer down from the widget. It has now
+    # happened twice (`colors`, then `avatar_deco_color`), which is why the
+    # guard for a new control asserts the LIVE APPLY and not merely that the
+    # value reached `cfg`.
     APPEARANCE_KEYS = ("bubble_design", "bubble_size", "animation_energy",
                        "bubble_accent", "colors", "design_image_path",
-                       "design_pack",
+                       "design_pack", "avatar_ring", "avatar_tint",
+                       "avatar_deco_color",
                        # ...and one key per STATE: a picture chosen for one
                        # state moves no other control, so without these the
                        # live apply would read it as "a load, not an edit".
@@ -1328,6 +1418,11 @@ class SettingsWindow(QMainWindow):
             state: str(self.cfg.get(key) or "")
             for state, key in STATE_IMAGE_KEYS}
         self._design_pack = str(self.cfg.get("design_pack") or "")
+        # The decoration's own colour, held as a form value like the art. Seeded
+        # from settings when the stored value IS a colour, so reloading shows
+        # the colour in use; otherwise from the first state colour, so the first
+        # click on the swatch opens on something related instead of black.
+        self._deco_colour = self._stored_deco_colour()
         # A pack can be LOOKED AT before it is taken. `_preview_art` is the
         # candidate's manifest while the strip above is showing it, and
         # `_preview_scratch` is the temporary folder a pack FILE had to be
@@ -2691,6 +2786,23 @@ class SettingsWindow(QMainWindow):
             "seconds. No Save needed.")
         self.design_combo.currentIndexChanged.connect(self._schedule_appearance_live)
         box.addLayout(self._field("Design", self.design_combo))
+        # How the picture is COLOURED, right beside the art it colours: the
+        # state wash is what makes a photo read as the bubble's mood, and what
+        # makes a drawn character impossible (every silhouette comes out the
+        # state hue). "Original colours" is the answer for a character, and the
+        # state is then carried by the rim and the decoration.
+        self.tint_combo = QComboBox(card)
+        for _value, _label in (("state", "State colours"),
+                               ("natural", "Original colours")):
+            self.tint_combo.addItem(_label, _value)
+        self.tint_combo.setToolTip(
+            "What colour the picture itself is drawn in. \"State colours\" "
+            "washes it in the state colour — a photo reads as the bubble's "
+            "mood. \"Original colours\" keeps the art's own palette, which is "
+            "what a drawn character needs to stay itself; the state is then "
+            "carried by the rim and the decoration. Applies live.")
+        self.tint_combo.currentIndexChanged.connect(self._schedule_appearance_live)
+        box.addLayout(self._field("Avatar colours", self.tint_combo))
         # The picture the `Image` design draws. It lives in the Shape card
         # rather than a card of its own because a shape whose art comes from a
         # file is still a shape; it is always visible (a picture may be chosen
@@ -2876,6 +2988,71 @@ class SettingsWindow(QMainWindow):
             "Window size in pixels — the drawn bubble is about 69% of it.", card))
         lay.addWidget(card)
 
+        # -- Decoration: what the avatar WEARS. Its own card and its own picker,
+        # -- because a decoration is a different choice from the art and from
+        # -- the shape: it is animated, it is the thing the voice visibly
+        # -- drives, and there are several to try. The schema owns the closed
+        # -- set (`AVATAR_DECOS`) and core.settings coerces to it, so this combo
+        # -- can only hold a name the painter implements.
+        card, box = self._card(
+            "Decoration",
+            "A light worn AROUND the avatar. It turns with the animation "
+            "energy and brightens and quickens with your voice. Shows when "
+            "the design is Image — a picture as the bubble.")
+        self.deco_combo = QComboBox(card)
+        for _value, _label in (("off", "Off"),
+                               ("ring-light", "Ring light"),
+                               ("orbit", "Orbiting comets"),
+                               ("pulse", "Pulse rings"),
+                               ("aurora", "Aurora ribbons"),
+                               ("rainbow", "Rainbow ring"),
+                               ("sparkle", "Sparkles"),
+                               ("comet", "Comet"),
+                               ("neon", "Neon tubes"),
+                               ("flames", "Flames")):
+            self.deco_combo.addItem(_label, _value)
+        self.deco_combo.setToolTip(
+            "The avatar's decoration: an animated light around the picture. "
+            "Each one turns on its own with the animation energy, brightens "
+            "and quickens with your voice, and is painted in the colour the "
+            "row below chooses. Applies live, no Save needed.")
+        self.deco_combo.currentIndexChanged.connect(
+            self._schedule_appearance_live)
+        self.deco_combo.currentIndexChanged.connect(self._update_deco_hint)
+        box.addLayout(self._field("Decoration", self.deco_combo))
+        self.deco_hint = self._muted("", card)
+        box.addWidget(self.deco_hint)
+        self._update_deco_hint()
+
+        # The decoration's OWN colour. Three answers, and the third is why this
+        # is not a plain swatch: "Colour of its own" is a colour the ring keeps
+        # while the bubble changes state, which is what makes a decoration
+        # independent rather than a copy of the mood. `rainbow` is the animated
+        # one, so the ring moves in colour as well as in shape.
+        self.deco_colour_combo = QComboBox(card)
+        for _value, _label in (("state", "State colour"),
+                               ("rainbow", "Rainbow"),
+                               ("custom", "Colour of its own")):
+            self.deco_colour_combo.addItem(_label, _value)
+        self.deco_colour_combo.setToolTip(
+            "What the decoration is painted in. State colour tracks the "
+            "bubble's mood (the rim carries the state anyway); Rainbow sweeps "
+            "through every hue on its own, speeding up with your voice; "
+            "Colour of its own keeps one colour whatever the state is.")
+        self.deco_colour_combo.currentIndexChanged.connect(
+            self._schedule_appearance_live)
+        self.deco_colour_combo.currentIndexChanged.connect(
+            self._update_deco_colour)
+        box.addLayout(self._field("Decoration colour", self.deco_colour_combo))
+        self.deco_colour_btn = QPushButton("#4F8CFF", card)
+        self.deco_colour_btn.setToolTip(
+            "Pick the decoration's own colour. The bubble's rim still carries "
+            "the state colour, so the mood stays readable.")
+        self.deco_colour_btn.clicked.connect(self._pick_deco_colour)
+        box.addLayout(self._field("Own colour", self.deco_colour_btn))
+        self._update_deco_colour()
+        lay.addWidget(card)
+
         # -- Motion: one global animation scale + one accent punch, both
         # applied by every design in the bubble's shared frame state
         card, box = self._card(
@@ -2976,6 +3153,7 @@ class SettingsWindow(QMainWindow):
             lambda: self.energy_slider.value() / 100.0,
             lambda: self.accent_slider.value() / 100.0,
             self._preview_picture,
+            self._preview_deco,
         )
         self.preview.setMinimumHeight(168)
         box.addWidget(self.preview)
@@ -3394,13 +3572,16 @@ class SettingsWindow(QMainWindow):
         if index >= 0 and combo.currentIndex() != index:
             combo.setCurrentIndex(index)
 
-    def _design_picture(self, state: str = "") -> str:
-        """The picture in effect for `state`, resolved the way the BUBBLE does.
+    def _design_picture(self, state: str = ""):
+        """The art in effect for `state`, resolved the way the BUBBLE does.
 
         The precedence (pack, then this state's own picture, then the fallback)
         lives in the bubble module's `picture_for`, so the panel and the desktop
         cannot disagree about which picture a state draws — which is the
         preview's whole job, and exactly where two implementations would drift.
+        A still comes back as a path; an ANIMATED pack state comes back as a
+        spec dict, and the strip draws its first frame (it is a decision aid,
+        not a projector).
         """
         try:
             bubble = _core_module("bubble")
@@ -3408,9 +3589,9 @@ class SettingsWindow(QMainWindow):
             log.debug("design picture: bubble module unavailable", exc_info=True)
             return ""
         try:
-            return str(bubble.picture_for(self._design_pack,
-                                          self._design_image, state,
-                                          self._design_images) or "")
+            return bubble.picture_for(self._design_pack,
+                                      self._design_image, state,
+                                      self._design_images) or ""
         except Exception:
             log.debug("design picture resolution failed", exc_info=True)
             return ""
@@ -3684,6 +3865,18 @@ class SettingsWindow(QMainWindow):
             return str((art.get("states") or {}).get(state)
                        or art.get("any") or "")
         return self._design_picture(state)
+
+    def _preview_deco(self) -> tuple:
+        """The decoration the strip should draw: `(name, colour value)`.
+
+        The colour value is exactly what `_collect` would WRITE — the literal
+        hex when the row says the colour is the user's own, the mode word
+        otherwise — so the strip shows the pending choice rather than the saved
+        one, and the bubble's own resolver can be handed it directly.
+        """
+        mode = str(self.deco_colour_combo.currentData() or "state")
+        value = self._deco_colour if mode == self.DECO_COLOUR_CUSTOM else mode
+        return (str(self.deco_combo.currentData() or "off"), str(value))
 
     def _preview_design_pack(self, kind: str) -> None:
         """Show a pack folder or pack FILE in the strip WITHOUT installing it.
@@ -3959,7 +4152,10 @@ class SettingsWindow(QMainWindow):
                       "animation_energy": "animation energy",
                       "bubble_accent": "colour accent", "colors": "state colours",
                       "design_image_path": "fallback image",
-                      "design_pack": "design pack"}
+                      "design_pack": "design pack",
+                      "avatar_ring": "decoration",
+                      "avatar_tint": "picture colours",
+                      "avatar_deco_color": "decoration colour"}
             # A per-state choice reports the STATE it was made for, not the
             # setting's own name: "idle picture" says what moved, and
             # "design_image_idle" does not.
@@ -4163,6 +4359,24 @@ class SettingsWindow(QMainWindow):
             state: str(self.cfg.get(key) or "")
             for state, key in STATE_IMAGE_KEYS}
         self._design_pack = str(self.cfg.get("design_pack") or "")
+        _av = self.deco_combo.findData(
+            str(self.cfg.get("avatar_ring") or "ring-light"))
+        self.deco_combo.setCurrentIndex(_av if _av >= 0 else 0)
+        # The colour row is derived from the stored value: a word selects that
+        # word, anything else is a colour of its own and selects `custom` — so
+        # the row a user sees always describes what is on disk, and saving
+        # without touching it is not an edit.
+        self._deco_colour = self._stored_deco_colour()
+        _stored = str(self.cfg.get("avatar_deco_color") or "state").strip().lower()
+        _want = (_stored if _stored in ("state", "rainbow")
+                 else self.DECO_COLOUR_CUSTOM)
+        _dci = self.deco_colour_combo.findData(_want)
+        self.deco_colour_combo.setCurrentIndex(_dci if _dci >= 0 else 0)
+        self._update_deco_colour()
+        _ti = self.tint_combo.findData(
+            str(self.cfg.get("avatar_tint") or "state"))
+        self.tint_combo.setCurrentIndex(_ti if _ti >= 0 else 0)
+        self._update_deco_hint()
         self._refresh_state_image_buttons()
         self._refresh_pack_combo()
         self._refresh_design_image_label()
@@ -4218,6 +4432,111 @@ class SettingsWindow(QMainWindow):
             self._report_rejected_colors(rejected, "using the default")
         # last: the tick must reflect the values just loaded from disk
         self._refresh_look_buttons()
+
+    # What each decoration IS, in the panel's own words: the picker names them,
+    # and this says what you are choosing between without opening the bubble to
+    # find out. One dict beside the picker that fills it, so a new decoration
+    # cannot ship with a name and no description.
+    DECO_HINTS = {
+        "off": "Nothing around the picture.",
+        "ring-light": "Two arc pairs that rotate, with a dimmer counter-rotating "
+                      "pair outside them — a lamp ring.",
+        "orbit": "Three glowing comets on their own orbits, each trailing its "
+                 "own light.",
+        "pulse": "Rings that travel outward and fade — a heartbeat. Speaks "
+                 "faster when you do.",
+        "aurora": "Three ribbons of light drifting around the edge in slow "
+                  "waves.",
+        "rainbow": "One thick band holding every hue at once, turning — the "
+                   "whole wheel rather than a colour.",
+        "sparkle": "Points that pop and fade all round a faint ring, each on "
+                   "its own beat.",
+        "comet": "A single comet with a long tail sweeping the ring — motion "
+                 "you read at a glance.",
+        "neon": "A segmented tube that is always lit, with a pulse chasing "
+                "round it.",
+        "flames": "Tongues of fire licking up all round, running white-hot at "
+                  "the tips when you talk.",
+    }
+
+    # The decoration's own colour. `custom` is not a settings value: it is the
+    # ROW's name for "the stored value is a literal hex", which is how one combo
+    # can offer two words and an arbitrary colour without a second dialog open
+    # by default. Keeping it out of the schema is deliberate — the schema holds
+    # what can be STORED, and what is stored is the hex.
+    DECO_COLOUR_CUSTOM = "custom"
+
+    def _update_deco_hint(self) -> None:
+        """Say what the chosen decoration does, in the panel's own words."""
+        name = str(self.deco_combo.currentData() or "off")
+        self.deco_hint.setText(self.DECO_HINTS.get(name, ""))
+        if getattr(self, "deco_colour_combo", None) is not None:
+            self._update_deco_colour()
+
+    def _stored_deco_colour(self) -> str:
+        """The colour to open the swatch on.
+
+        `avatar_deco_color` holds either a mode word or a literal hex, so the
+        swatch is seeded from the hex when there is one and from the first
+        state colour otherwise. `_color_ok` is the panel's own gate, so a
+        hand-edited settings.json cannot seed the swatch with junk the bubble
+        would refuse.
+        """
+        raw = str(self.cfg.get("avatar_deco_color") or "").strip()
+        if raw.lower() not in ("state", "rainbow", "") and self._color_ok(raw):
+            return raw
+        states = tuple(getattr(SCHEMA, "BUBBLE_STATES", ())) or ("idle",)
+        return str(DEFAULT_SETTINGS["colors"].get(states[0]) or "#4f8cff")
+
+    def _update_deco_colour(self) -> None:
+        """Enable the swatch only when it is the thing being used.
+
+        A live control that does nothing is the "I changed it and nothing
+        applied" defect in miniature, so the swatch is disabled unless the row
+        says the stored value is a colour of its own.
+        """
+        mode = str(self.deco_colour_combo.currentData() or "state")
+        custom = mode == self.DECO_COLOUR_CUSTOM
+        self.deco_colour_btn.setEnabled(custom)
+        if custom:
+            self._paint_deco_colour_button()
+        # The strip above draws the ring, so a colour change has to repaint it —
+        # the same reason every other appearance control does.
+        if getattr(self, "preview", None) is not None:
+            self.preview.update()
+
+    def _paint_deco_colour_button(self) -> None:
+        hexcol = self._deco_colour
+        col = QColor(hexcol)
+        luma = (0.299 * col.red() + 0.587 * col.green()
+                + 0.114 * col.blue()) / 255.0
+        ink = "#101014" if luma > 0.6 else "#ffffff"
+        self.deco_colour_btn.setText(hexcol.upper())
+        self.deco_colour_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {hexcol}; color: {ink}; "
+            f"border: 1px solid #555; border-radius: 6px; }}"
+            f"QPushButton:hover {{ border: 1px solid {ink}; }}")
+        self.deco_colour_btn.setToolTip(
+            f"The decoration's own colour ({hexcol.upper()}). The bubble's rim "
+            f"still carries the state colour, so the mood stays readable.")
+
+    def _pick_deco_colour(self) -> None:
+        col = QColorDialog.getColor(QColor(self._deco_colour), self,
+                                    "decoration colour")
+        if not col.isValid():
+            return
+        chosen = col.name()
+        if not self._color_ok(chosen):
+            # The dialog yields '#rrggbb', so this guards the invariant rather
+            # than an expected path: nothing may enter the row that the
+            # bubble's parser or core.settings would throw away.
+            self._report_rejected_colors(
+                [("decoration", chosen)], "keeping the current colour")
+            return
+        self._deco_colour = chosen
+        self._paint_deco_colour_button()
+        self.preview.update()
+        self._schedule_appearance_live()
 
     def _collect(self) -> list[str]:
         problems: list[str] = []
@@ -4280,6 +4599,16 @@ class SettingsWindow(QMainWindow):
         for state, key in STATE_IMAGE_KEYS:
             self.cfg[key] = str(self._design_images.get(state) or "")
         self.cfg["design_pack"] = str(self._design_pack or "")
+        self.cfg["avatar_ring"] = str(
+            self.deco_combo.currentData() or "ring-light")
+        # One key, three shapes: the two words, or the literal hex when the row
+        # says the colour is the user's own. `custom` itself is never stored —
+        # the schema holds what the bubble can READ, and what it reads is the
+        # hex.
+        _mode = str(self.deco_colour_combo.currentData() or "state")
+        self.cfg["avatar_deco_color"] = (
+            self._deco_colour if _mode == self.DECO_COLOUR_CUSTOM else _mode)
+        self.cfg["avatar_tint"] = str(self.tint_combo.currentData() or "state")
         self.cfg["animation_energy"] = self.energy_slider.value() / 100.0
         self.cfg["bubble_accent"] = self.accent_slider.value() / 100.0
         self.cfg["colors"] = dict(self._colors)

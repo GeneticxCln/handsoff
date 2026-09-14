@@ -3190,3 +3190,200 @@ class TestAudioFailurePaths:
             mod._open_input(None, 16000, 1024, lambda *a: None)
         assert ei.value is second
         assert ei.value.__cause__ is first, "the real cause was discarded"
+
+
+class TestWatchdogReopenLoop:
+    """The inner watchdog of ContinuousListener._run — the loop that guards
+    hands-free against a USB device that vanishes without closing its stream:
+    either the frames STOP arriving (stalled) or they arrive as pure digital
+    silence (wedged). Both must reopen; healthy flow must not. This block had
+    no test, yet it is what keeps a wedged mic from looking like 'the user is
+    quiet' forever."""
+
+    @staticmethod
+    def _listener(H):
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._assistant = types.SimpleNamespace()
+        ln._running = True
+        ln._run_id = 7
+        ln._suspended = False
+        ln._discard = False
+        ln._spotter = None
+        ln._stream = None
+        ln._frames_seen = 0
+        ln._last_nonzero = 0.0
+        ln._health_utt = 0
+        ln._health_opens_ok = 0
+        ln._health_opens_failed = 0
+        ln._health_open_device = ""
+        ln._health_last_open = "never"
+        ln._health_state = ""
+        ln._health_next_summary = 0.0
+        ln._health_failing_since = None
+        ln._health_recovered_after = None
+        ln._health_stalled_since = None
+        ln._was_struggling = False
+        ln._lock = threading.RLock()
+        return ln
+
+    @staticmethod
+    def _fake_stream(events):
+        class _S:
+            def start(self):
+                events.append("start")
+
+            def stop(self):
+                events.append("stop")
+
+            def close(self):
+                events.append("close")
+        return _S()
+
+    def _wire_open(self, H, monkeypatch, events):
+        monkeypatch.setattr(H, "_open_input",
+                            lambda dev, rate, bs, cb: (self._fake_stream(events), 16000))
+
+    # ---- stalled: frames stop arriving → REOPEN_S later the stream reopens
+
+    def test_stalled_stream_is_reopened(self, H, monkeypatch, caplog):
+        events = []
+        self._wire_open(H, monkeypatch, events)
+        ln = self._listener(H)
+        monkeypatch.setattr(H.ContinuousListener, "REOPEN_S", 1.0)
+        # A controllable clock is what makes the threshold REACHABLE: with the
+        # real monotonic, two instant sleeps are 0 µs apart and `now -
+        # stalled_since` never exceeds any threshold.
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
+        stalled_seen = []
+
+        def fake_sleep(s):
+            clock["t"] += max(s, 0.5)     # every sleep advances the fake clock
+            if s == 0.5:                  # a watchdog tick: NO frames arrive
+                if ln._health_stalled_since is not None:
+                    stalled_seen.append(ln._health_stalled_since)
+                if events.count("start") >= 2:
+                    ln._running = False   # generation 2 observed → end cleanly
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._run(7)
+        assert events.count("start") == 2, events          # REOPENED
+        assert events[-2:] == ["stop", "close"], events
+        assert "stalled; reopening" in caplog.text, caplog.text
+        assert stalled_seen, \
+            "the stalled period must be visible in the mic-health state"
+
+    # ---- silent: frames flow but are pure digital silence → SILENT_REOPEN_S
+
+    def test_silent_frames_are_reopened(self, H, monkeypatch, caplog):
+        events = []
+        self._wire_open(H, monkeypatch, events)
+        ln = self._listener(H)
+        monkeypatch.setattr(H.ContinuousListener, "SILENT_REOPEN_S", 1.0)
+        clock = {"t": 1000.0}     # _last_nonzero is stamped 1000.0 at open
+        monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
+
+        def fake_sleep(s):
+            clock["t"] += max(s, 0.5)
+            if s == 0.5:
+                ln._frames_seen += 1          # the PortAudio callback is alive…
+                if events.count("start") >= 2:
+                    ln._running = False
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._run(7)
+        assert events.count("start") == 2, events          # REOPENED
+        assert "only silence; reopening" in caplog.text, caplog.text
+
+    # ---- healthy: frames flow and speech happened recently → NO reopen
+
+    def test_healthy_flow_is_left_alone(self, H, monkeypatch):
+        events = []
+        self._wire_open(H, monkeypatch, events)
+        ln = self._listener(H)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
+
+        def fake_sleep(s):
+            clock["t"] += max(s, 0.5)
+            if s == 0.5:
+                ln._frames_seen += 1          # frames flow, and (no cb call)
+                if ln._frames_seen >= 5:      # …recent nonzero speech happened
+                    ln._running = False       # end the run cleanly
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        ln._run(7)
+        # The final stop/close IS the clean shutdown on exit; what must never
+        # happen is a WATCHDOG reopen — a second start.
+        assert events.count("start") == 1, events
+        assert ln._health_stalled_since is None
+
+    # ---- clean stop + generation token
+
+    def test_stop_before_reopen_tears_down_cleanly(self, H, monkeypatch):
+        events = []
+        self._wire_open(H, monkeypatch, events)
+        ln = self._listener(H)
+
+        def fake_sleep(s):
+            if s == 0.5:
+                ln._running = False                 # hands-free switched off
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        ln._run(7)
+        assert events == ["start", "stop", "close"], events
+        assert ln._running is False
+        assert ln.gate_open is False
+
+    def test_cb_counts_frames_even_when_suspended(self, H, monkeypatch):
+        """The liveness counter is bumped by the callback ALWAYS — even while
+        suspended — otherwise the watchdog would read a suspended listener as
+        a stalled stream."""
+        captured = {}
+
+        def fake_open(dev, rate, bs, cb):
+            captured["cb"] = cb
+            return self._fake_stream([]), 16000
+        monkeypatch.setattr(H, "_open_input", fake_open)
+        ln = self._listener(H)
+
+        def fake_sleep(s):
+            if s == 0.5:
+                ln._running = False                 # one tick, then off
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        ln._run(7)
+        ln._running = False                          # suspended/stopped
+        before = ln._frames_seen
+        captured["cb"](None, 0, None, None)
+        assert ln._frames_seen == before + 1
+
+    def test_stale_generation_never_touches_the_device(self, H, monkeypatch):
+        """A thread whose generation was superseded (stop() bumped _run_id)
+        must not open — the generation token is what kills old threads."""
+        events = []
+        self._wire_open(H, monkeypatch, events)
+        ln = self._listener(H)
+        ln._run_id = 8                               # superseded
+        ln._run(7)
+        assert events == []                          # nothing opened
+
+    def test_teardown_survives_a_raising_stop(self, H, monkeypatch, caplog):
+        """A PortAudio stream whose stop() raises mid-teardown must not kill
+        the reopen loop — _run still clears the stream and keeps going."""
+        class _BadStream:
+            def start(self):
+                pass
+            def stop(self):
+                raise RuntimeError("wedged PortAudio device")
+            def close(self):
+                pass
+        monkeypatch.setattr(H, "_open_input",
+                            lambda dev, rate, bs, cb: (_BadStream(), 16000))
+        ln = self._listener(H)
+
+        def fake_sleep(s):
+            if s == 0.5:
+                ln._running = False
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        with caplog.at_level("INFO", logger="handsoff"):
+            ln._run(7)
+        assert ln._stream is None, "the dead stream must be released"
+        assert ln._running is False

@@ -50,7 +50,8 @@ class _Reservation:
     teardown paths.
     """
 
-    __slots__ = ("_registry", "key", "replace", "reclaimed", "_settled")
+    __slots__ = ("_registry", "key", "replace", "reclaimed", "_settled",
+                 "_released", "_result")
 
     def __init__(self, registry: "BoundedRegistry", key, replace: bool) -> None:
         self._registry = registry
@@ -58,6 +59,12 @@ class _Reservation:
         self.replace = replace
         self.reclaimed = None
         self._settled = False
+        self._result = None
+        # Set when this reservation's slot has been given back (by commit OR
+        # cancel). It guards the double-release: a second commit() on one
+        # reservation used to decrement `_held` again, inventing capacity the
+        # cap thinks it still has.
+        self._released = False
 
     def commit(self, build):
         """Register the resource and return ``(key, displaced)``.
@@ -68,15 +75,23 @@ class _Reservation:
         be handed the same key. ``displaced`` is whatever this commit replaced
         — the caller disposes of it *outside* the lock.
         """
+        if self._settled:
+            # Idempotent, deliberately. Committing twice used to register a
+            # SECOND resource for ONE reservation — which the cap counted once,
+            # so the extra entry was never released and never counted, and the
+            # cap silently admitted an extra. Returning the first result keeps
+            # a teardown that settles twice from inventing anything.
+            return self._result
         result = self._registry._commit(self, build)
         self._settled = True
+        self._result = result
         return result
 
     def cancel(self) -> None:
         """Give the slot back without registering anything."""
         if not self._settled:
             self._settled = True
-            self._registry._cancel()
+            self._registry._cancel(self)
 
     def __enter__(self) -> "_Reservation":
         return self
@@ -271,12 +286,21 @@ class BoundedRegistry:
                 key = f"{self.name}-{self._auto}"
             displaced = self._items.get(key)
             self._items[key] = build(key) if callable(build) else build
-            self._held -= 1
+            self._release(reservation)
             return key, displaced
 
-    def _cancel(self) -> None:
-        with self._lock:
+    def _release(self, reservation: "_Reservation") -> None:
+        """Give back one reservation's slot — at most once, ever."""
+        if not reservation._released:
+            reservation._released = True
             self._held = max(0, self._held - 1)
+
+    def _cancel(self, reservation: "_Reservation | None" = None) -> None:
+        with self._lock:
+            if reservation is None:
+                self._held = max(0, self._held - 1)
+            else:
+                self._release(reservation)
 
 
 class Offer:

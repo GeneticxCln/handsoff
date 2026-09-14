@@ -191,6 +191,13 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
     until: "datetime.datetime | None" = None
     if parts.get("UNTIL"):
         until = _ics_parse_dt(f"UNTIL:{parts['UNTIL']}")
+        # A DATE-valued UNTIL is inclusive of that whole day. Parsed as written
+        # it is that day's MIDNIGHT, which then excluded same-day instances
+        # starting later in the day (RFC 5545: "the UNTIL rule part defines a
+        # DATE or DATE-TIME value … inclusive").
+        if until is not None and re.fullmatch(r"\d{8}", parts["UNTIL"].strip()):
+            until = until.replace(hour=23, minute=59, second=59,
+                                  microsecond=999999)
 
     def want(t: "datetime.datetime") -> bool:
         if t < dtstart or t >= win_end or t + dur <= win_start:
@@ -212,16 +219,26 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
         wd = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
         days = [wd[d] for d in parts.get("BYDAY", "").split(",")
                 if d in wd] or [dtstart.weekday()]
-        week0 = dtstart - datetime.timedelta(days=dtstart.weekday())
+        # Midnight-aligned on purpose. Subtracting whole DAYS from DTSTART
+        # cannot change its clock time, so a week0 built the obvious way still
+        # carried it — and adding `hours=dtstart.hour` on top of that doubled
+        # the time of day: a Monday 09:00 weekly event read back at 18:00, and
+        # an evening one rolled into the next day. The day offset is applied to
+        # that date and DTSTART's time is added exactly once below, which is
+        # the only shape in which the two cannot both apply.
+        week0 = (dtstart - datetime.timedelta(days=dtstart.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        clock = (dtstart.hour, dtstart.minute, dtstart.second,
+                 dtstart.microsecond)
         w = 0
         while w < 200 and k < count:
             base = week0 + datetime.timedelta(weeks=w * interval)
             if base > win_end:
                 break
             for d in days:
-                t = base + datetime.timedelta(
-                    days=d, hours=dtstart.hour, minutes=dtstart.minute,
-                    seconds=dtstart.second)
+                t = base + datetime.timedelta(days=d)
+                t = t.replace(hour=clock[0], minute=clock[1], second=clock[2],
+                              microsecond=clock[3])
                 if t >= dtstart:
                     k += 1
                     if want(t):
@@ -314,6 +331,42 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
     return out
 
 
+def _ics_duration(value: str) -> "datetime.timedelta | None":
+    """RFC 5545 DURATION (`P1DT2H30M`, `PT45M`, `P2W`) → timedelta, or None.
+
+    A VEVENT may carry DURATION INSTEAD of DTEND. Ignoring it (the old
+    behaviour) fabricated a one-hour duration for every such event, so a
+    two-hour class covered the wrong window and any event whose real duration
+    did not overlap the queried range was still reported as if it did.
+    """
+    text = str(value or "").strip().upper()
+    if not text.startswith("P") or text.endswith("T"):
+        return None
+    date_part, _, time_part = text[1:].partition("T")
+    units = {"W": "weeks", "D": "days"}
+    total = datetime.timedelta()
+    seen = False
+
+    def _num(chunk: str, table: dict) -> bool:
+        nonlocal total, seen
+        if not chunk:
+            return True
+        digits = chunk[:-1]
+        unit = chunk[-1:]
+        if unit not in table or not digits.isdigit():
+            return False
+        total += datetime.timedelta(**{table[unit]: int(digits)})
+        seen = True
+        return True
+
+    if not all(_num(c, units) for c in re.findall(r"\d*[A-Z]", date_part)):
+        return None
+    _t = {"H": "hours", "M": "minutes", "S": "seconds"}
+    if not all(_num(c, _t) for c in re.findall(r"\d*[A-Z]", time_part)):
+        return None
+    return total if seen else None
+
+
 def _ics_events_from_text(text: str, win_start: "datetime.datetime",
                           win_end: "datetime.datetime") -> list[dict]:
     """Parse VEVENTs overlapping [win_start, win_end); expands recurrences.
@@ -331,7 +384,7 @@ def _ics_events_from_text(text: str, win_start: "datetime.datetime",
     if win_end.tzinfo is None:
         win_end = win_end.astimezone()
 
-    props = ("SUMMARY", "LOCATION", "DTSTART", "DTEND", "RRULE",
+    props = ("SUMMARY", "LOCATION", "DTSTART", "DTEND", "DURATION", "RRULE",
              "EXDATE", "RECURRENCE-ID", "UID", "STATUS")
     raws: list[dict] = []          # every VEVENT in file order
     cur: dict | None = None
@@ -353,6 +406,9 @@ def _ics_events_from_text(text: str, win_start: "datetime.datetime",
                     cur[name] = ln if name in ("DTSTART", "DTEND", "RRULE",
                                                "RECURRENCE-ID") \
                         else ln.split(":", 1)[1].strip()
+                    # DURATION is stored as its bare value (`PT1H30M`), not a
+                    # full line: it has no property parameters this parser
+                    # needs, and `_ics_duration` reads it on its own.
 
     # masters: VEVENTs without RECURRENCE-ID (overrides are per-instance and
     # never the recurrence itself); drop duplicate-UID re-exports
@@ -386,8 +442,9 @@ def _ics_events_from_text(text: str, win_start: "datetime.datetime",
         ds = _ics_parse_dt(e.get("DTSTART", ""))
         if ds is None:
             continue
-        de = _ics_parse_dt(e.get("DTEND", "")) or ds
-        dur = de - ds
+        de = _ics_parse_dt(e.get("DTEND", ""))
+        dur = (de - ds) if de is not None else \
+            (_ics_duration(e.get("DURATION", "")) or datetime.timedelta(0))
         if dur <= datetime.timedelta(0):
             dur = datetime.timedelta(hours=1)
         rrule = (e.get("RRULE") or "").split(":", 1)[-1]
@@ -422,8 +479,9 @@ def _ics_events_from_text(text: str, win_start: "datetime.datetime",
             ods = _ics_parse_dt(ov.get("DTSTART", ""))
             if ods is None or not (win_start <= ods < win_end):
                 continue
-            ode = _ics_parse_dt(ov.get("DTEND", "")) or ods
-            odur = ode - ods
+            ode = _ics_parse_dt(ov.get("DTEND", ""))
+            odur = (ode - ods) if ode is not None else \
+                (_ics_duration(ov.get("DURATION", "")) or datetime.timedelta(0))
             if odur <= datetime.timedelta(0):
                 odur = datetime.timedelta(hours=1)
             events.append({

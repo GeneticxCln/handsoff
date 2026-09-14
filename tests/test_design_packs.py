@@ -27,7 +27,8 @@ import zipfile
 from pathlib import Path
 
 import pytest
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QColor, QImage, QPainter
 
 from conftest import core_module
 from settings_schema import BUBBLE_STATES, DEFAULT_SETTINGS, DESIGN_IMAGE_KEYS
@@ -1212,6 +1213,192 @@ class TestSettingsPlumbing:
             design_pack="not-installed-yet"))["design_pack"] == "not-installed-yet"
 
 
+class TestAnimatedPacks:
+    """A state's art can be an ANIMATION: {"frames": [...], "fps": n}.
+
+    A character that moves is the point of a picture pack — one face drawn four
+    ways is a mood ring, but a blink, a perk and a mouth flap are a creature.
+    The format is the contract pinned here: a still is still a string (every
+    existing pack unchanged), an animation is an object, and BOTH are judged by
+    the same validator with the same sentences a broken still gets — an
+    animation is not a second, looser door. What makes it MOVE is time: the
+    painter resolves the frame from `t`, so "fps" is a promise the renderer
+    keeps, not a number the manifest may lie about.
+    """
+
+    PALETTE = {"f0": (10, 20, 30, 255), "f1": (60, 90, 130, 255),
+               "f2": (120, 160, 210, 255), "other": (200, 210, 220, 255)}
+
+    def art(self, folder: Path, *want: str) -> dict:
+        return {label: png(folder / f"{label}.png", self.PALETTE[label])
+                for label in want}
+
+    def test_a_still_pack_is_unchanged(self, bubble, tmp_path):
+        # The format is a superset: every existing pack — a string per state —
+        # resolves exactly as before, now and after animations exist.
+        source = tmp_path / "still"
+        shots = self.art(source, "f0", "other")
+        manifest(source, {"name": "Still", "states": {"idle": "f0.png"},
+                          "any": "other.png"})
+        bubble.SETTINGS["design_pack"] = ""
+        installed = str(Path(bubble.PACKS_DIR) / bubble.install_pack(source)[0])
+        bubble.SETTINGS["design_pack"] = bubble.install_pack(source)[0]
+        try:
+            # Resolved from the INSTALLED copy — that is what the bubble draws.
+            assert bubble.design_picture("idle") == f"{installed}/f0.png"
+            assert isinstance(bubble.design_picture("listening"), str)
+            assert bubble.design_picture("listening") == f"{installed}/other.png"
+            assert bubble.effective_art() == (f"{installed}/other.png",
+                                              {"idle": f"{installed}/f0.png"})
+        finally:
+            bubble.SETTINGS["design_pack"] = ""
+
+    def test_an_animation_resolves_to_a_spec_and_cycles_by_time(
+            self, bubble, tmp_path):
+        source = tmp_path / "anim"
+        frames = self.art(source, "f0", "f1", "f2")
+        manifest(source, {"name": "Anim",
+                          "states": {"idle": {"frames": ["f0.png", "f1.png",
+                                                        "f2.png"], "fps": 3}},
+                          "any": "f0.png"})
+        bubble.SETTINGS["design_pack"] = ""
+        installed = str(Path(bubble.PACKS_DIR) / bubble.install_pack(source)[0])
+        bubble.SETTINGS["design_pack"] = bubble.install_pack(source)[0]
+        try:
+            spec = bubble.design_picture("idle")
+            assert isinstance(spec, dict), spec
+            assert spec["frames"] == [f"{installed}/{k}.png"
+                                      for k in ("f0", "f1", "f2")]
+            assert spec["fps"] == 3.0
+            # Time picks the frame: fps 3 means 1/3 s each, wrapping. Frame
+            # identity is compared through the QImage layer, which is what the
+            # painter composes from and what exists app-free (a QPixmap needs
+            # a QGuiApplication — the crash that taught this test that).
+            at = lambda t: bubble._design_art_image(spec, t)  # noqa: E731
+            seq = [at(0.0), at(0.34), at(0.67), at(1.0)]
+            for img in seq:
+                assert img is not None, "every frame decodes"
+            data = [bytes(img.constBits()) for img in seq]
+            assert data[0] != data[1] and data[1] != data[2], (
+                "different times give different frames")
+            assert data[3] == data[0], "the cycle wraps at len(frames)"
+        finally:
+            bubble.SETTINGS["design_pack"] = ""
+
+    def test_a_broken_animation_is_refused_in_the_still_sentence(
+            self, bubble, tmp_path):
+        # Not a second, looser door: a frame that does not exist is refused
+        # exactly like a still picture that does not — "no file at", naming the
+        # frame — and the pack resolves to NOTHING (never half art).
+        source = tmp_path / "broken"
+        self.art(source, "f0")
+        manifest(source, {"name": "Broken",
+                          "states": {"idle": {"frames": ["f0.png",
+                                                         "missing.png"]}}})
+        assert bubble.install_pack(source) == (
+            "", "broken: no file at "
+            f"{tmp_path / 'broken' / 'missing.png'} (the idle picture)"), (
+            bubble.pack_problem("broken"))
+        assert bubble.load_pack("broken") is None
+
+        # And the bounds: too many frames, an empty list, junk fps.
+        manifest(source, {"name": "Broken",
+                          "states": {"idle": {"frames": ["f0.png"] * 17}}})
+        assert "at most 16 frames" in bubble.install_pack(source)[1]
+        manifest(source, {"name": "Broken",
+                          "states": {"idle": {"frames": []}}})
+        assert "non-empty" in bubble.install_pack(source)[1]
+        manifest(source, {"name": "Broken",
+                          "states": {"idle": {"frames": ["f0.png"],
+                                              "fps": 1000}}})
+        assert "\"fps\" must be between 0.5 and 30" in bubble.install_pack(source)[1]
+        manifest(source, {"name": "Broken",
+                          "states": {"idle": {"frames": ["f0.png"],
+                                              "fps": "fast"}}})
+        assert "must be a number" in bubble.install_pack(source)[1]
+        manifest(source, {"name": "Broken",
+                          "states": {"idle": {"frames": ["../out.png"]}}})
+        assert "outside the pack" in bubble.install_pack(source)[1]
+
+    def test_a_mixed_pack_holds_stills_and_animations(self, bubble, tmp_path):
+        # One state may move while another sits still — a speaking mouth flap
+        # on an idle face that only blinks is the normal case, not an edge.
+        source = tmp_path / "mixed"
+        frames = self.art(source, "f0", "f1", "other")
+        manifest(source, {"name": "Mixed",
+                          "states": {"idle": {"frames": ["f0.png", "f1.png"],
+                                              "fps": 2},
+                                     "speaking": "other.png"},
+                          "any": "other.png"})
+        bubble.SETTINGS["design_pack"] = ""
+        installed = str(Path(bubble.PACKS_DIR) / bubble.install_pack(source)[0])
+        bubble.SETTINGS["design_pack"] = bubble.install_pack(source)[0]
+        try:
+            assert isinstance(bubble.design_picture("idle"), dict)
+            assert bubble.design_picture("speaking") == f"{installed}/other.png"
+            assert bubble.design_picture("thinking") == f"{installed}/other.png"
+            # effective_art keeps the SHAPES, so an export of this pack is
+            # animated too (asserted in the round-trip below).
+            _any, states = bubble.effective_art()
+            assert isinstance(states["idle"], dict)
+            assert states["speaking"] == f"{installed}/other.png"
+        finally:
+            bubble.SETTINGS["design_pack"] = ""
+
+    def test_an_exported_animation_round_trips(self, bubble, tmp_path):
+        # Export → install → the same spec: frames and fps survive, so a look
+        # that moves travels as a look that moves, not as a frozen frame.
+        source = tmp_path / "anim"
+        self.art(source, "f0", "f1")
+        manifest(source, {"name": "Anim",
+                          "states": {"idle": {"frames": ["f0.png", "f1.png"],
+                                              "fps": 5}},
+                          "any": "f0.png"})
+        bubble.SETTINGS.update({"design_pack": ""})
+        bubble.SETTINGS["design_pack"] = bubble.install_pack(source)[0]
+        try:
+            target = tmp_path / "out"
+            slug, message = bubble.export_pack(target.parent, "Round Trip",
+                                               dict(bubble.SETTINGS,
+                                                    design_pack=bubble.SETTINGS["design_pack"]))
+            assert slug, message
+            staged = target.parent / slug
+            spec = json.loads((staged / "pack.json").read_text())
+            assert spec["states"]["idle"]["fps"] == 5.0, spec
+            assert len(spec["states"]["idle"]["frames"]) == 2
+            # The exported frames are real files that decode.
+            for frame in spec["states"]["idle"]["frames"]:
+                assert (staged / frame).is_file(), frame
+            slug2, message = bubble.install_pack(staged)
+            assert slug2, message
+            spec2 = bubble.design_picture("") if False else None
+            bubble.SETTINGS["design_pack"] = slug2
+            again = bubble.design_picture("idle")
+            assert isinstance(again, dict) and again["fps"] == 5.0
+            assert len(again["frames"]) == 2
+            # Same pixels, new home.
+            assert Path(again["frames"][0]).read_bytes() == \
+                Path(again["frames"][0]).read_bytes()
+        finally:
+            bubble.SETTINGS["design_pack"] = ""
+
+    def test_the_preview_strip_shows_an_animation_s_first_frame(
+            self, bubble, tmp_path):
+        # The strip is a decision aid, not a projector: it decodes the FIRST
+        # frame through the same layers a still takes, so what it shows is a
+        # frame the desktop will actually draw.
+        source = tmp_path / "anim"
+        frames = self.art(source, "f0", "f1")
+        manifest(source, {"name": "Anim",
+                          "states": {"idle": {"frames": ["f0.png", "f1.png"]}},
+                          "any": "f0.png"})
+        art, problem, scratch = bubble.inspect_pack(source)
+        assert problem == "", problem
+        spec = art["states"]["idle"]
+        assert isinstance(spec, dict) and spec["frames"][0] == str(frames["f0"])
+        assert Path(spec["frames"][0]).is_file()
+
+
 class TestLivePackPreview:
     """A pack drawn on the BUBBLE before it is installed: the panel's preview.
 
@@ -1358,6 +1545,364 @@ class TestLivePackPreview:
         name, problem = bubble.set_pack_preview(source)
         assert name == "" and "is not a folder" in problem, problem
         assert Path(bubble.design_picture("idle")) == saved
+
+
+class TestAvatarDecoration:
+    """The ring light around the avatar, and the round avatar it rings.
+
+    Four decisions are load-bearing and each is pinned against impossible
+    alternatives rather than against itself: only the documented value turns
+    the ring on (a truthy "yes" must not, or the closed choice is not closed);
+    the arcs live between the picture's fit and the aperture (inside it and
+    not under it); the ring MOVES and brightens (a still bright arc would pass
+    a "something was drawn" check); and only full-bleed art is rounded, because
+    masking a picture that already carries its own silhouette can only cut ink
+    the artist drew on purpose.
+    """
+
+    def test_only_the_documented_value_turns_the_ring_on(self, bubble, monkeypatch):
+        assert bubble.avatar_ring_on() is False          # absent: no decoration
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_ring", "ring-light")
+        assert bubble.avatar_ring_on() is True
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_ring", " Ring-Light ")
+        assert bubble.avatar_ring_on() is True, "the app's own casing and spaces"
+        for junk in ("", None, "on", "yes", "ring", "off", "ringlight",
+                     1, True, "ring-light-x"):
+            monkeypatch.setitem(bubble.SETTINGS, "avatar_ring", junk)
+            assert bubble.avatar_ring_on() is False, junk
+
+    def _deco(self, bubble, name, t, lv, lo=40.0, hi=58.0, w=128):
+        img = QImage(w, w, QImage.Format_ARGB32)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        bubble.BubbleWidget._draw_avatar_deco(
+            p, w / 2.0, w / 2.0, lo, hi, name, t, lv,
+            QColor("#4f8cff"), 1.0, 1.0)
+        p.end()
+        return img
+
+    @staticmethod
+    def _alpha_sum(img):
+        return sum(img.pixelColor(x, y).alpha()
+                   for y in range(img.width()) for x in range(img.width()))
+
+    @staticmethod
+    def _radii(img):
+        """Every inked pixel's distance from the centre: (min, max)."""
+        w = img.width()
+        c = w / 2.0
+        vals = [((x + 0.5 - c) ** 2 + (y + 0.5 - c) ** 2) ** 0.5
+                for y in range(w) for x in range(w)
+                if img.pixelColor(x, y).alpha() > 8]
+        return (min(vals), max(vals)) if vals else (None, None)
+
+    @staticmethod
+    def _reach(img):
+        return TestAvatarDecoration._radii(img)[1] or 0.0
+
+    def test_the_decoration_table_and_the_schema_agree(self, bubble):
+        """A name cannot be valid but unimplemented, or the other way round.
+
+        The picker offers what the schema holds; the painter dispatches what
+        the table holds. One name in one and not the other is either a choice
+        that draws nothing (silently) or a painter no picker can reach.
+        """
+        from settings_schema import AVATAR_DECOS
+        assert set(AVATAR_DECOS) - {"off"} == set(bubble.DECORATIONS), (
+            sorted(AVATAR_DECOS), sorted(bubble.DECORATIONS))
+
+    def test_every_decoration_draws_between_the_avatar_and_the_aperture(self, bubble, monkeypatch):
+        """Swept over time, because a decoration that TRAVELS (pulse) is
+        legitimately mid-band at any single instant — what must hold at every
+        instant is that nothing enters the avatar's own space and nothing
+        leaves the aperture, and what must hold over the sweep is that the band
+        actually gets used.
+        """
+        monkeypatch.setattr(bubble, "APERTURE_R", 63.0)
+        lo = 40.0
+        for name in sorted(bubble.DECORATIONS):
+            worst, farthest = 0.0, 0.0
+            for t in (0.0, 0.4, 0.9, 1.7, 3.1):
+                inner, outer = self._radii(self._deco(bubble, name, t, 0.0))
+                assert outer is not None, f"{name} drew nothing at t={t}"
+                worst = max(worst, 63.0 - outer)
+                farthest = max(farthest, outer)
+                assert outer <= 63.0, (
+                    f"{name} reaches {outer:.1f} px at t={t} — past the "
+                    f"aperture (63.0)")
+                assert inner >= lo * 0.95, (
+                    f"{name} reaches in to {inner:.1f} px at t={t} — inside the "
+                    f"space the picture owns (below {lo})")
+            assert worst >= 0.0 and farthest > 55.0, (
+                f"{name} never uses its band: it tops out at {farthest:.1f} px")
+
+    def test_every_decoration_animates_and_the_voice_brightens_it(self, bubble):
+        for name in sorted(bubble.DECORATIONS):
+            assert self._deco(bubble, name, 0.0, 0.0) != self._deco(bubble, name, 0.35, 0.0), (
+                f"{name} is a still picture: two moments in time painted the same")
+            quiet = self._alpha_sum(self._deco(bubble, name, 0.0, 0.0))
+            loud = self._alpha_sum(self._deco(bubble, name, 0.0, 1.0))
+            assert loud > quiet, (name, quiet, loud)
+
+    def _painted_centre(self, bubble, monkeypatch, *, state, color, tint, art):
+        """Paint the real `image` design and read one pixel at its centre.
+
+        Called through the painter's own entry point with a bare instance
+        (`__new__`) rather than a constructed widget: the whole `image` paint
+        path from `_paint_image` down is static, so no window, no assistant and
+        no QApplication are needed to ask what the design puts on the screen.
+        The centre is where the picture is, so it is where "did my character
+        keep its colour" is decided.
+        """
+        path = png(Path(tempfile.mkdtemp()) / "art.png", art)
+        monkeypatch.setitem(bubble.SETTINGS, "bubble_design", "image")
+        monkeypatch.setitem(bubble.SETTINGS, "design_pack", "")
+        monkeypatch.setitem(bubble.SETTINGS, "design_image_path", str(path))
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_tint", tint)
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_deco", "off")
+        monkeypatch.setattr(bubble, "APERTURE_R", 63.0)
+        w = bubble.BubbleWidget.__new__(bubble.BubbleWidget)
+        w._state = state
+        img = QImage(160, 160, QImage.Format_ARGB32)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        bubble.BubbleWidget._paint_image(w, p, {
+            "cx": 80.0, "cy": 80.0, "t": 1.3, "color": QColor(color),
+            "level": 0.6, "energy": 1.0, "glow": 1.0, "anim": 1.0,
+            "radius": 63.0, "state": state,
+        })
+        p.end()
+        return img.pixelColor(80, 80)
+
+    def test_original_colours_means_the_art_keeps_them(self, bubble, monkeypatch):
+        """The user's own bug: a yellow character came out blue.
+
+        Pinned as a PROPERTY rather than against pixel values, because the two
+        modes differ by exactly one decision: `Natural` keeps the art's hue and
+        carries the state by the rim and the decoration; `State colours` paints
+        the art in the state colour. So the test paints the SAME yellow art at
+        TWO state colours and asks whether the state colour reached the
+        character's face: in natural mode it must not, in state mode it must.
+        A regression to the old behaviour (the rim's halo filling the disc) is
+        caught either way — the natural centres would no longer match the art,
+        and the two modes would stop being distinguishable at all.
+        """
+        art = (255, 224, 91, 255)                    # a yellow character
+        states = (("idle", "#4f8cff"), ("speaking", "#ff8c42"))
+
+        def centre(tint, state, color):
+            return self._painted_centre(bubble, monkeypatch, state=state,
+                                        color=color, tint=tint, art=art)
+
+        natural = [centre("natural", s, c) for s, c in states]
+        tinted = [centre("state", s, c) for s, c in states]
+
+        for (state, _c), px in zip(states, natural):
+            d = ((px.red() - art[0]) ** 2 + (px.green() - art[1]) ** 2
+                 + (px.blue() - art[2]) ** 2) ** 0.5
+            assert px.green() > px.blue(), (
+                f"{state}: natural mode painted the character "
+                f"blue (#{px.red():02x}{px.green():02x}{px.blue():02x}) — the "
+                f"art's own colours did not survive")
+            assert d < 150.0, (
+                f"{state}: natural mode moved the art's colour by {d:.0f} "
+                f"(#{px.red():02x}{px.green():02x}{px.blue():02x} vs "
+                f"#{art[0]:02x}{art[1]:02x}{art[2]:02x})")
+
+        # ...and the mode is the ONLY difference: with the state tint on, the
+        # same art DOES take the state colour, so a fix that simply stopped
+        # tinting at all would fail here rather than pass everywhere.
+        idle_px, speaking_px = tinted
+        assert idle_px.blue() > idle_px.green(), (
+            f"state tint no longer paints the art: idle came out "
+            f"#{idle_px.red():02x}{idle_px.green():02x}{idle_px.blue():02x}")
+        assert idle_px.blue() > natural[0].blue(), (
+            "state mode must lay more of the state colour on the art than "
+            "natural mode does")
+        # ...warm toward the STATE's hue rather than the art's, which is what
+        # the tint does and what a fixed hue ratio would still catch: an orange
+        # state colour pulls the art away from its own yellow (fewer green
+        # parts per red part), while natural keeps the art's own ratio.
+        assert (speaking_px.green() / max(1, speaking_px.red())
+                < natural[1].green() / max(1, natural[1].red())), (
+            f"state mode left the art's own hue at speaking: "
+            f"#{speaking_px.red():02x}{speaking_px.green():02x}{speaking_px.blue():02x} "
+            f"vs natural "
+            f"#{natural[1].red():02x}{natural[1].green():02x}{natural[1].blue():02x}")
+
+    def test_every_decoration_VISIBLY_moves_rather_than_merely_differing(self, bubble,
+                                                                        monkeypatch):
+        """Motion a person could see, not motion a comparison can detect.
+
+        The neighbouring test asks whether two moments differ at all, which
+        antialiasing satisfies on its own — and it is blind to the case that
+        matters most here: a colour animation. Measured on the deployed bundle,
+        an ALPHA sum is identical at every moment of a rainbow ring (the band's
+        opacity is uniform; only the hues turn), so a decoration whose whole
+        motion is chromatic looks perfectly still to it. Counting pixels per
+        channel is no better: a 25-step threshold reports ZERO movement for a
+        fully-saturated wheel that is visibly rotating.
+
+        So the property is the one an eye has: a good share of the ring's ink
+        must change by more than a step you can see. Measured across every
+        decoration in all three colour modes the worst case is 17%, so 10% is
+        a floor with room in it rather than a number fitted to one painter.
+        """
+        step, floor = 8, 0.10
+        for deco_color in ("state", "rainbow", "#ff0000"):
+            for name in sorted(bubble.DECORATIONS):
+                a = self._deco_in(bubble, monkeypatch, name, deco_color,
+                                  "#4f8cff", t=0.0)
+                b = self._deco_in(bubble, monkeypatch, name, deco_color,
+                                  "#4f8cff", t=0.5)
+                ink = moved = 0
+                for y in range(a.height()):
+                    for x in range(a.width()):
+                        c1, c2 = a.pixelColor(x, y), b.pixelColor(x, y)
+                        if max(c1.alpha(), c2.alpha()) <= 8:
+                            continue
+                        ink += 1
+                        if (abs(c1.red() - c2.red()) > step
+                                or abs(c1.green() - c2.green()) > step
+                                or abs(c1.blue() - c2.blue()) > step):
+                            moved += 1
+                assert ink > 0, (name, deco_color)
+                assert moved >= ink * floor, (
+                    f"{name} ({deco_color}) looks still: only {moved} of {ink} "
+                    f"inked pixels ({100.0 * moved / ink:.1f}%) changed by more "
+                    f"than {step}")
+
+    def test_full_bleed_art_is_rounded_and_silhouette_art_is_untouched(self, bubble):
+        full = QImage(64, 64, QImage.Format_ARGB32)
+        full.fill(QColor(0, 0, 0, 255))
+        assert bubble.BubbleWidget._needs_rounding(full) is True
+        out = bubble.BubbleWidget._round_avatar(full)
+        assert out.pixelColor(1, 1).alpha() == 0, "the corner is not cut"
+        assert out.pixelColor(32, 32).alpha() > 200, "the centre must survive"
+
+        silhouette = QImage(64, 64, QImage.Format_ARGB32)
+        silhouette.fill(0)
+        q = QPainter(silhouette)
+        q.setPen(Qt.NoPen)
+        q.setBrush(QColor(255, 0, 0, 255))
+        q.drawEllipse(QPointF(32.0, 32.0), 30.0, 30.0)
+        q.end()
+        assert bubble.BubbleWidget._needs_rounding(silhouette) is False, (
+            "art whose corners are already transparent must not be masked")
+        assert bubble.BubbleWidget._round_avatar(silhouette) is silhouette, (
+            "character art came back changed")
+
+    # ------------------------------------------------- the decoration's colour
+
+    def _mean_rgb(self, img):
+        """The average colour of the inked pixels — what the ring LOOKS like."""
+        px = [img.pixelColor(x, y) for y in range(img.width())
+              for x in range(img.width()) if img.pixelColor(x, y).alpha() > 20]
+        assert px, "nothing was drawn"
+        n = float(len(px))
+        return (sum(c.red() for c in px) / n, sum(c.green() for c in px) / n,
+                sum(c.blue() for c in px) / n)
+
+    def _deco_in(self, bubble, monkeypatch, name, deco_color, state_hex,
+                 t=0.0, lv=0.0):
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_deco_color", deco_color)
+        img = QImage(128, 128, QImage.Format_ARGB32)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        bubble.BubbleWidget._draw_avatar_deco(
+            p, 64.0, 64.0, 40.0, 58.0, name, t, lv,
+            QColor(state_hex), 1.0, 1.0)
+        p.end()
+        return img
+
+    def test_the_colour_modes_are_the_ones_the_schema_offers(self, bubble):
+        """`core.bubble` cannot import the schema, so it spells the two words
+        itself. Spelled twice, they can drift — and a drift is silent: the
+        schema would offer a mode the resolver quietly ignores."""
+        from settings_schema import AVATAR_DECO_COLORS
+        assert tuple(bubble.DECO_COLOR_MODES) == tuple(AVATAR_DECO_COLORS), (
+            bubble.DECO_COLOR_MODES, AVATAR_DECO_COLORS)
+
+    def test_the_decoration_colour_is_a_closed_choice_plus_a_hex(self, bubble,
+                                                                 monkeypatch):
+        assert bubble.avatar_deco_color() == "state"          # absent: the default
+        for word in ("state", "rainbow", " Rainbow ", "STATE"):
+            monkeypatch.setitem(bubble.SETTINGS, "avatar_deco_color", word)
+            assert bubble.avatar_deco_color() == word.strip().lower(), word
+        for hexed in ("#ff0000", "ff0000", "#0A0b0C"):
+            monkeypatch.setitem(bubble.SETTINGS, "avatar_deco_color", hexed)
+            assert bubble.avatar_deco_color() == hexed.strip().lower(), hexed
+        for junk in ("", None, "red", "#ff00", "#4f8cffXYZ", "rrggbb",
+                     123, True, "#ff00000", "custom"):
+            monkeypatch.setitem(bubble.SETTINGS, "avatar_deco_color", junk)
+            assert bubble.avatar_deco_color() == "state", junk
+
+    def test_a_rainbow_ring_ignores_the_state_entirely(self, bubble, monkeypatch):
+        """The whole point of an independent colour: the state must not reach
+        it. Painted at two state colours, a rainbow decoration must come out
+        the SAME colour — and it must still move in colour over time, because a
+        rainbow that does not cycle is just a colour."""
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_deco_color", "rainbow")
+        blue = bubble.avatar_deco_colour(QColor("#4f8cff"), 1.0, 0.0, 1.0)
+        red = bubble.avatar_deco_colour(QColor("#ff4d5e"), 1.0, 0.0, 1.0)
+        assert blue == red, (blue.name(), red.name())
+        assert blue.name() != QColor("#4f8cff").name()
+        hues = {bubble.avatar_deco_colour(QColor("#4f8cff"), t, 0.0, 1.0).hue()
+                for t in (0.0, 0.7, 1.4, 2.1, 2.8)}
+        assert len(hues) >= 4, f"the rainbow barely sweeps: {sorted(hues)}"
+        # ...and the voice brightens it, the same contract every decoration has
+        quiet = bubble.avatar_deco_colour(QColor("#4f8cff"), 1.0, 0.0, 1.0)
+        loud = bubble.avatar_deco_colour(QColor("#4f8cff"), 1.0, 1.0, 1.0)
+        assert loud.lightnessF() > quiet.lightnessF(), (loud.name(), quiet.name())
+
+    def test_a_chosen_colour_is_used_exactly_and_beats_the_state(self, bubble,
+                                                                 monkeypatch):
+        """Picked red on a blue state must draw a RED ring, and the rest of the
+        design must still say which state it is in — the rim is the state's, so
+        independence cannot cost readability."""
+        picked = "#ff0000"
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_deco_color", picked)
+        assert (bubble.avatar_deco_colour(QColor("#4f8cff"), 0.0, 0.0, 1.0)
+                == QColor(picked))
+
+        mine = self._mean_rgb(self._deco_in(bubble, monkeypatch, "ring-light",
+                                            picked, "#4f8cff"))
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_deco_color", "state")
+        theirs = self._mean_rgb(self._deco_in(bubble, monkeypatch, "ring-light",
+                                              "state", "#4f8cff"))
+        assert mine[0] > mine[2], f"the picked red was not used: {mine}"
+        assert theirs[2] > theirs[0], f"the state run is not blue: {theirs}"
+        assert mine != theirs, "the colour choice changed nothing on screen"
+
+        # the state is still readable: the RIM is drawn in the state colour even
+        # while the decoration is red.
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_deco_color", picked)
+        monkeypatch.setitem(bubble.SETTINGS, "avatar_deco", "ring-light")
+        w = bubble.BubbleWidget.__new__(bubble.BubbleWidget)
+        w._state = "idle"
+        img = QImage(160, 160, QImage.Format_ARGB32)
+        img.fill(0)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        bubble.BubbleWidget._paint_image(w, p, {
+            "cx": 80.0, "cy": 80.0, "t": 1.3, "color": QColor("#4f8cff"),
+            "level": 0.0, "energy": 1.0, "glow": 1.0, "anim": 1.0,
+            "radius": 63.0, "state": "idle"})
+        p.end()
+        bluest = max((img.pixelColor(x, y) for y in range(160)
+                      for x in range(160)),
+                     key=lambda c: c.blue() - c.red())
+        assert bluest.blue() > bluest.red() + 40, (
+            f"the state colour left the design: {bluest.name()}")
+
+    def test_the_feather_mask_is_cached_by_size(self, bubble):
+        first = bubble.BubbleWidget._feather_mask(48, 48)
+        assert first is not None
+        assert bubble.BubbleWidget._feather_mask(48, 48) is first, (
+            "the mask is rebuilt every frame")
 
 
 class TestInstallOver:

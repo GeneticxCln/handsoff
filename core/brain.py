@@ -105,6 +105,12 @@ def ollama_chat(messages: list[dict], tools: list[dict] | None = None, *,
         detail = _read_http_error(error)
         if error.code == 400 and tools and "tool" in detail.lower():
             logger.warning("model %s does not support tools; continuing without", model)
+            if state is not None:
+                # Record the refusal: the caller reads this back so the next
+                # turn does not pay the same failed round-trip. It was only
+                # ever set to True, so a tool-less model re-probed on every
+                # single turn.
+                state["tools_supported"] = False
             return ollama_chat(messages, None, base=base, model=model,
                                 num_ctx=num_ctx, guard=guard, logger=logger,
                                 state=state, urlopen=urlopen,
@@ -176,6 +182,8 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
         detail = _read_http_error(error)
         if error.code == 400 and tools and "tool" in detail.lower():
             logger.warning("model %s does not support tools; continuing without", model)
+            if state is not None:
+                state["tools_supported"] = False   # see ollama_chat
             fallback = True
             return ollama_chat_stream(
                 messages, q, cancel, None, base=base, model=model,

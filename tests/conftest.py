@@ -2,12 +2,14 @@
 monolithic test_handsoff.py; see test_*.py modules for the areas)."""
 from __future__ import annotations
 
+import atexit
 import contextlib
 import copy
 import importlib.util
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -173,17 +175,31 @@ def _assert_load_stayed_in_the_sandbox(mod, name: str) -> None:
             f"({'; '.join(offenders)}) — the load was not sandboxed")
 
 
+# Every sandbox home this run created. Removed at process exit, not when the
+# load finishes: the module's constants keep pointing at it for the session.
+_SANDBOX_HOMES: list[str] = []
+
+
+@atexit.register
+def _remove_sandbox_homes() -> None:
+    while _SANDBOX_HOMES:
+        shutil.rmtree(_SANDBOX_HOMES.pop(), ignore_errors=True)
+
+
 @contextlib.contextmanager
 def isolated_user_dirs(prefix: str = "handsoff-testhome-"):
     """Point HOME/XDG at a throw-away directory for the duration of a load.
 
     Restored on the way out, so nothing else in the suite (subprocess
-    environments, path helpers like `_user_site`) moves. Not deleted: the
-    loaded module's constants point into it for the rest of the session, and a
-    test that writes through them is writing into the sandbox — which is the
-    point.
+    environments, path helpers like `_user_site`) moves. Not deleted on the
+    way out: the loaded module's constants point into it for the rest of the
+    session, and a test that writes through them is writing into the sandbox —
+    which is the point. Every sandbox is registered and removed when the
+    PYTEST PROCESS exits, so a suite run no longer litters /tmp with one home
+    per module load.
     """
     home = tempfile.mkdtemp(prefix=prefix)
+    _SANDBOX_HOMES.append(home)
     saved = {k: os.environ.get(k) for k in _SANDBOX_VARS}
     os.environ.update({
         "HOME": home,

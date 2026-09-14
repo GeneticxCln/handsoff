@@ -179,6 +179,19 @@ class TestCalendarICS:
             "END:VCALENDAR", "",
         ])
 
+    def test_read_calendar_refuses_a_boolean_window(self, H, monkeypatch,
+                                                    tmp_path):
+        """`int(True)` is 1: a model that answered `days: true` got a silent
+        one-day window. A boolean is not a number here — refused at the
+        schema's argument coercion, and again inside the tool for any caller
+        that reaches it without the schema."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute("read_calendar", {"days": True})
+        assert err and "expected a number" in out, (out, err)
+        # Direct method call: no schema in the way, so the tool's own guard.
+        out = belt.read_calendar(True)
+        assert "must be a number" in out, out
+
     def test_read_calendar_today(self, H, monkeypatch, tmp_path):
         ics = tmp_path / "cal.ics"
         ics.write_text(self._make_ics(H), encoding="utf-8")
@@ -392,6 +405,69 @@ class TestICSOverrides:
         for line in out.splitlines():
             if line.strip().startswith(tmr):
                 assert "10:00" not in line, line
+
+
+class TestICSDurationAndUntil:
+    """Two RFC 5545 fields the parser used to ignore silently."""
+
+    def _event(self, H, body: list[str], days: int = 2):
+        text = "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0",
+                            "BEGIN:VEVENT", "UID:u@test", *body,
+                            "END:VEVENT", "END:VCALENDAR"])
+        win_s = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        return _core_calendar._ics_events_from_text(
+            text, win_s, win_s + H.datetime.timedelta(days=days))
+
+    def test_duration_replaces_the_fabricated_hour(self, H):
+        """A VEVENT may carry DURATION INSTEAD of DTEND. Ignoring it gave every
+        such event a made-up one-hour length, so a three-hour shift was
+        reported as an hour long."""
+        today = H.datetime.date.today().strftime("%Y%m%d")
+        ev = self._event(H, [f"DTSTART:{today}T090000",
+                             "DURATION:PT3H", "SUMMARY:Shift"])
+        assert len(ev) == 1, ev
+        assert ev[0]["dur"] == H.datetime.timedelta(hours=3)
+
+    def test_duration_decides_the_window_overlap(self, H):
+        """The length is what the range query is answered from: an event whose
+        REAL duration ends before the window opened was reported anyway when
+        the duration was guessed at an hour."""
+        # YESTERDAY 02:30 + 30 min: ended long before today's window opened.
+        yesterday = (H.datetime.date.today()
+                     - H.datetime.timedelta(days=1)).strftime("%Y%m%d")
+        ev = self._event(H, [f"DTSTART:{yesterday}T023000",
+                             "DURATION:PT30M", "SUMMARY:Done and dusted"])
+        assert ev == [], f"an event that ended before the window surfaced: {ev}"
+
+    def test_date_only_until_includes_that_whole_day(self, H):
+        """A DATE-valued UNTIL parses to that day's MIDNIGHT, which then
+        excluded same-day instances starting later — the last occurrence of a
+        recurrence silently vanished (RFC 5545: UNTIL is inclusive)."""
+        start = H.datetime.datetime.now().replace(
+            hour=9, minute=0, second=0, microsecond=0)
+        d = lambda dt: dt.strftime("%Y%m%d")
+        # three days of instances, UNTIL is the LAST day as a bare date
+        ev = self._event(H, [
+            f"DTSTART:{start.strftime('%Y%m%d')}T090000",
+            f"RRULE:FREQ=DAILY;UNTIL={d(start + H.datetime.timedelta(days=2))}",
+            "SUMMARY:Standup"], days=4)
+        days_seen = sorted(e["start"].day for e in ev)
+        assert len(ev) == 3, [e["start"] for e in ev]
+        assert days_seen[-1] == (start + H.datetime.timedelta(days=2)).day
+        # the day AFTER the UNTIL date must still be excluded
+        assert (start + H.datetime.timedelta(days=3)).day not in days_seen
+
+    def test_a_plain_timed_until_is_unchanged(self, H):
+        """The fix must not widen a DATE-TIME UNTIL, which was already exact."""
+        start = H.datetime.datetime.now().replace(
+            hour=9, minute=0, second=0, microsecond=0)
+        stop = start + H.datetime.timedelta(days=1)
+        ev = self._event(H, [
+            f"DTSTART:{start.strftime('%Y%m%d')}T090000",
+            "RRULE:FREQ=DAILY;UNTIL=" + stop.strftime("%Y%m%dT%H%M%S"),
+            "SUMMARY:Standup"], days=4)
+        assert len(ev) == 2, [e["start"] for e in ev]
 
 
 class TestICSMonthlyYearly:

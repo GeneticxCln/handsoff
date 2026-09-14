@@ -45,6 +45,24 @@ RETIRED_SETTINGS = ("piper_voice",)
 # pack (a folder with a `pack.json` and one picture per state) when several
 # pictures should switch together as the bubble changes state.
 BUBBLE_DESIGNS = ("orb", "halo", "reactor", "bloom", "droplet", "cube", "equalizer", "crystal", "saturn", "void", "sauron", "pikachu", "cat", "image")
+# Decoration drawn AROUND the avatar picture (the `image` design). A closed
+# set: junk coerces to the default in core/settings, so a typo cannot leave the
+# avatar half-decorated. Each name is an ANIMATION, not a still.
+AVATAR_DECOS = ("off", "ring-light", "orbit", "pulse", "aurora", "rainbow",
+                "sparkle", "comet", "neon", "flames")
+# What the decoration is COLOURED with, independent of the state. A closed set
+# of two WORDS — "state" (the state colour, the default: a decoration that
+# cannot hide which state the bubble is in) and "rainbow" (a hue that sweeps on
+# its own, so the ring is a colour of its own rather than a copy of the mood) —
+# plus a literal "#RRGGBB", which is the third answer and cannot be spelled as
+# a word. `core.settings` accepts the two words or a hex and coerces anything
+# else, so a typo cannot leave the ring half-coloured.
+AVATAR_DECO_COLORS = ("state", "rainbow")
+# How the picture is coloured. "state" washes it in the state colour (the
+# original behaviour: a photo reads as the bubble's mood), "natural" keeps the
+# art's OWN colours — the only setting under which a drawn character can be
+# yellow, since the wash otherwise paints every silhouette the state hue.
+AVATAR_TINTS = ("state", "natural")
 # The four states the bubble paints, in the order the Appearance tab shows
 # them. `colors` is keyed by these names, the preview draws one slot per name,
 # and the `image` design takes one picture per name — so the vocabulary exists
@@ -215,6 +233,23 @@ DEFAULT_SETTINGS: dict = {
                                # set it is the authority and every picture above
                                # is ignored; the reason it cannot draw is
                                # reported by `pack_problem()`.
+    "avatar_ring": "ring-light",  # decoration AROUND the avatar: one of
+                               # AVATAR_DECOS above (off / ring light / orbit /
+                               # pulse / aurora). Each is animated, brightens
+                               # and quickens with the voice, and carries the
+                               # state colour. Applies to the `image` design.
+    "avatar_deco_color": "state",  # what the decoration is coloured with:
+                               # AVATAR_DECO_COLORS above ("state" tracks the
+                               # state colour, "rainbow" sweeps a hue of its
+                               # own) or a literal "#RRGGBB" the user picked.
+                               # INDEPENDENT of the state on purpose: the rim
+                               # still carries the state colour, so a ring of
+                               # the user's choosing cannot hide the mood.
+    "avatar_tint": "state",    # one of AVATAR_TINTS above: "state" washes the
+                               # picture in the state colour, "natural" keeps
+                               # the picture's OWN colours (the state is then
+                               # carried by the rim and the decoration), which
+                               # is what a drawn character needs to stay itself.
     "bubble_accent": 0.5,      # 0..1 accent punch: how hard each shape leans on its
                                # state colour (glow alpha, saturation, comet light)
     "animation_energy": 1.0,   # 0.2..2.0 global animation scale: orbit speed, swirl

@@ -571,6 +571,11 @@ class ReminderStore:
                     self.save(kept)
                 except OSError:
                     self._log.exception("could not prune fired reminders")
+                    # They are STILL ON DISK. Reporting them as taken would
+                    # announce the same reminders again on the next boot — and
+                    # every boot after that, since the prune never lands. Hand
+                    # back nothing and let the next tick fire them normally.
+                    return []
         return fired
 
     def drain_due(self) -> list[dict]:

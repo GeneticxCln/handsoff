@@ -46,6 +46,11 @@ def web(monkeypatch):
     monkeypatch.setattr(mod, "_CACHE", {})
     monkeypatch.setattr(mod, "_HTTP_GET", None)
     monkeypatch.setattr(mod, "_HTTP_IS_FN", True)
+    # The reader's redirect seam too: leaving it set would send every reader
+    # test to the host's REAL fetch (the fixture's own contract is "the seams
+    # themselves", and this is a seam — forgetting it cost 5 minutes a run).
+    monkeypatch.setattr(mod, "_HTTP_HOP", None)
+    monkeypatch.setattr(mod, "_HTTP_HOP_IS_FN", True)
     monkeypatch.setattr(mod, "_SEARXNG_URL", "")
     monkeypatch.setattr(mod, "_LOG", None)
     monkeypatch.setattr(mod.socket, "getaddrinfo", _public_dns)
@@ -288,6 +293,28 @@ class TestDiscipline:
         assert web.search("cuda error")[0][0].title == '"CUDA" error'
         assert len(f.urls) == calls, "the cache must answer the repeat"
 
+    def test_an_expired_answer_is_dropped_not_just_ignored(self, web):
+        """The cache used to RETURN None on expiry but keep the entry: a
+        long-running bubble accumulated one dead slot per distinct query for
+        as long as it lived."""
+        serve(web, Fetch(**{"stackexchange": SE_JSON}))
+        web.search("cuda error", source="stackexchange")
+        web._store("stale-key", ["old"], [])
+        assert "stale-key" in web._CACHE
+        web._CACHE["stale-key"] = (time.time() - 1, ["old"], [])   # expired
+        assert web._cached("stale-key") is None
+        assert "stale-key" not in web._CACHE, "the dead entry was left behind"
+
+    def test_the_cache_is_bounded(self, web):
+        """Unbounded growth from a process that runs for weeks, asking a new
+        question every time."""
+        for i in range(web._CACHE_MAX * 2):
+            web._store(f"q{i}", [i], [])
+        assert len(web._CACHE) <= web._CACHE_MAX
+        # and the NEWEST survive: eviction must not throw away what was just
+        # asked for
+        assert web._cached(f"q{web._CACHE_MAX * 2 - 1}") is not None
+
     def test_one_request_in_flight_per_backend(self, web):
         hold = threading.Event()
         f = serve(web, Fetch(**{"stackexchange": SE_JSON}))
@@ -481,6 +508,60 @@ class TestReader:
         text, _via, problem = web.read_page("https://nowhere.example/x")
         assert text == "" and "cannot be resolved" in problem, problem
 
+    # ---------------------------------------------- the redirect hole (SSRF)
+    # `_public_url` checks ONE address, and a redirect is a NEW one. A
+    # model-supplied URL could pass every rule and then answer
+    # `302 Location: http://169.254.169.254/…` — the cloud metadata endpoint —
+    # or point at the LAN, and the page landed in the transcript as though it
+    # were public. The host's urlopen followed the chain before `core.web` saw
+    # anything, so the reader now takes a seam that does not follow by itself
+    # and walks the hops here.
+
+    def _hop_fetch(self, web, hops):
+        """A hop seam playing a chain: {url: (body_bytes, location)}."""
+        def hop(url, timeout=10.0):
+            body, location = hops.get(url, (b"", ""))
+            return body, location
+        return hop
+
+    def test_a_redirect_to_a_private_address_is_refused(self, web):
+        web.configure(http_get_hop=self._hop_fetch(web, {
+            "https://example.com/start": (b"", "http://169.254.169.254/latest/meta-data/"),
+        }))
+        text, _via, problem = web.read_page("https://example.com/start")
+        assert text == "" and "169.254.169.254" in problem, (text, problem)
+        assert "not fetched" in problem, problem
+        assert "on this machine or a private network" in problem, problem
+
+    def test_a_redirect_chain_is_walked_and_every_hop_rechecked(self, web):
+        """A public hop, then a LAN hop: the second one is refused. A walk that
+        only rechecked the FIRST hop would read the LAN page here."""
+        web.configure(http_get_hop=self._hop_fetch(web, {
+            "https://example.com/a": (b"", "https://cdn.example.net/b"),
+            "https://cdn.example.net/b": (b"", "http://192.168.1.1/router"),
+        }))
+        text, _via, problem = web.read_page("https://example.com/a")
+        assert text == "" and "192.168.1.1" in problem, (text, problem)
+
+    def test_a_relative_location_is_resolved_and_still_public(self, web):
+        """`Location: /b` is what a server actually sends; resolving it is not
+        a hole, and a site that bounces you to itself must still read."""
+        body = b"<html><body><h1>Fixture</h1>" + b"<p>sentence " * 60 + b"</p></body></html>"
+        web.configure(http_get_hop=self._hop_fetch(web, {
+            "https://example.com/a": (b"", "/b"),
+            "https://example.com/b": (body, ""),
+        }))
+        text, via, problem = web.read_page("https://example.com/a")
+        assert not problem and via == web.VIA_LOCAL, (text[:80], problem)
+        assert "sentence" in text
+
+    def test_an_endless_redirect_loop_is_refused_not_followed(self, web):
+        web.configure(http_get_hop=self._hop_fetch(web, {
+            "https://example.com/a": (b"", "https://example.com/a"),
+        }))
+        text, _via, problem = web.read_page("https://example.com/a")
+        assert text == "" and "redirected more than" in problem, (text, problem)
+
     def test_read_results_skips_a_hit_without_an_address(self, web):
         f = serve(web, Fetch(**{"example.com": LOCAL_PAGE}))
         hits = [web.Result("no url", "s", "", "ddg"),
@@ -503,6 +584,29 @@ class TestReader:
         hits = [web.Result("t", "s", "https://example.com/a", "ddg")]
         blocks, notes = web.read_results(hits, 1)
         assert blocks == [] and notes and "could not read" in notes[0]
+
+
+class TestLastProblem:
+    """The reason a quiet backend is quiet, for callers that must REPORT it.
+
+    The news tool used to print "offline?" while DuckDuckGo was in fact
+    refusing with a bot challenge — a wrong diagnosis the user cannot act on.
+    This is the accessor it asks instead of guessing.
+    """
+
+    def test_a_working_backend_has_no_problem_to_report(self, web):
+        web._record(web._SEEN, "ddg", True)
+        assert web.last_problem("ddg") == ""
+
+    def test_the_recorded_sentence_is_what_comes_back(self, web):
+        web._record(web._SEEN, "ddg", False, "DuckDuckGo served a bot challenge")
+        assert web.last_problem("ddg") == "DuckDuckGo served a bot challenge"
+
+    def test_an_untried_or_unknown_backend_reports_nothing(self, web):
+        assert web.last_problem("ddg") == ""          # never asked
+        assert web.last_problem("nonsense") == ""     # not a backend at all
+        web._record(web._SEEN, "hn", False)          # failure with no reason
+        assert web.last_problem("hn") == ""
 
 
 class TestDoctor:
@@ -565,9 +669,55 @@ class TestDoctor:
 class TestHandsoffWiring:
     """The app's side: the tools, the gate, the doctor, the delegations."""
 
+    def test_the_app_injects_the_redirect_checking_fetch(self, H):
+        """The hole this closes was real, and a MISSING seam would reopen it
+        silently — the reader would warn and read in one shot, which is exactly
+        the behaviour that was wrong. So the wiring itself is pinned: the app
+        hands `core.web` a hop fetch, and that fetch refuses to follow.
+        """
+        assert H._web._HTTP_HOP is not None, (
+            "the host did not inject the redirect-checking fetch")
+        assert callable(H._http_get_hop)
+        # One hop = one request: a 3xx is handed back, not chased.
+        assert H._NoRedirect().redirect_request(
+            None, None, 302, "Found", {}, "http://169.254.169.254/") is None, (
+            "the host's hop fetch follows redirects — the reader cannot check "
+            "an address it never sees")
+
+
+    def test_the_news_tool_names_the_recorded_reason(self, H, monkeypatch):
+        """A quiet headline source is REPORTED with its cause, never guessed.
+
+        The tool said "offline?" while DuckDuckGo was refusing with a bot
+        challenge. The sentence now comes from the web layer's own record, so
+        the user is told the thing they can act on.
+        """
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(H, "_world_events", lambda scope, n: ([], True))
+        monkeypatch.setattr(H._web, "_SEEN", {})
+        H._web._record(H._web._SEEN, "ddg", False,
+                       "DuckDuckGo served a bot challenge")
+        out = belt.world_events(3)
+        assert "offline" not in out, out
+        assert "refused" in out and "DuckDuckGo served a bot challenge" in out, out
+
+    def test_the_news_tool_does_not_invent_a_reason(self, H, monkeypatch):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(H, "_world_events", lambda scope, n: ([], True))
+        monkeypatch.setattr(H._web, "_SEEN", {})       # nothing was recorded
+        out = belt.world_events(3)
+        assert "refused" in out and "offline" not in out, out
+        # ...and an empty-but-healthy answer is not a failure at all
+        monkeypatch.setattr(H, "_world_events", lambda scope, n: ([], False))
+        assert belt.world_events(3) == "no world headlines right now"
+
     def test_the_tools_exist_and_are_gated(self, H):
         names = {t["function"]["name"] for t in H.TOOLS}
         assert {"web_search", "read_page"} <= names
+        # ...and the rest of the web surface the model is handed: the shape of
+        # the schema IS the model's ability, so a tool that is not here does
+        # not exist as far as the AI is concerned, however the module is wired.
+        assert {"lookup_fact", "world_events"} <= names, sorted(names)
         props = next(t["function"]["parameters"]["properties"]
                      for t in H.TOOLS if t["function"]["name"] == "web_search")
         assert {"source", "read_top"} <= set(props), (
@@ -593,13 +743,25 @@ class TestHandsoffWiring:
                 return body
             raise AssertionError(url)
         monkeypatch.setattr(H, "_http_get", fake)
+        # The reader goes through the REDIRECT-CHECKING seam, so the app's hop
+        # is patched too — and recording which seam served the read is the
+        # point: a reader that quietly used the plain fetch would follow an
+        # unchecked redirect.
+        hops = []
+        def fake_hop(url, timeout=10.0):
+            hops.append(url)
+            return fake(url, timeout), ""
+        monkeypatch.setattr(H, "_http_get_hop", fake_hop)
         monkeypatch.setattr(H, "_web", H._web)      # the app's own module
+        monkeypatch.setattr(H._web, "_HTTP_HOP", fake_hop)
         H._web.cache_clear()
         belt = H.ToolBelt(on_restart_pending=lambda: None)
         out, err = belt.execute("web_search", {"query": "a cuda error"})
         assert not err and "https://so.example/q/1" in out, out
         out2, err2 = belt.execute("web_search", {"query": "a cuda error", "read_top": 1})
         assert not err2 and "sentence" in out2 and "via local fetch" in out2, out2
+        assert any("so.example" in u for u in hops), (
+            f"the read did not go through the redirect-checking seam: {hops}")
 
     def test_reading_is_off_unless_asked(self, H, monkeypatch):
         seen = []

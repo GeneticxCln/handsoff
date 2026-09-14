@@ -63,7 +63,8 @@ from core import registry as _registry
 
 __all__ = [
     "BACKENDS", "Result", "cache_clear", "configure", "doctor_lines",
-    "read_page", "read_results", "reader_note", "search", "search_note",
+    "last_problem", "read_page", "read_results", "reader_note", "search",
+    "search_note",
 ]
 
 # ----------------------------------------------------------------- limits
@@ -87,6 +88,11 @@ _HTTP_GET = None            # callable(url, timeout) -> bytes, or a resolver
 _HTTP_IS_FN = True          # decided by configure(): see `_takes_a_url`
 _SEARXNG_URL = None         # resolver or plain str ("" disables the local backend)
 _LOG = None
+# The READER's seam: callable(url, timeout) -> (body, Location or ""), one
+# request, redirects NOT followed. See `_read_fetch` for why that is a
+# different question from `_HTTP_GET` above.
+_HTTP_HOP = None
+_HTTP_HOP_IS_FN = True
 
 
 def _warn(msg: str, *args) -> None:
@@ -120,12 +126,22 @@ def _takes_a_url(fn) -> bool:
     return bool(params)
 
 
-def configure(http_get=None, searxng_url=None, logger=None) -> None:
-    """Inject the host's seams. See the module docstring: pass resolvers."""
-    global _HTTP_GET, _HTTP_IS_FN, _SEARXNG_URL, _LOG
+def configure(http_get=None, searxng_url=None, logger=None,
+              http_get_hop=None) -> None:
+    """Inject the host's seams. See the module docstring: pass resolvers.
+
+    `http_get_hop` is the READER's seam: one request that does NOT follow
+    redirects, returning `(body, Location or "")`. It exists because
+    `http_get` follows them inside the host's urlopen, and a redirect is a new
+    address that was never checked — see `_read_fetch`.
+    """
+    global _HTTP_GET, _HTTP_IS_FN, _SEARXNG_URL, _LOG, _HTTP_HOP, _HTTP_HOP_IS_FN
     if http_get is not None:
         _HTTP_GET = http_get
         _HTTP_IS_FN = _takes_a_url(http_get)
+    if http_get_hop is not None:
+        _HTTP_HOP = http_get_hop
+        _HTTP_HOP_IS_FN = _takes_a_url(http_get_hop)
     if searxng_url is not None:
         _SEARXNG_URL = searxng_url
     if logger is not None:
@@ -143,6 +159,66 @@ def _http(url: str, timeout: float = SEARCH_TIMEOUT) -> bytes:
     if target is None:
         raise RuntimeError("no http_get injected")
     return target(url, timeout)
+
+
+MAX_REDIRECTS = 5           # a chain longer than this is refused, not followed
+
+
+def _hop(url: str, timeout: float) -> tuple:
+    """ONE request, redirects NOT followed: (body, Location or "")."""
+    target = _HTTP_HOP
+    if target is None:
+        return None, ""
+    if not _HTTP_HOP_IS_FN:
+        target = _resolve(target)
+    if target is None:
+        return None, ""
+    body, location = target(url, timeout)
+    return body, str(location or "")
+
+
+def _read_fetch(url: str, timeout: float) -> tuple:
+    """(body, final_url, problem): the reader's fetch, redirects walked HERE.
+
+    `_public_url` checks the address ONCE, and a redirect is a NEW address that
+    was never checked — which is the whole hole: a model-supplied URL can pass
+    every rule and then answer `302 Location: http://169.254.169.254/…`, or point
+    at a LAN address, and the page lands in the transcript as though it were
+    public. `_http` cannot help, because the host's urlopen follows the chain
+    before this module sees anything.
+
+    So the chain is walked one hop at a time and every hop goes back through
+    `_public_url`: URL policy lives here, and a redirect is just another
+    untrusted address. Relative Locations are resolved against the URL that
+    sent them, which is what a browser does and what a server means.
+
+    A host without the hop seam (a partial install, or a test that patched only
+    the plain fetch) gets the one-shot fetch and a warning, because the honest
+    alternative — reading nothing — would take the feature away from every
+    caller rather than one.
+    """
+    if _HTTP_HOP is None:
+        _warn("no redirect-checking fetch injected: reading %s in one shot", url)
+        return _http(url, timeout), url, ""
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        body, location = _hop(current, timeout)
+        if body is None:                     # seam disappeared mid-walk
+            return _http(current, timeout), current, ""
+        if not location:
+            return body, current, ""
+        try:
+            target = urllib.parse.urljoin(current, location)
+        except ValueError:
+            return b"", current, (f"{current} redirected to {location!r}, which "
+                                  f"is not a usable address")
+        clean, problem = _public_url(target)
+        if problem:
+            return b"", current, (f"{current} redirected to {target}, which is "
+                                  f"not fetched: {problem}")
+        current = clean
+    return b"", current, (f"{url} redirected more than {MAX_REDIRECTS} times — "
+                          f"refused rather than followed")
 
 
 def _searxng_url() -> str:
@@ -403,6 +479,18 @@ def _record(store: dict, name: str, ok: bool, why: str = "") -> None:
         store[name] = {"ok": bool(ok), "why": why, "at": time.time()}
 
 
+def failure_reasons() -> list:
+    """The recorded reasons the search backends last failed, named.
+
+    Consumers surface these verbatim: "offline?" was a GUESS, and the thing a
+    user can act on is what actually happened ("a bot challenge"). Empty when
+    nothing was recorded — a caller must then say so, not invent a cause.
+    """
+    with _RECORD_LOCK:
+        return [f"{name}: {rec['why']}" for name, rec in _SEEN.items()
+                if isinstance(rec, dict) and not rec.get("ok") and rec.get("why")]
+
+
 # One in-flight request per backend, admitted by the shared registry helper —
 # the project's rule is that no capacity is enforced by hand anywhere. A
 # refusal here is a NAMED skip ("busy"), never a silent drop.
@@ -445,6 +533,11 @@ def _reason(exc: Exception) -> str:
 # ------------------------------------------------------------------- caching
 _CACHE: dict = {}
 _CACHE_LOCK = threading.Lock()
+# A long-running bubble sees a distinct query string per web_search call, so an
+# uncapped cache grows without bound. 256 entries covers every realistic burst
+# of repeat lookups; past that the OLDEST is dropped (a plain dict keeps
+# insertion order, which is the eviction order).
+_CACHE_MAX = 256
 
 
 def cache_clear() -> None:
@@ -452,18 +545,33 @@ def cache_clear() -> None:
         _CACHE.clear()
 
 
+def _purge_locked(now: float) -> None:
+    """Drop expired entries, then the oldest while over the cap. Locked."""
+    for key in [k for k, (expires, _, _) in _CACHE.items() if expires <= now]:
+        del _CACHE[key]
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)))
+
+
 def _cached(key: str):
+    now = time.time()
     with _CACHE_LOCK:
         hit = _CACHE.get(key)
-    if hit is None:
-        return None
-    expires, results, notes = hit
-    return (results, notes) if expires > time.time() else None
+        if hit is None:
+            return None
+        expires, results, notes = hit
+        if expires <= now:
+            # DELETE on expiry, rather than leaving a dead entry behind: the
+            # old shape returned None but kept the slot forever.
+            del _CACHE[key]
+            return None
+        return results, notes
 
 
 def _store(key: str, results: list, notes: list) -> None:
     with _CACHE_LOCK:
         _CACHE[key] = (time.time() + CACHE_TTL, results, notes)
+        _purge_locked(time.time())
 
 
 # -------------------------------------------------------------------- search
@@ -684,7 +792,12 @@ def read_page(url: str, max_chars: int = READ_MAX_CHARS) -> tuple:
     cached = ""
     local_why = "nothing usable"
     try:
-        raw = _http(clean, timeout=READ_TIMEOUT)
+        # The redirect-checking fetch, not `_http`: the address was validated,
+        # and so must every hop the server sends us to (see `_read_fetch`).
+        raw, _final, hop_problem = _read_fetch(clean, READ_TIMEOUT)
+        if hop_problem:
+            _record(_READER_SEEN, "local", False, hop_problem)
+            return "", "", hop_problem
         local = html_to_text(raw.decode("utf-8", "replace"))
         # A page is "useless locally" when the site blocked us, or when there is
         # a LOT of HTML and almost no text — that is a JavaScript shell. A page
@@ -711,7 +824,13 @@ def read_page(url: str, max_chars: int = READ_MAX_CHARS) -> tuple:
     # failure sentence names BOTH attempts, because "nothing readable" on its
     # own would hide which half of the pipeline gave up.
     try:
-        body = _http(JINA_READER + clean, timeout=READ_TIMEOUT).decode("utf-8", "replace")
+        # Same walk for the fallback: the reader's own hops are addresses too,
+        # and a hosted reader is not a licence to follow one into the LAN.
+        raw, _final, hop_problem = _read_fetch(JINA_READER + clean, READ_TIMEOUT)
+        if hop_problem:
+            _record(_READER_SEEN, "jina", False, hop_problem)
+            return "", "", (f"{hop_problem}; local fetch: {local_why}")
+        body = raw.decode("utf-8", "replace")
     except Exception as exc:
         _record(_READER_SEEN, "jina", False, _reason(exc))
         return "", "", (f"nothing readable at {clean} — local fetch: {local_why}; "
@@ -831,6 +950,21 @@ def reader_note(now: float = None) -> str:
     else:
         out.append(f"Jina fallback refused ({jina['why']}, {_ago(jina['at'], now)})")
     return ", ".join(out)
+
+
+def last_problem(name: str) -> str:
+    """Why `name` last produced nothing, or "" when its last answer worked.
+
+    The record `doctor_lines` reads is the only place that knows WHY a backend
+    is quiet, so a caller that has to report a failure asks here instead of
+    guessing at a cause two layers down. "Offline?" was such a guess: the news
+    tool printed it while DuckDuckGo was in fact refusing with a bot challenge
+    — a wrong diagnosis the user cannot act on.
+    """
+    entry = _SEEN.get(str(name))
+    if not entry or entry.get("ok"):
+        return ""
+    return str(entry.get("why") or "")
 
 
 def doctor_lines() -> list:

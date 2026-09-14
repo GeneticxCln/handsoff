@@ -114,6 +114,19 @@ class TestAudio:
         snap = HW.snapshot(_ctx(tmp_path, mic_device="yeti"),
                            _ok_probers(query_devices=lambda: devs), {})
         assert snap["audio"]["default"] == "Yeti Stereo Microphone"
+        assert "note" not in snap["audio"]
+
+    def test_a_mic_name_matching_nothing_is_reported(self, HW, tmp_path):
+        """The fallback to the first input is right (a renamed mic must not
+        deafen the bubble), but it was SILENT: a misconfigured `mic_device`
+        read as healthy with no hint the configured name matched nothing."""
+        devs = [{"name": "Built-in Microphone", "max_input_channels": 1}]
+        snap = HW.snapshot(_ctx(tmp_path, mic_device="blue yeti x"),
+                           _ok_probers(query_devices=lambda: devs), {})
+        audio = snap["audio"]
+        assert audio["default"] == "Built-in Microphone"   # still falls back
+        assert "blue yeti x" in audio["note"], audio
+        assert audio["ok"] is True                          # healthy, not down
 
     def test_empty_device_list(self, HW, tmp_path):
         snap = HW.snapshot(_ctx(tmp_path),
@@ -169,6 +182,18 @@ class TestSttTtsMounts:
         assert snap["stt_tts"]["tts_cached"] is True
         assert snap["stt_tts"]["ok"] is True
 
+    def test_ok_means_both_directions_not_just_the_voice(self, HW, tmp_path):
+        """`ok` mirrored `tts_cached` alone, so a bubble with working speech and
+        NO whisper model reported `ok: True` — a deaf assistant described as
+        healthy. The prompt context reads both flags; the summary now does too."""
+        no_whisper = tmp_path / "no-whisper"     # never created
+        snap = HW.snapshot(
+            _ctx(tmp_path, whisper_model_dir=str(no_whisper)), _ok_probers(), {})
+        stt = snap["stt_tts"]
+        assert stt["tts_cached"] is True and stt["whisper_cached"] is False
+        assert stt["ok"] is False, "a missing whisper model must not read ok"
+        assert "whisper" in stt["note"], stt["note"]
+
     def test_missing_socket(self, HW, tmp_path):
         snap = HW.snapshot(_ctx(tmp_path), _ok_probers(), {})
         assert snap["mounts"]["sock_present"] is False
@@ -199,6 +224,40 @@ class TestTTL:
         calls.clear()
         HW.snapshot(_ctx(tmp_path), probers, cache)
         assert [c for c in calls if c in self.SLOW] == []
+
+    def test_a_failure_is_not_cached_for_the_full_ttl(self, HW, tmp_path):
+        """A failing probe was stamped as freshly probed, so ONE transient blip
+        on a long-TTL section (ollama: 60 s) kept the bubble reporting "down"
+        for a full minute after the daemon was back."""
+        ollama_ttl = HW.TTL["ollama"]
+        assert ollama_ttl > HW.FAILURE_TTL, "this test needs a long-TTL section"
+        calls: list = []
+
+        def flaky(base):
+            calls.append(1)
+            raise RuntimeError("connection refused")
+
+        cache: dict = {}
+        probers = _ok_probers(ollama_tags=flaky)
+        HW.snapshot(_ctx(tmp_path), probers, cache)
+        assert calls, "the failing prober never ran"
+        # The stamp is backdated so the entry expires after FAILURE_TTL, not
+        # after the section's TTL: still "fresh" (so the failure is reported
+        # rather than re-probed on every tick), but for 5 s instead of 60.
+        stale = cache["at"]["ollama"]
+        assert HW.time.monotonic() - stale < ollama_ttl
+        assert HW.time.monotonic() - stale >= ollama_ttl - HW.FAILURE_TTL - 1
+        # ...and the failure was reported THROUGH the cache this time
+        snap = HW.snapshot(_ctx(tmp_path), probers, cache)
+        assert snap["ollama"]["ok"] is False
+        # The backdated stamp expires FAILURE_TTL after the probe, i.e. once
+        # `now - stamp` reaches the section TTL. Rewind to exactly that point
+        # and the recovered daemon is seen — under the old stamp, which started
+        # at `now`, this moment would still be 55 s away.
+        cache["at"]["ollama"] = HW.time.monotonic() - ollama_ttl
+        healthy = _ok_probers()
+        snap = HW.snapshot(_ctx(tmp_path), healthy, cache)
+        assert snap["ollama"]["ok"] is True, "recovery was still hidden"
 
     def test_force_reprobes(self, HW, tmp_path):
         calls: list = []

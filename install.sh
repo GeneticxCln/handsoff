@@ -65,7 +65,7 @@ TOP_EXECUTABLE="handsoff.py handsoff-settings.py handsoff-restart"
 # but never installed, and because the deployment manifest enumerated files the
 # same way, doctor reported in-sync while the feature was simply absent (the
 # settings GUI quietly fell back to "no wallpaper matching").
-CORE_REQUIRED="__init__ registry settings audio brain tools doctor lifecycle calendar assistant bubble web"
+CORE_REQUIRED="__init__ registry settings audio brain tools doctor lifecycle calendar assistant bubble web theme"
 is_exec() {   # 0 when the basename is an entry point (installed 0755)
     case " $TOP_EXECUTABLE " in
         *" $1 "*) return 0 ;;
@@ -478,8 +478,15 @@ if [ -f "$BIN_DIR/handsoff.py" ]; then
         base="$(basename "$f")"
         [ -f "$BIN_DIR/$base" ] && cp -p "$BIN_DIR/$base" "$PREV_DIR.staging/$base"
     done
-    for f in "$BIN_DIR"/core/*.py; do
-        [ -f "$f" ] && cp -p "$f" "$PREV_DIR.staging/core/"
+    # Driven by the STAGED set, not by a sweep of $BIN_DIR/core: the same
+    # reason the switch above is built from the stage. A glob over the
+    # destination swept every .py a user happens to keep in ~/.local/bin/core
+    # into prev, and `--rollback` then restored those foreign files over the
+    # release. Only what this installer ships is a rollback target.
+    for f in "$STAGE_DIR"/core/*.py; do
+        base="$(basename "$f")"
+        [ -f "$BIN_DIR/core/$base" ] \
+            && cp -p "$BIN_DIR/core/$base" "$PREV_DIR.staging/core/$base"
     done
     mv "$PREV_DIR.staging" "$PREV_DIR"
     HAD_PREV=1

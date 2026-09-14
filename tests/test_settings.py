@@ -228,6 +228,91 @@ class TestSettingsCoercion:
             monkeypatch.setattr(H, "SETTINGS_FILE", f)
             assert H._load_settings()["bubble_design"] == "orb"
 
+    def test_avatar_ring_is_a_closed_choice(self, H, tmp_path, monkeypatch):
+        """Every decoration in the schema, and junk falls back — a typo must
+        not half-decorate, and a name the picker offers must survive the load."""
+        from settings_schema import AVATAR_DECOS
+        assert len(AVATAR_DECOS) >= 4 and "off" in AVATAR_DECOS, AVATAR_DECOS
+        for name in AVATAR_DECOS:
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"avatar_ring": name}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["avatar_ring"] == name
+        for bad in ("Ring Light", "ringlight", "comets", "yes", 1, True, "", None):
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"avatar_ring": bad}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["avatar_ring"] == "ring-light", bad
+
+    def test_every_decoration_can_be_named_in_the_report(self, H):
+        """A slug in the doctor line reads as a bug in the reader.
+
+        The picker offers `AVATAR_DECOS` and the painter draws them; the report
+        turns the stored slug into words. The three tables are written in three
+        files, so a decoration added to one of them is how the line ends up
+        saying `pulse-2` — selectable, drawable and unnameable. `off` is
+        exempt because it is never ON, so it never reaches the sentence.
+        """
+        from settings_schema import AVATAR_DECOS
+        missing = [d for d in AVATAR_DECOS
+                   if d != "off" and d not in H.DECORATION_LABELS]
+        assert not missing, f"decorations the report cannot name: {missing}"
+        labels = list(H.DECORATION_LABELS.values())
+        assert all(x.strip() for x in labels), labels
+        assert len(set(labels)) == len(labels), (
+            f"two decorations read the same in the report: {labels}")
+
+    def test_avatar_deco_colour_is_two_words_or_a_literal_hex(self, H, tmp_path,
+                                                             monkeypatch):
+        """One key, three shapes — and the third is a COLOUR, not a word.
+
+        A hand-edited settings.json is the only way junk can arrive here, and
+        it must not reach the painter: the bubble resolves the value with the
+        tree's one hex parser, so the settings loader has to admit exactly the
+        same strings or the two disagree about which colours exist. `custom`
+        is not one of them on purpose — it is the panel's name for "the value
+        is a hex", and storing it would leave the bubble reading a word it
+        does not know and quietly falling back to the state colour.
+        """
+        from settings_schema import AVATAR_DECO_COLORS
+        assert AVATAR_DECO_COLORS == ("state", "rainbow"), AVATAR_DECO_COLORS
+        for good, want in (("state", "state"), ("rainbow", "rainbow"),
+                           (" Rainbow ", "rainbow"), ("#4f8cff", "#4f8cff"),
+                           ("4f8cff", "4f8cff"), ("#0A0B0C", "#0a0b0c")):
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"avatar_deco_color": good}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["avatar_deco_color"] == want, good
+        for bad in ("custom", "red", "#ff00", "#4f8cffXYZ", "rrggbb", "", None,
+                    1, True, "own"):
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"avatar_deco_color": bad}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["avatar_deco_color"] == "state", bad
+
+    def test_avatar_tint_is_a_closed_choice(self, H, tmp_path, monkeypatch):
+        """The colour rule is two values: the state wash, or the art's own."""
+        from settings_schema import AVATAR_TINTS
+        assert AVATAR_TINTS == ("state", "natural"), AVATAR_TINTS
+        for name in AVATAR_TINTS:
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"avatar_tint": name}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["avatar_tint"] == name
+        # ...and the app's own spelling is accepted whatever the case, the same
+        # leniency `bubble_design` has: the value is a name, not a token.
+        for spelling in ("Natural", "NATURAL", " natural "):
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"avatar_tint": spelling}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["avatar_tint"] == "natural", spelling
+        for bad in ("original", "original colours", "yes", 1, True, "", None,
+                    "natural-colours"):
+            f = tmp_path / "settings.json"
+            f.write_text(json.dumps({"avatar_tint": bad}))
+            monkeypatch.setattr(H, "SETTINGS_FILE", f)
+            assert H._load_settings()["avatar_tint"] == "state", bad
+
     # ---------------------------------------------------- version + migration
 
     def test_settings_version_stamped_and_not_a_setting(self, H, tmp_path, monkeypatch):
@@ -482,6 +567,30 @@ class TestSettingsSplit:
         assert "bubble_design" not in merged
         json.dumps(merged)   # must stay JSON-serializable
 
+    def test_three_way_merge_dual_delete_does_not_leak_the_sentinel(self, H):
+        """The OTHER half of the sentinel trap: both sides deleted the key.
+
+        `candidate == current` is true when both are the _MISSING sentinel, so
+        the merge took the "take the candidate" branch and `deepcopy(_MISSING)`
+        minted a NEW object that is no longer `is _MISSING` — the key came back
+        in the written file as a non-serializable sentinel and `save()` raised
+        TypeError. The earlier fix covered only the first branch.
+        """
+        m = H._core_settings._three_way_merge
+        sentinel = H._core_settings._MISSING
+        # Both sides deleted `dry_run`; `bubble_size` differs at the top level,
+        # which is what forces the merge to RECURSE per key — the only way the
+        # dual-delete key is ever compared. (When nothing differs at the top the
+        # whole candidate is returned and the trap is never reached.)
+        expected = {"model": "m", "dry_run": False, "bubble_size": 128}
+        current = {"model": "m", "bubble_size": 97}    # disk: dry_run gone
+        candidate = {"model": "m", "bubble_size": 128}  # GUI: dry_run gone too
+        merged, conflict = m(expected, current, candidate, "")
+        assert conflict is None
+        assert "dry_run" not in merged, merged
+        assert all(v is not sentinel for v in merged.values())
+        json.dumps(merged)                # must stay JSON-serializable
+
     def test_three_way_merge_unchanged_candidate_preserves_disk_extras(self, H):
         """When the GUI changed nothing (candidate == expected), the merge
         returns the disk dict verbatim: foreign runtime keys such as
@@ -506,6 +615,37 @@ class TestSettingsSplit:
         # the live dict is the SAME object the object wraps
         obj["handsfree"] = True
         assert obj.as_dict()["handsfree"] is True
+
+    def test_coercion_survives_an_infinite_number(self, H):
+        """Python's json parses a bare `Infinity` token, and `int(float('inf'))`
+        raises OverflowError — which `_num` did not catch, so ONE crafted (or
+        truncated) value in settings.json killed startup inside
+        `_load_settings` instead of falling back to the default."""
+        assert H.json.loads("Infinity") == float("inf")   # the token parses
+        s = {**H.DEFAULT_SETTINGS, "bubble_size": float("inf"),
+             "num_ctx": float("nan")}
+        out = H._core_settings.coerce_settings(s)
+        assert out["bubble_size"] == H.DEFAULT_SETTINGS["bubble_size"]
+        assert out["num_ctx"] == H.DEFAULT_SETTINGS["num_ctx"]
+
+    def test_a_runtime_write_is_coerced_before_it_reaches_the_disk(
+            self, H, tmp_path, monkeypatch):
+        """`set_setting` is the path a TOOL takes, and it stored the model's
+        raw argument verbatim. A string in a numeric field then persisted, and
+        every later reader that did `int(...)` on it blew up at runtime — or
+        silently used the default until the next start."""
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"model": "m", "version": 2}), encoding="utf-8")
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        H._SETTINGS_OBJ.settings_file = f
+        H._SETTINGS_OBJ.config_dir = tmp_path
+        assert H._SETTINGS_OBJ.persist("followup_seconds", "nonsense") is True
+        on_disk = json.loads(f.read_text(encoding="utf-8"))
+        assert on_disk["followup_seconds"] == H.DEFAULT_SETTINGS["followup_seconds"]
+        assert isinstance(on_disk["followup_seconds"], float)
+        # ...and the unrelated keys are exactly as the file had them
+        assert on_disk["model"] == "m"
 
     def test_persist_failure_does_not_leave_memory_disagreeing_with_disk(
             self, H, tmp_path, monkeypatch):
@@ -1186,6 +1326,30 @@ class TestAppearanceLooks:
                    H._core_doctor._lines(deps))
         assert not any(line.startswith("appearance:") for line in
                        H._core_doctor._lines(H._core_doctor.DoctorDeps()))
+
+    def test_the_appearance_note_names_the_decoration_and_its_colour(self, H):
+        """The ring is INDEPENDENT of the state now, so the report has to say
+        which colour it wears: \"why is the ring purple in every state\" is
+        answered by that word and by nothing else in the report. It stays silent
+        when the colour IS the state's, because a line that says `(state)` on
+        every default setup is noise in the one place a user looks — and a
+        hand-edited junk value must not reach the report either, since the
+        resolver falls back to the state colour and the line has to agree.
+        """
+        H.SETTINGS.clear()
+        H.SETTINGS.update({"avatar_ring": "off", "avatar_deco_color": "state"})
+        assert "ring light" not in H._appearance_note()
+        H.SETTINGS["avatar_ring"] = "rainbow"
+        note = H._appearance_note()
+        assert H.DECORATION_LABELS["rainbow"] in note, note
+        assert "(state)" not in note, note
+        H.SETTINGS["avatar_deco_color"] = "rainbow"
+        assert "(rainbow)" in H._appearance_note(), H._appearance_note()
+        H.SETTINGS["avatar_deco_color"] = "#FF0000"
+        assert "(#ff0000)" in H._appearance_note(), H._appearance_note()
+        H.SETTINGS["avatar_deco_color"] = "chartreuse"
+        note = H._appearance_note()
+        assert "(#ff0000)" not in note and "(chartreuse)" not in note, note
 
     def test_the_look_doctor_reports_says_when_a_preview_is_on_screen(
             self, H, tmp_path):

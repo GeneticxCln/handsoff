@@ -425,6 +425,8 @@ except ImportError:
                 detail = cls._read_http_error(error)
                 if error.code == 400 and tools and "tool" in detail.lower():
                     logger.warning("model %s does not support tools; continuing without", model)
+                    if state is not None:
+                        state["tools_supported"] = False
                     return cls.ollama_chat(messages, None, base=base, model=model,
                                            num_ctx=num_ctx, guard=guard, logger=logger,
                                            state=state, urlopen=urlopen,
@@ -482,6 +484,8 @@ except ImportError:
                 detail = cls._read_http_error(error)
                 if error.code == 400 and tools and "tool" in detail.lower():
                     logger.warning("model %s does not support tools; continuing without", model)
+                    if state is not None:
+                        state["tools_supported"] = False
                     fallback = True
                     return cls.ollama_chat_stream(messages, q, cancel, None,
                         base=base, model=model, num_ctx=num_ctx, guard=guard,
@@ -642,6 +646,22 @@ def _appearance_note() -> str:
         # picture, so "which pictures are on screen" has to be answerable here
         # without opening the settings app.
         note = f"{note} — pack {pack}"
+    deco = _core_bubble.avatar_deco()
+    if deco != "off":
+        # Named rather than implied, like the pack: the decoration is drawn
+        # around the avatar but belongs to no picture file, so this is the only
+        # place a user can ask "what is that light" and get an answer.
+        note = f"{note} — {DECORATION_LABELS.get(deco, deco)} on"
+        _dc = _core_bubble.avatar_deco_color()
+        if _dc != "state":
+            # ...and the colour it wears, for the same reason: the ring is now
+            # independent of the state, so "why is it purple in every state"
+            # has an answer in the report rather than only in the panel.
+            note = f"{note} ({_dc})"
+    if _core_bubble.avatar_natural():
+        # ...and the picture's own colours, because "why is my character not
+        # yellow" is answered by this word and by nothing else in the report.
+        note = f"{note} — original colours"
     try:
         # Pack first, then the per-state pictures, then the single file —
         # `art_problem` owns that precedence, so doctor cannot describe a
@@ -1174,6 +1194,19 @@ def _persist_setting(key: str, value) -> bool:
     return True
 
 
+def _followup_seconds() -> float:
+    """The follow-up window, read defensively.
+
+    `_speak` reads this on the speech thread right after a reply; a bare
+    `float()` on a junk value raised there and killed the thread AFTER the
+    sentence had already been spoken. An unreadable window means "closed".
+    """
+    try:
+        return max(0.0, float(SETTINGS.get("followup_seconds", 0.0) or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
 def set_setting(key: str, value) -> bool:
     """Single entry point for every SETTINGS mutation.
 
@@ -1222,7 +1255,12 @@ def _fixed_prompt_tokens() -> int:
 def _history_budget() -> int:
     """History token budget: explicit setting wins; otherwise num_ctx minus
     the fixed prompt cost minus a 1024-token reply reserve (floor 1024)."""
-    explicit = int(SETTINGS.get("history_tokens") or 0)
+    try:
+        explicit = int(SETTINGS.get("history_tokens") or 0)
+    except (TypeError, ValueError, OverflowError):
+        # A hand-edited (or pre-coercion) value must not break every turn's
+        # history trim with a ValueError. Fall through to the computed budget.
+        explicit = 0
     if explicit:
         return explicit
     return max(1024, OLLAMA_NUM_CTX - _fixed_prompt_tokens() - 1024)
@@ -1253,7 +1291,9 @@ def reload_derived_settings() -> None:
     except (TypeError, ValueError):
         new_ctx = OLLAMA_NUM_CTX
     if new_model != OLLAMA_MODEL:
+        # A different model gets its own chance at tools.
         _TOOLS_SUPPORTED = True
+        _BRAIN_STATE["tools_supported"] = True
         _FIXED_PROMPT_TOKENS = 0
     if new_ctx != OLLAMA_NUM_CTX:
         _FIXED_PROMPT_TOKENS = 0
@@ -1492,6 +1532,21 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
                 _MissingBubble._missing()
 
     _core_bubble = _MissingBubble()
+
+# Readable names for the decorations in the `doctor` line: the setting stores a
+# slug (`ring-light`), and a report that says `ring-light` beside `orbit` reads
+# as a bug in the reader rather than as the choice the user made.
+DECORATION_LABELS = {
+    "ring-light": "ring light",
+    "orbit": "orbiting comets",
+    "pulse": "pulse rings",
+    "aurora": "aurora ribbons",
+    "rainbow": "rainbow ring",
+    "sparkle": "sparkles",
+    "comet": "the comet",
+    "neon": "neon tubes",
+    "flames": "flames",
+}
 
 _core_bubble.SETTINGS = SETTINGS
 _core_bubble.APP_NAME = APP_NAME
@@ -2122,11 +2177,18 @@ SELF-MODIFICATION
 
 _TOOLS_SUPPORTED = True
 
+# ONE persistent dict, not a fresh one per call. `core.brain` records a
+# model's tool refusal in here, so a model that answers 400 to a tools payload
+# is probed once per process instead of once per turn. A fresh dict made that
+# write land in garbage nobody collected — and `_TOOLS_SUPPORTED` stayed True
+# forever, which is what the audit called dead telemetry.
+_BRAIN_STATE: dict = {"tools_supported": True}
+
 
 def _brain_deps() -> dict:
     return dict(base=OLLAMA_BASE, model=OLLAMA_MODEL, num_ctx=OLLAMA_NUM_CTX,
                 guard=_guard_ollama_endpoint, logger=log,
-                state={"tools_supported": _TOOLS_SUPPORTED},
+                state=_BRAIN_STATE,
                 urlopen=urllib.request.urlopen)
 
 
@@ -2165,6 +2227,41 @@ def _http_get(url: str, timeout: float = 10.0) -> bytes:
         return r.read(2_000_000)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow: `core.web` re-checks every hop against its own rules.
+
+    Returning None makes urlopen raise the 3xx as an HTTPError instead of
+    chasing it, which is what lets the reader see the Location and decide. The
+    decision is NOT this class's: `core.web` owns the URL policy (public
+    http(s) only, no LAN, no metadata endpoints), and it can only apply it if
+    the chain is handed to it one hop at a time.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+def _http_get_hop(url: str, timeout: float = 10.0) -> tuple:
+    """ONE request, WITHOUT following redirects: `(body, Location or "")`.
+
+    `core.web.read_page` walks the chain itself so that the address it
+    validated is the address it fetches from. A redirect target is a new
+    address, and a model-supplied URL that passes every rule can still answer
+    `302 Location: http://169.254.169.254/…`.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": _HTTP_UA})
+    try:
+        with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as r:
+            return r.read(2_000_000), ""
+    except urllib.error.HTTPError as exc:
+        if exc.code in (301, 302, 303, 307, 308):
+            return b"", str(exc.headers.get("Location") or "")
+        raise
+
+
 # `core.web` owns the search router and the page reader. It is application-free
 # and takes RESOLVERS rather than values, which is not decoration: `_http_get` is
 # monkeypatched by the whole suite and `searxng_url` changes on a live settings
@@ -2174,6 +2271,9 @@ def _http_get(url: str, timeout: float = 10.0) -> bytes:
 _web = _load_module("web")
 _web.configure(
     http_get=lambda url, timeout=10.0: _http_get(url, timeout),
+    # The reader's second seam: one request, redirects NOT followed, so the URL
+    # policy in `core.web` applies to every hop rather than to the first one.
+    http_get_hop=lambda url, timeout=10.0: _http_get_hop(url, timeout),
     searxng_url=lambda: str(SETTINGS.get("searxng_url") or ""),
     logger=log,
 )
@@ -5497,7 +5597,8 @@ class Assistant(QObject):
         for _round in range(MAX_TOOL_ROUNDS):
             if cancel.is_set():
                 return
-            tools = [t for t in TOOLS if SETTINGS["permissions"].get(t["function"]["name"], True)]
+            tools = ([] if not _BRAIN_STATE["tools_supported"] else
+                     [t for t in TOOLS if SETTINGS["permissions"].get(t["function"]["name"], True)])
             stream_enabled = bool(SETTINGS.get("streaming_tts", True))
             if stream_enabled:
                 # speak sentences while the model is still generating; tool
@@ -5670,12 +5771,11 @@ class Assistant(QObject):
             # which the NEXT utterance is taken without the wake word. Only
             # after natural completion — an interrupted (barged-in) reply
             # opens nothing, or the barge-in speech would arm its own window.
+            window = _followup_seconds()
             if self._turn_spoke and not cancel.is_set() and self._handsfree \
-                    and float(SETTINGS.get("followup_seconds", 0.0)) > 0.0:
-                self._followup_until = _tick_now() + float(
-                    SETTINGS["followup_seconds"])
-                log.info("follow-up window open for %ss",
-                         SETTINGS["followup_seconds"])
+                    and window > 0.0:
+                self._followup_until = _tick_now() + window
+                log.info("follow-up window open for %ss", window)
             return
         said: list[str] = []
         while True:
@@ -5709,11 +5809,11 @@ class Assistant(QObject):
             self._turn_spoke = True
         self._last_spoken = " ".join(said)
         # announce-and-listen (streaming path): same arming as above
+        window = _followup_seconds()
         if self._turn_spoke and not cancel.is_set() and self._handsfree \
-                and float(SETTINGS.get("followup_seconds", 0.0)) > 0.0:
-            self._followup_until = _tick_now() + float(
-                SETTINGS["followup_seconds"])
-            log.info("follow-up window open for %ss", SETTINGS["followup_seconds"])
+                and window > 0.0:
+            self._followup_until = _tick_now() + window
+            log.info("follow-up window open for %ss", window)
 
     def _unarm_speech(self, text: str) -> None:
         """Withdraw `text` from the echo list: it was queued for playback but

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import importlib.util
 import inspect
 from collections import deque
@@ -20,9 +21,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site
+from conftest import HERE as ROOT, _load, _user_site, core_module
 
 from core import settings as _core_settings
+
+_core_tools = core_module("tools")   # resolved on first use, inside the sandbox
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -46,6 +49,24 @@ class TestKeyboardTakeover:
         assert not err and "typed 11" in out
         assert calls == [("type", "--key-delay", "6", "--", "hello world")]
 
+    def test_an_unidentifiable_window_is_never_typed_into(self, belt,
+                                                          monkeypatch):
+        """A window with NO app_id was allowed whenever its title was
+        non-empty, on the theory that a title identifies the target. It does
+        not — a terminal can be titled anything — and the rest of this class
+        exists to fail CLOSED on exactly that. `press_keys` had the same hole."""
+        typed: list = []
+        monkeypatch.setattr(
+            belt.__class__, "_focused_window_info",
+            lambda self: {"app_id": "", "title": "untitled - bash"})
+        monkeypatch.setattr(belt.__class__, "_ydotool",
+                            lambda self, *a: typed.append(a) or "ok")
+        out, err = belt.execute("type_text", {"text": "rm -rf /"})
+        assert err and "REFUSED" in out, out
+        out, err = belt.execute("press_keys", {"combo": "ctrl+d"})
+        assert err and "REFUSED" in out, out
+        assert typed == [], "keys were injected into an unidentified window"
+
     def test_type_text_chunks_long_input(self, belt, monkeypatch):
         monkeypatch.setattr(belt.__class__, "_focused_window_info",
                             lambda self: {"app_id": "firefox", "title": "Firefox"})
@@ -54,12 +75,17 @@ class TestKeyboardTakeover:
             calls.append(args)
             return "ok"
         monkeypatch.setattr(belt.__class__, "_ydotool", fake_ydotool)
-        text = "x" * 100
+        chunk = belt._TYPE_CHUNK
+        text = "x" * (chunk * 2)
         out, err = belt.execute("type_text", {"text": text})
-        assert not err and "typed 100" in out
-        # bulk path: ONE call, no chunk sleeps (~30x faster than chunking)
-        assert len(calls) == 1
-        assert calls[0][-1] == text
+        assert not err and f"typed {len(text)}" in out
+        # One injection per focus-verified chunk, in order, nothing re-sent.
+        # Written against the class constant, not a literal: the chunk size is
+        # a safety knob (it is the window in which focus could change mid-type)
+        # and this guard is about the CHUNKING, not about any particular size.
+        assert len(calls) == 2, calls
+        assert calls[0][-1] == text[:chunk]
+        assert calls[1][-1] == text[chunk:]
 
     def test_type_text_retries_nonascii_as_ascii(self, belt, monkeypatch):
         monkeypatch.setattr(belt.__class__, "_focused_window_info",
@@ -604,6 +630,70 @@ class TestWorkspaceTool:
         belt = H.ToolBelt(on_restart_pending=lambda: None)
         out, err = belt.execute("workspace", {"action": "dance"})
         assert err and "unknown workspace action" in out
+
+    def test_list_renders_names_aliases_focus_and_windows(self, H, monkeypatch):
+        """The LIST branch is what the model reads to decide where to type —
+        every decoration it reports must come from real data: the workspace
+        name, the user's aliases for that index, which one is focused, and the
+        windows on each. It was the one workspace branch with no test."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        wss = [{"idx": 1, "id": 11, "name": "chat", "is_focused": False},
+               {"idx": 2, "id": 22, "is_focused": True}]
+        wins = [{"id": 7, "workspace_id": 11, "app_id": "foot", "title": "term"},
+                {"id": 8, "workspace_id": 22, "app_id": "firefox",
+                 "title": ""},
+                {"id": 9, "workspace_id": 999, "app_id": "ghost",
+                 "title": "lost window"}]
+        class R:
+            returncode = 0; stderr = ""; stdout = ""
+        def fake_run(cmd, **k):
+            r = R()
+            if "--json" in cmd and "workspaces" in cmd:
+                r.stdout = json.dumps(wss)
+            elif "--json" in cmd and "windows" in cmd:
+                r.stdout = json.dumps(wins)
+            return r
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        monkeypatch.setitem(H.SETTINGS, "workspace_aliases", {"work": "2"})
+        out, err = belt.execute("workspace", {"action": "list"})
+        assert not err, out
+        assert "ws1 (chat)" in out, out                     # the niri name
+        assert "[work]" in out, out                        # the user's alias
+        assert "ws2" in out and "[current]" in out, out     # the focused one
+        # window label: TITLE when there is one, app_id when not (ws2's
+        # firefox has an empty title and must still be listed)
+        assert "term" in out, out
+        assert "firefox" in out, out
+        assert "ghost" not in out, out                     # foreign workspace id
+        assert "(empty)" not in out, out                   # both have windows
+
+    def test_list_empty_and_foreign_windows(self, H, monkeypatch):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        class R:
+            returncode = 0; stderr = ""; stdout = ""
+        def fake_run(cmd, **k):
+            r = R()
+            if "--json" in cmd and "workspaces" in cmd:
+                r.stdout = json.dumps([{"idx": 1, "id": 5}])
+            elif "--json" in cmd and "windows" in cmd:
+                r.stdout = json.dumps([])
+            return r
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        out, err = belt.execute("workspace", {"action": "list"})
+        assert not err and "ws1: (empty)" in out, out
+
+    def test_list_niri_failure_is_an_error_not_a_crash(self, H, monkeypatch):
+        """A dead compositor is a tool ERROR, not an exception through the
+        turn — the model needs the sentence to tell the user, not a traceback.
+        The list branch calls the CLOSURE `_niri` (plain subprocess.run), not
+        the classmethod `_niri_msg`, so the seam to break is subprocess.run."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        def boom(cmd, **k):
+            raise RuntimeError("niri socket gone")
+        monkeypatch.setattr(H.subprocess, "run", boom)
+        out, err = belt.execute("workspace", {"action": "list"})
+        assert err, "an exception through execute() means the turn died"
+        assert "ERROR: cannot read workspaces" in out, out
 
     def test_in_prompt(self, H):
         assert "WORKSPACES" in H.SYSTEM_PROMPT
@@ -1315,3 +1405,101 @@ class TestScrollAndWait:
         tb._pointer_scale = 1.0
         tb.click_at(500, 300)
         assert calls[0] == ("mousemove", "-a", "-x", "500", "-y", "300")
+
+
+class TestSuperBindingKnown:
+    """press_hotkey's Super-chord check walks the niri config AND its
+    `include "..."` files — the walk (escape, dedupe, size cap) is where a
+    chord actually bound in cfg/keybinds.kdl must be found, and was the one
+    branch with no test."""
+
+    @pytest.fixture()
+    def niri_home(self, monkeypatch, tmp_path):
+        """_super_binding_known reads _dep().HOME/.config/niri — point that
+        seam at a tmp home: a fresh ContextVar makes _dep() resolve to
+        _DEFAULT_DEPS (no ToolBelt host can leak in), and the deps' HOME is
+        the tmp path."""
+        base = tmp_path / ".config" / "niri"
+        base.mkdir(parents=True)
+        var = contextvars.ContextVar("tools_deps_test")
+        var.set(None)                    # mimic "no host": _dep() → _DEFAULT_DEPS
+        monkeypatch.setattr(_core_tools, "_CURRENT", var)
+        monkeypatch.setattr(_core_tools._DEFAULT_DEPS, "HOME", tmp_path)
+        return base
+
+    @staticmethod
+    def _write_cfg(base, text, name="config.kdl"):
+        cfg = base / name
+        cfg.write_text(text, encoding="utf-8")
+        return cfg
+
+    def test_found_in_included_keybinds(self, niri_home):
+        """The real layout: binds live in an included file, not config.kdl."""
+        self._write_cfg(niri_home, '// niri config\ninclude "cfg/keybinds.kdl"\n')
+        inc = niri_home / "cfg" / "keybinds.kdl"
+        inc.parent.mkdir()
+        inc.write_text('binds { Mod+T { spawn "foot"; } }\n', encoding="utf-8")
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is True
+        assert _core_tools.ToolBelt._super_binding_known("super+t") is True
+
+    def test_absent_from_readable_config_is_false(self, niri_home):
+        """Readable config WITHOUT the chord must say False — that is the
+        whole point of the check (the chord would reach the focused app)."""
+        self._write_cfg(niri_home, 'binds { Mod+E { spawn "nautilus"; } }\n')
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+        # the comment-stripped scan must not see the chord inside a comment
+        self._write_cfg(niri_home, '// binds { Mod+T; }\n')
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+
+    def test_unreadable_config_allows(self, monkeypatch, tmp_path):
+        """Legacy allow: no config (or unreadable) must NOT block hotkeys."""
+        base = tmp_path / ".config" / "niri"
+        base.mkdir(parents=True)                      # dir exists, no config.kdl
+        var = contextvars.ContextVar("tools_deps_test")
+        var.set(None)                    # mimic "no host": _dep() → _DEFAULT_DEPS
+        monkeypatch.setattr(_core_tools, "_CURRENT", var)
+        monkeypatch.setattr(_core_tools._DEFAULT_DEPS, "HOME", tmp_path)
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is True
+
+    def test_escape_outside_config_dir_is_refused(self, niri_home):
+        """An include pointing outside ~/.config/niri must be ignored: the
+        chord must not be 'found' from a file the config dir does not own."""
+        self._write_cfg(niri_home, 'include "../elsewhere/keybinds.kdl"\n')
+        outside = niri_home.parent / "elsewhere" / "keybinds.kdl"
+        outside.parent.mkdir()
+        outside.write_text("binds { Mod+T; }\n", encoding="utf-8")
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+
+    def test_include_cycle_terminates(self, niri_home):
+        """Two files including each other must not hang or crash."""
+        self._write_cfg(niri_home, 'include "a.kdl"\n')
+        (niri_home / "a.kdl").write_text('include "b.kdl"\n', encoding="utf-8")
+        (niri_home / "b.kdl").write_text('include "a.kdl"\n', encoding="utf-8")
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+
+    def test_include_walk_is_capped_at_twenty(self, niri_home):
+        """A config including 25 files stops following at 20 — the walk is
+        bounded, so a hostile config cannot turn one lookup into a crawl."""
+        incs = " ".join(f'include "k{i:02d}.kdl"' for i in range(25))
+        self._write_cfg(niri_home, incs + "\n")
+        for i in range(25):
+            (niri_home / f"k{i:02d}.kdl").write_text("// empty\n",
+                                                      encoding="utf-8")
+        # terminates (no hang) and the chord — in no file — is absent
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+
+    @pytest.mark.skipif(getattr(os, "geteuid", lambda: 0)() == 0,
+                        reason="root reads anything; unreadable-file path unreachable")
+    def test_unreadable_include_is_skipped(self, niri_home):
+        """An include that cannot be READ is skipped, not fatal — the walk
+        continues over it."""
+        self._write_cfg(niri_home, 'include "locked.kdl"\n')
+        locked = niri_home / "locked.kdl"
+        locked.write_text("binds { Mod+T; }\n", encoding="utf-8")
+        locked.chmod(0o000)
+        try:
+            if os.access(locked, os.R_OK):      # e.g. ACLs override the mode
+                pytest.skip("file still readable")
+            assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+        finally:
+            locked.chmod(0o644)                 # tmp_path cleanup can rmtree

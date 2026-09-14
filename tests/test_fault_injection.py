@@ -597,11 +597,14 @@ class TestDesktopServicesVanish:
             return "ok" if len(calls) == 1 else "ERROR: ydotool failed: cannot connect"
 
         monkeypatch.setattr(belt.__class__, "_ydotool", dying)
-        text = "x" * 1200
+        chunk = belt._TYPE_CHUNK
+        text = "x" * (chunk * 4)
         out, err = belt.execute("type_text", {"text": text})
         assert err, "a half-typed message was reported as success"
-        assert "512/1200" in out, out
-        assert "typed 1200" not in out
+        # It must say how much actually landed, counted from the real chunk
+        # size — one chunk was injected, then the second call failed.
+        assert f"{chunk}/{chunk * 4}" in out, out
+        assert f"typed {chunk * 4}" not in out
 
     def test_the_compositor_dying_is_not_blamed_on_the_app(
             self, H, monkeypatch):

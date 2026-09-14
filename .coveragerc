@@ -9,6 +9,10 @@ parallel = True
 omit =
     tests/*
     attic/*
+    # Developer scratch at the repo root: untracked and gitignored, but
+    # `--cov=.` measures it anyway, and 16 unmeasured lines drag the TOTAL
+    # below the floor for reasons that have nothing to do with the suite.
+    test.py
     # ci/pytest_summary.py is CI tooling but it *is* measured (94%, driven by
     # tests/test_ci_summary.py) — excluded code that is tested is how
     # regressions hide, so only the two archives above are omitted.

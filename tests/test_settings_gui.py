@@ -1338,6 +1338,220 @@ def every_design_has_its_own_preview_glyph():
 
 
 @scenario
+@scenario
+def the_appearance_panel_persists_the_avatar_decoration():
+    # The ring light is a CLOSED choice with exactly two values, and it has to
+    # survive the round trip: shown from settings.json into the row, and
+    # collected back into the payload Save writes. A combo that renders but
+    # never reaches `cfg` is precisely the "I changed it and nothing applies"
+    # defect this card exists to answer.
+    from settings_schema import AVATAR_DECOS, AVATAR_DECO_COLORS
+    values = [win.deco_combo.itemData(i) for i in range(win.deco_combo.count())]
+    assert values == list(AVATAR_DECOS), values
+
+    for value in values:
+        win.deco_combo.setCurrentIndex(values.index(value))
+        win._collect()
+        assert win.cfg["avatar_ring"] == value, win.cfg.get("avatar_ring")
+        # the picker describes what it is offering, and the sentence FOLLOWS the
+        # choice — a stale hint under a new selection is a lie in the panel
+        assert win.deco_hint.text().strip(), value
+    win.deco_combo.setCurrentIndex(values.index("off"))
+    assert win.deco_hint.text() != "", "even Off is described"
+
+    # ...and the load path: the value on disk is the value the row shows
+    win.cfg["avatar_ring"] = "aurora"
+    win._load_values()
+    assert win.deco_combo.currentData() == "aurora", win.deco_combo.currentData()
+    assert "ribbon" in win.deco_hint.text().lower(), win.deco_hint.text()
+
+    # The DECORATION'S OWN COLOUR is one key with three shapes, and the third is
+    # a literal hex — so the row has to round-trip all three and `custom` itself
+    # must never be what gets stored, or the bubble would read a word it does
+    # not know and fall back to the state colour quietly.
+    modes = [win.deco_colour_combo.itemData(i)
+             for i in range(win.deco_colour_combo.count())]
+    assert modes == list(AVATAR_DECO_COLORS) + ["custom"], modes
+    for mode in AVATAR_DECO_COLORS:
+        win.deco_colour_combo.setCurrentIndex(modes.index(mode))
+        win._collect()
+        assert win.cfg["avatar_deco_color"] == mode, win.cfg.get("avatar_deco_color")
+        assert not win.deco_colour_btn.isEnabled(), (
+            f"the swatch is live while the row says {mode}, so it does nothing")
+    # `custom` is driven through the real CLICK path with the colour dialog
+    # stubbed, because the wiring worth pinning is the button's: a swatch that
+    # renders but never reaches `cfg` is the same defect one layer down.
+    class _FakeDialog:
+        @staticmethod
+        def getColor(*_a, **_k):
+            return settings_app.QColor("#123456")
+    settings_app.QColorDialog = _FakeDialog
+    win.deco_colour_combo.setCurrentIndex(modes.index("custom"))
+    assert win.deco_colour_btn.isEnabled(), "the swatch must be live when it is used"
+    win.deco_colour_btn.click()
+    assert win._deco_colour == "#123456", win._deco_colour
+    assert "#123456" in win.deco_colour_btn.text().lower(), win.deco_colour_btn.text()
+    win._collect()
+    assert win.cfg["avatar_deco_color"] == "#123456", (
+        win.cfg.get("avatar_deco_color"))
+
+    # THE LIVE APPLY, which is the part that was broken and the part a `cfg`
+    # assertion cannot see: `_apply_appearance_live` only writes when a key it is
+    # WATCHING differs from disk, so a control whose key is missing from
+    # APPEARANCE_KEYS applies nothing and saves nothing while still reporting
+    # into `cfg`. This is the same defect the state colours had, and the reason
+    # this scenario now ends here rather than at the collection above.
+    seed({"model": "testmodel:latest"})        # a file on disk to be an EDIT against
+    win.reload_from_disk()
+    before = json.loads(settings_file.read_text(encoding="utf-8"))
+    win.deco_colour_combo.setCurrentIndex(modes.index("rainbow"))
+    win._apply_appearance_live()
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["avatar_deco_color"] == "rainbow", (
+        f"the decoration colour never reached settings.json: "
+        f"{on_disk.get('avatar_deco_color')!r} (was {before.get('avatar_deco_color')!r})")
+    assert "decoration colour" in win.status_label.text(), win.status_label.text()
+
+    win.deco_colour_combo.setCurrentIndex(modes.index("custom"))
+    win.deco_colour_btn.click()                 # the swatch, same path
+    win._apply_appearance_live()
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["avatar_deco_color"] == "#123456", on_disk["avatar_deco_color"]
+
+    # ...and the load path: whatever is on disk is what the row SHOWS, so saving
+    # without touching the control is not an edit.
+    win.cfg["avatar_deco_color"] = "#0A0B0C"
+    win._load_values()
+    assert win.deco_colour_combo.currentData() == "custom", (
+        win.deco_colour_combo.currentData())
+    assert win._deco_colour == "#0A0B0C", win._deco_colour
+    win.cfg["avatar_deco_color"] = "rainbow"
+    win._load_values()
+    assert win.deco_colour_combo.currentData() == "rainbow"
+
+    # The colour rule round-trips the same way, and it is a real choice: the
+    # wash is what painted a character the state hue.
+    tints = [win.tint_combo.itemData(i) for i in range(win.tint_combo.count())]
+    assert tints == ["state", "natural"], tints
+    for value in tints:
+        win.tint_combo.setCurrentIndex(tints.index(value))
+        win._collect()
+        assert win.cfg["avatar_tint"] == value, win.cfg.get("avatar_tint")
+    win.cfg["avatar_tint"] = "natural"
+    win._load_values()
+    assert win.tint_combo.currentData() == "natural"
+
+
+@scenario
+def the_appearance_panel_offers_every_decoration_in_the_schema():
+    # A picker is only as good as the set behind it: the schema owns the closed
+    # set, core.settings coerces to it, the painters implement it — and the
+    # panel must OFFER exactly that, because a decoration nobody can select is
+    # a feature that does not exist, and one the picker offers that no painter
+    # implements draws nothing (silently).
+    from settings_schema import AVATAR_DECOS, AVATAR_TINTS
+    offered = [win.deco_combo.itemData(i) for i in range(win.deco_combo.count())]
+    assert offered == list(AVATAR_DECOS), (offered, list(AVATAR_DECOS))
+    tints = [win.tint_combo.itemData(i) for i in range(win.tint_combo.count())]
+    assert tints == list(AVATAR_TINTS), (tints, list(AVATAR_TINTS))
+
+    # Every one of them has a sentence, and the sentence is not the same one
+    # repeated: the hints are how a person chooses between them.
+    seen = {}
+    for i, name in enumerate(offered):
+        win.deco_combo.setCurrentIndex(i)
+        seen[name] = win.deco_hint.text().strip()
+    assert all(seen.values()), seen
+    assert len(set(seen.values())) == len(seen), seen
+
+
+@scenario
+def the_strip_shows_the_decoration_and_its_colour():
+    # The Decoration card exists in this window for one reason: to choose what
+    # the avatar wears. Until this scenario the strip above it drew NO ring at
+    # all — so every choice the card offered, including the colour row under it,
+    # had no visible effect where the user was looking. Reported as "decoration
+    # color and own color rainbow color dont work".
+    #
+    # What is pinned is the property that was missing: changing the ring, or the
+    # colour it is drawn in, CHANGES PIXELS IN THE STRIP, and the colour really
+    # is the colour (a red ring puts red ink where the state-coloured one has
+    # none) rather than merely "something moved".
+    names = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+    win.tabs.setCurrentIndex(names.index("Appearance"))
+    win.show()
+    settings_app.QApplication.processEvents()
+    win.design_combo.setCurrentIndex(win.design_combo.findData("image"))
+    win.design_combo.setCurrentIndex(win.design_combo.findData("image"))
+
+    # The strip animates on a REAL clock, so two identical settings drawn a
+    # moment apart differ on their own — freezing time is what makes "these two
+    # shots are the same" a statement about the settings rather than about how
+    # long the process took. (The first run of this scenario failed on exactly
+    # that, which is why the pin is here and not in the assertion.)
+    class _Frozen:
+        def elapsed(self):
+            return 1200
+    win.preview._clock = _Frozen()
+
+    def shot(deco, mode, custom="#4f8cff"):
+        win.deco_combo.setCurrentIndex(
+            [win.deco_combo.itemData(i) for i in range(win.deco_combo.count())]
+            .index(deco))
+        modes = [win.deco_colour_combo.itemData(i)
+                 for i in range(win.deco_colour_combo.count())]
+        win.deco_colour_combo.setCurrentIndex(modes.index(mode))
+        win._deco_colour = custom
+        settings_app.QApplication.processEvents()
+        from PySide6.QtGui import QImage
+        img = QImage(win.preview.size(), QImage.Format_ARGB32)
+        img.fill(0)
+        win.preview.render(img)
+        return img
+
+    def changed(a, b, step=12):
+        n = 0
+        for y in range(a.height()):
+            for x in range(a.width()):
+                c1, c2 = a.pixelColor(x, y), b.pixelColor(x, y)
+                if (abs(c1.red() - c2.red()) > step
+                        or abs(c1.green() - c2.green()) > step
+                        or abs(c1.blue() - c2.blue()) > step):
+                    n += 1
+        return n
+
+    def red_ink(img):
+        # Pixels that are red and NOT explainable as the state orb or the art.
+        return sum(1 for y in range(img.height()) for x in range(img.width())
+                   if (lambda c: c.alpha() > 80 and c.red() > 120
+                       and c.red() > c.blue() + 40)(img.pixelColor(x, y)))
+
+    assert win.preview.size().width() > 0, "the strip was never laid out"
+    off = shot("off", "state")
+    assert changed(off, shot("off", "state")) == 0, (
+        "two identical settings drew differently — the measurement is noisy")
+
+    ring_state = shot("ring-light", "state")
+    assert changed(off, ring_state) > 200, (
+        f"choosing a decoration changed {changed(off, ring_state)} pixels of the "
+        f"strip — the card has no visible effect where it lives")
+    assert changed(ring_state, shot("orbit", "state")) > 200, (
+        "switching decoration changed nothing in the strip")
+    assert changed(ring_state, shot("ring-light", "rainbow")) > 0, (
+        "the Rainbow row changed nothing in the strip")
+
+    # ...and the colour is the colour: a red ring puts red ink where the
+    # state-coloured ring puts none, and a green one does not.
+    red = shot("ring-light", "custom", "#ff0000")
+    green = shot("ring-light", "custom", "#00ff00")
+    assert red_ink(red) > red_ink(ring_state) + 50, (
+        f"the own-colour row did not reach the strip: red ink "
+        f"{red_ink(red)} vs state ink {red_ink(ring_state)}")
+    assert changed(red, green) > 200, (
+        "two different own colours drew the same strip")
+
+
+@scenario
 def appearance_panel_is_a_scrolling_column_of_cards():
     # The panel used to be a flat stack of unlabelled rows pinned to a page that
     # did not scroll, so a section that grew pushed the live preview past the
@@ -2056,14 +2270,20 @@ def the_image_design_draws_the_users_picture():
     assert appearance.design_image_problem() == "", (
         "an unchosen picture is the starting state, not a problem")
 
-    # --- a real picture draws, and fills the glass
+    # --- a real picture draws, and fills the glass. The art is SQUARE so the
+    # --- avatar's ink radius is a stated property of the test (inscribed
+    # --- circle of the fit circle), not an accident of an aspect ratio.
     art = folder / "art.png"
-    black = QImage(180, 120, QImage.Format_ARGB32)
+    black = QImage(128, 128, QImage.Format_ARGB32)
     black.fill(QColor(0, 0, 0, 255))
     assert black.save(str(art))
     bubble.SETTINGS["design_image_path"] = str(art)
     assert appearance.design_image_problem() == "", (
         appearance.design_image_problem())
+    # The ring's coerced DEFAULT is on, and the harness loads a real settings
+    # dict — so the no-decoration baseline is pinned here, not assumed.
+    appearance.SETTINGS["avatar_ring"] = "off"
+    assert appearance.avatar_ring_on() is False
     drawn = shot()
     drawn_px = opaque_pixels(drawn)
     assert drawn_px > slot_px * 5, (
@@ -2072,9 +2292,59 @@ def the_image_design_draws_the_users_picture():
         f"steps and any one of them failing silently looks like this")
     reach = reach_of(drawn)
     assert reach <= appearance.APERTURE_R, (reach, appearance.APERTURE_R)
-    assert reach > appearance.APERTURE_R * 0.75, (
-        f"the picture collapsed to {reach:.1f} px instead of filling the "
-        f"glass — the fit is shrinking it away")
+    # The avatar is ROUND now: full-bleed art is clipped to a feathered circle
+    # (`_round_avatar`), so its ink stops inside the fit circle. The floor is
+    # spelled out factor by factor and PINNED HERE, not read from the painter:
+    # the fit policy 0.88 of the aperture, the breath's deepest sway −2%, the
+    # square art's inscribed fraction 1/√2, the feather's solid floor 86%, and
+    # an antialiasing margin. A painter that retunes any of these must change
+    # this number on purpose — while a fit that shrinks the avatar away still
+    # fails the test, which is what it exists to catch.
+    floor = (appearance.APERTURE_R * 0.88 * 0.98 * (2 ** -0.5) * 0.86) - 1.5
+    assert reach > floor, (
+        f"the picture collapsed to {reach:.1f} px (floor {floor:.1f}) — "
+        f"the fit is shrinking it away")
+
+    # --- the ring light: decoration AROUND the avatar. It takes its band out
+    # --- of the picture's fit by design (0.76 vs 0.88), so ring-on must draw
+    # --- arcs the picture does not cover, must keep every arc inside the
+    # --- aperture, must visibly shrink the picture into its own circle, and
+    # --- must vanish the moment the setting says off.
+    a = appearance.APERTURE_R
+
+    def new_ink(img, base):
+        # The ink the ring ADDS: opaque in the decorated shot, transparent in
+        # the baseline. Measuring an annulus instead would count the rim's own
+        # halo (which sits in any band wide enough to hold the arcs) and, worse,
+        # would count it as decoration; this difference is exactly the ink the
+        # decoration is responsible for. Threshold 25, not 200 — the arcs are
+        # decoration, not a filled disc.
+        return sum(1 for y in range(W) for x in range(W)
+                   if img.pixelColor(x, y).alpha() > 25
+                   and base.pixelColor(x, y).alpha() <= 25)
+
+    def reach_within(img, r_cap):
+        vals = [((x + 0.5 - W / 2.0) ** 2 + (y + 0.5 - W / 2.0) ** 2) ** 0.5
+                for y in range(W) for x in range(W)
+                if ((x + 0.5 - W / 2.0) ** 2 + (y + 0.5 - W / 2.0) ** 2) ** 0.5 <= r_cap
+                and img.pixelColor(x, y).alpha() > 200]
+        return max(vals) if vals else 0.0
+
+    appearance.SETTINGS["avatar_ring"] = "ring-light"
+    assert appearance.avatar_ring_on() is True
+    lit = shot()
+    assert new_ink(lit, drawn) > 40, (
+        f"the ring light added almost no ink ({new_ink(lit, drawn)} px)"
+        f" — it is drawn under the avatar instead of around it")
+    assert reach_of(lit) <= appearance.APERTURE_R, (
+        reach_of(lit), appearance.APERTURE_R)
+    assert reach_within(lit, 0.5 * a) < reach - 2.0, (
+        f"the ring did not take its band out of the picture's fit "
+        f"({reach_within(lit, 0.5 * a):.1f} against {reach:.1f})")
+    appearance.SETTINGS["avatar_ring"] = "off"
+    assert appearance.avatar_ring_on() is False
+    assert new_ink(shot(), drawn) == 0, (
+        "the ring is still drawn after the setting goes back to off")
 
     # --- ink stays inside the aperture for BOTH revisions, at every radius the
     # --- state machine can ask for and both voice extremes. Direct paint, the
@@ -2111,6 +2381,17 @@ def the_image_design_draws_the_users_picture():
         return worst
 
     assert worst_outside() == (0, None), worst_outside()
+
+    # ...and the whole sweep again for EVERY decoration. The decoration is the
+    # outermost ink this design can put down, so each one is a separate claim
+    # on the aperture — swept over the decoration names, because "the ring is
+    # fine" says nothing about the comets or the ribbons.
+    from settings_schema import AVATAR_DECOS
+    for deco in AVATAR_DECOS:
+        appearance.SETTINGS["avatar_ring"] = deco
+        assert worst_outside() == (0, None), (deco, worst_outside())
+    appearance.SETTINGS["avatar_ring"] = "off"
+
     white = QImage(3000, 2000, QImage.Format_ARGB32)   # big AND bright
     white.fill(QColor(255, 255, 255, 255))
     assert white.save(str(art))
@@ -3159,6 +3440,39 @@ def the_image_design_takes_one_picture_per_state():
     bubble.SETTINGS["design_image_path"] = ""
 
 
+@scenario
+def the_live_mic_probe_closes_a_stream_that_fails_to_start():
+    # A stream that OPENED but failed to start was dropped without a close:
+    # PortAudio holds the device until the object is collected, so a flapping
+    # device leaked one stream per retry. Watch for the close on the failure
+    # path, which is the branch nothing else in the suite reaches.
+    probe = settings_app._LiveMicProbe()
+    closed = []
+
+    class Stream:
+        def start(self):
+            probe._running = False      # let _run exit after this iteration
+            raise RuntimeError("device busy")
+
+        def close(self):
+            closed.append("closed")
+
+    settings_app.H._open_input = lambda *a, **k: (Stream(), 16000)
+    real_sleep = time.sleep
+    settings_app.time.sleep = lambda *_a: None   # no back-off wait in a test
+    probe._running = True
+    worker = threading.Thread(target=probe._run, args=(None, 300), daemon=True)
+    worker.start()
+    deadline = time.time() + 10
+    while time.time() < deadline and not closed:
+        app.processEvents()
+        real_sleep(0.02)
+    probe._running = False
+    worker.join(5)
+    assert closed == ["closed"], "a failed start leaked its PortAudio stream"
+    assert "device busy" in probe.snapshot().get("error", ""), probe.snapshot()
+
+
 if __name__ == "__main__":
     name = sys.argv[1]
     try:
@@ -3224,8 +3538,12 @@ SCENARIO_NAMES = [
     "the_appearance_panel_previews_a_pack_before_installing_it",
     "the_image_design_takes_one_picture_per_state",
     "appearance_panel_is_a_scrolling_column_of_cards",
+    "the_appearance_panel_persists_the_avatar_decoration",
+    "the_strip_shows_the_decoration_and_its_colour",
+    "the_appearance_panel_offers_every_decoration_in_the_schema",
     "look_tiles_are_drawn_from_the_shared_painter",
     "voice_tab_level_meter_reads_the_bubble_feed",
+    "the_live_mic_probe_closes_a_stream_that_fails_to_start",
     "external_change_reloads_and_reports",
     "missing_settings_file_mtime_is_zero",
     "conversation_pane_renders_roles_and_tool_calls",

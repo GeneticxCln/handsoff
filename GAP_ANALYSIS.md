@@ -3355,3 +3355,362 @@ is asserted is the panel's decisions rather than a thread's timing). **20/20 mut
 old behaviour caught on the first pass, one per decision. The preview is also process-global state,
 so the shared `bubble` fixture now resets it: a preview left behind by one test would otherwise be
 drawn by the next one.
+
+## A character that moves: animations in the pack format
+
+**What was missing.** A pack could give each state one STILL picture. A mood ring, not a creature:
+the state changed, the face never did. What a picture character is FOR — a blink, a perk, a mouth
+flap — needed time, and the format had none.
+
+**The format gained one shape, not a second format.** A state's value is either `"file.png"` or
+`{"frames": ["a.png", …], "fps": n}` — up to `PACK_MAX_FRAMES` (16) frames at 0.5–30 fps. The one
+reader of that shape is `pack_animation`, and the validator checks an animation's frames with the
+very loop it checks stills with, so a broken frame is refused with the SAME sentence a broken still
+gets — `no file at missing.png (the idle picture)` — and an animation is not a second, looser door.
+Every existing pack is untouched: a string resolves exactly as before, pinned by a test that reads
+one.
+
+**The movement is time, and only the painter owns it.** The frame index comes from `t` in the
+painter's own call (`design_image_tinted(…, t)`), resolved through the SAME `_image_entry` cache,
+decode, tint and fit a still takes — the painter cannot tell a still from a frame, and neither can
+the empty-slot rule. "fps" is a promise the renderer keeps, not a number the manifest may lie about:
+the index is computed per paint, so editing fps on disk takes effect without a restart like every
+other manifest edit. The preview strip decodes an animation's FIRST frame through the same layers —
+a decision aid, not a projector — and says nothing false about it.
+
+**An export of a look that moves is a look that moves.** `_stage_art` copies every frame and writes
+the spec; the round-trip test installs the export and compares the spec it reads back (frames count,
+fps, decodable files). A shared animated look arriving as four identical stills would be the
+preview lying about the install, in the one place nobody would re-check it.
+
+**`_image_entry` learned to defer its pixmap.** The decode path used to build a `QPixmap` eagerly,
+which ABORTS the process without a QGuiApplication — the pack tests run app-free, and the first
+animation test found the crash. The pixmap is now built on first request behind `_entry_pixmap`, on
+the paint path where an app exists; the decode path (and every test, doctor line and export that
+touches it) stays QImage-only.
+
+**Guards and evidence.** `TestAnimatedPacks` (6 cases): a still pack unchanged, a spec that cycles
+by time and wraps (frame identity compared as QImage bytes — the app-free twin
+`_design_art_image` exists because the pixmap path aborts without an application), a broken
+animation refused in the still sentence plus all five bounds (missing frame, >16 frames, empty
+list, fps 1000, fps "fast", a frame leaving the pack), a mixed pack, an export round-trip, and the
+strip's first frame. **1236 tests green**; `compile_all` clean (45 files); deployed `in-sync` and
+verified against the DEPLOYED module and RUNNING bubble: every state resolves to a spec, three
+consecutive frame periods give three distinct decodes, the cycle wraps at `len(frames)`, `doctor`
+names `pack pip`, and `--ptt say` flipped the running bubble to `state=speaking` — the mouth-flap
+loop — and back to idle.
+
+## A decoration that lives AROUND the avatar (the ring light)
+
+**What was missing.** Everything the `image` design could draw had to be a
+picture the user supplied, and the design's own furniture was a rim and an empty
+slot. There was no way to give the avatar a light — the one ornament that reads
+as "someone is home" on a desktop, and the thing that makes a plain photo or a
+character PNG feel placed rather than pasted.
+
+**What shipped.** `avatar_ring` (`core/bubble.py`, shown in the Appearance tab as
+**Avatar decoration**: Ring light / Off) draws the avatar's own ring light:
+two arc pairs on the ring's centreline, a second dimmer pair counter-rotating
+just outside them. It is a closed choice — junk coerces to the default in
+`core/settings.py` against `settings_schema.AVATAR_RINGS`, so a typo cannot
+half-decorate — and it is painted FIRST, behind the picture and the rim, so the
+avatar sits over its decoration instead of under it.
+
+**The three rules it had to keep.**
+
+* *It cannot fight the picture for room.* The picture's fit shrinks when the ring
+  is on (0.88 → 0.76 of the aperture) and the arcs live in the band that vacates,
+  so picture and decoration can never overlap by construction — not by tuning.
+  The ring's own outer edge is clamped under `APERTURE_R`, and the GUI scenario's
+  aperture sweep now runs the whole state/voice/radius matrix a second time with
+  the ring ON: zero pixels outside the aperture, at every combination.
+* *It must be alive without the voice.* Rotation is driven by `animation_energy`
+  (an always-turning decoration, not a still that lights up only when spoken to)
+  and the voice is layered on top as brightness AND speed, the same division of
+  labour every design follows.
+* *It must not hide the state.* The arcs are the state colour (`lighter(160)`)
+  over the picture's own tint, so the ring reinforces the state instead of
+  competing with it.
+
+## The inside, refined
+
+Two changes so a picture reads as an avatar rather than a cut-out:
+
+* **A stage.** `_draw_avatar_stage` puts a soft radial disc in the state colour
+  under the art (radius 1.04× the picture's fit, lit by the voice). A
+  transparent-background character — the normal case for a pack — was otherwise
+  drawn straight onto the wallpaper, which is what made a figure read as pasted.
+* **A round cut, only where it is needed.** `_round_avatar` clips art with
+  **opaque corners** to a feathered ellipse (`_feather_mask`, cached per size).
+  Art that already carries its own silhouette — transparent corners, the way a
+  character PNG is drawn — is returned untouched by identity, because masking it
+  could only cut ink the artist drew on purpose. The scenario pins both paths,
+  and the "fills the glass" floor is now derived from the design's own fit
+  constants with each factor named, so retuning the fit is a deliberate edit to
+  that number rather than a silent shrink.
+
+**Evidence.** 5 new unit cases (`TestAvatarDecoration`: the closed choice, the
+arcs' band between avatar and aperture, animation and voice response, the two
+rounding paths, the mask cache), a new offscreen scenario
+(`the_appearance_panel_persists_the_avatar_decoration`) plus the extended
+picture scenario (ring adds ink the baseline does not have, shrinks the picture
+into its band, and vanishes on Off), and a coercion case in `tests/test_settings.py`.
+**1243 tests green**; coverage **81.61% ≥ 70**; `compile_all` clean (45 files).
+Deployed `in-sync`; verified on the DEPLOYED bundle at the user's real settings:
+`9887` pixels differ between decoration on and off, ring ink lands at radius
+`55.3–57.4 px` (picture fit `33.2`, aperture `63.0`), max ink radius `57.4 ≤ 63.0`
+in both modes, two moments in time are two different pictures, ring brightness
+rises `3.3 → 18.8` from silence to full voice, and `doctor` reads
+`appearance: look Custom (image, 128 px) — pack pip — ring light on`.
+
+## Can the assistant actually search the web? (audited live)
+
+The question was "do all those abilities work", so the answer is measured on the
+DEPLOYED bundle at the user's real settings, through the MODEL-FACING methods
+(`ToolBelt.web_search` / `read_page` / `lookup_fact` / `world_events` — the same
+ones the tool schema exposes), not through the router underneath them.
+
+**What answers, with times (one live session):**
+
+| ability | result |
+|---|---|
+| `web_search` (auto), general query | **734 ms** — DuckDuckGo, real results |
+| `web_search` (auto), bug-shaped query | **1675 ms** — routed to Stack Exchange |
+| `web_search` (auto), stable fact | **734 ms** — DuckDuckGo |
+| `source=stackexchange` | 256 ms, 4 QA hits with scores |
+| `source=wikipedia` | 378 ms, 4 article hits |
+| `source=hn` | 314 ms, 4 stories with points/comments |
+| `source=github` | 417 ms, 4 repositories |
+| `read_top=1` (search + read the top hit) | 2602 ms — the page came back via Jina Reader |
+| `read_page` on a docs page | 151 ms, 43 854 chars via local fetch |
+| `read_page` on `127.0.0.1` / `localhost` / a non-URL | refused, named, in 0 ms |
+| `lookup_fact("Mongolia")` | 55 ms, the full encyclopedia extract |
+| `world_events` | real headlines when the source answers (CNN/BBC/Al Jazeera) |
+
+**The two limits, named rather than papered over.** `searxng` is the router's
+preferred general backend and it is **off** (`connection refused` — no local
+instance); that is the documented fix for general search and it costs one
+service. `ddg` answers a couple of queries and then serves a **bot challenge** —
+a rate limit, not an outage: in one session the `auto` searches returned real
+results while an explicit `source=ddg` call two seconds later was refused, and
+`doctor` reads `ddg FAILED (DuckDuckGo served a bot challenge …, quota
+285/300 on stackexchange)`. Every failure is attributed, and every backend that
+is not DuckDuckGo kept answering throughout, so `auto` degrades to Wikipedia /
+Stack Exchange / HN / GitHub instead of to nothing.
+
+**The bug the audit found.** `world_events` reported a quiet source as
+`unavailable (offline?)` — a guess, and the wrong one: DuckDuckGo had refused
+with a bot challenge, which the web layer had already recorded two layers down.
+`core/web.last_problem(name)` now exposes that record, and the tool names the
+cause. The property is pinned from both sides: the reason is reported when there
+is one, and never invented when there is not.
+
+**Evidence.** 68 cases in `tests/test_web.py` (3 for `last_problem`, 2 for the
+news tool's sentence, plus the schema assertion that all four web tools are in
+`H.TOOLS` — what the model is handed, which is the only thing that makes an
+ability exist for the AI). **1248 tests green**; `compile_all` clean (45 files);
+deployed `in-sync`; the corrected sentence observed live on the deployed bundle.
+
+## Your own colours, and a decoration that is not part of the shape
+
+**What was missing.** The `image` design was the only one whose art is the
+user's, and it was painted the way the drawn designs are: an opaque
+state-coloured gradient through the picture's luminance. That is right for a
+shape (a shape has no colours of its own to keep) and wrong for a character —
+a yellow figure came out **blue** at idle, and clicking "match wallpaper" only
+changed *which* colour it was repainted in. Nothing anywhere was a decoration:
+the ring light added earlier was one closed choice (`ring-light` or `off`), so
+there was no picker for decorations and nothing to pick between.
+
+**What was built.**
+
+1. `avatar_tint` — a closed choice, `state` (the old behaviour, kept as the
+   default so no existing setting changes meaning) or `natural`. `natural`
+   takes two composition passes instead of four: a state-coloured **veil**
+   capped at alpha 52, then a WHITE screen pass driven by the voice — so the
+   character lights up when spoken to without its hue changing. The ceiling is
+   the decision: a stronger wash is the repaint the mode exists to stop.
+2. The rim's halo became a **ring** in natural mode rather than a disc. A
+   filled disc lays ~27% of the state colour over the whole picture, which with
+   the veil was enough to keep the character blue even with the wash switched
+   off — found by measuring the centre pixel, not by reading the code.
+3. The `avatar_ring` key kept its NAME and its value set became a TABLE:
+   `AVATAR_DECOS` is `off / ring-light / orbit / pulse / aurora`, so the old
+   two-value boolean setting became a picker without a migration step and
+   without a second key meaning the same thing. Three new animations sit beside
+   `ring-light`: **orbit** (bright heads circling), **pulse** (rings travelling
+   outward, so its proof is a sweep over time rather than an instant), **aurora**
+   (a sweeping hue band). One dispatcher (`_draw_avatar_deco`) and one schema
+   constant, with a guard asserting the painter's table (`DECORATIONS`) and the
+   schema's agree — a name in one and not the other is either a choice that
+   draws nothing or a painter no picker can reach.
+4. The Appearance tab's avatar controls became their own **Decoration card**
+   with the decoration picker, its live description, and the colour picker.
+
+**Evidence.** `TestAvatarDecoration` grew the case that pins the user's own
+bug as a **property** rather than against pixel values: the same yellow art is
+painted at two state colours, and natural mode must keep the art (green over
+blue, within a stated distance of the art) while `state` mode must still take
+the state colour — so a fix that simply stopped tinting would fail rather than
+pass. It is mutation-checked: restoring the disc halo turns it red (`#91aecf`).
+**1253 tests green**; coverage **81.75% ≥ 70** with `core/bubble.py` at
+92%; `compile_all` clean (45 files); deployed `in-sync` and measured on the
+DEPLOYED bytes: the yellow art's centre reads delta ≤ 52 from the art in all
+four states in natural mode, and 62–214 in state mode. Ring light was revisited
+too: it is now one entry in the decoration table rather than a special case.
+
+## A decoration that is its own colour, and five more of them
+
+**What was missing.** Every ring was painted in the state colour — one source,
+passed straight into each painter — so a ring could never be *its own* colour:
+picking something that is not the mood was not possible, and the set was four
+shapes plus Off. Asked for: "the decoration rings has to change the color
+independent and we need more animation ring like the ones from discord".
+
+**What was built.**
+
+1. `avatar_deco_color` — one key, three shapes: the two words `state` (the
+   default, unchanged) and `rainbow`, or a literal `#RRGGBB`. `custom` is
+   deliberately NOT storable — it is the panel's name for "the value is a hex",
+   and storing it would leave the bubble reading a word it does not know and
+   quietly falling back. Validated through the tree's ONE hex parser
+   (`core.theme.hex_to_rgb`, fullmatch) in `core.settings`, in
+   `core.bubble.avatar_deco_color()` and at the swatch, so a hand-edited
+   `settings.json` and the dialog agree about which colours exist.
+2. `avatar_deco_colour(state_color, t, lv, anim)` — the ONE place that decides
+   the ring's colour, called by the dispatcher, so the painters keep owning only
+   their MOTION. `rainbow` sweeps a hue with time and the animation energy and
+   brightens with the voice. Independence cannot cost readability: the rim is
+   still drawn in the state colour and is the design's outermost ink.
+3. Five new rings, Discord-style: **rainbow** (a full hue wheel as one thick
+   conical-gradient band, anchored at the decoration's own hue so the picker
+   still means something), **sparkle** (spikes, not sines — a slowly breathing
+   dot is a lamp), **comet** (one head on the OUTER part of the band with the
+   tail sweeping back and inward), **neon** (a tube that is always lit with a
+   pulse chasing round it) and **flames** (tongues whose tallest possible height
+   is 0.72 of the band, by construction rather than by clamping).
+4. `core/theme.py` added to the installer's `CORE_REQUIRED` floor, because
+   `core/bubble.py` now hard-imports it — the floor is what fails loudly when a
+   module a hard import needs disappears.
+
+**Two measurement findings worth keeping.** Proving "the ring moves" defeated
+two plausible instruments before an honest one appeared. An **alpha sum** is
+identical at every moment of a rainbow ring — the band's opacity is uniform and
+only the hues turn — so a decoration whose whole motion is chromatic measures as
+perfectly still; and counting pixels whose channels differ by **more than 25**
+reports ZERO movement for a fully-saturated wheel that is visibly rotating.
+What an eye has is neither: it is *a good share of the ink changing by more than
+a step you can see*. The guard now measures that, swept over every decoration in
+all three colour modes, with a 10% floor against a measured worst case of 17% —
+and it catches a still rainbow ring, which the old "the two images differ"
+check also caught but only because antialiasing noise satisfied it.
+
+**Evidence.** 1260 tests green in all three orderings (default, shuffled-test
+seed 20260914, shuffled-file seed 7); coverage **81.94% ≥ 70**; `compile_all`
+clean (45 files); deployed `in-sync`. Four mutations, each caught and restored:
+rainbow ignored, the chosen colour never reaching the painters, the loader
+refusing a hex, and the rainbow wheel not turning. Guards added: the two colour
+modes matching the schema's tuple (spelled in two files that cannot import each
+other), the closed choice plus hex with junk falling back, a rainbow ring
+ignoring the state entirely *and* still sweeping, a chosen colour used exactly
+with the state still readable in the rim, the visible-motion sweep, the report
+naming every decoration and the ring's colour when it is not the state's, and
+the panel driving the swatch through the real click path with the dialog
+stubbed. The runtime line was verified live on the deployed bundle — with the
+user's own settings, `doctor` reads
+`appearance: look Custom (image, 136 px) — pack pip — rainbow ring on (#aaff00) — original colours`,
+and `settings.json` holds `avatar_ring: rainbow`, `avatar_deco_color: #aaff00`.
+
+## Two "it doesn't work" reports, both real, both mine
+
+Reported: *"decoration color and own color rainbow color dont work there are bugs
+there"*. Two defects, and the two are different layers of the same complaint —
+a control that appears to do nothing.
+
+**1. The key was missing from `APPEARANCE_KEYS`.** That tuple is what
+`_apply_appearance_live` compares against the disk, and a key it is not watching
+is read as *"a load, not an edit"*: the early return fires and the value is
+never saved and never applied, while `_collect` still writes it into `cfg` — so
+the panel reports "Applied … decoration colour" and nothing happens. This is the
+**second** time this exact key list has done it (`colors` was the first, and the
+scenario comment for it says so). The guard for a new appearance control now
+asserts the LIVE APPLY — read `settings.json` back after the change and require
+the value there — because a `cfg` assertion cannot see this bug at all.
+
+**2. The strip never drew a ring.** `BubblePreview.paintEvent` painted the orbs,
+the glyph and the picture, and no decoration ever — so every choice the
+Decoration card offered, and the whole colour row under it, had **no visible
+effect in the window that holds them**. The card now draws the ring under the
+picture exactly as the bubble does (decoration, then stage, then art, then rim),
+with the geometry taken from the bubble's own constants (`1.03` of the fit to
+`0.94` of the aperture, and the picture's fit at `0.76` of the aperture while a
+ring is on) and the colour from the bubble's own resolver — `avatar_deco_colour`
+grew an optional `mode` argument so a caller can draw a value it HOLDS but has
+not saved, rather than the preview reimplementing the choice.
+
+**The guard for (2) had to be fixed once itself**: the first version compared two
+screenshots of an animated strip on a REAL clock, so two identical settings drew
+differently and the restored run failed. Freezing the strip's clock is what makes
+"these two shots are the same" a statement about the settings rather than about
+how long the process took.
+
+**Evidence.** Both bugs are mutation-checked: deleting `avatar_deco_color` from
+`APPEARANCE_KEYS` fails the persistence scenario, and deleting the
+`_draw_deco_glyph` call fails the strip scenario with "choosing a decoration
+changed 0 pixels of the strip". 1261 tests green in all three orderings;
+coverage **81.96% ≥ 70**; `compile_all` clean; deployed `in-sync`. Verified
+end-to-end in an ISOLATED HOME (the user's own config confirmed untouched): the
+panel row `rainbow` → `settings.json 'rainbow'`, the real swatch click →
+`'#ff00aa'`, `state` → `'state'`, and the bubble module resolves those three
+saved values to `#e4af25` / `#ff00aa` / `#4f8cff` — with the rainbow value
+identical for three different state colours.
+
+## External audit: every finding closed at the cause
+
+The external audit ranked 3 HIGH, 8 MEDIUM and 10 low findings; all 21 are fixed
+with a guard each, and 17 are mutation-checked (each mutation reverts one fix
+and the named guard must go red). The three HIGH items were the ones worth the
+name: weekly recurring events read back at twice their time-of-day; a
+hand-edited settings.json saying `"false"` ENABLED mouse control and
+private-notification reading (`bool("false")` is True); and the page reader
+followed redirects without re-validating, so a model-supplied URL could hop
+into the LAN and land the page in the transcript.
+
+Two findings deserved a small design decision rather than a patch. The
+tool-support probe was dead telemetry by construction — `_brain_deps` minted a
+fresh state dict per call, so the refusal `core.brain` recorded was thrown away
+— and the fix is one persistent `_BRAIN_STATE` plus the turn pipeline skipping
+the tools payload entirely for a model known to refuse it (no more 400 probe on
+every turn). And `set_setting` now coerces what it writes through the same
+`coerce_settings` the loader uses (completed from defaults, only the changed
+key's value written back), because the file a TOOL writes must be as valid as
+the file the loader reads — with `_history_budget` and `_followup_seconds`
+guarding their reads anyway, since a value written before this fix may still be
+on disk.
+
+The rest were the same defects the tree has fixed elsewhere, arriving in files
+the earlier sweeps had not reached: an unbounded cache, a sentinel leaking
+through a merge branch, a probe whose failure looked fresh, a stream leaked on
+its error path, a comment claiming permissions were kept when `mkstemp` reset
+them, a rollback sweeping files the installer does not own. Each is closed with
+a test that names the failure, and the suite now runs 1287 tests green in all
+three orderings at 82.24% coverage.
+
+## Coverage: the blocks behind the 82% ceiling (2026-09-14)
+
+Ranked by missing lines from the CI-measured coverage JSON, the three largest
+blocks with no test now have one each:
+
+- `ToolBelt.workspace` `list` branch — aliases, names, focus and windows per
+  workspace asserted from fake niri JSON (`TestWorkspaceTool`).
+- `ToolBelt._super_binding_known` include-walk — 8 tests across found, absent,
+  comment, unreadable, escape, cycle, cap and skip paths
+  (`TestSuperBindingKnown`).
+- `ContinuousListener._run` watchdog — stalled/silent reopen, healthy flow,
+  clean stop, suspended liveness counter, stale generation, raising stop
+  (`TestWatchdogReopenLoop`, fake clock).
+
+Work left uncovered on purpose: the ~30 defensive `except`/`pass` lines inside
+those blocks, the Qt `main()` startup paths, and hardware-specific branches
+that need real devices. Remaining gap to the next ceiling is the settings GUI
+internals, which the offscreen scenarios already drive at the behavior level.

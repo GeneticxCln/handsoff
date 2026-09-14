@@ -146,6 +146,36 @@ in VRAM between questions).
   your voice. No file — or one that will not decode — draws a dashed empty slot
   in the state colour rather than silently falling back to the orb, and
   `--ptt doctor` names the reason either way.
+- **Avatar colours & decoration** — two controls that belong to a *character*
+  rather than to a shape. **Avatar colours** chooses `State colours` (the art is
+  painted in the current state's colour, so the picture can never hide which
+  state it is) or `Original colours` (the art keeps the colours you drew it in,
+  and the state is carried by the rim and by the decoration instead — a yellow
+  character stays yellow in every state, and your voice brightens it rather than
+  repainting it). **Decoration** picks an animated ring that lives *behind* the
+  avatar, in the band the picture gives up when it is on — nine of them:
+  **Ring light** (two arc pairs plus a dimmer counter-rotating pair), **Orbit**
+  (bright heads circling the avatar), **Pulse** (rings that travel outward as
+  you speak), **Aurora** (a shimmering band whose hues sweep around it),
+  **Rainbow ring** (one thick band holding every hue at once, turning),
+  **Sparkles** (points that pop and fade all round a faint ring), **Comet** (a
+  single long-tailed streak sweeping the ring), **Neon tubes** (a segmented tube
+  always lit, with a pulse chasing round it) and **Flames** (tongues of fire
+  licking up, running white-hot at the tips when you talk). Each turns with the
+  animation-energy setting and brightens and quickens with your voice; because
+  the picture's fit shrinks to hand the decoration its band, decoration and art
+  can never overlap, and every one of them is clamped inside the aperture.
+  **Decoration colour** is where a ring stops being a copy of the bubble's mood:
+  `State colour` (the default) tracks the state, `Rainbow` sweeps a hue of its
+  own and speeds up with your voice, and `Colour of its own` keeps one colour
+  whatever the state is — so a ring can be red while the bubble is thinking
+  purple, or a wheel that turns on its own. Choosing either of the independent
+  modes cannot cost readability, because the rim is drawn in the state colour
+  and is the design's outermost ink. When
+  the art carries opaque corners it is cut to a round avatar on a soft
+  state-coloured stage, so an ordinary photo reads as an avatar rather than a
+  pasted rectangle; character art that already has its own silhouette is left
+  exactly as drawn, because masking it could only cut ink on purpose.
 - **One picture per state** — the four fields under **Choose image…** let the
   Image design show a *different picture per state* without a pack folder: set
   **idle**/**listening**/**thinking**/**speaking** and each state draws its own
@@ -215,6 +245,26 @@ in VRAM between questions).
   moves. Previewing switches the strip to the `image` design whatever shape your
   bubble currently draws, because otherwise Preview would look as if it did
   nothing.
+- **A state can be an ANIMATION, not just a still.** A pack's state value is
+  either `"file.png"` or `{"frames": ["a.png", "b.png", …], "fps": 10}` — up to
+  16 frames at 0.5–30 fps — and the painter cycles them by time through the
+  same decode, cache, tint and fit a still takes, so a character can blink,
+  perk up and mouth-flap instead of posing. Every existing pack is unchanged
+  (a still is still a string), a broken frame is refused with the exact
+  sentence a broken still gets (`no file at missing.png (the idle picture)`),
+  and an export of an animated look ships every frame and the fps — a look
+  that moves travels as a look that moves. The preview strip shows an
+  animation's FIRST frame: a decision aid, not a projector.
+- **Avatar decoration** — the Image design can wear a **ring light**: arcs drawn
+  *around* the avatar that rotate with the animation energy, brighten and quicken
+  with your voice, and carry the state colour. The Appearance tab's **Avatar
+  decoration** row is a closed choice (Ring light / Off) and applies live. The
+  picture hands the ring its band by shrinking to fit (the picture can never
+  overlap its own decoration), the whole design still stays inside the aperture,
+  and `doctor` names the ring beside the pack so "what is that light" has an
+  answer. Art with OPAQUE corners — an ordinary rectangular photo — is clipped
+  to a feathered circle so the avatar is round rather than a pasted rectangle;
+  art that already carries its own silhouette (a character PNG) is untouched.
 - **The preview is drawn on the BUBBLE too**, so a look can be judged where it
   will actually live — against your wallpaper, beside your other windows, at the
   size this bubble really is — instead of only in a strip inside a settings

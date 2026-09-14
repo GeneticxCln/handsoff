@@ -28,6 +28,7 @@ import copy
 from pathlib import Path
 
 from . import load_module
+from . import theme as _theme
 
 _schema = load_module("settings_schema")
 DEFAULT_SETTINGS = _schema.DEFAULT_SETTINGS
@@ -192,6 +193,40 @@ def _backup_runtime_json(path: Path) -> None:
 
 # ------------------------------------------------------------------- coercion
 
+# The same vocabulary `core.tools.coerce_bool_arg` accepts for model-supplied
+# arguments, spelled here because `core.settings` is imported BY tools (so it
+# cannot import tools back) and because the two answer the same question in the
+# same words: "false" means false.
+_BOOL_TRUE = frozenset({"true", "yes", "on", "1"})
+_BOOL_FALSE = frozenset({"false", "no", "off", "0", ""})
+
+
+def _bool_flag(value, default: bool) -> bool:
+    """A settings flag, read STRICTLY — because `bool("false")` is True.
+
+    A hand-edited settings.json is the one way junk arrives, and this tree
+    treats it as hostile everywhere else; these flags went through plain
+    `bool()`, which INVERTS the most natural way to write "off": "false", "no"
+    and "off" are all truthy strings. For `permissions.*` and
+    `notification_reader` that is not cosmetic — it silently ENABLES mouse
+    control and private-notification reading on a file that asked for them to be
+    off, which is the one direction that must never fail open. Unknown junk
+    therefore takes the DEFAULT, so an enabling flag stays closed.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        # Only 0 and 1 are meaningful, for the same reason `coerce_bool_arg`
+        # refuses the rest: `bool(2)` is True, a flag nobody asked for.
+        return bool(value) if value in (0, 1) else default
+    token = str(value).strip().lower()
+    if token in _BOOL_TRUE:
+        return True
+    if token in _BOOL_FALSE:
+        return False
+    return default
+
+
 def coerce_settings(s: dict) -> dict:
     """Coerce/validate raw merged settings IN PLACE. Shared by the bubble's
     _load_settings AND the settings app (a hand-edited settings.json must
@@ -204,11 +239,18 @@ def coerce_settings(s: dict) -> dict:
         (a bad value must never kill startup or leak through unvalidated)."""
         try:
             s[key] = min(hi, max(lo, cast(s[key])))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: `int(float("inf"))` — and Python's json parses a
+            # bare `Infinity` token, so one crafted value in settings.json
+            # would otherwise kill startup inside _load_settings.
             log.warning(
                 "invalid %s — using default %r",
                 key, DEFAULT_SETTINGS[key])
             s[key] = DEFAULT_SETTINGS[key]
+
+    def _flag(key: str, default: bool) -> None:
+        """One boolean setting, through the strict reader (see `_bool_flag`)."""
+        s[key] = _bool_flag(s.get(key, default), default)
 
     _num("num_ctx", int, 1024, 2 ** 20)
     _num("history_tokens", int, 0, 2 ** 20)     # 0 = auto (3/4 of num_ctx)
@@ -229,6 +271,24 @@ def coerce_settings(s: dict) -> dict:
     # schema so the setting name and the state it belongs to cannot drift.
     for _key in _schema.DESIGN_IMAGE_KEYS:
         s[_key] = os.path.expanduser(str(s.get(_key) or "").strip())
+    # The decoration AROUND the avatar and how the picture is coloured. Both
+    # are closed choices, so a typo in settings.json cannot leave the bubble
+    # half-decorated or half-tinted: junk falls back to the default rather than
+    # being carried into a painter that would have to guess.
+    _av = str(s.get("avatar_ring", "ring-light")).strip().lower()
+    s["avatar_ring"] = _av if _av in _schema.AVATAR_DECOS else DEFAULT_SETTINGS["avatar_ring"]
+    # The decoration's own colour: one of the schema's two words, or a literal
+    # hex. The hex is accepted through the SAME parser everything else in the
+    # tree validates colours with (`core.theme.hex_to_rgb`, fullmatch), so
+    # "#4f8cffXYZ" and "red" are refused here exactly as they are refused at
+    # the swatch — a colour the panel would reject must not survive a hand-edit
+    # of settings.json either.
+    _dc = str(s.get("avatar_deco_color", "state")).strip().lower()
+    if _dc not in _schema.AVATAR_DECO_COLORS and _theme.hex_to_rgb(_dc) is None:
+        _dc = str(DEFAULT_SETTINGS["avatar_deco_color"])
+    s["avatar_deco_color"] = _dc
+    _at = str(s.get("avatar_tint", "state")).strip().lower()
+    s["avatar_tint"] = _at if _at in _schema.AVATAR_TINTS else DEFAULT_SETTINGS["avatar_tint"]
     # The `image` design's pack: ONE installed folder name. Stripped here and
     # nothing more, for the same reason the path above is not validated: a pack
     # that is temporarily moved or not yet installed must not erase the user's
@@ -247,7 +307,7 @@ def coerce_settings(s: dict) -> dict:
     _num("ram_alert_percent", float, 50.0, 99.0)
     _num("vram_alert_percent", float, 50.0, 99.0)
     _num("confirm_seconds", float, 5.0, 600.0)
-    s["dry_run"] = bool(s.get("dry_run", False))
+    _flag("dry_run", False)
     _pol = s.get("command_policy")
     if isinstance(_pol, dict):
         s["command_policy"] = {
@@ -257,14 +317,14 @@ def coerce_settings(s: dict) -> dict:
         }
     else:
         s["command_policy"] = {}
-    s["resource_alerts"] = bool(s.get("resource_alerts", False))
-    s["notification_reader"] = bool(s.get("notification_reader", False))
+    _flag("resource_alerts", False)
+    _flag("notification_reader", False)
     _nm = s.get("notification_mute_apps", [])
     s["notification_mute_apps"] = ([str(x).strip().lower() for x in _nm if str(x).strip()]
                                    if isinstance(_nm, list) else [])[:32]
-    s["handsfree"] = bool(s.get("handsfree", False))
-    s["streaming_tts"] = bool(s.get("streaming_tts", True))
-    s["wake_word_required"] = bool(s.get("wake_word_required", False))
+    _flag("handsfree", False)
+    _flag("streaming_tts", True)
+    _flag("wake_word_required", False)
     s["assistant_name"] = str(s.get("assistant_name", "assistant")).strip() or "assistant"
     _c = s.get("calendar_ics", [])
     if isinstance(_c, str):
@@ -274,9 +334,9 @@ def coerce_settings(s: dict) -> dict:
     else:
         _c = []
     s["calendar_ics"] = _c[:10]
-    s["wake_spotter"] = bool(s.get("wake_spotter", False))
-    s["mic_selfheal"] = bool(s.get("mic_selfheal", True))
-    s["dictation"] = bool(s.get("dictation", True))
+    _flag("wake_spotter", False)
+    _flag("mic_selfheal", True)
+    _flag("dictation", True)
     _num("followup_seconds", float, 0.0, 120.0)   # 0 = feature off
     _sm = s.get("spotter_models", [])
     s["spotter_models"] = ([str(x).strip() for x in _sm if str(x).strip()]
@@ -292,10 +352,10 @@ def coerce_settings(s: dict) -> dict:
          for k, v in aliases.items() if str(k).strip() and str(v).strip()}
         if isinstance(aliases, dict) else {})
     s["home_place"] = str(s.get("home_place", "")).strip()
-    s["briefing"] = bool(s.get("briefing", False))
-    s["world_warnings"] = bool(s.get("world_warnings", False))
+    _flag("briefing", False)
+    _flag("world_warnings", False)
     _num("world_cooldown_min", float, 5.0, 1440.0)
-    s["hardware_watch"] = bool(s.get("hardware_watch", False))
+    _flag("hardware_watch", False)
     _num("hardware_cooldown_min", float, 5.0, 1440.0)
     _num("hardware_disk_gb", float, 0.5, 1000.0)
     # ponytail: permissions fail-closed — garbage must never enable tools
@@ -304,8 +364,12 @@ def coerce_settings(s: dict) -> dict:
         log.warning("invalid permissions — using defaults (fail-closed)")
         s["permissions"] = dict(DEFAULT_SETTINGS["permissions"])
     else:
-        s["permissions"] = {str(k): bool(v) for k, v in _perms.items()
-                            if str(k).strip()}
+        # Each permission through the strict reader, defaulting CLOSED for a
+        # name the defaults do not know — an unknown permission is one nothing
+        # grants, so it cannot become "yes" by being written down.
+        s["permissions"] = {
+            str(k): _bool_flag(v, bool(DEFAULT_SETTINGS["permissions"].get(str(k), False)))
+            for k, v in _perms.items() if str(k).strip()}
         for k, v in DEFAULT_SETTINGS["permissions"].items():
             s["permissions"].setdefault(k, bool(v))
     # ponytail: unvalidated enums — garbage must fall back to defaults loudly
@@ -529,6 +593,13 @@ def _three_way_merge(expected, current, candidate, path: str):
         # JSON-serializable object into the written file (TypeError at save).
         return copy.deepcopy(current), None
     if current == expected or candidate == current:
+        # The same sentinel trap, reached by the DUAL-DELETE path: when both
+        # disk and GUI deleted a key, `candidate is current is _MISSING`, so
+        # `candidate == current` fires and `deepcopy(candidate)` clones the
+        # sentinel into something `is not _MISSING` — the key then reappears in
+        # the written file as a non-serializable object.
+        if candidate is _MISSING:
+            return _MISSING, None
         return copy.deepcopy(candidate), None
     if (isinstance(expected, dict) and isinstance(current, dict)
             and isinstance(candidate, dict)):
@@ -644,6 +715,21 @@ def _persist_setting(key: str, value, settings_file: Path,
                 "persist_setting %r aborted: settings file unreadable", key)
             return False
         data[key] = value
+        # Coerce what we are about to write, not just what we read: this is the
+        # path a TOOL takes (`set_setting`), and it used to store the model's
+        # raw argument verbatim. A string where a number belongs then persisted,
+        # and every later reader that does `int(...)` on it (history budget,
+        # follow-up window) blew up at runtime — or worse, survived until the
+        # next start silently used the default.
+        #
+        # `probe` is only there to validate: `coerce_settings` assumes every key
+        # is present (it indexes `s[key]`), while `data` is whatever the file
+        # happens to hold. So it is completed from the defaults, coerced, and
+        # only THIS key's coerced value is written back — the rest of the file
+        # is left byte-for-byte as the user had it.
+        probe = {**copy.deepcopy(DEFAULT_SETTINGS), **data}
+        coerce_settings(probe)
+        data[key] = probe[key]
         data["version"] = SETTINGS_VERSION   # every on-disk write is stamped
         # NOTE: _atomic_private_write creates its own uniquely-named temp
         # file; a pre-computed ".json.tmp" path here would reintroduce the

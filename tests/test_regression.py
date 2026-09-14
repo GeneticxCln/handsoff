@@ -1194,6 +1194,81 @@ class TestAuditNineFindings:
         assert a._state == H.IDLE
 
 
+class TestAuditRoundThree:
+    """Third external-audit fixes."""
+
+    def test_a_junk_history_budget_falls_back_instead_of_raising(self, H,
+                                                                 monkeypatch):
+        """`_history_budget` is called on EVERY turn to trim the conversation.
+
+        A bare `int()` on a hand-edited (or pre-coercion) value raised
+        ValueError there, which took out the turn — a config typo became a
+        bubble that could not answer at all.
+        """
+        monkeypatch.setitem(H.SETTINGS, "history_tokens", "lots")
+        assert H._history_budget() == max(
+            1024, H.OLLAMA_NUM_CTX - H._fixed_prompt_tokens() - 1024)
+
+    def test_a_junk_followup_window_closes_instead_of_raising(self, H,
+                                                              monkeypatch):
+        """`_speak` reads the follow-up window on the speech thread AFTER
+        speaking, so a bare `float()` there killed the thread with the sentence
+        already spoken — the reply landed but the bubble looked broken."""
+        assert H._followup_seconds() > 0
+        monkeypatch.setitem(H.SETTINGS, "followup_seconds", "soon")
+        assert H._followup_seconds() == 0.0
+        monkeypatch.setitem(H.SETTINGS, "followup_seconds", -5)
+        assert H._followup_seconds() == 0.0
+
+    def test_a_model_that_refuses_tools_is_remembered_not_re_probed(
+            self, H, monkeypatch):
+        """Probing was dead telemetry: `_brain_deps` handed `core.brain` a
+        FRESH state dict per call, so the recorded refusal was thrown away and
+        `_TOOLS_SUPPORTED` stayed True forever — a tool-less model paid the
+        same failed 400 round-trip on every single turn."""
+        deps = H._brain_deps()
+        assert deps["state"] is H._BRAIN_STATE, "state is not the shared dict"
+        assert H._BRAIN_STATE["tools_supported"] is True
+        H._BRAIN_STATE["tools_supported"] = False
+        assert H._brain_deps()["state"]["tools_supported"] is False
+        H.reload_derived_settings()
+        assert H._BRAIN_STATE["tools_supported"] is False
+
+    def test_the_pipeline_skips_tools_for_a_model_that_refuses_them(
+            self, H, monkeypatch):
+        """The point of remembering: do not send a tools payload (and eat a
+        400) to a model already known to refuse it."""
+        seen = []
+        monkeypatch.setattr(H, "_BRAIN_STATE", {"tools_supported": False})
+        monkeypatch.setattr(H, "ollama_chat",
+                            lambda msgs, tools=None: seen.append(tools)
+                            or {"content": "hi", "tool_calls": []})
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", False)
+        a = H.Assistant.__new__(H.Assistant)
+        a._gen = 1
+        a._tools = types.SimpleNamespace(_set_user_turn=lambda *_: None)
+        a._conversation_for = lambda text: []
+        a._speak = lambda *x, **k: None
+        a._turn_spoke = False
+        a._brain_turn("hi", 1, H.threading.Event())
+        assert seen == [[]], seen
+
+    def test_missed_reminders_are_not_consumed_when_the_prune_fails(
+            self, H, tmp_path, monkeypatch):
+        """If the prune cannot be saved, the reminders are still ON DISK.
+        Reporting them as taken announced the same ones again on the next boot
+        — and every boot after that."""
+        rf = tmp_path / "reminders.json"
+        store = H._reminder_store()
+        monkeypatch.setattr(store, "path", rf)
+        due = [{"name": "gone", "due": H.time.time() - 60}]
+        rf.write_text(H.json.dumps(due), encoding="utf-8")
+        monkeypatch.setattr(store, "save",
+                            lambda items: (_ for _ in ()).throw(OSError("disk")))
+        assert store.take_missed() == []
+        assert rf.exists(), "the file must be left alone"
+
+
 class TestAuditRoundTwo:
     """Second external-audit fixes (verified 2026-09-08)."""
 

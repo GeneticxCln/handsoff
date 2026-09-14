@@ -271,6 +271,32 @@ class TestBoundedRegistry:
         assert reg.snapshot() == {"k": "precious"}
         assert reg.refusals == 0, "a failed reserve is not a refusal"
 
+    def test_committing_twice_does_not_invent_capacity(self, H):
+        """One reservation releases ONE slot, however many times it settles.
+
+        `commit()` gave the slot back unconditionally, so calling it twice on
+        one reservation decremented `_held` twice — the registry then believed
+        it had a free slot it had already handed out, and the next caller was
+        admitted past the cap. The same trap was open to `cancel()` after a
+        commit, so both go through one idempotent release now.
+        """
+        reg = _core_registry.BoundedRegistry("t", 1)
+        slot = reg.reserve()
+        assert reg.reserve() is None, "the only slot was not counted"
+        key, displaced = slot.commit("first")
+        assert reg.room() is False, "a committed entry must still occupy the cap"
+        # The misuse: settle the same reservation again. It must register
+        # nothing new (one reservation, one resource) and must not release a
+        # second slot.
+        again_key, again_displaced = slot.commit("second")
+        slot.cancel()
+        assert (again_key, again_displaced) == (key, displaced)
+        assert reg.snapshot() == {key: "first"}, reg.snapshot()
+        assert reg.room() is False, "capacity was invented by a double release"
+        assert reg.reserve() is None, "a second slot appeared from nowhere"
+        reg.release(key)
+        assert reg.room() is True
+
     def test_two_registries_can_share_one_lock(self, H):
         """The watcher registries share a lock on purpose: their teardown is
         one step, so a watcher cannot start in the gap between the two clears.

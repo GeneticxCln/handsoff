@@ -45,6 +45,11 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
+# The tree's ONE hex parser. Imported rather than re-spelled so `#4f8cffXYZ` is
+# refused identically here, in `core.settings`, at the swatch and in doctor.
+# `theme` is Qt-free, so this cannot make the bubble depend on a display.
+from .theme import hex_to_rgb
+
 # --------------------------------------------------------------- injected host
 # Set by handsoff.py immediately after this module loads (the same shape as
 # core.tools' `time` / `log` / `_DEFAULT_DEPS` injection). The defaults below
@@ -194,6 +199,9 @@ def configure(settings: dict | None = None) -> None:
 # at the number of states a pack can name, so the ceiling stays a constant.
 _IMAGE_CACHE: dict = {}
 _IMAGE_CACHE_MAX = 4
+# (w, h) -> QImage: the feathered ellipse alpha mask `_round_avatar` applies to
+# full-bleed pictures. Bounded in `_feather_mask`; sizes are few and stable.
+_FEATHER_MASKS: dict = {}
 
 # The working canvas for the picture, in pixels. A user's 3000x2000 photo is
 # 24 MB, and this module builds a TINTED COPY of it per painted frame while the
@@ -286,31 +294,110 @@ def _image_entry(path):
     layers = image_layers(raw)
     if layers is not None:
         entry["image"], entry["shade"] = layers
-        entry["pixmap"] = QPixmap.fromImage(layers[0])
     while len(_IMAGE_CACHE) >= _IMAGE_CACHE_MAX:
         _IMAGE_CACHE.pop(next(iter(_IMAGE_CACHE)))
     _IMAGE_CACHE[key] = entry
     return entry
 
 
-def design_image(state: str = ""):
-    """The picture in effect for `state` as a QPixmap, or None."""
-    entry = _image_entry(design_picture(state))
-    return None if entry is None else entry["pixmap"]
+def _entry_pixmap(entry):
+    """`entry`'s QPixmap, built on FIRST request rather than at decode.
+
+    The decode path must stay usable without a QGuiApplication (the pack tests
+    run app-free over QImages only) — and `QPixmap.fromImage` aborts without
+    one. The pixmap is a paint-path concern, so it is built here, on demand,
+    where an app is guaranteed to exist.
+    """
+    if entry["pixmap"] is None and entry["image"] is not None:
+        entry["pixmap"] = QPixmap.fromImage(entry["image"])
+    return entry["pixmap"]
+
+
+def design_image(state: str = "", t: float = 0.0):
+    """The art in effect for `state` as a QPixmap, or None.
+
+    An ANIMATION resolves its frame from `t` here — the same cache, decode and
+    fit as a still, one frame at a time — so the painter never knows the
+    difference beyond receiving a time.
+    """
+    return _design_art_pixmap(design_picture(state), t)
+
+
+def _design_art_image(value, t: float = 0.0):
+    """`value` (path or animation spec) as the QImage to draw now, or None.
+
+    The app-free twin of `_design_art_pixmap`: same frame resolution, same
+    cache, one step earlier — tests (and anything without a QGuiApplication)
+    compare art as QImages, and the pixmap stays a paint-path concern.
+    """
+    if isinstance(value, dict):
+        frames = value.get("frames") or []
+        if not frames:
+            return None
+        fps = value.get("fps") or PACK_FPS_DEFAULT
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = PACK_FPS_DEFAULT
+        idx = int(t * max(0.5, fps)) % len(frames)
+        value = frames[idx]
+    entry = _image_entry(value)
+    return None if entry is None else entry["image"]
+
+
+def _design_art_pixmap(value, t: float = 0.0):
+    """`value` (path or animation spec) as the QPixmap to draw now, or None."""
+    if isinstance(value, dict):
+        frames = value.get("frames") or []
+        if not frames:
+            return None
+        fps = value.get("fps") or PACK_FPS_DEFAULT
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = PACK_FPS_DEFAULT
+        # Frame index from time; a period longer than any frame delay, so a
+        # 0-fps spec cannot freeze or divide by zero (validated, but the paint
+        # path never trusts a manifest twice).
+        idx = int(t * max(0.5, fps)) % len(frames)
+        value = frames[idx]
+    entry = _image_entry(value)
+    return None if entry is None else _entry_pixmap(entry)
 
 
 def design_image_tinted(color: QColor, glow: float = 1.0,
                         energy: float = 0.12, level: float = 0.0,
-                        state: str = ""):
-    """The picture in effect for `state`, in the state colour, or None.
+                        state: str = "", t: float = 0.0):
+    """The art in effect for `state`, in the state colour, or None.
 
     None is the ONE signal a painter uses to draw the empty slot instead, so
     "there is nothing to draw here" has a single cause and a single
     consequence — whether the cause is no picture at all, an unreadable one, or
-    a pack with nothing for this state.
+    a pack with nothing for this state. `t` picks an animation's frame; a still
+    ignores it.
     """
-    entry = _image_entry(design_picture(state))
-    if entry is None or entry["image"] is None or entry["shade"] is None:
+    value = design_picture(state)
+    if isinstance(value, dict):
+        frames = value.get("frames") or []
+        if not frames:
+            return None
+        fps = value.get("fps") or PACK_FPS_DEFAULT
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            fps = PACK_FPS_DEFAULT
+        idx = int(t * max(0.5, fps)) % len(frames)
+        entry = _image_entry(frames[idx])
+    else:
+        entry = _image_entry(value)
+    if entry is None or entry["image"] is None:
+        return None
+    if avatar_natural():
+        # A natural render needs no luminance layer — the picture's own pixels
+        # are the picture — so it cannot be blocked by one failing to compute.
+        return tinted_image(entry["image"], entry["shade"], color,
+                            glow, energy, level, natural=True)
+    if entry["shade"] is None:
         return None
     return tinted_image(entry["image"], entry["shade"], color,
                         glow, energy, level)
@@ -419,6 +506,14 @@ def design_image_problem(path: str | None = None) -> str:
 # carries a denylist.
 PACK_MANIFEST = "pack.json"
 PACK_STATES = (IDLE, LISTENING, THINKING, SPEAKING)
+# An animation is a LIST of frames cycled by time; these bound what a pack may
+# ask the painter to hold. 16 frames of a bounded decode is a constant memory
+# ceiling; 0.5-30 fps covers "slow breathing" to "fast flap" and refuses junk
+# (a string, 0, 1000) with one sentence instead of a division by zero.
+PACK_MAX_FRAMES = 16
+PACK_FPS_MIN = 0.5
+PACK_FPS_MAX = 30.0
+PACK_FPS_DEFAULT = 6.0
 # The setting that holds one picture PER STATE, derived from the state names so
 # a rename cannot desync the setting from the state it belongs to. The schema's
 # `DESIGN_IMAGE_KEYS` is the same four names (it cannot import this module — the
@@ -497,17 +592,93 @@ def _pack_file(folder, rel):
     return str(full)
 
 
+def _resolve_art(value):
+    """A manifest value as the resolver's output: a path or an animation spec.
+
+    A still stays a path STRING; an animation stays a spec dict — the caller
+    (the painter, the exports) branches on that. One function because
+    `design_picture`, `picture_for` and `effective_art` must all answer the
+    same way about the same manifest.
+    """
+    if _is_animation(value):
+        anim, _p = pack_animation(value)
+        return anim
+    return str(value or "")
+
+
+def pack_animation(raw, folder=None):
+    """`raw` as an animation spec: ({"frames": [abs paths], "fps": float}, "").
+
+    A state's manifest value is EITHER a plain string (a still picture, every
+    existing pack) OR an object `{"frames": [paths], "fps": n}` — an ANIMATION.
+    This is the one reader of that shape, returning `(spec, "")` or
+    `(None, problem)`, so validation, the resolver, `pack_problem` and the
+    exports cannot grow four ideas of what an animation is.
+
+    `folder` resolves frame paths absolutely when given; when None the frames
+    stay as given (the validator passes it, the picker's form passes None and
+    resolves later). A spec is NEVER half-returned: an empty frame list, a
+    frame that would leave the pack, more than `PACK_MAX_FRAMES`, or an
+    fps outside its bounds is a refusal naming the first thing wrong.
+    """
+    if isinstance(raw, str):
+        return {"frames": [raw], "fps": PACK_FPS_DEFAULT}, ""
+    if not isinstance(raw, dict):
+        return None, "an animation must be \"file.png\" or {\"frames\": […], \"fps\": n}"
+    frames_raw = raw.get("frames")
+    if not isinstance(frames_raw, list) or not frames_raw:
+        return None, "an animation needs a non-empty \"frames\" list"
+    if len(frames_raw) > PACK_MAX_FRAMES:
+        return None, (f"an animation holds at most {PACK_MAX_FRAMES} frames "
+                      f"(this one names {len(frames_raw)})")
+    frames = []
+    for rel in frames_raw:
+        text = str(rel or "").strip()
+        if not text:
+            return None, "an animation's frames must be file names, not empty"
+        found = _pack_file(folder, text) if folder is not None else text
+        if not found:
+            return None, (f"the frame '{text}' is outside the pack — a picture "
+                          f"has to sit beside it")
+        frames.append(found)
+    fps_raw = raw.get("fps", PACK_FPS_DEFAULT)
+    try:
+        fps = float(fps_raw)
+    except (TypeError, ValueError):
+        return None, f"\"fps\" must be a number ({fps_raw!r} is not)"
+    if not PACK_FPS_MIN <= fps <= PACK_FPS_MAX or fps != fps:
+        return None, (f"\"fps\" must be between {PACK_FPS_MIN:g} and "
+                      f"{PACK_FPS_MAX:g} ({fps:g} is not)")
+    return {"frames": frames, "fps": fps}, ""
+
+
+def _is_animation(raw) -> bool:
+    """Whether a manifest value is the animation shape (dict with frames)."""
+    return isinstance(raw, dict) and isinstance(raw.get("frames"), list)
+
+
 def _build_manifest(slug: str, folder, raw):
     """Validate one parsed manifest; None when it names nothing drawable."""
     if not isinstance(raw, dict):
         return None
     name = str(raw.get("name") or "").strip() or slug
-    fallback = _pack_file(folder, raw.get("any"))
+    if _is_animation(raw.get("any")):
+        anim, _p = pack_animation(raw["any"], folder)
+        fallback = anim if anim else _pack_file(folder, raw.get("any"))
+    else:
+        fallback = _pack_file(folder, raw.get("any"))
     states = {}
     named = raw.get("states")
     if isinstance(named, dict):
         for state in PACK_STATES:
-            found = _pack_file(folder, named.get(state))
+            value = named.get(state)
+            if not value:
+                continue
+            if _is_animation(value):
+                anim, _p = pack_animation(value, folder)
+                found = anim if anim else None
+            else:
+                found = _pack_file(folder, value)
             if found:
                 states[state] = found
     if not fallback and not states:
@@ -554,6 +725,15 @@ def _validate_pack(folder, raw, slug: str = "", display_root=None) -> tuple:
             (state, named.get(state)) for state in PACK_STATES):
         if not rel:
             continue
+        # A state is either a picture or an ANIMATION; the animation's frames
+        # are checked exactly like pictures, so an unreadable frame is refused
+        # with the same sentence a broken still would get.
+        if _is_animation(rel):
+            anim, problem = pack_animation(rel, folder)
+            if problem:
+                return f"the {where} animation: {problem}", None
+            checked.append((where, anim["frames"]))
+            continue
         found = _pack_file(folder, rel)
         if not found:
             return (f"{PACK_MANIFEST} names '{rel}' for {where}, which is "
@@ -562,20 +742,21 @@ def _validate_pack(folder, raw, slug: str = "", display_root=None) -> tuple:
     if not checked:
         return "the pack names no pictures", None
     for where, found in checked:
-        p = Path(found)
-        if not p.exists():
-            return (f"no file at {_shown(p, display_root)} "
-                    f"(the {where} picture)", None)
-        if not p.is_file():
-            return (f"{_shown(p, display_root)} is a folder, not an image "
-                    f"(the {where} picture)", None)
-        img = _decoded_image(p)
-        if img is None:
-            return (f"{p.name} is not an image this build can read "
-                    f"(the {where} picture)", None)
-        if not _has_ink(img):
-            return (f"every pixel of {p.name} is transparent — the {where} "
-                    f"picture would be invisible", None)
+        for p_text in (found if isinstance(found, list) else [found]):
+            p = Path(p_text)
+            if not p.exists():
+                return (f"no file at {_shown(p, display_root)} "
+                        f"(the {where} picture)", None)
+            if not p.is_file():
+                return (f"{_shown(p, display_root)} is a folder, not an image "
+                        f"(the {where} picture)", None)
+            img = _decoded_image(p)
+            if img is None:
+                return (f"{p.name} is not an image this build can read "
+                        f"(the {where} picture)", None)
+            if not _has_ink(img):
+                return (f"every pixel of {p.name} is transparent — the {where} "
+                        f"picture would be invisible", None)
     if not raw.get("any"):
         missing = [s for s in PACK_STATES if s not in named or not named.get(s)]
         if missing:
@@ -643,8 +824,8 @@ def state_pictures(settings=None) -> dict:
     return out
 
 
-def picture_for(pack, single, state: str = "", per_state=None) -> str:
-    """The picture in effect for `state`, by precedence, or "" for the slot.
+def picture_for(pack, single, state: str = "", per_state=None):
+    """The art in effect for `state`, by precedence, or "" for the slot.
 
     A pack is the AUTHORITY: setting one means its pictures are the art, so a
     pack that cannot be read returns "" (the empty slot) rather than silently
@@ -665,7 +846,8 @@ def picture_for(pack, single, state: str = "", per_state=None) -> str:
         manifest = load_pack(slug)
         if manifest is None:
             return ""
-        return str(manifest["states"].get(str(state)) or manifest["any"] or "")
+        value = manifest["states"].get(str(state)) or manifest["any"] or ""
+        return _resolve_art(value)
     own = str((per_state or {}).get(str(state)) or "").strip()
     return own or str(single or "").strip()
 
@@ -680,10 +862,107 @@ def design_picture(state: str = "") -> str:
     """
     live = pack_preview()
     if live is not None:
-        return str(live["states"].get(str(state)) or live["any"] or "")
+        return _resolve_art(live["states"].get(str(state))
+                            or live["any"] or "")
     return picture_for(SETTINGS.get("design_pack"),
                        SETTINGS.get("design_image_path"), state,
                        state_pictures(SETTINGS))
+
+
+def avatar_deco() -> str:
+    """Which decoration the avatar wears: "off" or one of the animations.
+
+    The painter calls this per frame, so the closed choice is read at the same
+    place everything else about the look is — a reload changes the decoration
+    on the next frame with no separate notification path to forget. An
+    unrecognised value is "off": a decoration is drawn from a name, and a name
+    nothing implements must draw nothing rather than something arbitrary.
+    """
+    name = str(SETTINGS.get("avatar_ring") or "").strip().lower()
+    return name if name in DECORATIONS else "off"
+
+
+def avatar_ring_on() -> bool:
+    """Whether the avatar wears ANY decoration (the band is reserved)."""
+    return avatar_deco() != "off"
+
+
+# The two WORDS `avatar_deco_color` accepts; anything else must be a literal
+# hex. Declared here as well as in `settings_schema` because this module cannot
+# import the schema (the installed layout resolves it through a loader) — and
+# pinned by a guard asserting the two tuples are EQUAL, so a mode added to one
+# is not a mode the other refuses.
+DECO_COLOR_MODES = ("state", "rainbow")
+
+
+def avatar_deco_color() -> str:
+    """What the decoration is coloured with: a mode word, or a literal hex.
+
+    Read per frame next to everything else about the look, so a reload changes
+    it with no separate notification path to forget. Anything unrecognised is
+    "state", which is the honest fallback: the state colour is the one answer
+    that is always available, and a ring left uncoloured would be the "nothing
+    applied" defect this card exists to answer.
+
+    A hex is validated through `core.theme.hex_to_rgb` — the tree's ONE hex
+    parser, fullmatch — so `#4f8cffXYZ` is refused here exactly as the swatch
+    refuses it. Named Qt colours (`red`) are refused too, because they would
+    make `settings.json` mean something different in another Qt version.
+    """
+    raw = str(SETTINGS.get("avatar_deco_color") or "").strip().lower()
+    if raw in DECO_COLOR_MODES:
+        return raw
+    if hex_to_rgb(raw) is not None:
+        return raw
+    return "state"
+
+
+def avatar_deco_colour(state_color, t: float, lv: float, anim: float,
+                       mode: str = ""):
+    """The colour the decoration is drawn in, INDEPENDENT of the state.
+
+    Three sources in one place, because the painters own their motion and
+    nothing else — the colour is decided here so that "the ring is its own
+    colour" is one decision rather than a term each painter has to remember:
+
+      * `state` — the state colour, the default, unchanged behaviour;
+      * `rainbow` — a hue that sweeps on its own, sped up by the animation
+        energy and the voice, so the ring MOVES in colour as well as in shape;
+      * a literal hex — the colour the user picked, exactly.
+
+    Independence cannot cost readability: the rim is drawn in the state colour
+    and is the design's outermost ink, so which state the bubble is in stays
+    answerable however the decoration is coloured.
+
+    `mode` lets a caller draw a value it HOLDS but has not saved — the settings
+    app's preview strip, which shows the form rather than the disk. The default
+    reads the settings, so the bubble still has exactly one source of truth and
+    the preview is not a second implementation of the choice.
+    """
+    mode = mode or avatar_deco_color()
+    if mode == "state":
+        return QColor(state_color)
+    if mode == "rainbow":
+        # A full turn every ~8 s at energy 1, up to ~2.5x that at the voice
+        # ceiling. Saturation stays below 1 so the ring reads as light rather
+        # than as a colour wheel, and lightness tracks the voice so a loud
+        # rainbow is a brighter one — the same "brighter with the voice"
+        # contract every decoration already has.
+        hue = (t * 0.12 * anim * (1.0 + 0.35 * lv)) % 1.0
+        light = min(0.80, 0.52 + 0.10 * lv + 0.05 * max(0.0, anim - 1.0))
+        return QColor.fromHslF(hue, 0.78, max(0.44, light))
+    return QColor(mode)
+
+
+def avatar_natural() -> bool:
+    """Whether the picture keeps its own colours instead of the state wash.
+
+    The wash is what makes a photo read as the bubble's mood, and what makes a
+    drawn character impossible: every silhouette comes out the state hue. When
+    this is on the state is carried by the rim and the decoration instead, so
+    "which state am I in" is still answerable without repainting the art.
+    """
+    return str(SETTINGS.get("avatar_tint") or "").strip().lower() == "natural"
 
 
 def installed_packs() -> list:
@@ -1065,8 +1344,8 @@ def effective_art(settings=None) -> tuple:
         manifest = load_pack(slug)
         if manifest is None:
             return "", {}
-        return (str(manifest.get("any") or ""),
-                {s: str(p) for s, p in (manifest.get("states") or {}).items()})
+        return (_resolve_art(manifest.get("any") or ""),
+                {s: _resolve_art(p) for s, p in (manifest.get("states") or {}).items()})
     return (str(src.get("design_image_path") or "").strip(),
             state_pictures(src))
 
@@ -1132,19 +1411,40 @@ def _stage_art(parent, slug, name, settings) -> tuple:
     manifest: dict = {"name": str(name).strip() or slug}
     named: dict = {}
     copies: list = []
+
+    def _copy_one(label: str, source_text: str) -> str:
+        source = os.path.expanduser(source_text)
+        file_name = _inside(label, source)
+        copies.append((source, file_name))
+        return file_name
+
+    def _copy_art(label: str, value) -> "dict | str | None":
+        """One state's art into staging: its manifest value, or None.
+
+        A STILL copies as before; an ANIMATION copies every frame and exports
+        the spec — so an animated look shares as animated, never as only its
+        first frame. `_validate_pack` re-judges the result below, so the spec
+        written here is the spec the pack will be read back with.
+        """
+        if isinstance(value, dict):
+            anim, problem = pack_animation(value)
+            if problem or not anim:
+                return None
+            frames = [_copy_one(f"{label}-frame-{i}", f)
+                      for i, f in enumerate(anim["frames"])]
+            return {"frames": frames, "fps": anim["fps"]}
+        path = str(value or "").strip()
+        return _copy_one(label, path) if path else None
+
     for state in PACK_STATES:
-        path = str(states.get(state) or "").strip()
-        if not path:
-            continue
-        source = os.path.expanduser(path)
-        file_name = _inside(state, source)
-        named[state] = file_name
-        copies.append((source, file_name))
+        if states.get(state):
+            entry = _copy_art(state, states[state])
+            if entry is not None:
+                named[state] = entry
     if fallback:
-        source = os.path.expanduser(fallback)
-        file_name = _inside("any", source)
-        manifest["any"] = file_name
-        copies.append((source, file_name))
+        entry = _copy_art("any", fallback)
+        if entry is not None:
+            manifest["any"] = entry
     if named:
         manifest["states"] = named
     staging = None
@@ -1423,7 +1723,8 @@ def _image_lights(color: QColor, glow: float, energy: float, level: float):
 
 
 def tinted_image(img, shade, color: QColor, glow: float = 1.0,
-                 energy: float = 0.12, level: float = 0.0):
+                 energy: float = 0.12, level: float = 0.0,
+                 natural: bool = False):
     """An image as a state-coloured silhouette that keeps its own luminance.
 
     Composition ops only — SourceIn to lay the state colour into the image's
@@ -1445,6 +1746,32 @@ def tinted_image(img, shade, color: QColor, glow: float = 1.0,
     out.fill(Qt.transparent)
     q = QPainter(out)
     q.drawImage(0, 0, img)
+    if natural:
+        # The picture KEEPS its colours. Two passes only, both of which a
+        # character can survive: a state-coloured veil low enough to read as a
+        # cast of light rather than a repaint (so "which state" still colours
+        # the face), then a WHITE brighten driven by the voice — a character
+        # that literally lights up when spoken to, without its hue changing.
+        # The veil is a CAST of the state colour, and its ceiling is what makes
+        # that true: at full voice it is under a fifth of the picture, because
+        # a stronger wash is the repaint this mode exists to stop — a yellow
+        # character that turns blue when it speaks has not been kept.
+        veil = QColor(color)
+        veil.setAlpha(int(min(52.0, (10 + 12 * glow) + 18 * level)))
+        q.setCompositionMode(QPainter.CompositionMode_SourceAtop)
+        q.fillRect(out.rect(), veil)
+        # The voice's real channel here is BRIGHTNESS: a screen pass that lifts
+        # the art toward the light without touching its hue, so the character
+        # visibly lights up when spoken to and stays itself.
+        lift = int(min(150.0, 10.0 + 30.0 * energy + 95.0 * level))
+        if lift > 0:
+            hot = QColor(255, 255, 255, lift)
+            q.setCompositionMode(QPainter.CompositionMode_Screen)
+            q.setOpacity(min(1.0, 0.22 + 0.5 * max(level, 0.0)))
+            q.fillRect(out.rect(), hot)
+            q.setOpacity(1.0)
+        q.end()
+        return out
     q.setCompositionMode(QPainter.CompositionMode_SourceIn)
     grad = QLinearGradient(0.0, 0.0, 0.0, float(img.height()))
     top, bottom = _image_lights(color, glow, energy, level)
@@ -3002,14 +3329,113 @@ class BubbleWidget(QWidget):
         # ceiling is what leaves the rim (the outermost element drawn) inside
         # the aperture at every value either slider can hold. Neutral at
         # silence: lv contributes none of the 5%, and the sway is 2% of radius.
+        deco = avatar_deco()
+        ring_on = deco != "off"
+        # The ring light lives in the band the smaller fit vacates, so the
+        # picture and the decoration can never overlap: when the ring is on,
+        # the picture's fit shrinks to hand it its band. The rim stays the
+        # outermost ink of the design either way.
+        fit_k = 0.76 if ring_on else 0.88
         breath = 1.0 + 0.05 * lv + 0.02 * anim * math.sin(t * 2.4 * anim)
-        fit = budget * 0.88 * breath
-        picture = design_image_tinted(color, glow, energy, lv, self._state)
+        fit = budget * fit_k * breath
+        if ring_on:
+            # The band the picture vacated: from just outside its own edge to
+            # just inside the aperture. `0.94` leaves room for the widest pen a
+            # decoration may use, so no decoration can touch the glass edge.
+            self._draw_avatar_deco(p, cx, cy, fit * 1.03, budget * 0.94, deco,
+                                   t, lv, color, glow, anim)
+        # The stage the avatar stands on: a soft disc in the state colour UNDER
+        # the art. A transparent-background character (the normal case for a
+        # pack) would otherwise be drawn straight onto the wallpaper, so the
+        # figure reads as cut out rather than placed; alpha stays low so the
+        # art is never competing with its own backdrop.
+        self._draw_avatar_stage(p, cx, cy, fit, lv, color, glow)
+        picture = design_image_tinted(color, glow, energy, lv, self._state, t)
         if picture is not None and not picture.isNull():
             self._draw_image_art(p, picture, cx, cy, fit, t, lv, anim)
         else:
             self._draw_image_slot(p, cx, cy, fit, t, lv, anim, color, glow)
-        self._draw_image_rim(p, cx, cy, fit, lv, color, glow)
+        self._draw_image_rim(p, cx, cy, fit, lv, color, glow,
+                             natural=avatar_natural())
+
+    @staticmethod
+    def _needs_rounding(img) -> bool:
+        """Whether an avatar picture has OPAQUE corners — a full-bleed rect.
+
+        Art that already carries its own silhouette (transparent corners, the
+        way a character PNG is drawn) is left alone: masking it could only cut
+        ink it drew on purpose. A rectangular photo has four opaque corners
+        and is the thing that reads as a pasted rectangle rather than an
+        avatar. Four pixel reads per frame, on the C++ side — nothing.
+        """
+        if img is None or img.isNull():
+            return False
+        w, h = img.width(), img.height()
+        return any(img.pixelColor(x, y).alpha() > 200
+                   for x, y in ((1, 1), (w - 2, 1), (1, h - 2), (w - 2, h - 2)))
+
+    @staticmethod
+    def _feather_mask(w: int, h: int):
+        """A soft-edged ellipse alpha mask, cached by size.
+
+        Solid to 86% of the inscribed radius, faded out by 97% — the feather
+        is what makes a masked photo read as an avatar instead of a sticker.
+        Cached per (w, h): the mask depends on nothing else, and the picture
+        size is stable across frames, so the gradient is built once.
+        """
+        key = (w, h)
+        cached = _FEATHER_MASKS.get(key)
+        if cached is not None:
+            return cached
+        m = QImage(w, h, QImage.Format_ARGB32_Premultiplied)
+        if m.isNull():
+            return None
+        m.fill(Qt.transparent)
+        q = QPainter(m)
+        q.setRenderHint(QPainter.Antialiasing, True)
+        r = 0.5 * min(w, h)
+        grad = QRadialGradient(QPointF(w / 2.0, h / 2.0), r)
+        white = QColor(255, 255, 255, 255)
+        grad.setColorAt(0.0, white)
+        grad.setColorAt(0.86, white)
+        edge = QColor(255, 255, 255, 0)
+        grad.setColorAt(0.97, edge)
+        grad.setColorAt(1.0, edge)
+        q.setCompositionMode(QPainter.CompositionMode_Source)
+        q.setPen(Qt.NoPen)
+        q.setBrush(QBrush(grad))
+        q.drawEllipse(QPointF(w / 2.0, h / 2.0), r, r)
+        q.end()
+        if len(_FEATHER_MASKS) > 8:          # bounded: sizes are few and stable
+            _FEATHER_MASKS.clear()
+        _FEATHER_MASKS[key] = m
+        return m
+
+    @staticmethod
+    def _round_avatar(picture):
+        """The picture clipped to a feathered circle — or unchanged.
+
+        Only full-bleed art is masked (see `_needs_rounding`); the offscreen
+        composite is the same size as the picture, so the draw below is the
+        only consumer and nothing else can see the intermediate.
+        """
+        if not BubbleWidget._needs_rounding(picture):
+            return picture
+        w, h = picture.width(), picture.height()
+        mask = BubbleWidget._feather_mask(w, h)
+        if mask is None:
+            return picture
+        out = QImage(picture.size(), QImage.Format_ARGB32_Premultiplied)
+        if out.isNull():
+            return picture
+        out.fill(Qt.transparent)
+        q = QPainter(out)
+        q.setCompositionMode(QPainter.CompositionMode_Source)
+        q.drawImage(0, 0, picture)
+        q.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        q.drawImage(0, 0, mask)
+        q.end()
+        return out
 
     @staticmethod
     def _draw_image_art(p: QPainter, picture, cx: float, cy: float, fit: float,
@@ -3028,12 +3454,355 @@ class BubbleWidget(QWidget):
             return
         scale = fit / half
         w, h = iw * scale, ih * scale
+        picture = BubbleWidget._round_avatar(picture)
         p.save()
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         p.translate(cx, cy)
         p.rotate(3.5 * lv * math.sin(t * 1.9 * anim))
         p.drawImage(QRectF(-w / 2.0, -h / 2.0, w, h), picture)
         p.restore()
+
+    @staticmethod
+    def _draw_avatar_stage(p: QPainter, cx: float, cy: float, fit: float,
+                           lv: float, color: QColor, glow: float) -> None:
+        """The soft disc behind the avatar: contrast, and a floor to stand on.
+
+        Sized to the picture's own fit (1.04x, so it peeks out from behind the
+        art's edge instead of underlapping it) and lit by the voice, because
+        this is part of the same body of light the rim and ring belong to.
+        """
+        r = fit * 1.04
+        if r <= 0.0:
+            return
+        grad = QRadialGradient(QPointF(cx, cy), r)
+        inner = QColor(color).darker(150)
+        inner.setAlpha(int(min(255.0, (58 + 70 * lv) * glow)))
+        grad.setColorAt(0.0, inner)
+        edge = QColor(color)
+        edge.setAlpha(int(min(255.0, (22 + 30 * lv) * glow)))
+        grad.setColorAt(0.72, edge)
+        edge.setAlpha(0)
+        grad.setColorAt(1.0, edge)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+
+    @staticmethod
+    def _draw_avatar_deco(p: QPainter, cx: float, cy: float, lo: float,
+                          hi: float, name: str, t: float, lv: float,
+                          color: QColor, glow: float, anim: float) -> None:
+        """The avatar's decoration: one ANIMATION, chosen by name.
+
+        Painted FIRST, before the picture and the rim, so the avatar always
+        sits over its own decoration — a light behind a person, not on them.
+
+        Every decoration lives between `lo` (just outside the picture's fit) and
+        `hi` (inside the aperture), so no decoration can fight the picture for
+        space or leave the glass: the GEOMETRY is the caller's, and each painter
+        only owns its own motion. Motion speed comes from the animation energy
+        and the voice brightens and quickens it — the same division of labour
+        every design in this file follows.
+        """
+        if hi <= lo:
+            return
+        painter = DECORATIONS.get(str(name))
+        if painter is None:
+            return
+        # ONE place decides the decoration's colour, so "the ring is its own
+        # colour" is a decision rather than a term each painter has to
+        # remember. The painters own their MOTION and nothing else.
+        painter(p, cx, cy, lo, hi, t, lv,
+                avatar_deco_colour(color, t, lv, anim), glow, anim)
+
+    @staticmethod
+    def _deco_ring_light(p: QPainter, cx: float, cy: float, lo: float,
+                         hi: float, t: float, lv: float, color: QColor,
+                         glow: float, anim: float) -> None:
+        """A ring light: two arc pairs, and a dimmer pair counter-rotating.
+
+        A ring LIGHT has to read as light: the base alpha is high enough that
+        the arcs are the brightest thing outside the avatar at silence, and the
+        voice drives both brightness and rotation from there.
+        """
+        r = (lo + hi) * 0.5
+        width = max(2.2, (hi - lo) * 0.42)
+        base = QColor(color).lighter(160)
+        base.setAlpha(int(min(255.0, (120 + 90 * lv) * glow)))
+        pen = QPen(base, width, Qt.SolidLine, Qt.RoundCap)
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(t * 55.0 * anim * (1.0 + 0.45 * lv))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(pen)
+        # Two arc pairs opposite each other — a ring light's broken segments,
+        # not a full circle (that is the rim's job).
+        for start in (0.0, 105.0, 180.0, 285.0):
+            p.drawArc(QRectF(-r, -r, 2.0 * r, 2.0 * r),
+                      int(start * 16.0), int(55.0 * 16.0))
+        # The counter-arc pair, dimmer and slightly larger, turning the other
+        # way — the second half of the "light" reading.
+        outer = r + width * 0.9
+        dim = QColor(color).lighter(140)
+        dim.setAlpha(int(min(255.0, (70 + 60 * lv) * glow)))
+        p.setPen(QPen(dim, width * 0.55, Qt.SolidLine, Qt.RoundCap))
+        p.rotate(-2.0 * t * 55.0 * anim * (1.0 + 0.45 * lv))
+        for start in (40.0, 220.0):
+            p.drawArc(QRectF(-outer, -outer, 2.0 * outer, 2.0 * outer),
+                      int(start * 16.0), int(70.0 * 16.0))
+        p.restore()
+
+    @staticmethod
+    def _deco_orbit(p: QPainter, cx: float, cy: float, lo: float, hi: float,
+                    t: float, lv: float, color: QColor, glow: float,
+                    anim: float) -> None:
+        """Three comets orbiting at different radii, each with a fading tail.
+
+        The tail is drawn as dots falling back along the same orbit rather than
+        as a stroked path: a path would have to be built per frame, and the
+        comet is a point with a smear, not a shape the eye tracks.
+        """
+        p.setPen(Qt.NoPen)
+        band = hi - lo
+        for i in range(3):
+            r = lo + band * ((i + 1) / 4.0)
+            a = (t * (1.9 - 0.5 * i) * anim * (1.0 + 0.5 * lv)) + i * 2.1
+            head = max(1.5, band * 0.16) * (1.0 + 0.3 * lv)
+            hot = QColor(color).lighter(205)
+            hot.setAlpha(int(min(255.0, (150 + 105 * lv) * glow)))
+            p.setBrush(hot)
+            p.drawEllipse(QPointF(cx + r * math.cos(a), cy + r * math.sin(a)),
+                          head, head)
+            for k in range(1, 7):
+                fade = (1.0 - k / 7.0) ** 1.6
+                rad = head * (0.85 - 0.1 * k)
+                if rad <= 0.35:
+                    break
+                tail = QColor(color).lighter(170)
+                tail.setAlpha(int(min(255.0, (120 + 90 * lv) * glow * fade)))
+                aa = a - k * 0.17
+                p.setBrush(tail)
+                p.drawEllipse(QPointF(cx + r * math.cos(aa),
+                                      cy + r * math.sin(aa)), rad, rad)
+
+    @staticmethod
+    def _deco_pulse(p: QPainter, cx: float, cy: float, lo: float, hi: float,
+                    t: float, lv: float, color: QColor, glow: float,
+                    anim: float) -> None:
+        """Rings travelling outward and fading — a heartbeat around the avatar."""
+        band = hi - lo
+        p.setBrush(Qt.NoBrush)
+        for i in range(3):
+            phase = (t * 0.55 * anim * (1.0 + 0.6 * lv) + i / 3.0) % 1.0
+            fade = 1.0 - phase
+            ring = QColor(color).lighter(180)
+            ring.setAlpha(int(min(255.0, (95 + 120 * lv) * glow * fade)))
+            width = max(1.2, band * 0.16 * (0.4 + 0.6 * fade))
+            p.setPen(QPen(ring, width))
+            r = lo + band * phase
+            p.drawEllipse(QPointF(cx, cy), r, r)
+
+    @staticmethod
+    def _deco_aurora(p: QPainter, cx: float, cy: float, lo: float, hi: float,
+                     t: float, lv: float, color: QColor, glow: float,
+                     anim: float) -> None:
+        """Three ribbons of light drifting around the avatar in slow waves."""
+        band = hi - lo
+        p.setBrush(Qt.NoBrush)
+        for band_i in range(3):
+            base_r = lo + band * (0.28 + 0.26 * band_i)
+            amp = band * (0.10 + 0.04 * band_i)
+            k = 3 + band_i * 2
+            speed = (1.3 + 0.5 * band_i) * anim
+            path = QPainterPath()
+            n = 72
+            for i in range(n + 1):
+                ang = i * 2 * math.pi / n
+                r = base_r + amp * math.sin(k * ang + t * speed * 2.0 + band_i)
+                x, y = cx + r * math.cos(ang), cy + r * math.sin(ang)
+                path.moveTo(x, y) if i == 0 else path.lineTo(x, y)
+            col = QColor(color).lighter(190 if band_i % 2 == 0 else 150)
+            col.setAlpha(int(min(255.0, (90 + 95 * lv) * glow)))
+            p.setPen(QPen(col, max(1.2, band * 0.13), Qt.SolidLine, Qt.RoundCap))
+            p.drawPath(path)
+
+    @staticmethod
+    def _deco_rainbow(p: QPainter, cx: float, cy: float, lo: float, hi: float,
+                      t: float, lv: float, color: QColor, glow: float,
+                      anim: float) -> None:
+        """A full hue wheel stroked as ONE ring, turning.
+
+        Not a circle in a single colour: the point of a rainbow ring is that
+        every angle is a different hue, so it is a CONICAL gradient. The sweep
+        is anchored at the decoration's OWN hue, which is what makes this mean
+        something under every colour choice instead of ignoring the picker —
+        `state` hangs the wheel off the state hue, a custom colour hangs it off
+        that colour, and `rainbow` mode feeds it a hue that is already moving.
+        The first and last stop are the same colour, so the wheel has no seam.
+        """
+        band = hi - lo
+        r = lo + band * 0.5
+        # A BAND, not a hairline: the wheel is the decoration, so the ring
+        # fills the space the picture gave up (0.86 of the band at its outer
+        # edge) rather than drawing a thin line through the middle of it.
+        width = max(2.0, band * 0.72)
+        base = QColor(color)
+        h0 = max(base.hueF(), 0.0)
+        sat = max(0.55, base.hslSaturationF())
+        light = min(0.86, max(0.46, base.lightnessF() + 0.10 + 0.10 * lv))
+        grad = QConicalGradient(QPointF(cx, cy),
+                                -90.0 + t * 40.0 * anim * (1.0 + 0.4 * lv))
+        alpha = int(min(255.0, (130 + 95 * lv) * glow))
+        for i in range(13):
+            f = i / 12.0
+            col = QColor.fromHslF((h0 + f) % 1.0, sat, light)
+            col.setAlpha(alpha)
+            grad.setColorAt(f, col)          # f = 1.0 is h0 again: no seam
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QBrush(grad), width, Qt.SolidLine, Qt.RoundCap))
+        p.drawEllipse(QPointF(cx, cy), r, r)
+
+    @staticmethod
+    def _deco_sparkle(p: QPainter, cx: float, cy: float, lo: float, hi: float,
+                      t: float, lv: float, color: QColor, glow: float,
+                      anim: float) -> None:
+        """Twinkling points around a faint ring.
+
+        The faint circle is the RING and the points are what the eye follows:
+        each pops on its own phase and is dark for most of its cycle, so the
+        ring reads as alive rather than as a band that is always lit.
+        """
+        band = hi - lo
+        p.setBrush(Qt.NoBrush)
+        faint = QColor(color).lighter(135)
+        faint.setAlpha(int(min(255.0, (60 + 45 * lv) * glow)))
+        p.setPen(QPen(faint, max(1.0, band * 0.10)))
+        p.drawEllipse(QPointF(cx, cy), lo + band * 0.5, lo + band * 0.5)
+        p.setPen(Qt.NoPen)
+        n = 9
+        for i in range(n):
+            phase = (t * (0.55 + 0.35 * ((i * 7) % 5) / 4.0) * anim
+                     * (1.0 + 0.5 * lv) + i * 0.37) % 1.0
+            # a SPIKE, not a sine: nothing for most of the cycle, blazing at
+            # the top of it. A slowly breathing dot would be a lamp, not a
+            # sparkle.
+            w = 1.0 - min(1.0, abs(phase - 0.5) * 4.0)
+            if w <= 0.0:
+                continue
+            ang = i * (2.0 * math.pi / n) + t * 0.25 * anim
+            rr = lo + band * (0.30 + 0.40 * ((i * 3) % 4) / 3.0)
+            size = max(0.8, band * (0.10 + 0.12 * w))
+            hot = QColor(color).lighter(190)
+            hot.setAlpha(int(min(255.0, (150 + 105 * lv) * glow * w)))
+            p.setBrush(hot)
+            p.drawEllipse(QPointF(cx + rr * math.cos(ang),
+                                  cy + rr * math.sin(ang)), size, size)
+
+    @staticmethod
+    def _deco_comet(p: QPainter, cx: float, cy: float, lo: float, hi: float,
+                    t: float, lv: float, color: QColor, glow: float,
+                    anim: float) -> None:
+        """ONE comet with a long tail, sweeping the ring.
+
+        Deliberately not `orbit`: orbit is three short-tailed points at three
+        radii and reads as lights, this is a single streak whose TAIL is the
+        point of it, so it reads as motion at a glance. The head rides the
+        OUTER part of the band and the tail sweeps back and inward, which is
+        what a comet looks like — and it puts the brightest ink at 0.89 of the
+        band rather than at the middle, so the decoration uses the room it was
+        given instead of crowding the picture. The tail is dots along that arc
+        rather than a stroked path: a path would have to be built per frame,
+        and it is a smear, not a shape the eye tracks.
+        """
+        band = hi - lo
+        a = t * 2.6 * anim * (1.0 + 0.6 * lv)
+        p.setPen(Qt.NoPen)
+        for k in range(24, -1, -1):
+            f = k / 24.0
+            r = lo + band * (0.74 - 0.42 * f)
+            rad = max(0.5, band * (0.15 - 0.11 * f))
+            head = QColor(color).lighter(int(205 - 65 * f))
+            head.setAlpha(int(min(255.0, (150 + 105 * lv) * glow
+                                  * (1.0 - f) ** 1.5)))
+            p.setBrush(head)
+            aa = a - f * 1.5
+            p.drawEllipse(QPointF(cx + r * math.cos(aa), cy + r * math.sin(aa)),
+                          rad, rad)
+
+    @staticmethod
+    def _deco_neon(p: QPainter, cx: float, cy: float, lo: float, hi: float,
+                   t: float, lv: float, color: QColor, glow: float,
+                   anim: float) -> None:
+        """A segmented neon tube with a pulse chasing round it.
+
+        The tube is ALWAYS there, dim, and the chase is what moves — which is
+        what makes this read as a lit sign rather than as arcs blinking on and
+        off. The chase is one lit segment plus two lagging halos in the same
+        colour, so the smear is light falling off instead of a second colour.
+        """
+        band = hi - lo
+        r = lo + band * 0.5
+        width = max(2.0, band * 0.40)
+        seg, pitch = 22.0, 30.0
+        rect = QRectF(cx - r, cy - r, 2.0 * r, 2.0 * r)
+        p.setBrush(Qt.NoBrush)
+        dim = QColor(color).lighter(120)
+        dim.setAlpha(int(min(255.0, (48 + 40 * lv) * glow)))
+        p.setPen(QPen(dim, width, Qt.SolidLine, Qt.FlatCap))
+        for i in range(max(6, int(360.0 / pitch))):
+            p.drawArc(rect, int(i * pitch * 16.0), int(seg * 16.0))
+        pos = (t * 0.55 * anim * (1.0 + 0.5 * lv)) % 1.0
+        for k in range(3):
+            lit = QColor(color).lighter(200 - 25 * k)
+            lit.setAlpha(int(min(255.0, (140 + 110 * lv) * glow
+                                 * (1.0 - 0.37 * k))))
+            p.setPen(QPen(lit, width * (1.0 + 0.4 * k), Qt.SolidLine, Qt.FlatCap))
+            start = (pos * 360.0 - k * 26.0) % 360.0
+            p.drawArc(rect, int(start * 16.0), int(seg * 16.0))
+
+    @staticmethod
+    def _deco_flames(p: QPainter, cx: float, cy: float, lo: float, hi: float,
+                     t: float, lv: float, color: QColor, glow: float,
+                     anim: float) -> None:
+        """Tongues of fire licking up around the avatar.
+
+        Each tongue is a tapered cone whose height flickers on its own phase,
+        running to near-white at the tip: fire is the one decoration the eye
+        reads as WARMTH, and a flame drawn in one flat tone reads as a spike.
+        The tallest tongue the flicker can produce is 0.72 of the band, taken
+        from the band's own inner edge — so no position of the animation can
+        reach `hi`, by construction rather than by clamping.
+        """
+        band = hi - lo
+        base_r = lo + band * 0.18
+        p.setPen(Qt.NoPen)
+        n = 11
+        for i in range(n):
+            ang = i * (2.0 * math.pi / n)
+            ph = (t * (1.5 + 0.35 * ((i * 5) % 3)) * anim
+                  * (1.0 + 0.5 * lv) + i * 0.7) % 1.0
+            # two flames per tongue per cycle, so the ring never looks synced
+            flick = 0.5 + 0.5 * math.sin(ph * 4.0 * math.pi + i)
+            height = band * (0.26 + 0.46 * flick)
+            ca, sa = math.cos(ang), math.sin(ang)
+            bx, by = cx + base_r * ca, cy + base_r * sa
+            tipx, tipy = cx + (base_r + height) * ca, cy + (base_r + height) * sa
+            grad = QLinearGradient(bx, by, tipx, tipy)
+            mid = QColor(color).lighter(150)
+            mid.setAlpha(int(min(255.0, (120 + 100 * lv) * glow)))
+            tip = QColor(color).lighter(235)
+            tip.setAlpha(int(min(255.0, (70 + 120 * lv) * glow)))
+            grad.setColorAt(0.0, mid)
+            grad.setColorAt(1.0, tip)
+            p.setBrush(QBrush(grad))
+            w = band * 0.26
+            waist = base_r + height * 0.55
+            path = QPainterPath()
+            path.moveTo(bx - w * sa, by + w * ca)
+            path.quadTo(cx + waist * ca, cy + waist * sa, tipx, tipy)
+            path.quadTo(cx + waist * ca, cy + waist * sa,
+                        bx + w * sa, by - w * ca)
+            path.closeSubpath()
+            p.drawPath(path)
 
     @staticmethod
     def _draw_image_slot(p: QPainter, cx: float, cy: float, fit: float,
@@ -3074,7 +3843,8 @@ class BubbleWidget(QWidget):
 
     @staticmethod
     def _draw_image_rim(p: QPainter, cx: float, cy: float, fit: float,
-                        lv: float, color: QColor, glow: float) -> None:
+                        lv: float, color: QColor, glow: float,
+                        natural: bool = False) -> None:
         """The state-colour rim: why a photo can never hide which state it is.
 
         A picture may be any colour at all — that is the point of choosing one
@@ -3091,9 +3861,21 @@ class BubbleWidget(QWidget):
         halo = QRadialGradient(QPointF(cx, cy), outer)
         hc = QColor(color)
         hc.setAlpha(int(min(255.0, (70 + 130 * lv) * glow)))
-        halo.setColorAt(max(0.0, min(1.0, (r - width) / outer)), hc)
-        hc.setAlpha(0)
-        halo.setColorAt(1.0, hc)
+        if natural:
+            # The halo is a RING, not a disc. Filling the disc puts ~27% of the
+            # state colour over the picture, which — with the veil — is the
+            # repaint "Original colours" exists to stop: a yellow character
+            # came out blue even with the wash switched off. Transparent until
+            # past the art, bright at the rim, gone at the aperture.
+            clear = QColor(hc)
+            clear.setAlpha(0)
+            halo.setColorAt(0.0, clear)
+            halo.setColorAt(0.70, clear)
+            halo.setColorAt(1.0, hc)
+        else:
+            halo.setColorAt(max(0.0, min(1.0, (r - width) / outer)), hc)
+            hc.setAlpha(0)
+            halo.setColorAt(1.0, hc)
         p.setPen(Qt.NoPen)
         p.setBrush(QBrush(halo))
         p.drawEllipse(QPointF(cx, cy), outer, outer)
@@ -3259,3 +4041,21 @@ class BubbleWidget(QWidget):
 
     def closeEvent(self, _e) -> None:
         self._assistant.shutdown()
+
+
+# The decorations, by name: the closed set `avatar_deco()` validates against and
+# the painters it dispatches to. ONE table, so a name cannot be valid but
+# unimplemented (which would draw nothing, silently) or implemented but invalid
+# (which the picker could never select). Defined after the class because the
+# painters are its static methods.
+DECORATIONS = {
+    "ring-light": BubbleWidget._deco_ring_light,
+    "orbit": BubbleWidget._deco_orbit,
+    "pulse": BubbleWidget._deco_pulse,
+    "aurora": BubbleWidget._deco_aurora,
+    "rainbow": BubbleWidget._deco_rainbow,
+    "sparkle": BubbleWidget._deco_sparkle,
+    "comet": BubbleWidget._deco_comet,
+    "neon": BubbleWidget._deco_neon,
+    "flames": BubbleWidget._deco_flames,
+}

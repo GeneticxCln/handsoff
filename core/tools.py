@@ -1157,6 +1157,9 @@ class ToolBelt:
         return None
     _TERMINAL_MARKERS = ('terminal', 'konsole', 'alacritty', 'kitty', 'foot', 'xterm', 'urxvt', 'wezterm', 'warp', 'ghostty', 'stterm', 'st-', 'tilix', 'terminator', 'qterminal', 'gnome-terminal', 'xfce4-terminal', 'ptyxis', 'console')
     _TERMINAL_PANEL_MARKERS = ('terminal', 'output', 'repl')
+    # Chars injected between focus re-verifications: the window in which focus
+    # could change mid-type. A safety knob, not an implementation detail.
+    _TYPE_CHUNK = 512
 
     def _focused_is_terminal(self) -> str | None:
         """App-id/title of the focused window if it looks like a terminal, else None.
@@ -1188,10 +1191,11 @@ class ToolBelt:
         if any((t in title for t in cls._TERMINAL_PANEL_MARKERS)):
             return (app_id or title or 'unknown-window') + ' (terminal panel)'
         if not app_id.strip():
-            if title.strip():
-                _dep().log.warning('typing target has empty app_id but safe title %r — allowing', title)
-                return None
-            return 'unknown-window (unidentified — fail-closed)'
+            # Fail CLOSED on an unidentified window: a non-empty title was
+            # once accepted as identification, but a terminal can be titled
+            # anything ("untitled - bash"), and keys typed blind can reach a
+            # shell. No app_id → refuse, whatever the title says.
+            return (title.strip() or 'unknown-window') + ' (no app_id — unidentified, fail-closed)'
         return None
 
     @tool(description='Type text into the focused window via virtual keyboard. Newlines allowed. Never type into a terminal.', aliases={'text': ('content', 'string', 'body')})
@@ -1212,8 +1216,7 @@ class ToolBelt:
             return f'REFUSED: the focused window is a terminal ({term}); typing into terminals is forbidden'
         typed = 0
         skipped = 0
-        _CHUNK = 512
-        for off in range(0, len(text), _CHUNK):
+        for off in range(0, len(text), self._TYPE_CHUNK):
             if off:
                 try:
                     target = self._typing_guard()
@@ -1221,7 +1224,7 @@ class ToolBelt:
                     return f'REFUSED: {e} (typed {typed}/{len(text)} chars before focus became unverifiable)'
                 if (term := self._terminal_marker(target)) is not None:
                     return f'REFUSED: focus moved to a terminal ({term}) after {typed} chars — typing aborted'
-            piece = text[off:off + _CHUNK]
+            piece = text[off:off + self._TYPE_CHUNK]
             r = self._ydotool('type', '--key-delay', '6', '--', piece)
             if r != 'ok':
                 break
@@ -2268,13 +2271,20 @@ class ToolBelt:
 
     @tool(gates='calendar', description='Read upcoming events from the configured ICS calendar source(s). days=1 = today, 2 = today+tomorrow.', aliases={'days': ('how_many_days', 'range')})
     def read_calendar(self, days: int=1) -> str:
-        sources = _dep().SETTINGS.get('calendar_ics') or []
-        if not sources:
-            return "no calendar is configured — add an ICS source in handsoff Settings (a Google Calendar 'secret iCal address' URL or a local .ics file path)"
+        # Validate arguments BEFORE the config check: a bad `days` must be
+        # refused on its own terms, not answered with an unrelated message
+        # (that is how int(True) hid behind "no calendar configured").
+        # bool is refused EXPLICITLY: int(True) is 1, so a bare int() accepts
+        # a model's `days: true` as a silent one-day window.
+        if isinstance(days, bool) or not isinstance(days, (int, float)):
+            return 'ERROR: days must be a number (1-14)'
         try:
             days = max(1, min(14, int(days)))
         except (TypeError, ValueError):
             return 'ERROR: days must be a number (1-14)'
+        sources = _dep().SETTINGS.get('calendar_ics') or []
+        if not sources:
+            return "no calendar is configured — add an ICS source in handsoff Settings (a Google Calendar 'secret iCal address' URL or a local .ics file path)"
         now = datetime.datetime.now()
         win_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         win_end = win_start + datetime.timedelta(days=days)
@@ -2381,7 +2391,14 @@ class ToolBelt:
         n = max(1, min(n, 5))
         events, degraded = _dep()._world_events('all', n)
         if not events:
-            return 'ERROR: world news unavailable (offline?)' if degraded else 'no world headlines right now'
+            if not degraded:
+                return 'no world headlines right now'
+            # Name what actually happened from the web layer's own record;
+            # "offline?" was a guess that hid a bot challenge.
+            reasons = _dep()._web.failure_reasons() if getattr(_dep(), '_web', None) is not None else []
+            if reasons:
+                return 'ERROR: world news refused — ' + '; '.join(reasons)
+            return 'ERROR: world news refused — the sources answered nothing (no reason recorded)'
         lines = ['World headlines:']
         for e in events:
             mark = '⚠ ' if e.get('urgent') else ''

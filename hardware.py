@@ -25,6 +25,13 @@ from pathlib import Path
 TTL = {"audio": 10.0, "gpu": 15.0, "systemd": 30.0,
        "compositor": 30.0, "ydotool": 30.0, "ollama": 60.0, "fastfetch": 60.0}
 
+# How long a FAILED probe is trusted before it is re-tried, whatever the
+# section's own TTL is. A failure used to be stamped as freshly probed, so one
+# transient blip on ollama (TTL 60s) kept the bubble reporting "down" for a
+# full minute after the daemon was back. Failures now expire quickly, which is
+# the direction a health cache must fail in.
+FAILURE_TTL = 5.0
+
 SECTIONS = ("cpu", "ram", "gpu", "audio", "display", "mounts",
             "ollama", "models", "stt_tts", "systemd", "compositor",
             "ydotool", "fastfetch")
@@ -129,18 +136,34 @@ def _probe(section: str, fn, ttl_cache: dict | None, force: bool):
             if (section in data
                     and time.monotonic() - at.get(section, 0.0) < TTL[section]):
                 return data[section], True
+    failed = False
     try:
         probed = fn()
     except Exception as e:  # ponytail: failure is data, not an exception
+        failed = True
         with _TTL_LOCK:
             prev = (ttl_cache or {}).get("data", {}).get(section)
         if isinstance(prev, dict) and prev.get("ok"):
             probed = {**prev, "degraded": True, "error": str(e)[:200]}
         else:
             probed = _deg(e)
+    # A failure (an exception, a fallback merge, or a prober that answered
+    # `ok: False`) is stamped so it expires after FAILURE_TTL rather than the
+    # section's full TTL — backdated rather than stored differently, so every
+    # reader of `at`/`data` keeps working unchanged.
+    if isinstance(probed, dict):
+        # `ok: False` from a prober that answered instead of raising counts as a
+        # failure too (a refused connection comes back that way), as does the
+        # degraded merge of a previous good value.
+        healthy = bool(not failed and probed.get("ok")
+                       and not probed.get("degraded"))
+    else:
+        healthy = not failed
     if ttl_cache is not None:
+        ttl = TTL.get(section, 0.0)
+        age = 0.0 if healthy else max(0.0, ttl - FAILURE_TTL)
         with _TTL_LOCK:
-            ttl_cache.setdefault("at", {})[section] = time.monotonic()
+            ttl_cache.setdefault("at", {})[section] = time.monotonic() - age
             ttl_cache.setdefault("data", {})[section] = probed
     return probed, False
 
@@ -217,8 +240,18 @@ def _audio(ctx: dict, probers: dict) -> dict:
         return {"ok": True, "count": 0, "inputs": [],
                 "note": "no input devices visible"}
     want = str(ctx.get("mic_device", "")).strip().lower()
-    return {"ok": True, "count": len(names), "inputs": names, "default": next(
-        (n for n in names if want and want in n.lower()), names[0])}
+    chosen = next((n for n in names if want and want in n.lower()), None)
+    out = {"ok": True, "count": len(names), "inputs": names,
+           "default": chosen or names[0]}
+    if want and chosen is None:
+        # The fallback to the first device is the right behaviour (a renamed
+        # mic must not deafen the bubble), but it used to be SILENT: a
+        # misconfigured `mic_device` read as healthy with no hint that the
+        # configured name matched nothing.
+        out["note"] = (f"configured mic_device {ctx.get('mic_device')!r} "
+                       f"matches none of {len(names)} inputs — using "
+                       f"{names[0]!r} instead")
+    return out
 
 def _display(ctx: dict) -> dict:
     return {"ok": True,
@@ -298,13 +331,26 @@ def _stt_tts(ctx: dict) -> dict:
     except OSError as e:
         return _deg(e)
     cached = any(wdir.iterdir()) if wdir.is_dir() else False
-    out = {"ok": tts_cached, "whisper_size": str(ctx.get("whisper_size", "")),
+    # `ok` means "both speech directions are ready", not "the TTS weights
+    # exist". It mirrored `tts_cached` alone, so a bubble with working speech
+    # and NO whisper model reported `ok: True` — a deaf assistant described as
+    # healthy. The prompt context already reads both flags; this makes the
+    # one-line summary agree with them.
+    ok = bool(tts_cached and cached)
+    out = {"ok": ok, "whisper_size": str(ctx.get("whisper_size", "")),
            "whisper_cached": cached,
            "tts_engine": str(ctx.get("tts_engine") or "chatterbox-turbo"),
            "tts_cached": tts_cached, "tts_weights_dir": str(tdir)}
+    _notes = []
     if not tts_cached:
-        out["note"] = ("speech weights not downloaded — the bubble will be mute "
-                       "until install.sh fetches them")
+        _notes.append("speech weights not downloaded — the bubble will be mute "
+                      "until install.sh fetches them")
+    if not cached:
+        _notes.append(f"whisper '{ctx.get('whisper_size', '')}' model not "
+                      "downloaded — the bubble cannot hear you until "
+                      "install.sh fetches it")
+    if _notes:
+        out["note"] = "; ".join(_notes)
     return out
 
 def _systemd(ctx: dict) -> dict:
