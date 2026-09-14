@@ -172,15 +172,23 @@ shell:
     # GitHub one did not), the same hand-maintained-list shape that let
     # core/theme.py escape the installer. `ci/gates.sh` runs this loop locally.
     - |
-      for f in $(find . -type f -not -path './.git/*' -not -path './attic/*' | sort); do
-        first=$(head -1 "$f")
+      rc=0
+      list=$(mktemp)
+      find . -type f \
+        -not -path './.git/*' -not -path './attic/*' \
+        -not -path './.venv/*' -not -path './venv/*' -not -path './env/*' \
+        -not -path './node_modules/*' -not -path './build/*' -not -path './dist/*' | sort > "$list"
+      while IFS= read -r f; do
+        first=$(head -c 128 -- "$f" 2>/dev/null | tr -d '\000' | head -n 1) || continue
         case "$first" in
           '#!'*bash*|'#!'*'/sh'*) ;;
           *) continue ;;
         esac
         echo "--- bash -n $f"
-        bash -n "$f" || exit 1
-      done
+        bash -n "$f" || rc=1
+      done < "$list"
+      rm -f "$list"
+      [ "$rc" = 0 ] || exit 1
 
 # --- Installer smoke (GH: `smoke` job) --------------------------------------
 # --help must parse and print usage without touching the system.

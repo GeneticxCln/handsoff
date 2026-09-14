@@ -564,6 +564,10 @@ def watcher_pattern_risk(pattern: str) -> str | None:
 _BOOL_TRUE = frozenset({"true", "yes", "on", "1"})
 _BOOL_FALSE = frozenset({"false", "no", "off", "0", ""})
 
+# A junk `max_tool_calls` stays junk (nothing repairs settings.json), so the
+# warning below is emitted once per process rather than on every tool call.
+_RATE_LIMIT_WARNED = False
+
 
 def coerce_bool_arg(raw) -> bool:
     """Strict bool for model-supplied args ("false" must not become True)."""
@@ -581,6 +585,30 @@ def coerce_bool_arg(raw) -> bool:
     if token in _BOOL_FALSE:
         return False
     raise ValueError(f"expected true or false, got {raw!r}")
+
+
+def setting_flag(key: str, default: bool = False) -> bool:
+    """A boolean SETTING, read strictly — never as `bool(SETTINGS[key])`.
+
+    `bool("false")` is True, so a raw truth test on a value that arrived from
+    anywhere other than `coerce_settings` (a hand-edited file read by a
+    standalone `core.tools` consumer, an embedder assigning into `SETTINGS`)
+    ENABLES the thing it looks like it disables: for `notification_reader` that
+    is the monitor that reads private desktop notifications aloud, for `dry_run`
+    it is the opposite of the setting someone thought they turned on.
+
+    The host's loader already coerces every flag key, so this is the module's
+    own independence from WHO wrote the dict — `core.tools` ships standalone and
+    a consumer bypasses every coercion in `core/settings.py`. Junk falls back to
+    `default` (what the loader stores for junk too), so a corrupted value cannot
+    make a gate looser than a fresh start.
+    """
+    raw = _dep().SETTINGS.get(key, default)
+    try:
+        return coerce_bool_arg(raw)
+    except (ValueError, TypeError):
+        log.warning('invalid %s=%r — using default %r', key, raw, default)
+        return default
 
 
 def coerce_number_arg(raw, kind) -> "int | float":
@@ -659,8 +687,44 @@ class ToolBelt:
         self._watch_lock = threading.RLock()
         self._file_watchers = _registry.BoundedRegistry("watch-file", 4, lock=self._watch_lock)
         self._process_watchers = _registry.BoundedRegistry("watch-process", 4, lock=self._watch_lock)
-        self._tool_times: deque[float] = deque(maxlen=60)
+        # No maxlen: the window is enforced by TIME (entries older than 60 s are
+        # popped below), while a maxlen of 60 silently capped the setting — the
+        # schema allows 10 000 and the panel's spinbox 600, but 61 stamps could
+        # never coexist, so any limit above 60 was unenforceable and read as
+        # "no limit" to anyone who tried one. The memory is already bounded by
+        # the window: only calls the limit admitted are ever appended.
+        self._tool_times: deque[float] = deque()
         self._perm = {'run_command': True, 'read_file': True, 'edit_file': True, 'self_restart': True, **(permissions or {})}
+
+    def _rate_limit(self) -> int:
+        """The configured calls/60s, read defensively.
+
+        A junk value used to raise `ValueError` straight out of `_execute`,
+        killing every tool call for the rest of the process — the same family
+        as `_history_budget` and `_followup_seconds`. Junk falls back to the
+        DEFAULT (0 = no limit), which is exactly what the loader would have
+        stored for it: a corrupted value must not make the belt stricter or
+        looser than a fresh start.
+        """
+        try:
+            return max(0, int(_dep().SETTINGS.get('max_tool_calls') or 0))
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: a bare `Infinity` token in settings.json parses to
+            # a float, and `int(float('inf'))` raises it — the same crafted
+            # value `_num` was fixed to survive at load.
+            #
+            # Warned ONCE per process, not per call: nothing repairs the file,
+            # so the value stays junk and this path runs on every single tool
+            # call — the warning would scale with tool-call volume and bury the
+            # journal it is trying to be legible in.
+            global _RATE_LIMIT_WARNED
+            if not _RATE_LIMIT_WARNED:
+                _RATE_LIMIT_WARNED = True
+                log.warning(
+                    'invalid max_tool_calls=%r — rate limit disabled (default); '
+                    'fix it in settings.json (warned once)',
+                    _dep().SETTINGS.get('max_tool_calls'))
+            return 0
 
     def _set_user_turn(self, marker: int) -> None:
         """Stamp tool calls belonging to one explicit user utterance."""
@@ -771,7 +835,7 @@ class ToolBelt:
     def _execute(self, name: str, args: dict) -> tuple[str, bool]:
         self._last_images = []
         self._last_confirmation_offer = False
-        limit = int(_dep().SETTINGS.get('max_tool_calls') or 0)
+        limit = self._rate_limit()
         now = time.monotonic()
         while self._tool_times and now - self._tool_times[0] > 60:
             self._tool_times.popleft()
@@ -826,7 +890,7 @@ class ToolBelt:
                     _split_name = 'split module'
                 extra = f'\nDIFF PREVIEW (proposed change to {_split_name}):\n' + self._split_edit_preview(args)
             return (f"CONFIRM REQUIRED: about to call '{name}' with {target or 'no arguments'}. Nothing happened yet. The user must hear this offer and reply; call confirm_action(answer='yes') in the NEXT turn to run it, or confirm_action(answer='no') to cancel." + extra, True)
-        dry_run = bool(_dep().SETTINGS.get('dry_run')) and DecisionPolicy.is_desktop_action(name)
+        dry_run = setting_flag('dry_run') and DecisionPolicy.is_desktop_action(name)
         if dry_run:
             log_decision(name, target, 'DRY-RUN', 'reported; nothing executed')
             return (f"DRY-RUN: {name} would run with {target or 'no arguments'}. Nothing was executed (dry_run is enabled in settings). Describe the plan to the user and stop.", True)
@@ -1317,7 +1381,7 @@ class ToolBelt:
         (it would reach the focused app).
         """
         try:
-            base = _dep().HOME / '.config/niri'
+            base = (_dep().HOME / '.config/niri').resolve()
             texts: list[str] = [(base / 'config.kdl').read_text(encoding='utf-8').lower()]
         except OSError:
             return True
@@ -1326,9 +1390,13 @@ class ToolBelt:
             for m in re.findall('include\\s+"([^"]+)"', texts[0]):
                 if len(seen) >= 20:
                     break
-                inc = (base / m).resolve() if not m.startswith('/') else Path(m)
+                inc = (base / m).resolve() if not m.startswith('/') else Path(m).resolve()
                 try:
-                    if str(inc) in seen or not str(inc).startswith(str(base)):
+                    # CONTAINMENT BY PATH, not by string prefix: `startswith`
+                    # admits `/home/u/.config/niri-evil/x.kdl` as "inside"
+                    # `/home/u/.config/niri`, so a sibling directory could feed
+                    # extra text into the chord match.
+                    if str(inc) in seen or not inc.is_relative_to(base):
                         continue
                     seen.add(str(inc))
                     if inc.is_file() and inc.stat().st_size < 500000:
@@ -1420,7 +1488,7 @@ class ToolBelt:
             return 'notification mute list set to: ' + (', '.join(apps) or '(empty)')
         if action not in ('start', 'stop', 'toggle', 'status'):
             return 'ERROR: action must be start, stop, toggle, status or mute'
-        current = bool(_dep().SETTINGS.get('notification_reader', False))
+        current = setting_flag('notification_reader')
         if action == 'toggle':
             current = not current
         elif action == 'start':

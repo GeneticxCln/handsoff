@@ -1905,6 +1905,48 @@ class TestAvatarDecoration:
             "the mask is rebuilt every frame")
 
 
+class TestAnimationCacheCapacity:
+    """One animation must stay resident in the decode cache.
+
+    `_decoded_image` keys its cache by (path, mtime, size) and an animated pack
+    names `PACK_MAX_FRAMES` distinct files PER STATE. A cache smaller than one
+    animation cycles every frame through the FIFO, so each frame advance
+    re-decoded (load + scale + shade) several times a second, sustained — a cost
+    the still path never pays and nothing measured.
+    """
+
+    def _frames(self, tmp_path, n):
+        return [png(tmp_path / f"f{i:02d}.png", rgba=(20 + i, 140, 255, 255))
+                for i in range(n)]
+
+    def test_the_cap_covers_a_whole_animation(self, bubble):
+        """The two constants are pinned to each other so the cache cannot drift
+        below what a pack is allowed to hold."""
+        assert bubble._IMAGE_CACHE_MAX >= (bubble.PACK_MAX_FRAMES
+                                           + len(BUBBLE_STATES))
+
+    def test_no_frame_is_evicted_by_its_own_animation(self, bubble, tmp_path,
+                                                      monkeypatch):
+        frames = self._frames(tmp_path, bubble.PACK_MAX_FRAMES)
+        decodes: list[str] = []
+        real = bubble.image_layers
+
+        def counting(raw):
+            decodes.append(raw)
+            return real(raw)
+
+        monkeypatch.setattr(bubble, "image_layers", counting)
+        for f in frames:
+            bubble._image_entry(f)
+        assert len(decodes) == bubble.PACK_MAX_FRAMES
+        # the animation loops back to its first frame — it must still be there
+        bubble._image_entry(frames[0])
+        assert len(decodes) == bubble.PACK_MAX_FRAMES, (
+            f"frame 0 was evicted by its own animation (cache holds "
+            f"{bubble._IMAGE_CACHE_MAX} of {bubble.PACK_MAX_FRAMES} frames), so "
+            "every frame advance re-decodes")
+
+
 class TestInstallOver:
     def test_installing_the_same_name_keeps_one_previous_generation(self, bubble,
                                                                    tmp_path):

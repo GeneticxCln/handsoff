@@ -154,20 +154,36 @@ gate_shell() {
     # two workflows' lists had already drifted from each other. Only the FIRST
     # line is read, so a shebang quoted inside a fixture cannot drag a Python
     # file into `bash -n` and turn this gate into a false alarm.
-    local f first
+    local f first list
+    list=$(mktemp) || return 1
+    # The find is pruned: without this a virtualenv or node_modules INSIDE the
+    # repo got every one of its files probed, and a multi-GB model blob or .wav
+    # had its first line read for nothing.
+    find . -type f \
+        -not -path './.git/*' -not -path './attic/*' \
+        -not -path './.freebuff/*' -not -path './.claude-flow/*' \
+        -not -path './.swarm/*' -not -path './.agents/*' \
+        -not -path './.codex/*' \
+        -not -path './.venv/*' -not -path './venv/*' \
+        -not -path './env/*' -not -path './node_modules/*' \
+        -not -path './build/*' -not -path './dist/*' \
+        -not -path './.tox/*' -not -path './.mypy_cache/*' \
+        -not -path './site-packages/*' | sort > "$list"
     while IFS= read -r f; do
-        IFS= read -r first < "$f" 2>/dev/null || continue
+        # Read at most a shebang's worth with `head -c`, never bash's `read`:
+        # `read` consumes until a NEWLINE, so a binary with none is pulled into
+        # a shell variable whole. 128 bytes is exact for line 1. `tr -d '\000'`
+        # is not cosmetic: command substitution that captures a NUL warns per
+        # binary file, so a repo with model blobs would print pages of noise.
+        first=$(head -c 128 -- "$f" 2>/dev/null | tr -d '\000' | head -n 1) || continue
         case "$first" in
             '#!'*bash*|'#!'*'/sh'*) ;;
             *) continue ;;
         esac
         echo "--- bash -n $f"
         bash -n "$f" || rc=1
-    done < <(find . -type f \
-                 -not -path './.git/*' -not -path './attic/*' \
-                 -not -path './.freebuff/*' -not -path './.claude-flow/*' \
-                 -not -path './.swarm/*' -not -path './.agents/*' \
-                 -not -path './.codex/*' | sort)
+    done < "$list"
+    rm -f "$list"
     return $rc
 }
 

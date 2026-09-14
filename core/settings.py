@@ -309,14 +309,14 @@ def coerce_settings(s: dict) -> dict:
     _num("confirm_seconds", float, 5.0, 600.0)
     _flag("dry_run", False)
     _pol = s.get("command_policy")
-    if isinstance(_pol, dict):
-        s["command_policy"] = {
-            str(k).strip(): str(v).strip().upper()
-            for k, v in _pol.items()
-            if str(k).strip() and str(v).strip().upper() in ("ALLOW", "DENY", "CONFIRM")
-        }
-    else:
-        s["command_policy"] = {}
+    _rules = ({
+        str(k).strip(): str(v).strip().upper()
+        for k, v in _pol.items()
+        if str(k).strip() and str(v).strip().upper() in ("ALLOW", "DENY", "CONFIRM")
+    } if isinstance(_pol, dict) else {})
+    # Capped like every other hand-editable mapping here, and for the same
+    # reason: the policy is consulted on every tool call.
+    s["command_policy"] = dict(list(_rules.items())[:64])
     _flag("resource_alerts", False)
     _flag("notification_reader", False)
     _nm = s.get("notification_mute_apps", [])
@@ -339,18 +339,24 @@ def coerce_settings(s: dict) -> dict:
     _flag("dictation", True)
     _num("followup_seconds", float, 0.0, 120.0)   # 0 = feature off
     _sm = s.get("spotter_models", [])
+    # Capped like its siblings: this list is hand-editable and each entry is a
+    # model name the wake spotter will try, so an unbounded one is an unbounded
+    # amount of work per utterance.
     s["spotter_models"] = ([str(x).strip() for x in _sm if str(x).strip()]
-                           if isinstance(_sm, list) else [])
+                           if isinstance(_sm, list) else [])[:5]
     try:
         v = float(s.get("engage_seconds", 45.0))
     except (TypeError, ValueError):
         v = 45.0
     s["engage_seconds"] = min(600.0, max(5.0, v))
     aliases = s.get("workspace_aliases")
-    s["workspace_aliases"] = (
-        {str(k).strip().lower(): str(v).strip()
-         for k, v in aliases.items() if str(k).strip() and str(v).strip()}
-        if isinstance(aliases, dict) else {})
+    _pairs = ({str(k).strip().lower(): str(v).strip()
+               for k, v in aliases.items()
+               if str(k).strip() and str(v).strip()}
+              if isinstance(aliases, dict) else {})
+    # Capped: one alias per workspace is the whole feature, and a hand-edited
+    # file is not a place to grow a lookup table of arbitrary size.
+    s["workspace_aliases"] = dict(list(_pairs.items())[:50])
     s["home_place"] = str(s.get("home_place", "")).strip()
     _flag("briefing", False)
     _flag("world_warnings", False)
@@ -429,8 +435,15 @@ def coerce_settings(s: dict) -> dict:
                        and isinstance(v, str) and str(v).strip()}
         for k, v in DEFAULT_SETTINGS["colors"].items():
             s["colors"].setdefault(k, v)
-    if not isinstance(s["extra_allowed_commands"], list):
+    _extra = s["extra_allowed_commands"]
+    if not isinstance(_extra, list):
         s["extra_allowed_commands"] = []
+    else:
+        # Capped, and each entry normalised to a string: this list is a
+        # hand-editable allowlist consulted per command, so an unbounded or
+        # non-string entry is either unbounded work or a matching surprise.
+        s["extra_allowed_commands"] = [str(x).strip() for x in _extra
+                                       if str(x).strip()][:64]
     if not isinstance(s.get("tool_call_times"), (list, type(None))):
         s["tool_call_times"] = None
     return s
@@ -698,6 +711,26 @@ def _write_settings_dict(data: dict, settings_file: Path, config_dir: Path,
         return data
 
 
+def coerce_setting(key: str, value):
+    """What `key` will hold after a save-and-reload of `value`.
+
+    The one answer to "what does this value BECOME", for the two runtime
+    writers. They used to write the disk the coerced value and MEMORY the raw
+    argument — so the two docstrings promising that "memory and the file cannot
+    disagree" were both false: `_persist_setting("mic_threshold", "junk")`
+    wrote 600 and left `"junk"` in `SETTINGS`, and the next PTT release died in
+    a bare `int(...)` while the hands-free listener's `_SpeechGate(int(...))`
+    took the listener thread down with it.
+
+    Unknown keys pass through untouched (`coerce_settings` only rewrites the
+    keys it knows), which is what keeps `set_setting` usable for a key this
+    build has no rule for.
+    """
+    probe = {**copy.deepcopy(DEFAULT_SETTINGS), key: value}
+    coerce_settings(probe)
+    return probe[key]
+
+
 def _persist_setting(key: str, value, settings_file: Path,
                      config_dir: Path) -> bool:
     """Persist one runtime setting without overwriting unrelated settings.
@@ -803,7 +836,9 @@ class Settings:
         """
         if not _persist_setting(key, value, self.settings_file, self.config_dir):
             return False
-        self._data[key] = value
+        # The COERCED value, not the argument: see `coerce_setting` for the
+        # divergence this closes.
+        self._data[key] = coerce_setting(key, value)
         return True
 
     def write_all(self, data: dict, *, expected_data: dict | None = None) -> dict:

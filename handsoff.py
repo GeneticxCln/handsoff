@@ -148,6 +148,18 @@ PENDING_FILE = STATE_DIR / "pending-restart.json"
 LOCK_FILE = STATE_DIR / "handsoff.lock"
 LOG_FILE = STATE_DIR / "handsoff.log"
 CONTROL_SOCK = STATE_DIR / "control.sock"
+# A control request is one line, and both clients send it and half-close. This
+# is a denial-of-service ceiling, not a protocol limit: reading a fixed 1024
+# bytes instead truncated `preview-pack <folder>` at 1024, which silently
+# previewed a SHORTER, DIFFERENT folder than the one named.
+_CONTROL_REQUEST_MAX = 65536
+# ...and the ceiling alone is not a bound on TIME: every `recv` refreshes the
+# 5 s idle timeout, so a local client that dribbles one byte every few seconds
+# without ever closing would hold the SINGLE accept thread for hours
+# (`_CONTROL_REQUEST_MAX` x the timeout). The whole request is therefore also
+# bounded by wall clock. Five seconds is generous for a request both clients
+# send in one `sendall`; a wedged client costs one accept cycle, not the unit.
+_CONTROL_READ_BUDGET = 5.0
 MIC_EVENTS_FILE = STATE_DIR / "mic-health.json"   # mic transitions + last briefing
 MIC_EVENTS_MAX = 200                              # hard cap on recorded transitions
 _MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
@@ -1188,7 +1200,12 @@ def _persist_setting(key: str, value) -> bool:
     if not _core_settings._persist_setting(key, value, SETTINGS_FILE, CONFIG_DIR):
         log.warning("setting %r was NOT persisted — keeping the old value", key)
         return False
-    SETTINGS[key] = value
+    # The COERCED value, not the argument. The disk got the coerced one and
+    # set_setting (the tool path) stored the raw one, so a junk value the
+    # loader would have corrected went on to kill the next bare int(...) in a
+    # timer path or a listener thread — while both sides' docstrings claimed
+    # memory and the file could not disagree.
+    SETTINGS[key] = _core_settings.coerce_setting(key, value)
     SETTINGS["version"] = SETTINGS_VERSION
     reload_derived_settings()
     return True
@@ -6411,7 +6428,30 @@ class ControlServer:
                     # RST, so a refused caller would see a connection reset
                     # instead of the reason. Reading first keeps the refusal
                     # legible (the check still gates every dispatch).
-                    raw = conn.recv(1024).decode("utf-8", "replace").strip()
+                    # Read the WHOLE request, not the first 1024 bytes. Both
+                    # clients half-close after sending, so EOF is the end of
+                    # the request; a client that does not (an older build) is
+                    # bounded by the 5 s timeout rather than by a truncated
+                    # command.
+                    chunks: list[bytes] = []
+                    total = 0
+                    deadline = time.monotonic() + _CONTROL_READ_BUDGET
+                    while total < _CONTROL_REQUEST_MAX:
+                        if time.monotonic() >= deadline:
+                            log.warning(
+                                "control socket: request from uid %s did not "
+                                "finish within %.1fs — reading what arrived",
+                                _peer_uid(conn), _CONTROL_READ_BUDGET)
+                            break
+                        try:
+                            part = conn.recv(65536)
+                        except (TimeoutError, OSError):
+                            break
+                        if not part:
+                            break               # EOF: the request is complete
+                        chunks.append(part)
+                        total += len(part)
+                    raw = b"".join(chunks).decode("utf-8", "replace").strip()
                     # Split the optional argument off BEFORE lowercasing: `say`
                     # carries the text to synthesize, so lowercasing the whole
                     # payload would make the bubble read a different sentence

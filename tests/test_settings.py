@@ -178,6 +178,38 @@ class TestSettingsCoercion:
         s = H._load_settings()
         assert s["bubble_size"] == 192 and s["tts_rate"] == 2.0
 
+    def test_hand_editable_lists_are_capped(self, H):
+        """Each of these is a hand-editable list the runtime walks, and an
+        unbounded one is unbounded work per turn — spotter models tried per
+        utterance, a policy consulted per tool call, an allowlist walked per
+        command — or a lookup table that can never match. Its siblings were
+        already capped, so the caps above are the missing half of one rule.
+        """
+        big = H._core_settings.coerce_settings({
+            **H.DEFAULT_SETTINGS,
+            "extra_allowed_commands": [f"cmd{i}" for i in range(200)],
+            "spotter_models": [f"m{i}" for i in range(20)],
+            "workspace_aliases": {f"w{i}": f"name{i}" for i in range(200)},
+            "command_policy": {f"c{i}": "ALLOW" for i in range(200)},
+        })
+        assert len(big["extra_allowed_commands"]) == 64
+        assert len(big["spotter_models"]) == 5
+        assert len(big["workspace_aliases"]) == 50
+        assert len(big["command_policy"]) == 64
+        # order is preserved (the first N survive), so a deliberate short list
+        # is never re-ordered by the cap
+        assert big["extra_allowed_commands"][:2] == ["cmd0", "cmd1"]
+
+    def test_a_non_string_allowlist_entry_cannot_survive(self, H):
+        """The allowlist is matched against command names, so a JSON number or
+        null in it is either a matching surprise or dead weight — either way
+        it is normalised to a string like the rest of the coercion does."""
+        out = H._core_settings.coerce_settings({
+            **H.DEFAULT_SETTINGS,
+            "extra_allowed_commands": [1, None, "ok", "  ", " two "],
+        })
+        assert out["extra_allowed_commands"] == ["1", "None", "ok", "two"]
+
     def test_every_schema_key_is_touched_by_coercion(self, H):
         """A schema key that coercion never mentions is a silent hole.
 
@@ -646,6 +678,50 @@ class TestSettingsSplit:
         assert isinstance(on_disk["followup_seconds"], float)
         # ...and the unrelated keys are exactly as the file had them
         assert on_disk["model"] == "m"
+
+    def test_both_runtime_writers_coerce_MEMORY_not_only_the_disk(
+            self, H, tmp_path, monkeypatch):
+        """Coercing the disk while storing the raw argument in memory left the
+        two disagreeing — the exact thing both writers' docstrings promise they
+        cannot do. `mic_threshold` was written to the file as 600 and kept in
+        SETTINGS as "junk", so the next PTT release died inside a bare
+        `int(...)` on the worker and the hands-free listener's
+        `_SpeechGate(int(...))` took the listener thread with it."""
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"model": "m", "version": H.SETTINGS_VERSION}),
+                     encoding="utf-8")
+
+        # (a) the facade the settings app and the bubble share
+        obj = H._core_settings.settings_object(f, tmp_path)
+        obj.load()
+        assert obj.persist("mic_threshold", "junk") is True
+        assert obj["mic_threshold"] == H.DEFAULT_SETTINGS["mic_threshold"], \
+            "the facade kept the raw argument in memory"
+
+        # (b) the bubble's wrapper, which updates the process-global SETTINGS
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        monkeypatch.setitem(H.SETTINGS, "mic_threshold",
+                            H.SETTINGS["mic_threshold"])
+        assert H._persist_setting("mic_threshold", "junk") is True
+        assert H.SETTINGS["mic_threshold"] == H.DEFAULT_SETTINGS["mic_threshold"], (
+            f"memory holds {H.SETTINGS['mic_threshold']!r} while the file holds "
+            f"{H.DEFAULT_SETTINGS['mic_threshold']!r}")
+
+    def test_an_unknown_key_still_passes_through_both_writers(
+            self, H, tmp_path, monkeypatch):
+        """`coerce_setting` must not swallow keys this build has no rule for:
+        `set_setting` is the model's escape hatch and the schema is not closed.
+        """
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"model": "m", "version": H.SETTINGS_VERSION}),
+                     encoding="utf-8")
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        assert H._persist_setting("zz_not_a_schema_key", "raw") is True
+        assert H.SETTINGS["zz_not_a_schema_key"] == "raw"
+        H.SETTINGS.pop("zz_not_a_schema_key", None)
+        assert json.loads(f.read_text(encoding="utf-8"))["zz_not_a_schema_key"] == "raw"
 
     def test_persist_failure_does_not_leave_memory_disagreeing_with_disk(
             self, H, tmp_path, monkeypatch):

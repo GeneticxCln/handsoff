@@ -1396,6 +1396,41 @@ class TestAmbientCapabilities:
         assert tb.notification_reader("status").startswith("notification reader is off")
         assert "started" in tb.notification_reader("start")
 
+    def test_a_raw_string_cannot_turn_the_privacy_gate_on(self, H, monkeypatch):
+        """The gate was read as `bool(SETTINGS.get(...))`, and `bool("false")`
+        is True — so a value that reached this module from anywhere other than
+        `coerce_settings` would START the monitor that reads private desktop
+        notifications aloud while looking like it switched it off.
+
+        The host's loader coerces every flag key, so the reachable case today is
+        a STANDALONE `core.tools` consumer (or an embedder assigning into
+        SETTINGS) — `core.tools` ships as its own module and cannot assume the
+        host's coercion ran. The read is strict now, so the gate no longer
+        depends on who wrote the dict.
+        """
+        for raw in ("false", "no", "off", "0", "nonsense", None, []):
+            monkeypatch.setitem(H.SETTINGS, "notification_reader", raw)
+            assert _core_tools.setting_flag("notification_reader") is False, (
+                f"{raw!r} was read as ENABLED — bool({raw!r}) is {bool(raw)!r}")
+            tb = self._tb(H, on_notification=lambda enabled: None)
+            assert tb.notification_reader("status").startswith(
+                "notification reader is off"), raw
+        # ...and a real truthy value still reads as on
+        monkeypatch.setitem(H.SETTINGS, "notification_reader", True)
+        assert _core_tools.setting_flag("notification_reader") is True
+        monkeypatch.setitem(H.SETTINGS, "notification_reader", "yes")
+        assert _core_tools.setting_flag("notification_reader") is True
+
+    def test_the_dry_run_gate_is_read_strictly_too(self, H, monkeypatch):
+        """Same shape, opposite direction: `dry_run` decided with `bool()` and
+        set to "false" read as ON, so the safety setting someone believed they
+        had turned off silently suppressed every desktop action."""
+        for raw in ("false", "nonsense", None, []):
+            monkeypatch.setitem(H.SETTINGS, "dry_run", raw)
+            assert _core_tools.setting_flag("dry_run") is False, raw
+        monkeypatch.setitem(H.SETTINGS, "dry_run", "on")
+        assert _core_tools.setting_flag("dry_run") is True
+
     def test_notification_mute_list_is_bounded_and_persisted(self, H, monkeypatch):
         saved = []
         # Model the real wrapper's contract (persist, update memory, return

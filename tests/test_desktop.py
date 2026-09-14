@@ -1470,6 +1470,28 @@ class TestSuperBindingKnown:
         outside.write_text("binds { Mod+T; }\n", encoding="utf-8")
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
 
+    def test_a_sibling_directory_prefix_is_not_inside(self, niri_home):
+        """Containment was a STRING prefix, and `/…/.config/niri-evil/x.kdl`
+        starts with `/…/.config/niri` — so a sibling directory fed text into the
+        chord match. It must be refused by PATH, not by prefix."""
+        self._write_cfg(niri_home, 'include "../niri-evil/keybinds.kdl"\n')
+        evil = niri_home.parent / "niri-evil"
+        evil.mkdir()
+        (evil / "keybinds.kdl").write_text("binds { Mod+T; }\n",
+                                            encoding="utf-8")
+        assert str(evil).startswith(str(niri_home)), \
+            "test setup: the sibling is not a string-prefix of the config dir"
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+
+    def test_an_absolute_include_outside_the_config_dir_is_refused(self, niri_home):
+        """An absolute include is not resolved against the base, so
+        containment is the only thing standing between the walk and any file
+        on the disk."""
+        elsewhere = niri_home.parent.parent / "outside.kdl"
+        elsewhere.write_text("binds { Mod+T; }\n", encoding="utf-8")
+        self._write_cfg(niri_home, f'include "{elsewhere}"\n')
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+
     def test_include_cycle_terminates(self, niri_home):
         """Two files including each other must not hang or crash — the
         dedupe (`seen`) stops a cycle from re-reading a file forever."""

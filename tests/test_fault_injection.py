@@ -509,6 +509,93 @@ class TestControlSocketDisappears:
             "a stopping server re-bound the control socket"
         assert not sock_path.exists(), "shutdown resurrected the socket file"
 
+    def test_a_long_request_is_read_whole_not_truncated(self, live_server):
+        """The server read a fixed `recv(1024)`, so a request longer than that
+        was silently cut: `preview-pack <folder>` previewed a SHORTER, DIFFERENT
+        folder than the one named — no error, wrong art. Both clients half-close
+        after sending, so EOF is the end of the request and it is read whole.
+        """
+        H, srv, sock_path = live_server
+        seen: list[str] = []
+        srv._assistant.set_pack_preview = lambda p: (seen.append(p), "ok")[1]
+        long_path = "/tmp/" + ("d" * 1500)
+        assert self._ask(sock_path, "preview-pack " + long_path).strip() == "ok"
+        assert seen and seen[0] == long_path, (
+            f"the server saw {len(seen[0]) if seen else 0} of "
+            f"{len(long_path)} bytes — the path was truncated")
+
+    def test_an_overlong_request_is_bounded_not_unbounded(self, live_server):
+        """The ceiling is a denial-of-service bound, not a protocol limit: a
+        client that never stops sending must not make the server read forever.
+
+        The assertion is on what the SERVER dispatched, not on the reply: a
+        Unix socket closed with unread data still queued resets the peer, so the
+        answer can be raced away — the bound is what matters, and it is what a
+        `recv(1024)`-shaped server could not demonstrate at all.
+        """
+        H, srv, sock_path = live_server
+        seen: list[str] = []
+        srv._assistant.set_pack_preview = lambda p: (seen.append(p), "ok")[1]
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect(str(sock_path))
+        try:
+            payload = b"preview-pack " + b"x" * (H._CONTROL_REQUEST_MAX * 2)
+            try:
+                s.sendall(payload)
+                s.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass            # the server answered and closed mid-send: fine
+            try:
+                while s.recv(65536):
+                    pass
+            except OSError:
+                pass            # reset after the answer: see the docstring
+        finally:
+            s.close()
+        assert wait_for(lambda: bool(seen)), "an overlong request was never dispatched"
+        assert len(seen[0]) <= H._CONTROL_REQUEST_MAX, (
+            f"the server buffered {len(seen[0])} bytes for a request it should "
+            f"have stopped reading at {H._CONTROL_REQUEST_MAX}")
+
+    def test_a_slow_drip_cannot_hold_the_accept_thread(self, live_server,
+                                                       monkeypatch):
+        """The byte ceiling alone is not a bound on TIME.
+
+        Every `recv` refreshes the 5 s idle timeout, so a client that dribbles
+        one byte every few seconds and never closes would hold the SINGLE accept
+        thread for `_CONTROL_REQUEST_MAX` x the timeout — hours — and the whole
+        bubble's remote control would be deaf. The realistic trigger is not an
+        attacker (peer-cred and the 0700 state dir gate dispatch) but a wedged
+        settings-app socket. The read now has a wall-clock budget for the whole
+        request, so a stuck client costs one accept cycle.
+        """
+        H, srv, sock_path = live_server
+        monkeypatch.setattr(H, "_CONTROL_READ_BUDGET", 0.5)
+        seen: list[str] = []
+        srv._assistant.set_pack_preview = lambda p: (seen.append(p), "ok")[1]
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(str(sock_path))
+        started = time.monotonic()
+        closed_on_us = False
+        try:
+            s.sendall(b"preview-pack ")
+            for _ in range(40):           # 4 s of dribble, ten bytes a second
+                try:
+                    s.sendall(b"x")
+                except OSError:
+                    closed_on_us = True   # the server gave up and closed
+                    break
+                time.sleep(0.1)
+            elapsed = time.monotonic() - started
+        finally:
+            s.close()
+        assert closed_on_us, (
+            "the server waited out the whole drip instead of its budget")
+        assert elapsed < 3.0, f"the accept thread was held for {elapsed:.1f}s"
+        assert wait_for(lambda: bool(seen)), "the request was never dispatched"
+
     def test_the_client_says_which_socket_is_missing(self, H, tmp_path, monkeypatch, capsys):
         """The CLI half: exit 1 is not enough, the user needs to know what is
         missing and where it was looked for."""

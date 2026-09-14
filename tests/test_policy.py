@@ -308,6 +308,57 @@ class TestToolRateLimit:
         out, err = belt.execute("get_datetime", {})
         assert not err, out
 
+    def test_a_limit_above_sixty_is_actually_enforceable(self, H, monkeypatch):
+        """The window deque was `deque(maxlen=60)`, so a 61st stamp silently
+        evicted the 1st and `len(_tool_times)` could never reach 61. The schema
+        allows 10 000 and the panel's spinbox 600, but every limit above 60
+        behaved as UNLIMITED — the setting looked enforced and was not."""
+        monkeypatch.setitem(H.SETTINGS, "max_tool_calls", 70)
+        belt = self._belt(H)
+        for i in range(70):
+            out, err = belt.execute("get_datetime", {})
+            assert not err, (i, out)
+        assert len(belt._tool_times) == 70, (
+            f"the window only remembers {len(belt._tool_times)} of 70 calls")
+        out, err = belt.execute("get_datetime", {})
+        assert err and "rate limit" in out, out
+
+    def test_a_junk_limit_does_not_kill_every_tool_call(self, H, monkeypatch):
+        """`int("junk")` raised straight out of `_execute`, so ONE corrupted
+        value took out every tool call for the rest of the process — the same
+        family as the already-guarded history budget and follow-up window."""
+        monkeypatch.setitem(H.SETTINGS, "max_tool_calls", "junk")
+        belt = self._belt(H)
+        out, err = belt.execute("get_datetime", {})
+        assert not err, out
+
+    def test_a_junk_limit_warns_once_not_on_every_call(self, H, monkeypatch, caplog):
+        """Nothing repairs settings.json, so a junk value stays junk and the
+        guard runs on EVERY tool call. A warning per call is proportional to
+        tool-call volume and buries the journal it exists to be legible in."""
+        import logging
+        monkeypatch.setitem(H.SETTINGS, "max_tool_calls", "junk")
+        monkeypatch.setattr(_core_tools, "_RATE_LIMIT_WARNED", False)
+        belt = self._belt(H)
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                out, err = belt.execute("get_datetime", {})
+                assert not err, out
+        warned = [r.getMessage() for r in caplog.records
+                  if "max_tool_calls" in r.getMessage()]
+        assert len(warned) == 1, (
+            f"{len(warned)} warnings for one bad value — the journal is spam")
+        assert "junk" in warned[0], (
+            f"the warning must name the value to fix: {warned[0]!r}")
+
+    def test_an_infinite_limit_does_not_crash_either(self, H, monkeypatch):
+        """`float('inf')` is not an int, and a bare `int()` of it raises
+        OverflowError — which the guard must treat like any other junk."""
+        monkeypatch.setitem(H.SETTINGS, "max_tool_calls", float("inf"))
+        belt = self._belt(H)
+        out, err = belt.execute("get_datetime", {})
+        assert not err, out
+
 
 class TestSpawnInterpreterBoundary:
     """niri spawn must not become arbitrary-execution via interpreters."""
@@ -1030,6 +1081,37 @@ class TestDecisionPolicy:
         tb = self._belt(H, monkeypatch, dry_run=True)
         out, err = tb.execute("start_command", {"command": "echo x"})
         assert err and "DRY-RUN" in out
+
+    def test_a_raw_string_cannot_switch_dry_run_on(self, H, monkeypatch):
+        """`bool("false")` is True, so a `dry_run` that reached SETTINGS from
+        anywhere but the coercer read as ON and silently turned a desktop action
+        into a report — the setting someone believed they had un-suppressed.
+
+        Driven through `_execute`, the CALL SITE, and not merely through the
+        helper: a test that only calls `setting_flag` cannot see the call site
+        revert to `bool(...)`, which is exactly what a mutation showed.
+        """
+        class _Done:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(H._core_tools, "subprocess", types.SimpleNamespace(
+            run=lambda *a, **k: _Done(), Popen=lambda *a, **k: _Done(),
+            check_output=lambda *a, **k: b"", PIPE=-1, STDOUT=-2, DEVNULL=-3))
+        # `open_app` is the desktop action whose permission gate is allowed by
+        # default, so it is the one that REACHES the dry-run branch — a tool
+        # behind the disabled `operator` gate returns before it (found by
+        # writing this with `click_at` first, whose arm was vacuous).
+        for raw in ("false", "no", "nonsense"):
+            tb = self._belt(H, monkeypatch, dry_run=raw)
+            out, _err = tb.execute("open_app", {"app": "files"})
+            assert "DRY-RUN" not in out, (raw, out)
+            assert "REFUSED" not in out, (raw, out)   # it really dispatched
+        # ...and a real ON value still reports instead of acting
+        tb = self._belt(H, monkeypatch, dry_run=True)
+        out, err = tb.execute("open_app", {"app": "files"})
+        assert err and "DRY-RUN" in out, out
 
     def test_confirm_repeated_direct_call_never_executes(self, H, monkeypatch,
                                                          _fast_wait):

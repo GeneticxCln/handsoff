@@ -440,6 +440,21 @@ class TestICSDurationAndUntil:
                              "DURATION:PT30M", "SUMMARY:Done and dusted"])
         assert ev == [], f"an event that ended before the window surfaced: {ev}"
 
+    def test_a_negative_duration_is_refused_not_flipped_positive(self, H):
+        """RFC 5545's leading sign means "this duration points BACKWARDS", and
+        the chunk parser never saw the sign: "P-1D" came back as +1 day and
+        "PT-5M" as +5 minutes, so a reminder-style negative duration widened the
+        overlap window instead of shrinking it."""
+        for bad in ("P-1D", "PT-5M", "-PT5M", "P1DT+2H", "PT+30M"):
+            assert _core_calendar._ics_duration(bad) is None, bad
+        today = H.datetime.date.today().strftime("%Y%m%d")
+        ev = self._event(H, [f"DTSTART:{today}T090000",
+                             "DURATION:P-1D", "SUMMARY:Reminder"])
+        assert len(ev) == 1, ev
+        # Refused, so the length falls back to the fabricated hour — NOT to the
+        # +1 day a sign-blind parser produced.
+        assert ev[0]["dur"] == H.datetime.timedelta(hours=1), ev[0]["dur"]
+
     def test_date_only_until_includes_that_whole_day(self, H):
         """A DATE-valued UNTIL parses to that day's MIDNIGHT, which then
         excluded same-day instances starting later — the last occurrence of a

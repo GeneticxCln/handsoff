@@ -195,10 +195,18 @@ def configure(settings: dict | None = None) -> None:
 #
 # The picture cache: revision key -> {"image", "shade", "pixmap"}. A DICT rather
 # than one slot, because with a pack the bubble draws a DIFFERENT FILE per state
-# and a single slot would re-decode a photo every time the state changed. Capped
-# at the number of states a pack can name, so the ceiling stays a constant.
+# and a single slot would re-decode a photo every time the state changed.
+#
+# The cap must cover one state's whole ANIMATION, not just the four states: an
+# animated pack is `PACK_MAX_FRAMES` distinct files per state, and a 4-slot FIFO
+# cycles 16 keys through 4 slots — so every frame advance evicted the frame it
+# was about to need, and a 6 fps animation re-decoded (load + scale + shade)
+# several times a second, sustained, for a picture the still path never pays for.
+# `PACK_MAX_FRAMES + the four state stills` keeps the animation resident while
+# the other states' entries are the ones that rotate out; a guard pins the two
+# constants together so this cannot drift below the pack limit.
 _IMAGE_CACHE: dict = {}
-_IMAGE_CACHE_MAX = 4
+_IMAGE_CACHE_MAX = 20
 # (w, h) -> QImage: the feathered ellipse alpha mask `_round_avatar` applies to
 # full-bleed pictures. Bounded in `_feather_mask`; sizes are few and stable.
 _FEATHER_MASKS: dict = {}

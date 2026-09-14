@@ -340,7 +340,12 @@ def _ics_duration(value: str) -> "datetime.timedelta | None":
     did not overlap the queried range was still reported as if it did.
     """
     text = str(value or "").strip().upper()
-    if not text.startswith("P") or text.endswith("T"):
+    # A leading sign is RFC 5545's "this duration points BACKWARDS" (a reminder
+    # before the event), which this model has no place for — and the chunk
+    # parser below never saw the sign, so "P-1D" came back as +1 day and
+    # "PT-5M" as +5 minutes: a negative duration silently became positive and
+    # shifted the overlap window the wrong way. Refused rather than guessed.
+    if not text.startswith("P") or text.endswith("T") or "-" in text or "+" in text:
         return None
     date_part, _, time_part = text[1:].partition("T")
     units = {"W": "weeks", "D": "days"}

@@ -3771,3 +3771,53 @@ a glob to catch. The pre-commit hook was in the same family of lie: it promised
 "~10s" and really takes ~2.5 min, so a commit that was correctly running the
 suite looked hung. Gates that cannot run, or that misreport their cost, are the
 same defect wearing different clothes: the check is real, and nobody trusts it.
+
+## One value, two sides of a boundary — the audit's recurring family
+
+The six findings above were re-filed until they were fixed as one shape: a value
+COERCED on one side of a boundary and trusted raw on the other. `_persist_setting`
+wrote the file 600 and left `"junk"` in `SETTINGS`; the rate limiter's window was
+capped at 60 while the setting allowed 10 000; an ICS duration's sign was dropped
+by the chunk parser; an include's containment was a string prefix rather than a
+path relation; the decode cache was sized for four stills while a pack may name
+sixteen frames per state; the control socket read a fixed 1024 bytes of a request
+someone had already made longer.
+
+The general rule, now written down where the next one can find it: **whatever a
+boundary validates, it must also PROPAGATE — and whatever a limit claims, its
+enforcement must be able to reach it.** A guard on the far side of a coerced
+value (`int(...)` on a setting) is not a guard, it is the sound of the bug
+arriving; the fix is at the writer. A cap the data structure cannot represent
+(`maxlen=60` vs a limit of 600) is not a cap; the fix is at the structure.
+
+The unresolved residue, stated rather than implied: the DNS-rebinding window in
+`core/web.py` (the URL is validated, then re-resolved at fetch) and the watcher's
+`(a|aa)+` alternation ReDoS remain, both documented at their site and both
+bounded to one daemon thread. Neither was in this pass; neither should be read as
+fixed because these were.
+
+## The same rule, seen from the other side
+
+The pass after that one produced four more items, and each is the PREVIOUS rule
+viewed from the far end — which is the useful thing to record, because the next
+one will arrive the same way:
+
+  * a bound that only covers one dimension is not a bound. The control read got a
+    byte ceiling and still had no time ceiling, because every `recv` refreshed the
+    idle timeout: `MAX x timeout` is hours. Whatever a guard measures, ask what it
+    does NOT measure.
+  * a guard that fires must not become the problem. The junk-limit warning was
+    correct and ran on every tool call, so it buried the journal it exists to keep
+    legible — the same defect as a gate whose cost is misreported (the pre-commit
+    hook promising "~10s" for 2.5 min): a check nobody can read is not a check.
+  * one rule in three places has already drifted (the workflows' shell lists), so
+    the copies are pinned EQUAL by a test rather than trusted to stay in step.
+  * a validated value must be propagated, and where propagation cannot be
+    guaranteed — `core.tools` ships standalone, so it cannot assume the host's
+    coercion ran — the consumer must read strictly instead of assuming a type.
+
+The honest edge case from this pass is worth keeping too: the raw
+`notification_reader` read was a REAL shape and NOT a reachable one through the
+host (the loader normalises every flag key, verified), so it was fixed as
+defence-in-depth and recorded that way. Calling it a live privacy hole would have
+been the more exciting sentence and the less true one.

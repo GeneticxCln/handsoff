@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 
@@ -459,3 +460,80 @@ class TestCompileAll:
     def test_the_real_tree_passes(self, C, capsys):
         assert C.main(["compile_all.py", str(HERE)]) == 0
         assert "byte-compiled" in capsys.readouterr().out
+
+
+class TestShellDiscovery:
+    """The shell-syntax gate discovers scripts by SHEBANG, in three places.
+
+    Three copies of one rule is two too many, and this pair HAS drifted (GitLab
+    checked `ci/apt_deps.sh` and GitHub did not, so a broken script passed one
+    gate and failed the other), which is why the copies are pinned equal here
+    rather than trusted. Two hazards the audit named are pinned too: an unpruned
+    walk probes every file of a virtualenv or `node_modules`, and a whole-file
+    read of a multi-GB blob pulls it into a shell variable.
+    """
+
+    SOURCES = ("ci/gates.sh", ".gitlab-ci.yml", ".github/workflows/ci.yml")
+    # The prune set that matters in CI: a vendored tree or a build output inside
+    # the checkout. The agent/cache dirs below are local-only and only the local
+    # runner needs them.
+    MUST_PRUNE = (".git", "attic", ".venv", "venv", "env", "node_modules",
+                  "build", "dist")
+
+    def _text(self, rel: str) -> str:
+        return (HERE / rel).read_text(encoding="utf-8")
+
+    def test_every_copy_prunes_vendored_and_build_directories(self):
+        for rel in self.SOURCES:
+            text = self._text(rel)
+            for d in self.MUST_PRUNE:
+                assert f"'./{d}/*'" in text, (
+                    f"{rel} walks ./{d} — a virtualenv inside the checkout means "
+                    f"every one of its files is probed for a shebang")
+
+    def test_the_local_runner_also_prunes_the_agent_and_cache_dirs(self):
+        text = self._text("ci/gates.sh")
+        for d in (".freebuff", ".claude-flow", ".swarm", ".agents", ".codex",
+                  ".tox", ".mypy_cache", "site-packages"):
+            assert f"'./{d}/*'" in text, f"ci/gates.sh walks ./{d}"
+
+    def test_no_copy_reads_a_whole_file_to_look_at_line_one(self):
+        """`head -1` (or bash's `read`) consumes until a NEWLINE: on a binary
+        without one, that is the whole file. `head -c 128` is exact instead."""
+        for rel in self.SOURCES:
+            text = self._text(rel)
+            assert "head -c 128" in text, f"{rel} does not bound its first-line read"
+            assert 'head -1 "$f"' not in text, (
+                f"{rel} reads a whole file to find line 1")
+            # ...and NULs must be stripped inside the substitution: capturing a
+            # NUL makes bash warn once per binary file in the tree.
+            assert "tr -d" in text, f"{rel} would warn once per binary file"
+
+    def test_the_copies_agree_on_what_counts_as_a_shell_script(self):
+        """Drift in the PATTERN is drift too: one gate accepting what another
+        refuses is how a file passes CI and fails on the next machine."""
+        for rel in self.SOURCES:
+            assert "'#!'*bash*|'#!'*'/sh'*) ;;" in self._text(rel), (
+                f"{rel} classifies shebangs differently from the others")
+
+    def test_the_gate_really_skips_a_pruned_tree_when_run(self):
+        """Behavioural, not textual: seed a vendored dir whose script WOULD be
+        found, run the gate, and require it to be ignored."""
+        venv = HERE / ".venv"
+        if venv.exists():
+            pytest.skip("a real .venv exists; refusing to write into it")
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "evil.sh").write_text("#!/usr/bin/env bash\n",
+                                             encoding="utf-8")
+        # A newline-free blob, the file that made an unbounded first-line read
+        # pull megabytes into a variable.
+        (venv / "blob.bin").write_bytes(b"\x00\x01" * 40000)
+        try:
+            proc = subprocess.run(["bash", "ci/gates.sh", "shell"], cwd=HERE,
+                                  capture_output=True, text=True, timeout=120)
+        finally:
+            shutil.rmtree(venv, ignore_errors=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert ".venv" not in proc.stdout, (
+            "the gate probed a vendored tree it is supposed to prune")
+        assert "install.sh" in proc.stdout, "the gate found nothing at all"
