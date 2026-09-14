@@ -1241,6 +1241,41 @@ def set_setting(key: str, value) -> bool:
     return bool(_persist_setting(key, value))
 
 
+def _setting_flag(key: str, default: bool = False, *,
+                  repair: bool = False) -> bool:
+    """Read one BOOLEAN setting through the shared strict reader.
+
+    `bool(SETTINGS["x"])` INVERTS the most natural way to write "off":
+    `"false"`, `"no"` and `"off"` are all truthy strings. These fifteen reads
+    are the flags that start hands-free, demand the public wake word, type into
+    other windows (dictation), read private desktop notifications aloud and
+    decide whether a tick may probe the machine — so none of them may depend on
+    who wrote the dict. `core.tools.setting_flag` is that reader; it falls back
+    to `default` on junk (exactly what `coerce_settings` stores for junk) and
+    warns once per key, because several of these are read on timer and per-turn
+    paths.
+
+    `repair=True` is for the reads that ESTABLISH durable state rather than
+    merely gating the work in front of them: the startup snapshot the live
+    reload later compares against, and the privacy gate whose state is
+    persisted on toggle. There the read also writes the resolved value back, so
+    the dict cannot go on holding a value two readers disagree about — it is
+    the read-side twin of what `_persist_setting` already does on the write
+    side ("memory and the file cannot disagree"). A pure gate (a tick, a
+    per-turn switch, an utterance test, a log line) reads strictly and leaves
+    the dict alone: repairing it from an audio or timer thread would be a
+    cross-thread mutation for a value nothing re-reads.
+    """
+    value = _core_tools.setting_flag(key, default)
+    if repair:
+        raw = SETTINGS.get(key, default)
+        if raw is not value:      # identity: any non-bool form gets normalised
+            SETTINGS[key] = value
+            log.info("settings: %s was %r — read as %r and corrected",
+                     key, raw, value)
+    return value
+
+
 SETTINGS = _load_settings()
 
 _ollama_host = str(SETTINGS["ollama_host"])
@@ -3472,8 +3507,8 @@ class ContinuousListener:
         min_frames = int(self.MIN_UTTERANCE_S * SAMPLE_RATE / self.FRAME)
         frames: list[np.ndarray] = []
         gate = _SpeechGate(int(SETTINGS["mic_threshold"]))
-        spotter_on = (bool(SETTINGS.get("wake_spotter"))
-                      and bool(SETTINGS.get("wake_word_required")))
+        spotter_on = (_setting_flag("wake_spotter")
+                      and _setting_flag("wake_word_required"))
         if spotter_on and _get_spotter() is not None:
             self._spotter = WakeSpotter()
             log.info("audio wake spotter active (openWakeWord)")
@@ -3652,7 +3687,7 @@ class Assistant(QObject):
         self._turn_spoke = False
         self._last_spoken = ""
         self._recently_spoken: list[str] = []   # last TTS lines, for echo rejection
-        self._handsfree = bool(SETTINGS.get("handsfree", False))
+        self._handsfree = _setting_flag("handsfree", False, repair=True)
         self._listener = ContinuousListener(self)
         self._notifications = _core_assistant.NotificationReader(
             spawn=self._start_worker, is_closed=self._is_closed,
@@ -3672,7 +3707,7 @@ class Assistant(QObject):
         )
         # (the refusal announcement shares this channel with job completions,
         # reminders and hands-free confirmations — one serializer, no overlap)
-        if bool(SETTINGS.get("notification_reader", False)):
+        if _setting_flag("notification_reader", False, repair=True):
             # Opt-in persistence means the reader should resume after restart;
             # a missing dbus-monitor simply reports an error and leaves it off.
             result = self._set_notification_reader(True)
@@ -3920,7 +3955,7 @@ class Assistant(QObject):
             self._heal_pending_since = None
             self._heal_attempts = 0
             return
-        if not (self._handsfree and bool(SETTINGS.get("mic_selfheal", True))):
+        if not (self._handsfree and _setting_flag("mic_selfheal", True)):
             return
         now = time.monotonic()
         if self._heal_pending_since is None:
@@ -4050,7 +4085,7 @@ class Assistant(QObject):
         """Announce RAM/VRAM threshold *crossings* once, and re-arm after
         usage drops below each threshold. Opt-in because spoken alerts can
         interrupt a user's work; health polling remains cheap either way."""
-        if not bool(SETTINGS.get("resource_alerts", False)):
+        if not _setting_flag("resource_alerts", False):
             return
         usage = self._resource_usage()
         limits = {
@@ -4080,7 +4115,7 @@ class Assistant(QObject):
         Opt-in: poll (cheap on cooldown), per-event seen-store, one global
         cooldown, popup always + spoken unless already speaking.
         """
-        if not bool(SETTINGS.get("world_warnings", False)):
+        if not _setting_flag("world_warnings", False):
             return
         try:
             cooldown_s = float(SETTINGS.get("world_cooldown_min", 60.0)) * 60.0
@@ -4111,7 +4146,7 @@ class Assistant(QObject):
         2nd tick with a 2 s timeout. Never raises (call site also isolates).
         """
         try:
-            if not bool(SETTINGS.get("hardware_watch", False)):
+            if not _setting_flag("hardware_watch", False):
                 return
             hw = _hardware
             last = self._hardware_last
@@ -4208,7 +4243,7 @@ class Assistant(QObject):
                               exc_info=True)
             # -- VRAM crossing here only when resource_alerts is off (else
             # _resource_tick owns it — never double-announce)
-            if gpu_util is not None and not SETTINGS.get("resource_alerts", False):
+            if gpu_util is not None and not _setting_flag("resource_alerts", False):
                 try:
                     vlim = float(SETTINGS.get("vram_alert_percent", 90.0))
                 except (TypeError, ValueError):
@@ -4911,7 +4946,7 @@ class Assistant(QObject):
         """Dictation fast path, checked before the wake gate so 'start
         dictation' needs no wake word. Returns True when the utterance was
         consumed (a toggle command, or transcribed speech to type)."""
-        if not bool(SETTINGS.get("dictation", True)):
+        if not _setting_flag("dictation", True):
             return False
         m = self._DICTATION_RE.fullmatch(text.strip())
         if m:
@@ -5188,7 +5223,7 @@ class Assistant(QObject):
         # call above, which now drives core.bubble.configure() — this used to
         # repeat half of that work here, which is exactly how the live path and
         # the startup path drifted apart.
-        hf = bool(SETTINGS.get("handsfree", False))
+        hf = _setting_flag("handsfree", False)
         if hf != self._handsfree:
             self._handsfree = hf
             if hf:
@@ -5462,7 +5497,7 @@ class Assistant(QObject):
                 # own words, so whatever survives to here is the user.
                 self._followup_until = 0.0     # exactly one utterance per reply
                 log.info("follow-up accepted (no wake word)")
-            elif self._handsfree and SETTINGS.get("wake_word_required"):
+            elif self._handsfree and _setting_flag("wake_word_required", False):
                 now = _tick_now()
                 if _is_wake_utt(text):
                     # bare wake name ('assistant' / 'hey assistant'): engage
@@ -5486,7 +5521,7 @@ class Assistant(QObject):
                     self._set(gen, IDLE)
                     return
             if not text:
-                if self._handsfree and SETTINGS.get("wake_word_required") \
+                if self._handsfree and _setting_flag("wake_word_required", False) \
                         and _tick_now() < self._wake_until:
                     log.info("ignored (unintelligible while engaged)")
                     self._set(gen, IDLE)
@@ -5527,7 +5562,7 @@ class Assistant(QObject):
     def _maybe_briefing_prefix(self, text: str) -> str:
         """Once a day, on the first conversational utterance, prepend live
         weather so the model delivers a spoken morning briefing."""
-        if not SETTINGS.get("briefing"):
+        if not _setting_flag("briefing", False):
             return ""
         today = datetime.date.today().isoformat()
         if self._briefing_done_date == today:
@@ -5616,7 +5651,7 @@ class Assistant(QObject):
                 return
             tools = ([] if not _BRAIN_STATE["tools_supported"] else
                      [t for t in TOOLS if SETTINGS["permissions"].get(t["function"]["name"], True)])
-            stream_enabled = bool(SETTINGS.get("streaming_tts", True))
+            stream_enabled = _setting_flag("streaming_tts", True)
             if stream_enabled:
                 # speak sentences while the model is still generating; tool
                 # calls still collected from the stream so the loop keeps working
@@ -6829,7 +6864,7 @@ def main() -> int:
         "wake=%s(name=%s/%ss)",
         OLLAMA_MODEL, OLLAMA_NUM_CTX, WHISPER_SIZE,
         SETTINGS.get("streaming_tts"), SETTINGS.get("handsfree"),
-        bool(SETTINGS.get("wake_word_required")), _wake_name(),
+        _setting_flag("wake_word_required", False), _wake_name(),
         SETTINGS.get("engage_seconds"),
     )
     log.info(

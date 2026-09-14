@@ -505,6 +505,36 @@ class TestWhitelistWidening:
         out, err = tb.execute("run_command", {"command": "cargo build"})
         assert err and out.startswith("CONFIRM REQUIRED"), out
 
+    def test_an_extra_entry_matches_however_it_was_typed(self, H, monkeypatch):
+        """The allowlist is TYPED by a human and the command comes from the
+        model, while exec is case-sensitive — so a GUI entry `Pactl` never
+        matched a real `pactl` invocation, and the refusal then LISTED `Pactl`
+        as allowed, which reads as a broken whitelist rather than as a typo.
+
+        Refused rather than executed, so this was never a bypass; the fix is
+        that a saved setting does what it says. `printf` is the probe because
+        it is NOT in the built-in ALLOWED set, so only the user's entry can let
+        it through — with a name that is, the test would pass either way.
+        """
+        for entry, command in (("PRINTF", "printf hi"),
+                               ("printf", "PRINTF hi"),
+                               ("Printf", "printf hi")):
+            tb = self._tb(H, monkeypatch)
+            monkeypatch.setattr(
+                H, "SETTINGS",
+                {**H.DEFAULT_SETTINGS, "extra_allowed_commands": [entry]})
+            out = tb.run_command(command)
+            assert not out.startswith("REFUSED"), (entry, command, out)
+
+    def test_a_path_entry_is_matched_by_its_name(self, H, monkeypatch):
+        """An entry may name a path; membership is the executable's basename,
+        and that comparison is normalised the same way."""
+        tb = self._tb(H, monkeypatch)
+        monkeypatch.setattr(
+            H, "SETTINGS",
+            {**H.DEFAULT_SETTINGS, "extra_allowed_commands": ["/usr/bin/PRINTF"]})
+        assert not tb.run_command("printf hi").startswith("REFUSED")
+
     def test_extras_cannot_shadow_git_or_cargo(self, H, monkeypatch):
         tb = self._tb(H, monkeypatch)
         monkeypatch.setattr(

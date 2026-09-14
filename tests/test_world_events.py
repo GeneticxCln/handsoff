@@ -254,6 +254,16 @@ class TestProactive:
         a._announce_now = lambda t: (_ for _ in ()).throw(AssertionError())
         a._world_tick()  # must return before any fetch/announce
 
+    def test_a_junk_value_that_means_off_neither_fetches_nor_announces(
+            self, H, net, seenfile, monkeypatch):
+        """`bool("false")` is True, so a junk `world_warnings` fetched and spoke
+        severe-world-event warnings for a value that turned them off."""
+        for raw in ("false", "no", "off", "nonsense"):
+            a, said, popped = _ticker(H, monkeypatch)
+            monkeypatch.setitem(H.SETTINGS, "world_warnings", raw)
+            a._world_tick()
+            assert said == [] and popped == [], (raw, said, popped)
+
     def test_cooldown_suppresses_refetch(self, H, net, seenfile, monkeypatch):
         a, said, popped = _ticker(H, monkeypatch)
         a._world_last_announce = time.monotonic()

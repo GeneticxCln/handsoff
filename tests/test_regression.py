@@ -1523,6 +1523,19 @@ class TestResourceAlerts:
         a._resource_tick()
         assert a.spoken == []
 
+    def test_a_junk_value_that_means_off_does_not_probe_or_speak(
+            self, H, monkeypatch):
+        """`bool("false")` is True — the tick probed the machine and spoke the
+        memory alerts the user had asked to be off."""
+        for raw in ("false", "no", "off", "0", "nonsense"):
+            a = self._assistant(H)
+            monkeypatch.setitem(H.SETTINGS, "resource_alerts", raw)
+            monkeypatch.setattr(H.Assistant, "_resource_usage", staticmethod(
+                lambda: (_ for _ in ()).throw(
+                    AssertionError("probed while off"))))
+            a._resource_tick()
+            assert a.spoken == [], raw
+
     def test_threshold_crossing_alerts_once_and_rearms(self, H, monkeypatch):
         a = self._assistant(H)
         monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
@@ -1560,6 +1573,204 @@ class TestResourceAlerts:
         for part in ("resource_chk", "ram_alert_spin", "vram_alert_spin",
                      'resource_alerts', 'ram_alert_percent', 'vram_alert_percent'):
             assert part in src
+
+
+class TestEveryFlagReadIsStrict:
+    """The monolith's boolean settings are read through ONE strict reader.
+
+    `bool(SETTINGS["x"])` INVERTS the most natural way to write "off":
+    `"false"`, `"no"` and `"off"` are all truthy strings, so the raw read
+    ENABLES the thing it looks like it disables. These are the flags that start
+    hands-free, demand the public wake word, type into other windows, read
+    private desktop notifications aloud and let a tick probe the machine.
+
+    The host's loader coerces every flag key, so through the host none of this
+    can fire today — these guards exist because the read must not depend on WHO
+    wrote the dict (`_reload_settings_live` swaps in a whole new one, an
+    embedder can assign into it, a test seam replaces it). That is the same
+    argument `core.tools.setting_flag` itself is written to, and the monolith
+    now reads every flag through it.
+    """
+
+    FLAGS = {
+        "wake_spotter": False,
+        "wake_word_required": False,
+        "handsfree": False,
+        "notification_reader": False,
+        "mic_selfheal": True,
+        "resource_alerts": False,
+        "world_warnings": False,
+        "hardware_watch": False,
+        "dictation": True,
+        "streaming_tts": True,
+        "briefing": False,
+    }
+
+    #: every way of writing "off" that `bool()` gets wrong
+    OFF_FORMS = ("false", "no", "off", "0", "", "FALSE", "No", 0, 0.0)
+
+    def test_no_raw_truth_test_of_a_flag_survives_in_the_monolith(self, H):
+        """The sweep itself.
+
+        A raw `bool(SETTINGS...` read — or an implicit truth test in an
+        `if`/`and`/`elif`, which is the same defect with no `bool()` to grep
+        for — fails here instead of waiting for someone to notice the bubble
+        did the opposite of the setting. `log.info(... %s', SETTINGS.get(x))`
+        is a value DISPLAY, not a read, and is left alone.
+        """
+        offenders = []
+        for i, line in enumerate(
+                (HERE / "handsoff.py").read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("#") or "_setting_flag(" in line:
+                continue
+            if not any(t in line for t in ("bool(", "not ", " and ",
+                                           " or ", "if ", "elif ")):
+                continue
+            for key in self.FLAGS:
+                if f'SETTINGS.get("{key}"' in line or \
+                        f'SETTINGS["{key}"]' in line:
+                    offenders.append(f"{i}: {line.strip()}")
+        assert not offenders, (
+            "raw truth test on a coerced flag — read it with _setting_flag:\n"
+            + "\n".join(offenders))
+
+    def test_every_flag_is_read_through_the_shared_reader(self, H):
+        """The other half, so the guard above cannot pass by the reads having
+        been deleted instead of fixed."""
+        src = (HERE / "handsoff.py").read_text(encoding="utf-8")
+        for key in self.FLAGS:
+            assert f'_setting_flag("{key}"' in src, key
+
+    def test_the_shared_reader_is_not_a_second_implementation(self, H):
+        """One strict flag reader in the tree, not two: the monolith's helper
+        must delegate to `core.tools.setting_flag`."""
+        body = inspect.getsource(H._setting_flag)
+        assert "_core_tools.setting_flag(" in body
+
+    def test_every_way_of_writing_off_reads_as_off(self, H, monkeypatch):
+        for key, default in self.FLAGS.items():
+            for raw in self.OFF_FORMS:
+                monkeypatch.setitem(H.SETTINGS, key, raw)
+                assert H._setting_flag(key, default) is False, (
+                    f'{key}={raw!r} read as ON — bool({raw!r}) is {bool(raw)!r}')
+
+    def test_a_truthy_form_still_reads_as_on(self, H, monkeypatch):
+        """Strictness must not cost a legitimate hand-written "on"."""
+        for key, default in self.FLAGS.items():
+            for raw in ("true", "yes", "on", "1", "TRUE", 1, True):
+                monkeypatch.setitem(H.SETTINGS, key, raw)
+                assert H._setting_flag(key, default) is True, (key, raw)
+
+    def test_a_missing_key_reads_its_documented_default(self, H, monkeypatch):
+        for key, default in self.FLAGS.items():
+            monkeypatch.delitem(H.SETTINGS, key, raising=False)
+            assert H._setting_flag(key, default) is default, key
+
+    def test_junk_takes_the_default_and_warns_once_per_key(
+            self, H, monkeypatch, caplog):
+        """A junk value is not repaired by reading it, and these reads sit on
+        TIMER and per-turn paths (`streaming_tts` once per tool round, the
+        three tick gates, the wake tests per utterance) — so the journal gets
+        one line per key, not one per tick."""
+        monkeypatch.setattr(H._core_tools, "_FLAG_WARNED", set())
+        monkeypatch.setitem(H.SETTINGS, "resource_alerts", "nonsense")
+        with caplog.at_level(logging.WARNING):
+            for _ in range(5):
+                assert H._setting_flag("resource_alerts", False) is False
+        said = [r.getMessage() for r in caplog.records
+                if "resource_alerts" in r.getMessage()]
+        assert len(said) == 1, said
+        # ...and a second key is still reported; the bound is per key, not one
+        # line for the whole process.
+        monkeypatch.setitem(H.SETTINGS, "briefing", "nonsense")
+        with caplog.at_level(logging.WARNING):
+            H._setting_flag("briefing", False)
+        assert [r.getMessage() for r in caplog.records
+                if "briefing" in r.getMessage()]
+
+    def test_a_pure_gate_leaves_the_dict_alone(self, H, monkeypatch):
+        """No repair: a tick gate or a per-turn switch must not mutate
+        SETTINGS from a timer or audio thread for a value nothing re-reads."""
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", "false")
+        assert H._setting_flag("streaming_tts", True) is False
+        assert H.SETTINGS["streaming_tts"] == "false"
+
+    def test_the_durable_reads_repair_what_they_find(self, H, monkeypatch):
+        """`repair=True` is the read-side twin of what `_persist_setting`
+        already does on the write side: the dict must not go on holding a value
+        two readers disagree about."""
+        for key in ("handsfree", "notification_reader"):
+            monkeypatch.setitem(H.SETTINGS, key, "false")
+            assert H._setting_flag(key, False, repair=True) is False
+            assert H.SETTINGS[key] is False, key
+        # a real bool is left exactly as it was
+        for raw in (True, False):
+            monkeypatch.setitem(H.SETTINGS, "handsfree", raw)
+            H._setting_flag("handsfree", False, repair=True)
+            assert H.SETTINGS["handsfree"] is raw
+
+    def test_repair_never_touches_a_missing_key(self, H, monkeypatch):
+        monkeypatch.delitem(H.SETTINGS, "handsfree", raising=False)
+        assert H._setting_flag("handsfree", False, repair=True) is False
+        assert "handsfree" not in H.SETTINGS
+
+
+class TestTheStartupFlagReads:
+    """The two reads that establish DURABLE state, driven through the real
+    `Assistant.__init__` rather than the helper: a junk value must not start
+    hands-free, and must not start the monitor that reads private desktop
+    notifications aloud."""
+
+    @pytest.fixture()
+    def junk_init(self, H, monkeypatch):
+        """Factory for a REAL `Assistant.__init__` with a junk flag set.
+
+        The two reads under test are the STARTUP ones, so a `__new__` stub
+        would not exercise them at all — and the real `__init__` starts
+        workers, so every instance is shut down again. An `Assistant` that
+        outlives its test is exactly what the suite's worker-leak fixture
+        fails on, and one did before this teardown existed.
+        """
+        made = []
+        monkeypatch.setattr(H.ContinuousListener, "start",
+                            lambda self: pytest.fail("listener started"))
+
+        def build(key, raw):
+            monkeypatch.setitem(H.SETTINGS, key, raw)
+            starts = []
+            monkeypatch.setattr(H.Assistant, "_set_notification_reader",
+                                lambda self, on: starts.append(on) or "ok")
+            a = H.Assistant()
+            made.append(a)
+            return a, starts
+
+        yield build
+        for a in made:
+            a.shutdown()
+
+    def test_junk_handsfree_does_not_turn_hands_free_on(self, H, junk_init):
+        a, _ = junk_init("handsfree", "false")
+        assert a._handsfree is False, (
+            "bool('false') is True — hands-free started from a value that asked "
+            "for it to be off")
+        assert H.SETTINGS["handsfree"] is False   # and the dict agrees now
+
+    def test_junk_notification_reader_does_not_start_the_monitor(
+            self, H, junk_init):
+        """The privacy gate: this reader announces private desktop
+        notifications out loud, so the one direction that must never fail open
+        is junk reading as ON."""
+        for raw in ("false", "no", "off", "nonsense", None, []):
+            a, starts = junk_init("notification_reader", raw)
+            assert starts == [], (raw, starts)
+            assert H.SETTINGS["notification_reader"] is False, raw
+
+    def test_a_real_true_still_starts_both(self, H, junk_init):
+        """...and the flags still work when they are actually on."""
+        a, starts = junk_init("notification_reader", True)
+        assert starts == [True]
+        a, _ = junk_init("handsfree", True)
+        assert a._handsfree is True
 
 
 class TestReminderStoreSeam:

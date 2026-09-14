@@ -68,6 +68,19 @@ class TestOff:
         assert time.monotonic() - start < 0.5
         assert a._hardware_note == ""
 
+    def test_a_junk_value_that_means_off_does_not_run_the_tick(
+            self, H, monkeypatch):
+        """`bool("false")` is True — the whole tick ran (probes, the one
+        in-tick subprocess) for a watch the user turned off. The flag is checked
+        before the tick counter advances, so that counter is the witness."""
+        for raw in ("false", "no", "off", "nonsense"):
+            a, said, popped = _assistant(H, monkeypatch)
+            monkeypatch.setitem(H.SETTINGS, "hardware_watch", raw)
+            a._hardware_tick()
+            assert a._hardware_tick_n == 0, raw        # no work at all
+            assert a._hardware_note == "", raw
+            assert said == [] and popped == [], raw
+
 
 class TestFastTick:
     def test_zero_subprocess_calls(self, H, watch_settings, quiet_box,
@@ -140,6 +153,27 @@ class TestCrossings:
         a._hardware_last_urgent = 0.0  # cooldown expired since the 1st urgent
         a._hardware_tick()  # crossing again: announces again
         assert len(said) == 2 and len(popped) == 2
+
+    def test_vram_branch_still_runs_for_a_junk_off(self, H, watch_settings,
+                                                   quiet_box, monkeypatch):
+        """The VRAM crossing is announced HERE only while `resource_alerts` is
+        off (`_resource_tick` owns it otherwise, so it is never said twice).
+        The two gates live in different functions, so reading one strictly and
+        leaving the other raw opened a hole with no owner: a junk "false" made
+        `_resource_tick` hand the crossing over and this branch then skip it.
+        """
+        class _NvidiaSmi:
+            stdout = "95, 100\n"
+
+        monkeypatch.setattr(H.shutil, "which",
+                            lambda name: "/usr/bin/nvidia-smi")
+        monkeypatch.setattr(H.subprocess, "run", lambda *a, **k: _NvidiaSmi())
+        monkeypatch.setitem(H.SETTINGS, "resource_alerts", "false")
+        monkeypatch.setitem(H.SETTINGS, "vram_alert_percent", 90.0)
+        a, said, popped = _assistant(H, monkeypatch)
+        a._hardware_tick_n = 1        # the util query runs on every 2nd tick
+        a._hardware_tick()
+        assert any("GPU memory" in s for s in said), (said, popped)
 
     def test_speaking_suppresses_spoken_copy(self, H, watch_settings,
                                              quiet_box, monkeypatch):

@@ -1907,6 +1907,23 @@ class TestMicSelfHeal:
         a._listener = ln
         return a
 
+    def test_a_junk_value_that_means_off_disables_self_heal(
+            self, H, monkeypatch):
+        """`bool("false")` is True — self-heal restarted the capture stream
+        mid-conversation, and said so out loud, for a value that asked for it to
+        be off. The flag is checked before the grace clock is even armed.
+
+        Only the forms that PARSE as false are here: this flag's default is ON,
+        so unparseable junk deliberately takes the default — which is what the
+        loader stores for junk too, and the point is that the two agree.
+        """
+        for raw in ("false", "no", "off", "0", ""):
+            a = self._mk_assistant(H)
+            monkeypatch.setitem(H.SETTINGS, "mic_selfheal", raw)
+            a._maybe_self_heal(True)
+            assert a._heal_pending_since is None, raw
+            assert a._heal_attempts == 0, raw
+
     def test_speaking_does_not_look_silent(self, H):
         """Regression: while the assistant SPEAKS, frames are dropped before
         the digital-silence check — the silence clock must stay warm, or a

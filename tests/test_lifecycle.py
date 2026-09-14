@@ -1500,6 +1500,70 @@ class TestRestartResilience:
         assert 'ship_top "$rel" || continue' in gen, (
             "the manifest must use the same membership rule as staging")
 
+    def test_the_no_git_fallback_ships_only_the_declared_set(self):
+        """The git rule fixed `test.py` LEAVING a checkout — but the fallback
+        used when there is no git tree returned 0 for every path, so a tarball
+        built from the working directory (not from `git archive`, which carries
+        no untracked file) still shipped the scratch and hashed it into the
+        manifest. The incident came back through the other door.
+
+        With no git there is no ownership signal at all, so the fallback is the
+        DECLARED set — the same floor the stage already validates — rather than
+        `whatever the glob finds`. This runs the REAL `ship_file` out of
+        install.sh (extracted, not re-implemented) against both variable sets,
+        so it pins the behaviour and not the text.
+        """
+        text = (HERE / "install.sh").read_text()
+
+        def var(name):
+            head = f'{name}="'
+            start = text.index(head) + len(head)
+            return text[start:text.index('"', start)]
+
+        fn = text[text.index("ship_file() {"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        assert "DECLARED_PY" in fn and "TRACKED_PY" in fn, fn
+
+        prelude = (
+            'set -eu\n'
+            f'TOP_REQUIRED="{var("TOP_REQUIRED")}"\n'
+            f'CORE_REQUIRED="{var("CORE_REQUIRED")}"\n'
+            'DECLARED_PY="$TOP_REQUIRED handsoff-settings.py"\n'
+            'for m in $CORE_REQUIRED; do\n'
+            '    DECLARED_PY="$DECLARED_PY core/$m.py"\n'
+            'done\n')
+        # both branches of the rule, the declared set always winning
+        body = (
+            'ship_file handsoff.py\n'
+            'ship_file handsoff-settings.py\n'
+            'ship_file core/tools.py\n'
+            'printf ":%s:" "$(ship_file test.py && echo SHIPPED || echo kept)"\n'
+            'printf ":%s:" "$(ship_file scratch_probe.py && echo SHIPPED || echo kept)"\n'
+            'printf ":%s:" "$(ship_file core/zz_future.py && echo SHIPPED || echo kept)"\n')
+
+        # sandbox_env, not a bare launch: this child is bash, but the rule the
+        # suite enforces is that NO child inherits the developer's HOME/XDG,
+        # whatever it runs — and the guard in test_sandbox.py cannot tell a
+        # shell probe from an app load from the argv alone (these strings name
+        # `handsoff.py`, which is one of its markers).
+        no_git = subprocess.run(
+            ["bash", "-c", prelude + fn + '\nTRACKED_PY=""\n' + body],
+            cwd=HERE, capture_output=True, text=True, env=sandbox_env())
+        assert no_git.returncode == 0, no_git.stdout + no_git.stderr
+        assert no_git.stdout.count(":kept:") == 3, (
+            "a no-git tree must ship ONLY the declared set: " + no_git.stdout)
+
+        # ...and in a git work tree the tracked list is what adds files
+        git_side = subprocess.run(
+            ["bash", "-c",
+             prelude + fn + '\nTRACKED_PY="$(git -C . ls-files -- \'*.py\')"\n'
+             + body],
+            cwd=HERE, capture_output=True, text=True, env=sandbox_env())
+        assert git_side.returncode == 0, git_side.stdout + git_side.stderr
+        assert git_side.stdout.count(":SHIPPED:") == 0, (
+            "the untracked scratch must not ship even where git exists: "
+            + git_side.stdout)
+
     def test_lock_failure_logs_instead_of_silent_exit(self, H, monkeypatch):
         """If the lock can't be acquired, say so in the log (no more silent vanish)."""
         import builtins

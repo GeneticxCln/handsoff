@@ -944,6 +944,21 @@ class TestDictationMode:
         assert a._try_dictation("start dictation", 1, threading.Event()) is False
         assert a._dictation is False
 
+    def test_a_junk_value_that_means_off_disables_it_too(self, H, monkeypatch):
+        """`bool("false")` is True — dictation typed transcripts into whatever
+        window was focused, for a value that asked for it to be off.
+
+        Only the forms that PARSE as false: dictation's default is ON, so
+        unparseable junk takes the default (what the loader stores for junk
+        too) — the two must agree, which is the whole point of the pass.
+        """
+        for raw in ("false", "no", "off", "0", ""):
+            a = self._mk(H, monkeypatch)
+            monkeypatch.setitem(H.SETTINGS, "dictation", raw)
+            assert a._try_dictation("start dictation", 1,
+                                    threading.Event()) is False, raw
+            assert a._dictation is False, raw
+
     def test_terminal_refusal_stops_dictation_and_explains(self, H, monkeypatch):
         a = self._mk(H, monkeypatch)
         a._dictation = True

@@ -3821,3 +3821,91 @@ The honest edge case from this pass is worth keeping too: the raw
 host (the loader normalises every flag key, verified), so it was fixed as
 defence-in-depth and recorded that way. Calling it a live privacy hole would have
 been the more exciting sentence and the less true one.
+
+## The flag reads: one reader, and a per-site decision about the dict
+
+**What was missing.** Every boolean setting in `handsoff.py` was read as
+`bool(SETTINGS.get(...))` — sixteen of them, of which the audit named the twelve
+that spell `bool(`. The other four were the same defect with nothing to grep
+for: four raw truth tests inside `if`/`elif` conditions, one of them inverted
+(`not SETTINGS.get("resource_alerts", False)` gating the VRAM crossing in
+`_hardware_tick`), two deciding whether the public wake word was required, one
+`briefing`. `bool("false")` is True, so each of these ENABLES what it looks like
+it disables.
+
+**What the fix is.** One reader — `core.tools.setting_flag`, which the host
+wraps as `_setting_flag` rather than duplicating — plus a decision per site
+about whether to repair the dict.
+
+| class of site | what it does | why |
+|---|---|---|
+| the two durable reads (startup `handsfree` snapshot, `notification_reader` privacy gate) | strict read **and** writes the resolved value back | they establish state that other code re-reads and that gets persisted; leaving junk there means two readers of one key disagree, which is what `_persist_setting` already refuses to allow on the write side |
+| the other fourteen (three tick gates, `streaming_tts` per tool round, `dictation`, `mic_selfheal`, `briefing`, the wake-word tests, the startup log line) | strict read only | they gate the work in front of them and nothing re-reads the key; mutating `SETTINGS` from a timer or audio thread would be the worse bug |
+
+**A pair that only works together.** `resource_alerts` is read in two functions
+with opposite senses — `_resource_tick` owns memory alerts while it is on,
+`_hardware_tick` owns the VRAM crossing while it is off, precisely so nothing is
+announced twice. Reading one strictly and leaving the other raw leaves the
+crossing with NO owner: junk `"false"` (meaning off) made `_resource_tick` hand
+it over and `_hardware_tick` then skip it. Neither announced. The sweep has to be
+per-site to catch this, and it is the strongest argument against the "just
+replace all the `bool(` calls" version of this job.
+
+**Deliberately NOT changed.** A flag whose default is ON (`dictation`,
+`mic_selfheal`, `streaming_tts`) reads ON for unparseable junk. That is correct:
+it is what `coerce_settings` stores for junk, and making the reader fail closed
+here would make memory and disk disagree — the exact divergence this whole
+family of fixes exists to remove. My first guards asserted the opposite and
+failed; the guards now state the distinction rather than the reader being bent to
+match a wrong test. `log.info(... SETTINGS.get("streaming_tts") ...)` also stays
+raw: it displays the setting, it does not test it.
+
+**Honest reachability.** Through the host none of this fires — the loader
+normalises every flag key, both runtime writers coerce, and no module writes raw
+into `SETTINGS` (grepped across `core/*.py`, `handsoff-settings.py`,
+`hardware.py`, `settings_schema.py`: zero). The pass buys independence from WHO
+wrote the dict, which is the same thing `core.tools` bought itself last round,
+and it is worth having because `_reload_settings_live` swaps in a whole new dict,
+an embedder can hand the module one, and the tests' own seam replaces it.
+Presenting it as a live privacy hole would have been wrong.
+
+**Residual, recorded rather than implied.** The reload comparison (`hf =
+_setting_flag("handsfree", False)`) is covered by the source-level guard only —
+there is no behavioural test that a junk `SETTINGS` fails to toggle hands-free
+through `_reload_settings_live`. The source guard does catch a revert at that
+line, which is why it was not left out of the sweep; a behavioural pin there
+would need the full reload harness and was not worth the cost in this round.
+
+## The installer's fallback, and one finding that was already closed
+
+**Closed already (re-filed as open, verified against the tree).** The twelve
+`bool(SETTINGS...)` reads were migrated earlier in this session — and there were
+sixteen, the other four being raw truth tests with no `bool(` to grep for. A
+re-read of `handsoff.py` finds no raw read of any of those keys except the
+pass's own docstring and a `%s` value display in a log line. The finding's
+reachability argument matches what is recorded: through the host it cannot fire,
+because the loader coerces every flag key and both writers coerce, and no module
+writes raw into `SETTINGS`. Its one new lead — the settings app's live-notify
+path — is clear on inspection: the app never shares the dict, it saves through
+`coerce_settings` and asks the bubble to `reload-settings` over the control
+socket, so the bubble re-loads and re-coerces.
+
+**The no-git fallback was a second door into the same incident.** `ship_file`
+returned 0 for every path when git could not be consulted, which made the glob
+the ship list again. `git archive` carries no untracked file, so this is
+specifically the "tarball built from the working directory" case — and the file
+it leaks is gitignored, so nothing else in the tree would notice. The fallback
+is now the declared set: there is no ownership signal without git, and inventing
+one by globbing is what caused the reported incident in the first place.
+
+**The cost, stated rather than buried.** A new `core/` module now has to be
+named in `CORE_REQUIRED` to ship from a tarball. That is already the installer's
+contract (the stage fails loudly when a declared module is missing), and the
+list is where the comment now says so, but it IS a behaviour change for tarball
+installs and belongs in the record. Git installs are unaffected: they still pick
+a new module up automatically once it is committed.
+
+**Case in the allowlist.** A saved `extra_allowed_commands` entry that never
+matched is worse than a rejected one, because the refusal message lists the entry
+as allowed. Matching is normalised on both sides now; the built-in `ALLOWED` set
+was already lowercase, so only a human-typed entry was ever affected.

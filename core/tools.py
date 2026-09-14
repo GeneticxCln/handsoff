@@ -568,6 +568,13 @@ _BOOL_FALSE = frozenset({"false", "no", "off", "0", ""})
 # warning below is emitted once per process rather than on every tool call.
 _RATE_LIMIT_WARNED = False
 
+# The same reasoning for the flag reader below, which the host calls on TIMER
+# and per-turn paths — `streaming_tts` once per tool round, the three tick
+# gates, the two wake-word tests per utterance. A junk value is not repaired by
+# reading it, so a warning per read would bury the journal in proportion to
+# how often the bubble ticks. Once per key per process.
+_FLAG_WARNED: set = set()
+
 
 def coerce_bool_arg(raw) -> bool:
     """Strict bool for model-supplied args ("false" must not become True)."""
@@ -602,12 +609,18 @@ def setting_flag(key: str, default: bool = False) -> bool:
     a consumer bypasses every coercion in `core/settings.py`. Junk falls back to
     `default` (what the loader stores for junk too), so a corrupted value cannot
     make a gate looser than a fresh start.
+
+    This is the ONE strict flag reader: the monolith's `_setting_flag` wraps it
+    on every flag read, so the warning is bounded to once per key per process
+    (`_FLAG_WARNED`) rather than repeating on whatever loop the read sits in.
     """
     raw = _dep().SETTINGS.get(key, default)
     try:
         return coerce_bool_arg(raw)
     except (ValueError, TypeError):
-        log.warning('invalid %s=%r — using default %r', key, raw, default)
+        if key not in _FLAG_WARNED:
+            _FLAG_WARNED.add(key)
+            log.warning('invalid %s=%r — using default %r', key, raw, default)
         return default
 
 
@@ -989,9 +1002,20 @@ class ToolBelt:
                 return (None, '', 'REFUSED: self-restart is disabled in handsoff settings', False)
             if not (_dep().RESTART_SCRIPT.exists() and os.access(_dep().RESTART_SCRIPT, os.X_OK)):
                 return (None, '', f'ERROR: restart script missing at {_dep().RESTART_SCRIPT} — run install.sh', False)
-        allowed = set(self.ALLOWED) | {Path(c.strip().split()[0]).name for c in _dep().SETTINGS.get("extra_allowed_commands") or [] if c.strip()}
+        # Built and compared in ONE case. The allowlist is typed by a human
+        # while the command comes from the model, and exec is case-sensitive —
+        # so a GUI entry "Pactl" never matched a real `pactl` invocation, and
+        # the refusal then LISTED "Pactl" as allowed, which reads as a broken
+        # whitelist rather than a typo. Refused rather than executed, so this
+        # was never a bypass: the fix is that a saved setting now does what it
+        # says. `self.ALLOWED` is already lowercase, so this only normalises
+        # the entries the user typed.
+        allowed = ({c.lower() for c in self.ALLOWED}
+                   | {Path(c.strip().split()[0]).name.lower()
+                      for c in _dep().SETTINGS.get("extra_allowed_commands")
+                      or [] if c.strip()})
         if not is_restart:
-            if exe_base not in allowed and exe_base != _unblocked:
+            if exe_base.lower() not in allowed and exe_base != _unblocked:
                 return (None, '', f"REFUSED: '{exe}' is not on the safe shell-command whitelist. Note: REFUSED does NOT mean the program is missing — it only means you may not run it via run_command. If it is one of your own tools (like ydotool for typing), use that tool instead. Allowed: " + ', '.join(sorted(allowed)) + f', {_dep().RESTART_SCRIPT}', False)
         _dep().log.info('run_command: %s', _dep()._log_metadata(cmd, 'command'))
         if Path(argv[0]).name == 'niri' and 'spawn' in argv:

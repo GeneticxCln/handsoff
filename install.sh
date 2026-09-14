@@ -85,8 +85,22 @@ is_exec() {   # 0 when the basename is an entry point (installed 0755)
 # So: the declared entry points always ship, plus every top-level *.py the repo
 # actually tracks. Discovery stays automatic (a new module ships once it is
 # committed — no list to maintain), while a scratch file never leaves the
-# checkout. Outside a git work tree (a tarball install) the glob is all there
-# is, and is kept as the fallback.
+# checkout.
+#
+# Outside a git work tree (a tarball install) there is NO "what does the
+# project own" signal to consult, and the previous fallback — ship whatever
+# the glob finds — is precisely how that scratch file got out: a tarball built
+# from the working directory (not from `git archive`) carries the untracked
+# scratch along and the installer would ship and hash it. So the no-git
+# fallback is the DECLARED set, not the glob. A module that belongs to the
+# project has to be named in TOP_REQUIRED/CORE_REQUIRED — which is also the
+# floor the stage below already validates, so there is still exactly one
+# answer to "what ships" and it is written down.
+#
+# ADDING A MODULE: commit it (git installs pick it up automatically) and add
+# it to CORE_REQUIRED if it lives in core/, or a tarball install will not ship
+# it. The stage fails loudly on a missing CORE_REQUIRED entry, so the mistake
+# is caught at install time rather than at first import.
 TRACKED_PY=""
 if command -v git >/dev/null 2>&1 \
     && git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -98,12 +112,12 @@ for m in $CORE_REQUIRED; do
     DECLARED_PY="$DECLARED_PY core/$m.py"
 done
 ship_file() {   # $1 = repo-relative path; 0 → it is part of the project
-    if [ -z "$TRACKED_PY" ]; then
-        return 0                       # no git: the glob is the source of truth
-    fi
     case " $DECLARED_PY " in
         *" $1 "*) return 0 ;;           # declared entry points always ship
     esac
+    if [ -z "$TRACKED_PY" ]; then
+        return 1                       # no git: nothing beyond the declared set
+    fi
     printf '%s\n' "$TRACKED_PY" | grep -qx -- "$1"
 }
 ship_top() { ship_file "$1"; }
@@ -429,8 +443,14 @@ stage_fail() {
 # hard-imported module has gone missing. Membership is decided in one place
 # (ship_file) so staging, the manifest and the rehearsal check cannot disagree.
 skip_unowned() {   # $1 = repo-relative path that failed the membership test
-    echo "    NOT shipping $1 — untracked in git, so it is not part of the project"
-    echo "      (commit it if it is a module; it would land in $BIN_DIR)"
+    if [ -n "$TRACKED_PY" ]; then
+        echo "    NOT shipping $1 — untracked in git, so it is not part of the project"
+        echo "      (commit it if it is a module; it would land in $BIN_DIR)"
+    else
+        echo "    NOT shipping $1 — not a declared module, and this is not a git"
+        echo "      checkout, so there is nothing to ask. If it belongs to the"
+        echo "      project, name it in TOP_REQUIRED/CORE_REQUIRED in install.sh."
+    fi
 }
 for src in "$HERE"/*.py; do
     base="$(basename "$src")"
