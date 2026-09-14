@@ -3243,11 +3243,32 @@ class TestWatchdogReopenLoop:
         monkeypatch.setattr(H, "_open_input",
                             lambda dev, rate, bs, cb: (self._fake_stream(events), 16000))
 
+    @staticmethod
+    def _run_capped(H, monkeypatch, ln, tick, max_ticks=80):
+        """Drive _run with a fake sleep; a stream that never ends the run
+        itself is force-stopped after max_ticks ticks instead of hanging.
+        The tick-count cap also turns 'the watchdog never fired' from a HANG
+        into a visible red (the reopen never happened)."""
+        state = {"ticks": 0}
+        real_sleep = time.sleep
+
+        def fake_sleep(s):
+            if s == 0.5:
+                state["ticks"] += 1
+                if state["ticks"] > max_ticks:
+                    ln._running = False      # force-exit: the guard fails below
+                    return
+            tick(s)
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        ln._run(7)
+        real_sleep(0)
+        return state["ticks"]
+
     # ---- stalled: frames stop arriving → REOPEN_S later the stream reopens
 
     def test_stalled_stream_is_reopened(self, H, monkeypatch, caplog):
         events = []
-        self._wire_open(H, monkeypatch, events)
+        start_at = []                      # clock time of each device open
         ln = self._listener(H)
         monkeypatch.setattr(H.ContinuousListener, "REOPEN_S", 1.0)
         # A controllable clock is what makes the threshold REACHABLE: with the
@@ -3257,21 +3278,30 @@ class TestWatchdogReopenLoop:
         monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
         stalled_seen = []
 
-        def fake_sleep(s):
-            clock["t"] += max(s, 0.5)     # every sleep advances the fake clock
+        def fake_open(dev, rate, bs, cb):
+            start_at.append(clock["t"])
+            return self._fake_stream(events), 16000
+        monkeypatch.setattr(H, "_open_input", fake_open)
+
+        def tick(s):
+            clock["t"] += s               # the fake clock advances per sleep
             if s == 0.5:                  # a watchdog tick: NO frames arrive
                 if ln._health_stalled_since is not None:
                     stalled_seen.append(ln._health_stalled_since)
                 if events.count("start") >= 2:
                     ln._running = False   # generation 2 observed → end cleanly
-        monkeypatch.setattr(H.time, "sleep", fake_sleep)
-        with caplog.at_level("INFO", logger="handsoff"):
-            ln._run(7)
+        self._run_capped(H, monkeypatch, ln, tick)
         assert events.count("start") == 2, events          # REOPENED
         assert events[-2:] == ["stop", "close"], events
         assert "stalled; reopening" in caplog.text, caplog.text
         assert stalled_seen, \
             "the stalled period must be visible in the mic-health state"
+        # Deterministic with the fake clock: every watchdog tick is exactly
+        # 0.5 s, detection must begin on the FIRST tick (last_seen is sampled
+        # from the live counter at open — a stale init delays detection one
+        # whole tick), REOPEN_S=1.0 fires by the 4th, and the settle sleep
+        # adds 1.0 s. So the second open lands at ≤ 3.0 s.
+        assert start_at[1] - start_at[0] <= 3.0, start_at
 
     # ---- silent: frames flow but are pure digital silence → SILENT_REOPEN_S
 
@@ -3283,17 +3313,43 @@ class TestWatchdogReopenLoop:
         clock = {"t": 1000.0}     # _last_nonzero is stamped 1000.0 at open
         monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
 
-        def fake_sleep(s):
-            clock["t"] += max(s, 0.5)
+        def tick(s):
+            clock["t"] += s               # silence must ELAPSE to be detected
             if s == 0.5:
                 ln._frames_seen += 1          # the PortAudio callback is alive…
                 if events.count("start") >= 2:
-                    ln._running = False
-        monkeypatch.setattr(H.time, "sleep", fake_sleep)
-        with caplog.at_level("INFO", logger="handsoff"):
-            ln._run(7)
+                    ln._running = False       # …but every frame is zero
+        self._run_capped(H, monkeypatch, ln, tick)
         assert events.count("start") == 2, events          # REOPENED
         assert "only silence; reopening" in caplog.text, caplog.text
+
+    def test_recovered_frames_clear_the_stalled_marker(self, H, monkeypatch):
+        """A stall that ENDS — frames flow again — must clear the mic-health
+        marker. If recovery leaves it set, health keeps reporting a stall
+        that is over and the UI cries wolf about a healthy mic."""
+        events = []
+        self._wire_open(H, monkeypatch, events)
+        ln = self._listener(H)
+        monkeypatch.setattr(H.ContinuousListener, "REOPEN_S", 60.0)
+        monkeypatch.setattr(H.ContinuousListener, "SILENT_REOPEN_S", 60.0)
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
+        phase = {"n": 0}
+
+        def tick(s):
+            clock["t"] += s
+            if s != 0.5:
+                return
+            phase["n"] += 1
+            if phase["n"] == 1:
+                return                    # tick 1: no frames → stall begins
+            # tick 2: the stall was marked, then frames flow again
+            assert ln._health_stalled_since is not None, "the stall was never marked"
+            ln._frames_seen += 1          # recovery: the callback is alive
+            ln._running = False           # end the run after this tick
+        self._run_capped(H, monkeypatch, ln, tick, max_ticks=10)
+        assert ln._health_stalled_since is None, \
+            "recovery must clear the stalled marker"
 
     # ---- healthy: frames flow and speech happened recently → NO reopen
 
@@ -3301,19 +3357,20 @@ class TestWatchdogReopenLoop:
         events = []
         self._wire_open(H, monkeypatch, events)
         ln = self._listener(H)
+        monkeypatch.setattr(H.ContinuousListener, "REOPEN_S", 3.0)
         clock = {"t": 1000.0}
         monkeypatch.setattr(H.time, "monotonic", lambda: clock["t"])
 
-        def fake_sleep(s):
-            clock["t"] += max(s, 0.5)
+        def tick(s):
             if s == 0.5:
                 ln._frames_seen += 1          # frames flow, and (no cb call)
                 if ln._frames_seen >= 5:      # …recent nonzero speech happened
                     ln._running = False       # end the run cleanly
-        monkeypatch.setattr(H.time, "sleep", fake_sleep)
-        ln._run(7)
+        ticks = self._run_capped(H, monkeypatch, ln, tick)
         # The final stop/close IS the clean shutdown on exit; what must never
-        # happen is a WATCHDOG reopen — a second start.
+        # happen is a WATCHDOG reopen — a second start. REOPEN_S=3.0 with five
+        # 0.5s ticks means even a stalled reading would have fired by now.
+        assert ticks <= 5, ticks
         assert events.count("start") == 1, events
         assert ln._health_stalled_since is None
 
@@ -3324,11 +3381,10 @@ class TestWatchdogReopenLoop:
         self._wire_open(H, monkeypatch, events)
         ln = self._listener(H)
 
-        def fake_sleep(s):
+        def tick(s):
             if s == 0.5:
                 ln._running = False                 # hands-free switched off
-        monkeypatch.setattr(H.time, "sleep", fake_sleep)
-        ln._run(7)
+        self._run_capped(H, monkeypatch, ln, tick, max_ticks=3)
         assert events == ["start", "stop", "close"], events
         assert ln._running is False
         assert ln.gate_open is False
@@ -3345,11 +3401,10 @@ class TestWatchdogReopenLoop:
         monkeypatch.setattr(H, "_open_input", fake_open)
         ln = self._listener(H)
 
-        def fake_sleep(s):
+        def tick(s):
             if s == 0.5:
                 ln._running = False                 # one tick, then off
-        monkeypatch.setattr(H.time, "sleep", fake_sleep)
-        ln._run(7)
+        self._run_capped(H, monkeypatch, ln, tick, max_ticks=2)
         ln._running = False                          # suspended/stopped
         before = ln._frames_seen
         captured["cb"](None, 0, None, None)
@@ -3362,8 +3417,29 @@ class TestWatchdogReopenLoop:
         self._wire_open(H, monkeypatch, events)
         ln = self._listener(H)
         ln._run_id = 8                               # superseded
+
+        def fail(s):                                 # NO sleep call may happen
+            raise AssertionError("stale generation entered the run loop")
+        monkeypatch.setattr(H.time, "sleep", fail)
         ln._run(7)
         assert events == []                          # nothing opened
+
+    def test_supersession_empties_the_inner_loop(self, H, monkeypatch):
+        """Mid-run supersession — _run_id bumped while streaming — must end
+        THIS run even though _running is still True: the inner watchdog loop
+        checks the generation token every tick, and the new generation owns
+        the device and the _running flag from that moment."""
+        events = []
+        self._wire_open(H, monkeypatch, events)
+        ln = self._listener(H)
+
+        def tick(s):
+            if s == 0.5:
+                ln._run_id = 8                # stop() bumped it mid-stream
+        ticks = self._run_capped(H, monkeypatch, ln, tick, max_ticks=4)
+        assert ticks <= 2, ticks              # ended on its own, not via the cap
+        assert events == ["start", "stop", "close"], events
+        assert ln._running is True            # the NEW generation owns the flag
 
     def test_teardown_survives_a_raising_stop(self, H, monkeypatch, caplog):
         """A PortAudio stream whose stop() raises mid-teardown must not kill
@@ -3379,11 +3455,9 @@ class TestWatchdogReopenLoop:
                             lambda dev, rate, bs, cb: (_BadStream(), 16000))
         ln = self._listener(H)
 
-        def fake_sleep(s):
+        def tick(s):
             if s == 0.5:
                 ln._running = False
-        monkeypatch.setattr(H.time, "sleep", fake_sleep)
-        with caplog.at_level("INFO", logger="handsoff"):
-            ln._run(7)
+        self._run_capped(H, monkeypatch, ln, tick, max_ticks=2)
         assert ln._stream is None, "the dead stream must be released"
         assert ln._running is False

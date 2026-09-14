@@ -1471,22 +1471,33 @@ class TestSuperBindingKnown:
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
 
     def test_include_cycle_terminates(self, niri_home):
-        """Two files including each other must not hang or crash."""
-        self._write_cfg(niri_home, 'include "a.kdl"\n')
+        """Two files including each other must not hang or crash — the
+        dedupe (`seen`) stops a cycle from re-reading a file forever."""
+        self._write_cfg(niri_home, 'include "a.kdl"\ninclude "final.kdl"\n')
         (niri_home / "a.kdl").write_text('include "b.kdl"\n', encoding="utf-8")
         (niri_home / "b.kdl").write_text('include "a.kdl"\n', encoding="utf-8")
-        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+        (niri_home / "final.kdl").write_text("binds { Mod+T; }\n",
+                                             encoding="utf-8")
+        # terminates (no hang) AND the dedupe must have left room: final.kdl
+        # is a second top-level include, so a walk that re-follows the a/b
+        # cycle forever would exhaust the 20-slot budget before reaching it.
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is True
 
     def test_include_walk_is_capped_at_twenty(self, niri_home):
-        """A config including 25 files stops following at 20 — the walk is
-        bounded, so a hostile config cannot turn one lookup into a crawl."""
-        incs = " ".join(f'include "k{i:02d}.kdl"' for i in range(25))
+        """The walk follows EXACTLY 20 includes — bounded, so a hostile
+        config cannot turn one lookup into a crawl. Pinned from both sides:
+        the chord in the 20th included file IS found, in the 21st is NOT —
+        an off-by-one or a removed cap goes red either way."""
+        n = 25
+        incs = " ".join(f'include "k{i:02d}.kdl"' for i in range(n))
         self._write_cfg(niri_home, incs + "\n")
-        for i in range(25):
-            (niri_home / f"k{i:02d}.kdl").write_text("// empty\n",
-                                                      encoding="utf-8")
-        # terminates (no hang) and the chord — in no file — is absent
-        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+        for i in range(n):
+            marker = "Mod+T" if i == 19 else ("Mod+Z" if i == 20 else "x")
+            (niri_home / f"k{i:02d}.kdl").write_text(
+                f"binds {{ {marker}; }}\n", encoding="utf-8")
+        # k19 is the 20th include: found. k20 would be the 21st: not.
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is True
+        assert _core_tools.ToolBelt._super_binding_known("mod+z") is False
 
     @pytest.mark.skipif(getattr(os, "geteuid", lambda: 0)() == 0,
                         reason="root reads anything; unreadable-file path unreachable")
@@ -1501,5 +1512,22 @@ class TestSuperBindingKnown:
             if os.access(locked, os.R_OK):      # e.g. ACLs override the mode
                 pytest.skip("file still readable")
             assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+        finally:
+            locked.chmod(0o644)                 # tmp_path cleanup can rmtree
+
+    def test_readable_later_include_is_still_followed(self, niri_home):
+        """A skipped include must not ABORT the walk: an unreadable file is
+        passed over and a later, readable include is still followed."""
+        self._write_cfg(niri_home,
+                        'include "locked.kdl"\ninclude "fine.kdl"\n')
+        locked = niri_home / "locked.kdl"
+        locked.write_text("binds { Mod+Q; }\n", encoding="utf-8")
+        locked.chmod(0o000)
+        (niri_home / "fine.kdl").write_text("binds { Mod+T; }\n",
+                                            encoding="utf-8")
+        try:
+            if os.access(locked, os.R_OK):
+                pytest.skip("file still readable")
+            assert _core_tools.ToolBelt._super_binding_known("mod+t") is True
         finally:
             locked.chmod(0o644)                 # tmp_path cleanup can rmtree
