@@ -1489,6 +1489,14 @@ class SettingsWindow(QMainWindow):
         self._live_timer.setInterval(400)
         self._live_timer.timeout.connect(self._apply_appearance_live)
 
+        # ...and the model picker applies on the same principle, with its own
+        # timer so a click cannot be confused with an appearance edit.
+        self._model_apply_timer = QTimer(self)
+        self._model_apply_timer.setSingleShot(True)
+        self._model_apply_timer.setInterval(400)
+        self._model_apply_timer.timeout.connect(self._apply_model_live)
+        self._model_list_syncing = False
+
         # Every page goes through `_scrolling_page`: ONE scrolling
         # implementation for all six tabs, so no page can decide how tall the
         # window has to be.
@@ -1627,6 +1635,7 @@ class SettingsWindow(QMainWindow):
 
         def done(ok, result):
             self.health_label.setToolTip(_health_tooltip(result))
+            self._render_model_in_use(result if ok else None)
             if ok and result is not None:
                 self.health_label.setText(_fmt_health(result))
                 degraded = ((result.get("mic") or {}).get("state")
@@ -1748,7 +1757,17 @@ class SettingsWindow(QMainWindow):
         form.addRow("", self.remote_ollama_chk)
         self.model_list = QListWidget(self)
         self.model_list.setMinimumHeight(180)
+        # Picking a model IS the action, like picking a shape in Appearance: the
+        # click applies and saves it a moment later, so there is no Save button
+        # in the middle to miss. Its oldest complaint is "swapping models never
+        # applies, the new model is never saved", and the honest reading of that
+        # is a picker whose choice only takes effect if someone presses a button
+        # somewhere else.
+        self.model_list.currentItemChanged.connect(self._on_model_picked)
         form.addRow("Models (🔧 tools = can control the desktop & self-modify)", self.model_list)
+        self.model_in_use = QLabel("In use now: …", self)
+        self.model_in_use.setWordWrap(True)
+        form.addRow("", self.model_in_use)
         row = QHBoxLayout()
         refresh = QPushButton("Refresh", self)
         refresh.clicked.connect(self.refresh_models)
@@ -1793,6 +1812,76 @@ class SettingsWindow(QMainWindow):
         it = self.model_list.currentItem()
         return it.data(Qt.UserRole) if it else ""
 
+    def _on_model_picked(self, *_args) -> None:
+        """A model CLICK starts the apply; a list REBUILD never does.
+
+        `refresh_models` sets the selection programmatically to put back the row
+        the user already had, and `QListWidget.clear()` emits
+        `currentItemChanged` naming some OTHER item on the way out (measured:
+        clearing a list whose current row was 2 emitted the item at row 1).
+        Without this guard a plain Refresh would apply a model nobody chose,
+        which is the same defect as losing a pick — a rebuild read as a choice.
+        """
+        if self._model_list_syncing:
+            return
+        if not self._selected_model():
+            return
+        self._model_apply_timer.start()
+
+    def _apply_model_live(self) -> None:
+        """Save the picked model and tell the running bubble. No button.
+
+        Skips the write when the file already holds this model, which is how a
+        plain window load (where the list is restored to the stored model) is
+        told apart from a real pick — the same "is this an edit?" rule the
+        Appearance tab applies, for the same reason.
+        """
+        picked = self._selected_model()
+        if not picked:
+            return
+        try:
+            on_disk = merge_settings(
+                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            on_disk = {}
+        if on_disk.get("model") == picked:
+            return                    # already the model on disk: not an edit
+        switched = str(picked) != str(self._model_at_open)
+        if not self._save_reported():
+            return
+        note = ("  The conversation was cleared for it (a backup is kept), "
+                "because a new model must not inherit what the old one was "
+                "tuned for." if switched else "")
+        self._status(f"Applied model {picked} — no Save needed.{note}")
+        self._refresh_health()        # and say what the bubble is on NOW
+
+    def _render_model_in_use(self, health: "dict | None") -> None:
+        """What the RUNNING bubble is actually on, right beside the picker.
+
+        The vitals line at the bottom of the window says the same thing, but the
+        question "did my pick apply?" is asked while looking at the list, so the
+        answer has to be there. The bubble's own `model` is the only authority:
+        `settings.json` says what was ASKED for, the bubble says what is IN USE,
+        and a picker that cannot show the difference is how "the model never
+        applies" stays invisible.
+        """
+        lab = getattr(self, "model_in_use", None)
+        if lab is None:
+            return
+        live = str((health or {}).get("model") or "")
+        picked = str(self._selected_model() or self.cfg.get("model") or "")
+        if not live:
+            lab.setText(f"In use now: the bubble is not answering (picked: "
+                        f"{picked or 'nothing'})")
+            lab.setStyleSheet("color: palette(mid);")
+            return
+        if picked and live != picked:
+            lab.setText(f"In use now: {live} — {picked} is not applied yet.")
+            lab.setStyleSheet("color: orange;")
+            return
+        lab.setText(f"In use now: {live}")
+        lab.setStyleSheet("color: palette(mid);")
+
     def refresh_models(self) -> None:
         base = (self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
         if not base.startswith(("http://", "https://")):
@@ -1802,6 +1891,9 @@ class SettingsWindow(QMainWindow):
         # mean, saved or not — so it has to be carried across the rebuild rather
         # than looked up afterwards, when it is already gone.
         keep = self._selected_model()
+        # A rebuild, not a choice: everything below (and in `_fill_model_list`,
+        # which clears the flag) is suppressed for the pick handler.
+        self._model_list_syncing = True
         self.model_list.clear()
         loading = QListWidgetItem("loading …")
         loading.setFlags(Qt.NoItemFlags)
@@ -1821,7 +1913,12 @@ class SettingsWindow(QMainWindow):
             return out
 
         def done(ok, result):
-            self._fill_model_list(base, ok, result, keep)
+            try:
+                self._fill_model_list(base, ok, result, keep)
+            finally:
+                # Always, including the unreachable-server return: a flag left
+                # set would make every later pick silently do nothing.
+                self._model_list_syncing = False
 
         self.run_bg(fetch, done)
 
@@ -1864,6 +1961,8 @@ class SettingsWindow(QMainWindow):
         if (self.model_list.currentRow() < 0 and self.model_list.count()
                 and not target):
             self.model_list.setCurrentRow(0)
+        # The rebuild is over: from here a selection change is the user's.
+        self._model_list_syncing = False
 
     def test_model(self) -> None:
         base = (self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
@@ -2672,7 +2771,18 @@ class SettingsWindow(QMainWindow):
             "watchers": ("File/process watchers", "bounded monitors that announce matching "
                          "lines or process exits"),
         }
-        for key, (title, desc) in labels.items():
+        # The KEY SET comes from the schema, not from the dict above. A
+        # permission declared in `settings_schema.DEFAULT_SETTINGS["permissions"]`
+        # used to ship with no checkbox at all, and `_collect` then wrote a
+        # `permissions` dict WITHOUT that key — which the three-way merge
+        # resolves as a DELETE (the candidate is missing it, the disk still
+        # equals what was loaded), so `"get_datetime": false` was silently
+        # turned back on from the defaults by the next Save. Wording stays in
+        # `labels`; the fallback keeps a brand-new permission visible instead of
+        # invisible, and the guard asserts the two sets agree in both directions.
+        for key in (DEFAULT_SETTINGS.get("permissions") or {}):
+            title, desc = labels.get(key, (key.replace("_", " ").capitalize(),
+                                           "no description yet"))
             chk = QCheckBox(f"{title} — {desc}", self)
             self.perm_checks[key] = chk
             form.addRow(chk)
@@ -4715,7 +4825,12 @@ class SettingsWindow(QMainWindow):
         self.cfg["animation_energy"] = self.energy_slider.value() / 100.0
         self.cfg["bubble_accent"] = self.accent_slider.value() / 100.0
         self.cfg["colors"] = dict(self._colors)
-        self.cfg["permissions"] = {k: chk.isChecked() for k, chk in self.perm_checks.items()}
+        # Filled FROM the loaded dict, so a key this tab has no widget for keeps
+        # the value it had instead of disappearing — a dropped key is a
+        # permission silently re-defaulted (see `_permissions_tab`).
+        permissions = dict(self.cfg.get("permissions") or {})
+        permissions.update({k: chk.isChecked() for k, chk in self.perm_checks.items()})
+        self.cfg["permissions"] = permissions
         policy_map: dict[str, str] = {}
         if self.policy_rows:
             # minimal map: ALLOW is the default, keep settings.json clean

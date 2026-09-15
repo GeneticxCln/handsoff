@@ -4267,3 +4267,50 @@ INSTALLED bytes with the user's real settings against the real Ollama (15
 models): minimum 331x173, all three bar buttons reachable, health line on
 screen, Permissions and Appearance scrolling, and picking `gemma4:26b` landing
 exactly that in `settings.json`; `deployment: in-sync`.
+
+---
+
+## 2026-09-15 — "the model swap is still unfixed", and a permission that turned itself on
+
+Reported after the screen-fit fix shipped: "applying another Ollama model is
+never saved — the model swap is still unfixed".
+
+**The Save path was proven correct before changing anything**, on the user's own
+file with their own Ollama: a real mouse click on `gemma4:26b` produced a
+candidate of `gemma4:26b`, `expect` = `gemma4:latest`, **no merge conflict**, and
+a merged result holding the new model. The decisive evidence was elsewhere:
+`settings.json` had not been written since **2026-09-14 13:49**. The button was
+never reached — so the honest fix is to take the button out of the path.
+
+**A click now applies the model.** Picking one saves it 400 ms later, the rule
+the Appearance tab already uses for a shape or a slider, with the status line
+saying `Applied model … — no Save needed` and naming the conversation clear when
+the pick is a real switch. The list's own rebuilds are explicitly NOT choices:
+`QListWidget.clear()` was measured emitting `currentItemChanged` naming some
+other item, so a plain Refresh would otherwise apply a model nobody picked.
+
+**And the Brain tab now shows what the bubble is actually on** (`In use now:`).
+`settings.json` says what was ASKED for; only the bubble says what is IN USE, and
+a picker that cannot show the difference is how "it never applies" stays
+invisible. When the two disagree the line says so, in orange.
+
+**A second, real bug fell out of the reproduction.** The Permissions tab built
+its checkboxes from a hand-written 18-key dict while `settings_schema` declares
+**19**: `get_datetime` had no checkbox, so `_collect` wrote a `permissions` dict
+WITHOUT it — and `_three_way_merge` reads a missing candidate key as a DELETE
+when the disk still equals what was loaded. Every GUI save therefore dropped
+`"get_datetime": false`, and the loader filled it back in from the defaults: a
+permission silently turned back ON. The key set now comes from the schema (the
+wording dict supplies labels, with a fallback so a new key is visible rather than
+invisible), and `_collect` FILLS the loaded dict instead of replacing it, so a
+key with no widget keeps the value it had. It was found by measuring the form
+against its own load — `phantom edits on load` — not by reading the tab.
+
+**Guards, 5/5 mutations caught, zero residue**, every restore sha256-verified: a
+depressing model pick that applies without any Save; a programmatic rebuild that
+applies nothing; the in-use line distinguishing the two answers; the permission
+key set matching the schema in both directions and surviving a save; a key with
+no widget surviving `_collect`. **1410 tests green in all three orderings**,
+coverage ≥ 70, compile/shell/smoke clean. Deployed and measured on the INSTALLED
+bytes with the user's settings: `phantom edits on load: none`, and a save moves
+`['model']` alone; `deployment: in-sync`.

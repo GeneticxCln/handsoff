@@ -4153,6 +4153,145 @@ def a_failed_save_says_so_instead_of_escaping():
     assert "could not save settings" in win.status_label.text()
 
 
+@scenario
+def a_model_click_applies_without_pressing_save():
+    # The report is "swapping Ollama models never applies, the new model is never
+    # saved", and the honest reading of that is a picker whose choice only takes
+    # effect if somebody presses a button elsewhere in the window. Picking a
+    # model IS the action now, exactly as picking a shape in Appearance is.
+    from PySide6.QtTest import QTest
+
+    def fake_http(url, payload=None, timeout=10):
+        if url.endswith("/api/tags"):
+            return {"models": [{"name": "stored:latest"},
+                                {"name": "picked:8b"}]}
+        return {"capabilities": ["tools"]}
+
+    settings_app.http_json = fake_http
+    seed({"model": "stored:latest"})
+    win.reload_from_disk()
+    win.refresh_models()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and win.model_list.count() < 2:
+        app.processEvents()
+        time.sleep(0.02)
+    win.show()
+    app.processEvents()
+    assert json.loads(settings_file.read_text())["model"] == "stored:latest"
+
+    # a real click on the other row, and nothing else: no Save button
+    row = next(i for i in range(win.model_list.count())
+               if win.model_list.item(i).data(Qt.UserRole) == "picked:8b")
+    QTest.mouseClick(
+        win.model_list.viewport(), Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        win.model_list.visualItemRect(win.model_list.item(row)).center())
+    deadline = time.time() + 4.0
+    while time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+        if "Applied model" in win.status_label.text():
+            break
+
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["model"] == "picked:8b", (
+        "the click did not save the model: "
+        f"{on_disk['model']!r} | status: {win.status_label.text()[:140]}")
+    assert "Applied model picked:8b" in win.status_label.text(), \
+        win.status_label.text()
+    assert "cleared" in win.status_label.text(), (
+        "a model SWITCH must say the conversation was cleared: "
+        + win.status_label.text())
+
+    # ...and a REBUILD is not a choice: a selection the code makes must apply
+    # nothing (the same defect as losing a pick, from the other side).
+    win._model_list_syncing = True
+    win.model_list.setCurrentRow(0)
+    deadline = time.time() + 1.5
+    while time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    assert json.loads(settings_file.read_text())["model"] == "picked:8b", (
+        "a programmatic list rebuild applied a model nobody picked")
+    win._model_list_syncing = False
+
+
+@scenario
+def every_declared_permission_survives_a_save():
+    # `get_datetime` was declared in the schema's `permissions` but had no
+    # checkbox here, so `_collect` wrote a `permissions` dict without it — and
+    # the three-way merge reads a missing candidate key as a DELETE when the
+    # disk still equals what was loaded. One Save therefore dropped
+    # `"get_datetime": false` from settings.json and the loader filled it back
+    # in from the defaults: a permission silently turned ON again. The key set
+    # now comes from the schema, so it cannot drift in either direction.
+    declared = set((bubble.DEFAULT_SETTINGS.get("permissions") or {}))
+    assert declared, "the schema declares no permissions at all"
+    assert set(win.perm_checks) == declared, (
+        "the tab offers %r but the schema declares %r"
+        % (sorted(set(win.perm_checks) - declared),
+           sorted(declared - set(win.perm_checks))))
+
+    # turn one OFF and save: the value must reach the disk, and no other
+    # declared key may vanish on the way
+    key = "get_datetime" if "get_datetime" in declared else sorted(declared)[0]
+    seed({"model": "testmodel:latest", "permissions": {key: False}})
+    win.reload_from_disk()
+    assert win.perm_checks[key].isChecked() is False, key
+    win.thresh_spin.setValue(win.thresh_spin.value() + 1)
+    assert win.save() is True
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    saved = set(on_disk.get("permissions") or {})
+    assert key in saved, (
+        f"saving DROPPED {key!r} from permissions: {sorted(saved)}")
+    assert on_disk["permissions"][key] is False, (
+        f"a permission switched off came back as "
+        f"{on_disk['permissions'][key]!r}")
+    assert saved == declared, (
+        "the saved key set drifted from the schema: "
+        f"{sorted(declared - saved)} missing, {sorted(saved - declared)} extra")
+
+    # ...and the loaded values the tab has no widget for are kept, not dropped
+    odd = dict.fromkeys(declared, True)
+    odd["not_a_real_key"] = False
+    seed({"model": "testmodel:latest", "permissions": odd})
+    win.reload_from_disk()
+    win._collect()
+    assert win.cfg["permissions"].get("not_a_real_key") is False, (
+        "a permission key with no checkbox was dropped from the collected set: "
+        f"{sorted(win.cfg['permissions'])}")
+
+
+@scenario
+def the_brain_tab_says_what_the_bubble_is_running():
+    # "It never applies" is invisible without this line: settings.json says what
+    # was ASKED for, and only the bubble says what is IN USE. The two answers are
+    # shown together, beside the picker, which is where the question is asked.
+    from PySide6.QtWidgets import QListWidgetItem
+
+    win.model_list.clear()
+    win._model_list_syncing = True
+    it = QListWidgetItem("gemma4:26b")
+    it.setData(Qt.UserRole, "gemma4:26b")
+    win.model_list.addItem(it)
+    win.model_list.setCurrentItem(it)
+    win._model_list_syncing = False
+
+    win._render_model_in_use({"model": "gemma4:latest"})
+    assert "gemma4:latest" in win.model_in_use.text(), win.model_in_use.text()
+    assert "not applied yet" in win.model_in_use.text(), win.model_in_use.text()
+    assert "orange" in win.model_in_use.styleSheet()
+
+    win._render_model_in_use({"model": "gemma4:26b"})
+    assert win.model_in_use.text() == "In use now: gemma4:26b", \
+        win.model_in_use.text()
+    assert "orange" not in win.model_in_use.styleSheet()
+
+    win._render_model_in_use(None)
+    assert "not answering" in win.model_in_use.text(), win.model_in_use.text()
+    assert "gemma4:26b" in win.model_in_use.text(), win.model_in_use.text()
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -4270,6 +4409,9 @@ SCENARIO_NAMES = [
     "settings_window_fits_a_screen_and_every_tab_scrolls",
     "a_refresh_keeps_the_model_the_user_picked",
     "a_failed_save_says_so_instead_of_escaping",
+    "a_model_click_applies_without_pressing_save",
+    "the_brain_tab_says_what_the_bubble_is_running",
+    "every_declared_permission_survives_a_save",
 ]
 
 
