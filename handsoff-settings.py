@@ -1414,14 +1414,13 @@ class SettingsWindow(QMainWindow):
     # happened twice (`colors`, then `avatar_deco_color`), which is why the
     # guard for a new control asserts the LIVE APPLY and not merely that the
     # value reached `cfg`.
-    APPEARANCE_KEYS = ("bubble_design", "bubble_size", "animation_energy",
-                       "bubble_accent", "colors", "design_image_path",
-                       "design_pack", "avatar_ring", "avatar_tint",
-                       "avatar_deco_color",
-                       # ...and one key per STATE: a picture chosen for one
-                       # state moves no other control, so without these the
-                       # live apply would read it as "a load, not an edit".
-                       ) + tuple(key for _state, key in STATE_IMAGE_KEYS)
+    # DERIVED from the settings contract (`settings_schema.SETTINGS_FIELDS`):
+    # every row marked `live=True` is in this tuple, so the table and the live
+    # apply cannot disagree — and the per-state picture keys are rows too, one
+    # per state, rather than a join done here. The hand-written list this
+    # replaces drifted twice (`colors`, then `avatar_deco_color`), each time as
+    # the same complaint: "I changed it and nothing happened".
+    APPEARANCE_KEYS = tuple(getattr(SCHEMA, "live_keys", lambda: ())())
 
     def __init__(self) -> None:
         super().__init__()
@@ -4170,19 +4169,11 @@ class SettingsWindow(QMainWindow):
             # exactly on a catalogue look says WHICH look, derived from the
             # saved values rather than remembered from the click — so a hand
             # tuned set that happens to match also reports itself as that look.
-            pretty = {"bubble_design": "shape", "bubble_size": "size",
-                      "animation_energy": "animation energy",
-                      "bubble_accent": "colour accent", "colors": "state colours",
-                      "design_image_path": "fallback image",
-                      "design_pack": "design pack",
-                      "avatar_ring": "decoration",
-                      "avatar_tint": "picture colours",
-                      "avatar_deco_color": "decoration colour"}
-            # A per-state choice reports the STATE it was made for, not the
-            # setting's own name: "idle picture" says what moved, and
-            # "design_image_idle" does not.
-            pretty.update({key: f"{state} picture"
-                           for state, key in STATE_IMAGE_KEYS})
+            # Named by the contract too: each row carries the words a live
+            # apply uses, including one per state ("idle picture" says what
+            # moved; "design_image_idle" does not).
+            labeller = getattr(SCHEMA, "field_label", None)
+            pretty = {k: (labeller(k) if labeller else k) for k in changed}
             name = self._current_look()
             entry = (SCHEMA.look(name) if name and hasattr(SCHEMA, "look")
                      else None)

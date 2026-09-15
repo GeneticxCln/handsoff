@@ -231,120 +231,202 @@ def coerce_settings(s: dict) -> dict:
     """Coerce/validate raw merged settings IN PLACE. Shared by the bubble's
     _load_settings AND the settings app (a hand-edited settings.json must
     never crash either program; the settings app is the recovery tool and
-    must open even when the config is garbage)."""
-    log = logging.getLogger("handsoff")
+    must open even when the config is garbage).
 
-    def _num(key: str, cast, lo, hi) -> None:
-        """Coerce one numeric setting; on garbage, warn and use the default
-        (a bad value must never kill startup or leak through unvalidated)."""
+    GENERATED from `settings_schema.SETTINGS_FIELDS` — one table row per
+    setting, so a key cannot be coerced here and forgotten there. Adding a
+    setting means adding a row, and `tests/test_settings_contract.py` fails if
+    the table and the shipped defaults disagree.
+    """
+    log = logging.getLogger("handsoff")
+    for field in _schema.SETTINGS_FIELDS:
+        _apply_field(s, field, log)
+    return s
+
+
+def _apply_field(s: dict, field, log) -> None:
+    """One table row's coercion. Never raises on DATA: a hand-edited file must
+    not stop the bubble from starting or the settings app from opening."""
+    key, kind = field.key, field.kind
+    default = DEFAULT_SETTINGS.get(key)
+
+    if kind == "bool":
+        # The strict reader: `bool("false")` is True, which is how a
+        # hand-edited "false" used to ENABLE mouse control or private-
+        # notification reading.
+        s[key] = _bool_flag(s.get(key, default), bool(default))
+        return
+
+    if kind in ("int", "float"):
+        cast = int if kind == "int" else float
         try:
-            s[key] = min(hi, max(lo, cast(s[key])))
+            s[key] = min(field.hi, max(field.lo, cast(s[key])))
         except (TypeError, ValueError, OverflowError):
             # OverflowError: `int(float("inf"))` — and Python's json parses a
             # bare `Infinity` token, so one crafted value in settings.json
             # would otherwise kill startup inside _load_settings.
-            log.warning(
-                "invalid %s — using default %r",
-                key, DEFAULT_SETTINGS[key])
-            s[key] = DEFAULT_SETTINGS[key]
+            log.warning("invalid %s — using default %r", key, default)
+            s[key] = default
+        return
 
-    def _flag(key: str, default: bool) -> None:
-        """One boolean setting, through the strict reader (see `_bool_flag`)."""
-        s[key] = _bool_flag(s.get(key, default), default)
+    if kind == "str":
+        # Must ALREADY be a string: `str(5)` would turn a wrong type into a
+        # path that a later open() fails on, which is worse than the default.
+        raw = s.get(key)
+        if not isinstance(raw, str):
+            log.warning("invalid %s — using default %r", key, default)
+            s[key] = str(default)
+        else:
+            s[key] = raw.strip()
+        return
 
-    _num("num_ctx", int, 1024, 2 ** 20)
-    _num("history_tokens", int, 0, 2 ** 20)     # 0 = auto (3/4 of num_ctx)
-    _num("bubble_size", int, 96, 192)
-    _num("bubble_accent", float, 0.0, 1.0)
-    _num("animation_energy", float, 0.2, 2.0)
-    _bd = str(s.get("bubble_design", "orb")).strip().lower()
-    s["bubble_design"] = _bd if _bd in _schema.BUBBLE_DESIGNS else DEFAULT_SETTINGS["bubble_design"]
-    # The `image` design's art. Expanded, never validated here: the file may be
-    # created later or deleted at any time, and DROPPING it to "" on a missing
-    # file would silently erase the user's choice the first time they moved a
-    # folder. The renderer reports why it cannot draw (`design_image_problem`).
-    s["design_image_path"] = os.path.expanduser(
-        str(s.get("design_image_path") or "").strip())
-    # The same art one picture PER STATE (idle/listening/thinking/speaking).
-    # Expanded and stripped for exactly the reasons above — a file that is moved
-    # or not yet drawn must not erase the choice — and the keys come from the
-    # schema so the setting name and the state it belongs to cannot drift.
-    for _key in _schema.DESIGN_IMAGE_KEYS:
-        s[_key] = os.path.expanduser(str(s.get(_key) or "").strip())
-    # The decoration AROUND the avatar and how the picture is coloured. Both
-    # are closed choices, so a typo in settings.json cannot leave the bubble
-    # half-decorated or half-tinted: junk falls back to the default rather than
-    # being carried into a painter that would have to guess.
-    _av = str(s.get("avatar_ring", "ring-light")).strip().lower()
-    s["avatar_ring"] = _av if _av in _schema.AVATAR_DECOS else DEFAULT_SETTINGS["avatar_ring"]
-    # The decoration's own colour: one of the schema's two words, or a literal
-    # hex. The hex is accepted through the SAME parser everything else in the
-    # tree validates colours with (`core.theme.hex_to_rgb`, fullmatch), so
-    # "#4f8cffXYZ" and "red" are refused here exactly as they are refused at
-    # the swatch — a colour the panel would reject must not survive a hand-edit
-    # of settings.json either.
-    _dc = str(s.get("avatar_deco_color", "state")).strip().lower()
-    if _dc not in _schema.AVATAR_DECO_COLORS and _theme.hex_to_rgb(_dc) is None:
-        _dc = str(DEFAULT_SETTINGS["avatar_deco_color"])
-    s["avatar_deco_color"] = _dc
-    _at = str(s.get("avatar_tint", "state")).strip().lower()
-    s["avatar_tint"] = _at if _at in _schema.AVATAR_TINTS else DEFAULT_SETTINGS["avatar_tint"]
-    # The `image` design's pack: ONE installed folder name. Stripped here and
-    # nothing more, for the same reason the path above is not validated: a pack
-    # that is temporarily moved or not yet installed must not erase the user's
-    # choice. The renderer reports why it cannot draw (`pack_problem`), and the
-    # settings app writes the slug it read from `installed_packs()`.
-    s["design_pack"] = str(s.get("design_pack") or "").strip()
-    # The local SearXNG the search router prefers. Stripped and de-slashed, not
-    # validated: a user who has not started one yet gets the keyless backends and
-    # a doctor line saying `searxng not running`, which is more useful than
-    # erasing the address they typed. An empty value disables the attempt.
-    s["searxng_url"] = str(s.get("searxng_url") or "").strip().rstrip("/")
-    _num("mic_threshold", int, 50, 10_000)
-    _num("tts_rate", float, 0.5, 2.0)
-    _num("tts_volume", float, 0.1, 2.0)
-    _num("max_tool_calls", int, 0, 10_000)
-    _num("ram_alert_percent", float, 50.0, 99.0)
-    _num("vram_alert_percent", float, 50.0, 99.0)
-    _num("confirm_seconds", float, 5.0, 600.0)
-    _flag("dry_run", False)
-    _pol = s.get("command_policy")
-    _rules = ({
-        str(k).strip(): str(v).strip().upper()
-        for k, v in _pol.items()
-        if str(k).strip() and str(v).strip().upper() in ("ALLOW", "DENY", "CONFIRM")
-    } if isinstance(_pol, dict) else {})
-    # Capped like every other hand-editable mapping here, and for the same
-    # reason: the policy is consulted on every tool call.
-    s["command_policy"] = dict(list(_rules.items())[:64])
-    _flag("resource_alerts", False)
-    _flag("notification_reader", False)
-    _nm = s.get("notification_mute_apps", [])
-    s["notification_mute_apps"] = ([str(x).strip().lower() for x in _nm if str(x).strip()]
-                                   if isinstance(_nm, list) else [])[:32]
-    _flag("handsfree", False)
-    _flag("streaming_tts", True)
-    _flag("wake_word_required", False)
-    s["assistant_name"] = str(s.get("assistant_name", "assistant")).strip() or "assistant"
-    _c = s.get("calendar_ics", [])
-    if isinstance(_c, str):
-        _c = [x.strip() for x in _c.replace(",", "\n").split("\n") if x.strip()]
-    elif isinstance(_c, list):
-        _c = [str(x).strip() for x in _c if str(x).strip()]
+    if kind == "path":
+        # Expanded, never validated: the file may be created later or deleted at
+        # any time, and DROPPING the value to "" on a missing file would
+        # silently erase the choice the first time the user moved a folder. The
+        # renderer reports why it cannot draw (`design_image_problem`).
+        s[key] = os.path.expanduser(str(s.get(key) or "").strip())
+        return
+
+    if kind == "text":
+        text = str(s.get(key) or "").strip()
+        if field.rstrip:
+            # A URL keeps working with or without its trailing slash, and the
+            # two forms must not compare unequal when they name one instance.
+            text = text.rstrip(field.rstrip)
+        if not text and field.fallback:
+            if field.warn:
+                log.warning("invalid %s — using default %r", key, default)
+            text = str(default)
+        s[key] = text
+        return
+
+    if kind in ("choice", "colour"):
+        value = str(s.get(key) or "").strip().lower()
+        hex_ok = (kind == "colour" and _theme.hex_to_rgb(value) is not None)
+        if value not in field.choices and not hex_ok:
+            # A `colour` also accepts a literal hex, through the SAME parser
+            # everything else validates colours with (`core.theme.hex_to_rgb`,
+            # fullmatch), so "#4f8cffXYZ" and "red" are refused here exactly as
+            # the swatch refuses them — a colour the panel would reject must not
+            # survive a hand-edit of settings.json either.
+            if field.warn:
+                log.warning("invalid %s %r — using default %r",
+                            key, s.get(key), default)
+            value = str(default).strip().lower()
+        s[key] = value
+        return
+
+    if kind == "str_list":
+        raw = s.get(key)
+        items = ([str(x).strip() for x in raw if str(x).strip()]
+                 if isinstance(raw, list) else [])
+        if field.lower:
+            items = [x.lower() for x in items]
+        s[key] = items[:field.cap] if field.cap else items
+        return
+
+    if kind == "custom":
+        coercer = _CUSTOM_COERCERS.get(field.coerce)
+        if coercer is None:
+            # A table row naming a coercer that does not exist is a coding
+            # error, not bad data: `tests/test_settings_contract.py` refuses to
+            # let it reach a run, and failing loudly here beats a privacy flag
+            # quietly losing its validation.
+            raise RuntimeError(
+                f"settings field {key!r} names custom coercer "
+                f"{field.coerce!r}, which does not exist")
+        coercer(s, field, log)
+        return
+
+    raise RuntimeError(f"settings field {key!r} has unknown kind {kind!r}")
+
+
+# ------------------------------------------------------------------ custom
+# Rows whose coercion is not one of the declarative kinds. Each takes
+# (settings, field, log) and mutates the one key; the ROW still declares the
+# key, so the contract guard covers them exactly like the simple ones.
+
+def _coerce_allow_remote_ollama(s: dict, field, log) -> None:
+    """The remote-brain opt-in: must be exactly true (fail-closed — truthy junk
+    like "yes" or 1 must NOT silently allow sending the conversation away)."""
+    raw_allow = s.get(field.key, False)
+    if raw_allow is True:
+        s[field.key] = True
     else:
-        _c = []
-    s["calendar_ics"] = _c[:10]
-    _flag("wake_spotter", False)
-    _flag("mic_selfheal", True)
-    _flag("dictation", True)
-    _num("followup_seconds", float, 0.0, 120.0)   # 0 = feature off
-    _sm = s.get("spotter_models", [])
-    # Capped like its siblings: this list is hand-editable and each entry is a
-    # model name the wake spotter will try, so an unbounded one is an unbounded
-    # amount of work per utterance.
-    _spotter = ([str(x).strip() for x in _sm if str(x).strip()]
-                if isinstance(_sm, list) else [])
-    if len(_spotter) > 5:
+        if raw_allow not in (False, None):
+            log.warning(
+                "invalid allow_remote_ollama %r — using False (fail-closed: "
+                "the opt-in must be exactly true)", raw_allow)
+        s[field.key] = False
+
+
+def _coerce_calendar_ics(s: dict, field, log) -> None:
+    """A list of ICS sources, also accepted as ONE comma/newline string (how a
+    user pastes a couple of URLs). Capped: each entry is a network fetch."""
+    raw = s.get(field.key, [])
+    if isinstance(raw, str):
+        raw = [x.strip() for x in raw.replace(",", "\n").split("\n") if x.strip()]
+    elif isinstance(raw, list):
+        raw = [str(x).strip() for x in raw if str(x).strip()]
+    else:
+        raw = []
+    s[field.key] = raw[:10]
+
+
+def _coerce_colors(s: dict, field, log) -> None:
+    """The four state colours, keyed by state name. Unknown keys are dropped
+    and missing ones filled from the defaults, so the renderer never has to ask
+    whether a state has a colour."""
+    colors = s.get(field.key)
+    if not isinstance(colors, dict):
+        log.warning("invalid colors — using defaults")
+        s[field.key] = dict(DEFAULT_SETTINGS["colors"])
+        return
+    s[field.key] = {str(k): str(v) for k, v in colors.items()
+                    if k in DEFAULT_SETTINGS["colors"]
+                    and isinstance(v, str) and str(v).strip()}
+    for k, v in DEFAULT_SETTINGS["colors"].items():
+        s[field.key].setdefault(k, v)
+
+
+def _coerce_command_policy(s: dict, field, log) -> None:
+    """tool -> ALLOW | DENY | CONFIRM. Capped like every other hand-editable
+    mapping here, and for the same reason: it is consulted on every tool call."""
+    policy = s.get(field.key)
+    rules = ({
+        str(k).strip(): str(v).strip().upper()
+        for k, v in policy.items()
+        if str(k).strip()
+        and str(v).strip().upper() in _schema.POLICY_RULES
+    } if isinstance(policy, dict) else {})
+    s[field.key] = dict(list(rules.items())[:64])
+
+
+def _coerce_permissions(s: dict, field, log) -> None:
+    """ponytail: permissions fail-closed — garbage must never enable tools."""
+    perms = s.get(field.key)
+    if not isinstance(perms, dict):
+        log.warning("invalid permissions — using defaults (fail-closed)")
+        s[field.key] = dict(DEFAULT_SETTINGS["permissions"])
+        return
+    # Each permission through the strict reader, defaulting CLOSED for a name
+    # the defaults do not know — an unknown permission is one nothing grants, so
+    # it cannot become "yes" by being written down.
+    s[field.key] = {
+        str(k): _bool_flag(v, bool(DEFAULT_SETTINGS["permissions"].get(str(k), False)))
+        for k, v in perms.items() if str(k).strip()}
+    for k, v in DEFAULT_SETTINGS["permissions"].items():
+        s[field.key].setdefault(k, bool(v))
+
+
+def _coerce_spotter_models(s: dict, field, log) -> None:
+    """Wake-word models, capped like its siblings: each entry is a model the
+    spotter will try, so an unbounded list is unbounded work per utterance."""
+    raw = s.get(field.key, [])
+    spotter = ([str(x).strip() for x in raw if str(x).strip()]
+               if isinstance(raw, list) else [])
+    if len(spotter) > 5:
         # The stock default ALREADY fills the cap (alexa, hey_jarvis,
         # hey_mycroft, timer, weather), so the first user-added entry was the
         # 6th model — and a silent `[:5]` discarded it: the wake word never
@@ -353,111 +435,38 @@ def coerce_settings(s: dict) -> dict:
         log.warning(
             "spotter_models: keeping the first 5 of %d — the rest never fire "
             "(the cap is per-utterance work, raise it in core/settings.py "
-            "if you really want more)", len(_spotter))
-    s["spotter_models"] = _spotter[:5]
-    try:
-        v = float(s.get("engage_seconds", 45.0))
-    except (TypeError, ValueError):
-        v = 45.0
-    s["engage_seconds"] = min(600.0, max(5.0, v))
-    aliases = s.get("workspace_aliases")
-    _pairs = ({str(k).strip().lower(): str(v).strip()
-               for k, v in aliases.items()
-               if str(k).strip() and str(v).strip()}
-              if isinstance(aliases, dict) else {})
-    # Capped: one alias per workspace is the whole feature, and a hand-edited
-    # file is not a place to grow a lookup table of arbitrary size.
-    s["workspace_aliases"] = dict(list(_pairs.items())[:50])
-    s["home_place"] = str(s.get("home_place", "")).strip()
-    _flag("briefing", False)
-    _flag("world_warnings", False)
-    _num("world_cooldown_min", float, 5.0, 1440.0)
-    _flag("hardware_watch", False)
-    _num("hardware_cooldown_min", float, 5.0, 1440.0)
-    _num("hardware_disk_gb", float, 0.5, 1000.0)
-    # ponytail: permissions fail-closed — garbage must never enable tools
-    _perms = s.get("permissions")
-    if not isinstance(_perms, dict):
-        log.warning("invalid permissions — using defaults (fail-closed)")
-        s["permissions"] = dict(DEFAULT_SETTINGS["permissions"])
-    else:
-        # Each permission through the strict reader, defaulting CLOSED for a
-        # name the defaults do not know — an unknown permission is one nothing
-        # grants, so it cannot become "yes" by being written down.
-        s["permissions"] = {
-            str(k): _bool_flag(v, bool(DEFAULT_SETTINGS["permissions"].get(str(k), False)))
-            for k, v in _perms.items() if str(k).strip()}
-        for k, v in DEFAULT_SETTINGS["permissions"].items():
-            s["permissions"].setdefault(k, bool(v))
-    # ponytail: unvalidated enums — garbage must fall back to defaults loudly
-    _host = str(s.get("ollama_host", "")).strip()
-    if not _host:
-        log.warning("invalid ollama_host — using default %r",
-                    DEFAULT_SETTINGS["ollama_host"])
-        _host = str(DEFAULT_SETTINGS["ollama_host"])
-    s["ollama_host"] = _host
-    # remote-brain opt-in: must be exactly true to enable (fail-closed —
-    # truthy junk like "yes" or 1 must NOT silently allow remote sending)
-    raw_allow = s.get("allow_remote_ollama", False)
-    if raw_allow is True:
-        s["allow_remote_ollama"] = True
-    else:
-        if raw_allow not in (False, None):
-            log.warning(
-                "invalid allow_remote_ollama %r — using False (fail-closed: "
-                "the opt-in must be exactly true)", raw_allow)
-        s["allow_remote_ollama"] = False
-    _model = str(s.get("model", "")).strip()
-    if not _model:
-        log.warning("invalid model — using default %r",
-                    DEFAULT_SETTINGS["model"])
-        _model = str(DEFAULT_SETTINGS["model"])
-    s["model"] = _model
-    _WHISPER_SIZES = {"tiny", "base", "small", "medium", "large",
-                      "large-v1", "large-v2", "large-v3", "turbo"}
-    _ws = str(s.get("whisper_size", "")).strip().lower()
-    if _ws not in _WHISPER_SIZES:
-        log.warning("invalid whisper_size %r — using default %r",
-                    s.get("whisper_size"), DEFAULT_SETTINGS["whisper_size"])
-        _ws = str(DEFAULT_SETTINGS["whisper_size"])
-    s["whisper_size"] = _ws
-    _wd = str(s.get("whisper_device", "auto")).strip().lower()
-    if _wd not in ("auto", "cpu", "cuda"):
-        log.warning("invalid whisper_device %r — using 'auto'", s.get("whisper_device"))
-        _wd = "auto"
-    s["whisper_device"] = _wd
-    if not isinstance(s.get("tts_reference"), str):
-        log.warning("invalid tts_reference — using default %r",
-                    DEFAULT_SETTINGS["tts_reference"])
-        s["tts_reference"] = str(DEFAULT_SETTINGS["tts_reference"])
-    else:
-        s["tts_reference"] = str(s["tts_reference"]).strip()
-    if not isinstance(s.get("mic_device"), str):
-        log.warning("invalid mic_device — using default %r",
-                    DEFAULT_SETTINGS["mic_device"])
-        s["mic_device"] = str(DEFAULT_SETTINGS["mic_device"])
-    _colors = s.get("colors")
-    if not isinstance(_colors, dict):
-        log.warning("invalid colors — using defaults")
-        s["colors"] = dict(DEFAULT_SETTINGS["colors"])
-    else:
-        s["colors"] = {str(k): str(v) for k, v in _colors.items()
-                       if k in DEFAULT_SETTINGS["colors"]
-                       and isinstance(v, str) and str(v).strip()}
-        for k, v in DEFAULT_SETTINGS["colors"].items():
-            s["colors"].setdefault(k, v)
-    _extra = s["extra_allowed_commands"]
-    if not isinstance(_extra, list):
-        s["extra_allowed_commands"] = []
-    else:
-        # Capped, and each entry normalised to a string: this list is a
-        # hand-editable allowlist consulted per command, so an unbounded or
-        # non-string entry is either unbounded work or a matching surprise.
-        s["extra_allowed_commands"] = [str(x).strip() for x in _extra
-                                       if str(x).strip()][:64]
-    if not isinstance(s.get("tool_call_times"), (list, type(None))):
-        s["tool_call_times"] = None
-    return s
+            "if you really want more)", len(spotter))
+    s[field.key] = spotter[:5]
+
+
+def _coerce_tool_call_times(s: dict, field, log) -> None:
+    """The per-belt call-time deque is runtime state, never a user value: a
+    hand-edited list is discarded rather than trusted as call history."""
+    if not isinstance(s.get(field.key), (list, type(None))):
+        s[field.key] = None
+
+
+def _coerce_workspace_aliases(s: dict, field, log) -> None:
+    """'code' -> '2' — one alias per workspace is the whole feature, and a
+    hand-edited file is not a place to grow a lookup table of arbitrary size."""
+    aliases = s.get(field.key)
+    pairs = ({str(k).strip().lower(): str(v).strip()
+              for k, v in aliases.items()
+              if str(k).strip() and str(v).strip()}
+             if isinstance(aliases, dict) else {})
+    s[field.key] = dict(list(pairs.items())[:50])
+
+
+_CUSTOM_COERCERS = {
+    "allow_remote_ollama": _coerce_allow_remote_ollama,
+    "calendar_ics": _coerce_calendar_ics,
+    "colors": _coerce_colors,
+    "command_policy": _coerce_command_policy,
+    "permissions": _coerce_permissions,
+    "spotter_models": _coerce_spotter_models,
+    "tool_call_times": _coerce_tool_call_times,
+    "workspace_aliases": _coerce_workspace_aliases,
+}
 
 
 # ------------------------------------------------------------------ migration

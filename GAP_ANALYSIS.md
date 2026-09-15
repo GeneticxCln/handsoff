@@ -4130,3 +4130,72 @@ fake now records this thread's calls and lets every other thread sleep for real.
 **State.** Seed `20260915` — the one that was red — and the gate seed are both
 1390 passed in all three orderings; coverage 84.01% ≥ 70; compile/shell/smoke
 clean. Test-only, so the deployed bubble is untouched and still in-sync.
+
+## P0-1 — settings as one typed contract (the last P0 item)
+
+**What was wrong.** A setting was declared in four places: `DEFAULT_SETTINGS`,
+`coerce_settings`, the form's `_collect`, and the Appearance tab's live-apply
+tuple. The fourth is the one that cost the user: `_apply_appearance_live`
+compares its keys against the disk and reads anything it is not watching as "a
+load, not an edit", so a control whose key is missing from that tuple applies
+nothing and saves nothing. It happened twice — `colors`, then
+`avatar_deco_color` — and reported itself both times as "I changed it and
+nothing happened".
+
+**Shape.** `settings_schema.SETTINGS_FIELDS` is one row per setting: the key,
+the kind of coercion, its bounds or choices, the words a live apply reports, and
+whether the Appearance tab watches it. From that:
+
+* `core.settings.coerce_settings` is GENERATED — a loop over the rows, one
+  `_apply_field` per kind (`bool`, `int`, `float`, `text`, `str`, `path`,
+  `choice`, `colour`, `str_list`, and `custom` for the eight rows whose logic is
+  genuinely bespoke: strict-true remote opt-in, fail-closed permissions, the
+  policy map, the state colours, aliases, ICS sources, spotter models, runtime
+  call times);
+* the tab's `APPEARANCE_KEYS` is DERIVED (`live_keys()`), and its live-apply
+  message takes each key's label from the row (`field_label`);
+* the look catalogue's one non-identical name (`design` → `bubble_design`) is
+  resolved by the schema rather than special-cased at each reader.
+
+The default is deliberately NOT repeated in the row. It stays in
+`DEFAULT_SETTINGS` and is looked up by key: a table that carried it too would be
+a fifth list, not the first.
+
+**Proven unchanged, then declared.** The old coercion was dumped on 929 crafted
+inputs before the rewrite and compared after: 896 byte-identical, 0 errors both
+times. The 33 differences are three deliberate corrections, all of them the old
+code being wrong, and all pinned by name in the new test file:
+
+* `autostart` — the one key the old coercion never touched, so a hand-edited
+  `"false"` read as True wherever it is read as a flag;
+* a JSON `null` for a text setting — `str(None)` became the literal `"None"`, so
+  a settings file with `"model": null` asked Ollama for a model named "None";
+* `mic_device` — the `else` branch meant to strip it stripped `tts_reference`
+  twice instead, so `"  Yeti  "` kept its spaces and matched no device.
+
+**Guards, and the gap the sweep found.** The previous guard grepped
+`coerce_settings`'s source for key literals, with an exemption set for keys
+validated in a loop. That is meaningless once the table drives the function, and
+deleting it would have left nothing behind, so it is replaced by a guard that
+counts the rows coercion actually applies — plus the two-way table/defaults
+equality, kind coverage, custom-coercer existence, "every junk value is really
+replaced", the tab's live set equalling the table's live rows, labels that are
+not identifiers, every key `_collect` writes being declared, and every key a
+LOOK sets being live.
+
+12/12 mutations are caught with zero residue. The first draft scored 11/12, and
+the miss was worth having: the tab now DERIVES its live set from the table, so a
+row quietly losing `live=True` makes both sides agree on the smaller set and the
+control silently stops applying — the original complaint, reachable one level
+up. Closed with the derived look-catalogue invariant, plus one deliberate
+specification of the tab's controls with a comment saying why that copy is
+allowed to exist: which controls a tab owns is not visible in the code.
+
+**State.** 1404 tests green in all three orderings at the gate seed; coverage
+84.10% ≥ 70; compile/shell/smoke clean; deployed and verified against the
+installed bytes (18/18 shipped files byte-identical, the deployed table covering
+59/59 defaults, the deployed window deriving 14 live keys, `deployment: in-sync`).
+
+**That closes the P0 list.** `GAP_ANALYSIS.md` rows for P0-2 (structured tool
+results), P0-3 (startup in degraded modes, already closed and verified) and P0-4
+(the socket capability token) are above.

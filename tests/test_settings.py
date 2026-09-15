@@ -257,35 +257,12 @@ class TestSettingsCoercion:
         })
         assert out["extra_allowed_commands"] == ["1", "None", "ok", "two"]
 
-    def test_every_schema_key_is_touched_by_coercion(self, H):
-        """A schema key that coercion never mentions is a silent hole.
-
-        coerce_settings validates key by key, hand-written, so adding a
-        DEFAULT_SETTINGS entry and forgetting to validate it ships a setting
-        that reaches the bubble raw — a string where a bool is expected, an
-        out-of-range number leaking through. Nothing fails when that happens,
-        which is why this guard exists.
-        """
-        body = inspect.getsource(_core_settings.coerce_settings)
-        # Deliberately passed through: written by the installer, read by
-        # nothing in the runtime (a dead schema entry, noted in GAP_ANALYSIS).
-        free_form = {"autostart"}
-        # Keys validated in a LOOP over the schema's own list cannot appear here
-        # as literals — the `image` design's four per-state pictures are one of
-        # them, and the loop is what keeps each setting name in step with the
-        # state it belongs to. The exemption is granted only while that loop is
-        # present and names the schema, so it cannot outlive the code it stands
-        # for: delete the loop and the four keys are reported missing again.
-        derived = set()
-        if "DESIGN_IMAGE_KEYS" in body:
-            from settings_schema import DESIGN_IMAGE_KEYS
-            derived = set(DESIGN_IMAGE_KEYS)
-        missing = sorted(k for k in H.DEFAULT_SETTINGS
-                         if f'"{k}"' not in body and k not in free_form
-                         and k not in derived)
-        assert missing == [], (
-            f"these settings are never coerced: {missing} — validate them in "
-            "coerce_settings, or add them to free_form with a reason")
+    # `test_every_schema_key_is_touched_by_coercion` lived here and looked for
+    # every key as a string literal in coerce_settings' SOURCE, with an
+    # exemption set. Coercion is generated from the settings table now, so that
+    # guard would find no literals at all — and would have been replaced by
+    # nothing if it had merely been deleted. `tests/test_settings_contract.py`
+    # carries the stronger version: it counts the rows the coercion APPLIES.
 
     def test_bubble_design_accepted_and_garbage_falls_back(self, H, tmp_path, monkeypatch):
         """Every shipped design loads; garbage coerces to orb (never a crash).
