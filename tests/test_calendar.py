@@ -8,6 +8,7 @@ from collections import deque
 import threading
 import io
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -98,6 +99,67 @@ class TestRemindersAndCalendar:
         missed = H._take_missed_reminders()
         assert [m["name"] for m in missed] == ["old"]
         assert [r["name"] for r in H.json.loads(rf.read_text())] == ["future"]
+
+    def test_a_startup_store_failure_does_not_kill_the_bubble(
+            self, H, monkeypatch, caplog):
+        """take_missed catches the prune-save OSError, but a failure BEFORE it
+        (an unreadable reminders.json, a wedged sidecar flock, anything else
+        the store does not convert to []) used to propagate out of start() —
+        which main() calls before the first turn, so the whole bubble died at
+        startup over a reminder. The worker path has wrapped the same store in
+        try/except for exactly this reason; the startup twin does now too, and
+        the person is told once instead of the process vanishing.
+        """
+        class Boom:
+            def take_missed(self):
+                raise RuntimeError("flock sidecar wedged")
+
+        monkeypatch.setattr(H, "_reminder_store", lambda: Boom())
+        a = H.Assistant.__new__(H.Assistant)
+        a._handsfree = False          # start() reads it before the reminder path
+        a._failures_reported = set()
+        told = []
+        monkeypatch.setattr(a, "_report_once",
+                            lambda kind, exc, msg: told.append(msg) or True)
+        started = []
+        monkeypatch.setattr(H.Assistant, "_start_worker",
+                            lambda self, target, args=(), name="w":
+                            started.append(name))
+        monkeypatch.setattr(H.Assistant, "_is_closed", lambda self: False)
+        monkeypatch.setattr(H.Assistant, "_loader", lambda self: None)
+        monkeypatch.setattr(H.Assistant, "_reminder_worker", lambda self: None)
+        monkeypatch.setattr(H.Assistant,
+                            "_settings_watch_worker", lambda self: None)
+        monkeypatch.setattr(H, "_load_mic_events", lambda *a, **k: [])
+        with caplog.at_level(logging.ERROR):
+            a.start()          # must NOT raise
+        assert "missed-reminders" not in started, started
+        assert "reminders" in started and "settings-watch" in started, started
+        assert told and "reminders are unavailable" in told[0], told
+        assert any("startup reminders unavailable" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_a_healthy_startup_still_announces_missed(self, H, monkeypatch,
+                                                      tmp_path):
+        rf = tmp_path / "reminders.json"
+        rf.write_text(H.json.dumps(
+            [{"name": "old", "due": H.time.time() - 60, "repeat_hours": 0}]))
+        monkeypatch.setattr(H, "REMINDERS_FILE", rf)
+        a = H.Assistant.__new__(H.Assistant)
+        a._handsfree = False          # start() reads it before the reminder path
+        started = []
+        monkeypatch.setattr(H.Assistant, "_start_worker",
+                            lambda self, target, args=(), name="w":
+                            started.append((name, args)))
+        monkeypatch.setattr(H.Assistant, "_is_closed", lambda self: False)
+        monkeypatch.setattr(H.Assistant, "_loader", lambda self: None)
+        monkeypatch.setattr(H.Assistant, "_reminder_worker", lambda self: None)
+        monkeypatch.setattr(H.Assistant,
+                            "_settings_watch_worker", lambda self: None)
+        monkeypatch.setattr(H, "_load_mic_events", lambda *a, **k: [])
+        a.start()
+        missed = [args for name, args in started if name == "missed-reminders"]
+        assert missed and missed[0][0][0]["name"] == "old", started
 
     def test_calendar_month_grid_and_errors(self, H):
         belt = H.ToolBelt(on_restart_pending=lambda: None)
@@ -446,6 +508,27 @@ class TestICSDurationAndUntil:
         "PT-5M" as +5 minutes, so a reminder-style negative duration widened the
         overlap window instead of shrinking it."""
         for bad in ("P-1D", "PT-5M", "-PT5M", "P1DT+2H", "PT+30M"):
+            assert _core_calendar._ics_duration(bad) is None, bad
+
+    def test_fractions_are_rfc_legal_and_parsed_exactly(self, H):
+        """ISO 8601 allows a decimal on the smallest component (`PT0.5H` is
+        thirty minutes); RFC 5545's own ABNF has none, but generators emit
+        both — and the old chunk regex skipped the `.`, so `PT0.5H` parsed as
+        `5H` (FIVE HOURS) and `PT1H30M15.5S` silently lost 10.5 seconds.
+        A 30-minute meeting covered a 5-hour overlap window and events
+        appeared on the wrong day.
+        """
+        from datetime import timedelta
+        assert _core_calendar._ics_duration("PT0.5H") == timedelta(minutes=30)
+        assert _core_calendar._ics_duration("PT1H30M15.5S") == timedelta(
+            hours=1, minutes=30, seconds=15.5)
+        assert _core_calendar._ics_duration("P0.5W") == timedelta(days=3.5)
+        # malformed decimals refuse the whole value rather than parsing past
+        for bad in ("PT1H.5M",      # a dot between chunks
+                    "PT0.5.5H",     # two dots in one number
+                    "PT.5H",        # a fraction with no integer part
+                    "PT1HM",        # a letter with no number
+                    "P1.DD"):       # junk after a decimal
             assert _core_calendar._ics_duration(bad) is None, bad
         today = H.datetime.date.today().strftime("%Y%m%d")
         ev = self._event(H, [f"DTSTART:{today}T090000",

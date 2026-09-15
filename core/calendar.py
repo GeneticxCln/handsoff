@@ -332,12 +332,22 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
 
 
 def _ics_duration(value: str) -> "datetime.timedelta | None":
-    """RFC 5545 DURATION (`P1DT2H30M`, `PT45M`, `P2W`) → timedelta, or None.
+    """RFC 5545 DURATION (`P1DT2H30M`, `PT45M`, `PT0.5H`, `P2W`) → timedelta.
 
     A VEVENT may carry DURATION INSTEAD of DTEND. Ignoring it (the old
     behaviour) fabricated a one-hour duration for every such event, so a
     two-hour class covered the wrong window and any event whose real duration
     did not overlap the queried range was still reported as if it did.
+
+    A decimal fraction is ISO 8601-legal on the smallest component
+    (`PT0.5H` is thirty minutes) — RFC 5545's own ABNF has no decimals, but
+    real-world generators emit both shapes, so accepting them with EXACT
+    arithmetic is strictly safer than refusing. Whatever the citation, the
+    old chunk regex skipped the `.`, so `0.5H` was read as the chunk `5H`: a
+    30-minute meeting became FIVE HOURS and `PT1H30M15.5S` lost 10.5 seconds.
+    Decimals are accepted per chunk and the timedelta arithmetic keeps the
+    exact value; a chunk that is not a clean number+unit is refused rather
+    than partially parsed.
     """
     text = str(value or "").strip().upper()
     # A leading sign is RFC 5545's "this duration points BACKWARDS" (a reminder
@@ -352,22 +362,45 @@ def _ics_duration(value: str) -> "datetime.timedelta | None":
     total = datetime.timedelta()
     seen = False
 
+    # One chunk = a (possibly decimal) number followed by its unit letter. The
+    # digits and fraction belong to the unit that FOLLOWS them, so `15.5S`
+    # parses as 15.5 seconds and `0.5H` as half an hour — while a stray second
+    # dot or a bare letter refuses the whole value rather than being silently
+    # skipped (the old `\d*[A-Z]` findall skipped exactly that `.`).
+    _chunk = re.compile(r"(\d+(?:\.\d+)?)([A-Z])")
+
+    def _tokens(part: str) -> "list[str] | None":
+        """The duration chunks of one part, or None when it is malformed."""
+        tokens, pos = [], 0
+        for m in _chunk.finditer(part):
+            if part[pos:m.start()]:
+                return None              # junk between chunks (`1H.5M`)
+            tokens.append(m.group(0))
+            pos = m.end()
+        if part[pos:]:
+            return None                  # trailing junk (a lone `.`, letters)
+        return tokens
+
     def _num(chunk: str, table: dict) -> bool:
         nonlocal total, seen
         if not chunk:
             return True
-        digits = chunk[:-1]
-        unit = chunk[-1:]
-        if unit not in table or not digits.isdigit():
+        m = _chunk.fullmatch(chunk)
+        if not m or m.group(2) not in table:
             return False
-        total += datetime.timedelta(**{table[unit]: int(digits)})
+        # Fractions are RFC-legal only on the smallest unit of the part, but
+        # timedelta accepts them anywhere and refusing a legal-if-unusual
+        # `P0.5W` buys nothing — the VALUE is what the overlap window needs.
+        total += datetime.timedelta(**{table[m.group(2)]: float(m.group(1))})
         seen = True
         return True
 
-    if not all(_num(c, units) for c in re.findall(r"\d*[A-Z]", date_part)):
+    date_tokens = _tokens(date_part)
+    if date_tokens is None or not all(_num(c, units) for c in date_tokens):
         return None
     _t = {"H": "hours", "M": "minutes", "S": "seconds"}
-    if not all(_num(c, _t) for c in re.findall(r"\d*[A-Z]", time_part)):
+    time_tokens = _tokens(time_part)
+    if time_tokens is None or not all(_num(c, _t) for c in time_tokens):
         return None
     return total if seen else None
 

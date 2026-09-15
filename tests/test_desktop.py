@@ -1463,7 +1463,7 @@ class TestSuperBindingKnown:
         self._write_cfg(niri_home, 'binds { Mod+E { spawn "nautilus"; } }\n')
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
         # the comment-stripped scan must not see the chord inside a comment
-        self._write_cfg(niri_home, '// binds { Mod+T; }\n')
+        self._write_cfg(niri_home, '// binds { Mod+T { spawn "x"; } }\n')
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
 
     def test_unreadable_config_allows(self, monkeypatch, tmp_path):
@@ -1476,13 +1476,37 @@ class TestSuperBindingKnown:
         monkeypatch.setattr(_core_tools._DEFAULT_DEPS, "HOME", tmp_path)
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is True
 
+    def test_a_prefix_of_a_bound_chord_is_not_the_binding(self, niri_home):
+        """Substring matching made `mod+e` "known" whenever any longer chord
+        shared the prefix — a config bound to Mod+Enter skipped the terminal
+        gate for press_hotkey('Mod+E'), which then fired Super+E INTO A
+        TERMINAL. The gate exists to keep keystrokes out of shells, and
+        Enter/End, F1/F10 and Tab/Table-ish prefixes are common binds, so this
+        was not an exotic shape. The chord may only be followed by `+` (a
+        longer chord) or whitespace then the `{` that opens the action.
+        """
+        self._write_cfg(niri_home, 'binds {\n    Mod+Enter { spawn "foot"; }\n    Mod+End { spawn "x"; }\n}\n')
+        f = _core_tools.ToolBelt._super_binding_known
+        assert f("mod+enter") is True          # the actual bind
+        assert f("mod+e") is False             # the overmatch the old scan made
+        assert f("mod+en") is False            # a second prefix, same shape
+        assert f("mod+e']") is False           # a tail that is not a boundary
+        # ...and a real bind is still found with niri's actual spacing
+        self._write_cfg(niri_home, 'binds { Mod+E { spawn "nautilus"; } }\n')
+        assert f("mod+e") is True
+        self._write_cfg(niri_home, 'binds { Mod+E{ spawn "nautilus"; } }\n')
+        assert f("mod+e") is True
+        # a longer chord sharing the prefix must NOT admit the shorter ask
+        self._write_cfg(niri_home, 'binds { Mod+Shift+E { spawn "x"; } }\n')
+        assert f("mod+e") is False
+
     def test_escape_outside_config_dir_is_refused(self, niri_home):
         """An include pointing outside ~/.config/niri must be ignored: the
         chord must not be 'found' from a file the config dir does not own."""
         self._write_cfg(niri_home, 'include "../elsewhere/keybinds.kdl"\n')
         outside = niri_home.parent / "elsewhere" / "keybinds.kdl"
         outside.parent.mkdir()
-        outside.write_text("binds { Mod+T; }\n", encoding="utf-8")
+        outside.write_text('binds { Mod+T { spawn "x"; } }\n', encoding="utf-8")
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
 
     def test_a_sibling_directory_prefix_is_not_inside(self, niri_home):
@@ -1492,7 +1516,7 @@ class TestSuperBindingKnown:
         self._write_cfg(niri_home, 'include "../niri-evil/keybinds.kdl"\n')
         evil = niri_home.parent / "niri-evil"
         evil.mkdir()
-        (evil / "keybinds.kdl").write_text("binds { Mod+T; }\n",
+        (evil / "keybinds.kdl").write_text('binds { Mod+T { spawn "x"; } }\n',
                                             encoding="utf-8")
         assert str(evil).startswith(str(niri_home)), \
             "test setup: the sibling is not a string-prefix of the config dir"
@@ -1503,7 +1527,7 @@ class TestSuperBindingKnown:
         containment is the only thing standing between the walk and any file
         on the disk."""
         elsewhere = niri_home.parent.parent / "outside.kdl"
-        elsewhere.write_text("binds { Mod+T; }\n", encoding="utf-8")
+        elsewhere.write_text('binds { Mod+T { spawn "x"; } }\n', encoding="utf-8")
         self._write_cfg(niri_home, f'include "{elsewhere}"\n')
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
 
@@ -1513,7 +1537,7 @@ class TestSuperBindingKnown:
         self._write_cfg(niri_home, 'include "a.kdl"\ninclude "final.kdl"\n')
         (niri_home / "a.kdl").write_text('include "b.kdl"\n', encoding="utf-8")
         (niri_home / "b.kdl").write_text('include "a.kdl"\n', encoding="utf-8")
-        (niri_home / "final.kdl").write_text("binds { Mod+T; }\n",
+        (niri_home / "final.kdl").write_text('binds { Mod+T { spawn "x"; } }\n',
                                              encoding="utf-8")
         # terminates (no hang) AND the dedupe must have left room: final.kdl
         # is a second top-level include, so a walk that re-follows the a/b
@@ -1529,9 +1553,10 @@ class TestSuperBindingKnown:
         incs = " ".join(f'include "k{i:02d}.kdl"' for i in range(n))
         self._write_cfg(niri_home, incs + "\n")
         for i in range(n):
-            marker = "Mod+T" if i == 19 else ("Mod+Z" if i == 20 else "x")
+            body = ('Mod+T { spawn "x"; }' if i == 19
+                    else ('Mod+Z { spawn "x"; }' if i == 20 else "x;"))
             (niri_home / f"k{i:02d}.kdl").write_text(
-                f"binds {{ {marker}; }}\n", encoding="utf-8")
+                f"binds {{ {body} }}\n", encoding="utf-8")
         # k19 is the 20th include: found. k20 would be the 21st: not.
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is True
         assert _core_tools.ToolBelt._super_binding_known("mod+z") is False
@@ -1543,7 +1568,7 @@ class TestSuperBindingKnown:
         continues over it."""
         self._write_cfg(niri_home, 'include "locked.kdl"\n')
         locked = niri_home / "locked.kdl"
-        locked.write_text("binds { Mod+T; }\n", encoding="utf-8")
+        locked.write_text('binds { Mod+T { spawn "x"; } }\n', encoding="utf-8")
         locked.chmod(0o000)
         try:
             if os.access(locked, os.R_OK):      # e.g. ACLs override the mode
@@ -1558,9 +1583,9 @@ class TestSuperBindingKnown:
         self._write_cfg(niri_home,
                         'include "locked.kdl"\ninclude "fine.kdl"\n')
         locked = niri_home / "locked.kdl"
-        locked.write_text("binds { Mod+Q; }\n", encoding="utf-8")
+        locked.write_text('binds { Mod+Q { spawn "x"; } }\n', encoding="utf-8")
         locked.chmod(0o000)
-        (niri_home / "fine.kdl").write_text("binds { Mod+T; }\n",
+        (niri_home / "fine.kdl").write_text('binds { Mod+T { spawn "x"; } }\n',
                                             encoding="utf-8")
         try:
             if os.access(locked, os.R_OK):

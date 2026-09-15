@@ -342,8 +342,19 @@ def coerce_settings(s: dict) -> dict:
     # Capped like its siblings: this list is hand-editable and each entry is a
     # model name the wake spotter will try, so an unbounded one is an unbounded
     # amount of work per utterance.
-    s["spotter_models"] = ([str(x).strip() for x in _sm if str(x).strip()]
-                           if isinstance(_sm, list) else [])[:5]
+    _spotter = ([str(x).strip() for x in _sm if str(x).strip()]
+                if isinstance(_sm, list) else [])
+    if len(_spotter) > 5:
+        # The stock default ALREADY fills the cap (alexa, hey_jarvis,
+        # hey_mycroft, timer, weather), so the first user-added entry was the
+        # 6th model — and a silent `[:5]` discarded it: the wake word never
+        # fired and nothing in the journal said why. Unlike a junk value, a
+        # truncated list is not an error to correct, it is a choice to report.
+        log.warning(
+            "spotter_models: keeping the first 5 of %d — the rest never fire "
+            "(the cap is per-utterance work, raise it in core/settings.py "
+            "if you really want more)", len(_spotter))
+    s["spotter_models"] = _spotter[:5]
     try:
         v = float(s.get("engage_seconds", 45.0))
     except (TypeError, ValueError):

@@ -200,6 +200,24 @@ class TestSettingsCoercion:
         # is never re-ordered by the cap
         assert big["extra_allowed_commands"][:2] == ["cmd0", "cmd1"]
 
+    def test_truncating_spotter_models_says_so(self, H, caplog):
+        """A capped junk value is corrected silently; a truncated LIST is a
+        choice to report. The stock default already fills the cap, so the
+        first user-added model is entry #6 — exactly the one the silent
+        `[:5]` discarded, which is why the wake word "never fired" with no
+        journal line to say why (unlike every junk-value warning)."""
+        caplog.set_level("INFO", logger="handsoff")
+        s = H._core_settings.coerce_settings({
+            **H.DEFAULT_SETTINGS,
+            "spotter_models": ["alexa", "hey_jarvis", "hey_mycroft",
+                               "timer", "weather", "my_custom_wake"]})
+        assert s["spotter_models"] == ["alexa", "hey_jarvis", "hey_mycroft",
+                                       "timer", "weather"], "cap still applies"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("spotter_models" in m and "first 5 of 6" in m
+                   for m in messages), \
+            f"the truncation must name the key and both counts; got {messages}"
+
     def test_a_non_string_allowlist_entry_cannot_survive(self, H):
         """The allowlist is matched against command names, so a JSON number or
         null in it is either a matching surprise or dead weight — either way

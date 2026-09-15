@@ -1435,7 +1435,22 @@ class ToolBelt:
         norm = combo.strip().lower().replace(' ', '')
         norm = norm.replace('meta+', 'mod+').replace('super+', 'mod+').replace('win+', 'mod+').replace('logo+', 'mod+')
         blob = '\n'.join((_code(t) for t in texts))
-        return norm in blob
+        # BOUNDARY match, not substring: `norm in blob` returned True for
+        # `mod+e` whenever ANY longer chord shared the prefix — a config bound
+        # to Mod+Enter made `mod+e` "known", so press_hotkey('Mod+E') skipped
+        # the terminal gate and fired Super+E INTO A TERMINAL. The gate exists
+        # to keep keystrokes out of shells; Enter/End, F1/F10 and Tab/Table-ish
+        # prefixes are common binds, so this was not an exotic shape.
+        #
+        # What may follow a bound chord: `+` (a longer chord like
+        # Mod+Shift+E), or optional whitespace then the `{` that opens the
+        # keybind action — niri's actual syntax (`Mod+E {`, `Mod+E{`). A chord
+        # followed by anything else (a letter, as in Mod+Escape or Mod+Enter
+        # when asking for Mod+E; prose in a string) is NOT a binding, and the
+        # gate then applies — fail-closed, which is the direction that keeps
+        # keystrokes out of terminals.
+        return re.search(
+            re.escape(norm) + r'(?:\+|\s*\{)', blob) is not None
 
     @tool(description="Fire a desktop/compositor shortcut: 'Mod+E' (files), 'Mod+Return' (terminal), 'Mod+F' (fullscreen), 'Mod+Shift+S' (settings). System-wide actions; for in-app chords use press_keys.", gates='press_keys', aliases={'combo': ('keys', 'key')})
     def press_hotkey(self, combo: str) -> str:

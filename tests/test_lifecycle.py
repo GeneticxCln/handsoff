@@ -1564,6 +1564,53 @@ class TestRestartResilience:
             "the untracked scratch must not ship even where git exists: "
             + git_side.stdout)
 
+    def test_no_untracked_scratch_sits_in_a_shipped_directory(self):
+        """Excluding a scratch file is not the same as it not being there.
+
+        Both answers to "what should the installer do with it?" have burned us:
+        shipping it put it in the user's PATH and hashed it into the deployment
+        manifest, so the next edit to the scratch made `--ptt doctor` report the
+        WHOLE installation as drift — a false alarm raised by a file the bubble
+        never uses — and then the no-git fallback shipped it anyway, after the
+        tracked-only rule was already in place.
+
+        The root and `core/` are the directories the installer decides about by
+        glob, so a file there is a file it must have an opinion on. Keep them
+        clean instead of merely ignored: anything in either one that git does
+        not track fails here, when it appears, rather than at the next install.
+        Commit it if it is a module; otherwise it belongs outside the tree.
+        """
+        try:
+            listed = subprocess.run(
+                ["git", "-C", str(HERE), "ls-files", "-z"],
+                capture_output=True, text=True, env=sandbox_env())
+        except FileNotFoundError:
+            pytest.skip("no git — tracking cannot be consulted")
+        if listed.returncode != 0:
+            pytest.skip("not a git work tree — nothing to compare against")
+        tracked = {p for p in listed.stdout.split("\0") if p}
+
+        # what the installer stages by glob, plus the one file it names
+        candidates = sorted(p.relative_to(HERE).as_posix()
+                            for p in list(HERE.glob("*.py"))
+                            + list((HERE / "core").glob("*.py")))
+        candidates.append("handsoff-restart")
+        offenders = [c for c in candidates
+                     if c != "handsoff-restart" and c not in tracked]
+        assert not offenders, (
+            "untracked scratch in a directory the installer ships by glob — it "
+            "would land in $BIN_DIR and be hashed into the deployment "
+            f"manifest: {offenders}")
+
+        # Media scratch is not shippable, but it is still 7 MB of clutter that
+        # nothing in the tree reads — and a stray `*.wav` beside handsoff.py is
+        # how the voice-clip experiment left its copies behind in the first
+        # place. The live reference lives in ~/.config/handsoff/voice-clips/.
+        stray_media = sorted(p.name for p in HERE.glob("*.wav"))
+        assert not stray_media, (
+            "stray media beside handsoff.py — move it out of the tree (the "
+            f"configured voice reference is under the config dir): {stray_media}")
+
     def test_lock_failure_logs_instead_of_silent_exit(self, H, monkeypatch):
         """If the lock can't be acquired, say so in the log (no more silent vanish)."""
         import builtins

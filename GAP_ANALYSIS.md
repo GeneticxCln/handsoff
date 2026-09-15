@@ -3909,3 +3909,73 @@ a new module up automatically once it is committed.
 matched is worse than a rejected one, because the refusal message lists the entry
 as allowed. Matching is normalised on both sides now; the built-in `ALLOWED` set
 was already lowercase, so only a human-typed entry was ever affected.
+
+## Scratch in the root: cleared, and kept cleared by the suite
+
+Four files sat beside `handsoff.py` — `test.py` (a chatterbox probe that patches
+`s3tokenizer` and `voice_encoder` to generate `output.wav`), its `output.wav`,
+`optimus.wav` (6.4 MB) and `optimus_clip.wav`. All four were gitignored, which
+made them untidy rather than invisible: `.gitignore` stops an accidental
+`git add`, it does not stop the installer having to decide about them, and that
+decision had already gone wrong twice (shipped into `$BIN_DIR` and hashed into
+the manifest, then shipped again through the no-git fallback).
+
+**Checked before deleting.** The configured `tts_reference` is
+`~/.config/handsoff/voice-clips/optimus_clip.wav`, outside the tree, and the root
+copy was a byte-identical duplicate of it — so the deletion removes a duplicate,
+not the voice. Verified afterwards: the doctor still resolves the reference and
+reports the model loaded, and the file is readable and non-empty.
+
+**Why the guard fails rather than skips.** The rule is "nothing in a
+by-glob-shipped directory that git does not track". A guard that only warned
+would be the gitignore line again in a new costume; this one makes the scratch
+cost a test failure the moment it appears, which is the only point at which
+moving it is cheap.
+## Four confirmed findings: a chord boundary, ICS fractions, a startup guard, and a silent cap
+
+**The chord gate matched substrings.** `_super_binding_known` tested `norm in
+blob`, so a config bound to `Mod+Enter` made `mod+e` "known" — any longer chord
+sharing a prefix admitted the shorter ask, and the terminal gate (whose whole
+purpose is keeping keystrokes out of shells) was skipped, firing Super+E *into*
+a terminal. Enter/End, F1/F10, Tab/Table are all common prefix families, so this
+was not exotic. Now a chord counts only when followed by niri's real boundary —
+`+` (a longer chord) or optional whitespace then `{` (the action block), with
+`Mod+E{` (no space) accepted. A chord followed by a letter (as in `Mod+Escape`
+when asking for `Mod+E`) is NOT a binding, so the gate stays armed — fail-closed.
+The pre-existing include-walk tests wrote `binds { Mod+T; }`, a shape real niri
+never produces: the substring matcher accepted it, the boundary matcher rightly
+does not. Those tests pin the WALK (follow, dedupe, cap, containment), so their
+fixture config was converted to real syntax (`Mod+T { spawn "x"; }`) rather than
+loosening the matcher to admit `;`.
+
+**ICS durations mangled decimals.** The `\d*[A-Z]` findall skipped the `.`, so
+`PT0.5H` parsed as the chunk `5H` — a 30-minute meeting covered a FIVE-HOUR
+overlap window and `PT1H30M15.5S` silently lost 10.5 seconds. One citation
+correction recorded in the source: RFC 5545's ABNF actually has no decimals
+anywhere (`dur-hour = 1*DIGIT "H"`); the decimal form is ISO 8601, and real
+generators emit both shapes. The parser accepts either and keeps the EXACT
+value per chunk (`(\d+(?:\.\d+)?)([A-Z])`, full-token validation, any junk
+between or after chunks refuses the whole value, and a leading `-`/`+` — the
+"this points backwards" sign — is refused rather than turned positive).
+
+**Startup could die over a reminder.** `take_missed` catches the prune-save
+OSError, but a failure BEFORE it (unreadable reminders.json, a wedged sidecar
+flock) propagated out of `start()` — which `main()` calls before the first
+turn. The reminder worker path has wrapped the same store for exactly this
+reason; now the startup twin does too: log, tell the person once, continue with
+`[]`. The reminders stay on disk either way and fire on the worker's next tick.
+
+**The spotter cap was silent.** `spotter_models[:5]` dropped the 6th+ entry
+with no journal line — and the stock default already fills the cap, so the
+first user-added wake word was exactly the one discarded, which is why it
+"never fired" and nothing said why. Truncation is a choice, not an error: the
+cap stays, and the truncation now says `spotter_models: keeping the first 5 of
+6 — the rest never fire` by name and counts.
+
+**Proven.** 4/4 mutations caught, zero residue (substring matcher restored,
+decimal support removed, guard block removed, warning block disabled — each
+file verified byte-identical after restore by sha256). 1369 tests green in all
+three orderings (default, shuffled-test, shuffled-file); coverage 83.94% ≥ 70;
+compile/shell/smoke clean. The deployed tree is now BEHIND this checkout —
+`core/tools.py`, `core/calendar.py`, `handsoff.py` and `core/settings.py` moved,
+so `--ptt doctor` reads out-of-sync until a redeploy.

@@ -4451,7 +4451,21 @@ class Assistant(QObject):
         self._start_worker(self._loader, name="loader")
         if self._handsfree:
             self._listener.start()
-        missed = _take_missed_reminders()
+        try:
+            missed = _take_missed_reminders()
+        except Exception as exc:
+            # Same shape as the reminder worker below: take_missed catches the
+            # prune-save OSError, but a failure BEFORE it (an unreadable
+            # reminders.json, a wedged sidecar flock, anything else the store
+            # does not convert to []) must not kill startup before the first
+            # turn. The reminders stay on disk either way — they fire on the
+            # worker's next tick.
+            log.exception("startup reminders unavailable")
+            self._report_once(
+                "reminder store unavailable", exc,
+                "handsoff: reminders are unavailable — "
+                f"{type(exc).__name__}: {str(exc)[:160]}")
+            missed = []
         if missed:
             self._start_worker(self._announce_missed, args=(missed,),
                                name="missed-reminders")
