@@ -1252,8 +1252,9 @@ class TestConfirmationLoop:
                 self.calls.append(name)
                 self._last_confirmation_offer = name == "wait"
                 if name == "wait":
-                    return "CONFIRM REQUIRED: pending", True
-                return "unexpected", True
+                    return _core_tools.ToolResult("CONFIRM REQUIRED: pending",
+                                                  "confirm")
+                return _core_tools.ToolResult("unexpected", "error")
 
         asst = H.Assistant.__new__(H.Assistant)
         asst._tools = Belt()

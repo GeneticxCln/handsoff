@@ -1022,6 +1022,26 @@ class TestDecisionPolicy:
         assert err and "CONFIRM REQUIRED" in out
         assert tb._pending_confirm["tool"] == "wait"
 
+    def test_an_offer_and_a_refusal_are_different_kinds(
+            self, H, monkeypatch, _fast_wait):
+        """`err` alone cannot tell an offer from a refusal — both are not-ok,
+        and the words differ per branch. The kind can, so anything that needs
+        to act on the difference ("this must be HEARD") stops guessing."""
+        offered = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
+        assert offered.execute("wait", {"seconds": 1}).kind == "confirm"
+        denied = self._belt(H, monkeypatch, policy={"wait": "DENY"})
+        assert denied.execute("wait", {"seconds": 1}).kind == "refused"
+        allowed = self._belt(H, monkeypatch)
+        assert allowed.execute("wait", {"seconds": 0}).kind == "ok"
+
+    def test_a_dry_run_is_its_own_kind(self, H, monkeypatch, _fast_wait):
+        """A dry run REPORTS instead of doing: its text says what would have
+        happened, so a prefix test could read it as either outcome."""
+        tb = self._belt(H, monkeypatch, dry_run=True)
+        res = tb.execute("press_keys", {"combo": "ctrl+c"})
+        assert res.kind == "dry-run" and res.err is True
+        assert res.text.startswith("DRY-RUN")
+
     def test_confirm_second_call_executes(self, H, monkeypatch, _fast_wait):
         tb = self._belt(H, monkeypatch, policy={"wait": "CONFIRM"})
         tb._set_user_turn(1)

@@ -21,9 +21,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import HERE as ROOT, _load, _user_site, pin_offer, wait_for
+from conftest import (HERE as ROOT, _load, _user_site, core_module, pin_offer,
+                      wait_for)
 
 from core import calendar as _core_calendar
+
+# Resolved on first use, inside the sandbox (a direct `from core import tools`
+# would bake the developer's real user dirs in at collection time).
+_core_tools = core_module("tools")
 
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
@@ -388,13 +393,33 @@ class TestSnooze:
         H._snooze_offer.arm(90, name="tea")
         a = H.Assistant.__new__(H.Assistant)
         a._tools = H.ToolBelt(on_restart_pending=lambda: None)
-        a._tools.execute = lambda name, args: ("snoozed!", False)
+        a._tools.execute = lambda name, args: _core_tools.ToolResult("snoozed!")
         a._set = lambda *x: None
         a._speak = lambda *x, **k: calls.setdefault("spoken", True)
         assert a._try_snooze("snooze 5 minutes", 1, H.threading.Event()) is True
         assert wait_for(lambda: calls.get("spoken")), \
             "snooze confirmation was not spoken"
         assert not H._snooze_offer, "offer window must close after use"
+
+    def test_a_refused_snooze_keeps_the_offer_armed(self, H):
+        """The offer is the only thing that can re-arm a fired one-off, so it
+        may close on a snooze that HAPPENED and not on one that was refused.
+
+        The refusal here is phrased WITHOUT the `ERROR:`/`REFUSED:` prefix on
+        purpose: that is the case the text-based read got wrong. A failure
+        whose wording does not happen to match a grep reads as success to a
+        caller sniffing the string, and the user's reminder is dropped.
+        """
+        H._snooze_offer.arm(90, name="tea")
+        a = H.Assistant.__new__(H.Assistant)
+        a._tools = H.ToolBelt(on_restart_pending=lambda: None)
+        a._tools.execute = lambda name, args: _core_tools.ToolResult(
+            "no reminder matching 'tea' — it may have already been pruned",
+            "error")
+        a._set = lambda *x: None
+        a._speak = lambda *x, **k: None
+        assert a._try_snooze("snooze 5 minutes", 1, H.threading.Event()) is True
+        assert H._snooze_offer, "a refused snooze must leave the offer armed"
 
     def test_try_snooze_ignores_normal_speech(self, H):
         H._snooze_offer.arm(90, name="tea")

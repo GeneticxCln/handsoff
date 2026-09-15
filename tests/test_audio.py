@@ -26,6 +26,11 @@ from conftest import (HERE as ROOT, _load, core_module, method_source,
 
 from core import settings as _core_settings
 
+# Resolved on first use, inside the sandbox: a direct `from core import tools`
+# bakes the developer's real HOME/XDG dirs into the module at collection time,
+# which the suite's own guard refuses (and is right to).
+_core_tools = core_module("tools")
+
 # Resolved on first use rather than at collection, so it cannot bake the
 # developer's HOME; see conftest.core_module.
 _core_audio = core_module("audio")
@@ -1769,8 +1774,9 @@ class TestMicHistory:
         class _Tools:
             @staticmethod
             def execute(name, args):
-                return ("Sunny, 21 degrees in Berlin.", None) \
-                    if name == "get_weather" else ("ERROR", "nope")
+                if name == "get_weather":
+                    return _core_tools.ToolResult("Sunny, 21 degrees in Berlin.")
+                return _core_tools.ToolResult("ERROR: nope", "error")
 
         a = H.Assistant.__new__(H.Assistant)
         a._tools = _Tools()
@@ -1792,7 +1798,9 @@ class TestMicHistory:
         class _Tools:
             @staticmethod
             def execute(name, args):
-                return ("Sunny.", None) if name == "get_weather" else ("ERROR", "x")
+                if name == "get_weather":
+                    return _core_tools.ToolResult("Sunny.")
+                return _core_tools.ToolResult("ERROR: x", "error")
 
         a = H.Assistant.__new__(H.Assistant)
         a._tools = _Tools()
@@ -1806,6 +1814,27 @@ class TestMicHistory:
         # commands never trigger a briefing
         a._briefing_done_date = ""
         assert a._maybe_briefing_prefix("open terminal") == ""
+
+    def test_a_refused_weather_call_is_not_a_briefing_body(
+            self, H, _micfile, monkeypatch):
+        """This site asked the same question two ways — `err` and a prefix
+        test — and the two could disagree. The refusal is phrased without the
+        `ERROR:`/`REFUSED:` prefix on purpose: a failure worded its own way is
+        the case a prefix test reads as success, which here would have put the
+        failure sentence into the spoken briefing as the weather."""
+        class _Tools:
+            @staticmethod
+            def execute(name, args):
+                return _core_tools.ToolResult(
+                    "no weather provider is configured", "error")
+
+        a = H.Assistant.__new__(H.Assistant)
+        a._tools = _Tools()
+        a._briefing_done_date = ""
+        monkeypatch.setitem(H.SETTINGS, "briefing", True)
+        monkeypatch.setitem(H.SETTINGS, "home_place", "Berlin")
+        monkeypatch.setattr(H, "_world_events", lambda *a, **k: ([], False))
+        assert a._maybe_briefing_prefix("good morning") == ""
 
 
 class TestMicHistoryPersistence:

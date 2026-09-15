@@ -11,7 +11,11 @@ import time
 
 import pytest
 
-from conftest import HERE as ROOT
+from conftest import HERE as ROOT, core_module
+
+# Resolved on first use, inside the sandbox (a direct `from core import tools`
+# would bake the developer's real user dirs in at collection time).
+_core_tools = core_module("tools")
 
 HERE = ROOT   # the repo root
 
@@ -155,8 +159,9 @@ def _briefing_stub(H, tools):
 class _WxTools:
     @staticmethod
     def execute(name, args):
-        return ("Sunny, 21 degrees.", None) if name == "get_weather" \
-            else ("ERROR", "x")
+        if name == "get_weather":
+            return _core_tools.ToolResult("Sunny, 21 degrees.")
+        return _core_tools.ToolResult("ERROR: x", "error")
 
 
 class TestBriefing:
@@ -194,7 +199,7 @@ class TestBriefing:
             @staticmethod
             def execute(name, args):
                 called.append(name)
-                return ("Sunny.", None)
+                return _core_tools.ToolResult("Sunny.")
 
         monkeypatch.setitem(H.SETTINGS, "briefing", True)
         monkeypatch.setitem(H.SETTINGS, "home_place", "")

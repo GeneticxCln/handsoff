@@ -1037,14 +1037,13 @@ def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -
             marker = belt._terminal_marker(belt._typing_guard())
             if not marker:
                 raise RuntimeError(f"{app_id} was not recognised as a terminal")
-            out, err = belt.execute("type_text", {"text": "selftest refused"})
-            out2, err2 = belt.execute("press_keys", {"combo": "enter"})
-            refused = (err and str(out).startswith("REFUSED")
-                       and err2 and str(out2).startswith("REFUSED"))
+            r1 = belt.execute("type_text", {"text": "selftest refused"})
+            r2 = belt.execute("press_keys", {"combo": "enter"})
+            refused = r1.kind == "refused" and r2.kind == "refused"
             _selftest_check(results, "terminal refusal",
                             "PASS" if refused else "FAIL",
                             f"{marker}: type_text and press_keys refused"
-                            if refused else f"NOT refused: {out} / {out2}")
+                            if refused else f"NOT refused: {r1.text} / {r2.text}")
 
         # 4. type_text lands in a scratch editor (focus-guarded by the tool)
         if shutil.which("gnome-text-editor"):
@@ -3711,7 +3710,9 @@ class Assistant(QObject):
             # Opt-in persistence means the reader should resume after restart;
             # a missing dbus-monitor simply reports an error and leaves it off.
             result = self._set_notification_reader(True)
-            if result and result.startswith("ERROR"):
+            # Not a ToolBelt result, but the same "ERROR:" convention — so it
+            # goes through the one classifier rather than a private copy.
+            if result and _core_tools.tool_kind(result) == "error":
                 log.error("notification reader startup: %s", result)
         self._empty_streak = 0                   # consecutive empty transcriptions
         self._wake_until = 0.0                   # monotonic: engagement window expiry
@@ -4977,7 +4978,10 @@ class Assistant(QObject):
         self._set(gen, THINKING)
         out = self._tools.type_text(text)
         log.info("dictation: typed %d chars", len(text))
-        if out.startswith("REFUSED"):
+        # The tool hands back its text; the KIND is what says whether that text
+        # is a refusal. Sniffing the prefix here was a second, quieter copy of
+        # the same convention core.tools already owns.
+        if _core_tools.tool_kind(out) == "refused":
             log.warning("dictation refused: %s", out[:120])
             self._set_dictation(False, gen, cancel)
             self._speak("Dictation stopped — I can't type into the focused "
@@ -5441,12 +5445,12 @@ class Assistant(QObject):
         # pruned from reminders.json, so snooze_reminder NEEDS the offer to
         # re-arm it. Clearing early made the spoken snooze fail with "no
         # reminder matching" (verified). Clear only AFTER success.
-        out, _err = self._tools.execute(
+        res = self._tools.execute(
             "snooze_reminder", {"name": offer["name"], "minutes": minutes})
-        if not out.startswith(("ERROR", "REFUSED")):
+        if res.ok:
             _snooze_offer.clear()
         self._set(gen, IDLE)
-        threading.Thread(target=lambda: self._speak(out, gen, cancel),
+        threading.Thread(target=lambda: self._speak(res.text, gen, cancel),
                          name="snooze-tts", daemon=True).start()
         return True
 
@@ -5587,11 +5591,11 @@ class Assistant(QObject):
         place = str(SETTINGS.get("home_place", "")).strip()
         body = ""
         if place:
-            out, err = self._tools.execute("get_weather", {"place": place})
-            if err or out.startswith(("REFUSED", "ERROR")):
-                log.info("briefing skipped: %s", out[:80])
+            res = self._tools.execute("get_weather", {"place": place})
+            if not res.ok:
+                log.info("briefing skipped: %s", res.text[:80])
                 return ""
-            body = out
+            body = res.text
         # ponytail: world news needs no home_place; weather keeps its own.
         events, _degraded = _world_events("all", 5)
         world_lines = []

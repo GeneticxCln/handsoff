@@ -65,6 +65,67 @@ def _instance_dep(instance):
     return getattr(instance, "_dependencies", None) or _CURRENT.get() or _DEFAULT_DEPS
 
 
+class ToolResult(tuple):
+    """What one tool call produced, with the failure flag CARRIED, not sniffed.
+
+    `execute` has always returned `(text, err)` and every caller and every test
+    unpacks exactly that, so this stays a 2-tuple; `kind` rides along as an
+    attribute. What changed is where `err` comes from. It used to be re-derived
+    at each call site with `text.startswith('ERROR')`, spelled out seven times,
+    so a tool that legitimately answered with a sentence beginning "ERROR" read
+    as a failure, and a failure phrased any other way read as success. Now the
+    kind is decided once, by the code that produced the text, and the flag
+    follows from it.
+
+    `kind` is one of KINDS below; "ok" is the only one that is not a failure,
+    and an unrecognised kind fails CLOSED rather than reading as success.
+    """
+
+    KINDS = ("ok", "refused", "confirm", "dry-run", "error", "unknown")
+
+    def __new__(cls, text, kind="ok"):
+        kind = kind if kind in cls.KINDS else "unknown"
+        self = super().__new__(cls, (str(text), kind != "ok"))
+        self.kind = kind
+        return self
+
+    @property
+    def text(self) -> str:
+        return self[0]
+
+    @property
+    def err(self) -> bool:
+        return self[1]
+
+    @property
+    def ok(self) -> bool:
+        return self.kind == "ok"
+
+    def __repr__(self) -> str:      # keeps a test failure readable
+        return f"ToolResult(kind={self.kind!r}, text={self.text!r})"
+
+
+# The tool-text failure convention, written down exactly once. A tool signals
+# failure by beginning its answer "ERROR:" or "REFUSED:"; the word boundary
+# check means "ERRORS: ..." or "REFUSEDLY ..." are prose, not failures.
+_FAILURE_PREFIXES = (("ERROR", "error"), ("REFUSED", "refused"))
+
+
+def tool_kind(text) -> str:
+    """Classify a tool's own return text: one of ToolResult.KINDS.
+
+    `_execute` uses this for everything a tool hands back, and the host uses it
+    for the subsystems that answer in the same shape (the notification reader),
+    so there is still exactly one answer to "is this a failure" rather than one
+    per call site.
+    """
+    head = str(text).lstrip()
+    for prefix, kind in _FAILURE_PREFIXES:
+        if head.startswith(prefix) and not head[len(prefix):len(prefix) + 1].isalnum():
+            return kind
+    return "ok"
+
+
 def _default_log_metadata(value, kind="text"):
     return str(value)
 
@@ -838,14 +899,14 @@ class ToolBelt:
             self._tool_cache = cache
         return cache
 
-    def execute(self, name: str, args: dict) -> tuple[str, bool]:
+    def execute(self, name: str, args: dict) -> ToolResult:
         token = _CURRENT.set(_instance_dep(self))
         try:
             return self._execute(name, args)
         finally:
             _CURRENT.reset(token)
 
-    def _execute(self, name: str, args: dict) -> tuple[str, bool]:
+    def _execute(self, name: str, args: dict) -> ToolResult:
         self._last_images = []
         self._last_confirmation_offer = False
         limit = self._rate_limit()
@@ -855,15 +916,15 @@ class ToolBelt:
         if limit > 0:
             if len(self._tool_times) >= limit:
                 log_decision(name, _log_target(args, 120), 'RATE-LIMITED', 'refused: rate limit')
-                return (f'REFUSED: tool-call rate limit reached ({limit} calls/60s) — stop calling tools, answer from what you have, or wait', True)
+                return ToolResult(f'REFUSED: tool-call rate limit reached ({limit} calls/60s) — stop calling tools, answer from what you have, or wait', 'refused')
             self._tool_times.append(now)
         fn = self._tool_methods().get(name)
         if fn is None:
-            return (f'unknown tool: {name}', True)
+            return ToolResult(f'unknown tool: {name}', 'error')
         gate = fn._tool_gates
         if gate and (not self._perm.get(gate, True)):
             log_decision(name, _log_target(args, 120), 'DENY', 'refused: permission gate disabled')
-            return (f"REFUSED: the '{gate}' tool is disabled in handsoff settings", True)
+            return ToolResult(f"REFUSED: the '{gate}' tool is disabled in handsoff settings", 'refused')
         if name in ('kill_process', 'confirm_kill'):
             verdict = 'ALLOW'
         else:
@@ -875,7 +936,7 @@ class ToolBelt:
         target = _log_target(args) if args else ''
         if verdict == 'DENY':
             log_decision(name, target, 'DENY', 'refused: command_policy DENY')
-            return (f"REFUSED: '{name}' is DENIED by the user's command policy (handsoff settings) — do not retry this turn", True)
+            return ToolResult(f"REFUSED: '{name}' is DENIED by the user's command policy (handsoff settings) — do not retry this turn", 'refused')
         if verdict == 'CONFIRM' and getattr(self, '_confirm_running', None) != name:
             # "Is there already an offer for this call?" and "arm one" are a
             # single step: a model looping on the same call in the same turn
@@ -902,11 +963,11 @@ class ToolBelt:
                 except (OSError, RuntimeError, ValueError):
                     _split_name = 'split module'
                 extra = f'\nDIFF PREVIEW (proposed change to {_split_name}):\n' + self._split_edit_preview(args)
-            return (f"CONFIRM REQUIRED: about to call '{name}' with {target or 'no arguments'}. Nothing happened yet. The user must hear this offer and reply; call confirm_action(answer='yes') in the NEXT turn to run it, or confirm_action(answer='no') to cancel." + extra, True)
+            return ToolResult(f"CONFIRM REQUIRED: about to call '{name}' with {target or 'no arguments'}. Nothing happened yet. The user must hear this offer and reply; call confirm_action(answer='yes') in the NEXT turn to run it, or confirm_action(answer='no') to cancel." + extra, 'confirm')
         dry_run = setting_flag('dry_run') and DecisionPolicy.is_desktop_action(name)
         if dry_run:
             log_decision(name, target, 'DRY-RUN', 'reported; nothing executed')
-            return (f"DRY-RUN: {name} would run with {target or 'no arguments'}. Nothing was executed (dry_run is enabled in settings). Describe the plan to the user and stop.", True)
+            return ToolResult(f"DRY-RUN: {name} would run with {target or 'no arguments'}. Nothing was executed (dry_run is enabled in settings). Describe the plan to the user and stop.", 'dry-run')
         log_decision(name, target, verdict if verdict != 'CONFIRM' else 'ALLOW', 'dispatched')
         alias_map = fn._tool_aliases
         sig = inspect.signature(fn)
@@ -939,15 +1000,15 @@ class ToolBelt:
                 else:
                     kwargs[pname] = str(raw) if raw is not None else ''
         except ValueError as e:
-            return (f'ERROR: bad arguments for {name}: {e}', True)
+            return ToolResult(f'ERROR: bad arguments for {name}: {e}', 'error')
         try:
             out = fn(**kwargs)
-            return (out, out.startswith('ERROR') or out.startswith('REFUSED'))
+            return ToolResult(out, tool_kind(out))
         except TypeError as e:
-            return (f'ERROR: bad arguments for {name}: {e}', True)
+            return ToolResult(f'ERROR: bad arguments for {name}: {e}', 'error')
         except Exception as e:
             _dep().log.exception('tool %s failed', name)
-            return (f'ERROR: {e}', True)
+            return ToolResult(f'ERROR: {e}', 'error')
 
     def _validate_command(self, command: str) -> tuple[list | None, str, str | None, bool]:
         """Validate without executing: shlex.split + policy checks.

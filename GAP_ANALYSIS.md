@@ -3979,3 +3979,47 @@ three orderings (default, shuffled-test, shuffled-file); coverage 83.94% ≥ 70;
 compile/shell/smoke clean. The deployed tree is now BEHIND this checkout —
 `core/tools.py`, `core/calendar.py`, `handsoff.py` and `core/settings.py` moved,
 so `--ptt doctor` reads out-of-sync until a redeploy.
+
+## P0-2 — the failure flag belongs to the text's producer, not its readers
+
+**What was missing.** `_execute` returned `tuple[str, bool]` and the boolean was a
+CONVENTION rather than a fact: seven call sites tested `text.startswith("ERROR")`
+(or `REFUSED`) to decide whether the thing in front of them had worked. The
+convention lived in the tool bodies (all 197 failure returns spell `ERROR:` or
+`REFUSED:`) but was restated in every reader, so the readers could — and did —
+spell it differently: the typing selftest tested both prefixes on one line, the
+briefing tested a bool AND both prefixes, and the notification reader tested only
+`ERROR`. A tool that failed with different wording, or a reader that drifted, is
+enough to report a refusal as success.
+
+**The fix, and why it does not break a single caller.** The result is a `tuple`
+subclass, not a named tuple: `text, err = belt.execute(...)` keeps working for the
+~40 tests and the eight host sites that unpack it, while the sites that need the
+difference read `.kind`. `ToolResult.KINDS` is closed (`ok`, `refused`,
+`confirm`, `dry-run`, `error`) and an unrecognised kind fails CLOSED, so a future
+typo in the producing code is loud rather than silently successful. The
+convention itself moved into one function, `tool_kind`, with a word boundary, so it
+is the only place that can be wrong — and the two host seams that cannot get a
+`ToolBelt` result (a direct `type_text` call, and `Notifications.set_enabled`)
+call it rather than growing their own copy.
+
+**The guard that had to be rewritten.** The first version of two host guards
+stubbed a refusal WITH its prefix. The old code read that correctly too, so the
+sweep reported a MISS instead of a pass — the bug is a failure worded another way,
+and only that case distinguishes the two implementations. Both guards now stub an
+unflagged refusal. This is recorded because a mutation sweep that reports 10/10
+while one mutation is an EQUIVALENT MUTANT is worse than a smaller honest number.
+
+**Proven.** 11/11 mutations caught, zero residue (flag decoupled from the kind,
+fail-closed removed, word boundary dropped, dispatch unclassified, gate refusal,
+confirm and dry-run kinds lost, snooze offer cleared on refusal, briefing reading a
+refusal as weather, dictation and the notification reader sniffing again), every
+restore sha256-verified. 1380 tests green in all three orderings; coverage
+83.96% ≥ 70; all six gates green. **P0-3 was verified already closed** rather than
+re-fixed: both boot stores have guarded every failure path, the reminders startup
+call was wrapped in the previous pass, and both its paths are pinned by tests.
+
+**Still open from the P0 list:** the socket's per-action capability (read-only
+verbs open, state-changing verbs gated), and the settings-typed-contract refactor
+(one field table generating coerce/collect/load). The deployed bubble is behind
+this checkout until a redeploy.

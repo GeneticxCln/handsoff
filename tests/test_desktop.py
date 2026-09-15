@@ -875,7 +875,8 @@ class TestWorkspaceAliasesAndBriefing:
     def test_briefing_once_daily_and_skips_commands(self, H, monkeypatch):
         tools = H.ToolBelt(on_restart_pending=lambda: None)
         monkeypatch.setattr(tools.__class__, "execute",
-                            lambda self, n, args: ("weather: 20C sunny", False))
+                            lambda self, n, args:
+                            _core_tools.ToolResult("weather: 20C sunny"))
         a = self._brief_stub(H, tools)
         monkeypatch.setitem(H.SETTINGS, "briefing", True)
         monkeypatch.setitem(H.SETTINGS, "home_place", "Berlin")

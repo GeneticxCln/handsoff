@@ -99,8 +99,10 @@ class TestTypingSelftestWiring:
                             classmethod(lambda cls, w: "foot"))
         monkeypatch.setattr(H.ToolBelt, "_typing_guard",
                             lambda self: foot_win)
-        outs = iter([("REFUSED: terminal (foot)", True),
-                     ("REFUSED: terminal (foot)", True)])
+        outs = iter([_core_tools.ToolResult("REFUSED: terminal (foot)",
+                                           "refused"),
+                     _core_tools.ToolResult("REFUSED: terminal (foot)",
+                                           "refused")])
         monkeypatch.setattr(H.ToolBelt, "execute",
                             lambda self, name, args: next(outs))
         monkeypatch.setattr(H.subprocess, "run",

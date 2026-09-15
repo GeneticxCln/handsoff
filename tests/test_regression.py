@@ -1715,6 +1715,124 @@ class TestEveryFlagReadIsStrict:
         assert "handsfree" not in H.SETTINGS
 
 
+class TestToolResultsCarryTheirKind:
+    """A tool result's failure flag is CARRIED, never re-derived from the text.
+
+    `_execute` handed back a bare `(text, err)` and every caller decided for
+    itself whether that text was a failure by testing
+    `text.startswith("ERROR")` — seven copies of one convention, each free to
+    disagree with the others and with the tool that produced the text. The
+    convention now has ONE owner (`core.tools.tool_kind`) and the result says
+    which kind it is; the flag is a consequence of that, so a typo'd prefix can
+    no longer flip a failure into a success.
+    """
+
+    #: prose that merely CONTAINS the failure words — none of these is a failure
+    NOT_FAILURES = (
+        "ERRORS: many of them",
+        "REFUSEDLY, the request stood",
+        "error: lowercase prose is not the convention",
+        "the ERROR was mine",
+        "",
+    )
+
+    def test_the_result_still_unpacks_as_a_plain_pair(self, H):
+        """Every caller and every test does `text, err = belt.execute(...)`.
+        Changing what decides `err` must not change that shape."""
+        r = H._core_tools.ToolResult("ERROR: boom", "error")
+        text, err = r
+        assert (text, err) == ("ERROR: boom", True)
+        assert r.text == text and r.err is err and r.ok is False
+        # and a list/dict round-trip still sees two elements
+        assert len(tuple(r)) == 2 and list(r) == ["ERROR: boom", True]
+
+    def test_the_flag_follows_the_kind_not_the_text(self, H):
+        """The SAME text is a failure or not depending on the kind it was
+        produced with. That is the whole point: the text cannot decide."""
+        said = "nothing to see here"
+        ok = H._core_tools.ToolResult(said, "ok")
+        err = H._core_tools.ToolResult(said, "error")
+        assert ok.text == err.text and ok.ok is True and err.err is True
+
+    def test_an_unrecognised_kind_fails_closed(self, H):
+        """A kind nobody defined must not read as success."""
+        r = H._core_tools.ToolResult("all good, honestly", "banana")
+        assert r.kind == "unknown" and r.ok is False and r.err is True
+
+    def test_the_classifier_needs_a_real_word_boundary(self, H):
+        kind = H._core_tools.tool_kind
+        assert kind("ERROR: boom") == "error"
+        assert kind("REFUSED: nope") == "refused"
+        assert kind("  REFUSED: leading space") == "refused"
+        assert kind("ERROR") == "error"          # bare prefix, end of string
+        assert kind("just prose") == "ok"
+        for text in self.NOT_FAILURES:
+            assert kind(text) == "ok", text
+
+    def test_execute_carries_the_kind_end_to_end(self, H, monkeypatch):
+        """Through the real dispatch, not the class: an answer, a refusal and
+        an unknown tool each come back with their own kind."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        assert belt.execute("job_status", {}).kind == "ok"
+        # a tool that FAILS reports its own failure, rather than the caller
+        # finding out by looking at what it said
+        failed = belt.execute("read_file", {"path": "/nonexistent/nope.txt"})
+        assert failed.kind == "error" and failed.err is True, failed
+        # a disabled permission gate refuses before anything is dispatched
+        monkeypatch.setitem(belt._perm, "press_keys", False)
+        refused = belt.execute("press_keys", {"combo": "ctrl+c"})
+        assert refused.kind == "refused" and refused.err is True
+        assert refused.text.startswith("REFUSED")
+        unknown = belt.execute("no_such_tool", {})
+        assert unknown.kind == "error" and unknown.err is True
+
+    def test_no_call_site_sniffs_the_failure_prefix_any_more(self, H):
+        """The sweep, in the shape of the flag-read guard next door.
+
+        A `startswith("ERROR")`/`startswith("REFUSED")` anywhere in the runtime
+        or the app is a second copy of the convention growing back — and the
+        copy that drifts is the one deciding whether work actually happened.
+
+        Parsed with `ast`, not grepped: the docstrings that EXPLAIN this
+        convention contain the same words, and a text sweep would flag the
+        explanation as the defect.
+        """
+        import ast
+        offenders = []
+        for name in ("core/tools.py", "handsoff.py"):
+            src = (HERE / name).read_text(encoding="utf-8")
+            lines = src.splitlines()
+            for node in ast.walk(ast.parse(src)):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                if not (isinstance(fn, ast.Attribute)
+                        and fn.attr == "startswith"):
+                    continue
+                for arg in node.args:
+                    elems = (arg.elts if isinstance(arg, (ast.Tuple, ast.List))
+                             else [arg])
+                    for el in elems:
+                        v = getattr(el, "value", None)
+                        if not isinstance(v, str):
+                            continue
+                        if v.lstrip().upper().startswith(("ERROR", "REFUSED")):
+                            offenders.append(
+                                f"{name}:{node.lineno}: "
+                                f"{lines[node.lineno - 1].strip()}")
+        assert not offenders, (
+            "a call site is re-deriving failure from the text — read "
+            "`.kind`/`.ok` (or core.tools.tool_kind) instead:\n"
+            + "\n".join(offenders))
+
+    def test_the_host_uses_the_one_classifier_at_its_string_seams(self, H):
+        """The two host paths that cannot get a ToolBelt result (a direct
+        method call and a subsystem that answers in the same shape) still ask
+        the shared classifier rather than spelling the prefixes again."""
+        src = (HERE / "handsoff.py").read_text(encoding="utf-8")
+        assert "_core_tools.tool_kind(" in src
+
+
 class TestTheStartupFlagReads:
     """The two reads that establish DURABLE state, driven through the real
     `Assistant.__init__` rather than the helper: a junk value must not start
