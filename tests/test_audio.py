@@ -1027,14 +1027,34 @@ class TestMicHealth:
         calls = []
         sleeps = []
         ticks = iter([RuntimeError("boom"), None, None])   # 1st report raises
+        # BOTH seams patched here are process-wide: `time.sleep` is one module
+        # object every thread shares, and `_health_tick` is patched on the CLASS.
+        # `ContinuousListener.__init__` spawns one `mic-health` reporter per
+        # listener and `_health_loop` is `while True: sleep; tick` with no stop
+        # path — so a shuffled run carries live reporters from earlier files
+        # (measured: 4 922 test boundaries in one gate run began with one already
+        # running). A reporter whose 10 s sleep came due DURING this test
+        # appended to `calls`, consumed this test's `ticks` iterator and raised
+        # the fake's StopIteration inside that other thread, which made the loop
+        # count 3 instead of 2 on a shuffled run. Reproduced on the unmodified
+        # commit by adding ONE concurrent reporter, so this is the test's
+        # fragility rather than a caller's mistake: the loop under test runs in
+        # THIS thread, and only this thread's calls and sleeps are its subject.
+        real_sleep = time.sleep
+        real_tick = H.ContinuousListener._health_tick
 
         def fake_tick(self):
+            if threading.current_thread() is not threading.main_thread():
+                return real_tick(self)   # a reporter this test did not start
             calls.append(1)
             r = next(ticks)
             if isinstance(r, Exception):
                 raise r
 
         def fake_sleep(s):
+            if threading.current_thread() is not threading.main_thread():
+                real_sleep(s)            # let it sleep as it would have
+                return
             sleeps.append(s)
             if len(sleeps) >= 3:            # two full hourly cycles, then stop
                 raise StopIteration

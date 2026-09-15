@@ -4292,6 +4292,132 @@ def the_brain_tab_says_what_the_bubble_is_running():
     assert "gemma4:26b" in win.model_in_use.text(), win.model_in_use.text()
 
 
+@scenario
+def the_window_writes_the_schema_vocabulary_not_a_copy_of_it():
+    # Two hand-written copies of a schema vocabulary DROVE A WRITE here: the
+    # state-colour row's four-name tuple keyed the whole `colors` dict, and the
+    # decoration-colour rows spelled out the two words `avatar_deco_color`
+    # accepts. `_collect` replaces a sub-dict wholesale, so a key missing from
+    # the candidate is a DELETE to the three-way merge and the loader then fills
+    # it from the defaults — the exact shape that silently switched
+    # `get_datetime` back on, one vocabulary over.
+    #
+    # Both now read the schema. This proves they FOLLOW it by adding a
+    # vocabulary entry the way the schema gains one, so a guard that only
+    # compared today's two key sets — which is what a `==` assertion does — is
+    # not the check being made here: a name added to the schema is the only
+    # thing that makes a stale copy visible.
+    import settings_schema as SCHEMA_MOD
+
+    colors = SCHEMA_MOD.DEFAULT_SETTINGS["colors"]
+    deco_words = SCHEMA_MOD.AVATAR_DECO_COLORS
+    assert tuple(settings_app._state_colour_keys()) == tuple(colors), (
+        (settings_app._state_colour_keys(), tuple(colors)))
+    assert tuple(settings_app._deco_colour_words()) == tuple(deco_words), (
+        (settings_app._deco_colour_words(), tuple(deco_words)))
+
+    colors["snoozing"] = "#123456"                 # a fifth state, as declared
+    SCHEMA_MOD.AVATAR_DECO_COLORS = tuple(deco_words) + ("chrome",)
+    try:
+        assert "snoozing" in settings_app._state_colour_keys(), (
+            "the state-colour row is a hand-written key set again")
+        assert "chrome" in settings_app._deco_colour_words(), (
+            "the decoration-colour row is a hand-written pair again")
+
+        # The swatches follow the schema too, so the new state has a value
+        # rather than the default of a row that never heard of it.
+        seed({"model": "testmodel:latest",
+              "colors": {"idle": "#101010", "listening": "#202020",
+                         "thinking": "#303030", "speaking": "#404040",
+                         "snoozing": "#ABCDEF"}})
+        win.reload_from_disk()
+        assert win._colors.get("snoozing") == "#ABCDEF", (
+            f"the swatch set ignored a declared state: {win._colors}")
+
+        coerce = settings_app._core_module("settings").coerce_settings
+        win._collect()
+        assert win.cfg["colors"].get("snoozing") == "#ABCDEF", (
+            f"a save dropped a state colour the schema declares: "
+            f"{win.cfg['colors']}")
+        loaded = coerce(copy.deepcopy(win.cfg))
+        assert loaded["colors"].get("snoozing") == "#ABCDEF", (
+            "the loader re-defaulted a state colour that a save dropped: "
+            f"{loaded['colors']}")
+
+        # ...and with no swatch for it at all (the row set is built at
+        # construction) the value must still be written back: that is the
+        # fill-from-loaded half of the same rule.
+        win._colors.pop("snoozing", None)
+        win.cfg["colors"]["snoozing"] = "#654321"
+        win._collect()
+        assert win.cfg["colors"].get("snoozing") == "#654321", (
+            "a colour with no swatch was dropped instead of kept: "
+            f"{win.cfg['colors']}")
+    finally:
+        colors.pop("snoozing", None)
+        SCHEMA_MOD.AVATAR_DECO_COLORS = deco_words
+
+
+@scenario
+def a_schema_key_with_no_control_survives_a_save():
+    # `permissions` and `command_policy` are the other two settings `_collect`
+    # writes as a WHOLE object, which is the only way a save can DELETE a value.
+    # The `colors` half is above; this covers a permission the schema grew after
+    # the tab was built, and a policy entry the registry gives no row for.
+    import settings_schema as SCHEMA_MOD
+
+    coerce = settings_app._core_module("settings").coerce_settings
+    perms = SCHEMA_MOD.DEFAULT_SETTINGS["permissions"]
+
+    # A permission added to the schema AFTER the tab was built: the checkbox row
+    # set was made at construction, so nothing in the window shows this key and
+    # only the fill-from-loaded rule can keep what is on disk.
+    perms["snooze_tools"] = True                    # the new default
+    try:
+        seed({"model": "testmodel:latest",
+              "permissions": {"snooze_tools": False}})
+        win.reload_from_disk()
+        assert "snooze_tools" not in win.perm_checks, (
+            "this scenario needs a permission the tab has no checkbox for")
+        win._collect()
+        assert win.cfg["permissions"].get("snooze_tools") is False, (
+            f"a save dropped a permission the schema declares: "
+            f"{win.cfg['permissions']}")
+        loaded = coerce(copy.deepcopy(win.cfg))
+        assert loaded["permissions"]["snooze_tools"] is False, (
+            "the loader switched a permission back ON after a save dropped it")
+    finally:
+        perms.pop("snooze_tools", None)
+
+    # A policy entry with no row: rows come from the tool registry, so a name it
+    # does not declare has none — and a save that dropped it would erase a
+    # choice without saying so.
+    orphan = "a_tool_this_registry_does_not_declare"
+    win.cfg["command_policy"] = {orphan: "DENY"}
+    win._collect()
+    assert win.cfg["command_policy"].get(orphan) == "DENY", (
+        f"a save dropped a policy with no row: {win.cfg['command_policy']}")
+    assert coerce(copy.deepcopy(win.cfg))["command_policy"][orphan] == "DENY"
+
+    # ...and the rows still speak, and still keep settings.json minimal: ALLOW
+    # is the default, so a row set back to ALLOW stores nothing at all.
+    names = sorted(win.policy_rows)
+    assert names, "no policy rows — the rest of this scenario asserts nothing"
+    target = names[0]
+    combo = win.policy_rows[target]
+    combo.setCurrentIndex(combo.findData("DENY"))
+    win._collect()
+    assert win.cfg["command_policy"].get(target) == "DENY", (
+        f"a policy row did not reach the payload: {win.cfg['command_policy']}")
+    assert win.cfg["command_policy"].get(orphan) == "DENY", (
+        "a row's write erased an entry the window has no row for")
+    combo.setCurrentIndex(combo.findData("ALLOW"))
+    win._collect()
+    assert target not in win.cfg["command_policy"], (
+        "an ALLOW row was stored — ALLOW is the default, the file stays clean")
+    assert win.cfg["command_policy"].get(orphan) == "DENY"
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -4412,6 +4538,8 @@ SCENARIO_NAMES = [
     "a_model_click_applies_without_pressing_save",
     "the_brain_tab_says_what_the_bubble_is_running",
     "every_declared_permission_survives_a_save",
+    "the_window_writes_the_schema_vocabulary_not_a_copy_of_it",
+    "a_schema_key_with_no_control_survives_a_save",
 ]
 
 

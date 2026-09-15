@@ -166,6 +166,42 @@ def _state_image_keys() -> tuple:
 STATE_IMAGE_KEYS = _state_image_keys()
 
 
+def _state_colour_keys() -> tuple:
+    """The state names the colour row swatches, in the schema's own order.
+
+    Derived from the KEYS of `DEFAULT_SETTINGS["colors"]` — which is exactly
+    the set `core.settings._coerce_colors` keeps (it drops a key that dict does
+    not have and fills a missing one from it), so the row and the loader cannot
+    disagree about what a state colour is.
+
+    This used to be a hand-written four-name tuple on the window class, which
+    is the same shape of defect that dropped `get_datetime` from `permissions`:
+    `_collect` writes the whole `colors` sub-dict from this key set, the
+    three-way merge reads a key that is missing from the candidate as a DELETE,
+    and the loader puts the default back — so a fifth state declared in the
+    schema would be silently re-defaulted on every single save. Reading the
+    loader's own key set makes a new state appear in the row by itself.
+    """
+    colors = DEFAULT_SETTINGS.get("colors")
+    if isinstance(colors, dict) and colors:
+        return tuple(str(k) for k in colors)
+    return tuple(getattr(SCHEMA, "BUBBLE_STATES", ()) or ())
+
+
+def _deco_colour_words() -> tuple:
+    """The word values `avatar_deco_color` accepts besides a literal hex.
+
+    The schema owns this vocabulary (`AVATAR_DECO_COLORS`). The picker row and
+    the load path each spelled the pair out by hand, so a third word the schema
+    declared would be offered by the combo and still not be selectable here:
+    the row would show "custom" for a value that is not a colour of its own,
+    and the swatch would open on it as though it were one.
+    """
+    words = tuple(str(m).strip().lower()
+                  for m in getattr(SCHEMA, "AVATAR_DECO_COLORS", ()))
+    return words or ("state", "rainbow")
+
+
 def _core_module(name: str):
     """An extracted module through the shared loader, loaded on first use.
 
@@ -663,17 +699,24 @@ class LookTile(QPushButton):
             p.drawRoundedRect(rect, 6, 6)
 
             t = self._clock.elapsed() / 1000.0
+            # The state list is the schema's, so a fifth state is painted here
+            # instead of being missed by a hand-written three-name tuple: the
+            # first wears the glyph, the rest are the dots below it.
+            _states = _state_colour_keys()
+            _lead = _states[0] if _states else "idle"
             paint_design_glyph(p, self._design, self.width() / 2.0,
                                self.GLYPH_Y, self.GLYPH_R,
-                               self._colors["idle"], t, 1.0)
+                               self._colors[_lead], t, 1.0)
 
             # the rest of the palette, so the tile shows the whole look: one
             # dot per other state, under the glyph
-            x = self.width() / 2.0 - 12.0
+            _dots = [k for k in _states[1:]]
+            x = self.width() / 2.0 - 6.0 * (len(_dots) - 1)
             p.setPen(Qt.NoPen)
-            for key in ("listening", "thinking", "speaking"):
-                p.setBrush(QBrush(self._colors[key]))
-                p.drawEllipse(QPointF(x, self.DOTS_Y), 3.0, 3.0)
+            for key in _dots:
+                if key in self._colors:
+                    p.setBrush(QBrush(self._colors[key]))
+                    p.drawEllipse(QPointF(x, self.DOTS_Y), 3.0, 3.0)
                 x += 12.0
 
             text = (self.palette().color(role.HighlightedText) if checked
@@ -2866,7 +2909,9 @@ class SettingsWindow(QMainWindow):
     # discarded by the parser — the bubble kept the old colour while the GUI
     # said otherwise. Admission now uses the parser's own predicate, and a
     # refusal is said out loud instead of being left to be discovered later.
-    COLOR_KEYS = ("idle", "listening", "thinking", "speaking")
+    #
+    # The KEY SET is `_state_colour_keys()`, i.e. the loader's own — never a
+    # tuple written here (see that function for the failure it caused).
     _HEX6 = re.compile(r"#?[0-9a-fA-F]{6}")
 
     @classmethod
@@ -2889,7 +2934,7 @@ class SettingsWindow(QMainWindow):
         defaults = DEFAULT_SETTINGS["colors"]
         clean: dict[str, str] = {}
         rejected: list = []
-        for key in self.COLOR_KEYS:
+        for key in _state_colour_keys():
             value = raw.get(key, defaults[key])
             if self._color_ok(value):
                 text = str(value).strip()
@@ -3250,11 +3295,17 @@ class SettingsWindow(QMainWindow):
         # while the bubble changes state, which is what makes a decoration
         # independent rather than a copy of the mood. `rainbow` is the animated
         # one, so the ring moves in colour as well as in shape.
+        # The words come from the schema (`_deco_colour_words`); only the LABELS
+        # live here, with a readable fallback — so a colour the schema adds is
+        # offered the day it is declared rather than only once this file is
+        # edited too. `custom` is last and is never stored (see `_collect`).
+        _colour_labels = {"state": "State colour", "rainbow": "Rainbow"}
         self.deco_colour_combo = QComboBox(card)
-        for _value, _label in (("state", "State colour"),
-                               ("rainbow", "Rainbow"),
-                               ("custom", "Colour of its own")):
-            self.deco_colour_combo.addItem(_label, _value)
+        for _value in _deco_colour_words():
+            self.deco_colour_combo.addItem(
+                _colour_labels.get(_value, _value.replace("-", " ").capitalize()),
+                _value)
+        self.deco_colour_combo.addItem("Colour of its own", "custom")
         self.deco_colour_combo.setToolTip(
             "What the decoration is painted in. State colour tracks the "
             "bubble's mood (the rim carries the state anyway); Rainbow sweeps "
@@ -4581,7 +4632,12 @@ class SettingsWindow(QMainWindow):
         # without touching it is not an edit.
         self._deco_colour = self._stored_deco_colour()
         _stored = str(self.cfg.get("avatar_deco_color") or "state").strip().lower()
-        _want = (_stored if _stored in ("state", "rainbow")
+        # A word the schema declares selects its own row; anything else is a
+        # colour of its own. Spelling the two words out here meant a third one
+        # the schema offered showed up as "custom" — the row describing
+        # something other than what is on disk, which is the defect this whole
+        # card family is about.
+        _want = (_stored if _stored in _deco_colour_words()
                  else self.DECO_COLOUR_CUSTOM)
         _dci = self.deco_colour_combo.findData(_want)
         self.deco_colour_combo.setCurrentIndex(_dci if _dci >= 0 else 0)
@@ -4696,7 +4752,9 @@ class SettingsWindow(QMainWindow):
         would refuse.
         """
         raw = str(self.cfg.get("avatar_deco_color") or "").strip()
-        if raw.lower() not in ("state", "rainbow", "") and self._color_ok(raw):
+        # Every word the schema accepts, plus the empty value, is NOT a colour
+        # of its own — the swatch would otherwise open on the word itself.
+        if raw.lower() not in _deco_colour_words() + ("",) and self._color_ok(raw):
             return raw
         states = tuple(getattr(SCHEMA, "BUBBLE_STATES", ())) or ("idle",)
         return str(DEFAULT_SETTINGS["colors"].get(states[0]) or "#4f8cff")
@@ -4824,7 +4882,14 @@ class SettingsWindow(QMainWindow):
         self.cfg["avatar_tint"] = str(self.tint_combo.currentData() or "state")
         self.cfg["animation_energy"] = self.energy_slider.value() / 100.0
         self.cfg["bubble_accent"] = self.accent_slider.value() / 100.0
-        self.cfg["colors"] = dict(self._colors)
+        # Filled FROM the loaded dict before the swatches are applied, for the
+        # same reason `permissions` is: a colour this row has no swatch for must
+        # keep the value it had. A key missing from the candidate is a DELETE to
+        # the merge, and `_coerce_colors` then fills it from the defaults — the
+        # silent re-default this file has already been bitten by once.
+        colors = {str(k): str(v) for k, v in (self.cfg.get("colors") or {}).items()}
+        colors.update(self._colors)
+        self.cfg["colors"] = colors
         # Filled FROM the loaded dict, so a key this tab has no widget for keeps
         # the value it had instead of disappearing — a dropped key is a
         # permission silently re-defaulted (see `_permissions_tab`).
@@ -4833,10 +4898,20 @@ class SettingsWindow(QMainWindow):
         self.cfg["permissions"] = permissions
         policy_map: dict[str, str] = {}
         if self.policy_rows:
-            # minimal map: ALLOW is the default, keep settings.json clean
+            # Start FROM the loaded map, then let the rows speak: an entry this
+            # window has no row for (a tool the registry no longer declares, or
+            # a name written by hand) must survive the save, because a key
+            # missing from the candidate is a DELETE to the three-way merge.
+            # The rows still keep settings.json minimal — ALLOW is the default,
+            # so a row set to ALLOW is stored as no entry at all.
+            policy_map = {str(k): str(v).strip().upper()
+                          for k, v in (self.cfg.get("command_policy") or {}).items()}
             for name, combo in self.policy_rows.items():
-                if combo.currentData() != "ALLOW":
-                    policy_map[name] = combo.currentData()
+                rule = str(combo.currentData() or "ALLOW")
+                if rule == "ALLOW":
+                    policy_map.pop(name, None)
+                else:
+                    policy_map[name] = rule
         elif getattr(self, "policy_edit", None) is not None:
             for line in self.policy_edit.toPlainText().splitlines():
                 if "=" not in line or line.strip().startswith("#"):

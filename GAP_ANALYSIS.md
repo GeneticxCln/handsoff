@@ -4314,3 +4314,68 @@ no widget surviving `_collect`. **1410 tests green in all three orderings**,
 coverage ≥ 70, compile/shell/smoke clean. Deployed and measured on the INSTALLED
 bytes with the user's settings: `phantom edits on load: none`, and a save moves
 `['model']` alone; `deployment: in-sync`.
+
+## The hand-written key sets, and the gate a reshuffle exposed (2026-09-15)
+
+**The shape, not the name.** `get_datetime` was not a typo; it was this:
+`_collect` writes a whole SUB-DICT built from a key list in the window, the list
+is missing a key the schema declares, `_three_way_merge` reads a missing
+candidate key as a DELETE because the disk still equals what was loaded, and the
+loader fills the hole from the defaults. So the pass AST-scanned
+`handsoff-settings.py` for literal all-string collections (65 of them) and
+cross-referenced each against every schema vocabulary. Seven duplicate one;
+what matters is which of those DRIVE A WRITE.
+
+**1. State colours — the one that could still bite.** `COLOR_KEYS` was a
+four-name tuple on the window class while `_coerce_colors` keys `colors` by
+`DEFAULT_SETTINGS["colors"]`, and `_collect` wrote the whole dict from it. A
+fifth state declared in the schema would be missing from the candidate, read as
+a delete, and silently re-defaulted on every save. `_state_colour_keys()` now
+reads the LOADER's own key set, and the `colors` write is filled from the loaded
+dict before the swatches are applied — the same rule `permissions` follows, and
+for the same reason: a key this row has no swatch for must keep its value.
+
+**2. Decoration colour.** The picker row and the load path each spelled out
+`("state", "rainbow")`. A third word the schema declared would be offered by the
+combo and still read as "Colour of its own" when selected, with the swatch
+opening on a word as though it were a colour. One `_deco_colour_words()` now
+feeds the combo items (labels stay local, with a fallback), `_load_values` and
+`_stored_deco_colour`.
+
+**3. `command_policy`** was rebuilt from the registry's rows alone, so an entry
+for a tool this registry does not declare was dropped by any save. It now starts
+from the loaded map and only pops the rows it sets back to ALLOW — the default,
+so the file still stays clean.
+
+**4. The look tiles** drew dots for a hand-written three-state tuple; they now
+walk the schema's states (the first wears the glyph), so a fifth state is painted
+rather than missed.
+
+**The guard a `==` cannot be.** Comparing today's two key sets passes on the
+broken code, because the breakage only shows when the SCHEMA moves. Both new
+scenarios therefore ADD a vocabulary entry the way the schema gains one — a
+fifth state, a third decoration colour, a permission added after the tab was
+built — and require the save AND the loader to keep it, with the two halves of
+the rule pinned separately (a colour with no swatch; a policy with no row).
+**6/6 mutations caught, zero residue**, every restore sha256-verified, and each
+mutation fails at its own named assertion rather than a crash.
+
+**The order gate was red, and it was not this change.** The gate failed in
+`TestMicHealth::test_health_loop_reports_hourly_and_survives_errors` (`len(calls)
+== 2`, got 3) with an unhandled exception in a `mic-health` thread. That test
+patches `time.sleep` — one module object shared by every thread — and
+`_health_tick`, a CLASS attribute, while `ContinuousListener.__init__` spawns one
+`mic-health` reporter per listener and `_health_loop` is `while True: sleep;
+tick` with no stop path. A plugin sweep of one shuffled run measured **4 922 test
+boundaries that began with a live `mic-health` thread**, and adding ONE
+concurrent reporter to the PRISTINE commit reproduces the identical failure at
+the identical line — so the fragility is the test's, not the diff's; my added
+scenarios only reshuffled the order, which is what a shuffle gate is for. The
+fakes are now thread-aware (this thread's calls and sleeps are the subject;
+other threads run the real tick and sleep for real), the same remedy the sibling
+`test_wait_bounds_and_reports` leak needed one pass earlier, and re-running the
+rogue reproduction now leaves the test green. **Still open, and worth its own
+pass:** the suite leaves those reporters running — hundreds of live daemon
+threads, none of them stoppable — because `_health_loop` has no stop path and
+every constructed listener starts one. The tests are now immune to them; the
+suite would still be healthier without them.
