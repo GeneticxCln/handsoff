@@ -4199,3 +4199,71 @@ installed bytes (18/18 shipped files byte-identical, the deployed table covering
 **That closes the P0 list.** `GAP_ANALYSIS.md` rows for P0-2 (structured tool
 results), P0-3 (startup in degraded modes, already closed and verified) and P0-4
 (the socket capability token) are above.
+
+---
+
+## 2026-09-15 — the settings window was taller than the screen
+
+Reported: "swapping Ollama models never applies, the new model is never saved",
+and "on appearance we need scroll so you can see everything".
+
+**One cause, and it was not the picker.** Every tab page was its own widget, and
+`QTabWidget`/`QStackedWidget` takes the tallest page's minimum — Permissions at
+2294 px. So the WINDOW's minimum was **1679 x 2399**, and this host's screen is
+**1728 logical px** tall (the 3840x2160 panel at scale 1.25). A compositor gives
+the window what the screen has while the client keeps its own minimum, so
+everything below the screen edge was drawn past the bottom: the health line and
+the entire **Save / Save & restart / Quit** bar. The model pick was fine; there
+was no reachable button to save it with.
+
+**How it was found — by measuring the window, not by reading the picker.** The
+window's own `minimumSizeHint` (1679 x 2399), the buttons' mapped position at a
+screen-sized geometry, and per-tab `viewport` vs `content` heights. An earlier
+probe looked like a PASS because `setFixedSize` overrides a minimum — the
+interesting number is what the window ASKS for.
+
+**The fix is one wrapper for every tab.** `_scrolling_page(body)` puts each body
+in a `widgetResizable` `QScrollArea`, so no page can dictate the window's size:
+the minimum is now **331 x 173**. The Appearance tab already had its own scroll
+area and now uses the same wrapper, so there is one scrolling implementation
+rather than two that can drift.
+
+**A real second defect in the picker, found while proving the first.**
+`refresh_models` restored the selection from `cfg["model"]`, so a refresh landing
+after a pick put the STORED model back under the cursor and the next Save wrote
+the model that was already there. The row under the cursor is the user's intent,
+so it is now read BEFORE the list is emptied (`clear()` throws the current row
+away) and restored afterwards. That ordering also sidesteps a measured Qt
+behaviour: `QListWidget.clear()` emits `currentItemChanged` naming some OTHER
+item — clearing a list whose current row was 2 emitted the item at row 1 — so a
+rebuild must never be read as a choice. With that fixed, a `_model_pick` field
+became unnecessary and was removed: one source of truth (the row) beats a second
+one that has to be kept in sync, which the first draft of this pass demonstrated
+by breaking two existing scenarios.
+
+**Two smaller honesty fixes.** The status label wraps: a `QLabel`'s minimum is
+the width of its text, and one save message (`Saved to /home/… Memory cleared
+for the new model…`) made the window ask for ~1680 px of WIDTH, which a tiled
+column then clips. And a save that raises is reported in the status label by
+every Qt entry point (`_save_reported`) instead of escaping the slot to a stderr
+nobody sees when the window is launched from the bubble's menu.
+
+**Guards (3 new scenarios, 5/5 mutations caught, zero residue).**
+`settings_window_fits_a_screen_and_every_tab_scrolls` — the minimum must fit an
+ordinary 1280x720 screen WITH a long status line on it, the save bar must be
+inside the window on every tab, and the tallest page must scroll (a page taller
+than its viewport with no scrollbar fails as "clipped").
+`a_refresh_keeps_the_model_the_user_picked` — a pick survives a refresh and
+reaches `settings.json`; a model the server no longer has is not replaced by row
+0 (that fallback silently moved the model on a plain refresh).
+`a_failed_save_says_so_instead_of_escaping` — a raising `save()` is named in the
+status label and never restarts the bubble. Mutations: tabs unwrapped, the
+refresh restoring from `cfg`, the label not wrapping, the row-0 fallback back,
+the save exception escaping — each caught, every restore sha256-verified.
+
+**State.** 1407 tests green in all three orderings at the gate seed, coverage
+84.24% ≥ 70, compile/shell/smoke clean. Deployed and verified against the
+INSTALLED bytes with the user's real settings against the real Ollama (15
+models): minimum 331x173, all three bar buttons reachable, health line on
+screen, Permissions and Appearance scrolling, and picking `gemma4:26b` landing
+exactly that in `settings.json`; `deployment: in-sync`.

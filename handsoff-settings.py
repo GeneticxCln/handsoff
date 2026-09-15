@@ -1425,7 +1425,15 @@ class SettingsWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("handsoff settings")
-        self.resize(780, 600)
+        # A window the SCREEN can hold. Every tab scrolls (see
+        # `_scrolling_page`), so this is a preference and not the layout's
+        # minimum any more — which is the point: the layout used to ASK for
+        # 1679x2399 (the tallest tab page, stacked), a size no 1728-px-tall
+        # display can give, so the compositor cut the window off at the screen
+        # edge and everything below it — the health line and the whole
+        # Save/Quit bar — was drawn past the bottom.
+        self.setMinimumSize(560, 420)
+        self.resize(*self._preferred_window_size())
         import copy
         self.cfg = copy.deepcopy(H.SETTINGS)
         # The `image` design's art, held as form values like every other
@@ -1481,15 +1489,19 @@ class SettingsWindow(QMainWindow):
         self._live_timer.setInterval(400)
         self._live_timer.timeout.connect(self._apply_appearance_live)
 
+        # Every page goes through `_scrolling_page`: ONE scrolling
+        # implementation for all six tabs, so no page can decide how tall the
+        # window has to be.
         tabs = QTabWidget(self)
         self.tabs = tabs
-        tabs.addTab(self._brain_tab(), "Brain")
-        self._voice_page = self._voice_tab()     # the meter polls with its tab
+        tabs.addTab(self._scrolling_page(self._brain_tab()), "Brain")
+        # the meter polls with its tab
+        self._voice_page = self._scrolling_page(self._voice_tab())
         tabs.addTab(self._voice_page, "Voice")
-        tabs.addTab(self._permissions_tab(), "Permissions")
-        tabs.addTab(self._appearance_tab(), "Appearance")
-        tabs.addTab(self._startup_tab(), "Startup")
-        self._history_page = self._history_tab()
+        tabs.addTab(self._scrolling_page(self._permissions_tab()), "Permissions")
+        tabs.addTab(self._scrolling_page(self._appearance_tab()), "Appearance")
+        tabs.addTab(self._scrolling_page(self._startup_tab()), "Startup")
+        self._history_page = self._scrolling_page(self._history_tab())
         tabs.addTab(self._history_page, "History")
         tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(tabs)
@@ -1497,7 +1509,14 @@ class SettingsWindow(QMainWindow):
         bottom = QWidget(self)
         bl = QHBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
+        # A long status line must not become the WINDOW's minimum width. A
+        # QLabel's minimum is the width of its text, so one save message
+        # ("Saved to /home/… Memory cleared for the new model…") made this
+        # window ask for ~1680 px — and a compositor that gives it less cuts the
+        # message and the buttons off the side. Wrapping keeps the sentence
+        # whole without dictating the geometry.
         self.status_label = QLabel("", self)
+        self.status_label.setWordWrap(True)
         save = QPushButton("Save", self)
         save.clicked.connect(self._on_save)
         apply_btn = QPushButton("Save & restart bubble", self)
@@ -1665,6 +1684,51 @@ class SettingsWindow(QMainWindow):
     def _status(self, text: str) -> None:
         self.status_label.setText(text)
 
+    def _preferred_window_size(self) -> tuple[int, int]:
+        """An opening size the screen can actually give this window.
+
+        Read from the screen rather than hard-coded: a request taller than the
+        output is what put the Save bar off the bottom edge in the first place,
+        and 780x600 was chosen when the window could not be laid out below
+        2399 px anyway.
+        """
+        want_w, want_h = 900, 760
+        try:
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                want_w = max(560, min(want_w, avail.width() - 60))
+                want_h = max(420, min(want_h, avail.height() - 60))
+        except Exception:            # no screen (offscreen platform): the defaults
+            log.debug("could not read the screen geometry", exc_info=True)
+        return want_w, want_h
+
+    def _scrolling_page(self, body: QWidget) -> QWidget:
+        """Wrap a tab's body in a scroll area, so the window never asks the
+        compositor for a display taller than the content.
+
+        A tab page used to BE its body, and the tab widget's minimum height is
+        the tallest page it holds (a stacked layout takes the max). With
+        Permissions at ~2300 px that made the WINDOW's minimum 1679x2399 — a
+        screen taller than this machine has. A compositor hands the window what
+        the screen has while the client keeps its own minimum, so the bottom of
+        the window falls off the edge: the health line and the Save / Save &
+        restart / Quit bar, which is why picking a different Ollama model never
+        reached settings.json, and why the lower half of a tab with no scroll
+        area of its own could not be reached at all. Wrapping every body is the
+        whole fix: each page's minimum collapses to the scroll area's, the
+        window fits the screen, and the rest is scrolling like everything else.
+        """
+        page = QWidget(self)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(page)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        return page
+
     # ------------------------------------------------------------------- brain
 
     def _brain_tab(self) -> QWidget:
@@ -1733,6 +1797,11 @@ class SettingsWindow(QMainWindow):
         base = (self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
         if not base.startswith(("http://", "https://")):
             base = "http://" + base
+        # Read the selection BEFORE the list is emptied. `clear()` throws the
+        # current row away, and the row IS the user's intent — the model they
+        # mean, saved or not — so it has to be carried across the rebuild rather
+        # than looked up afterwards, when it is already gone.
+        keep = self._selected_model()
         self.model_list.clear()
         loading = QListWidgetItem("loading …")
         loading.setFlags(Qt.NoItemFlags)
@@ -1752,24 +1821,49 @@ class SettingsWindow(QMainWindow):
             return out
 
         def done(ok, result):
-            self.model_list.clear()
-            if not ok:
-                bad = QListWidgetItem(f"cannot reach {base} — {result}")
-                bad.setFlags(Qt.NoItemFlags)
-                self.model_list.addItem(bad)
-                return
-            for name, caps in result:
-                badges = "   ·  " + "  ".join(caps) if caps else ""
-                it = QListWidgetItem(name + badges)
-                it.setData(Qt.UserRole, name)
-                it.setToolTip(f"capabilities: {', '.join(caps) or 'none'}")
-                self.model_list.addItem(it)
-                if name == self.cfg["model"]:
-                    self.model_list.setCurrentItem(it)
-            if self.model_list.currentRow() < 0 and self.model_list.count():
-                self.model_list.setCurrentRow(0)
+            self._fill_model_list(base, ok, result, keep)
 
         self.run_bg(fetch, done)
+
+    def _fill_model_list(self, base: str, ok: bool, result, keep: str = "") -> None:
+        """Draw a finished refresh, WITHOUT changing which model is in use.
+
+        `keep` is the row that was under the cursor when the refresh started
+        (the caller reads it before emptying the list) and it is put back when
+        the server still has that model. The old code restored from
+        `cfg["model"]` instead, so a refresh landing after a pick silently put
+        the STORED model back under the cursor and the next Save wrote the model
+        that was already there: "swapping Ollama models never applies, the new
+        model is never saved".
+
+        Restoring this way also sidesteps `QListWidget.clear()`, which emits
+        `currentItemChanged` naming some OTHER item (measured: clearing a list
+        whose current row was 2 emitted the item at row 1) — a rebuild is not a
+        choice, and nothing listens for one.
+
+        The stored model is the fallback for a list that had no selection of its
+        own (the first refresh of a window), and nothing is auto-selected when
+        neither is in the list: picking row 0 there made the next save quietly
+        move off a model the user never touched.
+        """
+        self.model_list.clear()
+        if not ok:
+            bad = QListWidgetItem(f"cannot reach {base} — {result}")
+            bad.setFlags(Qt.NoItemFlags)
+            self.model_list.addItem(bad)
+            return
+        target = str(keep or "") or str(self.cfg.get("model") or "")
+        for name, caps in result:
+            badges = "   ·  " + "  ".join(caps) if caps else ""
+            it = QListWidgetItem(name + badges)
+            it.setData(Qt.UserRole, name)
+            it.setToolTip(f"capabilities: {', '.join(caps) or 'none'}")
+            self.model_list.addItem(it)
+            if name == target:
+                self.model_list.setCurrentItem(it)
+        if (self.model_list.currentRow() < 0 and self.model_list.count()
+                and not target):
+            self.model_list.setCurrentRow(0)
 
     def test_model(self) -> None:
         base = (self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
@@ -2775,19 +2869,15 @@ class SettingsWindow(QMainWindow):
         return lab
 
     def _appearance_tab(self) -> QWidget:
-        page = QWidget(self)
-        outer = QVBoxLayout(page)
-        outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea(page)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        content = QWidget(scroll)
+        # The BODY only. `_scrolling_page` wraps it like every other tab, so
+        # there is one scrolling implementation in this window instead of two
+        # that can drift apart (this tab used to own its own, which is how the
+        # others came to have none).
+        content = QWidget(self)
         content.setStyleSheet(self._panel_stylesheet())
         lay = QVBoxLayout(content)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(14)
-        scroll.setWidget(content)
-        outer.addWidget(scroll)
         self.color_buttons: dict[str, QPushButton] = {}
         self.color_swatches: dict[str, QLabel] = {}
         # Adopt before the status bar exists; `_load_values` reports the
@@ -3190,7 +3280,7 @@ class SettingsWindow(QMainWindow):
 
         lay.addStretch(1)
         self._paint_color_buttons()
-        return page
+        return content
 
     # ------------------------------------------------------------------ looks
 
@@ -4162,7 +4252,7 @@ class SettingsWindow(QMainWindow):
                    if on_disk.get(k) != wanted.get(k)]
         if not changed:
             return                   # nothing changed: this was a load, not an edit
-        if self.save():
+        if self._save_reported():
             # name what moved instead of always reporting the shape: the old
             # message made a colour or size change look like it had not been
             # taken (and hid the fact that it never was). A change that lands
@@ -4767,11 +4857,27 @@ class SettingsWindow(QMainWindow):
                 pass
 
     def _on_save(self) -> None:
-        self.save()
+        self._save_reported()
 
     def _on_apply(self) -> None:
-        if self.save():
+        if self._save_reported():
             self._on_restart_bubble()
+
+    def _save_reported(self) -> bool:
+        """`save()` with its failure MADE VISIBLE.
+
+        The status label is the only place this window speaks, and an exception
+        escaping a Qt slot is printed to a stderr nobody sees when the window is
+        launched from the bubble's menu — which is exactly the report "I pressed
+        Save and nothing happened". Every Qt entry point (Save, Save & restart,
+        and the Appearance live apply) goes through here.
+        """
+        try:
+            return self.save()
+        except Exception as e:      # noqa: BLE001 - a save must not die silently
+            log.exception("settings save failed")
+            self._status(f"could not save settings: {e}")
+            return False
 
 
 def main() -> int:

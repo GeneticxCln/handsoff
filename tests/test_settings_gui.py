@@ -3989,6 +3989,170 @@ def http_json_parses_a_plain_reply():
     finally:
         srv.shutdown()
 
+@scenario
+def settings_window_fits_a_screen_and_every_tab_scrolls():
+    # The Save button was OFF THE SCREEN. Every tab page used to BE its body,
+    # and a stacked layout takes the TALLEST page's minimum — with Permissions
+    # at ~2300 px the WINDOW asked for 1679x2399, a screen taller than this host
+    # has (1728 logical px). A compositor hands the window what the screen has
+    # while the client keeps its own minimum, so the bottom of the window was
+    # drawn past the edge: the health line and the whole Save / Save & restart /
+    # Quit bar. That is why picking a different Ollama model never reached
+    # settings.json ("the new model is never saved"), and why a tab with no
+    # scroll area of its own could not be read to its end.
+    #
+    # Two properties, and both are load-bearing: the window's own minimum is
+    # SMALL enough for a real screen (so nothing can be pushed off it), and any
+    # page too tall for its viewport SCROLLS instead of being clipped.
+    from PySide6.QtWidgets import QPushButton, QScrollArea
+
+    win.show()
+    app.processEvents()
+
+    # A long status line is the other half of the width story: a QLabel's
+    # minimum is the width of its text, and one save message ("Saved to
+    # /home/… Memory cleared for the new model…") asked for ~1680 px. Measure
+    # with one on screen, because that is the state it was reported in.
+    win._status("Saved to " + str(settings_file) + ". Applied look Handsoff: "
+                "size, shape, fallback image, idle picture. No restart "
+                "needed. Bubble unreachable — restart to apply.")
+    app.processEvents()
+
+    # A deliberately ordinary screen: what the minimum must fit inside.
+    SCREEN_W, SCREEN_H = 1280, 720
+    need_w, need_h = win.minimumSizeHint().width(), win.minimumSizeHint().height()
+    assert need_w <= SCREEN_W, (
+        f"the window needs {need_w}px of a {SCREEN_W}px-wide screen")
+    assert need_h <= SCREEN_H, (
+        f"the window needs {need_h}px of a {SCREEN_H}px-tall screen — the "
+        f"Save bar is drawn below the screen edge on anything smaller")
+
+    win.resize(SCREEN_W, SCREEN_H)
+    app.processEvents()
+    names = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+    assert names, "no tabs"
+    for i, name in enumerate(names):
+        win.tabs.setCurrentIndex(i)
+        app.processEvents()
+        # 1. the bar that saves is INSIDE the window on every tab
+        for label in ("Save", "Save & restart bubble", "Quit bubble"):
+            btn = next(b for b in win.findChildren(QPushButton)
+                       if b.text() == label)
+            top = btn.mapTo(win, btn.rect().topLeft())
+            assert 0 <= top.y() and top.y() + btn.height() <= win.height(), (
+                f"{name}: {label!r} sits at y={top.y()} in a {win.height()}px "
+                f"window — a button nobody can press")
+        # 2. the page reaches its end by scrolling, never by clipping
+        page = win.tabs.widget(i)
+        scroll = page.findChild(QScrollArea)
+        assert scroll is not None, f"{name} has no scroll area"
+        assert scroll.widgetResizable(), f"{name} must resize with the window"
+        content = scroll.widget()
+        view = scroll.viewport()
+        assert content.minimumSizeHint().width() <= view.width() or \
+            scroll.horizontalScrollBar().isVisible(), (
+            f"{name} demands {content.minimumSizeHint().width()}px inside a "
+            f"{view.width()}px viewport")
+
+    # The tallest page is the one that used to dictate the window's height: it
+    # must now be a scrolling page, not a size nobody's screen can give.
+    tall = names.index("Permissions")
+    win.tabs.setCurrentIndex(tall)
+    app.processEvents()
+    scroll = win.tabs.widget(tall).findChild(QScrollArea)
+    assert scroll.widget().height() > scroll.viewport().height(), (
+        "this page should need scrolling; if it fits, this test proves nothing")
+    assert scroll.verticalScrollBar().isVisible(), (
+        "the page is taller than its viewport with no scrollbar — clipped")
+
+
+@scenario
+def a_refresh_keeps_the_model_the_user_picked():
+    # A refresh landing after a pick restored the selection from `cfg["model"]`,
+    # so the STORED model went back under the cursor and the next Save wrote the
+    # model that was already there — "swapping Ollama models never applies, the
+    # new model is never saved". The row under the cursor is the user's intent,
+    # saved or not.
+    def fake_http(url, payload=None, timeout=10):
+        if url.endswith("/api/tags"):
+            return {"models": [{"name": "stored:latest"},
+                                {"name": "picked:8b"}]}
+        if url.endswith("/api/show"):
+            return {"capabilities": ["tools"]}
+        raise urllib.error.URLError("unexpected " + url)
+
+    def settle(want=2):
+        deadline = time.time() + 5.0
+        while time.time() < deadline and win.model_list.count() < want:
+            app.processEvents()
+            time.sleep(0.02)
+        app.processEvents()
+
+    settings_app.http_json = fake_http
+    seed({"model": "stored:latest"})
+    win.reload_from_disk()
+    win.refresh_models()
+    settle()
+    assert win._selected_model() == "stored:latest", win._selected_model()
+
+    # the user picks the other model...
+    win.model_list.setCurrentRow(1)
+    assert win._selected_model() == "picked:8b"
+    # ...and a refresh (the Refresh button, or one still in flight) must not
+    # undo that
+    win.refresh_models()
+    settle()
+    assert win._selected_model() == "picked:8b", (
+        "a refresh put the stored model back under the cursor: "
+        f"{win._selected_model()!r}")
+    assert win.save() is True
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["model"] == "picked:8b", on_disk["model"]
+
+    # A stored model the server no longer has must NOT become row 0: that would
+    # make the next Save quietly move off a model the user never touched.
+    def fewer(url, payload=None, timeout=10):
+        if url.endswith("/api/tags"):
+            return {"models": [{"name": "unrelated:1b"},
+                                {"name": "other:2b"}]}
+        return {"capabilities": []}
+
+    settings_app.http_json = fewer
+    win.refresh_models()
+    settle()
+    assert win._selected_model() == "", (
+        f"a model nobody has any more was replaced by {win._selected_model()!r}")
+    assert win.save() is True
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["model"] == "picked:8b", (
+        "saving after a refresh moved the model the user never changed: "
+        f"{on_disk['model']!r}")
+
+
+@scenario
+def a_failed_save_says_so_instead_of_escaping():
+    # The status label is the only place this window speaks, and an exception
+    # escaping a Qt slot is printed to a stderr nobody sees when the window is
+    # opened from the bubble's menu — which is the report "I pressed Save and
+    # nothing happened": no message on screen, nothing in any log, and the model
+    # never written. Every Qt entry point must SAY it failed.
+    def broken():
+        raise RuntimeError("disk went away")
+
+    win.save = broken
+    win._on_save()
+    assert "could not save settings" in win.status_label.text(), \
+        win.status_label.text()
+    assert "disk went away" in win.status_label.text(), win.status_label.text()
+
+    # ...and Save & restart must not restart the bubble on a save that failed
+    restarted = []
+    win._on_restart_bubble = lambda: restarted.append(True)
+    win._on_apply()
+    assert not restarted, "a failed save restarted the bubble anyway"
+    assert "could not save settings" in win.status_label.text()
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -4103,6 +4267,9 @@ SCENARIO_NAMES = [
     "autostart_set_unset_migrate_and_double_start_guard",
     "the_panel_installs_a_previewed_pack",
     "http_json_parses_a_plain_reply",
+    "settings_window_fits_a_screen_and_every_tab_scrolls",
+    "a_refresh_keeps_the_model_the_user_picked",
+    "a_failed_save_says_so_instead_of_escaping",
 ]
 
 
