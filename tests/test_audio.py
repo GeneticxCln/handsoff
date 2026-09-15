@@ -1466,6 +1466,11 @@ class TestHandsfreeConfirm:
         monkey = pytest.MonkeyPatch()
         monkey.setattr(H, "CONTROL_SOCK", sock_path)
         asst = H.Assistant()
+        # Commands the server does not answer itself are delivered on the Qt
+        # event loop. Record them so the teardown can tell a test that owned
+        # its delivery from one that left a command queued.
+        delivered: list[str] = []
+        asst.sigCommand.connect(delivered.append)
         srv = H.ControlServer(asst)
         srv.start()
         deadline, ready = time.time() + 5, False
@@ -1483,6 +1488,19 @@ class TestHandsfreeConfirm:
             yield H, None, None
         finally:
             srv.stop()                  # the accept loop is a named worker
+            # Anything that arrives in this drain was left queued by THIS test:
+            # it would otherwise run during whichever test next processes
+            # events, where a speaking verb starts a worker the leak guard then
+            # blames on that innocent neighbour.
+            before = len(delivered)
+            app = QCoreApplication.instance()
+            if app is not None:
+                app.processEvents()
+            assert delivered[before:] == [], (
+                "this test left control command(s) queued: "
+                + ", ".join(delivered[before:])
+                + " — a command runs on the Qt event loop, so process events "
+                  "and assert its delivery inside the test that sent it")
             monkey.undo()
             try:
                 sock_path.unlink(missing_ok=True)

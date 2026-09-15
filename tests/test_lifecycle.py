@@ -269,6 +269,19 @@ class TestControlSocket:
             # loop is a named worker with a stop path, so leaving it running
             # is a leak the suite's worker guard now fails on.
             srv.stop()
+            # A command this test caused but never drained would run during
+            # whichever test next calls processEvents() — and `handsfree-status`
+            # really speaks, so the worker it starts outlives a test that has
+            # already finished and the leak guard blames that innocent
+            # neighbour (measured). Draining here is what makes the GUILTY test
+            # the one that fails: anything that arrives now was left queued.
+            before = len(delivered)
+            app.processEvents()
+            assert delivered[before:] == [], (
+                "this test left control command(s) queued: "
+                + ", ".join(delivered[before:])
+                + " — a command runs on the Qt event loop, so process events "
+                  "and assert its delivery inside the test that sent it")
             monkey.undo()
             try:
                 sock_path.unlink(missing_ok=True)
@@ -608,12 +621,31 @@ class TestControlSocket:
             assert verb in text, (verb, text)
 
     def test_read_only_verbs_stay_open_and_state_changing_ones_do_not(
-            self, server):
+            self, server, monkeypatch):
         """The split itself: every verb in PTT_ACTIONS is on exactly one side,
         the read-only side answers without a token, and the other side refuses
-        without one and accepts with it."""
-        H, _delivered, _app = server
+        without one and accepts with it.
+
+        A command ACCEPTED here still runs on the Qt event loop afterwards, so
+        this test delivers what it caused instead of leaving it in the queue:
+        `handsfree-status` really speaks, and a command executed during whatever
+        test next calls processEvents() leaves a TTS worker for a test that has
+        already finished — measured, with the leak guard blaming that test.
+        The speech channel is stubbed for the same reason, and the drain is not
+        decoration: it also pins that each verb REACHED the bubble rather than
+        merely avoiding the refusal string.
+        """
+        H, delivered, app = server
         assert H.PTT_READ_ONLY <= H.PTT_ACTIONS
+        # `handsfree-status` is the one read-only verb the server does NOT
+        # answer itself (status/level/health/doctor are replied to directly), so
+        # it is the one that goes to the Qt thread — and it speaks. Stub the
+        # channel, then wait for the dispatch HERE: accepting a command only
+        # queues it, and one left queued runs during whichever test next calls
+        # processEvents() — measured, as a TTS worker blamed on an unrelated
+        # test.
+        monkeypatch.setattr(H.Assistant, "_announce_now",
+                            lambda self, text: None)
         for verb in sorted(H.PTT_READ_ONLY):
             if verb in ("doctor", "health"):
                 continue          # slow diagnostics, exercised elsewhere
@@ -624,6 +656,12 @@ class TestControlSocket:
         assert bare.startswith("error:") and "control token" in bare
         accepted = self._roundtrip(H.CONTROL_SOCK, "preview-clear")
         assert "control token" not in accepted, accepted
+        deadline = time.time() + 3
+        while "handsfree-status" not in delivered and time.time() < deadline:
+            app.processEvents()
+        assert "handsfree-status" in delivered, (
+            f"delivered {delivered} — the accepted command stayed queued, so it "
+            f"would run (and speak) inside a later test")
 
     def test_a_forged_token_file_does_not_authorize(self, server, tmp_path,
                                                     monkeypatch):

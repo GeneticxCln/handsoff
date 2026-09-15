@@ -4066,12 +4066,67 @@ green. Driven **live** against the running service: bare `status` answered, bare
 token, a wrong token refused, `--ptt` attaching the token only where it is needed,
 `deployment: in-sync`, 18/18 shipped files byte-identical.
 
-**Found while gating, not fixed.** Shuffling the test order with an arbitrary seed
-(`20260915`) leaks an `announce` worker thread past
-`test_action_delivery_via_event_loop`'s teardown. The gate seed (`git rev-parse
---short HEAD`) does not reproduce it, and nothing this pass touched creates or
-stops that thread — but a seed-dependent leak is a real order dependency, so it is
-recorded rather than filed away as a flake.
+**Found while gating, and admitted as this pass's own.** Shuffling the test order
+with an arbitrary seed (`20260915`) leaks an `announce` worker thread past
+`test_action_delivery_via_event_loop`'s teardown. This block first claimed that
+nothing here created that thread. That was wrong, and the correction is the next
+section.
 
 **Still open from the P0 list:** the settings-typed-contract refactor (one field
 table generating coerce/collect/load, so a new key stops needing four edits).
+
+## The queued-command order dependency (found, then fixed at the cause)
+
+**What the leak actually was.** A control command the server does not answer
+itself is delivered on the **Qt event loop**. Accepting it only *queues* it, so a
+test that sends one and never calls `processEvents()` hands it to whichever test
+next does — and `handsfree-status` really speaks. In the P0-4 pass, the new
+read-only verb loop sent exactly that verb bare and never drained, so the
+confirmation was delivered inside `test_action_delivery_via_event_loop`, where
+`_announce_now` → `_speak` started an `announce` worker that waits on the
+models-ready event. The worker outlived that test and conftest's leak guard
+blamed it — the innocent neighbour, while the guilty test looked green.
+
+The previous ledger rows for that pass said the leaking test "was not touched by
+this pass". It was touched: by the same row's own new loop. That correction is in
+the rows above rather than quietly rewritten.
+
+**How it was found.** Patching `threading.Thread.start` and `socket.socket.sendall`
+to record the currently-running test turned a mis-attributed flake into three
+facts: the birth test, the birth call site (`_on_command`'s `handsfree-status`
+branch), and the sender. The sender was the new test. No amount of re-reading the
+leak guard's message would have said that, because a guard that runs at teardown
+can only report where a thread was noticed.
+
+**The fix, in two halves.**
+
+* The test that sends a command owns its delivery: the read-only loop stubs the
+  speech channel and drains, asserting the command REACHED the dispatcher — a
+  stronger claim than the refusal-string check it replaced, since "not refused"
+  and "actually dispatched" are different properties.
+* The guard: both real-socket fixtures now drain at teardown and fail on anything
+  they had not already delivered. Draining there is the point — it means the test
+  that left a command queued is the one that fails, instead of whichever
+  neighbour next processes events.
+
+**Proven.** Three mutations, each required to behave correctly: dropping the
+drain fails the right test (both the new guard and the leak guard name it);
+letting the command really speak fails the right test; and with the teardown
+guard removed, leaving a command queued goes **unnoticed** — the anti-vacuity
+case, which is what says the guard is doing the catching rather than the leak
+guard catching it by luck. Every restore sha256-verified.
+
+**The same seed exposed a second, unrelated order dependency.** `time.sleep` is a
+single module object shared by every thread in the process, so
+`test_wait_bounds_and_reports`' process-wide patch made every live `mic-health`
+reporter — one per `ContinuousListener` the suite constructs, each sleeping 10 s
+in a loop — append to that test's capture list: **12 847** stray `10.0`s in the
+failing run. An isolated probe against the real module measured **18 447 083**
+background calls from two reporters in eleven seconds, against 25 with a
+thread-aware fake. The product is fine (one reporter per assistant, and `restart()`
+reuses the instance); the hazard is a test patching a process-global seam. The
+fake now records this thread's calls and lets every other thread sleep for real.
+
+**State.** Seed `20260915` — the one that was red — and the gate seed are both
+1390 passed in all three orderings; coverage 84.01% ≥ 70; compile/shell/smoke
+clean. Test-only, so the deployed bubble is untouched and still in-sync.

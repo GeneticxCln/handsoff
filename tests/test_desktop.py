@@ -1395,7 +1395,25 @@ class TestScrollAndWait:
     def test_wait_bounds_and_reports(self, H, monkeypatch):
         tb = H.ToolBelt(on_restart_pending=lambda: None)
         slept = []
-        monkeypatch.setattr(H.time, "sleep", lambda s: slept.append(s))
+        # `time.sleep` is ONE module object shared by every thread in the
+        # process, so patching it process-wide is a trap: the assistant's
+        # background loops are all sleeping on it (the capture retry, and one
+        # `mic-health` reporter per listener the suite has constructed), and a
+        # fake that returns instantly turns each of them into a busy loop
+        # appending to THIS list — measured: 12 847 extra `10.0`s on a test
+        # that only ever asked for 0.5 and 30, failing whichever test happened
+        # to be running when a listener was still winding down. Record this
+        # thread's calls and let the others sleep as they would have: a stray
+        # sleeper cannot decide this test's result.
+        real_sleep = time.sleep
+
+        def fake(s):
+            if threading.current_thread() is threading.main_thread():
+                slept.append(s)
+            else:
+                real_sleep(s)
+
+        monkeypatch.setattr(H.time, "sleep", fake)
         out, err = tb.execute("wait", {"seconds": 0.1})
         assert not err and "waited 0.5s" in out and slept == [0.5]
         tb.execute("wait", {"seconds": 500})
