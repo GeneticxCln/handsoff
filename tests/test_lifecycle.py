@@ -348,10 +348,16 @@ class TestControlSocket:
 
     @staticmethod
     def _roundtrip(sock_path: Path, action: str) -> str:
+        from core import app_module
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5)
         s.connect(str(sock_path))
-        s.sendall(action.encode())
+        # Sent the way a REAL client sends it, capability token and all: the
+        # helper stands in for `--ptt`, and a state-changing verb sent bare is
+        # refused now. Going around that would leave every one of these tests
+        # exercising a protocol no client uses.
+        argv = action.split(" ")
+        s.sendall(app_module()._control_payload(argv[0], argv))
         s.shutdown(socket.SHUT_WR)
         reply = b""
         while True:
@@ -548,6 +554,103 @@ class TestControlSocket:
         """The same-uid path (every real caller) must be untouched."""
         H, _delivered, _app = server
         assert self._roundtrip(H.CONTROL_SOCK, "status").startswith("state=")
+
+    @staticmethod
+    def _bare_roundtrip(sock_path: Path, action: str) -> str:
+        """A request with NO capability token: an old client, or a process
+        that can reach the socket but has not read the token file."""
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(str(sock_path))
+        s.sendall(action.encode())
+        s.shutdown(socket.SHUT_WR)
+        reply = b""
+        while True:
+            part = s.recv(1024)
+            if not part:
+                break
+            reply += part
+        s.close()
+        return reply.decode()
+
+    def test_a_state_changing_verb_without_the_token_is_refused(
+            self, server, monkeypatch):
+        """`say` in the user's voice, dropping the conversation and swapping
+        the previewed look all ride this socket, and a same-UID process passes
+        the uid check — so `_peer_uid` and the 0700 directory are not what
+        stands between a compromised child and those verbs. The token is.
+
+        The assertion is on what the assistant was ASKED to do, not only on
+        the reply: a refusal that dispatched anyway would be the whole bug.
+        """
+        H, _delivered, _app = server
+        said: list = []
+        monkeypatch.setattr(H.Assistant, "say_preview",
+                            lambda self, text: said.append(text) or "ok")
+        text = self._bare_roundtrip(H.CONTROL_SOCK, "say hello there")
+        assert text.startswith("error:") and "control token" in text, text
+        assert said == [], "a tokenless request still reached the assistant"
+        # ...and WITH the token the very same verb does reach it, so what was
+        # refused is the credential rather than the command being broken
+        assert self._roundtrip(H.CONTROL_SOCK,
+                               "say hello there").startswith("ok")
+        assert said == ["hello there"], said
+
+    def test_the_refusal_names_the_token_file(self, server, monkeypatch):
+        """A refusal an honest client cannot act on is a dead end: the reply
+        has to say WHICH file to read, and which verbs do not need it."""
+        H, _delivered, _app = server
+        text = self._bare_roundtrip(H.CONTROL_SOCK, "say hello")
+        assert text.startswith("error:"), text
+        assert "control token" in text
+        assert str(H.CONTROL_TOKEN) in text
+        for verb in sorted(H.PTT_READ_ONLY):
+            assert verb in text, (verb, text)
+
+    def test_read_only_verbs_stay_open_and_state_changing_ones_do_not(
+            self, server):
+        """The split itself: every verb in PTT_ACTIONS is on exactly one side,
+        the read-only side answers without a token, and the other side refuses
+        without one and accepts with it."""
+        H, _delivered, _app = server
+        assert H.PTT_READ_ONLY <= H.PTT_ACTIONS
+        for verb in sorted(H.PTT_READ_ONLY):
+            if verb in ("doctor", "health"):
+                continue          # slow diagnostics, exercised elsewhere
+            reply = self._bare_roundtrip(H.CONTROL_SOCK, verb)
+            assert "control token" not in reply, (verb, reply)
+        # ...and a state-changing verb is refused bare, accepted with it
+        bare = self._bare_roundtrip(H.CONTROL_SOCK, "preview-clear")
+        assert bare.startswith("error:") and "control token" in bare
+        accepted = self._roundtrip(H.CONTROL_SOCK, "preview-clear")
+        assert "control token" not in accepted, accepted
+
+    def test_a_forged_token_file_does_not_authorize(self, server, tmp_path,
+                                                    monkeypatch):
+        """The server compares against the token IT generated, not against
+        whatever the file says now — so overwriting the file is not a way in.
+        """
+        H, _delivered, _app = server
+        monkeypatch.setattr(H, "CONTROL_TOKEN", tmp_path / "forged.token")
+        H.CONTROL_TOKEN.write_text("0" * 64 + "\n")
+        text = self._roundtrip(H.CONTROL_SOCK, "preview-clear")
+        assert text.startswith("error:") and "control token" in text
+
+    def test_the_cli_payload_carries_the_token_only_where_it_is_needed(
+            self, H):
+        """The `--ptt` half. Read-only verbs are sent bare (one of them is
+        polled twenty times a second), everything else leads with the token.
+        """
+        H._prepare_runtime()
+        token = H._rotate_control_token()
+        assert token
+        for verb in sorted(H.PTT_READ_ONLY):
+            assert H._control_payload(verb, [verb]) == verb.encode(), verb
+        for verb in sorted(H.PTT_ACTIONS - H.PTT_READ_ONLY):
+            data = H._control_payload(verb, [verb])
+            assert data.startswith(
+                f"{H._CONTROL_TOKEN_PREFIX}{token}\n".encode()), verb
+            assert data.endswith(verb.encode()), verb
 
     def test_a_previewed_pack_is_drawn_by_the_running_bubble(self, server,
                                                              tmp_path):

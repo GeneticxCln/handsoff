@@ -4023,3 +4023,55 @@ call was wrapped in the previous pass, and both its paths are pinned by tests.
 verbs open, state-changing verbs gated), and the settings-typed-contract refactor
 (one field table generating coerce/collect/load). The deployed bubble is behind
 this checkout until a redeploy.
+
+## P0-4 — the control socket trusted every verb at the same level (fixed)
+
+**What was wrong.** `_peer_uid(conn)` plus a 0700 `STATE_DIR` stops *other users*,
+and nothing stops a process running as this user — a compromised child of ours, a
+sandboxed app under the same uid, a stray script. Every verb rode that one check,
+so `say` (the bubble speaking in the user's voice), `clear-history`,
+`preview-pack` (a chosen picture on the desktop) and `reload-settings` were exactly
+as reachable as `status`. The audit had recorded this as a documented limit; it is
+now a boundary.
+
+**Shape.** A capability token, written by the serving process into the state
+directory and read per-request by clients on the same machine:
+
+* **rotated on every start** — a token left behind by a previous run must be worth
+  nothing, or the file's whole history stays valid;
+* **compared against the token the server generated**, not against the file's
+  current contents, so overwriting the file is not a way in (constant-time via
+  `secrets.compare_digest`);
+* **read-only verbs stay open**: `status`, `health`, `level`, `doctor`,
+  `handsfree-status`. `level` is polled about twenty times a second, so the token
+  file is read only for a verb that needs it;
+* **a token that cannot be written does not stop the bubble** — it logs and
+  refuses only the verbs that change state, rather than failing to start.
+
+**One wording, in the server.** A client that cannot fill in the token still SENDS
+the request, so the refusal comes back naming the token file and the verbs that do
+not need it. That also decided a smaller question the right way: the first draft of
+the `--ptt` half sniffed the reply with `startswith("error:")` and restated the
+refusal on stderr — which the tool-result convention sweep caught. Deleted rather
+than exempted: the duplication was the defect, and the socket's wording is its own
+protocol, not a result's kind.
+
+**Proven.** 7/7 mutations caught with zero residue, every restore sha256-verified:
+the server stopping its token requirement, the read-only exemption dropped, the
+comparison moved to whatever the file says, no rotation, the token written without
+the private mode, and each of the two clients sending every verb bare. 1390 tests
+green in all three orderings at the gate seed; coverage 84.01% ≥ 70; all six gates
+green. Driven **live** against the running service: bare `status` answered, bare
+`preview-clear` refused naming the token path, the same verb accepted with the
+token, a wrong token refused, `--ptt` attaching the token only where it is needed,
+`deployment: in-sync`, 18/18 shipped files byte-identical.
+
+**Found while gating, not fixed.** Shuffling the test order with an arbitrary seed
+(`20260915`) leaks an `announce` worker thread past
+`test_action_delivery_via_event_loop`'s teardown. The gate seed (`git rev-parse
+--short HEAD`) does not reproduce it, and nothing this pass touched creates or
+stops that thread — but a seed-dependent leak is a real order dependency, so it is
+recorded rather than filed away as a flake.
+
+**Still open from the P0 list:** the settings-typed-contract refactor (one field
+table generating coerce/collect/load, so a new key stops needing four edits).

@@ -148,6 +148,35 @@ class TestSettingsApp:
         monkeypatch.setattr(mod.H, "CONTROL_SOCK", gone)
         assert mod._socket_command(gone, "say hi", timeout=0.5) is None
 
+    def test_every_state_changing_request_carries_the_capability_token(
+            self, monkeypatch, tmp_path):
+        """A save that only LOOKS applied is the silent-failure shape this
+        project keeps re-finding, and this is the request that decides it: the
+        bubble re-reads settings.json only when `reload-settings` arrives, so
+        that one has to carry the token like any other verb that changes state
+        — otherwise Save reports success and the running bubble keeps the old
+        values.
+
+        The Voice meter's `level` must NOT read the token file: it is polled
+        about twenty times a second.
+        """
+        mod = _load("handsoff_settings_token", HERE / "handsoff-settings.py")
+        token_file = tmp_path / "control.token"
+        token_file.write_text("b" * 64 + "\n")
+        monkeypatch.setattr(mod.H, "CONTROL_TOKEN", token_file)
+        prefix = "token=" + "b" * 64 + "\n"
+
+        for command in ("reload-settings", "clear-history",
+                        "say hello there"):
+            data = mod._control_request_bytes(command).decode()
+            assert data == prefix + command, data
+        for verb in sorted(mod.H.PTT_READ_ONLY):
+            assert mod._control_request_bytes(verb) == verb.encode(), verb
+        # ...and with no token to read it still SENDS, so the refusal comes
+        # back with the server's own wording instead of a client guess
+        monkeypatch.setattr(mod.H, "CONTROL_TOKEN", tmp_path / "absent.token")
+        assert mod._control_request_bytes("reload-settings") == b"reload-settings"
+
 
 # ---------------------------------------------------------------- keyboard takeover
 

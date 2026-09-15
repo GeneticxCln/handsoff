@@ -1132,6 +1132,28 @@ class _LiveMicProbe:
             }
 
 
+def _control_request_bytes(command: str) -> bytes:
+    """One control-socket request, carrying the capability token when needed.
+
+    The bubble accepts the read-only verbs without a token and requires one for
+    every verb that changes state, because a same-UID process passes the uid
+    check. `level` is polled about twenty times a second, so the token file is
+    read only for a verb that actually needs it. Falls back to the bare command
+    when the bubble module or the token cannot be read — the refusal the server
+    sends then explains itself, which is one place instead of two.
+    """
+    try:
+        verb = command.split(" ", 1)[0].strip().lower()
+        if verb in H.PTT_READ_ONLY:
+            return command.encode("utf-8")
+        token = H.CONTROL_TOKEN.read_text(encoding="utf-8").strip()
+        if not token:
+            return command.encode("utf-8")
+        return f"{H._CONTROL_TOKEN_PREFIX}{token}\n{command}".encode("utf-8")
+    except Exception:      # noqa: BLE001 - never take the window down for this
+        return command.encode("utf-8")
+
+
 def _socket_command(sock_path, command: str, timeout: float = 1.5) -> "str | None":
     """One request/response round-trip with the running bubble's control
     socket. Returns the raw reply text, or None when the bubble isn't running,
@@ -1143,7 +1165,7 @@ def _socket_command(sock_path, command: str, timeout: float = 1.5) -> "str | Non
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect(str(sock_path))
-        s.sendall(command.encode("utf-8"))
+        s.sendall(_control_request_bytes(command))
         s.shutdown(socket.SHUT_WR)
         buf = b""
         while True:
@@ -4731,7 +4753,11 @@ class SettingsWindow(QMainWindow):
             sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
             sock.settimeout(2.0)
             sock.connect(str(H.CONTROL_SOCK))
-            sock.sendall(b"reload-settings\n")
+            # This is the request that makes the bubble re-read settings.json,
+            # so it carries the capability token like any other verb that
+            # changes state — otherwise the save would appear to succeed and
+            # the running bubble would keep the old values.
+            sock.sendall(_control_request_bytes("reload-settings"))
             sock.settimeout(5.0)
             reply = b""
             while not reply.endswith(b"\n"):

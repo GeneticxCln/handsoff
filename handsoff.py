@@ -54,6 +54,7 @@ import signal
 import queue
 import random
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -160,6 +161,24 @@ _CONTROL_REQUEST_MAX = 65536
 # bounded by wall clock. Five seconds is generous for a request both clients
 # send in one `sendall`; a wedged client costs one accept cycle, not the unit.
 _CONTROL_READ_BUDGET = 5.0
+# Per-verb capability for the control socket. `_peer_uid` plus a 0700 state
+# directory keep OTHER users off the socket, and that is all they can do: a
+# same-UID process — a compromised child of ours, a sandboxed app running as
+# the user — passes the uid check, and every verb used to ride the same trust.
+# So a child could `say` in the user's voice, drop the conversation, or launch
+# a window. Read-only verbs stay open, because the Voice meter polls `level`
+# about twenty times a second and the CLI reads `doctor`; every verb that
+# CHANGES something must now present a token that only the serving process
+# knows. It is a file in the state directory rather than a secret in an
+# environment variable, so the tools that already talk to this socket (niri
+# keybinds, the settings window) keep working with no configuration.
+CONTROL_TOKEN = STATE_DIR / "control.token"
+_CONTROL_TOKEN_PREFIX = "token="
+_CONTROL_TOKEN_BYTES = 32          # 64 hex characters of os.urandom
+#: Verbs that report state and change nothing, so they stay open to any
+#: same-UID client. Everything else in PTT_ACTIONS needs the token.
+PTT_READ_ONLY = frozenset({"status", "health", "level", "doctor",
+                           "handsfree-status"})
 MIC_EVENTS_FILE = STATE_DIR / "mic-health.json"   # mic transitions + last briefing
 MIC_EVENTS_MAX = 200                              # hard cap on recorded transitions
 _MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
@@ -1144,7 +1163,7 @@ def _secure_runtime_files() -> bool:
     earlier one is bad, and the AND of the results is returned."""
     paths = [SETTINGS_FILE, HISTORY_FILE, MEMORY_FILE, CRASH_LOG,
              PENDING_FILE, LOCK_FILE, LOG_FILE, CONTROL_SOCK, MIC_EVENTS_FILE,
-             CAP_EVENTS_FILE, REMINDERS_FILE]
+             CAP_EVENTS_FILE, REMINDERS_FILE, CONTROL_TOKEN]
     # Backups hold the SAME secrets as the files they copy (a transcript, the
     # settings), and `shutil.copy2` inherits the SOURCE's mode at copy time —
     # so any sidecar written while the source was still loose stays loose
@@ -1167,6 +1186,56 @@ def _prepare_runtime() -> bool:
         if not _private_dir(directory):
             return False
     return _secure_runtime_files()
+
+
+def _rotate_control_token() -> "str | None":
+    """Write a fresh capability token for THIS process and return it.
+
+    Rotated on every start rather than reused: a token left in the file by a
+    previous run must be worth nothing, or the file's whole history would stay
+    valid. Written through the same atomic 0600 writer the rest of the runtime
+    state uses, so a reader never sees a half-written token. Returns None when
+    the state directory cannot be written — the caller then keeps serving and
+    refuses only the verbs that change state, rather than refusing to start.
+    """
+    try:
+        token = secrets.token_hex(_CONTROL_TOKEN_BYTES)
+        _core_settings._atomic_private_write(CONTROL_TOKEN, token + "\n")
+        return token
+    except OSError:
+        log.exception("could not write the control token")
+        return None
+
+
+def _read_control_token() -> "str | None":
+    """The current capability token, for a client on this machine, or None.
+
+    Read per request instead of cached: the token is rotated every time the
+    bubble starts, so a cached copy from the previous process is exactly the
+    stale credential this exists to defeat.
+    """
+    try:
+        token = CONTROL_TOKEN.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    return token or None
+
+
+def _control_payload(action: str, argv: "list[str]") -> bytes:
+    """One control-socket request, carrying the token when the verb needs it.
+
+    Read-only verbs are sent bare: they are accepted without a token, and one
+    of them is polled twenty times a second. A state-changing verb whose token
+    cannot be read is still SENT, so the refusal comes from the server with its
+    own wording in one place rather than being guessed at by every client.
+    """
+    payload = " ".join(argv)
+    if action in PTT_READ_ONLY:
+        return payload.encode("utf-8")
+    token = _read_control_token()
+    if not token:
+        return payload.encode("utf-8")
+    return f"{_CONTROL_TOKEN_PREFIX}{token}\n{payload}".encode("utf-8")
 
 
 def _migrate_settings(data: dict, _slog: "logging.Logger | None" = None) -> dict:
@@ -6273,6 +6342,10 @@ class ControlServer:
         self._stop = threading.Event()
         self._server: socket.socket | None = None
         self._runs = _core_registry.BoundedRegistry("control", 1)
+        # The capability token this process will require for every verb that
+        # changes state. Decided in `_serve`, before the socket exists, so a
+        # client can never reach a listener whose token is still undecided.
+        self._token: str | None = None
         # Latch for the orphaned-path reports so a path that cannot be
         # reclaimed cannot fill the journal with one line per idle second.
         self._orphan_reported = False
@@ -6413,6 +6486,15 @@ class ControlServer:
         try:
             if not _prepare_runtime():
                 raise OSError("runtime/config directories or files are not private")
+            # Rotate the token BEFORE the socket exists: a client must never
+            # find a listener whose capability has not been decided, and a
+            # token left by a previous run is replaced rather than reused.
+            self._token = _rotate_control_token()
+            if self._token is None:
+                log.error(
+                    "control socket: no capability token could be written — "
+                    "only the read-only commands (%s) will be accepted",
+                    " ".join(sorted(PTT_READ_ONLY)))
             _remove_stale_control_socket()
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.bind(str(CONTROL_SOCK))
@@ -6505,6 +6587,17 @@ class ControlServer:
                         chunks.append(part)
                         total += len(part)
                     raw = b"".join(chunks).decode("utf-8", "replace").strip()
+                    # A client that holds the token sends it as an explicit
+                    # first line (`token=<hex>`), a client that does not sends
+                    # the bare command. Explicit rather than positional so that
+                    # `say` text containing a newline can never be read as a
+                    # credential — and so an old client keeps working for every
+                    # read-only verb.
+                    token_line, sep, rest = raw.partition("\n")
+                    supplied = None
+                    if sep and token_line.startswith(_CONTROL_TOKEN_PREFIX):
+                        supplied = token_line[len(_CONTROL_TOKEN_PREFIX):].strip()
+                        raw = rest.strip()
                     # Split the optional argument off BEFORE lowercasing: `say`
                     # carries the text to synthesize, so lowercasing the whole
                     # payload would make the bubble read a different sentence
@@ -6518,6 +6611,26 @@ class ControlServer:
                             peer, os.getuid())
                         conn.sendall(b"error: not permitted\n")
                         continue
+                    if action in PTT_ACTIONS and action not in PTT_READ_ONLY:
+                        # Constant-time compare: the token is not secret from
+                        # anyone who can read the state directory, but a
+                        # comparison that leaks its prefix by timing is still
+                        # free to avoid.
+                        if (not self._token or not supplied
+                                or not secrets.compare_digest(supplied,
+                                                              self._token)):
+                            log.warning(
+                                "control socket: refusing %r from uid %s — "
+                                "this command changes state and no valid "
+                                "capability token was presented", action, peer)
+                            conn.sendall(
+                                ("error: '{0}' changes state and needs the "
+                                 "control token; read it from {1}. Read-only "
+                                 "commands do not need it: {2}.\n").format(
+                                     action, CONTROL_TOKEN,
+                                     ", ".join(sorted(PTT_READ_ONLY))
+                                 ).encode("utf-8"))
+                            continue
 
                     def _with_timeout(fn, timeout_s: float):
                         """Slow diagnostics, off the accept thread (see
@@ -6783,7 +6896,7 @@ def ptt_client(argv: list[str]) -> int:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5.0)
         s.connect(str(CONTROL_SOCK))
-        s.sendall(payload.encode("utf-8"))
+        s.sendall(_control_payload(action, argv))
         s.shutdown(socket.SHUT_WR)
         reply = b""
         while True:
@@ -6791,6 +6904,11 @@ def ptt_client(argv: list[str]) -> int:
             if not part:
                 break
             reply += part
+        # Print the reply verbatim, refusal or not. The bubble's refusal for a
+        # missing capability names the token file and the verbs that do not
+        # need it, so the client has nothing to add — and it must not decide
+        # "was that a refusal?" by reading the text of a TOOL result either
+        # (the socket's wording is its own protocol, not a result's kind).
         print(reply.decode("utf-8", "replace").strip())
         return 0
     except (FileNotFoundError, ConnectionRefusedError):

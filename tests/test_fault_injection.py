@@ -418,10 +418,13 @@ class TestControlSocketDisappears:
 
     @staticmethod
     def _ask(sock_path: Path, action: str) -> str:
+        from core import app_module
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5)
         s.connect(str(sock_path))
-        s.sendall(action.encode())
+        # Like a real client: state-changing verbs carry the capability token.
+        argv = action.split(" ")
+        s.sendall(app_module()._control_payload(argv[0], argv))
         s.shutdown(socket.SHUT_WR)
         reply = b""
         while True:
@@ -540,7 +543,10 @@ class TestControlSocketDisappears:
         s.settimeout(10)
         s.connect(str(sock_path))
         try:
-            payload = b"preview-pack " + b"x" * (H._CONTROL_REQUEST_MAX * 2)
+            # the token line first, like a real client: the bound under test is
+            # on the REQUEST, and a refused request is read just the same
+            payload = (H._control_payload("preview-pack", ["preview-pack", ""])
+                       + b"x" * (H._CONTROL_REQUEST_MAX * 2))
             try:
                 s.sendall(payload)
                 s.shutdown(socket.SHUT_WR)
@@ -580,7 +586,7 @@ class TestControlSocketDisappears:
         started = time.monotonic()
         closed_on_us = False
         try:
-            s.sendall(b"preview-pack ")
+            s.sendall(H._control_payload("preview-pack", ["preview-pack", ""]))
             for _ in range(40):           # 4 s of dribble, ten bytes a second
                 try:
                     s.sendall(b"x")

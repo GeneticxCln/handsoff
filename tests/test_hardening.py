@@ -64,6 +64,7 @@ def sandbox(H, monkeypatch, tmp_path):
     monkeypatch.setattr(H, "LOCK_FILE", state / "handsoff.lock")
     monkeypatch.setattr(H, "LOG_FILE", state / "handsoff.log")
     monkeypatch.setattr(H, "CONTROL_SOCK", state / "control.sock")
+    monkeypatch.setattr(H, "CONTROL_TOKEN", state / "control.token")
     monkeypatch.setattr(H, "MIC_EVENTS_FILE", state / "mic-health.json")
     monkeypatch.setattr(H, "REMINDERS_FILE", state / "reminders.json")
     return tmp_path
@@ -172,6 +173,56 @@ class TestSecureFile:
         sp.chmod(0o600)
         assert _core_settings._secure_file(sp) is True
         s.close()
+
+
+class TestControlCapabilityToken:
+    """The token is what separates "reports state" from "changes it".
+
+    `_peer_uid` plus a 0700 state directory keep OTHER users off the socket;
+    neither can exclude a same-UID process (a compromised child of ours, a
+    sandboxed app running as the user), and every verb used to ride the same
+    trust. These pin the FILE half: where it lives, how it is written, that it
+    rotates, and that reading it or forging it is not the same as holding it.
+    """
+
+    def test_the_token_is_owner_only_inside_the_state_directory(self, H,
+                                                                sandbox):
+        assert H._prepare_runtime() is True
+        token = H._rotate_control_token()
+        assert token and len(token) == H._CONTROL_TOKEN_BYTES * 2
+        assert H.CONTROL_TOKEN.parent == H.STATE_DIR
+        assert (H.CONTROL_TOKEN.stat().st_mode & 0o777) == 0o600
+        assert H._read_control_token() == token
+
+    def test_a_rotation_replaces_the_previous_token(self, H, sandbox):
+        """A token left in the file by an earlier run must be worth nothing,
+        or the file's whole history would stay valid."""
+        H._prepare_runtime()
+        first = H._rotate_control_token()
+        second = H._rotate_control_token()
+        assert first != second
+        assert H._read_control_token() == second
+        assert H._read_control_token() != first
+
+    def test_a_missing_file_reads_as_no_token(self, H, sandbox):
+        H._prepare_runtime()
+        assert not H.CONTROL_TOKEN.exists()
+        assert H._read_control_token() is None
+
+    def test_an_unwritable_state_dir_reports_no_token_rather_than_raising(
+            self, H, sandbox, monkeypatch):
+        """The server refuses only the state-changing verbs in this case; a
+        token it cannot write must not stop the bubble from serving at all."""
+        H._prepare_runtime()
+        monkeypatch.setattr(H, "CONTROL_TOKEN",
+                            sandbox / "no-such-dir" / "control.token")
+        monkeypatch.setattr(H._core_settings, "_atomic_private_write",
+                            _raise_oserror)
+        assert H._rotate_control_token() is None
+
+
+def _raise_oserror(*a, **k):
+    raise OSError("read-only state directory")
 
 
 class TestPrepareRuntime:
