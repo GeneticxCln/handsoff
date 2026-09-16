@@ -4579,3 +4579,57 @@ cannot build" means, and `_bespoke_drawn` records each one as drawn so the two
 sets cannot drift. A page can also still supply a whole card with no rows of its
 own (`_group_panels`) and content under a card's rows (`_group_tails`); those
 are panels, not placement, and the table describes neither.
+
+## The specs were a claim nobody checked (2026-09-16)
+
+`specs/` (8 files, 885 lines) says of itself: "when code and spec disagree, the
+code runs and the spec is wrong — fix the spec in the same change." Nothing
+checked, so nothing ever disagreed out loud. The counts a reader leans on when
+deciding what exists — how many tools the model can call, how many settings a
+save must carry, how many control-socket verbs there are, how many core modules
+ship — are now read from the source of truth each spec names FOR ITSELF, and
+compared against every place a spec states one:
+
+- tools: AST census of `core/tools.py` (the method's own `@tool` decorator);
+- settings keys and permission keys: `settings_schema.DEFAULT_SETTINGS`;
+- PTT verbs: the `PTT_ACTIONS` set in `handsoff.py`, parsed rather than
+  imported — counting 22 strings should not drag Qt and the whole app in;
+- core modules: `core/*.py`.
+
+Eight statements of the tool count, six of the settings keys, two each for the
+verbs and the permission keys, three for the core modules, spread over
+`00-overview` (the vision line and the index row), `10-requirements`,
+`20-architecture`, `30-tools-api`, `40-data`, `50-ops`, `60-test-plan` and
+`90-audit` — every one is read back and must equal the code. A statement that no
+longer MATCHES its pattern is a failure, not a skip: a reworded spec has to be
+reworded with the guard that reads it, or the guard goes quietly vacuous the
+first time somebody tidies a sentence — which is the defect this file refuses.
+
+It pins STRUCTURE too, because a count cannot see a swap: every `core/*.py` must
+be named in the architecture map and the map must name nothing that is gone;
+every `tests/test_*.py` must be in the test plan; every spec the index names must
+exist, and every spec on disk must be in the index.
+
+**Deliberately not pinned: sizes.** "Scale (measured 2026-09-15)" is a snapshot
+and its own date says so; pinning a line count would make every edit a two-file
+change for no contract gained. That leaves real, recorded drift for a later pass
+to refresh — this pass did NOT touch these, and they are the numbers a reader
+should not trust: `handsoff.py` 7057 → 7119, `handsoff-settings.py` 4812 → 5414,
+`settings_schema.py` 319 → 974, `core/brain.py` 215 → 275, `core/settings.py`
+874 → 883, the docs table (`ACCEPTANCE.md` 214 → 236, `GAP_ANALYSIS.md` 4025 →
+4583) and the suite line (1390 collected across 23 files → 1442 across 25). Two
+line citations are stale as well (`handsoff.py:6288` for `PTT_ACTIONS` is now
+6350; `settings_schema.py:269` for `permissions` is now 296), while
+`install.sh (915)`, `handsoff.py:742` and `handsoff.py:1375` are still exact.
+
+**The first run found a real gap**, which is the point: `test_settings_contract.py`
+(24 tests — the guards for the settings table itself) was in no row of the test
+plan. It and this pass's own file are listed now, and the plan's header says what
+its table is: the FILE LIST is the contract, the counts are a dated snapshot.
+
+**4/4 mutations caught, zero residue, every restore sha256-verified**: a tool
+count going stale in `30-tools-api.md`; a core module dropped from the
+architecture map; a test file removed from the plan; and a spec sentence
+REWORDED so the guard stops reading it. 1442 tests green, and `specs/` is in git
+for the first time — it was untracked, so the normative set would have gone with
+the checkout. No shipped byte changed: `deployment: in-sync`.
