@@ -32,6 +32,22 @@ from . import theme as _theme
 
 _schema = load_module("settings_schema")
 DEFAULT_SETTINGS = _schema.DEFAULT_SETTINGS
+__all__ = [
+    # the lifecycle, in the order a caller meets it: load owns read -> migrate ->
+    # coerce -> quarantine; write_settings owns lock -> backup -> drop-retired ->
+    # stamp -> atomic replace; persist_setting owns read-merge-write of one key.
+    "load_settings", "write_settings", "persist_setting", "coerce_setting",
+    "coerce_settings", "Settings", "settings_object", "SettingsConflictError",
+    # shared with the rest of the runtime rather than with settings: a private
+    # 0600 writer, a 0600 hardening pass, a corrupt-file quarantine, a
+    # sidecar-flock guard (settings.json AND reminders.json use it) and a
+    # one-generation backup.
+    "atomic_private_write", "secure_file", "quarantine_file",
+    "cross_process_lock", "backup_runtime_json",
+    # looks catalogue readers the settings window and the bubble both use
+    "look_label", "look_matching", "SETTINGS_VERSION",
+]
+
 SETTINGS_VERSION = _schema.SETTINGS_VERSION
 # Keys a past version wrote that this build retired; dropped on load AND on
 # write, so a read-merge-write cannot resurrect them (see the schema).
@@ -76,7 +92,7 @@ def look_matching(settings: dict) -> str:
 # Used by settings writes AND re-exported by handsoff.py (where the runtime
 # hardening suite exercises them under the same names).
 
-def _secure_file(path: Path) -> bool:
+def secure_file(path: Path) -> bool:
     """Make an existing runtime/config file owner-only, without creating it.
 
     ``Path.exists()`` is not sufficient here: it returns false for a broken
@@ -128,7 +144,7 @@ def atomic_private_write(path: Path, text: str) -> None:
             fh.write(text)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
-        if not _secure_file(path):
+        if not secure_file(path):
             raise OSError(f"refusing insecure runtime file: {path}")
     except Exception:
         try:
@@ -138,7 +154,7 @@ def atomic_private_write(path: Path, text: str) -> None:
         raise
 
 
-def _quarantine_bad(path: Path) -> None:
+def quarantine_file(path: Path) -> None:
     """Move a corrupt config/state file aside; never fail-open on garbage."""
     try:
         if not path.exists():
@@ -156,7 +172,7 @@ def _quarantine_bad(path: Path) -> None:
             "corrupt %s could not be quarantined", path, exc_info=True)
 
 
-def _backup_runtime_json(path: Path) -> None:
+def backup_runtime_json(path: Path) -> None:
     """One-generation .bak beside a runtime JSON file (history, memory,
     reminders, settings). Best-effort: a backup failure must never block the
     write that follows — the atomic write is the real safety mechanism.
@@ -229,7 +245,7 @@ def _bool_flag(value, default: bool) -> bool:
 
 def coerce_settings(s: dict) -> dict:
     """Coerce/validate raw merged settings IN PLACE. Shared by the bubble's
-    _load_settings AND the settings app (a hand-edited settings.json must
+    load_settings AND the settings app (a hand-edited settings.json must
     never crash either program; the settings app is the recovery tool and
     must open even when the config is garbage).
 
@@ -264,7 +280,7 @@ def _apply_field(s: dict, field, log) -> None:
         except (TypeError, ValueError, OverflowError):
             # OverflowError: `int(float("inf"))` — and Python's json parses a
             # bare `Infinity` token, so one crafted value in settings.json
-            # would otherwise kill startup inside _load_settings.
+            # would otherwise kill startup inside load_settings.
             log.warning("invalid %s — using default %r", key, default)
             s[key] = default
         return
@@ -521,7 +537,7 @@ class SettingsConflictError(RuntimeError):
     """A full save would overwrite a newer value written by another actor."""
 
 
-def _settings_file_lock():
+def cross_process_lock():
     """Cross-process file lock (flock on a sidecar, not the data file).
 
     Shared by settings writes AND reminders.json: pass lock_name to reuse
@@ -562,7 +578,7 @@ def _settings_file_lock():
 
 # -------------------------------------------------------------- load + writers
 
-def _load_settings(settings_file: Path) -> dict:
+def load_settings(settings_file: Path) -> dict:
     """Built-in defaults <- environment <- settings.json (the settings app wins)."""
     s = json.loads(json.dumps(DEFAULT_SETTINGS))
     env_map = {
@@ -586,12 +602,12 @@ def _load_settings(settings_file: Path) -> dict:
     try:
         data = json.loads(raw)
     except ValueError:
-        _quarantine_bad(settings_file)
+        quarantine_file(settings_file)
         s = coerce_settings(s)
         s["version"] = SETTINGS_VERSION
         return s
     if not isinstance(data, dict):
-        _quarantine_bad(settings_file)
+        quarantine_file(settings_file)
         s = coerce_settings(s)
         s["version"] = SETTINGS_VERSION
         return s
@@ -687,27 +703,27 @@ def _read_settings_for_write(settings_file: Path) -> dict:
     except FileNotFoundError:
         return {}
     except ValueError:
-        _quarantine_bad(settings_file)
+        quarantine_file(settings_file)
         return {}
     if not isinstance(loaded, dict):
-        _quarantine_bad(settings_file)  # valid JSON, wrong shape: never wipe blind
+        quarantine_file(settings_file)  # valid JSON, wrong shape: never wipe blind
         return {}
     # OSError (permissions, transient I/O) propagates: the caller must abort
     # the write rather than persist a near-empty dict over good data.
     return {}
 
 
-def _write_settings_dict(data: dict, settings_file: Path, config_dir: Path,
+def write_settings(data: dict, settings_file: Path, config_dir: Path,
                          *, stamp_version: bool = True,
                          expected_data: dict | None = None) -> dict:
     """Serialize a full settings dict to settings.json: version-stamped,
     backed up one generation, atomic. The single writer both the bubble and
     the settings app use, so every settings.json on disk carries a version."""
-    with _SETTINGS_WRITE_LOCK, _settings_file_lock()(config_dir):
+    with _SETTINGS_WRITE_LOCK, cross_process_lock()(config_dir):
         if expected_data is not None:
             # Compare normalized snapshots so an old sparse settings file is
             # compatible with the full dict held by the GUI.
-            current = _load_settings(settings_file)
+            current = load_settings(settings_file)
             expected = dict(expected_data)
             candidate = dict(data)
             expected.pop("version", None)
@@ -725,7 +741,7 @@ def _write_settings_dict(data: dict, settings_file: Path, config_dir: Path,
         # reintroduce a key this build retired (the GUI's edit dict is built
         # through merge_settings, which can carry one along).
         data = _drop_retired_settings(data)
-        _backup_runtime_json(settings_file)
+        backup_runtime_json(settings_file)
         atomic_private_write(
             settings_file, json.dumps(data, ensure_ascii=False, indent=1))
         return data
@@ -737,7 +753,7 @@ def coerce_setting(key: str, value):
     The one answer to "what does this value BECOME", for the two runtime
     writers. They used to write the disk the coerced value and MEMORY the raw
     argument — so the two docstrings promising that "memory and the file cannot
-    disagree" were both false: `_persist_setting("mic_threshold", "junk")`
+    disagree" were both false: `persist_setting("mic_threshold", "junk")`
     wrote 600 and left `"junk"` in `SETTINGS`, and the next PTT release died in
     a bare `int(...)` while the hands-free listener's `_SpeechGate(int(...))`
     took the listener thread down with it.
@@ -751,7 +767,7 @@ def coerce_setting(key: str, value):
     return probe[key]
 
 
-def _persist_setting(key: str, value, settings_file: Path,
+def persist_setting(key: str, value, settings_file: Path,
                      config_dir: Path) -> bool:
     """Persist one runtime setting without overwriting unrelated settings.
 
@@ -760,7 +776,7 @@ def _persist_setting(key: str, value, settings_file: Path,
     a failed write left the runtime using (and believing) a value the next
     start would not read back.
     """
-    with _SETTINGS_WRITE_LOCK, _settings_file_lock()(config_dir):
+    with _SETTINGS_WRITE_LOCK, cross_process_lock()(config_dir):
         try:
             data = _read_settings_for_write(settings_file)
         except OSError:
@@ -787,7 +803,7 @@ def _persist_setting(key: str, value, settings_file: Path,
         # NOTE: atomic_private_write creates its own uniquely-named temp
         # file; a pre-computed ".json.tmp" path here would reintroduce the
         # predictable-name race that helper exists to prevent.
-        _backup_runtime_json(settings_file)
+        backup_runtime_json(settings_file)
         try:
             atomic_private_write(
                 settings_file, json.dumps(data, ensure_ascii=False, indent=1))
@@ -840,7 +856,7 @@ class Settings:
     def load(self) -> dict:
         """(Re)load from disk: defaults <- env <- file, coerced and
         version-stamped. Returns and stores the live dict."""
-        self._data = _load_settings(self.settings_file)
+        self._data = load_settings(self.settings_file)
         self._loaded = True
         return self._data
 
@@ -854,7 +870,7 @@ class Settings:
         Returns whether the value reached the disk; the cached dict is only
         updated when it did, so memory and the file cannot disagree.
         """
-        if not _persist_setting(key, value, self.settings_file, self.config_dir):
+        if not persist_setting(key, value, self.settings_file, self.config_dir):
             return False
         # The COERCED value, not the argument: see `coerce_setting` for the
         # divergence this closes.
@@ -865,7 +881,7 @@ class Settings:
         """Version-stamped, backed-up full-file write (the settings app's
         save path). ``expected_data`` is the snapshot read by the editor;
         changed keys are merged and conflicting keys are rejected."""
-        written = _write_settings_dict(
+        written = write_settings(
             data, self.settings_file, self.config_dir,
             expected_data=expected_data)
         self._data = written
@@ -873,7 +889,7 @@ class Settings:
         return written
 
     def backup_runtime_json(self, path: Path) -> None:
-        _backup_runtime_json(path)
+        backup_runtime_json(path)
 
 
 def settings_object(settings_file: Path, config_dir: Path,

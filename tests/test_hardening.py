@@ -110,7 +110,7 @@ class TestPrivateDir:
 
 class TestSecureFile:
     def test_missing_file_is_success(self, H, sandbox):
-        assert _core_settings._secure_file(sandbox / "state" / "nope.json") is True
+        assert _core_settings.secure_file(sandbox / "state" / "nope.json") is True
 
     def test_regular_file_gets_0600(self, H, sandbox):
         state = sandbox / "state"
@@ -118,7 +118,7 @@ class TestSecureFile:
         f = state / "f.json"
         f.write_text("{}")
         f.chmod(0o644)
-        assert _core_settings._secure_file(f) is True
+        assert _core_settings.secure_file(f) is True
         assert (f.stat().st_mode & 0o777) == 0o600
 
     def test_refuses_symlink_including_broken(self, H, sandbox):
@@ -128,17 +128,17 @@ class TestSecureFile:
         target.write_text("data")
         link = state / "link.json"
         link.symlink_to(target)
-        assert _core_settings._secure_file(link) is False
+        assert _core_settings.secure_file(link) is False
         broken = state / "broken.json"
         broken.symlink_to(sandbox / "ghost")     # broken symlink
-        assert _core_settings._secure_file(broken) is False
+        assert _core_settings.secure_file(broken) is False
 
     def test_refuses_directory(self, H, sandbox):
         state = sandbox / "state"
         state.mkdir()
         d = state / "dir.json"
         d.mkdir()
-        assert _core_settings._secure_file(d) is False
+        assert _core_settings.secure_file(d) is False
 
     def test_refuses_foreign_owned(self, H, monkeypatch, sandbox):
         state = sandbox / "state"
@@ -146,7 +146,7 @@ class TestSecureFile:
         f = state / "f.json"
         f.write_text("{}")
         monkeypatch.setattr(H.os, "getuid", lambda: f.stat().st_uid + 1)
-        assert _core_settings._secure_file(f) is False
+        assert _core_settings.secure_file(f) is False
 
     def test_stale_permissive_socket_self_heals(self, H, sandbox):
         """E10 (the wedge): a stale socket with 0777 (umask 000 bind) must be
@@ -161,7 +161,7 @@ class TestSecureFile:
             os.umask(old)
         assert (sp.stat().st_mode & 0o777) == 0o777
         # self-healed, not refused
-        assert _core_settings._secure_file(sp) is True
+        assert _core_settings.secure_file(sp) is True
         assert (sp.stat().st_mode & 0o777) == 0o600
         s.close()
 
@@ -171,7 +171,7 @@ class TestSecureFile:
         sp = state / "control.sock"
         s = _mk_socket(sp)
         sp.chmod(0o600)
-        assert _core_settings._secure_file(sp) is True
+        assert _core_settings.secure_file(sp) is True
         s.close()
 
 

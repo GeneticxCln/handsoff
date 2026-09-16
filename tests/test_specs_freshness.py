@@ -607,6 +607,12 @@ class TestSpecFreshness:
         Second rule, and the reason it is here: a DECLARED private that is
         crossed must be named in the map's row for that module, so a blessed
         seam cannot hide in a list nobody opens.
+
+        Third, aimed at the declaration itself: every name a module puts in
+        `__all__` must exist in it. A declaration that outruns the module is a
+        promise about a name nobody can call — and because `__all__` is what
+        this guard accepts in place of a debt row, it is also the cheapest way
+        to launder a crossing past it.
         """
         crossings = _private_crossings()
         assert sum(len(names) for names in crossings.values()) >= 4, (
@@ -627,6 +633,24 @@ class TestSpecFreshness:
         declared_any = 0
         listed = set()
         problems = []
+        for label in ("core/audio.py", "core/web.py", "core/registry.py",
+                      "core/settings.py"):
+            body = ast.parse((HERE / label).read_text(encoding="utf-8"))
+            exported = set()
+            for node in body.body:
+                if isinstance(node, ast.Assign) and any(
+                        getattr(t, "id", "") == "__all__" for t in node.targets):
+                    exported = {e.value for e in node.value.elts
+                                if isinstance(e, ast.Constant)}
+            have = _top_level_names(body)
+            for node in body.body:
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    for a in node.names:
+                        have.add((a.asname or a.name).split(".")[0])
+            ghosts = sorted(name for name in exported if name not in have)
+            assert not ghosts, (
+                f"{label} declares {ghosts} in __all__ and does not define them "
+                f"— and __all__ is what this guard accepts instead of a debt row")
         for label, names in crossings.items():
             for name in names:
                 if debt.get(name) == label:

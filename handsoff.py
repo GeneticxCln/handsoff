@@ -546,8 +546,13 @@ if sys.modules.get("settings_schema") is None:
 
 def _load_settings() -> dict:
     """Defaults <- environment <- settings.json (implemented in core.settings;
-    the paths stay handsoff globals so tests can redirect them)."""
-    s = _core_settings._load_settings(SETTINGS_FILE)
+    the paths stay handsoff globals so tests can redirect them).
+
+    `load_settings` is the module's public entry point and owns the sequence:
+    read, migrate an older layout, coerce every key, quarantine a file that
+    cannot be parsed.
+    """
+    s = _core_settings.load_settings(SETTINGS_FILE)
     _SETTINGS_OBJ.settings_file = SETTINGS_FILE
     _SETTINGS_OBJ.config_dir = CONFIG_DIR
     _SETTINGS_OBJ._data = s
@@ -1177,7 +1182,7 @@ def _secure_runtime_files() -> bool:
             log.warning("could not enumerate backups in %s", directory)
     # materialize first: all(generator) short-circuits, which would leave
     # every file after a bad one unhardened
-    return all([_core_settings._secure_file(path) for path in paths])
+    return all([_core_settings.secure_file(path) for path in paths])
 
 
 def _prepare_runtime() -> bool:
@@ -1238,22 +1243,24 @@ def _control_payload(action: str, argv: "list[str]") -> bytes:
     return f"{_CONTROL_TOKEN_PREFIX}{token}\n{payload}".encode("utf-8")
 
 
-def _migrate_settings(data: dict, _slog: "logging.Logger | None" = None) -> dict:
-    """Migrate an older settings.json layout (thin wrapper: real hook in core)."""
-    return _core_settings._migrate_settings(data, _slog)
-
-
 def _backup_runtime_json(path: Path) -> None:
     """One-generation .bak beside a runtime JSON file (thin wrapper: real
-    implementation in core.settings)."""
-    _core_settings._backup_runtime_json(path)
+    implementation in core.settings, which needs the same backup for its own
+    writes and for `reminders.json`)."""
+    _core_settings.backup_runtime_json(path)
 
 
 def _write_settings_dict(data: dict, *, stamp_version: bool = True) -> None:
     """Serialize a full settings dict to settings.json: version-stamped,
-    backed up one generation, atomic (thin wrapper: real writer in core)."""
-    _core_settings._write_settings_dict(data, SETTINGS_FILE, CONFIG_DIR,
-                                        stamp_version=stamp_version)
+    backed up one generation, atomic (thin wrapper: real writer in core).
+
+    Kept as the host's seam because the tests patch it here, and because the
+    paths stay handsoff globals — but it now calls the module's PUBLIC
+    `write_settings`, which owns the whole sequence (lock, backup, drop-retired,
+    stamp, atomic write) rather than the host reaching for its steps.
+    """
+    _core_settings.write_settings(data, SETTINGS_FILE, CONFIG_DIR,
+                                  stamp_version=stamp_version)
 
 
 def _persist_setting(key: str, value) -> bool:
@@ -1265,7 +1272,7 @@ def _persist_setting(key: str, value) -> bool:
     write error left the bubble running on (and re-stamping) a value that the
     next start would not read back.
     """
-    if not _core_settings._persist_setting(key, value, SETTINGS_FILE, CONFIG_DIR):
+    if not _core_settings.persist_setting(key, value, SETTINGS_FILE, CONFIG_DIR):
         log.warning("setting %r was NOT persisted — keeping the old value", key)
         return False
     # The COERCED value, not the argument. The disk got the coerced one and
@@ -2789,7 +2796,7 @@ _core_assistant = _load_module("assistant")
 _REMINDER_STORE = _core_assistant.ReminderStore(
     REMINDERS_FILE,
     lock=REMINDERS_LOCK,
-    file_lock=_core_settings._settings_file_lock(),
+    file_lock=_core_settings.cross_process_lock(),
     backup=_backup_runtime_json,
     write=_core_settings.atomic_private_write,
     logger=log,
@@ -6073,14 +6080,14 @@ class Assistant(QObject):
         except FileNotFoundError:
             return []
         except ValueError:
-            _core_settings._quarantine_bad(HISTORY_FILE)
+            _core_settings.quarantine_file(HISTORY_FILE)
             return []
         except OSError:
             return []
         except Exception:
             return []
         if not isinstance(data, list):
-            _core_settings._quarantine_bad(HISTORY_FILE)
+            _core_settings.quarantine_file(HISTORY_FILE)
             return []
         try:
             msgs = [m for m in data if isinstance(m, dict) and m.get("role") and m.get("content") is not None]
@@ -6231,14 +6238,14 @@ def _load_memory() -> list[dict]:
     except FileNotFoundError:
         return []
     except ValueError:
-        _core_settings._quarantine_bad(MEMORY_FILE)
+        _core_settings.quarantine_file(MEMORY_FILE)
         return []
     except OSError:
         return []
     except Exception:
         return []
     if not isinstance(data, list):
-        _core_settings._quarantine_bad(MEMORY_FILE)
+        _core_settings.quarantine_file(MEMORY_FILE)
         return []
     try:
         items = [{"k": str(m.get("k", "")), "v": str(m.get("v", ""))}

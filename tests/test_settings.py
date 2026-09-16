@@ -894,10 +894,12 @@ class TestSettingsSplit:
 
     def test_wrapper_is_late_bound_for_patch_seam(self, H, monkeypatch):
         """The H._persist_setting wrapper must look the core function up at
-        CALL time through _core_settings, so patching the core attr (future
-        split steps' seam) works exactly like patching the wrapper."""
+        CALL time through _core_settings, so patching the core attr works
+        exactly like patching the wrapper. The seam is the module's PUBLIC
+        `persist_setting` now — the private step name it used to patch is gone,
+        which is the whole point of the rename."""
         seen = []
-        monkeypatch.setattr(H._core_settings, "_persist_setting",
+        monkeypatch.setattr(H._core_settings, "persist_setting",
                             lambda k, v, sf, cd: seen.append(k))
         H._persist_setting("x", 1)
         assert seen == ["x"]
@@ -972,7 +974,7 @@ class TestSettingsSplit:
 
         def write(value):
             try:
-                cs._write_settings_dict({"bubble_size": value}, path, tmp_path)
+                cs.write_settings({"bubble_size": value}, path, tmp_path)
             except BaseException as exc:  # surface worker failures below
                 errors.append(exc)
 

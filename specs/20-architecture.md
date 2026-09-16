@@ -9,11 +9,11 @@ copy a size out of it into prose.
 
 | Module | Lines | Owns | Must not import |
 |---|---|---|---|
-| `handsoff.py` | 7119 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
+| `handsoff.py` | 7126 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
 | `core/__init__.py` | 306 | `APP_MODULE_NAME="handsoff_core"`, `claim_app_instance`, `load_module`, origin rule, stdlib-shadow guard | app globals |
 | `core/tools.py` | 3330 | 48 `@tool`s, `ToolBelt`, `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
 | `core/bubble.py` | 4069 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |
-| `core/settings.py` | 883 | loader/writer/migrate/coerce/lock/merge, `atomic_private_write` (0600 + mkstemp), `Settings` object | app globals (paths as params) |
+| `core/settings.py` | 899 | the lifecycle as three calls — `load_settings` (read → migrate → coerce → quarantine), `write_settings` (lock → backup → drop-retired → stamp → atomic replace), `persist_setting` (read-merge-write one key) — plus `Settings`/`settings_object`, `coerce_setting`, and the utilities the runtime shares: `atomic_private_write`, `secure_file`, `quarantine_file`, `backup_runtime_json`, `cross_process_lock` | app globals (paths as params) |
 | `core/audio.py` | 835 | `Recorder`, resample (`_resample_to_16k`), whisper/TTS getters, `play_wav`, level hook; the seam shared with the host: `MIC_OPERATION_LOCK`, `_stop_recorder_bounded`, `_tts_device`, and the mirrored caches it drops through that lock (`_tts_model`, `_whisper_model`, `_whisper_cpu_fallback`) | `handsoff` (`configure()` only) |
 | `core/web.py` | 972 | 6 backends behind `search`, `Result`, `_route`, TTL cache, `read_page`, SSRF guard | `handsoff` (resolvers via `configure()`) |
 | `core/calendar.py` | 548 | `ics_fetch`/`ics_events_from_text`/`fmt_events` (its whole interface, promoted from five private names), ICS unfold/parse/RRULE, `DAY_NAMES`/`MONTH_NAMES`, scheme + label guards | anything (stdlib only) |
@@ -45,13 +45,18 @@ the fix is to move the work to where the data lives, not to bless it.
 
 A row that is no longer reached, or a name that has since become public or been
 declared, FAILS the guard: this table is a transition, not a parking space.
-`core/calendar.py` is the example of paying it — five private names were reached
-and NO public one existed, so the five lost the underscore instead of being
-listed here.
+`core/calendar.py` and `core/settings.py` are the two examples of paying it.
+Calendar had five private names reached and NO public one, so the five lost the
+underscore. Settings' eight were steps of ONE lifecycle that the module already
+owned in outline — `Settings.load`/`persist`/`write_all` called them — so the
+seven that are genuine entry points became `load_settings`, `write_settings`,
+`persist_setting`, `backup_runtime_json`, `secure_file`, `quarantine_file` and
+`cross_process_lock`, the eighth (`_migrate_settings`) stayed private because
+loading migrates internally and the host's wrapper around it had no callers at
+all.
 
 | Module | Names still reached | Why this is debt, not a seam |
 |---|---|---|
-| `core/settings.py` | `_load_settings`, `_write_settings_dict`, `_migrate_settings`, `_persist_setting`, `_settings_file_lock`, `_backup_runtime_json`, `_quarantine_bad`, `_secure_file` | Eight steps of ONE lifecycle — load → drop retired keys → migrate → write under a file lock, with a backup and a quarantine on the way. The fix is not eight renames but the module owning the sequence, so the host asks once. |
 | `core/tools.py` | `_DEFAULT_DEPS`, `_CURRENT` | Injected state the host reads to answer health and doctor, not functions: there is nothing to promote, only something to stop reaching for. |
 | `core/brain.py` | `_read_http_error` | One HTTP error reader the host reuses for the doctor's probe; it belongs on whatever both callers should be sharing. |
 

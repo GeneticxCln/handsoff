@@ -4854,3 +4854,57 @@ tests green, `compile`/`shell`/`smoke` PASS.
 This pass changed SHIPPED bytes (`handsoff.py`, four `core/*.py`, the settings
 app), so the deployment fell behind the checkout the moment it landed: redeployed
 and verified in the same pass — 17/17 files byte-identical, `deployment: in-sync`.
+
+## core/settings.py pays its §1a debt (2026-09-16)
+
+The debt row is deleted, and not by blessing eight names: the module now owns the
+sequence the host was walking step by step.
+
+Reading the code changed the shape of the job. `core/settings.py` already had the
+object — `Settings.load`/`persist`/`write_all`/`backup_runtime_json` — so the
+module had a doorway all along, and the host's wrappers were reaching **past** it
+into the private steps with the host's own paths. Seven of the eight are genuine
+entry points and took a public name:
+
+- `load_settings` — read → migrate → coerce → quarantine;
+- `write_settings` — lock → backup → drop-retired → stamp → atomic replace;
+- `persist_setting` — read-merge-write one key;
+- `backup_runtime_json`, `secure_file`, `quarantine_file`, `cross_process_lock` —
+  shared by the whole runtime rather than by settings alone (the lock's own
+  docstring already said settings.json AND reminders.json use it).
+
+The eighth, `_migrate_settings`, stayed private: loading migrates internally, so
+nothing outside needs it. The host's `_migrate_settings` wrapper turned out to
+have **no callers at all** and is deleted rather than repointed. The same check
+found `_write_settings_dict` has no host caller either — only tests patch it — so
+it stays as the tests' documented seam.
+
+`__all__` (16 names) now declares the module's interface, and it is the first
+thing a reader meets.
+
+**Renaming was scoped so the patch seams survived**: only references *through* the
+core module moved (`_core_settings._x`, `cs._x`, `H._core_settings._x`, 19 sites),
+never the host's own wrapper names, because those are what the tests
+monkeypatch. One test did need a real update: `test_wrapper_is_late_bound_for_patch_seam`
+patched core's private name to prove the host wrapper looks it up per call; it
+patches the public `persist_setting` now.
+
+The guard grew a third rule aimed at the declaration itself: every name a module
+puts in `__all__` must exist in it, since `__all__` is what the guard accepts
+instead of a debt row and a ghost entry would be the cheapest way to launder a
+crossing past it. Measured before adding: audio 33, web 11, registry 2, settings
+16 declared names, zero ghosts.
+
+**3/3 mutations caught plus a probe — and the sweep's own first run taught it
+something.** A mutation inside a function the import path runs turns every test
+into a fixture ERROR rather than a FAILED, which the sweep was counting as
+"missed"; it reads both now, and that mutation was moved inside a function the
+import path does not run, to isolate the guard from the crash. Caught: the host
+re-reaching a settings private that no longer exists (the exact re-accrual), a
+debt row for a name nothing reaches, and an `__all__` entry naming nothing.
+
+§1a is down to two rows: `core/tools.py`'s `_DEFAULT_DEPS`/`_CURRENT` (injected
+state, nothing to promote) and `core/brain.py`'s `_read_http_error`.
+
+1452 tests green, `compile`/`shell`/`smoke` PASS, tables fresh. Shipped bytes
+changed, so redeployed in the same pass — `deployment: in-sync`.
