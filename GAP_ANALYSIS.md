@@ -4415,3 +4415,167 @@ now enforces the same rule, so the end-to-end turn guard is real. One limit:
 the `_LegacyBrain` shim (reachable only when `core/brain.py` is absent) still
 sends its list raw.
 
+## The settings window's controls come from the same table (and the one line
+## that is still hand-written)
+
+**What was missing.** The first half of this contract made
+`settings_schema.SETTINGS_FIELDS` the single declaration of a setting's KIND —
+one row per setting, and `core/settings.coerce_settings` generated from it. The
+window was left on the old contract: a new setting still meant a widget built by
+hand in `handsoff-settings.py`, a line in `_load_values`, and a line in
+`_collect`, so the same value existed in four places and the three that were
+hand-written drifted independently of the table. Two of the four places had
+already caused shipped bugs (`colors`, then `avatar_deco_color`), and four
+settings — `whisper_device`, `confirm_seconds`, `streaming_tts`,
+`world_cooldown_min` — had no control AT ALL, which was recorded in the test
+suite as a hand-maintained exemption list rather than fixed.
+
+**How it stands now.** A row carries its page, its label, which control to
+build, its tooltip, and how a control presents its value (suffix, step, what
+zero reads as, and for sliders the integer multiplier plus the unit and
+decimals). One registry in the window builds them; `_load_values` and `_collect`
+each walk `self._controls` once. 41 of the 59 settings are generated that way,
+17 are drawn by name by a bespoke panel and are declared as such in
+`SettingsWindow.BESPOKE_KEYS`, and one (`tool_call_times`) declares `ctrl="none"`
+because the bubble writes it and no person does — the three sets together must
+account for every setting, which is what the guards check in both directions.
+The four control-less settings now have controls, the exemption list is gone,
+and the two dead helpers the refactor orphaned (`_add_controls`,
+`control_titles()`) are deleted. A page that names a key the table does not
+declare is now a logged skip instead of an `AttributeError` at open, and a page
+that names its rows does so through `_page_row`, which warns when the row belongs
+to another page.
+
+**Guards.** Nine tests, and they are aimed at the CLASS rather than at one
+setting: the control vocabulary, the three-set union, a title and a page on every
+generated row with the page checked against the window's own `addTab` calls,
+a page's named keys checked against the table (a rename otherwise leaves a
+setting silently absent), the settings the window reads as WIDGETS required to be
+generated rows (a row turned `custom` would raise at open), the two loops that
+make a new row need no line in the app asserted as loops, and the offscreen
+scenario that adds a row to the TABLE alone and drives the real window: the
+control appears with the row's bounds, the value on disk loads, the edit collects
+through the loader's own coercion, and the value survives a save and a reload.
+Twelve mutations, one per property, each caught at its own assertion.
+
+**The honest limit.** Placement is still hand-written on the three pages that
+group their rows around bespoke cards (Voice, Appearance, Permissions): a new
+row there needs one line saying which card it belongs to — no widget, no load
+line, no collect line — and the "rows with no control" scenario fails until that
+line exists, so the omission is loud rather than invisible. Deriving the page
+GROUPS from the table too (a `group` field, with each page rendering its groups
+in table order and the bespoke extras attached to named rows) is the obvious
+next step and is not done.
+
+### The settings typed contract, third half: placement (2026-09-15)
+
+**The limit the previous pass wrote down, closed.** A new setting used to need
+one line in `SETTINGS_FIELDS` *plus* a placement line on each page that grouped
+its rows by hand around bespoke cards — Voice, Appearance, Permissions. The
+tempting fix was to keep those pages and add a `group=` field to the row; the
+fix taken is that the WINDOW has no placement of its own at all.
+
+**`PAGE_GROUPS` is the placement.** It declares each page's cards **in draw
+order** and now carries each card's subtitle as well, so the Appearance tab is
+Preview → Look → Shape → Decoration → Motion → State colours → Match your
+desktop because the table says so, not because the page built seven cards and
+moved two of them to the top with `insertWidget`. `Field.group` names the card,
+`group_fields()` returns that card's rows in table order, and every page is one
+loop over `page_groups()`: rows from `_draw_group()`, plus three named kinds of
+extra — `_row_specials` (the table builds the control, the page configures or
+wraps it), `_group_panels` (a card with no rows at all), `_group_tails` (content
+under a card's rows).
+
+**Two pages stopped being special, and the Appearance tab stopped being two
+implementations.** Permissions built its three cards with literal titles and
+placed six rows by hand (`searxng_url` into "tools", the command box into
+"extra", dry-run and the confirmation window into a `policy_tail` form of their
+own); it is the loop now, and the three titles come from the table — no literal
+`QGroupBox("…")` survives in the file. Appearance is the loop too. Everything
+that existed only to serve the hand-grouped shape is gone rather than left for
+someone to use again — `_page_row` (placement by key), `_control_row`,
+`_draw_remaining`, the module-level `_field_for`, and `_card_hints` (text the
+schema now carries) — and the contract guard that read by-key helper calls was
+re-aimed at `_row_specials` rather than deleted, because that is the surface a
+rename can still strand.
+
+**A declaration that had to be corrected to stay honest.** `_bespoke_drawn` means
+"the table could not build this control". Four Voice rows (`handsfree`,
+`hardware_watch`, `resource_alerts`, `tts_reference`) wrap a GENERATED control
+with a note or a pair of limits, and were claiming to be bespoke — the GUI guard
+failed on it the moment the Appearance refactor made the two sets comparable in
+one run, which is how the distinction got a name: a row-special is not a bespoke
+row.
+
+**Guards.** Every row that has a control must name a card that IS declared (a row
+in no declared card reaches no widget: nothing raises, nothing logs, it is never
+iterated — the quietest way for a setting to become invisible); every card has a
+title; each page renders the table's cards in the table's order and each card's
+rows in the table's order, read back from where the rows actually landed (a
+widget's y within its card) rather than the order the code created them; every
+declared card was drawn and nothing was drawn that no declaration knows about;
+and the window's panels are exactly the declared cards that hold no rows — a
+declared card with no panel is an empty frame, and a panel registered for a card
+that HAS rows swallows them. The schema's docstring had claimed "the contract
+guard checks that the two sets are the same" while nothing did; the claim now
+names the guard. The contract check on the keys a page names by hand was re-aimed
+rather than deleted — it reads `_row_specials` registrations now, the surface a
+rename can actually strand — and its "more than 20 keys" anti-vacuity floor,
+calibrated on the hand-grouped pages, became "both shapes found", because the
+count falling to 9 is the point of this pass rather than a regression in it.
+Eight mutations, one per property, each caught at its own assertion with every
+restore sha256-verified.
+
+**What is still hand-written, deliberately.** A card's rows can be wrapped by a
+page (a note under a switch, two limits sharing a row, a grid with a status
+line), and a page can supply a whole card that has no rows. That is not placement
+and the table does not describe it; what the table now guarantees is that a row
+is never *invisible*, never in the wrong card, and never in the wrong order
+inside one — and that the cards themselves are drawn where they are declared.
+
+## The settings window stops naming settings: a row declares its own wrapper
+(2026-09-16 — the fourth half of the typed contract)
+
+The previous half moved PLACEMENT into the table and left one surface behind on
+purpose: a page could still WRAP a generated control — a switch with a note under
+it, two limits sharing one line, the four per-state pictures as one row. That
+wrapping lived in `_row_specials`, a dict in the window keyed by setting NAME, so
+a rename moved nothing and a new setting could still need window code.
+
+`Field.also` (with `also_label`) declares the settings a row BRINGS WITH IT, and
+`Field.placeholder` / `Field.height` declare how a control that can show them
+presents itself. `also_pairs()` resolves the pairs — a bare key means the SHAPE
+names it, which is how the three extra state pictures are labelled by their
+state without a second copy of the words in the table — and `_draw_row` draws
+the row's own shape, then its companions on one line, then its paragraph.
+`_row_specials` is gone from the file (0 occurrences) rather than left for
+someone to reach for again; the three pages that used it (Voice, Appearance,
+Permissions) draw nothing by hand any more.
+
+**Verified rather than read**, on the deployed bytes: 59 table rows, **42
+generated controls and 42 built, none missing**; all **7 companion rows
+accounted for** (4 as real controls, 3 drawn and collected by the picture shape
+that owns them, each recorded in `_bespoke_drawn`); 18 cards drawn; `also_pairs`
+is what the draw reads; `_row_specials` absent from the installed source. Two new
+contract guards hold the claims, because both failures are SILENT: a companion
+must be a declared row, never the claiming row itself, never claimed twice, in
+the OWNER's card, and AFTER the owner in that card's order (a companion listed
+before its owner is drawn where it stands and the claim quietly does nothing);
+and presentation data — `placeholder`, `height`, `choice_labels` — may only sit
+on a control that can show it, since a widget ignores what it cannot use without
+saying so. **3/3 mutations caught, zero residue, every restore sha256-verified**:
+a companion moved to another card; `height` on a slider; a combo labelling a
+value it does not offer — each failing at its own assertion. 1433 tests green in
+the default order, `compile`/`shell`/`smoke` PASS, and the deployed window
+verified at the installed path (`deployment: in-sync`, 17/17 files).
+
+**What this row does NOT claim.** The order gate was not re-run for this half
+(the previous half's run is the last one on record), and the two new guards were
+mutation-swept while the offscreen SCENARIOS were only run green, not swept. The
+per-setting code that remains is the bespoke RENDERERS (model list from the
+server, mic list from the audio server, permissions grid, policy rows, alias
+editor, the colour/pack/picture pickers) — that is what "a control the table
+cannot build" means, and `_bespoke_drawn` records each one as drawn so the two
+sets cannot drift. A page can also still supply a whole card with no rows of its
+own (`_group_panels`) and content under a card's rows (`_group_tails`); those
+are panels, not placement, and the table describes neither.

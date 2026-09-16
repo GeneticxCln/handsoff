@@ -175,11 +175,19 @@ class TestAuditFixes:
         assert "brain privacy" not in text
 
     def test_settings_gui_wires_remote_opt_in(self):
-        """The Settings Brain tab must carry the checkbox and persist it."""
-        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
-        assert "remote_ollama_chk" in src
-        assert 'self.cfg["allow_remote_ollama"]' in src
-        assert 'self.cfg.get("allow_remote_ollama"' in src
+        """The Settings Brain tab carries the checkbox, and persists it by key.
+
+        The hand-written widget name (`remote_ollama_chk`) and the two cfg lines
+        beside it are gone: the control, its load and its save are generated
+        from the table, and the widget is reachable as
+        `win.allow_remote_ollama` — which is exactly what the offscreen
+        `remote_ollama_checkbox_roundtrip` scenario ticks and saves.
+        """
+        from settings_schema import control_for, fields_by_key
+        field = fields_by_key()["allow_remote_ollama"]
+        assert control_for(field) == "checkbox", field
+        assert field.tab == "brain", field
+        assert "remote" in field.title.lower(), field.title
 
     def test_late_worker_cannot_change_state_after_shutdown(self, H):
         a = H.Assistant.__new__(H.Assistant)
@@ -1577,11 +1585,23 @@ class TestResourceAlerts:
         usage = H.Assistant._resource_usage()
         assert usage == {"ram": None, "vram": None}
 
-    def test_settings_wiring(self, H):
-        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
-        for part in ("resource_chk", "ram_alert_spin", "vram_alert_spin",
-                     'resource_alerts', 'ram_alert_percent', 'vram_alert_percent'):
-            assert part in src
+    def test_settings_wiring(self):
+        """All three rows are table-driven; the hand-written names are gone.
+
+        `resource_chk` / `ram_alert_spin` / `vram_alert_spin` were the widgets
+        this file used to require in the settings app's source. The refactor
+        replaced them with generated controls (the window exposes them as
+        `win.resource_alerts`, `win.ram_alert_percent`, `win.vram_alert_percent`)
+        so the subject stays the same and the question moves to the table: one
+        checkbox and two spin boxes, all on the Voice page.
+        """
+        from settings_schema import control_for, fields_by_key
+        rows = fields_by_key()
+        assert control_for(rows["resource_alerts"]) == "checkbox"
+        assert control_for(rows["ram_alert_percent"]) == "spin"
+        assert control_for(rows["vram_alert_percent"]) == "spin"
+        for key in ("resource_alerts", "ram_alert_percent", "vram_alert_percent"):
+            assert rows[key].tab == "voice", key
 
 
 class TestEveryFlagReadIsStrict:

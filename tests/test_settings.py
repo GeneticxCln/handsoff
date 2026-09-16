@@ -566,40 +566,62 @@ class TestPiperToChatterboxMigration:
 
 
 class TestSchemaWiring:
-    """Adding a setting takes three edits, and two of them are now guarded.
+    """Adding a setting is one table row plus whatever CONSUMES it.
 
-    A new DEFAULT_SETTINGS key must reach (1) coerce_settings — guarded in
-    TestSettingsCoercion — (2) a control in the settings app, and (3) whatever
-    consumes it. Forgetting (2) fails nothing and shows nothing: the setting
-    just cannot be edited, and nobody notices. This makes that a decision.
+    A new DEFAULT_SETTINGS key must reach (1) coerce_settings, (2) a control in
+    the settings app, and (3) whatever consumes it. (1) and (2) are now both
+    generated from `settings_schema.SETTINGS_FIELDS` and guarded in
+    `tests/test_settings_contract.py`; what is left for this file is the side a
+    table cannot see — that a row a bespoke panel draws is actually named by
+    that panel, and that the one no-control bucket stays bookkeeping.
     """
 
-    # Consumed by the bubble, deliberately without a settings-app control.
-    NO_GUI_CONTROL = {
-        "tool_call_times",     # bookkeeping the bubble writes at runtime
-        "whisper_device",      # read as WHISPER_DEVICE; defaults to auto-detect
-        "confirm_seconds",     # default for the per-tool confirmation policy
-        "streaming_tts",       # read by the speech path only
-        "world_cooldown_min",  # read by the world-warning ticker
-    }
-
     def test_every_schema_key_reaches_the_settings_app(self, H):
+        """The old literal-grep, asked in the form the table makes possible.
+
+        This used to require each key's name to appear in the app's source. That
+        is the wrong question now: the control, the load line and the collect
+        line are GENERATED from the table, so a key named nowhere in the app is
+        exactly what table-driven looks like — and the four keys this test used
+        to exempt as deliberately unwired (`whisper_device`, `confirm_seconds`,
+        `streaming_tts`, `world_cooldown_min`) have controls in the table
+        today. So the literal is kept where it still means something: a row a
+        panel draws by name must BE named (or derived from a schema list, the
+        same guarantee by another route).
+        """
+        from settings_schema import SETTINGS_FIELDS, control_for, generated_keys
         source = (HERE / "handsoff-settings.py").read_text()
-        # The four per-state picture keys are wired by a LOOP that derives them
-        # from the schema (`STATE_IMAGE_KEYS`), so their literals are absent by
-        # design. Exempted only while that derivation is present, so removing it
-        # brings all four back as missing rather than passing silently.
+        rows = {field.key: control_for(field) for field in SETTINGS_FIELDS}
+        assert set(rows) == set(H.DEFAULT_SETTINGS), (
+            "the table and the shipped defaults disagree — the contract guard "
+            "in tests/test_settings_contract.py fails on this too")
+        # The per-state picture keys are wired by a LOOP that derives them from
+        # the schema (`STATE_IMAGE_KEYS`), so their literals are absent by
+        # design — exempted only while that derivation is present, so removing
+        # it brings them back as missing rather than passing silently.
         derived = set()
         if '"DESIGN_IMAGE_KEYS"' in source:
             from settings_schema import DESIGN_IMAGE_KEYS
             derived = set(DESIGN_IMAGE_KEYS)
-        missing = sorted(k for k in H.DEFAULT_SETTINGS
-                         if f'"{k}"' not in source
-                         and k not in self.NO_GUI_CONTROL
-                         and k not in derived)
-        assert missing == [], (
-            f"these settings have no settings-app wiring: {missing} — add a "
-            "control, or list them in NO_GUI_CONTROL with a reason")
+        unnamed = sorted(k for k, control in rows.items()
+                         if control == "custom"
+                         and f'"{k}"' not in source and k not in derived)
+        assert unnamed == [], (
+            f"the table says a bespoke panel draws these, and nothing in the "
+            f"settings app names them: {unnamed}")
+        # The one escape hatch, and it stays small: a row with no control is
+        # bookkeeping the BUBBLE writes, not a setting a person edits.
+        assert sorted(k for k, control in rows.items()
+                      if control == "none") == ["tool_call_times"]
+        # The four this test used to exempt now have generated controls, so no
+        # exemption list is needed — and keeping one would hide the regression
+        # it guards: a control quietly dropped from the table.
+        generated = set(generated_keys())
+        for key in ("whisper_device", "confirm_seconds", "streaming_tts",
+                    "world_cooldown_min"):
+            assert key in generated, (
+                f"{key} no longer has a control the table generates — it would "
+                "be uneditable in the settings app again")
 
 
 class TestSettingsSplit:

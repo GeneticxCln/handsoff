@@ -982,8 +982,13 @@ class TestDictationMode:
         assert _core_settings.coerce_settings({**D, "dictation": 0})["dictation"] is False
         assert _core_settings.coerce_settings(dict(D))["dictation"] is True
         src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
-        assert 'self.cfg["dictation"] = self.dictation_chk.isChecked()' in src
         assert 'Mod+Shift+D' in src and '"dictation"' in src
+        # The checkbox itself is GENERATED from the table (widget, load and
+        # save path), so the claim moves there: a checkbox row on Voice.
+        from settings_schema import control_for, fields_by_key
+        field = fields_by_key()["dictation"]
+        assert control_for(field) == "checkbox", field
+        assert field.tab == "voice", field
 
 
 class TestOperator:

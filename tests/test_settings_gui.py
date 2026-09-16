@@ -204,9 +204,9 @@ def save_roundtrip():
     seed({"model": "testmodel:latest", "mic_threshold": 700,
           "allow_remote_ollama": True})
     win.reload_from_disk()
-    win.ctx_spin.setValue(8192)
-    win.thresh_spin.setValue(750)
-    win.wake_name_edit.setText("cypher")
+    win.num_ctx.setValue(8192)
+    win.mic_threshold.setValue(750)
+    win.assistant_name.setText("cypher")
     assert win.save() is True
     on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
     assert on_disk["num_ctx"] == 8192
@@ -275,23 +275,33 @@ def disk_change_does_not_reset_unsaved_edits():
     assert win._user_edited is False
 
 
+def _spelled_value(win, key: str) -> str:
+    # The value a generated control spells beside itself. A slider travels with
+    # its own label now — the row says what its value reads as (px, ×, %) — so
+    # the label is not an attribute to reach for: it is part of the control, and
+    # this is how a test reads what it says.
+    labels = [child for child in win._controls[key].row.children()
+              if hasattr(child, "text")]
+    return " ".join(label.text() for label in labels if label.text())
+
+
 @scenario
 def appearance_energy_and_accent_roundtrip():
     # the two new Appearance knobs must survive save/load like every other key,
     # and the live preview must paint from whatever the sliders report
     seed({"model": "testmodel:latest"})
     win.reload_from_disk()
-    win.energy_slider.setValue(160)
-    win.accent_slider.setValue(80)
-    assert win.energy_label.text() == "1.6×"
-    assert win.accent_label.text() == "80%"
+    win.animation_energy.setValue(160)
+    win.bubble_accent.setValue(80)
+    assert _spelled_value(win, "animation_energy") == "1.6×"
+    assert _spelled_value(win, "bubble_accent") == "80%"
     assert win.save() is True
     on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
     assert on_disk["animation_energy"] == 1.6
     assert on_disk["bubble_accent"] == 0.8
     win.reload_from_disk()
-    assert win.energy_slider.value() == 160
-    assert win.accent_slider.value() == 80
+    assert win.animation_energy.value() == 160
+    assert win.bubble_accent.value() == 80
     win.preview.resize(420, 160)
     assert not win.preview.grab().isNull()
 
@@ -320,7 +330,7 @@ def appearance_changes_apply_without_save():
     assert notified, "the live apply must tell the running bubble to repaint"
 
     # a slider drag writes too, so the sliders are not decoration
-    win.energy_slider.setValue(160)
+    win.animation_energy.setValue(160)
     win._apply_appearance_live()
     assert json.loads(settings_file.read_text())["animation_energy"] == 1.6
 
@@ -389,7 +399,7 @@ def size_slider_applies_without_save():
     # label update and nothing else, so the bubble never resized live.
     seed({"model": "testmodel:latest", "bubble_size": 97})
     win.reload_from_disk()
-    win.size_slider.setValue(150)
+    win.bubble_size.setValue(150)
     win._apply_appearance_live()
     on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
     assert on_disk["bubble_size"] == 150
@@ -1000,7 +1010,7 @@ def a_look_sets_every_appearance_control():
         # to match the seeded defaults, the live apply correctly finds nothing
         # changed and writes nothing — and the scenario would be measuring the
         # seed rather than the click.
-        win.size_slider.setValue(96 if entry["bubble_size"] != 96 else 192)
+        win.bubble_size.setValue(96 if entry["bubble_size"] != 96 else 192)
         win._apply_appearance_live()
         win._apply_look(entry["name"])
         win._apply_appearance_live()      # what the debounce timer calls
@@ -1016,7 +1026,7 @@ def a_look_sets_every_appearance_control():
                                                        on_disk["colors"])
         assert notified, f"{entry['name']} must tell the bubble to repaint"
         assert win.design_combo.currentData() == entry["design"]
-        assert win.size_slider.value() == entry["bubble_size"]
+        assert win.bubble_size.value() == entry["bubble_size"]
         assert entry["label"] in win.look_label.text(), \
             (entry["name"], win.look_label.text())
         assert win.look_buttons[entry["name"]].isChecked(), entry["name"]
@@ -1026,7 +1036,7 @@ def a_look_sets_every_appearance_control():
     # the last look is on screen; nudge the size slider and the section must
     # stop claiming it rather than leaving a stale tick behind
     last = APPEARANCE_LOOKS[-1]
-    win.size_slider.setValue(int(last["bubble_size"]) + 1)
+    win.bubble_size.setValue(int(last["bubble_size"]) + 1)
     assert "Custom" in win.look_label.text(), win.look_label.text()
     assert not any(b.isChecked() for b in win.look_buttons.values())
     assert len(notes) == len(APPEARANCE_LOOKS)
@@ -1439,16 +1449,18 @@ def the_appearance_panel_persists_the_avatar_decoration():
     assert win.deco_colour_combo.currentData() == "rainbow"
 
     # The colour rule round-trips the same way, and it is a real choice: the
-    # wash is what painted a character the state hue.
-    tints = [win.tint_combo.itemData(i) for i in range(win.tint_combo.count())]
+    # wash is what painted a character the state hue. Its row is a GENERATED
+    # combo now (the table can build a two-word choice), so what this drives is
+    # the control the table registered under the setting's own name.
+    tints = [win.avatar_tint.itemData(i) for i in range(win.avatar_tint.count())]
     assert tints == ["state", "natural"], tints
     for value in tints:
-        win.tint_combo.setCurrentIndex(tints.index(value))
+        win.avatar_tint.setCurrentIndex(tints.index(value))
         win._collect()
         assert win.cfg["avatar_tint"] == value, win.cfg.get("avatar_tint")
     win.cfg["avatar_tint"] = "natural"
     win._load_values()
-    assert win.tint_combo.currentData() == "natural"
+    assert win.avatar_tint.currentData() == "natural"
 
 
 @scenario
@@ -1461,8 +1473,13 @@ def the_appearance_panel_offers_every_decoration_in_the_schema():
     from settings_schema import AVATAR_DECOS, AVATAR_TINTS
     offered = [win.deco_combo.itemData(i) for i in range(win.deco_combo.count())]
     assert offered == list(AVATAR_DECOS), (offered, list(AVATAR_DECOS))
-    tints = [win.tint_combo.itemData(i) for i in range(win.tint_combo.count())]
+    tints = [win.avatar_tint.itemData(i) for i in range(win.avatar_tint.count())]
     assert tints == list(AVATAR_TINTS), (tints, list(AVATAR_TINTS))
+    # ...and each value is SPELLED by the row that offers it (`choice_labels`),
+    # so a person chooses between words rather than between identifiers.
+    spelled = [win.avatar_tint.itemText(i)
+               for i in range(win.avatar_tint.count())]
+    assert spelled == ["State colours", "Original colours"], spelled
 
     # Every one of them has a sentence, and the sentence is not the same one
     # repeated: the hints are how a person chooses between them.
@@ -1892,7 +1909,7 @@ def modelswitch_clears_history():
     kept = [{"role": "user", "content": "fresh conversation"}]
     seed({"model": "thirdmodel:latest"}, history=kept)
     win.reload_from_disk()
-    win.thresh_spin.setValue(win.thresh_spin.value() + 1)
+    win.mic_threshold.setValue(win.mic_threshold.value() + 1)
     assert win.save() is True
     assert json.loads(history_file.read_text(encoding="utf-8")) == kept
     assert "Memory cleared" not in win.status_label.text()
@@ -1980,11 +1997,240 @@ def policy_rows_roundtrip():
 
 
 @scenario
+def a_table_row_alone_can_ask_for_a_note_and_a_companion_line():
+    # "let a table row declare its own wrapper content": that is the point of
+    # `explain` and `also` being schema fields — a row can say "I come with this
+    # sentence" and "these two settings belong to me", and the WINDOW needs no
+    # change at all: no method, no registration, no placement. This adds both to
+    # the table and nothing to the window, then drives the real one.
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QLabel
+    schema = settings_app.SCHEMA
+    owner, friend = "probe_evening_tail", "probe_evening_patience"
+    owner_row = schema.Field(
+        owner, "float", lo=0.0, hi=5.0, tab="brain", title="Evening tail",
+        ctrl="slider", scale=10, unit="s", decimals=1, group="server",
+        explain="How long the bubble stays awake after the last word.",
+        also=((friend, "Patience"),), also_label="Evening limits")
+    friend_row = schema.Field(friend, "float", lo=0.0, hi=30.0, tab="brain",
+                              title="Evening patience", suffix=" s",
+                              group="server")
+    # The owner comes FIRST: a companion is drawn with the row that claims it,
+    # and a companion declared before its owner is simply drawn where it is (the
+    # claim then does nothing, silently) — which is the ordering the contract
+    # guard exists to refuse in the shipped table.
+    schema.SETTINGS_FIELDS = tuple(schema.SETTINGS_FIELDS) + (owner_row, friend_row)
+    schema.DEFAULT_SETTINGS[owner] = 1.5
+    schema.DEFAULT_SETTINGS[friend] = 7.0
+    try:
+        seed({"model": "testmodel:latest", owner: 2.5, friend: 9.0})
+        fresh = settings_app.SettingsWindow()   # nothing in the window changed
+        assert owner in fresh._controls and friend in fresh._controls, (
+            sorted(fresh._controls))
+        # the window has to be LAID OUT for "where the rows landed" to mean
+        # anything: an unshown page has no geometry yet
+        tabs = [fresh.tabs.tabText(i) for i in range(fresh.tabs.count())]
+        fresh.tabs.setCurrentIndex(tabs.index("Brain"))
+        fresh.show()
+        settings_app.QApplication.processEvents()
+        here = fresh._controls[owner].widget
+        there = fresh._controls[friend].widget
+        # the note is on screen, and it is the row's own words
+        assert owner_row.explain in [lab.text() for lab in fresh.findChildren(QLabel)], \
+            "the row's own note was not drawn"
+        # the companion is drawn ONCE — with its owner, not at its own place
+        twins = [w for w in fresh.findChildren(type(there)) if w is there]
+        assert len(twins) == 1, f"the companion was drawn {len(twins)} times"
+        assert (there.mapTo(fresh, QPoint(0, 0)).y()
+                > here.mapTo(fresh, QPoint(0, 0)).y()), \
+            "the companion was not drawn under the row that claims it"
+        assert fresh.status_label is not None      # the window is whole
+        # both are ordinary rows: the value on disk loaded, and the edit is
+        # collected the same way any other row's is
+        assert fresh._controls[owner].read() == 2.5, fresh._controls[owner].read()
+        assert fresh._controls[friend].read() == 9.0, fresh._controls[friend].read()
+        fresh._collect()
+        assert fresh.cfg[friend] == fresh._controls[friend].read()
+    finally:
+        schema.SETTINGS_FIELDS = tuple(field for field in schema.SETTINGS_FIELDS
+                                       if field.key not in (owner, friend))
+        schema.DEFAULT_SETTINGS.pop(owner, None)
+        schema.DEFAULT_SETTINGS.pop(friend, None)
+
+
+@scenario
+def the_pages_are_the_tables_cards_in_the_tables_order():
+    # "have every settings page render its groups and rows in table order": the
+    # page IS a loop over the schema's cards, so what is drawn is the declared
+    # order — and this reads the real widget tree back and holds the two
+    # together. It matters because every way of getting it wrong is silent at
+    # build time: a card in the wrong place, a card no declaration knows about,
+    # or a row that reached no card at all (the renderer just never reaches it).
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QGroupBox, QLabel, QScrollArea
+    schema = settings_app.SCHEMA
+    tabs = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+    # The pages come from the TABLE, not from a list written here: a page that
+    # declares cards is checked, and one added later is checked without an edit.
+    pages = [name for name in tabs if schema.page_groups(name.lower())]
+    assert len(pages) >= 5, (pages, tabs)
+    checked_rows = 0
+    for label in pages:
+        page = label.lower()
+        idx = tabs.index(label)
+        win.tabs.setCurrentIndex(idx)      # an unraised card is never laid out
+        settings_app.QApplication.processEvents()
+        widget = win.tabs.widget(idx)
+        scroll = widget.findChild(QScrollArea)
+        content = scroll.widget() if scroll is not None else widget
+        wanted = [schema.group_title(page, group)
+                  for group in schema.page_groups(page)]
+        drawn, cards = [], []
+        for i in range(content.layout().count()):
+            item = content.layout().itemAt(i)
+            held = item.widget() if item is not None else None
+            if isinstance(held, QGroupBox):
+                drawn.append(held.title())
+                cards.append(held)
+            elif held is not None and held.objectName() == "card":
+                heads = [lab.text() for lab in held.findChildren(QLabel)
+                         if lab.objectName() == "cardTitle"]
+                drawn.append(heads[0] if heads else "")
+                cards.append(held)
+        assert drawn == wanted, (label, drawn, wanted)
+        # ...and a row's place INSIDE its card is the table's order too, read
+        # from where the rows actually landed (a row's y) rather than from the
+        # order the code happened to create them in.
+        for group, card in zip(schema.page_groups(page), cards):
+            keys = [key for key, control in win._controls.items()
+                    if control.widget is not None
+                    and card.isAncestorOf(control.widget)]
+            if len(keys) < 2:
+                continue                   # one row cannot be out of order
+            rows = [key for key in (f.key for f in schema.group_fields(page, group))
+                    if key in keys]
+            # (y, x), not just y: two rows that share a line (a switch's limits
+            # under it) have the same height and are ordered left to right.
+            drawn_order = sorted(
+                keys, key=lambda key: (
+                    win._controls[key].widget.mapTo(card, QPoint(0, 0)).y(),
+                    win._controls[key].widget.mapTo(card, QPoint(0, 0)).x()))
+            assert drawn_order == rows, (label, group, drawn_order, rows)
+            checked_rows += 1
+    assert checked_rows >= 3, checked_rows
+    # Every declared card was drawn, and no card was drawn that no declaration
+    # knows about — the set that would otherwise show up as an empty frame in
+    # one direction and an unreachable control in the other.
+    declared = {(row[0], row[1]) for row in schema.PAGE_GROUPS}
+    assert set(win._cards) == declared, (
+        sorted(declared - set(win._cards)),
+        sorted(set(win._cards) - declared))
+    # A card with no table rows is a PANEL the window supplies, and the two sets
+    # have to be the same set: a declared card with neither rows nor a panel is
+    # an empty frame, and a panel registered for a card that HAS rows swallows
+    # them (the page skips a card it thinks the panel drew) — the second one is
+    # worse, and neither is loud anywhere else.
+    assert set(win._group_panels) == set(schema.panel_groups()), (
+        sorted(set(schema.panel_groups()) - set(win._group_panels)),
+        sorted(set(win._group_panels) - set(schema.panel_groups())))
+
+
+@scenario
+def the_windows_controls_are_the_tables_rows():
+    # The window builds its controls from the table, so the two have to agree in
+    # BOTH directions. A row that generates a control and gets none is the
+    # dangerous one: the window logs the skip and carries on (it is the tool you
+    # open when the bubble is broken), so nothing else in the suite would notice
+    # that a setting had become unreachable.
+    schema = settings_app.SCHEMA
+    generated = tuple(schema.generated_keys())
+    assert len(generated) > 30, generated          # never vacuous
+    # Membership, not order: the PAGES decide where a row goes (a page groups
+    # its rows by hand around its bespoke cards), and the table decides which
+    # rows exist. A row here with no control is one the window silently skipped
+    # (it logs and carries on, being the tool you open when the bubble is
+    # broken); a control with no row is a second widget for one setting.
+    assert set(win._controls) == set(generated), (
+        f"rows with no control: {sorted(set(generated) - set(win._controls))}; "
+        f"controls with no row: {sorted(set(win._controls) - set(generated))}")
+    for key, control in win._controls.items():
+        assert control.title, key                  # a row nobody can name
+    # Every setting is reachable from this window: generated, drawn by name, or
+    # declared as having no control at all. Which is what makes reading the
+    # table enough to know the window can show it.
+    rows = {field.key: schema.control_for(field)
+            for field in schema.SETTINGS_FIELDS}
+    covered = (set(win._controls) | set(win._bespoke_drawn)
+               | {key for key, control in rows.items() if control == "none"})
+    assert covered == set(rows), (
+        f"setting(s) this window cannot change: {sorted(set(rows) - covered)}")
+    # What the panels RECORDED while building is what the window DECLARED. The
+    # declaration is what the Qt-free guard reads, so the two drifting apart is
+    # how a bespoke row would end up declared-and-not-drawn.
+    declared = set(settings_app.SettingsWindow.BESPOKE_KEYS)
+    assert set(win._bespoke_drawn) == declared, (
+        f"declared but never drawn: {sorted(declared - set(win._bespoke_drawn))}; "
+        f"drawn but never declared: {sorted(set(win._bespoke_drawn) - declared)}")
+
+
+@scenario
+def a_table_row_alone_becomes_a_working_control():
+    # "a new setting stops needing a hand-written widget, load and collect path":
+    # this adds a row to the TABLE and nothing to the window, then drives the real
+    # window — the control appears with the row's own type, bounds and wording,
+    # the value on disk loads, the edit collects through the loader's own
+    # coercion, and the value survives a save and a reload. The row is placed on
+    # the Brain page by naming that page's card, which is ALL the placement there
+    # is now: the card is declared in the schema and the row lands in it because
+    # it says so, with no line in the window to keep in step — the previous
+    # scenario fails the moment a table row has no control.
+    from PySide6.QtWidgets import QSlider
+    schema = settings_app.SCHEMA
+    key = "probe_evening_tail"
+    row = schema.Field(key, "float", lo=0.0, hi=5.0, tab="brain",
+                       title="Evening tail", ctrl="slider", scale=10,
+                       unit="s", decimals=1, group="server",
+                       tip="How long the bubble stays awake after the last word.")
+    schema.SETTINGS_FIELDS = tuple(schema.SETTINGS_FIELDS) + (row,)
+    schema.DEFAULT_SETTINGS[key] = 1.5
+    try:
+        seed({"model": "testmodel:latest", key: 2.5})
+        fresh = settings_app.SettingsWindow()   # nothing in the window changed
+        control = fresh._controls.get(key)
+        assert control is not None, "the table row drew no control"
+        assert isinstance(control.widget, QSlider), type(control.widget)
+        assert (control.widget.minimum(), control.widget.maximum()) == (0, 50), \
+            (control.widget.minimum(), control.widget.maximum())
+        assert control.title == "Evening tail", control.title
+        assert control.widget.toolTip() == row.tip, control.widget.toolTip()
+        assert control.read() == 2.5, control.read()      # loaded from disk
+        assert "2.5 s" in _spelled_value(fresh, key)
+        control.widget.setValue(40)                       # 4.0 s
+        fresh._collect()
+        assert fresh.cfg[key] == 4.0, fresh.cfg[key]
+        # The row's bounds are the LOADER's, not the widget's: the same answer
+        # whether the value came from this control or a hand-edited file.
+        assert settings_app._core_module("settings").coerce_setting(key, 99) == 5.0
+        assert fresh.save() is True, fresh.status_label.text()
+        assert json.loads(settings_file.read_text())[key] == 4.0
+        fresh.reload_from_disk()
+        assert fresh._controls[key].read() == 4.0
+        # and it is still a row the contract covers: the window's controls are
+        # the table's, with the new one in it
+        assert key in schema.generated_keys()
+        assert key in fresh._controls
+    finally:
+        schema.SETTINGS_FIELDS = tuple(field for field in schema.SETTINGS_FIELDS
+                                       if field.key != key)
+        schema.DEFAULT_SETTINGS.pop(key, None)
+
+
+@scenario
 def remote_ollama_checkbox_roundtrip():
-    win.remote_ollama_chk.setChecked(True)
+    win.allow_remote_ollama.setChecked(True)
     win._collect()
     assert win.cfg["allow_remote_ollama"] is True
-    win.remote_ollama_chk.setChecked(False)
+    win.allow_remote_ollama.setChecked(False)
     win._collect()
     assert win.cfg["allow_remote_ollama"] is False
 
@@ -2005,16 +2251,16 @@ def model_picker_and_tts_reference():
     win.refresh_tts()
     assert "chatterbox-turbo" in win.tts_engine_label.text()
     assert win.tts_ref_status.text() == "" or "weights" in win.tts_ref_status.text()
-    win.tts_ref_edit.setText(str(short_clip))
+    win.tts_reference.setText(str(short_clip))
     win.refresh_tts()
     assert "⚠" in win.tts_ref_status.text() and "5" in win.tts_ref_status.text(), \
         win.tts_ref_status.text()
-    win.tts_ref_edit.setText(str(ok_clip))
+    win.tts_reference.setText(str(ok_clip))
     win.refresh_tts()
     assert "optimus" in win.tts_ref_status.text()
     win._collect()
     assert win.cfg["tts_reference"] == str(ok_clip)
-    win.tts_ref_edit.setText("")
+    win.tts_reference.setText("")
     win.refresh_tts()
     assert "built-in" in win.tts_ref_status.text(), win.tts_ref_status.text()
 
@@ -3504,7 +3750,7 @@ def refresh_models_lists_pins_and_survives_a_dead_server():
         return {"capabilities": ["tools"]}
 
     settings_app.http_json = fake_http
-    win.host_edit.setText("127.0.0.1:11434")     # no scheme: prefix required
+    win.ollama_host.setText("127.0.0.1:11434")     # no scheme: prefix required
     win.cfg["model"] = "gemma4:latest"
     win.refresh_models()
     deadline = time.time() + 5.0
@@ -3563,10 +3809,10 @@ def tts_reference_pick_clear_and_report():
         win._pick_reference()
     finally:
         QFileDialog.getOpenFileName = real_pick
-    assert picked and win.tts_ref_edit.text().endswith("optimus.wav")
+    assert picked and win.tts_reference.text().endswith("optimus.wav")
     assert win.tts_ref_status.text(), "the clip report must render"
     win._clear_reference()
-    assert win.tts_ref_edit.text() == ""
+    assert win.tts_reference.text() == ""
 
 
 @scenario
@@ -3675,7 +3921,7 @@ def the_mic_live_tick_renders_every_probe_state():
     win._live_probe = fake
     win.mic_live_btn.setChecked(True)
     assert started and started[0] == (win.mic_combo.currentData(),
-                                      win.thresh_spin.value())
+                                      win.mic_threshold.value())
 
     def render(snap):
         fake.snap = snap
@@ -4238,7 +4484,7 @@ def every_declared_permission_survives_a_save():
     seed({"model": "testmodel:latest", "permissions": {key: False}})
     win.reload_from_disk()
     assert win.perm_checks[key].isChecked() is False, key
-    win.thresh_spin.setValue(win.thresh_spin.value() + 1)
+    win.mic_threshold.setValue(win.mic_threshold.value() + 1)
     assert win.save() is True
     on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
     saved = set(on_disk.get("permissions") or {})
@@ -4540,6 +4786,10 @@ SCENARIO_NAMES = [
     "every_declared_permission_survives_a_save",
     "the_window_writes_the_schema_vocabulary_not_a_copy_of_it",
     "a_schema_key_with_no_control_survives_a_save",
+    "the_windows_controls_are_the_tables_rows",
+    "a_table_row_alone_becomes_a_working_control",
+    "the_pages_are_the_tables_cards_in_the_tables_order",
+    "a_table_row_alone_can_ask_for_a_note_and_a_companion_line",
 ]
 
 

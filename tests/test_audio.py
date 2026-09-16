@@ -2131,13 +2131,21 @@ class TestMicSelfHeal:
         assert coerced("") is False
         assert coerced("yes") is True
 
-    def test_settings_checkbox_wiring(self, H):
-        """The Voice-tab checkbox exists and is loaded from / saved to cfg."""
-        src = (HERE / "handsoff-settings.py").read_text(encoding="utf-8")
-        assert 'QCheckBox(\n            "Auto-recover the microphone' in src
-        assert ('self.selfheal_chk.setChecked(bool(self.cfg.get('
-                '"mic_selfheal", True)))') in src
-        assert 'self.cfg["mic_selfheal"] = self.selfheal_chk.isChecked()' in src
+    def test_settings_checkbox_wiring(self):
+        """The Voice-tab checkbox comes from the table, load and save included.
+
+        This used to grep the app's source for a hand-written widget name
+        (`self.selfheal_chk`) together with its load and save lines. All three
+        are generated from `settings_schema.SETTINGS_FIELDS` now, and the window
+        exposes the widget under the setting's own name (`win.mic_selfheal`, the
+        name the offscreen checkbox scenarios drive), so what has to be true is
+        asked of the table: a checkbox row on the Voice page.
+        """
+        from settings_schema import control_for, fields_by_key
+        field = fields_by_key()["mic_selfheal"]
+        assert control_for(field) == "checkbox", field
+        assert field.tab == "voice", field
+        assert "microphone" in field.title.lower(), field.title
 
 
 class TestUtteranceHealth:

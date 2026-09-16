@@ -233,6 +233,8 @@ class TestTheAppearanceTabReadsTheSameTable:
 
         Parsed with `ast`: the mapping is one `self.cfg["key"] = ...` per
         control, and a text sweep would also match the comments explaining it.
+        The literal writes that remain are the keys a bespoke panel owns — the
+        generated ones are read in a single loop, which is the next guard.
         """
         schema = _schema()
         mod = _load("handsoff_settings_collect", HERE / "handsoff-settings.py")
@@ -250,11 +252,320 @@ class TestTheAppearanceTabReadsTheSameTable:
             key = node.slice
             if isinstance(key, ast.Constant) and isinstance(key.value, str):
                 written.add(key.value)
-        assert len(written) > 20, written          # never vacuous
+        assert len(written) >= 8, written          # never vacuous
         undeclared = sorted(written - set(schema.DEFAULT_SETTINGS))
         assert undeclared == [], (
             f"the form writes setting(s) nothing declares: {undeclared} — add "
             "a row to settings_schema.SETTINGS_FIELDS")
+
+    def test_the_form_collects_every_generated_control_in_one_loop(self):
+        """The generated half of the save path, pinned to the mechanism.
+
+        `_load_values` and `_collect` both walk `self._controls`, which is what
+        makes a new row need no line in either. Counting the literal writes
+        above would call that loop-covered key MISSING, so the loop is asserted
+        directly: a generated key collected by hand would be the second source
+        of truth this table exists to remove.
+        """
+        mod = _load("handsoff_settings_collect_loop", HERE / "handsoff-settings.py")
+        for name in ("_collect", "_load_values"):
+            src = textwrap.dedent(inspect.getsource(getattr(mod.SettingsWindow, name)))
+            reached = set()
+            for node in ast.walk(ast.parse(src)):
+                if not isinstance(node, ast.For):
+                    continue
+                it = node.iter
+                if not (isinstance(it, ast.Call)
+                        and isinstance(it.func, ast.Attribute)
+                        and it.func.attr == "items"
+                        and isinstance(it.func.value, ast.Attribute)
+                        and it.func.value.attr == "_controls"):
+                    continue
+                reached.update(n.id for n in ast.walk(node.target)
+                               if isinstance(n, ast.Name))
+            assert "key" in reached, (
+                f"`{name}` no longer reads the generated controls from "
+                "`self._controls` — a new table row would then need a line "
+                "added here, which is the hand-written path this contract "
+                "removes")
+
+
+class TestTheWindowDrawsTheTable:
+    """Every setting has a control, and the window's controls are the table's rows.
+
+    A setting used to be drawn wherever somebody remembered to draw it, so a new
+    one cost a widget here, a load line there and a collect line somewhere else —
+    and the three forgot at different times, which is how a live row ends up with
+    nothing on screen and a control ends up saving nothing. The window builds its
+    controls FROM the table now, and draws a row in the SHAPE the row asks for,
+    so this holds those promises without Qt: every control and every shape a row
+    names is one the window implements, no shape is dead code, and a row the
+    table cannot build a control for is one something actually draws.
+    """
+
+    def _window_module(self):
+        return _load("handsoff_settings_controls", HERE / "handsoff-settings.py")
+
+    def test_every_control_a_row_names_is_one_the_window_implements(self):
+        schema = _schema()
+        built = set(self._window_module()._CONTROL_BUILDERS)
+        assert built, "no control builders — this guard would be vacuous"
+        assert built <= set(schema.CONTROL_NAMES), (
+            "the window implements a control the schema does not declare, so "
+            "no row can ask for it: "
+            f"{sorted(built - set(schema.CONTROL_NAMES))}")
+        for field in schema.SETTINGS_FIELDS:
+            control = schema.control_for(field)
+            assert control, (
+                f"{field.key} names no control and its kind {field.kind!r} has "
+                "no default one — nothing would draw it")
+            assert control in schema.CONTROL_NAMES, (
+                f"{field.key} names control {control!r}, which the schema does "
+                "not declare")
+            if control not in ("custom", "none"):
+                assert control in built, (
+                    f"{field.key} asks for a {control!r} control that "
+                    "handsoff-settings.py does not build — the row would be "
+                    "logged and skipped, and the setting unreachable")
+
+    def test_every_row_is_drawn_by_its_control_or_a_shape_that_exists(self):
+        """A row is drawn one of two ways, and BOTH ends of both ways must exist.
+
+        Either the table's generated control draws it, or the row names a SHAPE
+        (`render`) — and a shape nothing implements is a setting with no widget,
+        exactly as a control name nothing implements would be. A `custom` row is
+        the one case the table cannot build, so it must name a shape of its own
+        or be drawn as another row's companion; there is no third way in, which
+        is what makes "a new setting needs one line" safe. The shape registry is
+        also held against the declared vocabulary in both directions: a name with
+        no method and a method no name reaches are the same defect from the two
+        sides, and a shape no row asks for is dead code that hides a rename.
+        """
+        schema = _schema()
+        mod = self._window_module()
+        built = set(mod.SettingsWindow.RENDERERS)
+        assert built, "no renderers — this guard would be vacuous"
+        assert built == set(schema.RENDER_NAMES), (
+            "implemented but not declared: "
+            f"{sorted(built - set(schema.RENDER_NAMES))}; declared but not "
+            f"implemented: {sorted(set(schema.RENDER_NAMES) - built)}")
+        claims = schema.claimed_keys()
+        for field in schema.SETTINGS_FIELDS:
+            name = schema.renderer_for(field)
+            if name:
+                assert name in built, (
+                    f"{field.key} asks to be drawn as {name!r}, which "
+                    "handsoff-settings.py does not implement — the row would be "
+                    "named in the journal and skipped")
+            if schema.control_for(field) == "custom":
+                assert name or field.key in claims, (
+                    f"{field.key} is a custom row that nothing draws: no render "
+                    "of its own, and no row claims it in `also`")
+        used = {field.render for field in schema.SETTINGS_FIELDS if field.render}
+        assert sorted(set(schema.RENDER_NAMES) - used) == [], (
+            f"shape(s) no row asks for: {sorted(set(schema.RENDER_NAMES) - used)}")
+
+    def test_companion_rows_are_declared_well_formed_and_drawn_once(self):
+        """`also` is a placement claim, so a broken one is a lost setting.
+
+        A companion is skipped at its own table position and drawn with the row
+        that claims it, so the claim has to be exact: a declared row, never the
+        claiming row itself, never claimed twice (the second owner would simply
+        never see it), in the OWNER's card, and AFTER the owner in that card's
+        order — a companion drawn before its owner is drawn where it is and the
+        claim quietly does nothing.
+        """
+        schema = _schema()
+        place = {field.key: (field.tab, field.group)
+                 for field in schema.SETTINGS_FIELDS}
+        order = {key: [f.key for f in schema.group_fields(tab, group)]
+                 for key, (tab, group) in place.items()}
+        claimed: dict = {}
+        for field in schema.SETTINGS_FIELDS:
+            for key, _label in schema.also_pairs(field):
+                assert key in place, (
+                    f"{field.key} claims {key!r}, which the table has no row for")
+                assert key != field.key, f"{field.key} claims itself"
+                assert key not in claimed, (
+                    f"{key} is claimed by both {claimed.get(key)} and {field.key}")
+                claimed[key] = field.key
+                assert place[key] == place[field.key], (
+                    f"{field.key} claims {key} from another card: "
+                    f"{place[key]} is not {place[field.key]}")
+                assert (order[field.key].index(key)
+                        > order[field.key].index(field.key)), (
+                    f"{key} is declared BEFORE the row that claims it "
+                    f"({field.key}), so the claim would do nothing")
+        assert claimed, "no `also` claims: this guard would be vacuous"
+
+    def test_presentation_data_only_sits_on_rows_that_can_show_it(self):
+        """A placeholder on a checkbox, a height on a spin box: data nobody reads.
+
+        Each of these is a row asking to be drawn in a way its control cannot,
+        and the failure is perfectly quiet — the widget simply ignores it — which
+        is why the table has to be checked instead of the screen. The labels a
+        combo spells are checked the same way: a label for a value the row does
+        not offer is a typo that changes nothing.
+        """
+        schema = _schema()
+        seen = {"placeholder": 0, "height": 0, "choice_labels": 0, "explain": 0}
+        for field in schema.SETTINGS_FIELDS:
+            control = schema.control_for(field)
+            if field.placeholder:
+                seen["placeholder"] += 1
+                assert control in ("line", "lines"), (field.key, control)
+            if field.height:
+                seen["height"] += 1
+                assert control == "lines", (field.key, control)
+            if field.explain:
+                seen["explain"] += 1
+            if field.choice_labels:
+                seen["choice_labels"] += 1
+                assert control == "combo", (field.key, control)
+                offered = {str(choice) for choice in field.choices}
+                spelled = {str(value) for value, _words in field.choice_labels}
+                assert spelled <= offered, (
+                    f"{field.key} spells a value it does not offer: "
+                    f"{sorted(spelled - offered)}")
+        # never vacuous: every one of these is in use somewhere in the table
+        assert all(seen.values()), seen
+
+    @staticmethod
+    def _main_tab_names(mod) -> set:
+        """The pages the window actually builds, read from `__init__`'s addTab.
+
+        Read rather than listed: a page renamed in the window must fail the guard
+        below, and a list here would have to be renamed with it — which is the
+        kind of agreement-in-two-places this file exists to refuse. Only the MAIN
+        tabs count (the History page's own sub-tabs are not settings pages), so
+        the call has to be on the `tabs` widget itself.
+        """
+        src = textwrap.dedent(inspect.getsource(mod.SettingsWindow.__init__))
+        names = set()
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            if getattr(node.func, "attr", "") != "addTab":
+                continue
+            if getattr(getattr(node.func, "value", None), "id", "") != "tabs":
+                continue
+            label = node.args[1]
+            if isinstance(label, ast.Constant) and isinstance(label.value, str):
+                names.add(label.value.lower())
+        return names
+
+    def test_a_generated_row_declares_the_label_and_the_page_it_needs(self):
+        """A widget with no label names nothing, and one on no page is unreachable.
+
+        The page is also checked against the main tabs the window builds, read
+        from `__init__`: a row assigned to a page that does not exist is the
+        quietest version of this failure — the control is built, registered and
+        never shown.
+        """
+        schema = _schema()
+        mod = self._window_module()
+        for field in schema.SETTINGS_FIELDS:
+            if schema.control_for(field) in ("custom", "none", ""):
+                continue
+            assert field.title, (
+                f"{field.key} declares no title, so its row would be labelled "
+                "with the setting's own name")
+            assert field.title != field.key, (field.key, field.title)
+            assert field.tab, (
+                f"{field.key} builds a control that no page of the settings "
+                "window shows")
+        pages = self._main_tab_names(mod)
+        assert len(pages) >= 5, pages
+        wanted = {field.tab for field in schema.SETTINGS_FIELDS if field.tab}
+        assert wanted <= pages, (
+            f"row(s) assigned to pages the window never builds: "
+            f"{sorted(wanted - pages)}")
+
+    def test_every_row_lands_in_a_card_the_table_declares(self):
+        """A row's card IS its placement, so a card nothing declares is no card.
+
+        The window draws a page by walking the cards the schema declares and
+        placing each card's rows, so a row whose `group` names no declared card
+        reaches no widget at all: nothing raises, nothing is logged, the row is
+        simply never iterated. That is the quietest way a new setting can end up
+        invisible, and it is why `group` has to be a declared name rather than a
+        free string.
+        """
+        schema = _schema()
+        cards = tuple(schema.PAGE_GROUPS)
+        assert cards, "no cards declared: this guard would be vacuous"
+        for row in cards:
+            assert row[2], f"card {row[0]}/{row[1]} has no title to show"
+        declared = {(row[0], row[1]) for row in cards}
+        for field in schema.SETTINGS_FIELDS:
+            if schema.control_for(field) == "none":
+                continue            # runtime bookkeeping: never drawn at all
+            assert field.group, (
+                f"{field.key} names no card, so no page would ever place it")
+            assert (field.tab, field.group) in declared, (
+                f"{field.key} asks for card {field.group!r} on page "
+                f"{field.tab!r}, which nothing declares — its control would be "
+                "built and never shown")
+
+    # The guard that read the keys a PAGE named by hand — the helper calls and
+    # row-special registrations this class used to walk — is GONE rather than
+    # re-aimed: the pass that gave every row its own `render` removed the last
+    # such call (`_control_for_key("mic_threshold")` became `field.key`), so
+    # there is no key left to mis-spell. What a page still names directly is the
+    # WIDGET of a row it reads, and the guard below covers exactly that.
+
+    def test_every_attribute_the_window_reads_is_a_generated_control(self):
+        """`self.ollama_host` is a reference to a widget the TABLE builds.
+
+        The generated controls are registered under the setting's own name
+        (`setattr(self, field.key, control.widget)`), which is convenient and
+        load-bearing: the pages read a few of them back by name — the server URL
+        while refreshing models, the reference clip beside its Choose button, the
+        threshold the live meter restarts on. A row that stops being generated
+        (becoming `custom`) leaves those references dangling, and the window
+        raises at OPEN, which is the worst place: it is the tool you open when
+        the bubble is already broken.
+        """
+        schema = _schema()
+        mod = self._window_module()
+        declared = set(schema.DEFAULT_SETTINGS)
+        generated = set(schema.generated_keys())
+        src = textwrap.dedent(inspect.getsource(mod.SettingsWindow))
+        referenced = set()
+        for node in ast.walk(ast.parse(src)):
+            if not (isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "self"
+                    and isinstance(node.ctx, ast.Load)):
+                continue
+            if node.attr in declared:
+                referenced.add(node.attr)
+        assert len(referenced) >= 3, sorted(referenced)   # never vacuous
+        dangling = sorted(referenced - generated)
+        assert dangling == [], (
+            f"the window reads these settings as widgets, and the table no "
+            f"longer generates a control for them: {dangling} — the window "
+            "would raise at open; either generate the control again or reach "
+            "the value through `_controls`")
+
+    def test_the_only_control_less_rows_are_runtime_bookkeeping(self):
+        """`ctrl="none"` is a promise that no PERSON sets this key.
+
+        It is the one escape hatch in the table, so it stays a list a person can
+        read: a setting the bubble writes for itself. A user-facing setting
+        landing here would be invisible in the window with nothing to say so.
+        """
+        schema = _schema()
+        control_less = sorted(field.key for field in schema.SETTINGS_FIELDS
+                              if schema.control_for(field) == "none")
+        assert control_less == ["tool_call_times"], (
+            f"a setting with no control and no bespoke panel: {control_less} — "
+            "either give it a control or move it out of the settings table")
+        for field in schema.SETTINGS_FIELDS:
+            if schema.control_for(field) != "none":
+                continue
+            assert field.tab == "", (
+                f"{field.key} has no control but claims the {field.tab!r} page")
 
 
 class TestDeclaredBehaviourChanges:

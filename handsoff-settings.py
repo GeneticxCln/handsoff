@@ -149,6 +149,107 @@ DEFAULT_SETTINGS = SCHEMA.DEFAULT_SETTINGS
 SETTINGS_VERSION = SCHEMA.SETTINGS_VERSION
 
 
+def _page_fields(tab: str) -> tuple:
+    """Every row the table puts on one page, in the table's own order.
+
+    A page is a list of rows and nothing else: that is what makes adding a
+    setting one line in settings_schema.py rather than a widget here plus a load
+    line plus a collect line.
+    """
+    return tuple(field for field in getattr(SCHEMA, "SETTINGS_FIELDS", ())
+                 if getattr(field, "tab", "") == tab)
+
+
+def _page_groups(page: str) -> tuple:
+    """The CARDS of one page, in the order the table declares them.
+
+    A page is a loop over these; the rows of each card are the table's. That is
+    what makes placement — which card a setting appears in — part of the one
+    declaration, so a new setting needs no line in this file to be visible.
+    """
+    getter = getattr(SCHEMA, "page_groups", None)
+    return tuple(getter(page)) if getter else ()
+
+
+def _group_fields(page: str, group: str) -> tuple:
+    """The rows of one card, in the table's own order."""
+    getter = getattr(SCHEMA, "group_fields", None)
+    if getter is None:                  # an older schema: the whole page
+        return tuple(field for field in getattr(SCHEMA, "SETTINGS_FIELDS", ())
+                     if getattr(field, "tab", "") == page)
+    return tuple(getter(page, group))
+
+
+def _group_title(page: str, group: str) -> str:
+    """What a card says; the group's own key when this build has no title."""
+    getter = getattr(SCHEMA, "group_title", None)
+    return getter(page, group) if getter else group
+
+
+def _group_hint(page: str, group: str) -> str:
+    """The line a card shows under its title ("" when it shows none).
+
+    The subtitle belongs to the card rather than to the page that draws it, so
+    it lives beside the title in the table — including for the Appearance cards,
+    whose subtitles used to be written here as strings the schema could not see.
+    """
+    getter = getattr(SCHEMA, "group_hint", None)
+    return getter(page, group) if getter else ""
+
+
+class _Rows:
+    """Where a card's rows go: a form, or a card's own column of rows.
+
+    One renderer and two layouts, so a page can be written the same way whether
+    its cards are `QGroupBox` + `QFormLayout` (Voice, Brain, Permissions) or the
+    Appearance tab's framed cards — and a row's placement does not depend on
+    which one it is.
+    """
+
+    def __init__(self, window, target, style: str) -> None:
+        self.window = window
+        self.target = target
+        self.style = style
+
+    def add(self, control) -> None:
+        """Place one control as a labelled row."""
+        if control is None:
+            return
+        if self.style == "card":
+            self.target.addLayout(
+                self.window._field(control.title, control.row))
+        else:
+            self.target.addRow(
+                "" if control.labelled else control.title, control.row)
+
+    def widget(self, widget) -> None:
+        """Place a bare widget (a note, a progress bar, a button row)."""
+        if self.style == "card":
+            self.target.addWidget(widget)
+        else:
+            self.target.addRow(widget)
+
+    def layout(self, layout) -> None:
+        """Place a layout (the shared rows: two thresholds side by side)."""
+        if self.style == "card":
+            self.target.addLayout(layout)
+        else:
+            self.target.addRow(layout)
+
+    def labelled(self, label: str, widget) -> None:
+        """Place a widget with its OWN label, in the column labels go in.
+
+        `_field` builds that column for a card (a fixed-width name beside the
+        control); a form has one already, so the label goes in its own cell. One
+        helper for both, because a row that says what it is should read the same
+        on either kind of page.
+        """
+        if self.style == "card":
+            self.target.addLayout(self.window._field(label, widget))
+        else:
+            self.target.addRow(label, widget)
+
+
 def _state_image_keys() -> tuple:
     """[(state, setting key)] for the `image` design's pictures per state.
 
@@ -239,12 +340,6 @@ from PySide6.QtWidgets import (  # noqa: E402
 # Spoken by Settings → Voice "Test voice". Kept short: the answer comes back
 # over the control socket, and `say` caps the payload anyway.
 _VOICE_TEST_LINE = "Hello, I am your desktop assistant."
-
-WHISPER_SIZES = {          # size key -> approx download size
-    "tiny": "~75 MB", "tiny.en": "~75 MB", "base": "~145 MB",
-    "base.en": "~145 MB", "small": "~500 MB", "medium": "~1.5 GB",
-    "large-v3": "~3 GB",
-}
 
 # The piper voice catalog and its download dialog are GONE. chatterbox-turbo
 # ships exactly one built-in voice and conditions on an optional reference
@@ -1435,6 +1530,248 @@ def _health_tooltip(snap: dict | None) -> str:
     return ("<pre>" + html.escape(body) + "</pre>")
 
 
+# --------------------------------------------------------------------------- #
+# Controls, built from the field table
+# --------------------------------------------------------------------------- #
+# A setting used to be spelled out in FOUR places — the schema row, the loader's
+# coercion, the widget, and both halves of the load/save path — and the parts
+# that are easy to forget drifted, each time as a setting a person could not
+# change: a permission key with no checkbox that every save silently
+# re-defaulted, and settings (`streaming_tts`, `confirm_seconds`, the two
+# cooldowns, the whisper device) that had no control anywhere in the window at
+# all. The row now carries how the value is PRESENTED, and this module builds
+# the widget, its reader and its writer from it: adding a setting is one row in
+# settings_schema.py.
+class _Control:
+    """One generated control: the widget, how to read it, how to load it.
+
+    `widget` is the thing itself, so a key reads as `win.<key>` — the widget for
+    a setting is named after the setting, in the window and in its tests.
+    `row` is what a form puts on screen when the two differ (a slider travels
+    with its own value label), and `labelled` says the widget already states
+    what it is, so its form row needs no label of its own.
+    """
+
+    __slots__ = ("key", "widget", "read", "write", "row", "title", "labelled")
+
+    def __init__(self, key, widget, read, write, row=None, title="",
+                 labelled=False):
+        self.key = key
+        self.widget = widget
+        self.read = read
+        self.write = write
+        self.row = row if row is not None else widget
+        self.title = title
+        self.labelled = labelled
+
+
+def _slider_text(value: float, field) -> str:
+    """The text beside a slider: the value, its unit, no invented precision.
+
+    `show_scale` is for the row whose setting and whose wording count
+    differently — the accent is stored as a fraction and read as a percentage —
+    so the label says the number a person thinks in without moving the value.
+    """
+    shown = value * int(field.show_scale or 1)
+    unit = field.unit
+    if not unit:
+        return f"{shown:.{field.decimals}f}"
+    sep = " " if unit[0].isalnum() else ""
+    return f"{shown:.{field.decimals}f}{sep}{unit}"
+
+
+def _control_title(field: "object") -> str:
+    """The label a generated row draws: the row's title, else its key in words.
+
+    A blank label is a control nobody can identify, so the fallback is not
+    cosmetic — and `title` is what the table is expected to declare, which the
+    contract guard requires of every generated row.
+    """
+    return SCHEMA.field_title(field)
+
+
+def _build_checkbox(win, field: "object") -> _Control:
+    box = QCheckBox(_control_title(field), win)
+    box.setToolTip(field.tip)
+    box.toggled.connect(lambda *_: win._control_changed(field.key))
+    return _Control(field.key, box, box.isChecked,
+                    lambda value: box.setChecked(bool(value)),
+                    title=_control_title(field), labelled=True)
+
+
+def _build_spin(win, field: "object") -> _Control:
+    spin = QSpinBox(win)
+    # A float row keeps integer steps: the browser UI never offered a fraction,
+    # and ceil/floor of the bounds is what stops `hardware_disk_gb` offering a
+    # "warn when free disk drops below 0 GiB" row (its bound is 0.5).
+    spin.setRange(int(math.ceil(field.lo if field.lo is not None else 0)),
+                  int(math.floor(field.hi if field.hi is not None else 100)))
+    if field.step:
+        spin.setSingleStep(int(field.step))
+    if field.suffix:
+        spin.setSuffix(field.suffix)
+    if field.zero:
+        spin.setSpecialValueText(field.zero)
+    if field.tip:
+        spin.setToolTip(field.tip)
+    spin.valueChanged.connect(lambda *_: win._control_changed(field.key))
+    as_float = field.kind == "float"
+    return _Control(field.key, spin,
+                    (lambda: float(spin.value())) if as_float else spin.value,
+                    lambda value: spin.setValue(int(float(value or 0))),
+                    title=_control_title(field))
+
+
+def _build_slider(win, field: "object") -> _Control:
+    """A slider, with its value spelled out beside it.
+
+    The widget counts in integers and the setting does not, so `scale` is the
+    multiplier between them (0.5–2.0 becomes 50–200). Whatever the row calls the
+    value — px, ×, % — is what the label says.
+    """
+    scale = int(field.scale or 1)
+    row = QWidget(win)
+    lay = QHBoxLayout(row)
+    lay.setContentsMargins(0, 0, 0, 0)
+    slider = QSlider(Qt.Horizontal, row)
+    slider.setRange(int(round((field.lo if field.lo is not None else 0) * scale)),
+                    int(round((field.hi if field.hi is not None else 1) * scale)))
+    if field.tip:
+        slider.setToolTip(field.tip)
+    value_label = QLabel("", row)
+    value_label.setMinimumWidth(64)
+    lay.addWidget(slider, 1)
+    lay.addWidget(value_label)
+    as_int = field.kind == "int"
+
+    def _value():
+        raw = slider.value() / scale
+        return int(round(raw)) if as_int else raw
+
+    def _paint(*_args) -> None:
+        value_label.setText(_slider_text(_value(), field))
+
+    slider.valueChanged.connect(_paint)
+    slider.valueChanged.connect(lambda *_: win._control_changed(field.key))
+
+    def _set(value) -> None:
+        lo = field.lo if field.lo is not None else 0
+        hi = field.hi if field.hi is not None else 1
+        try:
+            held = min(hi, max(lo, float(value))) if value is not None else lo
+        except (TypeError, ValueError):
+            held = lo
+        slider.setValue(int(round(held * scale)))
+        _paint()
+
+    return _Control(field.key, slider, _value, _set, row=row,
+                    title=_control_title(field))
+
+
+def _build_line(win, field: "object") -> _Control:
+    edit = QLineEdit(win)
+    if field.tip:
+        edit.setToolTip(field.tip)
+    if field.placeholder:
+        # The example a person needs while the box is EMPTY, from the row that
+        # knows what the value looks like — not an "if key ==" branch here.
+        edit.setPlaceholderText(field.placeholder)
+    edit.textChanged.connect(lambda *_: win._control_changed(field.key))
+
+    def _read() -> str:
+        text = edit.text().strip()
+        return text.rstrip(field.rstrip) if field.rstrip else text
+
+    return _Control(field.key, edit, _read,
+                    lambda value: edit.setText(str(value or "")),
+                    title=_control_title(field))
+
+
+def _build_combo(win, field: "object") -> _Control:
+    """A closed choice. What each one is CALLED comes from the row itself.
+
+    A spelling belongs to the choice, so it lives beside the choice in the table
+    (`choice_labels`) rather than in a second table here keyed by setting name;
+    the value stored is the row's data either way, so a label can never change
+    what is saved.
+    """
+    combo = QComboBox(win)
+    spell = dict(getattr(field, "choice_labels", ()) or ())
+    for choice in field.choices:
+        combo.addItem(spell.get(choice) or str(choice), choice)
+    if field.tip:
+        combo.setToolTip(field.tip)
+    combo.currentIndexChanged.connect(lambda *_: win._control_changed(field.key))
+
+    def _write(value) -> None:
+        index = combo.findData(value)
+        # An unknown value leaves the row on its first entry rather than on a
+        # blank: the loader would have replaced it with the default anyway, and
+        # a combo with nothing selected reads as a setting nobody chose.
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _read() -> str:
+        data = combo.currentData()
+        return str(data if data is not None else (field.choices[0] if field.choices else ""))
+
+    return _Control(field.key, combo, _read, _write, title=_control_title(field))
+
+
+def _build_lines(win, field: "object") -> _Control:
+    """One entry per line, in a box big enough to see a list in."""
+    edit = QPlainTextEdit(win)
+    # How tall the box wants to be is the row's business (`height`), because only
+    # the row knows whether it holds two lines or a script.
+    edit.setMinimumHeight(int(field.height or 72))
+    if field.tip:
+        edit.setToolTip(field.tip)
+    if field.placeholder:
+        edit.setPlaceholderText(field.placeholder)
+    edit.textChanged.connect(lambda *_: win._control_changed(field.key))
+
+    def _read() -> list:
+        out = [line.strip() for line in edit.toPlainText().splitlines() if line.strip()]
+        return out[:field.cap] if field.cap else out
+
+    return _Control(field.key, edit, _read,
+                    lambda value: edit.setPlainText(
+                        "\n".join(str(x) for x in (value or []))),
+                    title=_control_title(field))
+
+
+def _build_commas(win, field: "object") -> _Control:
+    """A short list on one line, comma separated."""
+    edit = QLineEdit(win)
+    if field.tip:
+        edit.setToolTip(field.tip)
+    edit.textChanged.connect(lambda *_: win._control_changed(field.key))
+
+    def _read() -> list:
+        out = []
+        for item in edit.text().split(","):
+            item = item.strip()
+            if not item:
+                continue
+            out.append(item.lower() if field.lower else item)
+        return out[:field.cap] if field.cap else out
+
+    return _Control(field.key, edit, _read,
+                    lambda value: edit.setText(
+                        ", ".join(str(x) for x in (value or []))),
+                    title=_control_title(field))
+
+
+_CONTROL_BUILDERS = {
+    "checkbox": _build_checkbox,
+    "spin": _build_spin,
+    "slider": _build_slider,
+    "line": _build_line,
+    "combo": _build_combo,
+    "lines": _build_lines,
+    "commas": _build_commas,
+}
+
+
 class SettingsWindow(QMainWindow):
     # EVERY value the Appearance tab owns; a change to any of them applies live.
     # `colors` and `bubble_size` belong here too: the live-apply only writes when
@@ -1464,6 +1801,41 @@ class SettingsWindow(QMainWindow):
     # replaces drifted twice (`colors`, then `avatar_deco_color`), each time as
     # the same complaint: "I changed it and nothing happened".
     APPEARANCE_KEYS = tuple(getattr(SCHEMA, "live_keys", lambda: ())())
+
+    # Every setting this window DRAWS BY HAND — the rows whose control the table
+    # cannot build (its `ctrl` is `custom`): the model list (filled from the
+    # server), the microphone device list (from the audio server), the policy
+    # rows (from the tool registry), the permissions grid, the alias editor, the
+    # autostart switch, and the Appearance tab's shape/swatch/pack/picture rows.
+    # DERIVED from the table, because the thing a guard has to catch is not "did
+    # the window list its bespoke keys" — it cannot get that wrong if it asks —
+    # but "was every one of them actually drawn", which is `_bespoke_drawn` held
+    # against this set in the GUI guard. A custom row that nothing draws (no
+    # `render` of its own, no `also` claiming it) fails the contract guard.
+    BESPOKE_KEYS = SCHEMA.bespoke_keys()
+
+    #: The SHAPES this window draws, by name (`settings_schema.RENDER_NAMES`).
+    #: A row names one and the row is drawn in it; the value is the method that
+    #: does it. The mapping IS the registry: a name with no method is a row
+    #: nothing can draw, and a method no name reaches is dead code — both are
+    #: contract-guard failures, so the two sets can only ever be one.
+    RENDERERS = {
+        "model-list": "_render_model_list",
+        "device-list": "_render_device_list",
+        "mic-test": "_render_mic_test",
+        "clip-picker": "_render_clip_picker",
+        "alias-editor": "_render_alias_editor",
+        "permission-grid": "_render_permission_grid",
+        "policy-rows": "_render_policy_rows",
+        "design-picker": "_render_design_picker",
+        "state-pictures": "_render_state_pictures",
+        "fallback-image": "_render_fallback_image",
+        "pack-picker": "_render_pack_picker",
+        "deco-picker": "_render_deco_picker",
+        "deco-colour": "_render_deco_colour",
+        "colour-grid": "_render_colour_grid",
+        "autostart": "_render_autostart",
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -1543,6 +1915,24 @@ class SettingsWindow(QMainWindow):
         # Every page goes through `_scrolling_page`: ONE scrolling
         # implementation for all six tabs, so no page can decide how tall the
         # window has to be.
+        # Every control this window builds from the table, by setting key, and
+        # every key a bespoke panel draws by hand. The two sets together are
+        # what a person can change in this window, which is a thing the contract
+        # guard can compare against the table (see tests/test_settings_gui.py).
+        self._controls: dict = {}
+        self._bespoke_drawn: set = set()
+        # Every row this window has PLACED, the cards it built, and what it
+        # draws by hand: a row the page draws itself (a list from the running
+        # system, a grid of swatches, a row two settings share), a card a panel
+        # draws whole, and the extra content that belongs under a card. The
+        # table is the default for all four, so a page says only where it
+        # differs — and the guards read these sets against the table.
+        self._drawn_keys: set = set()
+        self._cards: set = set()
+        self._group_panels: dict = {}
+        self._group_tails: dict = {}
+        # What each card's subtitle says, when it has one: page copy, kept with
+        # the page rather than in the schema.
         tabs = QTabWidget(self)
         self.tabs = tabs
         tabs.addTab(self._scrolling_page(self._brain_tab()), "Brain")
@@ -1755,6 +2145,149 @@ class SettingsWindow(QMainWindow):
             log.debug("could not read the screen geometry", exc_info=True)
         return want_w, want_h
 
+    # ------------------------------------------------ controls from the table
+
+    def _build_control(self, field) -> "_Control | None":
+        """Build one row's control, or None when a bespoke panel owns the key.
+
+        A row the table marks `custom` or `none` is skipped rather than guessed
+        at, so "what the table declares" and "what this window draws" stay
+        comparable — the contract guard compares them, instead of the two
+drifting apart one forgotten key at a time.
+        """
+        name = SCHEMA.control_for(field)
+        if name in ("custom", "none", ""):
+            return None
+        builder = _CONTROL_BUILDERS.get(name)
+        if builder is None:
+            # A row naming a control nothing implements is a setting with no
+            # widget. Raising here would take the whole recovery tool down with
+            # it (the window is what a person opens when the bubble is broken),
+            # so it is named in the journal and skipped: the guard is what fails.
+            log.warning("settings: no control named %r for %s", name, field.key)
+            return None
+        control = builder(self, field)
+        setattr(self, field.key, control.widget)
+        self._controls[field.key] = control
+        return control
+
+    def _control_for_key(self, key: str) -> "_Control | None":
+        """The table's control for one key, built and registered (or None).
+
+        For a page whose groups are laid out by hand: the ROW still comes from
+        the table (so the widget, its type and its bounds are the schema's), and
+        only the placement is the page's business.
+        """
+        field = SCHEMA.fields_by_key().get(key)
+        if field is None:
+            log.warning("settings: no table row for %s", key)
+            return None
+        return self._build_control(field)
+
+    def _control_changed(self, key: str) -> None:
+        """A generated control moved: re-apply live when its row lives there."""
+        if key in self.APPEARANCE_KEYS:
+            self._schedule_appearance_live()
+
+    # ------------------------------------------- a page is its cards, in order
+
+    def _draw_group(self, page: str, group: str, rows: "_Rows") -> None:
+        """One card: the table's rows for it, in the table's own order.
+
+        A row is drawn by what the ROW says: the shape it asks for, the
+        paragraph it carries, the settings that travel with it. Nothing here
+        knows a setting by name, which is the whole point — a new setting, or a
+        whole new card, is one line in `settings_schema.py`.
+        """
+        self._cards.add((page, group))
+        for field in _group_fields(page, group):
+            if field.key in self._drawn_keys:
+                continue
+            self._draw_row(field, rows)
+            self._drawn_keys.add(field.key)
+
+    def _draw_row(self, field, rows: "_Rows") -> None:
+        """Draw one table row: its shape, its control, and what it carries.
+
+        Three things, in one place, all of them the row's own declaration: the
+        SHAPE that draws it (`render`), the paragraph under it (`explain`), and
+        the settings it brings with it (`also` — the switches whose limits belong
+        to them, the four pictures that are one choice). A shape nothing
+        implements is named in the journal and skipped rather than raised: this
+        window is what a person opens when the bubble is already broken, and the
+        contract guard is what fails.
+        """
+        name = SCHEMA.renderer_for(field)
+        if name:
+            method = getattr(self, type(self).RENDERERS.get(name, ""), None)
+            if method is None:
+                log.warning("settings: no %r renderer for %s", name, field.key)
+            else:
+                method(rows, field)
+        else:
+            control = self._control_for_key(field.key)
+            if control is not None:
+                rows.add(control)
+        if SCHEMA.control_for(field) == "custom":
+            # The table cannot build this control, so whoever drew the row drew
+            # it by hand. Recorded HERE rather than in each renderer, so what the
+            # window DECLARES and what it DREW cannot drift apart.
+            self._bespoke_drawn.add(field.key)
+        companions = [(key, label) for key, label in SCHEMA.also_pairs(field)
+                      if key not in self._drawn_keys]
+        if companions:
+            holder = QWidget(self)
+            line = QHBoxLayout(holder)
+            line.setContentsMargins(0, 0, 0, 0)
+            any_drawn = False
+            for key, label in companions:
+                held = self._row_control(key)
+                if held is None:
+                    continue          # the shape drew it (the state pictures)
+                any_drawn = True
+                if label:
+                    line.addWidget(QLabel(label, self))
+                line.addWidget(held.row)
+            line.addStretch(1)
+            if any_drawn:
+                rows.labelled(field.also_label, holder)
+        if field.explain:
+            rows.widget(self._muted(field.explain, self))
+
+    def _group_panel(self, page: str, group: str, layout) -> bool:
+        """Draw a card that is a PANEL (no rows of its own), if this page has one.
+
+        Returns True when it drew it, so a page can be a loop over the table's
+        cards with the bespoke ones named once.
+        """
+        panel = self._group_panels.get((page, group))
+        if panel is None:
+            return False
+        panel(layout)
+        self._cards.add((page, group))
+        return True
+
+    def _group_tail(self, page: str, group: str, layout) -> None:
+        """Extra content that belongs AFTER a card's rows (a note, a strip)."""
+        tail = self._group_tails.get((page, group))
+        if tail is not None:
+            tail(layout)
+
+    def _row_control(self, key: str):
+        """The table's control for one row, marked placed (a companion row).
+
+        A companion is drawn exactly once — with the row it belongs to — and if
+        its own control is one the table cannot build, it is recorded as drawn by
+        hand for the same reason a rendered row is (`_draw_row`). A companion the
+        SHAPE draws itself (the three extra state pictures) returns None here:
+        already drawn, still marked.
+        """
+        self._drawn_keys.add(key)
+        field = SCHEMA.fields_by_key().get(key)
+        if field is not None and SCHEMA.control_for(field) == "custom":
+            self._bespoke_drawn.add(key)
+        return self._control_for_key(key)
+
     def _scrolling_page(self, body: QWidget) -> QWidget:
         """Wrap a tab's body in a scroll area, so the window never asks the
         compositor for a display taller than the content.
@@ -1786,18 +2319,31 @@ class SettingsWindow(QMainWindow):
     def _brain_tab(self) -> QWidget:
         w = QWidget(self)
         lay = QVBoxLayout(w)
-        host_group = QGroupBox("Ollama server", w)
-        form = QFormLayout(host_group)
-        self.host_edit = QLineEdit(self.cfg["ollama_host"], self)
-        form.addRow("Server URL", self.host_edit)
-        self.remote_ollama_chk = QCheckBox(
-            "Allow a remote server (send history, screenshots & schemas off this machine)", self)
-        self.remote_ollama_chk.setToolTip(
-            "handsoff refuses to talk to a non-loopback Ollama server until this is "
-            "checked (or HANDSOFF_ALLOW_REMOTE_OLLAMA=1 is set). The bubble's "
-            "conversation history, voice transcripts, and tool schemas leave your "
-            "machine when the server is remote.")
-        form.addRow("", self.remote_ollama_chk)
+        # One row on this page is drawn here (a list filled from the server);
+        # everything else is the table's, including the tool-call limit, which
+        # this window never drew before this pass.
+        for group in _page_groups("brain"):
+            card = QGroupBox(_group_title("brain", group), w)
+            form = QFormLayout(card)
+            self._draw_group("brain", group, _Rows(self, form, "form"))
+            lay.addWidget(card)
+            self._group_tail("brain", group, lay)
+        hint = QLabel(
+            "Tool-capable models (badge “tools”) can run commands and edit their own code.\n"
+            "Chat works with any model. Models are pulled with:  ollama pull <name>", w)
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addStretch(1)
+        return w
+
+    def _render_model_list(self, rows: "_Rows", field) -> None:
+        """The picker whose rows come from the SERVER, not from the schema.
+
+        A list, the line that says which model is in use NOW, and the buttons. It
+        draws those rows itself (there is no value to type), and the model's name
+        is still stored under the row's own key, which is the table's part.
+        """
+        form = rows.target
         self.model_list = QListWidget(self)
         self.model_list.setMinimumHeight(180)
         # Picking a model IS the action, like picking a shape in Appearance: the
@@ -1807,8 +2353,9 @@ class SettingsWindow(QMainWindow):
         # is a picker whose choice only takes effect if someone presses a button
         # somewhere else.
         self.model_list.currentItemChanged.connect(self._on_model_picked)
-        form.addRow("Models (🔧 tools = can control the desktop & self-modify)", self.model_list)
-        self.model_in_use = QLabel("In use now: …", self)
+        form.addRow("Models (\U0001f527 tools = can control the desktop & self-modify)",
+                    self.model_list)
+        self.model_in_use = QLabel("In use now: \u2026", self)
         self.model_in_use.setWordWrap(True)
         form.addRow("", self.model_in_use)
         row = QHBoxLayout()
@@ -1820,36 +2367,6 @@ class SettingsWindow(QMainWindow):
         row.addWidget(self.test_btn)
         row.addStretch(1)
         form.addRow(row)
-        self.ctx_spin = QSpinBox(self)
-        self.ctx_spin.setRange(1024, 131072)
-        self.ctx_spin.setSingleStep(1024)
-        self.ctx_spin.setSuffix(" tokens")
-        form.addRow("Context size", self.ctx_spin)
-        self.hist_spin = QSpinBox(self)
-        self.hist_spin.setRange(0, 131072)
-        self.hist_spin.setSingleStep(512)
-        self.hist_spin.setSuffix(" tokens")
-        self.hist_spin.setToolTip(
-            "0 = automatic (context size minus the system prompt + tool "
-            "schemas and a reply reserve). History is trimmed to this token "
-            "budget so long conversations never exceed the model's context.")
-        form.addRow("History budget", self.hist_spin)
-        self.toolrate_spin = QSpinBox(self)
-        self.toolrate_spin.setRange(0, 600)
-        self.toolrate_spin.setSpecialValueText("unlimited")
-        self.toolrate_spin.setSuffix(" /min")
-        self.toolrate_spin.setToolTip(
-            "Safety limit on tool calls per minute (0 = unlimited). "
-            "Stops the AI if it ever gets stuck in a tool-calling loop.")
-        form.addRow("Tool-call rate limit", self.toolrate_spin)
-        lay.addWidget(host_group)
-        hint = QLabel(
-            "Tool-capable models (badge “tools”) can run commands and edit their own code.\n"
-            "Chat works with any model. Models are pulled with:  ollama pull <name>", w)
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
-        lay.addStretch(1)
-        return w
 
     def _selected_model(self) -> str:
         it = self.model_list.currentItem()
@@ -1926,7 +2443,7 @@ class SettingsWindow(QMainWindow):
         lab.setStyleSheet("color: palette(mid);")
 
     def refresh_models(self) -> None:
-        base = (self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
+        base = (self.ollama_host.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
         if not base.startswith(("http://", "https://")):
             base = "http://" + base
         # Read the selection BEFORE the list is emptied. `clear()` throws the
@@ -2008,7 +2525,7 @@ class SettingsWindow(QMainWindow):
         self._model_list_syncing = False
 
     def test_model(self) -> None:
-        base = (self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
+        base = (self.ollama_host.text().strip() or DEFAULT_SETTINGS["ollama_host"]).rstrip("/")
         model = self._selected_model() or self.cfg["model"]
         self.test_btn.setEnabled(False)
         self._status(f"testing {model} …")
@@ -2034,21 +2551,57 @@ class SettingsWindow(QMainWindow):
     def _voice_tab(self) -> QWidget:
         w = QWidget(self)
         lay = QVBoxLayout(w)
+        # Every row on this page is the table's, in the shape the row asks for:
+        # the device list, the microphone test rig, the alias editor and the clip
+        # picker are SHAPES, and the rows that carry a second setting under them
+        # (the hardware limits, the alert thresholds) say so in their `also`. A
+        # new setting here needs one line in settings_schema.py and nothing in
+        # this file.
+        self._group_panels[("voice", "level")] = self._level_panel
+        self._group_tails[("voice", "stt")] = self._stt_note
+        self._group_tails[("voice", "tts")] = self._voice_test_row
+        # The page is its cards, in the table's order, and each card is the
+        # table's rows — so a new setting on this page needs one line in
+        # settings_schema.py and nothing here.
+        for group in _page_groups("voice"):
+            if self._group_panel("voice", group, lay):
+                continue
+            card = QGroupBox(_group_title("voice", group), w)
+            card_lay = QVBoxLayout(card)
+            form = QFormLayout()
+            card_lay.addLayout(form)
+            self._draw_group("voice", group, _Rows(self, form, "form"))
+            self._group_tail("voice", group, form)
+            lay.addWidget(card)
+        lay.addStretch(1)
+        return w
 
-        mic_group = QGroupBox("Microphone", w)
-        form = QFormLayout(mic_group)
-        mic_row = QHBoxLayout()
+    def _render_device_list(self, rows: "_Rows", field) -> None:
+        """The input device: a list from the audio server, plus a refresh."""
+        row = QHBoxLayout()
         self.mic_combo = QComboBox(self)
-        mic_refresh = QPushButton("Refresh", self)
-        mic_refresh.clicked.connect(self.refresh_mics)
-        mic_row.addWidget(self.mic_combo, 1)
-        mic_row.addWidget(mic_refresh)
-        form.addRow("Input device", mic_row)
-        self.thresh_spin = QSpinBox(self)
-        self.thresh_spin.setRange(50, 5000)
-        self.thresh_spin.setSingleStep(50)
-        self.thresh_spin.setToolTip("Peak loudness needed to accept a recording (noise gate)")
-        form.addRow("Recording threshold", self.thresh_spin)
+        refresh = QPushButton("Refresh", self)
+        refresh.clicked.connect(self.refresh_mics)
+        row.addWidget(self.mic_combo, 1)
+        row.addWidget(refresh)
+        rows.target.addRow(field.title, row)
+        # Reopening the live test is what makes a device switch observable, so
+        # the handler is wired here, beside the widget it belongs to.
+        self.mic_combo.currentIndexChanged.connect(
+            lambda _i: self._mic_live_restart_if_on())
+
+    def _render_mic_test(self, rows: "_Rows", field) -> None:
+        """The noise gate, with both ways of testing the microphone under it.
+
+        The row's OWN control (a spin box, from its table row) plus the rig: the
+        one-off test, the live meter, the transcript. A shape that keeps the
+        table's control places it itself, which is why this asks for it first.
+        """
+        control = self._control_for_key(field.key)
+        if control is not None:
+            rows.add(control)
+        self.mic_threshold.valueChanged.connect(
+            lambda _v: self._mic_live_restart_if_on())
         mic_test_row = QHBoxLayout()
         self.mic_test_btn = QPushButton("Test microphone (3 s)", self)
         self.mic_test_btn.clicked.connect(self.test_mic)
@@ -2056,7 +2609,7 @@ class SettingsWindow(QMainWindow):
         self.mic_bar.setRange(0, 100)
         mic_test_row.addWidget(self.mic_test_btn)
         mic_test_row.addWidget(self.mic_bar, 1)
-        form.addRow(mic_test_row)
+        rows.target.addRow(mic_test_row)
 
         # -- live test mode: continuous meter + last transcript -------------
         mic_live_row = QHBoxLayout()
@@ -2073,32 +2626,81 @@ class SettingsWindow(QMainWindow):
         mic_live_row.addWidget(self.mic_live_btn)
         self.mic_live_state = QLabel("idle", self)
         mic_live_row.addWidget(self.mic_live_state, 1)
-        form.addRow(mic_live_row)
+        rows.target.addRow(mic_live_row)
         self.mic_live_event = QLabel("", self)
         self.mic_live_event.setStyleSheet("color: palette(mid);")
-        form.addRow(self.mic_live_event)
+        rows.target.addRow(self.mic_live_event)
         self.mic_live_transcript = QLabel("", self)
         self.mic_live_transcript.setWordWrap(True)
         self.mic_live_transcript.setStyleSheet("font-weight: bold;")
-        form.addRow("Last transcript", self.mic_live_transcript)
-        self.thresh_spin.valueChanged.connect(
-            lambda _v: self._mic_live_restart_if_on())
-        self.mic_combo.currentIndexChanged.connect(
-            lambda _i: self._mic_live_restart_if_on())
-        lay.addWidget(mic_group)
+        rows.target.addRow("Last transcript", self.mic_live_transcript)
 
-        # -- live level from the RUNNING BUBBLE -----------------------------
-        # "Live test" above proves the microphone itself works; this proves the
-        # bubble is publishing the level its designs paint from, which is a
-        # different failure and was previously invisible from here.
-        level_group = QGroupBox("Live level (from the bubble)", w)
-        lvl = QVBoxLayout(level_group)
-        self.level_meter = LevelMeter(level_group)
+    def _render_alias_editor(self, rows: "_Rows", field) -> None:
+        """Workspace aliases: its own editor, one `name = workspace` per line."""
+        self.alias_edit = QPlainTextEdit(self)
+        self.alias_edit.setMaximumHeight(76)
+        self.alias_edit.setPlaceholderText(
+            "one per line:  name = workspace number\ne.g.  code = 2")
+        aliases = self.cfg.get("workspace_aliases") or {}
+        self.alias_edit.setPlainText(
+            "\n".join(f"{k} = {v}" for k, v in sorted(aliases.items())))
+        rows.target.addRow(self.alias_edit)
+
+    def _render_clip_picker(self, rows: "_Rows", field) -> None:
+        """The clip row, with the engine report above it and the status below."""
+        self.tts_engine_label = QLabel("", self)
+        self.tts_engine_label.setWordWrap(True)
+        rows.target.addRow(self.tts_engine_label)
+
+        ref_row = QHBoxLayout()
+        ref_control = self._control_for_key(field.key)
+        if ref_control is not None:
+            ref_control.widget.setPlaceholderText("(built-in voice)")
+            ref_row.addWidget(ref_control.row, 1)
+        browse = QPushButton("Choose clip…", self)
+        browse.clicked.connect(self._pick_reference)
+        clear = QPushButton("Clear", self)
+        clear.clicked.connect(self._clear_reference)
+        ref_row.addWidget(browse)
+        ref_row.addWidget(clear)
+        rows.target.addRow(field.title, ref_row)
+
+        self.tts_ref_status = QLabel("", self)
+        self.tts_ref_status.setWordWrap(True)
+        rows.target.addRow(self.tts_ref_status)
+
+    def _stt_note(self, form: QFormLayout) -> None:
+        """The whisper card's footnote, under its two table rows."""
+        note = QLabel("Smaller = faster. The model downloads on the next bubble start.",
+                      self)
+        note.setWordWrap(True)
+        form.addRow(note)
+
+    def _voice_test_row(self, form: QFormLayout) -> None:
+        """The TTS card's Test button, under the two sliders."""
+        self.voice_test_btn = QPushButton("Test voice", self)
+        self.voice_test_btn.setToolTip(
+            "Speak a line through the running bubble. It plays the SAVED voice, "
+            "rate and volume, so save first to hear a change.")
+        self.voice_test_btn.clicked.connect(self.test_voice)
+        form.addRow(self.voice_test_btn)
+
+    def _level_panel(self, layout: QVBoxLayout) -> None:
+        """The live-level card: what the BUBBLE is painting with, right now.
+
+        "Live test" above proves the microphone itself works; this proves the
+        bubble is publishing the level its designs paint from, which is a
+        different failure and was previously invisible from here. No table row
+        belongs here — the card has none, which is what makes it a panel.
+        """
+        group = QGroupBox(_group_title("voice", "level"), self)
+        lvl = QVBoxLayout(group)
+        self.level_meter = LevelMeter(group)
         lvl.addWidget(self.level_meter)
-        self.level_readout = QLabel("waiting for the bubble\u2026", level_group)
+        self.level_readout = QLabel("waiting for the bubble\u2026", group)
         self.level_readout.setStyleSheet("color: palette(mid);")
         lvl.addWidget(self.level_readout)
-        level_note = QLabel(
+        note = QLabel(
             "The exact signal the bubble's designs animate from, polled over "
             "its control socket. <b>Raw</b> is what the audio pipeline last "
             "emitted \u2014 your microphone while it listens, the bubble's own "
@@ -2106,244 +2708,10 @@ class SettingsWindow(QMainWindow):
             "painting with, so a raw bar that never moves the tick means the "
             "feed is arriving but not being shown. The bubble emits a level "
             "only while it is listening or speaking: a flat meter in a quiet "
-            "room is normal.", w)
-        level_note.setWordWrap(True)
-        lvl.addWidget(level_note)
-        lay.addWidget(level_group)
-
-        hf_group = QGroupBox("Hands-free listening", w)
-        hfl = QVBoxLayout(hf_group)
-        self.hf_chk = QCheckBox("Continuous listening — talk without pressing anything", self)
-        self.hf_chk.setToolTip("A voice-activity gate detects speech and auto-sends each utterance")
-        hfl.addWidget(self.hf_chk)
-        hf_note = QLabel(
-            "When on, the microphone stays open and the bubble turns red while you speak; "
-            "after a short pause your utterance is sent automatically. The mic is muted "
-            "while the assistant talks, so it never hears itself.", w)
-        hf_note.setWordWrap(True)
-        hfl.addWidget(hf_note)
-
-        wake_form = QFormLayout()
-        self.wake_name_edit = QLineEdit(str(self.cfg.get("assistant_name", "assistant")), w)
-        self.wake_name_edit.setMaximumWidth(220)
-        wake_form.addRow("Assistant name", self.wake_name_edit)
-        self.wake_chk = QCheckBox(
-            "Only listen when addressed by name (\u201chey assistant\u201d)", w)
-        self.wake_chk.setToolTip(
-            "On: the assistant ignores everything until you say its name, then stays "
-            "engaged for the window below. Off: it answers every utterance it hears.")
-        wake_form.addRow(self.wake_chk)
-        self.wake_secs = QSpinBox(w)
-        self.wake_secs.setRange(5, 600)
-        self.wake_secs.setSuffix(" s")
-        self.wake_secs.setValue(int(float(self.cfg.get("engage_seconds", 45.0))))
-        wake_form.addRow("Stay engaged after the wake word", self.wake_secs)
-        self.followup_secs = QSpinBox(w)
-        self.followup_secs.setRange(0, 60)
-        self.followup_secs.setSuffix(" s")
-        self.followup_secs.setSpecialValueText("Off")
-        self.followup_secs.setToolTip(
-            "After each spoken reply, listen for one follow-up without the wake "
-            "word for this many seconds (0 = off). Requires hands-free and the "
-            "wake-word gate to be on.")
-        self.followup_secs.setValue(
-            int(float(self.cfg.get("followup_seconds", 0.0))))
-        wake_form.addRow("Follow-up window after a reply", self.followup_secs)
-        self.home_edit = QLineEdit(str(self.cfg.get("home_place", "")), w)
-        self.home_edit.setPlaceholderText("e.g. Hamburg")
-        self.home_edit.setMaximumWidth(220)
-        wake_form.addRow("Home place (weather)", self.home_edit)
-        self.brief_chk = QCheckBox(
-            "Morning briefing — weather on the first \u201chello\u201d each day", w)
-        self.brief_chk.setToolTip(
-            "Needs a home place. On the first conversational utterance each day, "
-            "the assistant greets you with the live weather before answering.")
-        wake_form.addRow(self.brief_chk)
-        self.world_warn_chk = QCheckBox(
-            "World warnings — speak up about severe world events as they break", w)
-        self.world_warn_chk.setToolTip(
-            "Opt-in. Checks breaking-news and severe-weather headlines on the "
-            "existing health tick and announces urgent ones (popup always, "
-            "spoken unless already speaking), at most once per cooldown.")
-        wake_form.addRow(self.world_warn_chk)
-        self.hw_watch_chk = QCheckBox(
-            "Hardware watch — note machine changes, warn when critical", w)
-        self.hw_watch_chk.setToolTip(
-            "Opt-in. Samples cheap health signals on the existing tick and "
-            "tells the next turn about changes (popup + spoken only when "
-            "urgent: mic lost, disk critically low, Ollama down).")
-        wake_form.addRow(self.hw_watch_chk)
-        hw_row = QHBoxLayout()
-        self.hw_cool_spin = QSpinBox(w)
-        self.hw_cool_spin.setRange(5, 1440)
-        self.hw_cool_spin.setSuffix(" min")
-        self.hw_cool_spin.setToolTip("Min minutes between hardware urgents.")
-        self.hw_disk_spin = QSpinBox(w)
-        self.hw_disk_spin.setRange(1, 1000)
-        self.hw_disk_spin.setSuffix(" GiB")
-        self.hw_disk_spin.setToolTip("Warn when free disk drops below this.")
-        hw_row.addWidget(QLabel("Urgent cooldown", w))
-        hw_row.addWidget(self.hw_cool_spin)
-        hw_row.addWidget(QLabel("Disk floor", w))
-        hw_row.addWidget(self.hw_disk_spin)
-        hw_row.addStretch(1)
-        wake_form.addRow("Hardware watch", hw_row)
-        self.cal_edit = QLineEdit(
-            ", ".join(self.cfg.get("calendar_ics") or []), w)
-        self.cal_edit.setPlaceholderText(
-            "Google Calendar secret iCal URL, or /path/to/calendar.ics")
-        self.cal_edit.setMaximumWidth(220)
-        wake_form.addRow("Calendar (ICS URL or file)", self.cal_edit)
-        self.spotter_chk = QCheckBox(
-            "Audio wake spotter — detect the keyword before speech-to-text", w)
-        self.spotter_chk.setToolTip(
-            "Uses openWakeWord (~1 ms CPU per chunk) to detect the wake phrase at "
-            "the audio level and reacts in under 100 ms. Requires 'only listen when "
-            "addressed by name'. Stock keywords: hey jarvis, hey mycroft, alexa, timer.")
-        wake_form.addRow(self.spotter_chk)
-        self.spotter_edit = QLineEdit(
-            ", ".join(self.cfg.get("spotter_models") or []), w)
-        self.spotter_edit.setPlaceholderText(
-            "empty = all stock models, or e.g. hey jarvis, timer")
-        self.spotter_edit.setMaximumWidth(220)
-        wake_form.addRow("Spotter keywords", self.spotter_edit)
-        self.selfheal_chk = QCheckBox(
-            "Auto-recover the microphone — restart the audio stream and say so "
-            "when it stays broken", w)
-        self.selfheal_chk.setToolTip(
-            "If the microphone stays silent or unusable for over a minute while "
-            "hands-free is on, restart the capture stream automatically and "
-            "announce it out loud. Gives up after 3 tries (keeps logging until "
-            "the mic recovers, then re-arms).")
-        wake_form.addRow(self.selfheal_chk)
-        self.resource_chk = QCheckBox(
-            "Resource alerts — warn when RAM or GPU memory is nearly full", w)
-        self.resource_chk.setToolTip(
-            "Opt-in spoken alerts on threshold crossings. Alerts fire once while "
-            "usage is high and re-arm only after it drops below the threshold.")
-        wake_form.addRow(self.resource_chk)
-        resource_row = QHBoxLayout()
-        self.ram_alert_spin = QSpinBox(w)
-        self.ram_alert_spin.setRange(50, 99)
-        self.ram_alert_spin.setSuffix("%")
-        self.vram_alert_spin = QSpinBox(w)
-        self.vram_alert_spin.setRange(50, 99)
-        self.vram_alert_spin.setSuffix("%")
-        resource_row.addWidget(QLabel("RAM", w))
-        resource_row.addWidget(self.ram_alert_spin)
-        resource_row.addWidget(QLabel("GPU", w))
-        resource_row.addWidget(self.vram_alert_spin)
-        resource_row.addStretch(1)
-        wake_form.addRow("Alert thresholds", resource_row)
-        self.notification_chk = QCheckBox(
-            "Read desktop notifications aloud (opt-in)", w)
-        self.notification_chk.setToolTip(
-            "Private by default. When enabled, future notifications are spoken; "
-            "use the assistant's notification_reader mute action for noisy apps.")
-        wake_form.addRow(self.notification_chk)
-        self.notification_mute_edit = QLineEdit(
-            ", ".join(self.cfg.get("notification_mute_apps") or []), w)
-        self.notification_mute_edit.setPlaceholderText("muted app names, comma-separated")
-        self.notification_mute_edit.setMaximumWidth(260)
-        wake_form.addRow("Muted notification apps", self.notification_mute_edit)
-        self.dictation_chk = QCheckBox(
-            "Voice dictation — 'start dictation' types what you say into the "
-            "focused window (no AI turn); Mod+Shift+D toggles", w)
-        self.dictation_chk.setToolTip(
-            "Zero-cost dictation: transcripts are typed into whatever window is "
-            "focused, exactly like the model's own typing tool — terminals are "
-            "refused fail-closed. Toggle by voice ('start dictation' / 'stop "
-            "dictation', no wake word needed) or the Mod+Shift+D keybind.")
-        wake_form.addRow(self.dictation_chk)
-        hfl.addLayout(wake_form)
-        lay.addWidget(hf_group)
-
-        ws_group = QGroupBox("Workspace aliases (voice shortcuts)", w)
-        wsl = QVBoxLayout(ws_group)
-        self.alias_edit = QPlainTextEdit(w)
-        self.alias_edit.setMaximumHeight(76)
-        self.alias_edit.setPlaceholderText(
-            "one per line:  name = workspace number\ne.g.  code = 2")
-        aliases = self.cfg.get("workspace_aliases") or {}
-        self.alias_edit.setPlainText(
-            "\n".join(f"{k} = {v}" for k, v in sorted(aliases.items())))
-        wsl.addWidget(self.alias_edit)
-        wsl_note = QLabel(
-            "Say \u201chey assistant, go to code\u201d and it switches to the matching "
-            "workspace. Numbers stay unchanged \u2014 pure voice alias, nothing is renamed.", w)
-        wsl_note.setWordWrap(True)
-        wsl.addWidget(wsl_note)
-        lay.addWidget(ws_group)
-
-        stt_group = QGroupBox("Speech-to-text (faster-whisper)", w)
-        stt_form = QFormLayout(stt_group)
-        self.whisper_combo = QComboBox(self)
-        for size, approx in WHISPER_SIZES.items():
-            self.whisper_combo.addItem(f"{size}   ({approx} download)", size)
-        stt_form.addRow("Model size", self.whisper_combo)
-        note = QLabel("Smaller = faster. The model downloads on the next bubble start.", w)
+            "room is normal.", group)
         note.setWordWrap(True)
-        stt_form.addRow(note)
-        lay.addWidget(stt_group)
-
-        tts_group = QGroupBox("Text-to-speech", w)
-        tts_form = QFormLayout(tts_group)
-
-        self.tts_engine_label = QLabel("", w)
-        self.tts_engine_label.setWordWrap(True)
-        tts_form.addRow(self.tts_engine_label)
-
-        ref_row = QHBoxLayout()
-        self.tts_ref_edit = QLineEdit(self)
-        self.tts_ref_edit.setPlaceholderText("(built-in voice)")
-        ref_browse = QPushButton("Choose clip…", self)
-        ref_browse.clicked.connect(self._pick_reference)
-        ref_clear = QPushButton("Clear", self)
-        ref_clear.clicked.connect(self._clear_reference)
-        ref_row.addWidget(self.tts_ref_edit, 1)
-        ref_row.addWidget(ref_browse)
-        ref_row.addWidget(ref_clear)
-        tts_form.addRow("Voice clip", ref_row)
-
-        ref_note = QLabel(
-            "Optional: a clip longer than 5 seconds to clone. Leave empty for "
-            "the built-in voice.", w)
-        ref_note.setWordWrap(True)
-        tts_form.addRow(ref_note)
-
-        self.tts_ref_status = QLabel("", w)
-        self.tts_ref_status.setWordWrap(True)
-        tts_form.addRow(self.tts_ref_status)
-
-        def slider_row(slider: QSlider, label: QLabel) -> QHBoxLayout:
-            r = QHBoxLayout()
-            r.addWidget(slider, 1)
-            r.addWidget(label)
-            return r
-
-        self.rate_slider = QSlider(Qt.Horizontal, self)
-        self.rate_slider.setRange(50, 200)
-        self.rate_label = QLabel("", self)
-        self.rate_slider.valueChanged.connect(
-            lambda v: self.rate_label.setText(f"{v / 100:.2f}×"))
-        tts_form.addRow("Speech rate", slider_row(self.rate_slider, self.rate_label))
-
-        self.vol_slider = QSlider(Qt.Horizontal, self)
-        self.vol_slider.setRange(10, 200)
-        self.vol_label = QLabel("", self)
-        self.vol_slider.valueChanged.connect(
-            lambda v: self.vol_label.setText(f"{v / 100:.2f}×"))
-        tts_form.addRow("Volume", slider_row(self.vol_slider, self.vol_label))
-
-        self.voice_test_btn = QPushButton("Test voice", self)
-        self.voice_test_btn.setToolTip(
-            "Speak a line through the running bubble. It plays the SAVED voice, "
-            "rate and volume, so save first to hear a change.")
-        self.voice_test_btn.clicked.connect(self.test_voice)
-        tts_form.addRow(self.voice_test_btn)
-        lay.addWidget(tts_group)
-        lay.addStretch(1)
-        return w
+        lvl.addWidget(note)
+        layout.addWidget(group)
 
     def refresh_mics(self) -> None:
         self.mic_combo.clear()
@@ -2391,7 +2759,7 @@ class SettingsWindow(QMainWindow):
                 f"⚠ {engine} weights are NOT downloaded — the bubble will be "
                 "mute until install.sh fetches them.")
             return
-        ref = self.tts_ref_edit.text().strip()
+        ref = self.tts_reference.text().strip()
         if not ref:
             self.tts_ref_status.setText(
                 f"{engine} weights present · built-in voice")
@@ -2399,16 +2767,16 @@ class SettingsWindow(QMainWindow):
         self.tts_ref_status.setText(_reference_note(H._audio, Path(ref)))
 
     def _pick_reference(self) -> None:
-        start = self.tts_ref_edit.text().strip() or str(HOME)
+        start = self.tts_reference.text().strip() or str(HOME)
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose a voice reference clip", start,
             "Audio (*.wav *.flac *.mp3 *.m4a *.ogg);;All files (*)")
         if path:
-            self.tts_ref_edit.setText(path)
+            self.tts_reference.setText(path)
         self.refresh_tts()
 
     def _clear_reference(self) -> None:
-        self.tts_ref_edit.setText("")
+        self.tts_reference.setText("")
         self.refresh_tts()
 
     def test_mic(self) -> None:
@@ -2441,7 +2809,7 @@ class SettingsWindow(QMainWindow):
                 if box["err"]:
                     self._status(f"microphone test failed: {box['err']}")
                 else:
-                    thr = self.thresh_spin.value()
+                    thr = self.mic_threshold.value()
                     verdict = "good signal" if box["peak"] >= thr else "too quiet — lower the threshold?"
                     self._status(f"mic peak {box['peak']:.0f} (threshold {thr}) — {verdict}")
                 return
@@ -2456,7 +2824,7 @@ class SettingsWindow(QMainWindow):
             if self._live_probe is None:
                 self._live_probe = _LiveMicProbe()
             self._live_probe.start(self.mic_combo.currentData(),
-                                   self.thresh_spin.value())
+                                   self.mic_threshold.value())
             self._mic_live_tick()
         else:
             if self._live_probe is not None:
@@ -2472,7 +2840,7 @@ class SettingsWindow(QMainWindow):
                 and self.mic_live_btn.isChecked() \
                 and self._live_probe is not None:
             self._live_probe.start(self.mic_combo.currentData(),
-                                   self.thresh_spin.value())
+                                   self.mic_threshold.value())
 
     def _mic_live_tick(self) -> None:
         """Poll the probe snapshot ~5x/s and refresh meter, state, transcript."""
@@ -2774,10 +3142,45 @@ class SettingsWindow(QMainWindow):
     # ------------------------------------------------------------- permissions
 
     def _permissions_tab(self) -> QWidget:
+        # Every row is the table's, in the card the table puts it in: the
+        # permission grid and the per-tool policy rows are SHAPES
+        # (`render="permission-grid"` / `"policy-rows"`), and the two rows that
+        # needed configuring now say so themselves (the command box's height and
+        # example, the search server's placeholder). So a new setting here needs
+        # one line in settings_schema.py and nothing at all in this file.
+        self._group_tails[("permissions", "extra")] = self._blocked_note
         w = QWidget(self)
         lay = QVBoxLayout(w)
-        group = QGroupBox("Tools the assistant may use", w)
-        form = QFormLayout(group)
+        # The page is its cards, in the table's order, and each card is the
+        # table's rows — including the two that used to be placed by hand into
+        # a "tail" form of their own (dry-run and the confirmation window are
+        # ordinary rows of the policy card, and the table puts them there).
+        for group in _page_groups("permissions"):
+            if self._group_panel("permissions", group, lay):
+                continue
+            card = QGroupBox(_group_title("permissions", group), w)
+            form = QFormLayout(card)
+            self._draw_group("permissions", group, _Rows(self, form, "form"))
+            self._group_tail("permissions", group, form)
+            lay.addWidget(card)
+        lay.addStretch(1)
+        return w
+
+    def _render_permission_grid(self, rows: "_Rows", field) -> None:
+        """The permission grid: one checkbox per permission the schema declares.
+
+        The KEY SET comes from the schema, not from the dict below. A
+        permission declared in `settings_schema.DEFAULT_SETTINGS["permissions"]`
+        used to ship with no checkbox at all, and `_collect` then wrote a
+        `permissions` dict WITHOUT that key — which the three-way merge resolves
+        as a DELETE (the candidate is missing it, the disk still equals what was
+        loaded), so `"get_datetime": false` was silently turned back on from the
+        defaults by the next Save. Wording stays in `labels`; the fallback keeps
+        a brand-new permission visible instead of invisible, and the guard
+        asserts the two sets agree in both directions.
+
+        A checkbox carries its own label, so each one is a bare row of the card.
+        """
         self.perm_checks: dict[str, QCheckBox] = {}
         labels = {
             "run_command": ("Run desktop commands", "whitelisted only: pactl, playerctl, "
@@ -2814,56 +3217,30 @@ class SettingsWindow(QMainWindow):
             "watchers": ("File/process watchers", "bounded monitors that announce matching "
                          "lines or process exits"),
         }
-        # The KEY SET comes from the schema, not from the dict above. A
-        # permission declared in `settings_schema.DEFAULT_SETTINGS["permissions"]`
-        # used to ship with no checkbox at all, and `_collect` then wrote a
-        # `permissions` dict WITHOUT that key — which the three-way merge
-        # resolves as a DELETE (the candidate is missing it, the disk still
-        # equals what was loaded), so `"get_datetime": false` was silently
-        # turned back on from the defaults by the next Save. Wording stays in
-        # `labels`; the fallback keeps a brand-new permission visible instead of
-        # invisible, and the guard asserts the two sets agree in both directions.
         for key in (DEFAULT_SETTINGS.get("permissions") or {}):
             title, desc = labels.get(key, (key.replace("_", " ").capitalize(),
                                            "no description yet"))
             chk = QCheckBox(f"{title} — {desc}", self)
             self.perm_checks[key] = chk
-            form.addRow(chk)
-        # The local SearXNG the search router prefers when one answers. A real
-        # field rather than a key only editable by hand in settings.json:
-        # pointing at another port (or another machine) is a reasonable thing to
-        # want, and hiding it is the support trap the installer notes warn about.
-        # Empty means the keyless backends only. It is PROBED, never assumed —
-        # `--ptt doctor` says whether an instance actually answered.
-        self.searxng_edit = QLineEdit(self)
-        self.searxng_edit.setPlaceholderText(
-            "http://127.0.0.1:8888   (empty: keyless backends only)")
-        self.searxng_edit.setToolTip(
-            "A local SearXNG to search through, if you run one. Best results and "
-            "your queries stay on this machine; without it the AI uses the "
-            "keyless backends (Stack Exchange, Hacker News, GitHub, Wikipedia, "
-            "DuckDuckGo).")
-        form.addRow("SearXNG address", self.searxng_edit)
-        lay.addWidget(group)
+            rows.target.addRow(chk)
 
-        extra_group = QGroupBox("Extra whitelisted commands (one per line)", w)
-        el = QVBoxLayout(extra_group)
-        self.extra_edit = QPlainTextEdit(self)
-        self.extra_edit.setMaximumHeight(110)
-        self.extra_edit.setPlaceholderText("e.g.\ngrep\ndate\nfree")
-        el.addWidget(self.extra_edit)
+    def _blocked_note(self, form: QFormLayout) -> None:
+        """What the whitelist can never include, under the box it applies to."""
         blocked = QLabel(
-            "Always blocked, no matter what: " + ", ".join(H.ToolBelt.BLOCKED[:14]) + " …", w)
+            "Always blocked, no matter what: "
+            + ", ".join(H.ToolBelt.BLOCKED[:14]) + " \u2026", self)
         blocked.setWordWrap(True)
         blocked.setStyleSheet("color: #888;")
-        el.addWidget(blocked)
-        lay.addWidget(extra_group)
+        form.addRow(blocked)
 
-        # centralized ALLOW/DENY/CONFIRM policy + dry-run rehearsal mode
-        pol_group = QGroupBox("Command policy (ALLOW / DENY / CONFIRM per tool)", w)
-        pl = QVBoxLayout(pol_group)
-        # one row per declared tool, straight from the live registry — a tool
-        # added in core/tools.py shows up here with no GUI change
+    def _render_policy_rows(self, rows: "_Rows", field) -> None:
+        """One ALLOW / DENY / CONFIRM row per declared tool.
+
+        The rows come from the live registry, not from the schema, which is what
+        makes a tool added in `core/tools.py` show up here with no GUI change.
+        The dry-run and confirmation rows below them are ordinary table rows of
+        this card, in the table's order.
+        """
         policy_form = QFormLayout()
         self.policy_rows: dict[str, QComboBox] = {}
         try:
@@ -2878,7 +3255,7 @@ class SettingsWindow(QMainWindow):
             combo.addItem("CONFIRM", "CONFIRM")
             policy_form.addRow(QLabel(name, self), combo)
             self.policy_rows[name] = combo
-        pl.addLayout(policy_form)
+        rows.target.addRow(policy_form)
         if not self.policy_rows:
             # registry unavailable (e.g. H degenerate in recovery mode): keep
             # the raw text path so policy editing still works
@@ -2889,14 +3266,7 @@ class SettingsWindow(QMainWindow):
                 "e.g.\nrun_command = DENY\nopen_app = CONFIRM\n"
                 "CONFIRM asks the user out loud and runs only after a separate "
                 "'yes' reply")
-            pl.addWidget(self.policy_edit)
-        self.dryrun_chk = QCheckBox(
-            "Dry-run mode — desktop actions report what they would do, "
-            "without doing it", self)
-        pl.addWidget(self.dryrun_chk)
-        lay.addWidget(pol_group)
-        lay.addStretch(1)
-        return w
+            rows.target.addRow(self.policy_edit)
 
     # -------------------------------------------------------------- appearance
 
@@ -3038,10 +3408,43 @@ class SettingsWindow(QMainWindow):
         # Adopt before the status bar exists; `_load_values` reports the
         # refusals once it does, so the message is not lost or shown twice.
         self._adopt_colors(self.cfg.get("colors"))
+        # Every row on this page is the table's, drawn in the shape the ROW asks
+        # for (`render`): the shape, tint, swatch, pack and picture pickers are
+        # names in the renderer registry, and the page below is a loop over the
+        # table's cards and rows. Nothing here names a setting, so a new row — or
+        # a new card — needs one line in settings_schema.py.
+        self._group_panels.update({
+            ("appearance", "preview"): self._preview_panel,
+            ("appearance", "look"): self._look_panel,
+            ("appearance", "desktop"): self._desktop_panel,
+        })
+        # The size note belongs to the sliders, so it travels with their card.
+        self._group_tails[("appearance", "motion")] = self._motion_tail
+        # The page is its cards, in the table's order, and each card is the
+        # table's rows — so a new setting on this page needs one line in
+        # settings_schema.py and nothing here. The look tiles come FIRST in the
+        # table for the same reason the preview does: the strip is what a look
+        # is chosen against, so it is the card at the top of the page, and the
+        # page does not have to move a card it already drew to say so.
+        for group in _page_groups("appearance"):
+            if self._group_panel("appearance", group, lay):
+                continue
+            card, box = self._card(_group_title("appearance", group),
+                                   _group_hint("appearance", group))
+            self._draw_group("appearance", group, _Rows(self, box, "card"))
+            self._group_tail("appearance", group, box)
+            lay.addWidget(card)
+        lay.addStretch(1)
+        self._paint_color_buttons()
+        return content
 
-        # -- Shape ---------------------------------------------------------
-        card, box = self._card("Shape")
-        self.design_combo = QComboBox(card)
+    def _render_design_picker(self, rows: "_Rows", field) -> None:
+        """The shape picker: the names come from the BUBBLE, not from here.
+
+        `BUBBLE_DESIGNS` is what the renderer can paint, so the combo is filled
+        from it and the choice is stored under the row's own key.
+        """
+        self.design_combo = QComboBox(self)
         # display names for designs a bare .capitalize() would flatten
         design_labels = {"sauron": "Eye of Sauron"}
         for name in getattr(SCHEMA, "BUBBLE_DESIGNS", ("orb",)):
@@ -3051,100 +3454,98 @@ class SettingsWindow(QMainWindow):
             "Bubble shape — applies immediately; the bubble repaints within "
             "seconds. No Save needed.")
         self.design_combo.currentIndexChanged.connect(self._schedule_appearance_live)
-        box.addLayout(self._field("Design", self.design_combo))
-        # How the picture is COLOURED, right beside the art it colours: the
-        # state wash is what makes a photo read as the bubble's mood, and what
-        # makes a drawn character impossible (every silhouette comes out the
-        # state hue). "Original colours" is the answer for a character, and the
-        # state is then carried by the rim and the decoration.
-        self.tint_combo = QComboBox(card)
-        for _value, _label in (("state", "State colours"),
-                               ("natural", "Original colours")):
-            self.tint_combo.addItem(_label, _value)
-        self.tint_combo.setToolTip(
-            "What colour the picture itself is drawn in. \"State colours\" "
-            "washes it in the state colour — a photo reads as the bubble's "
-            "mood. \"Original colours\" keeps the art's own palette, which is "
-            "what a drawn character needs to stay itself; the state is then "
-            "carried by the rim and the decoration. Applies live.")
-        self.tint_combo.currentIndexChanged.connect(self._schedule_appearance_live)
-        box.addLayout(self._field("Avatar colours", self.tint_combo))
-        # The picture the `Image` design draws. It lives in the Shape card
-        # rather than a card of its own because a shape whose art comes from a
-        # file is still a shape; it is always visible (a picture may be chosen
-        # before the design is switched to it) and it applies live like the
-        # combo, which is the contract this tab promises.
-        # One picture PER STATE first, then a fallback for the states that have
-        # none: a state with its own file draws it, a state without one draws the
-        # fallback, and a state with neither draws the empty slot. That is the
-        # same rule a pack follows (`states` then `any`), so the two ways of
-        # giving this design several pictures obey one precedence instead of two.
+        rows.layout(self._field(field.title, self.design_combo))
+
+    def _render_state_pictures(self, rows: "_Rows", field) -> None:
+        """ONE row for the four per-state pictures, from the row's own `also`.
+
+        A state with its own file draws it, a state without one draws the
+        fallback below, and a state with neither draws the empty slot — the same
+        rule a pack follows (`states` then `any`), so the two ways of giving this
+        design several pictures obey one precedence instead of two.
+
+        The table gives each picture its own ROW (so the bubble's own loader and
+        the live-apply tuple see four settings, one per state) and this shape
+        shows them as four buttons on one row, because four rows of one button
+        each is a wall of empty space. The other three are claimed by that row's
+        `also`, so they are drawn here and nowhere else — and this shape names
+        each of them by its state, which the table already says.
+        """
         self.state_image_buttons: dict[str, QPushButton] = {}
-        if STATE_IMAGE_KEYS:
-            holder = QWidget(card)
-            grid = QGridLayout(holder)
-            grid.setContentsMargins(0, 0, 0, 0)
-            grid.setHorizontalSpacing(8)
-            grid.setVerticalSpacing(4)
-            for i, (state, _key) in enumerate(STATE_IMAGE_KEYS):
-                btn = QPushButton(state.capitalize(), holder)
-                btn.setMinimumHeight(30)
-                btn.clicked.connect(
-                    lambda _=False, s=state: self._pick_state_image(s))
-                self.state_image_buttons[state] = btn
-                # TWO to a row, not four: the row's width is the sum of its
-                # buttons, and four full state names made this card demand more
-                # width than a narrow window's viewport — a card you cannot
-                # reach. Two rows of two fit, and read the same.
-                grid.addWidget(btn, i // 2, i % 2)
-            grid.setColumnStretch(2, 1)
-            box.addLayout(self._field("Picture per state", holder))
-            state_row = QHBoxLayout()
-            self.state_image_clear = QPushButton("Clear all states", card)
-            self.state_image_clear.setToolTip(
-                "Drop every per-state picture; each state goes back to the "
-                "fallback picture below")
-            self.state_image_clear.clicked.connect(self._clear_state_images)
-            state_row.addWidget(self.state_image_clear)
-            state_row.addStretch(1)
-            box.addLayout(state_row)
-            self.state_image_label = self._muted("", card)
-            box.addWidget(self.state_image_label)
-        # The FALLBACK picture: what a state with no picture of its own draws.
-        # It lives in the Shape card rather than a card of its own because a
-        # shape whose art comes from a file is still a shape; it is always
-        # visible (a picture may be chosen before the design is switched to it)
-        # and it applies live like the combo, which is the contract this tab
-        # promises.
-        pick_row = QHBoxLayout()
-        self.image_button = QPushButton("Choose fallback\u2026", card)
+        if not STATE_IMAGE_KEYS:
+            return
+        holder = QWidget(self)
+        grid = QGridLayout(holder)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        for i, (state, _key) in enumerate(STATE_IMAGE_KEYS):
+            btn = QPushButton(state.capitalize(), holder)
+            btn.setMinimumHeight(30)
+            btn.clicked.connect(
+                lambda _=False, s=state: self._pick_state_image(s))
+            self.state_image_buttons[state] = btn
+            # TWO to a row, not four: the row's width is the sum of its
+            # buttons, and four full state names made this card demand more
+            # width than a narrow window's viewport — a card you cannot
+            # reach. Two rows of two fit, and read the same.
+            grid.addWidget(btn, i // 2, i % 2)
+        grid.setColumnStretch(2, 1)
+        rows.layout(self._field("Picture per state", holder))
+        state_row = QHBoxLayout()
+        self.state_image_clear = QPushButton("Clear all states", self)
+        self.state_image_clear.setToolTip(
+            "Drop every per-state picture; each state goes back to the "
+            "fallback picture below")
+        self.state_image_clear.clicked.connect(self._clear_state_images)
+        state_row.addWidget(self.state_image_clear)
+        state_row.addStretch(1)
+        rows.layout(state_row)
+        self.state_image_label = self._muted("", self)
+        rows.widget(self.state_image_label)
+
+    def _render_fallback_image(self, rows: "_Rows", field) -> None:
+        """The FALLBACK picture: what a state with no picture of its own draws.
+
+        It lives in the Shape card rather than a card of its own because a shape
+        whose art comes from a file is still a shape; it is always visible (a
+        picture may be chosen before the design is switched to it) and it
+        applies live like the combo, which is the contract this tab promises.
+        """
+        holder = QWidget(self)
+        pick_row = QHBoxLayout(holder)
+        pick_row.setContentsMargins(0, 0, 0, 0)
+        self.image_button = QPushButton("Choose fallback\u2026", holder)
         self.image_button.setToolTip(
             "The picture the \"Image\" design draws in every state that has no "
             "picture of its own: fitted to the glass, tinted by the state "
             "colour and lit by the voice.")
         self.image_button.clicked.connect(self._pick_design_image)
-        self.image_clear = QPushButton("Clear", card)
+        self.image_clear = QPushButton("Clear", holder)
         self.image_clear.setToolTip(
             "Go back to the empty-slot frame for the states that fall back")
         self.image_clear.clicked.connect(self._clear_design_image)
         pick_row.addWidget(self.image_button)
         pick_row.addWidget(self.image_clear)
         pick_row.addStretch(1)
-        box.addLayout(pick_row)
-        self.image_label = self._muted("", card)
-        box.addWidget(self.image_label)
-        # A PACK is the same art as several pictures that switch with the state,
-        # so it sits beside the single file as an alternative SOURCE for this
-        # shape's art. When one is chosen it is the AUTHORITY and the picture
-        # above it is ignored — which the label under the row says out loud,
-        # because "I picked a pack and nothing changed" is the complaint this
-        # whole card exists to answer.
-        self.pack_combo = QComboBox(card)
+        rows.layout(self._field(field.title, holder))
+        self.image_label = self._muted("", self)
+        rows.widget(self.image_label)
+
+    def _render_pack_picker(self, rows: "_Rows", field) -> None:
+        """A pack: the same art as several pictures that switch with the state.
+
+        It sits beside the single file as an alternative SOURCE for this shape's
+        art. When one is chosen it is the AUTHORITY and the picture above it is
+        ignored — which the label under the row says out loud, because "I picked
+        a pack and nothing changed" is the complaint this card exists to answer.
+        """
+        self.pack_combo = QComboBox(self)
         self.pack_combo.setToolTip(
             "An installed design pack: one picture per state, chosen together "
             "and switched as the bubble changes state.")
         self.pack_combo.currentIndexChanged.connect(self._on_pack_changed)
-        self.pack_install = QPushButton("Install pack\u2026", card)
+        self.pack_install = QPushButton("Install pack\u2026", self)
         self.pack_install.setToolTip(
             "Copy a folder holding a pack.json and its pictures into this "
             "install, so the pack keeps working when the folder it came from "
@@ -3153,21 +3554,21 @@ class SettingsWindow(QMainWindow):
         # The same install, from the shape a pack actually travels in: ONE file
         # someone sent you. The archive is unpacked and checked by the bubble
         # module BEFORE anything reaches the installed packs, and from there it
-        # is the same code path a folder takes \u2014 so a file can only ever do
+        # is the same code path a folder takes — so a file can only ever do
         # what a folder could already do.
-        self.pack_import_file = QPushButton("Import pack file\u2026", card)
+        self.pack_import_file = QPushButton("Import pack file\u2026", self)
         self.pack_import_file.setToolTip(
             "Install a pack that arrived as ONE file (a .hpack someone sent "
             "you). Checked before anything is copied, then copied in, so it "
             "keeps working wherever that file goes afterwards.")
         self.pack_import_file.clicked.connect(self._import_design_pack_file)
-        self.pack_clear = QPushButton("Clear", card)
+        self.pack_clear = QPushButton("Clear", self)
         self.pack_clear.setToolTip("Stop using a pack; go back to one picture")
         self.pack_clear.clicked.connect(self._clear_design_pack)
-        # The reverse of Install: write the art ON SCREEN \u2014 the selected
-        # pack, or the pictures chosen above \u2014 into a new folder as a pack,
-        # so a look built by hand can be handed to someone else.
-        self.pack_export = QPushButton("Export pack\u2026", card)
+        # The reverse of Install: write the art ON SCREEN — the selected pack,
+        # or the pictures chosen above — into a new folder as a pack, so a look
+        # built by hand can be handed to someone else.
+        self.pack_export = QPushButton("Export pack\u2026", self)
         self.pack_export.setToolTip(
             "Write the art on screen (this pack, or your own per-state "
             "pictures and fallback) into a new folder as a pack you can share. "
@@ -3175,43 +3576,43 @@ class SettingsWindow(QMainWindow):
         self.pack_export.clicked.connect(self._export_design_pack)
         # ...and the same art in the shape you can actually SEND: one file,
         # because a folder is not something anyone can attach to a message.
-        self.pack_export_file = QPushButton("Export pack file\u2026", card)
+        self.pack_export_file = QPushButton("Export pack file\u2026", self)
         self.pack_export_file.setToolTip(
             "Write the art on screen (this pack, or your own per-state "
             "pictures and fallback) into ONE .hpack file you can send to "
             "someone, who installs it with Import pack file. Nothing is "
             "installed and nothing on screen changes.")
         self.pack_export_file.clicked.connect(self._export_design_pack_file)
-        box.addLayout(self._field("Pack", self.pack_combo))
+        rows.layout(self._field(field.title, self.pack_combo))
         # Two rows on purpose: the first is what a pack does on THIS desktop
         # (install a folder, export a folder, stop using one) and the second is
-        # the single-file form of the same two things \u2014 the pair you reach
-        # for when a look arrives or leaves as an attachment.
+        # the single-file form of the same two things — the pair you reach for
+        # when a look arrives or leaves as an attachment.
         pack_row = QHBoxLayout()
         pack_row.addWidget(self.pack_install)
         pack_row.addWidget(self.pack_export)
         pack_row.addWidget(self.pack_clear)
         pack_row.addStretch(1)
-        box.addLayout(pack_row)
-        pack_row = QHBoxLayout()
-        pack_row.addWidget(self.pack_import_file)
-        pack_row.addWidget(self.pack_export_file)
-        pack_row.addStretch(1)
-        box.addLayout(pack_row)
-        self.pack_label = self._muted("", card)
-        box.addWidget(self.pack_label)
+        rows.layout(pack_row)
+        file_row = QHBoxLayout()
+        file_row.addWidget(self.pack_import_file)
+        file_row.addWidget(self.pack_export_file)
+        file_row.addStretch(1)
+        rows.layout(file_row)
+        self.pack_label = self._muted("", self)
+        rows.widget(self.pack_label)
         # Look before you leap: a pack can be shown in the strip above WITHOUT
         # being installed, so the choice gets made with the look in front of you
-        # instead of blind. Two buttons because a pack arrives in two shapes, the
-        # same pairing Install/Import already teaches.
+        # instead of blind. Two buttons because a pack arrives in two shapes,
+        # the same pairing Install/Import already teaches.
         preview_row = QHBoxLayout()
-        self.pack_preview_dir = QPushButton("Preview folder\u2026", card)
+        self.pack_preview_dir = QPushButton("Preview folder\u2026", self)
         self.pack_preview_dir.setToolTip(
             "Show what a pack FOLDER would look like in all four states, drawn "
             "in the strip above. Nothing is installed and nothing is copied.")
         self.pack_preview_dir.clicked.connect(
             lambda: self._preview_design_pack("folder"))
-        self.pack_preview_file = QPushButton("Preview pack file\u2026", card)
+        self.pack_preview_file = QPushButton("Preview pack file\u2026", self)
         self.pack_preview_file.setToolTip(
             "Show what a .hpack someone sent you would look like in all four "
             "states. The file is unpacked to a temporary folder so the strip "
@@ -3221,51 +3622,36 @@ class SettingsWindow(QMainWindow):
         preview_row.addWidget(self.pack_preview_dir)
         preview_row.addWidget(self.pack_preview_file)
         preview_row.addStretch(1)
-        box.addLayout(preview_row)
-        self.preview_label = self._muted("", card)
-        box.addWidget(self.preview_label)
+        rows.layout(preview_row)
+        self.preview_label = self._muted("", self)
+        rows.widget(self.preview_label)
         follow_row = QHBoxLayout()
-        self.preview_try = QPushButton("Try it", card)
+        self.preview_try = QPushButton("Try it", self)
         self.preview_try.setToolTip(
             "Install the previewed pack and switch to it. THIS is the step that "
             "writes: everything before it only showed you the look.")
         self.preview_try.clicked.connect(self._try_design_pack)
-        self.preview_cancel = QPushButton("Cancel preview", card)
+        self.preview_cancel = QPushButton("Cancel preview", self)
         self.preview_cancel.setToolTip(
-            "Stop previewing \u2014 nothing was installed, and the strip goes "
+            "Stop previewing — nothing was installed, and the strip goes "
             "back to the look you actually have.")
         self.preview_cancel.clicked.connect(self._cancel_design_pack_preview)
         follow_row.addWidget(self.preview_try)
         follow_row.addWidget(self.preview_cancel)
         follow_row.addStretch(1)
-        box.addLayout(follow_row)
+        rows.layout(follow_row)
         self.preview_label.setVisible(False)
         self._toggle_preview_buttons()
-        self.size_slider = QSlider(Qt.Horizontal, card)
-        self.size_slider.setRange(96, 192)
-        self.size_label = QLabel("", card)
-        self.size_slider.valueChanged.connect(
-            lambda v: self.size_label.setText(f"{v} px"))
-        # ...and actually apply it: this slider used to only relabel itself, so
-        # the bubble size never changed without pressing Save.
-        self.size_slider.valueChanged.connect(self._schedule_appearance_live)
-        box.addLayout(self._field("Size", self.size_slider, self.size_label))
-        box.addWidget(self._muted(
-            "Window size in pixels — the drawn bubble is about 69% of it.", card))
-        lay.addWidget(card)
 
-        # -- Decoration: what the avatar WEARS. Its own card and its own picker,
-        # -- because a decoration is a different choice from the art and from
-        # -- the shape: it is animated, it is the thing the voice visibly
-        # -- drives, and there are several to try. The schema owns the closed
-        # -- set (`AVATAR_DECOS`) and core.settings coerces to it, so this combo
-        # -- can only hold a name the painter implements.
-        card, box = self._card(
-            "Decoration",
-            "A light worn AROUND the avatar. It turns with the animation "
-            "energy and brightens and quickens with your voice. Shows when "
-            "the design is Image — a picture as the bubble.")
-        self.deco_combo = QComboBox(card)
+    def _render_deco_picker(self, rows: "_Rows", field) -> None:
+        """The decoration picker — a different choice from the art and the shape.
+
+        It is animated, it is the thing the voice visibly drives, and there are
+        several to try. The schema owns the closed set (`AVATAR_DECOS`) and
+        core.settings coerces to it, so this combo can only hold a name the
+        painter implements.
+        """
+        self.deco_combo = QComboBox(self)
         for _value, _label in (("off", "Off"),
                                ("ring-light", "Ring light"),
                                ("orbit", "Orbiting comets"),
@@ -3285,22 +3671,25 @@ class SettingsWindow(QMainWindow):
         self.deco_combo.currentIndexChanged.connect(
             self._schedule_appearance_live)
         self.deco_combo.currentIndexChanged.connect(self._update_deco_hint)
-        box.addLayout(self._field("Decoration", self.deco_combo))
-        self.deco_hint = self._muted("", card)
-        box.addWidget(self.deco_hint)
+        rows.layout(self._field(field.title, self.deco_combo))
+        self.deco_hint = self._muted("", self)
+        rows.widget(self.deco_hint)
         self._update_deco_hint()
 
-        # The decoration's OWN colour. Three answers, and the third is why this
-        # is not a plain swatch: "Colour of its own" is a colour the ring keeps
-        # while the bubble changes state, which is what makes a decoration
-        # independent rather than a copy of the mood. `rainbow` is the animated
-        # one, so the ring moves in colour as well as in shape.
-        # The words come from the schema (`_deco_colour_words`); only the LABELS
-        # live here, with a readable fallback — so a colour the schema adds is
-        # offered the day it is declared rather than only once this file is
-        # edited too. `custom` is last and is never stored (see `_collect`).
+    def _render_deco_colour(self, rows: "_Rows", field) -> None:
+        """The decoration's OWN colour: three answers, and the third is the point.
+
+        "Colour of its own" is a colour the ring keeps while the bubble changes
+        state, which is what makes a decoration independent rather than a copy
+        of the mood. `rainbow` is the animated one, so the ring moves in colour
+        as well as in shape. The words come from the schema
+        (`_deco_colour_words`); only the LABELS live here, with a readable
+        fallback — so a colour the schema adds is offered the day it is declared
+        rather than only once this file is edited too. `custom` is last and is
+        never stored (see `_collect`).
+        """
         _colour_labels = {"state": "State colour", "rainbow": "Rainbow"}
-        self.deco_colour_combo = QComboBox(card)
+        self.deco_colour_combo = QComboBox(self)
         for _value in _deco_colour_words():
             self.deco_colour_combo.addItem(
                 _colour_labels.get(_value, _value.replace("-", " ").capitalize()),
@@ -3315,61 +3704,26 @@ class SettingsWindow(QMainWindow):
             self._schedule_appearance_live)
         self.deco_colour_combo.currentIndexChanged.connect(
             self._update_deco_colour)
-        box.addLayout(self._field("Decoration colour", self.deco_colour_combo))
-        self.deco_colour_btn = QPushButton("#4F8CFF", card)
+        rows.layout(self._field(field.title, self.deco_colour_combo))
+        self.deco_colour_btn = QPushButton("#4F8CFF", self)
         self.deco_colour_btn.setToolTip(
             "Pick the decoration's own colour. The bubble's rim still carries "
             "the state colour, so the mood stays readable.")
         self.deco_colour_btn.clicked.connect(self._pick_deco_colour)
-        box.addLayout(self._field("Own colour", self.deco_colour_btn))
+        rows.layout(self._field("Own colour", self.deco_colour_btn))
         self._update_deco_colour()
-        lay.addWidget(card)
 
-        # -- Motion: one global animation scale + one accent punch, both
-        # applied by every design in the bubble's shared frame state
-        card, box = self._card(
-            "Motion",
-            "Energy scales every design's speed; accent scales how hard it "
-            "leans on the state colour.")
-        self.energy_slider = QSlider(Qt.Horizontal, card)
-        self.energy_slider.setRange(20, 200)
-        self.energy_slider.setToolTip(
-            "Scales orbit speed, swirl speed, hue sweep and comet brightness "
-            "for every design. 1.0 is the original feel.")
-        self.energy_label = QLabel("", card)
-        self.energy_slider.valueChanged.connect(
-            lambda v: self.energy_label.setText(f"{v / 100:.1f}\u00d7"))
-        self.energy_slider.valueChanged.connect(self._schedule_appearance_live)
-        box.addLayout(self._field("Energy", self.energy_slider,
-                                  self.energy_label))
-        self.accent_slider = QSlider(Qt.Horizontal, card)
-        self.accent_slider.setRange(0, 100)
-        self.accent_slider.setToolTip(
-            "How hard each shape leans on its state colour: saturation and "
-            "glow punch. 50% is the original look.")
-        self.accent_label = QLabel("", card)
-        self.accent_slider.valueChanged.connect(
-            lambda v: self.accent_label.setText(f"{v}%"))
-        self.accent_slider.valueChanged.connect(self._schedule_appearance_live)
-        box.addLayout(self._field("Accent", self.accent_slider,
-                                  self.accent_label))
-        lay.addWidget(card)
-
-        # -- State colours --------------------------------------------------
-        card, box = self._card(
-            "State colours",
-            "One colour per state. Click a swatch to change it.")
+    def _render_colour_grid(self, rows: "_Rows", field) -> None:
+        """The swatch grid: one button per STATE, from the loader's key set."""
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(4)
-        for i, (key, title) in enumerate((
-                ("idle", "Idle"), ("listening", "Listening"),
-                ("thinking", "Thinking"), ("speaking", "Speaking"))):
-            cell = QWidget(card)
+        for i, key in enumerate(_state_colour_keys()):
+            cell = QWidget(self)
             column = QVBoxLayout(cell)
             column.setContentsMargins(0, 0, 0, 0)
             column.setSpacing(3)
-            btn = QPushButton(title, cell)
+            btn = QPushButton(key.capitalize(), cell)
             btn.setMinimumHeight(34)
             btn.clicked.connect(lambda _=False, k=key: self._pick_color(k))
             self.color_buttons[key] = btn
@@ -3379,21 +3733,58 @@ class SettingsWindow(QMainWindow):
             column.addWidget(btn)
             column.addWidget(swatch)
             grid.addWidget(cell, i // 4, i % 4)
-        reset = QPushButton("Reset", card)
+        reset = QPushButton("Reset", self)
         reset.setToolTip("Restore the four default state colours")
         reset.clicked.connect(self._reset_colors)
         reset_row = QHBoxLayout()
         reset_row.addStretch(1)
         reset_row.addWidget(reset)
-        box.addLayout(grid)
-        box.addLayout(reset_row)
-        lay.addWidget(card)
+        rows.layout(grid)
+        rows.layout(reset_row)
 
-        # -- Match your desktop ---------------------------------------------
-        card, box = self._card(
-            "Match your desktop",
-            "Samples your wallpaper and retunes all four colours so the bubble "
-            "reads clearly against it.")
+    def _motion_tail(self, box) -> None:
+        """What the size slider actually measures, under the sliders."""
+        box.addWidget(self._muted(
+            "Window size in pixels — the drawn bubble is about 69% of it.",
+            self))
+
+    def _preview_panel(self, layout: QVBoxLayout) -> None:
+        """The strip: the four states, drawn live from the controls' values.
+
+        A live preview and nothing else — the values it draws are read through
+        the callables below on every repaint, so it shows what the page is
+        showing rather than a copy taken once at build time.
+        """
+        card, box = self._card(_group_title("appearance", "preview"),
+                               _group_hint("appearance", "preview"))
+        self.preview = BubblePreview(
+            lambda: {k: QColor(c) for k, c in self._colors.items()},
+            lambda: self.bubble_size.value(),
+            self._preview_design,
+            lambda: self.animation_energy.value() / 100.0,
+            lambda: self.bubble_accent.value() / 100.0,
+            self._preview_picture,
+            self._preview_deco,
+        )
+        self.preview.setMinimumHeight(168)
+        box.addWidget(self.preview)
+        layout.addWidget(card)
+
+    def _look_panel(self, layout: QVBoxLayout) -> None:
+        """The named looks: one click for the five controls under them."""
+        card, box = self._card(_group_title("appearance", "look"),
+                               _group_hint("appearance", "look"))
+        self._build_look_group(card, box)
+        layout.addWidget(card)
+
+    def _desktop_panel(self, layout: QVBoxLayout) -> None:
+        """Match the wallpaper: three one-shot actions, no setting of its own.
+
+        No table row belongs here — nothing on this card is remembered — which
+        is what makes it a panel rather than a card of rows.
+        """
+        card, box = self._card(_group_title("appearance", "desktop"),
+                               _group_hint("appearance", "desktop"))
         tune_row = QHBoxLayout()
         match_btn = QPushButton("Match wallpaper", card)
         match_btn.setToolTip(
@@ -3411,37 +3802,7 @@ class SettingsWindow(QMainWindow):
         tune_row.addWidget(light_btn)
         tune_row.addStretch(1)
         box.addLayout(tune_row)
-        lay.addWidget(card)
-
-        # The preview is the hero of the panel, so it is created here (the
-        # combo and sliders it reads must exist first) but shown at the TOP.
-        card, box = self._card(
-            "Preview",
-            "Idle \u00b7 listening \u00b7 thinking \u00b7 speaking — live, no Save needed.")
-        self.preview = BubblePreview(
-            lambda: {k: QColor(c) for k, c in self._colors.items()},
-            lambda: self.size_slider.value(),
-            self._preview_design,
-            lambda: self.energy_slider.value() / 100.0,
-            lambda: self.accent_slider.value() / 100.0,
-            self._preview_picture,
-            self._preview_deco,
-        )
-        self.preview.setMinimumHeight(168)
-        box.addWidget(self.preview)
-        lay.insertWidget(0, card)
-
-        # A look is one click for everything under it, so it sits directly
-        # beneath the preview that shows what the click did.
-        card, box = self._card(
-            "Look", "One click sets the shape, the size, the motion and all "
-            "four colours.")
-        self._build_look_group(card, box)
-        lay.insertWidget(1, card)
-
-        lay.addStretch(1)
-        self._paint_color_buttons()
-        return content
+        layout.addWidget(card)
 
     # ------------------------------------------------------------------ looks
 
@@ -3509,9 +3870,9 @@ class SettingsWindow(QMainWindow):
         """The five Appearance values the controls are showing right now."""
         return {
             "bubble_design": self.design_combo.currentData() or "orb",
-            "bubble_size": self.size_slider.value(),
-            "animation_energy": self.energy_slider.value() / 100.0,
-            "bubble_accent": self.accent_slider.value() / 100.0,
+            "bubble_size": self.bubble_size.value(),
+            "animation_energy": self.animation_energy.value() / 100.0,
+            "bubble_accent": self.bubble_accent.value() / 100.0,
             "colors": dict(self._colors),
         }
 
@@ -3567,10 +3928,10 @@ class SettingsWindow(QMainWindow):
                          f"{entry['design']!r} shape — nothing applied")
             return
         self.design_combo.setCurrentIndex(index)
-        self.size_slider.setValue(int(entry["bubble_size"]))
-        self.energy_slider.setValue(
+        self.bubble_size.setValue(int(entry["bubble_size"]))
+        self.animation_energy.setValue(
             int(round(float(entry["animation_energy"]) * 100)))
-        self.accent_slider.setValue(
+        self.bubble_accent.setValue(
             int(round(float(entry["bubble_accent"]) * 100)))
         self._colors = {str(k): str(v) for k, v in entry["colors"].items()}
         self._paint_color_buttons()
@@ -4438,17 +4799,18 @@ class SettingsWindow(QMainWindow):
     def _startup_tab(self) -> QWidget:
         w = QWidget(self)
         lay = QVBoxLayout(w)
-        group = QGroupBox("Autostart", w)
-        gl = QVBoxLayout(group)
-        self.autostart_chk = QCheckBox("Start handsoff when niri starts", self)
-        self.autostart_chk.setChecked(autostart_enabled())
-        gl.addWidget(self.autostart_chk)
-        note = QLabel(
-            f"Adds one spawn-at-startup line to {NIRI_CONFIG}\n"
-            "(a backup is written next to it before the first change).", w)
-        note.setWordWrap(True)
-        gl.addWidget(note)
-        lay.addWidget(group)
+        # The card is the table's; its one row is drawn here, and says so: its
+        # STATE comes from the niri config (`autostart_enabled()`), not from the
+        # setting, because the setting is what was ASKED for and the config is
+        # what the machine will do — a row showing the stored value would
+        # describe something that may not be true.
+        for group in _page_groups("startup"):
+            card = QGroupBox(_group_title("startup", group), w)
+            card_lay = QVBoxLayout(card)
+            form = QFormLayout()
+            card_lay.addLayout(form)
+            self._draw_group("startup", group, _Rows(self, form, "form"))
+            lay.addWidget(card)
 
         btns = QHBoxLayout()
         restart = QPushButton("Restart bubble now", self)
@@ -4469,6 +4831,23 @@ class SettingsWindow(QMainWindow):
         lay.addWidget(paths)
         lay.addStretch(1)
         return w
+
+    def _render_autostart(self, rows: "_Rows", field) -> None:
+        """The autostart switch, whose state is the CONFIG's, not the setting's.
+
+        The one Startup row the table cannot build: its checked state is read from
+        the niri config (and systemd), not from settings.json, so this widget is
+        wired to the DESKTOP rather than to the file.
+        """
+        self.autostart_chk = QCheckBox(field.title, self)
+        self.autostart_chk.setToolTip(field.tip)
+        self.autostart_chk.setChecked(autostart_enabled())
+        rows.target.addRow(self.autostart_chk)
+        note = QLabel(
+            f"Adds one spawn-at-startup line to {NIRI_CONFIG}\n"
+            "(a backup is written next to it before the first change).", self)
+        note.setWordWrap(True)
+        rows.target.addRow(note)
 
     def _write_keybinds(self) -> None:
         exe = f"{HOME}/.local/bin/handsoff.py"
@@ -4603,11 +4982,13 @@ class SettingsWindow(QMainWindow):
         self._model_at_open = str(self.cfg.get("model") or "")
 
     def _load_values(self) -> None:
-        self.ctx_spin.setValue(int(self.cfg["num_ctx"]))
-        self.remote_ollama_chk.setChecked(
-            bool(self.cfg.get("allow_remote_ollama", False)))
-        self.hist_spin.setValue(int(self.cfg.get("history_tokens", 0)))
-        self.toolrate_spin.setValue(int(self.cfg.get("max_tool_calls", 0)))
+        # EVERY control the table draws this window, in one loop: this is the
+        # whole load path for a generated control, which is why adding a setting
+        # needs no line here. A load is not an edit — the live apply compares
+        # against the disk — so writing these values through their own signals
+        # is safe, and it is what keeps a paired label (px, ×, %) in step.
+        for key, control in self._controls.items():
+            control.write(self.cfg.get(key, DEFAULT_SETTINGS.get(key)))
         pol = self.cfg.get("command_policy") or {}
         if isinstance(pol, dict) and self.policy_rows:
             for name, combo in self.policy_rows.items():
@@ -4642,55 +5023,19 @@ class SettingsWindow(QMainWindow):
         _dci = self.deco_colour_combo.findData(_want)
         self.deco_colour_combo.setCurrentIndex(_dci if _dci >= 0 else 0)
         self._update_deco_colour()
-        _ti = self.tint_combo.findData(
-            str(self.cfg.get("avatar_tint") or "state"))
-        self.tint_combo.setCurrentIndex(_ti if _ti >= 0 else 0)
+        # `avatar_tint` is a GENERATED row now, so the loop over `self._controls`
+        # above has already loaded it — the hand-written line that used to sit
+        # here existed only because the row was drawn by name.
         self._update_deco_hint()
         self._refresh_state_image_buttons()
         self._refresh_pack_combo()
         self._refresh_design_image_label()
-        self.energy_slider.setValue(int(round(min(
-            2.0, max(0.2, float(self.cfg.get("animation_energy", 1.0)))) * 100)))
-        self.accent_slider.setValue(int(round(min(
-            1.0, max(0.0, float(self.cfg.get("bubble_accent", 0.5)))) * 100)))
-        self.dryrun_chk.setChecked(bool(self.cfg.get("dry_run", False)))
-        self.thresh_spin.setValue(int(self.cfg["mic_threshold"]))
-        wi = self.whisper_combo.findData(self.cfg["whisper_size"])
-        self.whisper_combo.setCurrentIndex(max(0, wi))
-        self.rate_slider.setValue(int(float(self.cfg["tts_rate"]) * 100))
-        self.vol_slider.setValue(int(float(self.cfg["tts_volume"]) * 100))
-        self.tts_ref_edit.setText(str(self.cfg.get("tts_reference") or ""))
         self.refresh_tts()
-        self.size_slider.setValue(int(self.cfg["bubble_size"]))
-        self.hf_chk.setChecked(bool(self.cfg.get("handsfree", False)))
-        self.wake_name_edit.setText(str(self.cfg.get("assistant_name", "assistant")))
-        self.wake_chk.setChecked(bool(self.cfg.get("wake_word_required", False)))
-        self.wake_secs.setValue(int(float(self.cfg.get("engage_seconds", 45.0))))
-        self.followup_secs.setValue(
-            int(float(self.cfg.get("followup_seconds", 0.0))))
-        self.home_edit.setText(str(self.cfg.get("home_place", "")))
-        self.cal_edit.setText(", ".join(self.cfg.get("calendar_ics") or []))
-        self.spotter_chk.setChecked(bool(self.cfg.get("wake_spotter", False)))
-        self.spotter_edit.setText(", ".join(self.cfg.get("spotter_models") or []))
-        self.selfheal_chk.setChecked(bool(self.cfg.get("mic_selfheal", True)))
-        self.resource_chk.setChecked(bool(self.cfg.get("resource_alerts", False)))
-        self.ram_alert_spin.setValue(int(float(self.cfg.get("ram_alert_percent", 90.0))))
-        self.vram_alert_spin.setValue(int(float(self.cfg.get("vram_alert_percent", 90.0))))
-        self.notification_chk.setChecked(bool(self.cfg.get("notification_reader", False)))
-        self.notification_mute_edit.setText(", ".join(self.cfg.get("notification_mute_apps") or []))
-        self.dictation_chk.setChecked(bool(self.cfg.get("dictation", True)))
-        self.brief_chk.setChecked(bool(self.cfg.get("briefing", False)))
-        self.world_warn_chk.setChecked(bool(self.cfg.get("world_warnings", False)))
-        self.hw_watch_chk.setChecked(bool(self.cfg.get("hardware_watch", False)))
-        self.hw_cool_spin.setValue(int(float(self.cfg.get("hardware_cooldown_min", 60.0))))
-        self.hw_disk_spin.setValue(int(float(self.cfg.get("hardware_disk_gb", 5.0))))
         aliases = self.cfg.get("workspace_aliases") or {}
         self.alias_edit.setPlainText(
             "\n".join(f"{k} = {v}" for k, v in sorted(aliases.items())))
-        self.extra_edit.setPlainText("\n".join(self.cfg["extra_allowed_commands"]))
         for key, chk in self.perm_checks.items():
             chk.setChecked(bool(self.cfg["permissions"].get(key, True)))
-        self.searxng_edit.setText(str(self.cfg.get("searxng_url") or ""))
         # `self.cfg` is left as read: `_collect` is what writes the cleaned
         # palette (it always did), and mutating cfg here would leave it
         # disagreeing with `_loaded_cfg` — a reload would then look like an
@@ -4811,46 +5156,20 @@ class SettingsWindow(QMainWindow):
 
     def _collect(self) -> list[str]:
         problems: list[str] = []
-        self.cfg["ollama_host"] = self.host_edit.text().strip() or DEFAULT_SETTINGS["ollama_host"]
-        self.cfg["allow_remote_ollama"] = self.remote_ollama_chk.isChecked()
+        # Every generated control, in one loop — the whole save path for a
+        # setting the table draws. `coerce_setting` then answers "what does this
+        # BECOME" with the loader's own rule, so what is written here is what a
+        # reload would keep: an emptied server URL becomes the default instead
+        # of an empty string the loader has to repair, a number outside its
+        # declared range is clamped now rather than on the next start, and a
+        # string in a numeric field never reaches the disk at all. It is the
+        # same function the bubble's runtime writers use, so the window cannot
+        # disagree with them about what a value means.
+        for key, control in self._controls.items():
+            self.cfg[key] = _core_module("settings").coerce_setting(
+                key, control.read())
         self.cfg["model"] = self._selected_model() or self.cfg["model"]
-        # Normalised the same way the bubble's coercion does it, so the two
-        # cannot disagree about whether a trailing slash is part of the address.
-        self.cfg["searxng_url"] = self.searxng_edit.text().strip().rstrip("/")
-        self.cfg["num_ctx"] = self.ctx_spin.value()
-        self.cfg["history_tokens"] = self.hist_spin.value()
-        self.cfg["max_tool_calls"] = self.toolrate_spin.value()
-        self.cfg["whisper_size"] = self.whisper_combo.currentData() or "tiny"
-        self.cfg["tts_reference"] = self.tts_ref_edit.text().strip()
-        self.cfg["tts_rate"] = self.rate_slider.value() / 100.0
-        self.cfg["tts_volume"] = self.vol_slider.value() / 100.0
         self.cfg["mic_device"] = self.mic_combo.currentData() or ""
-        self.cfg["mic_threshold"] = self.thresh_spin.value()
-        self.cfg["handsfree"] = self.hf_chk.isChecked()
-        self.cfg["assistant_name"] = (
-            self.wake_name_edit.text().strip() or DEFAULT_SETTINGS["assistant_name"])
-        self.cfg["wake_word_required"] = self.wake_chk.isChecked()
-        self.cfg["engage_seconds"] = float(self.wake_secs.value())
-        self.cfg["followup_seconds"] = float(self.followup_secs.value())
-        self.cfg["home_place"] = self.home_edit.text().strip()
-        self.cfg["briefing"] = self.brief_chk.isChecked()
-        self.cfg["world_warnings"] = self.world_warn_chk.isChecked()
-        self.cfg["hardware_watch"] = self.hw_watch_chk.isChecked()
-        self.cfg["hardware_cooldown_min"] = float(self.hw_cool_spin.value())
-        self.cfg["hardware_disk_gb"] = float(self.hw_disk_spin.value())
-        self.cfg["calendar_ics"] = [
-            x.strip() for x in self.cal_edit.text().split(",") if x.strip()]
-        self.cfg["wake_spotter"] = self.spotter_chk.isChecked()
-        self.cfg["spotter_models"] = [
-            x.strip() for x in self.spotter_edit.text().split(",") if x.strip()]
-        self.cfg["mic_selfheal"] = self.selfheal_chk.isChecked()
-        self.cfg["resource_alerts"] = self.resource_chk.isChecked()
-        self.cfg["ram_alert_percent"] = float(self.ram_alert_spin.value())
-        self.cfg["vram_alert_percent"] = float(self.vram_alert_spin.value())
-        self.cfg["notification_reader"] = self.notification_chk.isChecked()
-        self.cfg["notification_mute_apps"] = [
-            x.strip().lower() for x in self.notification_mute_edit.text().split(",") if x.strip()][:32]
-        self.cfg["dictation"] = self.dictation_chk.isChecked()
         alias_map = {}
         for lineno, line in enumerate(self.alias_edit.toPlainText().splitlines(), 1):
             if not line.strip() or line.strip().startswith("#"):
@@ -4864,7 +5183,6 @@ class SettingsWindow(QMainWindow):
             if k and v:
                 alias_map[k] = v
         self.cfg["workspace_aliases"] = alias_map
-        self.cfg["bubble_size"] = self.size_slider.value()
         self.cfg["bubble_design"] = self.design_combo.currentData() or "orb"
         self.cfg["design_image_path"] = str(self._design_image or "")
         for state, key in STATE_IMAGE_KEYS:
@@ -4879,9 +5197,6 @@ class SettingsWindow(QMainWindow):
         _mode = str(self.deco_colour_combo.currentData() or "state")
         self.cfg["avatar_deco_color"] = (
             self._deco_colour if _mode == self.DECO_COLOUR_CUSTOM else _mode)
-        self.cfg["avatar_tint"] = str(self.tint_combo.currentData() or "state")
-        self.cfg["animation_energy"] = self.energy_slider.value() / 100.0
-        self.cfg["bubble_accent"] = self.accent_slider.value() / 100.0
         # Filled FROM the loaded dict before the swatches are applied, for the
         # same reason `permissions` is: a colour this row has no swatch for must
         # keep the value it had. A key missing from the candidate is a DELETE to
@@ -4921,9 +5236,9 @@ class SettingsWindow(QMainWindow):
                 if k and v in ("ALLOW", "DENY", "CONFIRM"):
                     policy_map[k] = v
         self.cfg["command_policy"] = policy_map
-        self.cfg["dry_run"] = self.dryrun_chk.isChecked()
-        self.cfg["extra_allowed_commands"] = [
-            line.strip() for line in self.extra_edit.toPlainText().splitlines() if line.strip()]
+
+        # `extra_allowed_commands` needs no line: it is a `lines` control from
+        # the table, so the loop above read it AND capped it at the declared cap.
         self.cfg["autostart"] = self.autostart_chk.isChecked()
         return problems
 
