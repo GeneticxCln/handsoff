@@ -380,10 +380,11 @@ APP_MODULE_NAME = _claim_app_name()
 # Phase 4c: core.tools owns the extracted runtime; this host supplies the
 # existing globals and callbacks so historical monkeypatch seams stay live.
 
-# Text filtering for a bundle whose core/ is not importable. Defined at MODULE
-# level, not inside the legacy class, so it is a single implementation the tests
-# can compare against core.brain's — a fallback that drifts from the real one is
-# exactly how a legitimate "<3" reply ended up being dropped from speech.
+# Text filtering and Ollama error reading for a bundle whose core/ is not
+# importable. Defined at MODULE level, not inside the legacy class, so it is a
+# single implementation the tests can compare against core.brain's — a fallback
+# that drifts from the real one is exactly how a legitimate "<3" reply ended up
+# being dropped from speech.
 _LEAKED_MARKUP_RE = re.compile(
     r"^\s*(?:</?(?:think|tool_calls?|im_start|im_end)\b|<\|)", re.IGNORECASE)
 
@@ -400,6 +401,24 @@ def _fallback_strip_thinking(text: str) -> str:
                   flags=re.MULTILINE).strip()
 
 
+def _fallback_read_http_error(error) -> str:
+    """The no-core/brain bundle's copy of `core.brain._read_http_error`.
+
+    It cannot BE that function: this fallback exists precisely when
+    `core/brain.py` is absent. So the pinning is the point, not a formality —
+    the legacy class is only ever constructed on a bundle no checkout test
+    exercises by importing normally, which is how this copy's caller stayed
+    broken (it read `_brain._read_http_error`, a name that cannot exist in the
+    branch that needs it). `tests/test_hardening.py` boots the app with the
+    module unloadable and drives this class; `tests/test_regression.py` pins
+    this reader against core's on the same corpus.
+    """
+    try:
+        return str(json.loads(error.read().decode("utf-8")).get("error", ""))
+    except Exception:
+        return str(error.reason)
+
+
 try:
     _brain = _load_module("brain")
 except ImportError:
@@ -414,15 +433,7 @@ except ImportError:
         TurnStream = _LegacyTurnStream
         strip_thinking = staticmethod(_fallback_strip_thinking)
         is_leaked_markup = staticmethod(_fallback_is_leaked_markup)
-
-        @staticmethod
-        def _read_http_error(error):
-            try:
-                return str(json.loads(error.read().decode("utf-8")).get("error", ""))
-            except Exception:
-                return str(error.reason)
-
-        _error = _brain._read_http_error
+        _read_http_error = staticmethod(_fallback_read_http_error)
 
         @staticmethod
         def ollama_available(*, base, guard, urlopen):
@@ -3176,8 +3187,7 @@ _core_tools.shutil = shutil
 _core_tools.os = os
 _core_tools.Path = Path
 _core_tools.log = log
-_core_tools._DEFAULT_DEPS = _tool_dependencies
-_core_tools._CURRENT.set(_tool_dependencies)
+_core_tools.set_dependencies(_tool_dependencies)
 
 
 class ToolBelt(_core_tools.ToolBelt):

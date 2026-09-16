@@ -505,3 +505,130 @@ class TestMissingAudioFallback:
         # and the audio entry points must fail loudly, never return junk
         for probe in ("transcribe", "get_whisper", "play_wav", "Recorder"):
             assert report[probe] == "ImportError", probe
+
+
+class TestMissingBrainFallback:
+    """The other compatibility branch, and the one nothing could see.
+
+    `handsoff.py` keeps a whole `_LegacyBrain` for a bundle whose
+    `core/brain.py` is absent (a pre-extraction install). Its class body read
+    `_brain._read_http_error` — and `_brain` is exactly the name that branch
+    does NOT have, because having it is what skips the branch — so the fallback
+    raised NameError while being BUILT: the app could not start at all on the
+    bundle the class exists for, and no test could notice, since the class only
+    exists on a bundle the suite never loads.
+
+    So this boots the real module with core/brain.py unbuildable, the way
+    `TestMissingAudioFallback` does for core/audio.py, and drives the class
+    rather than merely touching it.
+    """
+
+    DRIVER = textwrap.dedent(
+        """
+        import importlib.util, io, json, logging, os, sys, urllib.error
+        _real_spec = importlib.util.spec_from_file_location
+
+        def _unbuildable(name, *args, **kwargs):
+            # core.load_module builds every candidate's spec this way, so None
+            # for "brain" is what a bundle without the file looks like from the
+            # loader's side: every candidate is skipped and it raises
+            # ImportError, exactly as it does when the file is not there.
+            if name == "brain":
+                return None
+            return _real_spec(name, *args, **kwargs)
+
+        importlib.util.spec_from_file_location = _unbuildable
+        spec = importlib.util.spec_from_file_location(
+            "handsoff_no_brain", os.path.join(sys.argv[1], "handsoff.py"))
+        mod = importlib.util.module_from_spec(spec)
+        # Named before executing: the app refuses to run unregistered, because
+        # an unnamed load cannot be told apart from a second copy.
+        sys.modules["handsoff_no_brain"] = mod
+        spec.loader.exec_module(mod)
+        from core import brain as real_brain
+
+        def http_error(body, code=400, reason="Bad Request"):
+            return urllib.error.HTTPError("http://127.0.0.1:11434/api/chat",
+                                          code, reason, None, io.BytesIO(body))
+
+        class _Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return io.BytesIO(self.payload)
+
+            def __exit__(self, *exc):
+                return False
+
+        calls, state = [], {}
+
+        def urlopen(request, timeout=None):
+            calls.append(json.loads(request.data.decode()))
+            if len(calls) == 1:
+                raise http_error(json.dumps(
+                    {"error": "this model does not support tools"}).encode())
+            return _Response(json.dumps({"message": {"content": "ok"}}).encode())
+
+        legacy = mod._brain
+        report = {
+            "name": getattr(legacy, "__name__", type(legacy).__name__),
+            "turn_stream": legacy.TurnStream(1, None, None).__class__.__name__,
+            # the MODULE-level implementations, not copies of them: the whole
+            # reason the filters moved out here is that a fallback drifting from
+            # the real one is how a legitimate "<3" reply stopped being spoken
+            "shared_filters": (
+                legacy.strip_thinking is mod._fallback_strip_thinking
+                and legacy.is_leaked_markup is mod._fallback_is_leaked_markup),
+            # identity, not behaviour: a second COPY of the reader inside the
+            # class is exactly what drifted before, and it would pass every
+            # behavioural check here while being the thing that was wrong.
+            "shared_reader": legacy._read_http_error is mod._fallback_read_http_error,
+            "reader_json": legacy._read_http_error(
+                http_error(json.dumps({"error": "no such model"}).encode())),
+            "reader_not_json": legacy._read_http_error(
+                http_error(b"<html>oops</html>", code=500,
+                           reason="Server Error")),
+            "reader_matches_core": all(
+                legacy._read_http_error(http_error(body))
+                == real_brain._read_http_error(http_error(body))
+                for body in (json.dumps({"error": "x"}).encode(), b"",
+                             b"not json at all")),
+        }
+        report["chat"] = legacy.ollama_chat(
+            [{"role": "user", "content": "hi"}], [{"type": "function"}],
+            base="http://127.0.0.1:11434", model="m", num_ctx=8,
+            guard=lambda: None, logger=logging.getLogger("driver"),
+            state=state, urlopen=urlopen)
+        report["call_tools"] = ["tools" in call for call in calls]
+        report["state"] = state
+        print(json.dumps(report))
+        """
+    )
+
+    def test_the_bundle_boots_and_its_reader_behaves_like_core(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        proc = run_driver(
+            ["-c", self.DRIVER, str(HERE)], home=home,
+            capture_output=True, text=True, timeout=180,
+        )
+        # a NameError while BUILDING the class is what this catches: the app
+        # never reaches its first turn, so the exit code is the assertion that
+        # matters most here.
+        assert proc.returncode == 0, proc.stderr[-3000:]
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert report["name"] == "_LegacyBrain"
+        assert report["turn_stream"] == "_LegacyTurnStream"
+        assert report["shared_filters"] is True
+        assert report["shared_reader"] is True
+        # the reader: the JSON body's `error`, and the reason when it is not JSON
+        assert report["reader_json"] == "no such model"
+        assert report["reader_not_json"] == "Server Error"
+        assert report["reader_matches_core"] is True
+        # and the class's own chat path really works through it — a 400 naming
+        # tools retries without them, which is the behaviour the branch exists
+        # to preserve, not just the function it calls
+        assert report["chat"] == {"content": "ok"}
+        assert report["call_tools"] == [True, False]
+        assert report["state"] == {"tools_supported": False}

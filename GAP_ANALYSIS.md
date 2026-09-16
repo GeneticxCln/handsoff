@@ -4908,3 +4908,102 @@ state, nothing to promote) and `core/brain.py`'s `_read_http_error`.
 
 1452 tests green, `compile`/`shell`/`smoke` PASS, tables fresh. Shipped bytes
 changed, so redeployed in the same pass — `deployment: in-sync`.
+
+## The last two §1a rows are paid — and one of them was never a caller (2026-09-16)
+
+§1a is now empty, and the two rows went out for two different reasons. Only one
+of them was a boundary problem.
+
+**`core/tools.py`: the state got a setter.** `_DEFAULT_DEPS` and `_CURRENT` are
+injected STATE, so the row's own reason ("the host reads them for health") was
+wrong in the one way that mattered: the host was *installing* them, rebinding
+both by name at import. They are two slots answering different questions — the
+ContextVar is what a thread that inherited a context resolves, the module
+default is what a thread with NO context falls through to — and a host that
+moves one without the other gets a tool that behaves differently depending on
+which thread ran it. `core/tools.py:set_dependencies(deps)` now installs them
+together, which is also the only way to keep them together.
+
+**`core/brain.py`: the crossing was a NameError bomb, not a caller.** The row
+said "one HTTP error reader the host reuses for the doctor's probe". That came
+from grep of the NAME, and the only reference was
+`_error = _brain._read_http_error` — inside `except ImportError:`, where `_brain`
+is precisely the name that branch cannot have, because having it is what skips
+the branch. So it raised NameError while `_LegacyBrain` was being **built**:
+`import handsoff` on a bundle without `core/brain.py` — the exact bundle that
+class exists for — died before its first turn, and nothing could notice, because
+the class only exists on a bundle no test loads. The host's copy is now
+`_fallback_read_http_error` at module level, beside the two filters that live
+there for exactly this reason; the file's own comment above them already said
+why ("a fallback that drifts from the real one is exactly how a legitimate
+'<3' reply ended up being dropped from speech") — the reader was the third one
+and had never been given the treatment.
+
+**Guards.** `tests/test_hardening.py::TestMissingBrainFallback` boots the real
+module in a child process with `core/brain.py` unbuildable (the same shape as
+its `core/audio.py` twin), then DRIVES the class rather than touching it: a 400
+naming tools must retry without them and pass the fallback through
+`ollama_chat`. Two identity assertions matter more than the behavioural ones —
+the class's filters and its reader must each BE the module-level function, so a
+second copy fails even when it behaves identically, which is the only way a
+copy can drift. `tests/test_regression.py` pins the reader against core's on the
+same bodies (JSON `error`, empty, non-JSON, empty body, HTML), and
+`test_set_dependencies_installs_both_slots` pins the installer: a fresh thread
+gets `None` from the ContextVar and must still resolve the module default.
+
+**Sweep: 6/6 mutations caught, zero residue, every restore sha256-verified**, one
+of them only after it was missed. "No `_error` line" → caught. "Reader drifts
+from core's" → caught. "The reader is a second, behaviourally identical copy
+inside the class" → caught by the identity assertion, which is why it is there.
+"The host rebinds `_DEFAULT_DEPS`/`_CURRENT` by name again" → caught by the §1a
+guard. "A debt row left behind for a crossing nobody makes" → caught. And the
+MISS: `set_dependencies` setting only the ContextVar passed everything, because
+the existing worker-thread test pins the BELT's captured deps
+(`ToolBelt(dependencies=...)`), not the host's install — so the property the new
+docstring claims was unguarded until the new test was written, and the mutation
+was re-run to prove it fails now. A probe keeps the sanctioned path open: the
+declared `core/audio.py` mirror seam and both fallback guards stay green.
+
+**Citations moved, and six of them were loose before they moved.** Editing
+`handsoff.py` shifted every citation below line 404, so each was re-checked
+against the symbol its sentence names — and all six turned out to have been
+pointing at a NEARBY line rather than that symbol: `_DEPLOY_FILES` cited 628,
+which held `seen.add(str(resolved))`; `_deployment_snapshot` cited 742, inside
+the previous function; `PTT_ACTIONS` cited 6350, a comment; and two more cited
+blank lines. They point at `644`, `758`, `6367`, `1393`, `1529` and `3203` now,
+`core/tools.py`'s three `compile()` sites moved 837/3296/3305 → 852/3311/3320,
+and the test-plan snapshot is refreshed (1455 collected / 1353 `test_*`). This is
+the citation guard's own documented limit doing its job badly by design: it
+checks that a cited line EXISTS, not that it is the right line, which is exactly
+how six loose pointers survived it.
+
+**What is still not checked** (the honest limit): the map's Owns prose — a cell
+may name a doorway, and nothing requires it to, so `set_dependencies` is named
+there by hand; and `_LegacyBrain` duplicates brain's whole chat API, of which
+this pass exercises the tools-retry path only. The reader was the third drifting
+copy; the other two dozen lines of that class are the same kind of risk and are
+next in line, not done.
+
+1455 tests green, `compile`/`shell`/`smoke` PASS, order gate green in both
+sub-runs. Shipped bytes changed (`core/tools.py`, `handsoff.py`), so the
+deployment fell behind the moment it landed: redeployed and verified in the same
+pass (`deployment: in-sync`, `running sha256: 86dab828ce6f…`).
+
+**The coverage total is a range, not a number, and this pass is what showed it.**
+The gate was run three times on the identical tree and read **84.25%, 84.16%,
+84.25%** — 15672 statements, with **2468, 2483, 2468 missing**. Diffing the two
+full tables (never done before, which is why one number was previously recorded
+as if it were a measurement) puts the whole spread in exactly two places:
+
+- `core/bubble.py` 2011–2035 — the entire `_on_tick` body, 17 of those lines:
+  the tick is driven by a QTimer, so a run covers it when the event loop spins
+  long enough inside some test and does not when it doesn't.
+- `handsoff-settings.py` 1327–1328 — the malformed-reply `except` in
+  `_json_command`: a control-socket answer that arrives (or doesn't) inside the
+  timeout.
+
+Both are timing, both are bounded, and neither is near the 70% floor — but it
+means a single coverage figure is reproducible only to ±0.1 point, so this
+ledger states the range and the sites rather than a false-precision number. It
+also means the documented figure was never wrong enough to be caught by
+disagreement; only a second measurement could see it.

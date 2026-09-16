@@ -26,7 +26,7 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
 
 ## Ranked risks
 
-1. **`_DEPLOY_FILES` drift (open).** `handsoff.py:628` lists 8 files
+1. **`_DEPLOY_FILES` drift (open).** `handsoff.py:644` lists 8 files
    (`handsoff.py handsoff-settings.py settings_schema.py hardware.py
    core/__init__ core/settings core/doctor handsoff-restart`) while
    install.sh `CORE_REQUIRED` ships 13 core modules (+ audio brain tools
@@ -77,7 +77,7 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
 ## No-inference notes (checked, not assumed)
 
 - No `eval/exec(untrusted)`: only `compile()` for self-edit preview/verify
-  (`core/tools.py:837,3296,3305`) + `app.exec()` (Qt) + `__import__` in the
+  (`core/tools.py:852,3311,3320`) + `app.exec()` (Qt) + `__import__` in the
   origin-checked loader. No `pickle`, no `os.system`, no `shell=True`.
 - Subprocess is argv-list only (`subprocess.run([...])`), never a shell
   string; shell operators are refused before `shlex.split`.

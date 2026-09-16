@@ -27,7 +27,7 @@ Sources: `settings_schema.py` (59 keys, `DEFAULT_SETTINGS`, `BUBBLE_DESIGNS`,
   strict arg coercion (`coerce_bool_arg`, `coerce_number_arg`) — malformed args
   refuse as "bad arguments", never guess 0/True.
 - R2.3 History budget: estimated tokens chars/4, auto = `num_ctx` − fixed
-  prompt − 1024 reply reserve, floor 1024 (`handsoff.py:1375`).
+  prompt − 1024 reply reserve, floor 1024 (`handsoff.py:1393`).
 - R2.4 Durable memory: ≤24 facts (`MAX_MEMORY_FACTS`), extracted per
   utterance, merged, surviving history trim and restarts (`memory.json`).
 - R2.5 Control-token hygiene: `<think>`/`tool_calls`/`im_start` leakage

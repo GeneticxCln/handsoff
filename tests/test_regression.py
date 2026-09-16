@@ -1199,6 +1199,40 @@ class TestAuditNineFindings:
         assert result and result[0][1] is False, result
         assert H._load_reminders()[0]["name"] == "worker"
 
+    def test_set_dependencies_installs_both_slots(self, H, monkeypatch):
+        """The host's installer, not just a belt's constructor.
+
+        Two slots answer different questions and the installer exists because
+        they have to move together: a thread that INHERITED a context resolves
+        the ContextVar, and a thread with none — a worker, an executor child —
+        falls through to the module default. Install only the first and the same
+        tool behaves differently depending on which thread ran it, which is the
+        whole reason `set_dependencies` is a function rather than two lines in
+        the host that someone can do half of.
+        """
+        import contextvars
+        tools = H._core_tools
+        fresh = contextvars.ContextVar("test_tools_deps", default=None)
+        monkeypatch.setattr(tools, "_CURRENT", fresh)
+        # something else in the default slot, so the call is what has to move it
+        monkeypatch.setattr(tools, "_DEFAULT_DEPS",
+                            types.SimpleNamespace(name="not-the-host"))
+        marker = types.SimpleNamespace(name="host-installed")
+        tools.set_dependencies(marker)
+        assert fresh.get() is marker
+        seen = {}
+
+        def worker_body():
+            seen["context"] = fresh.get()
+            seen["resolved"] = tools._dep()
+
+        worker = H.threading.Thread(target=worker_body)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert seen["context"] is None, seen       # a fresh thread has no context
+        assert seen["resolved"] is marker, seen    # so only the default can answer
+
     def test_9_set_survives_deleted_qt_object(self, H):
         """A late emit after Qt teardown must not raise (background threads
         outliving the widget raised 'Signal source has been deleted')."""
@@ -2160,6 +2194,35 @@ class TestStreamedReplyFiltering:
             assert H._fallback_strip_thinking(text) == brain.strip_thinking(text), text
             assert (H._fallback_is_leaked_markup(text)
                     == brain.is_leaked_markup(text)), text
+
+    def test_fallback_error_reader_matches_core_brain(self, H):
+        """The third fallback gets the check the other two have.
+
+        `_read_http_error` cannot BE core's: the branch that uses it is the one
+        where `core/brain.py` could not be loaded. So what can be checked is
+        that the two agree on the same corpus — and this check is exactly what
+        was missing when the host's copy was reached through `_brain`, a name
+        that branch never has, so the class could not even be built. The filters
+        above have had this test since they were found to drift; the reader was
+        the one nobody compared.
+        """
+        import urllib.error
+
+        def error(body, code=400, reason="Bad Request"):
+            return urllib.error.HTTPError("http://127.0.0.1:11434/api/chat",
+                                          code, reason, None, io.BytesIO(body))
+
+        bodies = [json.dumps({"error": "model does not support tools"}).encode(),
+                  json.dumps({"error": ""}).encode(), b"{}",
+                  b"not json at all", b"", b"<html>500</html>"]
+        for body in bodies:
+            assert (H._fallback_read_http_error(error(body))
+                    == _core_brain._read_http_error(error(body))), body
+        # the reason must survive as the fallback's answer, or an HTTP error with
+        # a non-JSON body loses the only sentence that explains it
+        assert H._fallback_read_http_error(
+            error(b"<html>oops</html>", code=500, reason="Server Error")) \
+            == "Server Error"
 
     def test_a_less_than_reply_is_actually_streamed(self, H):
         import queue as _queue

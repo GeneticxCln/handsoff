@@ -8,13 +8,13 @@ Sources: `tests/` (25 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
 
 `tests/` — the FILE LIST is the contract: every `tests/test_*.py` must appear
 below, and `test_specs_freshness.py` fails when one does not. The counts are the
-2026-09-16 snapshot (1451 collected; 1349 `test_*` functions), so a stale count
+2026-09-16 snapshot (1455 collected; 1353 `test_*` functions), so a stale count
 in this table means nothing — a missing row does.
 
 | File | `test_*` fns | Area |
 |---|---|---|
 | `test_audio.py` | 151 | Recorder, resample, whisper/TTS seams, levels, playback cancel |
-| `test_regression.py` | 142 | cross-cutting pins: prompt text, tool census, marker, restart internals |
+| `test_regression.py` | 144 | cross-cutting pins: prompt text, tool census, marker, restart internals |
 | `test_desktop.py` | 119 | niri/typing/windows/clipboard/screens, guards |
 | `test_policy.py` | 100 | DecisionPolicy, gates, confirm flow, whitelist/blocked |
 | `test_design_packs.py` | 98 | packs, image design, palettes, ink guard |
@@ -29,14 +29,14 @@ in this table means nothing — a missing row does.
 | `test_ci_summary.py` | 42 | `ci/pytest_summary.py` digest |
 | `test_hardware.py` | 35 | snapshot sections, TTLs, probers |
 | `test_theme.py` | 34 | hex parse, luminance, retune |
-| `test_hardening.py` | 33 | perms, symlink/0600, token, caps |
+| `test_hardening.py` | 34 | perms, symlink/0600, token, caps, the no-core fallbacks (audio, brain) |
 | `test_registry.py` | 29 | BoundedRegistry admission, Offer arm/consume |
 | `test_assistant.py` | 25 | pomodoro/notifications/reminders/watcher ticks |
 | `test_world_events.py` | 24 | fixed queries, severity, seen-store, cooldowns |
 | `test_notify_coalesce.py` | 15 | notification batching/cooldown |
 | `test_hardware_watch.py` | 13 | hardware watch tick, disk/VRAM alerts |
 | `test_p0_fixes.py` | 6 | named P0 regressions |
-| `test_specs_freshness.py` | 18 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |
+| `test_specs_freshness.py` | 19 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |
 | `test_settings_gui.py` | 1 (+ offscreen subprocess drivers) | Qt GUI incl. 10-design ink guard |
 | `conftest.py` / `fake_ollama.py` | 0 | module loader (`handsoff_core` + alias), order-shuffle, fake brain |
 

@@ -36,7 +36,7 @@ Sources: `install.sh`, `handsoff.py` (`main`, `_deployment_snapshot`,
 
 ## 2. Deployment truth
 
-`_deployment_snapshot()` (`handsoff.py:742`) hashes running vs repo vs
+`_deployment_snapshot()` (`handsoff.py:758`) hashes running vs repo vs
 installed per file over `manifest.files ∪ _DEPLOY_FILES`, compares hashes
 (not mtimes). Statuses: `in-sync`, `installed-drift`, `source-unknown`,
 `installed-missing`, `running-missing`. Surfaced three ways: `--ptt doctor`
@@ -57,7 +57,7 @@ brain/mic banner → `acquire_lock()` (flock; second copy exits 0) →
 
 ## 4. Control socket (22 verbs)
 
-`PTT_ACTIONS` (`handsoff.py:6350`): start stop toggle interrupt handsfree
+`PTT_ACTIONS` (`handsoff.py:6367`): start stop toggle interrupt handsfree
 handsfree-on handsfree-off handsfree-status dictation dictation-on
 dictation-off status health level doctor settings selftest reload-settings
 clear-history say preview-pack preview-clear. Read-only (no token):

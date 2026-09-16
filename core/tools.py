@@ -65,6 +65,21 @@ def _instance_dep(instance):
     return getattr(instance, "_dependencies", None) or _CURRENT.get() or _DEFAULT_DEPS
 
 
+def set_dependencies(deps) -> None:
+    """Install the host's runtime as this module's dependency source.
+
+    Both slots, because they answer different questions: the ContextVar is what
+    a thread that inherited a context resolves, and the module default is what a
+    thread with NO context falls back to. Set only the first and a tool that
+    runs on a worker thread — or in an executor child — silently uses the
+    stdlib-only defaults, so the same tool behaves differently depending on
+    which thread ran it.
+    """
+    global _DEFAULT_DEPS
+    _DEFAULT_DEPS = deps
+    _CURRENT.set(deps)
+
+
 class ToolResult(tuple):
     """What one tool call produced, with the failure flag CARRIED, not sniffed.
 

@@ -9,9 +9,9 @@ copy a size out of it into prose.
 
 | Module | Lines | Owns | Must not import |
 |---|---|---|---|
-| `handsoff.py` | 7126 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
+| `handsoff.py` | 7136 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
 | `core/__init__.py` | 306 | `APP_MODULE_NAME="handsoff_core"`, `claim_app_instance`, `load_module`, origin rule, stdlib-shadow guard | app globals |
-| `core/tools.py` | 3330 | 48 `@tool`s, `ToolBelt`, `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
+| `core/tools.py` | 3345 | 48 `@tool`s, `ToolBelt`, `set_dependencies` (the host installs its runtime with this), `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
 | `core/bubble.py` | 4069 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |
 | `core/settings.py` | 899 | the lifecycle as three calls — `load_settings` (read → migrate → coerce → quarantine), `write_settings` (lock → backup → drop-retired → stamp → atomic replace), `persist_setting` (read-merge-write one key) — plus `Settings`/`settings_object`, `coerce_setting`, and the utilities the runtime shares: `atomic_private_write`, `secure_file`, `quarantine_file`, `backup_runtime_json`, `cross_process_lock` | app globals (paths as params) |
 | `core/audio.py` | 835 | `Recorder`, resample (`_resample_to_16k`), whisper/TTS getters, `play_wav`, level hook; the seam shared with the host: `MIC_OPERATION_LOCK`, `_stop_recorder_bounded`, `_tts_device`, and the mirrored caches it drops through that lock (`_tts_model`, `_whisper_model`, `_whisper_cpu_fallback`) | `handsoff` (`configure()` only) |
@@ -34,31 +34,41 @@ Dependency direction: `handsoff.py` → `core.*` via `_load_module` handles
 deps. `core/calendar.py` + `core/brain.py` + `core/registry.py` +
 `core/lifecycle.py` are dependency-free leaves.
 
-### 1a. Private names still reached across a boundary (declared debt)
+### 1a. Private names reached across a boundary: all paid
 
 A leading underscore is a module saying "not my interface".
 `tests/test_specs_freshness.py` fails when another shipped module reaches such a
-name anyway — unless the module declares it in `__all__` (the mirror seam in
-`core/audio.py` does exactly that) or the row appears below. Every row here is
-DEBT: the caller needs the step, the module has not grown a doorway for it, and
-the fix is to move the work to where the data lives, not to bless it.
+name anyway. There are three ways to clear it, and each of the six names this
+pass crossed was cleared by the one that matched what the name actually was:
 
-A row that is no longer reached, or a name that has since become public or been
-declared, FAILS the guard: this table is a transition, not a parking space.
-`core/calendar.py` and `core/settings.py` are the two examples of paying it.
-Calendar had five private names reached and NO public one, so the five lost the
-underscore. Settings' eight were steps of ONE lifecycle that the module already
-owned in outline — `Settings.load`/`persist`/`write_all` called them — so the
-seven that are genuine entry points became `load_settings`, `write_settings`,
-`persist_setting`, `backup_runtime_json`, `secure_file`, `quarantine_file` and
-`cross_process_lock`, the eighth (`_migrate_settings`) stayed private because
-loading migrates internally and the host's wrapper around it had no callers at
-all.
+1. **Promote it.** Calendar had five private names reached and NO public one, so
+the five lost the underscore — the boundary existed only as a naming convention.
+2. **Point the caller at the doorway that already exists.** Settings' eight were
+steps of ONE lifecycle the module already owned in outline (`Settings.load`
+`persist`/`write_all` called them), so the seven genuine entry points became
+`load_settings`, `write_settings`, `persist_setting`, `backup_runtime_json`,
+`secure_file`, `quarantine_file` and `cross_process_lock`. The eighth,
+`_migrate_settings`, stayed private — loading migrates internally — and the
+host's wrapper around it turned out to have no callers, so it was deleted.
+3. **Give the state a setter.** `core/tools.py`'s `_DEFAULT_DEPS`/`_CURRENT` are
+injected STATE, not functions, and the host was rebinding both by name:
+`_core_tools.set_dependencies(deps)` now installs them together, which is also
+the only way to keep them together — set the ContextVar alone and a tool running
+on a worker thread silently falls back to the stdlib-only defaults.
 
-| Module | Names still reached | Why this is debt, not a seam |
-|---|---|---|
-| `core/tools.py` | `_DEFAULT_DEPS`, `_CURRENT` | Injected state the host reads to answer health and doctor, not functions: there is nothing to promote, only something to stop reaching for. |
-| `core/brain.py` | `_read_http_error` | One HTTP error reader the host reuses for the doctor's probe; it belongs on whatever both callers should be sharing. |
+`core/brain.py`'s `_read_http_error` looked like the one remaining crossing and
+was in fact never a caller: the only reference to it sat inside the
+`except ImportError:` branch in `handsoff.py`, where `_brain` is the name that
+branch does not have — so it raised NameError while the class was being BUILT,
+and the legacy bundle could not start at all. The host's copy is now a module
+level function (`_fallback_read_http_error`) beside the two filters that already
+live there for exactly this reason, and `tests/test_hardening.py` boots the app
+with `core/brain.py` unloadable to drive it.
+
+The guard still reads a declared-debt table here — module, names still reached,
+and why each cannot be renamed yet — and it is empty: a row that is no longer
+reached, or a name since promoted or declared, would FAIL it, because a debt row
+is a transition, not a parking space.
 
 ## 2. Bootstrap (why it reads paranoid)
 
@@ -87,7 +97,7 @@ runtime → `core/tools.py` + host `ToolBelt` subclass, (4d) doctor →
 - `core/tools.py`: `_DEFAULT_DEPS` + `_CURRENT: ContextVar`, host publishes
   `_ToolDependencies` (`_CORE_HANDLES` tuple) and rebinds
   `_core_tools.ToolBelt = ToolBelt` before `build_tools()`
-  (`handsoff.py:3136`). Tests keep the historical `H.*` monkeypatch surface.
+  (`handsoff.py:3203`). Tests keep the historical `H.*` monkeypatch surface.
 - `core/bubble.py`: module-level `SETTINGS`/`APP_NAME`/`SETTINGS_APP`/
   `RESTART_SCRIPT` set by the host post-load; inert defaults keep it
   importable alone.
@@ -125,7 +135,7 @@ diagnostic worker. Shutdown joins with `SHUTDOWN_JOIN_TIMEOUT = 0.25`.
 ## 5. Assistant state machine
 
 Constants `IDLE/LISTENING/THINKING/SPEAKING = "idle"/...` defined once per
-side (`handsoff.py:1511`, `core/bubble.py:65`). `Assistant._state` mutates
+side (`handsoff.py:1529`, `core/bubble.py:65`). `Assistant._state` mutates
 only via `_set(gen, state)` (stale generations cannot paint); `sigState`
 drives the bubble. Typical turn: `IDLE → LISTENING` (PTT press / wake) →
 `THINKING` (submit off-thread on release) → `SPEAKING` (TTS) → `IDLE`;
@@ -154,6 +164,6 @@ timeout are reported as WARNING with frame counts, never dropped silently.
   mirrors `_tts_model`/`_whisper_model`. Push reads the module copy INSIDE
   the lock; reload drops under the same lock; adopt refuses to republish a
   model `core.audio` no longer holds (ordering reviewed, not just tested).
-- `_DEPLOY_FILES` (8 entries, `handsoff.py:628`) is a FLOOR for
+- `_DEPLOY_FILES` (8 entries, `handsoff.py:644`) is a FLOOR for
   manifest-less installs; the manifest glob is the ceiling. Any new module
   MUST reach install.sh `CORE_REQUIRED` (13 names today) — see `90-audit.md`.
