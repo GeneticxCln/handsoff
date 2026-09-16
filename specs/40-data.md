@@ -1,6 +1,6 @@
 # handsoff — data
 
-Sources: `settings_schema.py` (319), `core/settings.py` (874),
+Sources: `settings_schema.py`, `core/settings.py`,
 `handsoff.py` paths/caps, `core/calendar.py`, `core/web.py`, `hardware.py`.
 
 ## 1. settings.json (59 keys, `SETTINGS_VERSION = 2`)

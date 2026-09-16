@@ -1,6 +1,8 @@
 # handsoff — tools API
 
-Source: `core/tools.py`, AST census 2026-09-15: **48 `@tool` methods**.
+Source: `core/tools.py` — **48 `@tool` methods**, counted from the decorators that
+define them. The census below is GENERATED (`python3 ci/spec_tables.py --write`);
+do not hand-edit it, and do not copy a number out of it into prose.
 `gates=None` (decorator omits `gates=`) means "own name"; `gates=''` means
 ungated. Descriptions are the pinned model-facing strings in the decorator.
 
@@ -29,7 +31,7 @@ ungated. Descriptions are the pinned model-facing strings in the decorator.
 | `cancel_reminder` | `reminders` | 2251 |
 | `snooze_reminder` | `reminders` | 2270 |
 | `media_play` | `media` | 2308 |
-| `media_control` | `media` | 2343 |
+| `media_control` | `media` | 2344 |
 | `media_volume` | `media` | 2363 |
 | `now_playing` | `media` | 2375 |
 | `search_library` | `media` | 2392 |

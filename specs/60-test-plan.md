@@ -1,6 +1,6 @@
 # handsoff — test plan
 
-Sources: `tests/` (23 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
+Sources: `tests/` (25 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
 `.coveragerc`, `.github/workflows/ci.yml`, `.gitlab-ci.yml`,
 `githooks/pre-commit`, `ci/`.
 
@@ -8,19 +8,19 @@ Sources: `tests/` (23 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
 
 `tests/` — the FILE LIST is the contract: every `tests/test_*.py` must appear
 below, and `test_specs_freshness.py` fails when one does not. The counts are the
-2026-09-15 snapshot (1390 collected; ~1300 `test_*` functions), so a stale count
+2026-09-16 snapshot (1445 collected; 1343 `test_*` functions), so a stale count
 in this table means nothing — a missing row does.
 
 | File | `test_*` fns | Area |
 |---|---|---|
-| `test_audio.py` | 150 | Recorder, resample, whisper/TTS seams, levels, playback cancel |
-| `test_regression.py` | 137 | cross-cutting pins: prompt text, tool census, marker, restart internals |
+| `test_audio.py` | 151 | Recorder, resample, whisper/TTS seams, levels, playback cancel |
+| `test_regression.py` | 142 | cross-cutting pins: prompt text, tool census, marker, restart internals |
 | `test_desktop.py` | 119 | niri/typing/windows/clipboard/screens, guards |
 | `test_policy.py` | 100 | DecisionPolicy, gates, confirm flow, whitelist/blocked |
 | `test_design_packs.py` | 98 | packs, image design, palettes, ink guard |
-| `test_settings.py` | 81 | loader/coerce/migrate/merge/lock, looks catalogue |
+| `test_settings.py` | 80 | loader/coerce/migrate/merge/lock, looks catalogue |
 | `test_settings_contract.py` | 24 | the field table: coercion, controls, cards, companion rows, the window |
-| `test_lifecycle.py` | 78 | generations, staleness, PTT epoch, cancel/done |
+| `test_lifecycle.py` | 80 | generations, staleness, PTT epoch, cancel/done |
 | `test_ops.py` | 67 | deploy snapshot, restart, control socket, health/doctor |
 | `test_web.py` | 64 | router, backends, cache, reader, SSRF refusals |
 | `test_fault_injection.py` | 52 | boundary breakage, loud-degradation contract |
@@ -36,7 +36,7 @@ in this table means nothing — a missing row does.
 | `test_notify_coalesce.py` | 15 | notification batching/cooldown |
 | `test_hardware_watch.py` | 13 | hardware watch tick, disk/VRAM alerts |
 | `test_p0_fixes.py` | 6 | named P0 regressions |
-| `test_specs_freshness.py` | 9 | the specs' counts vs the code, and the module/test-file/spec lists |
+| `test_specs_freshness.py` | 12 | the specs' counts vs the code, the generated tables, and the file/module/spec lists |
 | `test_settings_gui.py` | 1 (+ offscreen subprocess drivers) | Qt GUI incl. 10-design ink guard |
 | `conftest.py` / `fake_ollama.py` | 0 | module loader (`handsoff_core` + alias), order-shuffle, fake brain |
 

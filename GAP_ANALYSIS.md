@@ -4633,3 +4633,56 @@ architecture map; a test file removed from the plan; and a spec sentence
 REWORDED so the guard stops reading it. 1442 tests green, and `specs/` is in git
 for the first time — it was untracked, so the normative set would have gone with
 the checkout. No shipped byte changed: `deployment: in-sync`.
+
+## The tables that were counts are generated now (2026-09-16)
+
+The freshness pass left its own honest limit: it pinned the COUNTS and left the
+SIZES hand-written, and the previous commit's ledger had to record six of them as
+wrong. That is the installer's old file-list defect one level down — a number
+nobody recomputes is a number that is wrong — so the two tables that are counts
+of the tree are now produced FROM the tree by `ci/spec_tables.py`:
+
+- `20-architecture.md` §1: the module set comes from the installer's own
+  declaration (`TOP_REQUIRED` + `TOP_EXECUTABLE`, minus the shell script) plus
+  every `core/*.py`, so a module that ships is a module that appears, and a new
+  module is priced the moment it exists. The Lines column is measured, not read.
+- `30-tools-api.md`: the census is read from the decorators that define the
+  tools — name (`name=` or the function), effective gate (`gates` if given,
+  else the tool's own name, `''` being the only ungated form, rendered `—`),
+  and the `def` line — plus the count in its own header sentence.
+
+What is NOT generated is the prose: what a module owns and what it must not
+import are statements only a person can make, so a row's cells are preserved and
+a module that arrives without one gets a row reading `TODO` — while `--check`
+KEEPS FAILING. The row appears, the sentence is still owed; `--write` cannot
+ever make the gate green on its own. `--check` is the form the suite runs
+(`tests/test_specs_freshness.py`), and `--write` is the deliberate act a person
+takes in the same commit.
+
+**4/4 mutations caught, tree restored and verified clean**: a module growing one
+line; a tool moving one line down (every later census line with it); a tool's
+gate changed to another tool's; and a brand-new `core/` module — which failed
+twice for the right reason, stale first and then "has no description" after the
+mechanical rewrite.
+
+**The drift it found on arrival, now fixed**: the architecture table priced
+`handsoff.py` at 7057 lines (7119), `core/settings.py` 874 (883),
+`core/brain.py` 215 (275), `core/lifecycle.py` 62 (63), `settings_schema.py` 319
+(974) and `handsoff-settings.py` 4812 (5414), and the census had `media_control`
+one line out of place. Two line citations were refreshed by hand
+(`50-ops.md`: `PTT_ACTIONS` is at `handsoff.py:6350`, not 6288; and
+`10-requirements.md`: the permission dict is at `settings_schema.py:296`, not
+269). And where a size cannot stay true, the number is GONE rather than
+refreshed: `00-overview.md`'s Scale section and its docs table, the two file
+headers in `20-architecture.md` and `40-data.md`, its §7 line, the hard test
+count in `10-requirements.md` N5, and the census's own stale date — each now
+points at the generated table or at the plan instead of repeating a number.
+
+**One honest incident, recorded because the guard that caught it is the point:**
+the first full run of this pass was RED — `test_no_python_child_is_built_by_hand`
+failed on my own new CLI test, because it launched `sys.executable` by hand. The
+sandbox rule (a Python child must come from `conftest.run_driver` or
+`sandbox_env`, or it resolves the DEVELOPER's HOME) caught a test written by the
+person who had just added a guard about isolation. The child now takes
+`sandbox_env()`. 1445 tests green in the default order, `compile`/`shell`/`smoke`
+PASS, `deployment: in-sync` (docs, a test and a CI helper — no shipped byte).

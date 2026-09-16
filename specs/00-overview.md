@@ -34,24 +34,29 @@ settings GUI, systemd service, control socket for keybinds.
 
 | Doc | Role, not replaced |
 |---|---|
-| `README.md` (729 lines) | user manual: install, usage, voice loop, tools tour |
-| `ACCEPTANCE.md` (214 lines) | hardware checklist: must execute on the real desk, not read |
-| `GAP_ANALYSIS.md` (4025 lines) | audit log + roadmap: dated defect batches, mutation guards |
+| `README.md` | user manual: install, usage, voice loop, tools tour |
+| `ACCEPTANCE.md` | hardware checklist: must execute on the real desk, not read |
+| `GAP_ANALYSIS.md` | audit log + roadmap: dated defect batches, mutation guards |
 | `docs/superpowers/specs/*.md` (4) | point designs: hardware-detector, live-watch, world-events, quality-hardening |
 | `docs/superpowers/plans/*.md` (2) | hygiene + quality phase-1 plans |
 
 These specs describe **what the tree promises**. Tutorials stay in `README.md`,
 desk verification stays in `ACCEPTANCE.md`, history stays in `GAP_ANALYSIS.md`.
 
-## Scale (measured 2026-09-15)
+## Scale
 
-- `handsoff.py` 7057 lines (app + Assistant + ControlServer + voice pipeline).
-- `handsoff-settings.py` 4812 lines (6-tab GUI).
-- `core/`: 13 modules — `__init__` 306, `assistant` 595, `audio` 824,
-  `brain` 215, `bubble` 4069, `calendar` 548, `doctor` 515, `lifecycle` 62,
-  `registry` 435, `settings` 874, `theme` 313, `tools` 3330, `web` 972.
-- `settings_schema.py` 319, `hardware.py` 529.
-- Suite: 1390 collected / ~1300 `test_*` functions across 23 test files.
+- `core/`: 13 modules (sizes and ownership in `20-architecture.md` §1, which is
+  GENERATED from the tree — a size copied into prose starts lying that day).
+- `handsoff.py` is the app: bootstrap, `Assistant`, `ControlServer`, voice
+  pipeline, memory, `main()`; `handsoff-settings.py` is the 6-tab GUI.
+- The suite's own inventory is `60-test-plan.md` (where the counts are a dated
+  snapshot and the file list is the contract).
+
+Whatever this file states as a COUNT — the core module count here, the tool
+census, the settings keys — is checked against the code by
+`tests/test_specs_freshness.py`, and the two tables derived from the tree are
+checked against `ci/spec_tables.py`. Prose that rots is prose that is wrong:
+it carries no numbers it cannot keep.
 
 ## Maintenance rule
 

@@ -27,10 +27,19 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
+import sys
 from pathlib import Path
+
+from conftest import _load as _load_module, sandbox_env
 
 HERE = Path(__file__).resolve().parent.parent
 SPECS = HERE / "specs"
+
+
+def _generator():
+    """`ci/spec_tables.py`, through the suite's one loader (sandboxed home)."""
+    return _load_module("spec_tables", HERE / "ci" / "spec_tables.py")
 
 # (spec file, pattern) for each count, taken from the sentence the spec states it
 # in. Only the number is captured.
@@ -192,6 +201,61 @@ class TestSpecFreshness:
         assert not unlisted, (
             f"specs/{unlisted} is not in the index — a spec nobody links is a "
             f"spec nobody reads")
+
+    def test_the_tables_are_what_the_generator_produces(self):
+        """The two count tables cannot drift, because they are not written by hand.
+
+        Both were hand-maintained and both were wrong: the architecture table
+        priced `settings_schema.py` at 319 lines when it was 974, and the tool
+        census was off by one on a tool whose decorator grew a line. The
+        generator reads the module set from the installer's own declaration and
+        the tools from the decorators that define them, so this test is the
+        thing that keeps the spec honest — `python3 ci/spec_tables.py --write`
+        is how a person updates it, deliberately, in the same commit.
+        """
+        spec_tables = _generator()
+        stale = spec_tables.pending()
+        assert not stale, (
+            "the spec's generated tables are not what the tree says: "
+            + ", ".join(f"{path.name} ({what})" for path, what, _o, _n in stale)
+            + " — run: python3 ci/spec_tables.py --write")
+        owed = spec_tables.undescribed()
+        assert not owed, (
+            "a module arrived with no sentence about it (what it owns, what it "
+            f"must not import): {owed}")
+
+    def test_the_generated_tables_agree_with_the_census(self):
+        """Two readers of the same fact must not disagree (tools, at least).
+
+        The architecture table is priced in lines, so it says nothing about the
+        tool count; the census does, and the generator derives it from the same
+        AST this file counts. If they ever diverge, one of them is reading the
+        file wrong — which is the failure a generated table is supposed to end.
+        """
+        spec_tables = _generator()
+        assert len(spec_tables.tool_rows()) == LIVE["tools"]
+        labels = [label for label, _path in spec_tables.modules()]
+        assert labels.count("core/__init__.py") == 1, labels
+        assert len([name for name in labels if name.startswith("core/")]) == LIVE["core_modules"]
+
+    def test_the_generator_exits_zero_on_a_current_tree(self):
+        """The gates call it as a COMMAND; in-process checks do not prove that.
+
+        `--check` is the form `ci/gates.sh` and a reviewer run, so its exit
+        status is the whole contract: a script that raises while importing, or
+        that prints a complaint and still exits 0, would read as clean in both
+        places while the tables rot.
+        """
+        # sandbox_env, not os.environ: a child started by hand resolves the
+        # developer's CONFIG_DIR/STATE_DIR (tests/test_sandbox.py pins that rule).
+        proc = subprocess.run(
+            [sys.executable, str(HERE / "ci" / "spec_tables.py")],
+            capture_output=True, text=True, cwd=str(HERE),
+            env=sandbox_env(), timeout=120)
+        assert proc.returncode == 0, (
+            f"ci/spec_tables.py exited {proc.returncode}:\n"
+            f"{proc.stdout}\n{proc.stderr}")
+        assert "STALE" not in proc.stdout, proc.stdout
 
     def test_the_census_is_not_vacuous(self):
         """Every quantity in the table was really read, and from a real file."""

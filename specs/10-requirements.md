@@ -108,13 +108,13 @@ Knowledge (gate `web_access`): `get_weather`, `web_search`, `read_page`,
   PTT 60 s, read 160 KB / write 2 MB / self-edit 500 KB, control request
   64 KB + 5 s budget, history/lookups TTLs, refusal stores capped (see
   `40-data.md`). A refusal names the cap, the occupants, and the remedy.
-- N5 Deterministic suite: 1390 tests, coverage TOTAL ≥70, any-order green
+- N5 Deterministic suite: coverage TOTAL ≥70, any-order green
   (shuffled twice in CI), thread-crash fails the build, every shipped file
   byte-compiles, every shell script `bash -n`, installer `--help` smokes.
 - N6 Platform: Arch/CachyOS + niri, NVIDIA strongly recommended (26B ≈
   14 GB VRAM), mic + speakers, Ollama, MPD for music, ydotoold for typing.
 
-## 8. Permission model (19 keys, `settings_schema.py:269`)
+## 8. Permission model (19 keys, `settings_schema.py:296`)
 
 Defaults ON: run/read/edit/self_restart/type/press_keys/web/media/screen/
 paste/copy/reminders/calendar/focus/get_datetime/pomodoro/watchers.

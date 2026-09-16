@@ -57,7 +57,7 @@ brain/mic banner → `acquire_lock()` (flock; second copy exits 0) →
 
 ## 4. Control socket (22 verbs)
 
-`PTT_ACTIONS` (`handsoff.py:6288`): start stop toggle interrupt handsfree
+`PTT_ACTIONS` (`handsoff.py:6350`): start stop toggle interrupt handsfree
 handsfree-on handsfree-off handsfree-status dictation dictation-on
 dictation-off status health level doctor settings selftest reload-settings
 clear-history say preview-pack preview-clear. Read-only (no token):
