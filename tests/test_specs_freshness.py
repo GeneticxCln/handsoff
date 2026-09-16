@@ -78,6 +78,30 @@ CLAIMS = {
 }
 
 
+def _generated_lines(headers) -> set:
+    """(file, 1-based line) of every line inside a generated table.
+
+    The generator owns these lines, so they are the only place a size may
+    appear; everything else in the specs is prose a person maintains.
+    """
+    out = set()
+    for name, header in headers:
+        lines = (SPECS / name).read_text(encoding="utf-8").splitlines()
+        try:
+            start = lines.index(header)
+        except ValueError:
+            raise AssertionError(
+                f"the generated table `{header}` is gone from specs/{name} — "
+                f"the generator edits it and this guard skips it, so the two "
+                f"have to be reworded together")
+        row = start + 1                      # header + separator (0-based)
+        while row <= len(lines) and (row <= start + 2
+                                     or lines[row - 1].startswith("|")):
+            out.add((name, row))
+            row += 1
+    return out
+
+
 def _spec(name: str) -> str:
     return (SPECS / name).read_text(encoding="utf-8")
 
@@ -256,6 +280,80 @@ class TestSpecFreshness:
             f"ci/spec_tables.py exited {proc.returncode}:\n"
             f"{proc.stdout}\n{proc.stderr}")
         assert "STALE" not in proc.stdout, proc.stdout
+
+    def test_every_line_citation_points_at_a_line_that_exists(self):
+        """A citation is `module.py:NNN`; the file and the line must still be there.
+
+        What a citation MEANT cannot be checked — no guard reads intent — so
+        this catches a rename, a cut, or a number left past the end of a module
+        that shrank, and NOT the case of a citation that lands inside the file
+        on the wrong line. That is the honest size of it, and it is stated
+        because both citations corrected in this pass were the second kind: the
+        pointer survived, the number had moved.
+        """
+        citations = []
+        for path in sorted(SPECS.glob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            for number, line in enumerate(text.splitlines(), 1):
+                for target, at in re.findall(r"`?([\w/]+\.py)`?:(\d+)", line):
+                    citations.append((f"{path.name}:{number}", target, int(at)))
+        assert len(citations) >= 10, (
+            f"only {len(citations)} citations were found — the specs used to "
+            f"carry 17, so this guard has stopped reading them (a reworded "
+            f"citation is a citation nothing checks)")
+        dead = []
+        for where, target, at in citations:
+            module = HERE / target
+            if not module.exists():
+                dead.append(f"{where} cites {target}, which is gone")
+                continue
+            count = len(module.read_text(encoding="utf-8").splitlines())
+            if at > count:
+                dead.append(f"{where} cites {target}:{at}, which has {count} lines")
+        assert not dead, "a spec cites a line that is not there:\n  " + "\n  ".join(dead)
+
+    def test_no_spec_restates_a_module_size_outside_the_tables(self):
+        """A size copied out of §1 starts lying the day the file it prices changes.
+
+        Three of the numbers corrected when §1 became generated were exactly
+        this: the audit restated four file sizes and two had gone wrong, and the
+        test plan timed the suite at 2.5 min when it took 3.5. Keeping a size
+        *in* the generated table is safe; copying it into a sentence is the
+        defect — nobody recomputes a number in a sentence, which is how the
+        installer's file list went wrong one level up.
+
+        Line *citations* (`handsoff.py:6350`) are the useful form and are
+        stripped first: they say where a thing is, which the table cannot, and
+        two of them had also gone stale. A number under three digits beside a
+        module name is not matched — `handsoff-settings.py` really is a 6-tab
+        GUI, and that is a count of tabs, not of lines.
+        """
+        spec_tables = _generator()
+        labels = sorted({label for label, _path in spec_tables.modules()})
+        assert labels, "the generator prices no modules — nothing is being read"
+        generated = _generated_lines({("20-architecture.md",
+                                      spec_tables.ARCH_HEADER),
+                                     ("30-tools-api.md",
+                                      spec_tables.TOOLS_HEADER)})
+        offenders = []
+        for path in sorted(SPECS.glob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            for number, line in enumerate(text.splitlines(), 1):
+                if (path.name, number) in generated:
+                    continue
+                text_ = re.sub(r"`?[\w/]+\.py`?:\d+", "", line)   # citations
+                if not re.search(r"\d{3,}", text_):
+                    continue
+                named = [label for label in labels if label in text_]
+                if named:
+                    offenders.append(
+                        f"{path.name}:{number} restates {named} beside a "
+                        f"number — {line.strip()[:70]!r}")
+        assert not offenders, (
+            "a spec states a shipped module's size in prose:\n  "
+            + "\n  ".join(offenders)
+            + "\nspecs/20-architecture.md §1 is generated — point at it instead "
+            "of copying out of it")
 
     def test_the_census_is_not_vacuous(self):
         """Every quantity in the table was really read, and from a real file."""

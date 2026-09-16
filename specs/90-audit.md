@@ -43,11 +43,14 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    lock, drop takes the same lock, adopt refuses republish of a dropped
    model) is ordering-sensitive — any new reader/writer of the mirrors must
    take the same lock or the defect returns.
-3. **Monolith mass (accepted, cutting).** 7057 + 4812 + 4069 + 3330 lines in
-   four files. Cut plan works ((a)/4c/4d/4e done) but every new feature
-   landed in `handsoff.py` lengthens the critical path the suite + pre-commit
-   already take ~2.5 min to guard. Rule: new seams go to `core/` with a
-   `H.*` alias, never new globals in the app.
+3. **Monolith mass (accepted, cutting).** The four largest files are priced in
+   `20-architecture.md` §1, which is generated from the tree; no size is
+   restated here, because a restated size is a size that rots (this item used
+   to carry four of them, and two had gone wrong). Cut plan works
+   ((a)/4c/4d/4e done) but every new feature landed in `handsoff.py` lengthens
+   the critical path the suite + pre-commit already spend minutes guarding.
+   Rule: new seams go to `core/` with a `H.*` alias, never new globals in the
+   app.
 4. **Control-token trust boundary is same-UID (documented).** 0700 dir +
    peer-uid stop other users; a same-UID compromised child passes uid and is
    stopped only by the token — which any process that can read `STATE_DIR`

@@ -1,6 +1,6 @@
 # handsoff — operations
 
-Sources: `install.sh` (915), `handsoff.py` (`main`, `_deployment_snapshot`,
+Sources: `install.sh`, `handsoff.py` (`main`, `_deployment_snapshot`,
 `ControlServer`, `ptt_client`), `handsoff-restart`, `hardware.py`,
 `core/doctor.py`.
 

@@ -55,8 +55,9 @@ in this table means nothing — a missing row does.
 - `pytest.ini`: `PytestUnhandledThreadExceptionWarning` is an ERROR —
   a worker thread raising fails the build.
 - pre-commit (`githooks/`, opt-in via `core.hooksPath`): staged
-  `py_compile` + shebang `bash -n` + FULL suite (~2.5 min) when shipped
-  sources/workflows change; bypass only via `--no-verify`, deliberately.
+  `py_compile` + shebang `bash -n` + FULL suite (minutes — no duration is
+  copied here, because a copied one rots) when shipped sources/workflows
+  change; bypass only via `--no-verify`, deliberately.
 - GitLab: same gates + pip cache on the lock file, junit report, and
   `after_script` digest (`ci/pytest_summary.py --post`) that prints failing
   names + env-fix hints even when the job dies.
@@ -83,10 +84,13 @@ in this table means nothing — a missing row does.
 ## 4. Coverage floor (`.coveragerc`, TOTAL ≥70)
 
 Omit: `tests/*`, `attic/*`, root `test.py` scratch, `site-packages`,
-`shibokensupport`/`signature_bootstrap` phantoms. Measured shape ≈75%:
-handsoff.py ~71, hardware ~84, core/assistant ~84, core/theme 100,
-`ci/pytest_summary.py` 94, handsoff-settings.py ~68 via subprocess drivers.
-Raise with tests, never with omit-patterns.
+`shibokensupport`/`signature_bootstrap` phantoms. The per-file shape is not
+restated here: this section used to list a percentage per file, and every one
+of them had drifted by the time it was read. `coverage report` prints the
+shape as it is today; the gate enforces the floor on TOTAL. The module that
+needs tests most is the one only the subprocess GUI drivers exercise, which is
+what the driver scenarios in §3 exist for. Raise with tests, never with
+omit-patterns.
 
 ## 5. What tests cannot cover (desk truth in ACCEPTANCE.md)
 

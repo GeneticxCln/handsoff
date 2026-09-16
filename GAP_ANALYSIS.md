@@ -4686,3 +4686,56 @@ sandbox rule (a Python child must come from `conftest.run_driver` or
 person who had just added a guard about isolation. The child now takes
 `sandbox_env()`. 1445 tests green in the default order, `compile`/`shell`/`smoke`
 PASS, `deployment: in-sync` (docs, a test and a CI helper — no shipped byte).
+
+## A size can no longer be copied out of the generated tables (2026-09-16)
+
+Generating the two tables closed the drift where a number is *derived*; the
+failure they were built to end was still available one step away, in a sentence,
+where nobody recomputes it. Three numbers in the specs were that shape:
+
+- `90-audit.md` item 3 restated four file sizes (7057 + 4812 + 4069 + 3330) and
+  two of them were already wrong — `handsoff.py` is 7119 lines and
+  `handsoff-settings.py` is 5414. It now prices nothing and points at §1.
+- `60-test-plan.md` §4 printed a per-file coverage shape ("handsoff.py ~71,
+  hardware ~84, core/theme 100, …") measured against a tree whose statement
+  counts have since changed, under a heading that says `TOTAL ≥70` while the
+  recorded coverage is 84%. It now says how to read the shape (`coverage
+  report`) and which number the gate holds (TOTAL).
+- `50-ops.md`'s source list carried `install.sh` (915) — exact that day, and a
+  size nobody recomputes.
+
+All three are now statements of METHOD rather than measurements, which is the
+only form of a number that cannot rot.
+
+**Two guards, because both failures are silent.** The module labels the
+generator prices are read from the generator itself, and a spec may not name one
+beside a number of three digits or more anywhere OUTSIDE the two generated
+tables. Citations (`handsoff.py:6350`) are stripped first — they are the useful
+form, and the form the table cannot carry — and a two-digit count is exempt
+because `handsoff-settings.py` really is a 6-tab GUI, which is a count of tabs,
+not of lines. The table lines are exempt BY LINE NUMBER, from the generator's own
+headers, and the exemption is proven rather than assumed: one of the sweep's
+mutations changes a size *inside* §1, where the prose guard stays silent and the
+generator guard fires.
+
+The second guard is the citation one: every `module.py:NNN` must name a file that
+exists and a line the file still has. That catches a rename, a cut, or a number
+left past the end of a module that shrank — and NOT a citation that lands in the
+right file on the wrong line. The docstring says so, because both citations
+corrected in the previous pass were that second kind, and a guard that implies
+more than it checks is how the installer's file list started.
+
+**4/4 mutations caught, zero residue, every restore sha256-verified**: a size
+copied back into prose; the same size changed inside the generated table (caught
+by the generator, the exemption proven); a citation to a module that is gone; and
+a citation past the end of a shrunken one. Two anti-vacuity rules keep the guards
+from going quiet: an unmatched statement FAILS rather than skips, and the
+citation guard refuses to pass if it finds fewer than 10 (the specs carry 17).
+
+One limit probe behaved better than predicted and is recorded for that reason: a
+citation reworded to `handsoff.py` line 742, so the citation regex stops seeing
+it, was expected to be invisible — the prose guard flagged it instead, for its own
+reason. The hole is smaller than the docstring claims.
+
+14 tests green in `test_specs_freshness.py`, the full suite in the commit hook,
+`deployment: in-sync` — a test and four spec files, no shipped byte.
