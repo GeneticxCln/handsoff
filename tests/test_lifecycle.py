@@ -1320,6 +1320,64 @@ class TestStreamingChat:
         finally:
             H.OLLAMA_BASE = old_base
 
+    def test_a_turn_with_facts_and_a_hardware_note_is_accepted(self, H,
+                                                              fake_ollama,
+                                                              monkeypatch):
+        """The real conversation builder through the real wire path, against a
+        server that enforces Ollama's rule (the fake answers HTTP 500, "system
+        message must be at the beginning", to any list with a system message
+        after the first — measured live: qwen3.8:27b 500s, gemma4:latest does
+        not).
+
+        The host put the remembered facts and the hardware note in their own
+        system messages, so every turn carrying either died with "Sorry, my
+        brain is offline" on a model that enforces the rule. The turn must now
+        reach the model AND the injected blocks must stay out of history —
+        they are re-injected every turn, so a persisted copy accumulates.
+        """
+        old_base = H.OLLAMA_BASE
+        H.OLLAMA_BASE = fake_ollama
+        try:
+            asst = H.Assistant.__new__(H.Assistant)
+            asst._tools = types.SimpleNamespace()
+            asst._gen = 1
+            asst._history = []
+            asst._memory = [{"k": "name", "v": "Quinton"}]
+            asst._hardware_note = "mic looks silent"
+            asst._turn_spoke = False
+            asst._maybe_briefing_prefix = lambda text: ""
+            asst._save_history = lambda: None
+            asst._set = lambda *args, **kwargs: None
+            said = []
+
+            def fake_speak(text, gen, cancel, sentence_q=None):
+                if sentence_q is None:
+                    if text:
+                        said.append(text)
+                    return
+                while True:
+                    item = sentence_q.get(timeout=2)
+                    if item is None:
+                        return
+                    said.append(item)
+
+            asst._speak = fake_speak
+            monkeypatch.setitem(H.SETTINGS, "streaming_tts", True)
+            monkeypatch.setitem(H._BRAIN_STATE, "tools_supported", False)
+
+            H.Assistant._brain_turn(asst, "what is my name", 1,
+                                    threading.Event())
+
+            assert said == ["One.", "Two.", "Three."], said
+            assert asst._hardware_note == ""      # consumed once, not persisted
+            users = [m for m in asst._history if m.get("role") == "user"]
+            assert users and users[-1]["content"] == "what is my name", users
+            assert "Facts you remember" not in users[-1]["content"]
+            assert not any("hardware note" in str(m.get("content", ""))
+                           for m in asst._history)
+        finally:
+            H.OLLAMA_BASE = old_base
+
     def test_old_stream_cannot_overwrite_new_turn_result(self, H, monkeypatch):
         """A late canceled stream owns its result and cannot replace turn B's."""
         asst = H.Assistant.__new__(H.Assistant)

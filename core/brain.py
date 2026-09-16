@@ -72,6 +72,64 @@ def _defaults(base: str, model: str, num_ctx: int, tools: list[dict] | None,
     return payload
 
 
+_TAIL_SYSTEM_WARNED = False
+
+
+def _messages_system_first(messages: list[dict],
+                           logger: logging.Logger) -> list[dict]:
+    """Fold any system message that is not the first one into a user turn.
+
+    Ollama refuses the WHOLE request with HTTP 500 ("system message must be at
+    the beginning") when a system message follows the first. Verified live
+    against Ollama 0.32.13 and qwen3.8:27b: the same list that 500s there is
+    accepted by gemma4:latest, so the failure looks like a broken brain on one
+    model and works on another. A caller that appends a per-turn note as a
+    system message would therefore kill every turn, so the one place every
+    request passes through enforces the API's role rule instead of trusting
+    each caller — and names the offending content once in the journal.
+    """
+    global _TAIL_SYSTEM_WARNED
+    if not any(m.get("role") == "system" for m in messages[1:]):
+        return messages
+    head = []
+    rest = list(messages)
+    # at most one leading system message may stay: two of them is the same
+    # shape that 500s (the renderer allows only the first)
+    for index, message in enumerate(rest):
+        if message.get("role") == "system":
+            head.append(str(message.get("content") or ""))
+            continue
+        rest = rest[index:]
+        break
+    else:
+        rest = []
+    parts = [s for s in head[1:] if s]
+    parts += [str(m.get("content") or "") for m in rest
+              if m.get("role") == "system" and str(m.get("content") or "")]
+    kept = [m for m in rest if m.get("role") != "system"]
+    note = "\n\n".join(parts)
+    if not note and len(head) < 2:
+        return messages
+    if note:
+        target = next((i for i in range(len(kept) - 1, -1, -1)
+                       if kept[i].get("role") == "user"), None)
+        if target is None:
+            kept.append({"role": "user", "content": note})
+        else:
+            kept[target] = {**kept[target],
+                            "content": note + "\n\n"
+                            + str(kept[target].get("content") or "")}
+        if not _TAIL_SYSTEM_WARNED:
+            _TAIL_SYSTEM_WARNED = True
+            logger.warning(
+                "model call had a system message after the first (Ollama "
+                "answers HTTP 500); folded into the user turn: %s", note[:200])
+    if not head:
+        return kept
+    merged = "\n\n".join(h for h in head if h)
+    return [{"role": "system", "content": merged}] + kept
+
+
 def ollama_available(*, base: str, guard: Callable[[], None],
                      urlopen: Callable = urllib.request.urlopen) -> bool:
     try:
@@ -91,6 +149,7 @@ def ollama_chat(messages: list[dict], tools: list[dict] | None = None, *,
                 keep_alive: str | None = None) -> dict:
     guard()
     payload = _defaults(base, model, num_ctx, tools, False, keep_alive)
+    messages = _messages_system_first(messages, logger)
     payload["messages"] = messages
     req = urllib.request.Request(
         base + "/api/chat", data=json.dumps(payload).encode("utf-8"),
@@ -136,6 +195,7 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
     """Stream chat content into q, ending it with exactly one terminator."""
     guard()
     payload = _defaults(base, model, num_ctx, tools, True, keep_alive)
+    messages = _messages_system_first(messages, logger)
     payload["messages"] = messages
     req = urllib.request.Request(
         base + "/api/chat", data=json.dumps(payload).encode("utf-8"),

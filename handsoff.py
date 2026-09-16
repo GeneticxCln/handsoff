@@ -5698,10 +5698,16 @@ class Assistant(QObject):
         """Build the full message list for a turn: system prompt + history +
         remembered facts + the user utterance.
 
-        The memory block is the LAST system message (after history) so the
-        long prefix — main system prompt + history — stays byte-identical
-        across turns and Ollama's KV cache keeps hitting on it; only the
-        small memory delta and the new utterance are evaluated."""
+        EXACTLY ONE system message, at index 0. Ollama 0.32 rejects the whole
+        request (HTTP 500, "system message must be at the beginning") when a
+        system message follows the first — verified live against qwen3.8:27b,
+        where every turn carrying a tail system note failed while the same
+        prompt on gemma4:latest worked. The facts block and the hardware note
+        therefore ride in the final user message instead of their own roles.
+
+        The prefix — main system prompt + history — still stays byte-identical
+        across turns, so Ollama's KV cache keeps hitting on it and only the
+        small per-turn delta and the new utterance are evaluated."""
         _now = datetime.datetime.now()
         now = (f"{_core_calendar._DAY_NAMES[_now.weekday()]}, {_now.day:02d} "
                f"{_core_calendar._MONTH_NAMES[_now.month - 1]} {_now.year}, "
@@ -5711,21 +5717,23 @@ class Assistant(QObject):
                   "date (weather today, 'tomorrow', news), use your tools.")
         briefing = self._maybe_briefing_prefix(text)
         user_content = (briefing + "\n\nThe user just said: " + text) if briefing else text
-        conversation = [{"role": "system", "content": system}]
-        conversation += list(self._history)
+        tail: list[str] = []
         if self._memory:
             facts = "\n".join(f"- {m['v']}" for m in self._memory)
-            conversation.append({"role": "system",
-                                 "content": "Facts you remember about the user:\n" + facts})
+            tail.append("Facts you remember about the user:\n" + facts)
         # ponytail: consumed-once hardware note goes last (same prefix-cache
         # rationale as the memory block) and is cleared on attach.
         hw_note = (getattr(self, "_hardware_note", "") or "")[:200]
         self._hardware_note = ""
         if hw_note:
-            conversation.append({"role": "system",
-                                 "content": "Live hardware note:\n" + hw_note})
-        conversation.append({"role": "user", "content": user_content})
-        return conversation
+            tail.append("Live hardware note:\n" + hw_note)
+        injected = ("\n\n".join(tail) + "\n\n") if tail else ""
+        # remembered for the history-publish tail: the block is re-injected
+        # every turn, so persisting it would accumulate one stale copy per turn
+        self._turn_injected = injected
+        return ([{"role": "system", "content": system}]
+                + list(self._history)
+                + [{"role": "user", "content": injected + user_content}])
 
     def _brain_turn(self, text: str, gen: int, cancel: threading.Event) -> None:
         set_turn = getattr(self._tools, "_set_user_turn", None)
@@ -5851,13 +5859,22 @@ class Assistant(QObject):
         # only THIS turn may publish history: a newer utterance owns the
         # assistant's memory once it has started (its own pipeline will write)
         if gen == self._gen:
-            self._history = _trim_history(
-                [m for m in conversation[1:]
-                 if m.get("role") != "system"])
-            # ^ drop the main system prompt [1:] AND the memory block: the
-            # block is injected fresh by _conversation_for on every turn —
-            # persisting it would accumulate one stale copy per turn (token
-            # bloat, broken KV-cache prefix, and a superseded fact could win)
+            msgs = [m for m in conversation[1:] if m.get("role") != "system"]
+            # ^ drop the main system prompt [1:]; the facts/hardware block is
+            # injected fresh by _conversation_for on every turn — persisting it
+            # would accumulate one stale copy per turn (token bloat, broken
+            # KV-cache prefix, and a superseded fact could win), so the turn's
+            # user message is stored without it.
+            injected = getattr(self, "_turn_injected", "")
+            if injected:
+                for index, message in enumerate(msgs):
+                    content = str(message.get("content") or "")
+                    if (message.get("role") == "user"
+                            and content.startswith(injected)):
+                        msgs[index] = {**message,
+                                       "content": content[len(injected):].lstrip("\n")}
+                        break
+            self._history = _trim_history(msgs)
             _strip_images(self._history)   # screenshots: this turn's model call only
             self._save_history()
         else:

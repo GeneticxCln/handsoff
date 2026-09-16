@@ -983,14 +983,23 @@ class TestRollingMemory:
         a._memory = [{"k": "name", "v": "the user's name is Quinton"}]
         a._maybe_briefing_prefix = lambda t: ""
         conv = a._conversation_for("what is my name")
-        roles = [m["role"] for m in conv]
-        assert roles == ["system", "system", "user"]
-        assert "the user's name is Quinton" in conv[1]["content"]
-        assert "Facts you remember" in conv[1]["content"]
+        # EXACTLY one system message, first. Ollama answers HTTP 500 ("system
+        # message must be at the beginning") for any system message after the
+        # first — verified live against qwen3.8:27b, where every turn carrying
+        # a tail system note died while the same prompt on gemma4:latest was
+        # fine — so the block rides in the user turn instead of its own role.
+        assert [m["role"] for m in conv] == ["system", "user"]
+        assert "the user's name is Quinton" in conv[-1]["content"]
+        assert "Facts you remember" in conv[-1]["content"]
+        assert "what is my name" in conv[-1]["content"]
+        # and the injected block is remembered, so the history write can keep
+        # the plain utterance (the block is re-injected on every turn)
+        assert conv[-1]["content"].startswith(a._turn_injected)
         # and with no memory: no extra block
         a._memory = []
         conv2 = a._conversation_for("hello")
         assert [m["role"] for m in conv2] == ["system", "user"]
+        assert a._turn_injected == ""
 
     def test_pipeline_extracts_and_persists(self, H, monkeypatch, tmp_path):
         """End-to-end: a pipeline turn with a durable fact updates memory.json
@@ -1986,6 +1995,113 @@ def _stream(q, cancel, urlopen):
                                     model="m", num_ctx=8192, guard=lambda: None,
                                     logger=logging.getLogger("test.stream"),
                                     state={}, urlopen=urlopen)
+
+
+class TestSystemFirstMessages:
+    """Ollama 0.32 refuses the WHOLE request with HTTP 500 ("system message
+    must be at the beginning") when a system message follows the first.
+
+    Measured live: the identical list 500s against qwen3.8:27b and is accepted
+    by gemma4:latest, so the breakage reads as "broken brain on one model".
+    The wire seam every request passes through folds such a note into the user
+    turn and names it once in the journal, so a caller that reintroduces the
+    shape cannot hand the user a 500 for their next question.
+    """
+
+    def _sent(self, H, messages, monkeypatch):
+        from core import brain as core_brain
+        sent = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"message": {"content": "ok"}}'
+
+        def fake_urlopen(req, timeout=None):
+            sent.update(json.loads(req.data.decode("utf-8")))
+            return _Resp()
+
+        monkeypatch.setattr(core_brain, "_TAIL_SYSTEM_WARNED", False)
+        core_brain.ollama_chat(messages, None, base="http://127.0.0.1:9",
+                               model="m", num_ctx=8192, guard=lambda: None,
+                               logger=logging.getLogger("test.system.first"),
+                               urlopen=fake_urlopen)
+        return sent
+
+    def test_a_tail_system_note_is_folded_into_the_user_turn(self, H, monkeypatch):
+        sent = self._sent(H, [
+            {"role": "system", "content": "MAIN"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "Facts you remember:\n- Quinton"},
+            {"role": "user", "content": "what is my name"},
+        ], monkeypatch)
+        assert [m["role"] for m in sent["messages"]] == ["system", "user", "user"]
+        assert sent["messages"][0]["content"] == "MAIN"
+        assert sent["messages"][-1]["content"] == (
+            "Facts you remember:\n- Quinton\n\nwhat is my name")
+        assert "Facts you remember" not in sent["messages"][1]["content"]
+
+    def test_a_clean_list_reaches_the_server_untouched(self, H, monkeypatch):
+        clean = [{"role": "system", "content": "MAIN"},
+                 {"role": "user", "content": "hi"}]
+        sent = self._sent(H, clean, monkeypatch)
+        assert sent["messages"] == clean
+
+    def test_a_note_with_no_user_turn_still_reaches_the_model(self, H, monkeypatch):
+        """Mid-tool-loop there is no user message after the note; the content
+        must land somewhere a model can read rather than being dropped."""
+        sent = self._sent(H, [
+            {"role": "system", "content": "MAIN"},
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "content": "result"},
+            {"role": "system", "content": "Live hardware note:\nmic silent"},
+        ], monkeypatch)
+        assert [m["role"] for m in sent["messages"]] == ["system", "user", "tool"]
+        assert "Live hardware note" in sent["messages"][1]["content"]
+
+    def test_the_fold_is_named_once_in_the_journal(self, H, monkeypatch, caplog):
+        from core import brain as core_brain
+        logged = []
+
+        class _Log:
+            def warning(self, fmt, *args):
+                logged.append(fmt % args if args else fmt)
+
+        monkeypatch.setattr(core_brain, "_TAIL_SYSTEM_WARNED", False)
+        tail = [{"role": "system", "content": "S"}, {"role": "user", "content": "hi"},
+                {"role": "system", "content": "note"}, {"role": "user", "content": "q"}]
+        core_brain._messages_system_first(tail, _Log())
+        core_brain._messages_system_first(tail, _Log())
+        assert len(logged) == 1, logged
+        assert "note" in logged[0] and "500" in logged[0]
+
+    def test_the_streaming_path_folds_it_too(self, H, monkeypatch):
+        import queue as _queue
+        from core import brain as core_brain
+        sent = {}
+
+        def fake_urlopen(req, timeout=None):
+            sent.update(json.loads(req.data.decode("utf-8")))
+            return _FakeStreamResponse(_ndjson("Fine."))
+
+        monkeypatch.setattr(core_brain, "_TAIL_SYSTEM_WARNED", False)
+        q = _queue.Queue()
+        core_brain.ollama_chat_stream(
+            [{"role": "system", "content": "MAIN"},
+             {"role": "user", "content": "hi"},
+             {"role": "system", "content": "Facts"},
+             {"role": "user", "content": "q"}], q, None, None,
+            base="http://127.0.0.1:9", model="m", num_ctx=8192,
+            guard=lambda: None, logger=logging.getLogger("test.system.first"),
+            state={}, urlopen=fake_urlopen)
+        assert [m["role"] for m in sent["messages"]] == ["system", "user", "user"]
+        assert sent["messages"][-1]["content"] == "Facts\n\nq"
+        assert list(q.queue) == ["Fine.", None], list(q.queue)
 
 
 class TestStreamedReplyFiltering:

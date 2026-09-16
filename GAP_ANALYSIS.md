@@ -4379,3 +4379,30 @@ pass:** the suite leaves those reporters running — hundreds of live daemon
 threads, none of them stoppable — because `_health_loop` has no stop path and
 every constructed listener starts one. The tests are now immune to them; the
 suite would still be healthier without them.
+## Every turn died with `system message must be at the beginning`
+
+**What was missing.** The request the bubble sent was one Ollama 0.32 refuses
+outright: `_conversation_for` put the remembered facts and the live hardware
+note in their OWN `system` messages AFTER the history — a deliberate choice, so
+the main system prompt plus the history stayed byte-identical across turns and
+the KV cache kept the prefix. Ollama answers HTTP 500 (`system message must be
+at the beginning`) for any system message after the first, so every turn ended
+as `ollama stream: Ollama error 500: system message must be at the beginning`
+and the user heard "Sorry, my brain is offline." It was model-dependent —
+measured here: `gemma4:latest`, `qwen3:8b` and a legacy-template 1B model accept
+the tail shape, `qwen3.8:27b` (the model actually in use, and the one whose
+warm-up succeeded because a warm-up sends `system` first) rejects it in 0.3 s —
+which is why it read as a broken brain rather than a rejected request.
+
+**How it stands now.** One system message, at index 0: the blocks ride in the
+final user message, and the prefix is still byte-identical across turns, so the
+cache reason survives. The injected block is remembered and stripped by the
+history write, so it cannot accumulate one stale copy per turn. And because the
+rule belongs to the API rather than to one builder, `core.brain` folds any
+post-0 system message into the last user turn at the seam every request passes
+through, naming the folded content once in the journal — a future caller gets a
+working turn and a visible journal line instead of a 500. `tests/fake_ollama.py`
+now enforces the same rule, so the end-to-end turn guard is real. One limit:
+the `_LegacyBrain` shim (reachable only when `core/brain.py` is absent) still
+sends its list raw.
+

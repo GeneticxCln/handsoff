@@ -10,6 +10,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
+        # Ollama 0.32 refuses the WHOLE request when a system message follows
+        # the first ("system message must be at the beginning", HTTP 500 —
+        # verified live against qwen3.8:27b). Enforced here so a conversation
+        # builder that starts emitting a tail system message fails the turn
+        # locally instead of only on the real server.
+        messages = body.get("messages", [])
+        if any(m.get("role") == "system" for m in messages[1:]):
+            payload = json.dumps(
+                {"error": "system message must be at the beginning"}).encode()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         want_tools = "tools" in body
         # first request with tools -> answer with a tool call; the follow-up
         # (conversation containing a tool role) -> plain streamed answer
