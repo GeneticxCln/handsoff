@@ -952,7 +952,7 @@ class TestSettingsSplit:
         active = 0
         maximum = 0
         state_lock = threading.Lock()
-        real_write = cs._atomic_private_write
+        real_write = cs.atomic_private_write
 
         def slow_write(*args, **kwargs):
             nonlocal active, maximum
@@ -967,7 +967,7 @@ class TestSettingsSplit:
                 with state_lock:
                     active -= 1
 
-        monkeypatch.setattr(cs, "_atomic_private_write", slow_write)
+        monkeypatch.setattr(cs, "atomic_private_write", slow_write)
         errors = []
 
         def write(value):

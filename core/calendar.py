@@ -22,10 +22,10 @@ def _http_get(url: str, timeout: float = 10.0) -> bytes:
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read(2_000_000)
 
-_DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday")
 
-_MONTH_NAMES = ("January", "February", "March", "April", "May", "June",
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June",
                 "July", "August", "September", "October", "November",
                 "December")
 
@@ -72,7 +72,7 @@ def _ics_source_label(source: str) -> str:
     return f"{m.group(1).lower()}://{host or '?'}/… (path redacted)"
 
 
-def _ics_fetch(source: str) -> str:
+def ics_fetch(source: str) -> str:
     """Read an ICS calendar from an https URL or a local file path."""
     if re.match(r"^https?://", source, re.I):
         refusal = _ics_scheme_error(source)
@@ -405,7 +405,7 @@ def _ics_duration(value: str) -> "datetime.timedelta | None":
     return total if seen else None
 
 
-def _ics_events_from_text(text: str, win_start: "datetime.datetime",
+def ics_events_from_text(text: str, win_start: "datetime.datetime",
                           win_end: "datetime.datetime") -> list[dict]:
     """Parse VEVENTs overlapping [win_start, win_end); expands recurrences.
 
@@ -531,13 +531,13 @@ def _ics_events_from_text(text: str, win_start: "datetime.datetime",
     return events
 
 
-def _fmt_events(events: list[dict]) -> str:
+def fmt_events(events: list[dict]) -> str:
     """'Mon 07 Sep 09:00–10:00: Team sync @ Teams' — locale-independent."""
     lines = []
     for e in sorted(events, key=lambda x: x["start"])[:40]:
         s = e["start"]
-        day = (f"{_DAY_NAMES[s.weekday()][:3]} {s.day:02d} "
-               f"{_MONTH_NAMES[s.month - 1][:3]}")
+        day = (f"{DAY_NAMES[s.weekday()][:3]} {s.day:02d} "
+               f"{MONTH_NAMES[s.month - 1][:3]}")
         when = "all day" if e["allday"] else f"{s.hour:02d}:{s.minute:02d}"
         if not e["allday"] and e["dur"] > datetime.timedelta(0):
             end = s + e["dur"]

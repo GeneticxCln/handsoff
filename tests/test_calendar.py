@@ -461,7 +461,7 @@ class TestICSOverrides:
         win_s = H.datetime.datetime.now().replace(hour=0, minute=0,
                                                   second=0, microsecond=0)
         win_e = win_s + H.datetime.timedelta(days=3)
-        ev = _core_calendar._ics_events_from_text(text, win_s, win_e)
+        ev = _core_calendar.ics_events_from_text(text, win_s, win_e)
         starts = {(e["start"].strftime("%d%H"), e["summary"]) for e in ev}
         today = H.datetime.date.today()
         # EXDATE suppressed today's instance
@@ -503,7 +503,7 @@ class TestICSDurationAndUntil:
                             "END:VEVENT", "END:VCALENDAR"])
         win_s = H.datetime.datetime.now().replace(
             hour=0, minute=0, second=0, microsecond=0)
-        return _core_calendar._ics_events_from_text(
+        return _core_calendar.ics_events_from_text(
             text, win_s, win_s + H.datetime.timedelta(days=days))
 
     def test_duration_replaces_the_fabricated_hour(self, H):
@@ -607,7 +607,7 @@ class TestICSMonthlyYearly:
         ])
         ws = H.datetime.datetime(*win_s)
         we = H.datetime.datetime(*win_e)
-        return _core_calendar._ics_events_from_text(text, ws, we)
+        return _core_calendar.ics_events_from_text(text, ws, we)
 
     def test_monthly_nth_weekday(self, H):
         # 2nd Tuesday: Jan 13 / Feb 10 / Mar 10 / Apr 14 2026

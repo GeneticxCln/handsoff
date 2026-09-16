@@ -104,6 +104,9 @@ def _generated_lines(headers) -> set:
     return out
 
 
+DEBT_HEADER = "| Module | Names still reached | Why this is debt, not a seam |"
+
+
 def _map_rows() -> list:
     """[(module, owns, must-not-import)] from the architecture map's table.
 
@@ -163,6 +166,132 @@ def _largest_public_class(path: Path):
     return biggest.name, biggest.end_lineno - biggest.lineno
 
 
+def _module_aliases(tree) -> dict:
+    """{local name -> module label} for the handles a module holds.
+
+    Three ways this tree binds one, and all three were found by looking: an
+    import, a literal-argument load (`_audio = _load_module("audio")`), and the
+    settings module's own loader (`_core_settings = _load_core_package()`) —
+    settings is loaded before the core package exists, so it cannot use the
+    shared one. The last case has no literal to read, so it uses the naming
+    convention the architecture map already states: the host's handles are
+    `_core_<module>`.
+    """
+    found = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.startswith("core"):
+                    found[a.asname or a.name.split(".")[-1]] = a.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for a in node.names:
+                if node.module.startswith("core"):
+                    found[a.asname or a.name] = f"{node.module}.{a.name}"
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            fn = node.value.func
+            helper = getattr(fn, "id", "") or getattr(fn, "attr", "")
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            arg = node.value.args[0] if node.value.args else None
+            if helper in ("load_module", "_load_module", "load_core_package") \
+                    and isinstance(arg, ast.Constant) \
+                    and isinstance(arg.value, str):
+                for target in targets:
+                    found[target] = "core." + arg.value
+            elif helper == "_load_core_package":
+                for target in targets:
+                    if target.startswith("_core_"):
+                        found[target] = "core." + target[len("_core_"):]
+    return found
+
+
+def _shipped_trees() -> tuple:
+    """(labels, {label: AST}) for the modules the deployment ships."""
+    labels = [label for label, _path in _generator().modules()]
+    return labels, {label: ast.parse((HERE / label).read_text(encoding="utf-8"))
+                    for label in labels}
+
+
+def _top_level_names(tree) -> set:
+    """Names assigned or defined at MODULE level (not inside a class or def)."""
+    out = set()
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.add(node.name)
+        for target in getattr(node, "targets", []):
+            if isinstance(target, ast.Name):
+                out.add(target.id)
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            out.add(node.target.id)
+    return out
+
+
+def _private_crossings() -> dict:
+    """{module: {private name crossed from outside: {files}}} for shipped modules.
+
+    Three forms are read, because the tree uses three, and each was found by
+    looking rather than by guessing:
+
+      * `alias._name`, alias from an import or from `load_module("x")` — how the
+        host reaches `_audio._tts_model`;
+      * `from core.x import _name` — how the settings app reaches one;
+      * `_core_module("settings")._name` — a module looked up BY NAME, which is
+        still a real crossing.
+
+    Deliberately NOT counted: an attribute on any other call (`_dep()._x`).
+    That is the injected dependency object — the HOST's own namespace — not
+    another module's, and attributing those by which module happens to define
+    the name reported twelve false positives out of `core/tools.py` alone
+    (`_dep()._geocode`, `_dep()._mpc`, …).
+
+    Every form above names the target explicitly, so a local name of the same
+    name does NOT excuse it: the host defines its own `_tts_model` mirror AND
+    assigns into `core.audio`'s copy, and the second one is the crossing. A name
+    defined at module level in the accessing file is only excluded for the
+    UNQUALIFIED forms, and there are none left. Dunders are never crossings.
+    Tests are out of scope: this is about the shipped modules, the same set the
+    map prices.
+    """
+    labels, trees = _shipped_trees()
+    by_key = {}
+    for label in labels:
+        by_key[label] = label
+        by_key[Path(label).stem] = label
+        by_key[f"core.{Path(label).stem}"] = label
+    crossings = {}
+    for user in labels:
+        aliases = _module_aliases(trees[user])
+        for node in ast.walk(trees[user]):
+            name, owner = None, None
+            if isinstance(node, ast.Attribute) and node.attr.startswith("_") \
+                    and not node.attr.startswith("__"):
+                name = node.attr
+                base = node.value
+                if isinstance(base, ast.Name):
+                    owner = by_key.get(aliases.get(base.id, ""))
+                elif isinstance(base, ast.Call):
+                    helper = getattr(base.func, "id", "") or getattr(
+                        base.func, "attr", "")
+                    if helper in ("_core_module", "load_module", "_load_module") \
+                            and base.args \
+                            and isinstance(base.args[0], ast.Constant) \
+                            and isinstance(base.args[0].value, str):
+                        looked_up = base.args[0].value
+                        owner = by_key.get(looked_up) or by_key.get(f"core.{looked_up}")
+            elif isinstance(node, ast.ImportFrom) and node.module \
+                    and node.module.startswith("core"):
+                for a in node.names:
+                    if a.name.startswith("_") and not a.name.startswith("__"):
+                        target = by_key.get(node.module)
+                        if target and target != user:
+                            crossings.setdefault(target, {}).setdefault(
+                                a.name, set()).add(user)
+                continue
+            if not name or not owner or owner == user:
+                continue
+            crossings.setdefault(owner, {}).setdefault(name, set()).add(user)
+    return crossings
+
+
 def _qualified_seams() -> dict:
     """{module: {name: {files that reach it by module-qualified access}}}.
 
@@ -172,43 +301,16 @@ def _qualified_seams() -> dict:
     what that module exposes, and counting it made every host global look like a
     seam of every module.
     """
-    spec_tables = _generator()
-    shipped = [label for label, _path in spec_tables.modules()]
-    trees = {label: ast.parse((HERE / label).read_text(encoding="utf-8"))
-             for label in shipped}
+    shipped, trees = _shipped_trees()
     by_key = {}
     for label in shipped:
         by_key[label] = label
         by_key[Path(label).stem] = label
         by_key[f"core.{Path(label).stem}"] = label
 
-    def aliases(tree):
-        found = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for a in node.names:
-                    if a.name.startswith("core"):
-                        found[a.asname or a.name.split(".")[-1]] = a.name
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                for a in node.names:
-                    if node.module.startswith("core"):
-                        found[a.asname or a.name] = f"{node.module}.{a.name}"
-            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-                fn = node.value.func
-                if (getattr(fn, "id", "") or getattr(fn, "attr", "")) != "load_module":
-                    continue
-                if not node.value.args:
-                    continue
-                arg = node.value.args[0]
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            found[target.id] = "core." + arg.value
-        return found
-
     seams = {}
     for user, tree in trees.items():
-        found = aliases(tree)
+        found = _module_aliases(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Attribute):
                 continue
@@ -483,6 +585,91 @@ class TestSpecFreshness:
         # the checks that actually forbid something have to be exercised.
         assert len(set(seen)) >= 6, sorted(set(seen))
         assert "handsoff" in seen and "Qt" in seen, sorted(set(seen))
+
+    def test_a_private_name_that_crosses_a_module_boundary_is_declared(self):
+        """The other direction: an internal must not leak out of its module.
+
+        A name with a leading underscore is the module saying "not my
+        interface". When another shipped module reaches it anyway, one of the
+        two has to give: either the name stops being private, or the module
+        declares it — `core/audio.py.__all__` already declares three private
+        names, so the convention exists, and nothing reads `__all__` at runtime,
+        so declaring costs nothing and makes the seam readable.
+
+        The two renames this pass made are the other resolution, and the honest
+        one for a name that four modules use: `atomic_private_write` and
+        `MIC_OPERATION_LOCK` were private names crossing boundaries, and lost
+        the underscore. The four mirror names stayed private because the
+        host<->audio mirror protocol is documented as ordering-sensitive, so
+        they are declared instead: a coupling that exists is better stated than
+        renamed.
+
+        Second rule, and the reason it is here: a DECLARED private that is
+        crossed must be named in the map's row for that module, so a blessed
+        seam cannot hide in a list nobody opens.
+        """
+        crossings = _private_crossings()
+        assert sum(len(names) for names in crossings.values()) >= 4, (
+            f"only {crossings} — the detector has stopped finding the crossings "
+            f"it is supposed to check")
+        # The map carries a DECLARED-DEBT table, because eleven crossed names
+        # could not be renamed in this pass: `_load_settings` alone has 37 sites
+        # and `_DEFAULT_DEPS` 30, most of them monkeypatch string names in tests.
+        # A debt row is a promise with an expiry, so both directions fail — a
+        # crossing that is not listed, and a listed name that is no longer
+        # crossed or has since been promoted.
+        debt = {}
+        text = _spec("20-architecture.md")
+        if DEBT_HEADER in text:
+            for cells in _generator()._table_body(text, DEBT_HEADER):
+                for name in re.findall(r"`([^`]+)`", cells[1]):
+                    debt[name] = cells[0].strip("`")
+        declared_any = 0
+        listed = set()
+        problems = []
+        for label, names in crossings.items():
+            for name in names:
+                if debt.get(name) == label:
+                    listed.add(name)
+        rows = dict((label, owns) for label, owns, _must_not in _map_rows())
+        for label, names in sorted(crossings.items()):
+            table = ast.parse((HERE / label).read_text(encoding="utf-8"))
+            exported = set()
+            for node in table.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                if any(getattr(t, "id", "") == "__all__" for t in node.targets):
+                    exported = {e.value for e in node.value.elts
+                                if isinstance(e, ast.Constant)}
+            for name, owner in debt.items():
+                if owner == label and name in exported:
+                    problems.append(
+                        f"§1a lists {label}.{name} as debt and {label} now "
+                        f"declares it in __all__ — the row is stale, delete it")
+            for name, users in sorted(names.items()):
+                where = f"{', '.join(sorted(users))} reaches {label}.{name}"
+                if name in debt:
+                    continue
+                if name not in exported:
+                    problems.append(
+                        f"{where} and {label} does not declare it in __all__ — "
+                        f"drop the underscore, declare the seam, or add a debt "
+                        f"row to §1a saying why it cannot be renamed yet")
+                    continue
+                declared_any += 1
+                if not re.search(rf"\b{re.escape(name)}\b", rows.get(label, "")):
+                    problems.append(
+                        f"{where}, {label} declares it in __all__, and its map "
+                        f"row never names it")
+        stale = sorted(name for name in debt if name not in listed)
+        assert not stale, (
+            f"§1a lists {stale} as debt and nothing reaches them any more — a "
+            f"paid debt left in the table is how a transition becomes a parking "
+            f"space: delete the row (and the ones beside it for that module)")
+        assert declared_any, "no declared private seam was exercised — nothing read"
+        assert not problems, (
+            "a private name crosses a module boundary undeclared:\n  "
+            + "\n  ".join(problems))
 
     def test_the_test_plan_lists_every_test_file(self):
         """The inventory's COUNTS are a dated snapshot; its FILE LIST is not."""

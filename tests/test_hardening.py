@@ -216,7 +216,7 @@ class TestControlCapabilityToken:
         H._prepare_runtime()
         monkeypatch.setattr(H, "CONTROL_TOKEN",
                             sandbox / "no-such-dir" / "control.token")
-        monkeypatch.setattr(H._core_settings, "_atomic_private_write",
+        monkeypatch.setattr(H._core_settings, "atomic_private_write",
                             _raise_oserror)
         assert H._rotate_control_token() is None
 
@@ -445,7 +445,7 @@ class TestMissingAudioFallback:
                 # The app reaches these through its `core.audio` handle rather
                 # than re-exporting them, so read them where it does.
                 "resample": callable(audio._resample_to_16k),
-                "mic_lock": hasattr(audio._MIC_OPERATION_LOCK, "acquire"),
+                "mic_lock": hasattr(audio.MIC_OPERATION_LOCK, "acquire"),
             },
         }
         for probe in ("transcribe", "get_whisper", "play_wav", "get_tts",

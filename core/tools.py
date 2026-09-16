@@ -136,8 +136,8 @@ RESTART_SCRIPT = HOME / ".local/bin/handsoff-restart"
 SELF_MARKER = "# handsoff-self-marker: this line must be preserved across self-edits"
 SELF_PATH = Path(__file__).resolve()
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
-_DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-_MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
+DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+MONTH_NAMES = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
 _WMO = {}
 _SPLIT_EDIT_FILES = frozenset({"settings_schema.py", "hardware.py", "handsoff-settings.py"})
 # Every cap and every offer goes through core.registry, which owns BOTH the
@@ -227,7 +227,7 @@ def log_decision(tool: str, target: str, decision: str, result: str='dispatched'
                     with decision_file.open('r', encoding='utf-8') as fh:
                         lines = fh.readlines()
                     if len(lines) > _DECISIONS_MAX * 2:
-                        _dep()._atomic_private_write(decision_file, ''.join(lines[-_DECISIONS_MAX:]))
+                        _dep().atomic_private_write(decision_file, ''.join(lines[-_DECISIONS_MAX:]))
             except OSError:
                 pass
     except Exception:
@@ -2423,7 +2423,7 @@ class ToolBelt:
             return f'ERROR: no such month {y}-{mo:02d}'
         nxt_y, nxt_mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
         ndays = (datetime.date(nxt_y, nxt_mo, 1) - first).days
-        head = f'{_dep()._MONTH_NAMES[mo - 1]} {y}'.center(21).rstrip()
+        head = f'{_dep().MONTH_NAMES[mo - 1]} {y}'.center(21).rstrip()
         rows = [head, 'Mo Tu We Th Fr Sa Su']
         row = '   ' * first.weekday()
         for d in range(1, ndays + 1):
@@ -2434,7 +2434,7 @@ class ToolBelt:
                 row = ''
         if row.strip():
             rows.append(row.rstrip())
-        rows.append(f'today is {_dep()._DAY_NAMES[today.weekday()]} {today.day:02d} {_dep()._MONTH_NAMES[today.month - 1][:3]} {today.year}')
+        rows.append(f'today is {_dep().DAY_NAMES[today.weekday()]} {today.day:02d} {_dep().MONTH_NAMES[today.month - 1][:3]} {today.year}')
         return '\n'.join(rows)
 
     @tool(gates='calendar', description='Read upcoming events from the configured ICS calendar source(s). days=1 = today, 2 = today+tomorrow.', aliases={'days': ('how_many_days', 'range')})
@@ -2462,7 +2462,7 @@ class ToolBelt:
             if re.match('^https?://', src, re.I) and (not self._perm.get('web_access', True)):
                 return "REFUSED: fetching calendar URLs needs the 'web_access' permission, disabled in handsoff settings"
             try:
-                events.extend(_dep()._ics_events_from_text(_dep()._ics_fetch(src), win_start, win_end))
+                events.extend(_dep().ics_events_from_text(_dep().ics_fetch(src), win_start, win_end))
             except Exception as e:
                 # Never echo the source: for a Google-style feed the URL is a
                 # bearer token, and error strings (HTTPError especially)
@@ -2476,7 +2476,7 @@ class ToolBelt:
         if not events:
             return f'no events in the next {days} day(s)'
         label = 'Today' if days == 1 else f'Next {days} days'
-        out = _dep()._fmt_events(events)
+        out = _dep().fmt_events(events)
         if bad:
             out += f"  [unreadable: {'; '.join(bad)}]"
         return f'{label}: {out}'
@@ -2593,7 +2593,7 @@ class ToolBelt:
     @tool(description='Current local date, weekday and time.')
     def get_datetime(self) -> str:
         now = datetime.datetime.now()
-        return f'Local date and time: {_dep()._DAY_NAMES[now.weekday()]}, {now.day:02d} {_dep()._MONTH_NAMES[now.month - 1]} {now.year}, {now.hour:02d}:{now.minute:02d} (timezone {now.astimezone().tzname()}). Unix epoch: {int(now.timestamp())}'
+        return f'Local date and time: {_dep().DAY_NAMES[now.weekday()]}, {now.day:02d} {_dep().MONTH_NAMES[now.month - 1]} {now.year}, {now.hour:02d}:{now.minute:02d} (timezone {now.astimezone().tzname()}). Unix epoch: {int(now.timestamp())}'
     SCREENSHOT_FILE = _dep().STATE_DIR / 'screen.png'
 
     @staticmethod
@@ -3318,7 +3318,7 @@ class ToolBelt:
                 # copy2 inherits the SOURCE mode: a 0644 project file would
                 # leave a 0644 backup holding the same content.
                 os.chmod(bak, 0o600)
-            _dep()._atomic_private_write(p, content)
+            _dep().atomic_private_write(p, content)
         except OSError as e:
             return f'ERROR: cannot write {p}: {e}'
         _dep().log.info('edit_file wrote %d bytes to %s', len(content), _dep()._log_metadata(p, 'path'))

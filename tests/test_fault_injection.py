@@ -1136,7 +1136,7 @@ class TestDiskIsFull:
         target.write_text('{"keep": true}')
         before = target.read_bytes()
         with pytest.raises(OSError) as ei:
-            _core_settings._atomic_private_write(target, '{"keep": false}')
+            _core_settings.atomic_private_write(target, '{"keep": false}')
         assert ei.value.errno == errno.ENOSPC
         assert target.read_bytes() == before, "the previous file was damaged"
         leftovers = [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")]

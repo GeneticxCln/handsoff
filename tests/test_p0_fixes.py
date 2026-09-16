@@ -156,7 +156,7 @@ class TestAtomicPrivateWrite:
 
     def test_mode_content_and_no_predictable_tmp(self, H, tmp_path):
         target = tmp_path / "s.json"
-        _core_settings._atomic_private_write(target, '{"a": 1}')
+        _core_settings.atomic_private_write(target, '{"a": 1}')
         assert target.read_text(encoding="utf-8") == '{"a": 1}'
         assert (target.stat().st_mode & 0o777) == 0o600
         assert not (tmp_path / "s.json.tmp").exists()

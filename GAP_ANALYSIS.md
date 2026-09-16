@@ -4796,3 +4796,61 @@ but the lesson is the ordering, and the sweep now restores in a `finally`.
 1451 tests green, `compile`/`shell`/`smoke` PASS, `deployment: in-sync` — specs,
 tests and a CI helper, no shipped byte. The plan's dated snapshot reads 1451
 collected / 1349 `test_*` functions.
+
+## An internal no longer crosses a module boundary undeclared (2026-09-16)
+
+The map's fourth column says what a module must not *import*. Nothing said what
+it must not *export*, and a leading underscore is a module saying "not my
+interface" — the host crossed sixteen of them.
+
+The guard reads crossings in the three forms this tree actually uses:
+`alias._name` (alias from `load_module`, `_load_module` or an import),
+`from core.x import _name`, and `_core_module("settings")._name`. It fails
+unless the module declares the name in `__all__` — nothing reads `__all__` at
+runtime, and `core/audio.py` already declared three private names, so the
+convention was there — or the crossing is listed in the map's new §1a.
+
+**All four directions fail**, because a debt row is a promise with an expiry: a
+crossing that is declared or listed passes; one that is neither fails; a listed
+name nothing reaches any more fails; and a listed name the module has since
+declared fails, since a paid debt left in the table is how a transition becomes a
+parking space.
+
+**Renamed, because they were API and the underscore was the lie:**
+`atomic_private_write` (four modules call it) and `MIC_OPERATION_LOCK` (the
+app-wide PortAudio lock the host takes around stream construction and teardown) —
+35 sites.
+
+**Promoted, because the module had no public interface at all:**
+`core/calendar.py` had five private names reached and zero public ones, so
+`ics_fetch`, `ics_events_from_text`, `fmt_events`, `DAY_NAMES` and `MONTH_NAMES`
+lost the underscore (28 sites) and the map row names them.
+
+**Declared as debt, because renaming is the wrong fix:**
+`core/settings.py`'s eight are steps of ONE lifecycle — load, drop retired keys,
+migrate, write under a file lock, backup, quarantine. The fix is the module
+owning the sequence, not eight renames, and `_load_settings` alone has 37 sites
+with `_DEFAULT_DEPS` at 30, most of them `monkeypatch.setattr` string names.
+`core/tools.py`'s `_DEFAULT_DEPS`/`_CURRENT` are injected state, not functions:
+nothing to promote, only something to stop reaching for. `core/brain.py`'s
+`_read_http_error` belongs on whatever both callers should be sharing.
+
+**Two measurements were wrong before they were right, and the guard caught both
+rather than review.** The alias map knew only `load_module`, so the entire
+`_load_module("x")` handle family was invisible — along with
+`_core_settings = _load_core_package()`, settings' own loader, which exists
+because settings loads before the core package does. With all three forms the
+crossing set went from 8 names to 22 across 5 modules. And attributing
+`call()._x` by name uniqueness reported twelve false positives out of
+`core/tools.py` alone: `_dep()._geocode`, `_dep()._mpc` are the HOST's namespace
+through the injected dependency object, not another module's, so that branch is
+now only `_core_module("literal")`.
+
+**8/8 mutations caught across two sweeps, zero residue, every restore
+sha256-verified**, plus two probes confirming the sanctioned paths stay open (a
+declared seam crossed on purpose; a promoted name that no longer crosses). 1452
+tests green, `compile`/`shell`/`smoke` PASS.
+
+This pass changed SHIPPED bytes (`handsoff.py`, four `core/*.py`, the settings
+app), so the deployment fell behind the checkout the moment it landed: redeployed
+and verified in the same pass — 17/17 files byte-identical, `deployment: in-sync`.

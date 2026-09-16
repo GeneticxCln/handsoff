@@ -46,7 +46,7 @@ junk warns once per key per process. Concurrent writes: file lock +
 three-way merge (`expected/current/candidate`); conflict raises
 `SettingsConflictError` rather than last-writer-wins. Corrupt JSON →
 quarantine `*.bad-<ts>-<pid>` + defaults; non-dict → same. All writes
-atomic + 0600 (`_atomic_private_write`, mkstemp in-dir, no predictable
+atomic + 0600 (`atomic_private_write`, mkstemp in-dir, no predictable
 `.tmp`).
 
 ## 2. On-disk map

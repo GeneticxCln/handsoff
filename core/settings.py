@@ -111,7 +111,7 @@ def _secure_file(path: Path) -> bool:
         return False
 
 
-def _atomic_private_write(path: Path, text: str) -> None:
+def atomic_private_write(path: Path, text: str) -> None:
     """Write a sensitive text file with mode 0600 and an atomic replacement.
 
     A unique temporary name prevents unrelated writers from swapping the same
@@ -726,7 +726,7 @@ def _write_settings_dict(data: dict, settings_file: Path, config_dir: Path,
         # through merge_settings, which can carry one along).
         data = _drop_retired_settings(data)
         _backup_runtime_json(settings_file)
-        _atomic_private_write(
+        atomic_private_write(
             settings_file, json.dumps(data, ensure_ascii=False, indent=1))
         return data
 
@@ -784,12 +784,12 @@ def _persist_setting(key: str, value, settings_file: Path,
         coerce_settings(probe)
         data[key] = probe[key]
         data["version"] = SETTINGS_VERSION   # every on-disk write is stamped
-        # NOTE: _atomic_private_write creates its own uniquely-named temp
+        # NOTE: atomic_private_write creates its own uniquely-named temp
         # file; a pre-computed ".json.tmp" path here would reintroduce the
         # predictable-name race that helper exists to prevent.
         _backup_runtime_json(settings_file)
         try:
-            _atomic_private_write(
+            atomic_private_write(
                 settings_file, json.dumps(data, ensure_ascii=False, indent=1))
         except OSError as e:
             # A full disk (ENOSPC), a read-only mount or a vanished directory

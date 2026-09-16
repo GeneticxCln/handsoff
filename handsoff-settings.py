@@ -3018,9 +3018,9 @@ drifting apart one forgotten key at a time.
         kept = [m for m in data if isinstance(m, dict)
                 and str(m.get("v", "")) != fact]
         try:
-            from core.settings import _atomic_private_write
+            from core.settings import atomic_private_write
             _backup_keep_n(H.MEMORY_FILE, "bak-facts")
-            _atomic_private_write(
+            atomic_private_write(
                 H.MEMORY_FILE, json.dumps(kept, ensure_ascii=False, indent=1))
         except OSError as e:
             self._status(f"cannot update memory.json: {e}")
@@ -5297,7 +5297,7 @@ drifting apart one forgotten key at a time.
         try:
             if H.HISTORY_FILE.exists():
                 _backup_keep_n(H.HISTORY_FILE, tag)
-            _core_module("settings")._atomic_private_write(
+            _core_module("settings").atomic_private_write(
                 H.HISTORY_FILE, "[]")                        # empty JSON list
         except OSError as e:
             return f"could not clear history: {e}"

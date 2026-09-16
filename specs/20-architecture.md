@@ -13,10 +13,10 @@ copy a size out of it into prose.
 | `core/__init__.py` | 306 | `APP_MODULE_NAME="handsoff_core"`, `claim_app_instance`, `load_module`, origin rule, stdlib-shadow guard | app globals |
 | `core/tools.py` | 3330 | 48 `@tool`s, `ToolBelt`, `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
 | `core/bubble.py` | 4069 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |
-| `core/settings.py` | 883 | loader/writer/migrate/coerce/lock/merge, `Settings` object | app globals (paths as params) |
-| `core/audio.py` | 824 | `Recorder`, resample, whisper/TTS getters, `play_wav`, level hook | `handsoff` (`configure()` only) |
+| `core/settings.py` | 883 | loader/writer/migrate/coerce/lock/merge, `atomic_private_write` (0600 + mkstemp), `Settings` object | app globals (paths as params) |
+| `core/audio.py` | 835 | `Recorder`, resample (`_resample_to_16k`), whisper/TTS getters, `play_wav`, level hook; the seam shared with the host: `MIC_OPERATION_LOCK`, `_stop_recorder_bounded`, `_tts_device`, and the mirrored caches it drops through that lock (`_tts_model`, `_whisper_model`, `_whisper_cpu_fallback`) | `handsoff` (`configure()` only) |
 | `core/web.py` | 972 | 6 backends behind `search`, `Result`, `_route`, TTL cache, `read_page`, SSRF guard | `handsoff` (resolvers via `configure()`) |
-| `core/calendar.py` | 548 | ICS fetch/unfold/parse/RRULE/format, scheme + label guards | anything (stdlib only) |
+| `core/calendar.py` | 548 | `ics_fetch`/`ics_events_from_text`/`fmt_events` (its whole interface, promoted from five private names), ICS unfold/parse/RRULE, `DAY_NAMES`/`MONTH_NAMES`, scheme + label guards | anything (stdlib only) |
 | `core/assistant.py` | 595 | `PomodoroController`, `NotificationReader`, `ReminderStore`, mute/parse helpers | `handsoff` |
 | `core/doctor.py` | 515 | `run_doctor`/`doctor_json` via `DoctorDeps` | `handsoff` (deps injected) |
 | `core/registry.py` | 435 | `BoundedRegistry` (admission under lock), `Offer` (arm/read/consume) | — |
@@ -33,6 +33,27 @@ Dependency direction: `handsoff.py` → `core.*` via `_load_module` handles
 `_core_doctor`, `_hardware`). Core modules reach back ONLY through injected
 deps. `core/calendar.py` + `core/brain.py` + `core/registry.py` +
 `core/lifecycle.py` are dependency-free leaves.
+
+### 1a. Private names still reached across a boundary (declared debt)
+
+A leading underscore is a module saying "not my interface".
+`tests/test_specs_freshness.py` fails when another shipped module reaches such a
+name anyway — unless the module declares it in `__all__` (the mirror seam in
+`core/audio.py` does exactly that) or the row appears below. Every row here is
+DEBT: the caller needs the step, the module has not grown a doorway for it, and
+the fix is to move the work to where the data lives, not to bless it.
+
+A row that is no longer reached, or a name that has since become public or been
+declared, FAILS the guard: this table is a transition, not a parking space.
+`core/calendar.py` is the example of paying it — five private names were reached
+and NO public one existed, so the five lost the underscore instead of being
+listed here.
+
+| Module | Names still reached | Why this is debt, not a seam |
+|---|---|---|
+| `core/settings.py` | `_load_settings`, `_write_settings_dict`, `_migrate_settings`, `_persist_setting`, `_settings_file_lock`, `_backup_runtime_json`, `_quarantine_bad`, `_secure_file` | Eight steps of ONE lifecycle — load → drop retired keys → migrate → write under a file lock, with a backup and a quarantine on the way. The fix is not eight renames but the module owning the sequence, so the host asks once. |
+| `core/tools.py` | `_DEFAULT_DEPS`, `_CURRENT` | Injected state the host reads to answer health and doctor, not functions: there is nothing to promote, only something to stop reaching for. |
+| `core/brain.py` | `_read_http_error` | One HTTP error reader the host reuses for the doctor's probe; it belongs on whatever both callers should be sharing. |
 
 ## 2. Bootstrap (why it reads paranoid)
 
@@ -108,7 +129,7 @@ barge-in closes it.
 
 ## 6. Voice pipeline
 
-`Recorder` (16 kHz mono int16, `_MIC_OPERATION_LOCK` serializes
+`Recorder` (16 kHz mono int16, `MIC_OPERATION_LOCK` serializes
 construct/teardown, bounded `stop()` never aborts a live native call) →
 `_SpeechGate` (adaptive floor) → `ContinuousListener` (hands-free VAD thread)
 → whisper `transcribe` (FFT-brickwall `_resample_to_16k`, native-rate retry

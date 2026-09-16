@@ -36,12 +36,12 @@ SETTINGS: dict = {"tts_rate": 1.0, "tts_volume": 1.0}
 log = logging.getLogger("handsoff")
 
 # Process-wide mic-operation ownership: InputStream construction and teardown
-# serialize on _MIC_OPERATION_LOCK. A bounded stop runs rec.stop() on an owner
+# serialize on MIC_OPERATION_LOCK. A bounded stop runs rec.stop() on an owner
 # thread holding the lock; a timeout returns control WITHOUT touching the
 # stream — the owner finishes the state transition and fires the recorder's
 # _handsoff_stop_done finalizer (never abort a live native call from a second
 # thread).
-_MIC_OPERATION_LOCK = threading.RLock()
+MIC_OPERATION_LOCK = threading.RLock()
 _MIC_OPERATION_STATE_LOCK = threading.Lock()
 _MIC_OPERATION_OWNER = None
 
@@ -203,7 +203,7 @@ def _stop_recorder_bounded(rec, timeout: float = 3.0):
 
     def _call() -> None:
         global _MIC_OPERATION_OWNER
-        _MIC_OPERATION_LOCK.acquire()
+        MIC_OPERATION_LOCK.acquire()
         with _MIC_OPERATION_STATE_LOCK:
             _MIC_OPERATION_OWNER = threading.current_thread()
             try:
@@ -240,7 +240,7 @@ def _stop_recorder_bounded(rec, timeout: float = 3.0):
                     callback()
             except Exception:
                 log.exception("recorder stop finalizer failed")
-            _MIC_OPERATION_LOCK.release()
+            MIC_OPERATION_LOCK.release()
 
     th = threading.Thread(target=_call, name="ptt-stop-native", daemon=True)
     th.start()
@@ -821,4 +821,15 @@ __all__ = [
     "reference_clip_seconds", "reference_problem",
     "tts_to_wav", "play_wav", "configure",
     "portaudio_in_use", "portaudio_busy", "set_level_hook",
+    "MIC_OPERATION_LOCK",
+    # The lock above and the four names below are the seam the HOST shares with
+    # this module rather than a second copy of it: the host takes the lock around
+    # PortAudio construction and teardown, mirrors the two model caches through
+    # it (`_push_model`/`_adopt_model` in handsoff.py), carries the cpu-fallback
+    # flag across the call, and reads `_tts_device` for the health snapshot.
+    # They are declared here because a private name that crosses a module
+    # boundary has to be declared somewhere the reader can see —
+    # `tests/test_specs_freshness.py` fails on one that is not — and because the
+    # whole interface of this module should be readable in one place.
+    "_tts_model", "_whisper_model", "_whisper_cpu_fallback", "_tts_device",
 ]

@@ -1200,7 +1200,7 @@ def _rotate_control_token() -> "str | None":
     """
     try:
         token = secrets.token_hex(_CONTROL_TOKEN_BYTES)
-        _core_settings._atomic_private_write(CONTROL_TOKEN, token + "\n")
+        _core_settings.atomic_private_write(CONTROL_TOKEN, token + "\n")
         return token
     except OSError:
         log.exception("could not write the control token")
@@ -1537,7 +1537,7 @@ except ImportError:  # compatibility with pre-Phase-4a deployed bundles
         TTS_ENGINE = "chatterbox-turbo"
         TTS_REFERENCE = ""
         MIN_REFERENCE_S = 5.0
-        _MIC_OPERATION_LOCK = threading.RLock()
+        MIC_OPERATION_LOCK = threading.RLock()
         _MIC_OPERATION_STATE_LOCK = threading.Lock()
         _MIC_OPERATION_OWNER = None
         _whisper_model = None
@@ -1761,32 +1761,32 @@ def _open_input_unlocked(device, rate: int, blocksize: int, cb) -> tuple:
 
 def _open_input(device, rate: int, blocksize: int, cb) -> tuple:
     """Serialize InputStream construction with native stream teardown."""
-    if not _audio._MIC_OPERATION_LOCK.acquire(timeout=0.6):
+    if not _audio.MIC_OPERATION_LOCK.acquire(timeout=0.6):
         raise RuntimeError("microphone operation still in flight")
     try:
         return _open_input_unlocked(device, rate, blocksize, cb)
     finally:
-        _audio._MIC_OPERATION_LOCK.release()
+        _audio.MIC_OPERATION_LOCK.release()
 
 
 def _stop_stream_owned(stream) -> None:
     """Run stream teardown under the same owner as InputStream construction."""
     if stream is None:
         return
-    _audio._MIC_OPERATION_LOCK.acquire()
+    _audio.MIC_OPERATION_LOCK.acquire()
     try:
         stream.stop()
         stream.close()
     finally:
-        _audio._MIC_OPERATION_LOCK.release()
+        _audio.MIC_OPERATION_LOCK.release()
 
 
 def _start_stream_owned(stream) -> None:
-    _audio._MIC_OPERATION_LOCK.acquire()
+    _audio.MIC_OPERATION_LOCK.acquire()
     try:
         stream.start()
     finally:
-        _audio._MIC_OPERATION_LOCK.release()
+        _audio.MIC_OPERATION_LOCK.release()
 
 
 class Recorder(_audio.Recorder):
@@ -2518,7 +2518,7 @@ def _world_mark_seen(titles) -> None:
             while len(seen) > WORLD_EVENTS_MAX:
                 seen.pop(min(seen, key=seen.get))
             WORLD_EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _core_settings._atomic_private_write(WORLD_EVENTS_FILE, json.dumps(seen))
+            _core_settings.atomic_private_write(WORLD_EVENTS_FILE, json.dumps(seen))
     except Exception:
         log.exception("cannot persist world-events seen store")
 
@@ -2663,8 +2663,8 @@ def _fmt_when(due_epoch: float) -> str:
     Locale-independent on purpose: the TTS voice is English, and a German
     LC_TIME must not change what gets spoken."""
     due = datetime.datetime.fromtimestamp(due_epoch)
-    return (f"{_core_calendar._DAY_NAMES[due.weekday()]} {due.day:02d} "
-            f"{_core_calendar._MONTH_NAMES[due.month - 1]} {due.hour:02d}:{due.minute:02d}"
+    return (f"{_core_calendar.DAY_NAMES[due.weekday()]} {due.day:02d} "
+            f"{_core_calendar.MONTH_NAMES[due.month - 1]} {due.hour:02d}:{due.minute:02d}"
             f" ({_fmt_due_in(due_epoch)})")
 
 
@@ -2791,7 +2791,7 @@ _REMINDER_STORE = _core_assistant.ReminderStore(
     lock=REMINDERS_LOCK,
     file_lock=_core_settings._settings_file_lock(),
     backup=_backup_runtime_json,
-    write=_core_settings._atomic_private_write,
+    write=_core_settings.atomic_private_write,
     logger=log,
     clock=time.time,
 )
@@ -2813,7 +2813,7 @@ def _record_mic_event(from_state: str, to_state: str) -> None:
                 "device": SETTINGS.get("mic_device") or "system default",
             })
             doc["events"] = doc["events"][-MIC_EVENTS_MAX:]
-            _core_settings._atomic_private_write(MIC_EVENTS_FILE, json.dumps(doc))
+            _core_settings.atomic_private_write(MIC_EVENTS_FILE, json.dumps(doc))
     except Exception:
         log.exception("cannot record mic event")
 
@@ -2885,7 +2885,7 @@ def _record_cap_refusal(report: dict) -> None:
             name = str(entry.get("registry") or "?")
             by[name] = int(by.get(name) or 0) + 1
             doc["by_registry"] = by
-            _core_settings._atomic_private_write(CAP_EVENTS_FILE, json.dumps(doc))
+            _core_settings.atomic_private_write(CAP_EVENTS_FILE, json.dumps(doc))
     except Exception:
         log.exception("cannot record cap refusal")
 
@@ -2952,7 +2952,7 @@ def _mark_briefing_delivered() -> None:
         with _MIC_EVENTS_LOCK:
             doc = _load_mic_events()
             doc["last_briefing"] = time.time()
-            _core_settings._atomic_private_write(MIC_EVENTS_FILE, json.dumps(doc))
+            _core_settings.atomic_private_write(MIC_EVENTS_FILE, json.dumps(doc))
     except Exception:
         log.exception("cannot stamp briefing time")
 
@@ -2968,9 +2968,9 @@ def _today_events_summary() -> str:
         win_end = win_start + datetime.timedelta(days=1)
         events: list[dict] = []
         for src in sources:
-            events.extend(_core_calendar._ics_events_from_text(_core_calendar._ics_fetch(src),
+            events.extend(_core_calendar.ics_events_from_text(_core_calendar.ics_fetch(src),
                                                 win_start, win_end))
-        return _core_calendar._fmt_events(events)
+        return _core_calendar.fmt_events(events)
     except Exception:
         log.exception("briefing calendar summary failed")
         return ""
@@ -3138,7 +3138,7 @@ class _ToolDependencies:
 
     A name the app still owns comes from here. One that lives in an extracted
     module is read from that module, so the app's namespace stops being a second
-    copy of core's public names — `_dep()._ics_fetch`, `_dep().log_decision` and
+    copy of core's public names — `_dep().ics_fetch`, `_dep().log_decision` and
     the rest keep resolving without handsoff.py re-exporting anything.
     """
 
@@ -5754,8 +5754,8 @@ class Assistant(QObject):
         across turns, so Ollama's KV cache keeps hitting on it and only the
         small per-turn delta and the new utterance are evaluated."""
         _now = datetime.datetime.now()
-        now = (f"{_core_calendar._DAY_NAMES[_now.weekday()]}, {_now.day:02d} "
-               f"{_core_calendar._MONTH_NAMES[_now.month - 1]} {_now.year}, "
+        now = (f"{_core_calendar.DAY_NAMES[_now.weekday()]}, {_now.day:02d} "
+               f"{_core_calendar.MONTH_NAMES[_now.month - 1]} {_now.year}, "
                f"{_now.hour:02d}:{_now.minute:02d}")
         system = (f"{SYSTEM_PROMPT}\n\nCurrent local date and time: {now}. "
                   "If the user asks about anything that depends on the current "
@@ -6060,7 +6060,7 @@ class Assistant(QObject):
         """Called just before the restart script runs; leaves a note for our next self."""
         note = "" if self._turn_spoke else "I'm back, with my changes applied."
         try:
-            _core_settings._atomic_private_write(PENDING_FILE, json.dumps({"note": note}))
+            _core_settings.atomic_private_write(PENDING_FILE, json.dumps({"note": note}))
         except OSError:
             pass
 
@@ -6094,7 +6094,7 @@ class Assistant(QObject):
     def _save_history(self) -> None:
         try:
             _backup_runtime_json(HISTORY_FILE)
-            _core_settings._atomic_private_write(
+            _core_settings.atomic_private_write(
                 HISTORY_FILE, json.dumps(self._history, ensure_ascii=False, indent=1))
         except OSError:
             log.exception("cannot save history")
@@ -6252,7 +6252,7 @@ def _load_memory() -> list[dict]:
 def _save_memory(items: list[dict]) -> None:
     try:
         _backup_runtime_json(MEMORY_FILE)
-        _core_settings._atomic_private_write(
+        _core_settings.atomic_private_write(
             MEMORY_FILE, json.dumps(items, ensure_ascii=False, indent=1))
     except OSError:
         log.exception("cannot save memory")
