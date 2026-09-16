@@ -202,7 +202,12 @@ class TestSourceIntegrity:
         a._closed = False
         a._workers = set()
         a._cancel = threading.Event()
-        a._listener = types.SimpleNamespace(stop=lambda: None)
+        # shutdown() must CLOSE the listener, not merely stop it: stop() is the
+        # hands-free toggle, and the mic-health reporter (spawned in __init__) is
+        # a second thread that only close() ends.
+        listener_calls = []
+        a._listener = types.SimpleNamespace(
+            close=lambda: listener_calls.append("close"))
         a._tools = None
         a._notifications = types.SimpleNamespace(
             set_enabled=lambda enabled: "notification reader disabled")
@@ -224,11 +229,30 @@ class TestSourceIntegrity:
         worker.join(1)
         assert a._closed is True
         assert a._shutdown_event.is_set()
+        assert listener_calls == ["close"], listener_calls
         a._announce_now("late")
         assert spoken == []
         queued = a._pipeline_q.qsize()
         a.submit_audio(np.zeros(16000, dtype=np.int16))
         assert a._pipeline_q.qsize() == queued
+
+    def test_shutdown_takes_the_mic_reporter_with_it(self, H):
+        # The bubble's own shutdown used to stop the CAPTURE and leave the hourly
+        # reporter running — a daemon thread nothing else could end, which only
+        # the process exit hid. The stub above pins that shutdown CALLS the right
+        # seam; this one pins that the seam does what it claims on a real
+        # listener, because a stub can agree with a method that does nothing.
+        a = H.Assistant()
+        reporter = a._listener._health_thread
+        try:
+            assert reporter.is_alive(), "the reporter must start with the bubble"
+            a.shutdown()
+            reporter.join(timeout=2.0)
+            assert not reporter.is_alive(), (
+                "shutdown() left the mic-health reporter running: every bubble "
+                "built and dropped then leaks one thread that polls forever")
+        finally:
+            a._listener.close()
 
 
 # ------------------------------------------------------------------ control socket

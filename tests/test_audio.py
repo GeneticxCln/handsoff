@@ -1025,50 +1025,36 @@ class TestMicHealth:
     def test_health_loop_reports_hourly_and_survives_errors(self, H, monkeypatch):
         ln = self._mk_listener(H)
         calls = []
-        sleeps = []
+        waits = []
         ticks = iter([RuntimeError("boom"), None, None])   # 1st report raises
-        # BOTH seams patched here are process-wide: `time.sleep` is one module
-        # object every thread shares, and `_health_tick` is patched on the CLASS.
-        # `ContinuousListener.__init__` spawns one `mic-health` reporter per
-        # listener and `_health_loop` is `while True: sleep; tick` with no stop
-        # path — so a shuffled run carries live reporters from earlier files
-        # (measured: 4 922 test boundaries in one gate run began with one already
-        # running). A reporter whose 10 s sleep came due DURING this test
-        # appended to `calls`, consumed this test's `ticks` iterator and raised
-        # the fake's StopIteration inside that other thread, which made the loop
-        # count 3 instead of 2 on a shuffled run. Reproduced on the unmodified
-        # commit by adding ONE concurrent reporter, so this is the test's
-        # fragility rather than a caller's mistake: the loop under test runs in
-        # THIS thread, and only this thread's calls and sleeps are its subject.
-        real_sleep = time.sleep
-        real_tick = H.ContinuousListener._health_tick
 
-        def fake_tick(self):
-            if threading.current_thread() is not threading.main_thread():
-                return real_tick(self)   # a reporter this test did not start
+        def fake_tick():
             calls.append(1)
             r = next(ticks)
             if isinstance(r, Exception):
                 raise r
 
-        def fake_sleep(s):
-            if threading.current_thread() is not threading.main_thread():
-                real_sleep(s)            # let it sleep as it would have
-                return
-            sleeps.append(s)
-            if len(sleeps) >= 3:            # two full hourly cycles, then stop
-                raise StopIteration
+        def fake_wait(seconds):
+            waits.append(seconds)
+            return len(waits) >= 3          # two full cycles, then stop
 
-        monkeypatch.setattr(H.time, "sleep", fake_sleep)
-        monkeypatch.setattr(H.ContinuousListener, "_health_tick", fake_tick)
-        with pytest.raises(StopIteration):
-            ln._health_loop()
-        assert sleeps and sleeps[0] == 10.0, "health loop must poll frequently"
+        # BOTH seams are the INSTANCE's, which is the whole point: `_health_wait`
+        # is how the reporter waits for its next poll (an Event, so `close()` can
+        # interrupt it) and `_health_tick` is patched on THIS listener rather than
+        # on the class. Patching `time.sleep` (one module object every thread
+        # shares) or the class attribute measured whatever else happened to be
+        # sleeping or ticking — a reporter leaked by an earlier test appended to
+        # this test's `calls` and consumed its `ticks` iterator, which made the
+        # loop count 3 instead of 2 on a shuffled run.
+        monkeypatch.setattr(ln, "_health_tick", fake_tick)
+        monkeypatch.setattr(ln, "_health_wait", fake_wait)
+        ln._health_loop()
+        assert waits and waits[0] == 10.0, "health loop must poll frequently"
         assert len(calls) == 2, "a failing report must not kill the loop"
 
     def test_health_loop_minimal_logger_survives_error(self, H, monkeypatch):
         calls = []
-        sleeps = iter([None, StopIteration])
+        waits = []
 
         class MinimalLog:
             def error(self, message):
@@ -1076,17 +1062,51 @@ class TestMicHealth:
 
         ln = self._mk_listener(H)
         monkeypatch.setattr(H, "log", MinimalLog())
-        def sleep(_seconds):
-            value = next(sleeps)
-            if value is not None:
-                raise value
-        monkeypatch.setattr(H.time, "sleep", sleep)
+
+        def fake_wait(_seconds):
+            waits.append(1)
+            return len(waits) >= 2          # one tick that raises, then stop
+
         def tick():
             raise RuntimeError("missing optional hook")
-        monkeypatch.setattr(H.ContinuousListener, "_health_tick", tick)
-        with pytest.raises(StopIteration):
-            ln._health_loop()
+
+        monkeypatch.setattr(ln, "_health_tick", tick)
+        monkeypatch.setattr(ln, "_health_wait", fake_wait)
+        ln._health_loop()
         assert calls == ["mic health report failed"]
+
+    def test_close_ends_the_reporter_that_stop_leaves_running(self, H):
+        # The reporter is spawned in `__init__` and its loop was `while True:
+        # sleep(10); tick()` — so before `close()` existed the ONLY thing that
+        # ever ended one was the process exiting. `stop()` is the hands-free
+        # toggle and must NOT end it (state=stopped, and the hourly summary, are
+        # exactly what it reports while hands-free is off), and `restart()`
+        # replaces the capture thread, not this one: a listener that was stopped,
+        # restarted and dropped still left a reporter behind.
+        class _Asst:
+            def _maybe_self_heal(self, degraded): pass
+            def _resource_tick(self): pass
+            def _world_tick(self): pass
+            def _hardware_tick(self): pass
+
+        ln = H.ContinuousListener(_Asst())
+        try:
+            thread = ln._health_thread
+            assert thread.name == "mic-health", thread.name
+            assert thread.is_alive(), "the reporter must be running to be stopped"
+            ln.stop()
+            assert thread.is_alive(), (
+                "stop() ended the reporter: switching hands-free off would then "
+                "stop the state=stopped line and the hourly summary with it")
+            ln.close()
+            thread.join(timeout=2.0)
+            assert not thread.is_alive(), (
+                "close() left the reporter running — a listener thrown away must "
+                "take its thread with it, or every construction leaks one")
+            ln.close()          # teardown may close the same listener twice
+            assert not thread.is_alive()
+        finally:
+            ln.close()
 
     # -- immediate transition reporting -----------------------------------
 

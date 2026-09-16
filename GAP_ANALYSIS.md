@@ -4374,11 +4374,20 @@ scenarios only reshuffled the order, which is what a shuffle gate is for. The
 fakes are now thread-aware (this thread's calls and sleeps are the subject;
 other threads run the real tick and sleep for real), the same remedy the sibling
 `test_wait_bounds_and_reports` leak needed one pass earlier, and re-running the
-rogue reproduction now leaves the test green. **Still open, and worth its own
-pass:** the suite leaves those reporters running — hundreds of live daemon
-threads, none of them stoppable — because `_health_loop` has no stop path and
-every constructed listener starts one. The tests are now immune to them; the
-suite would still be healthier without them.
+rogue reproduction now leaves the test green. **Closed in the next pass.** The reporters were unstoppable for a product
+reason, not a test one: `_health_loop` was `while True: sleep(10); tick`, so
+`stop()` (the capture stream) and `restart()` (the capture thread) had nothing
+to say to it and a dropped listener left a thread nothing could end.
+`ContinuousListener.close()` now ends both, the bubble's own shutdown calls it,
+and the loop waits on an `Event` (`_health_wait`) — which is the same seam the
+tests drive instead of patching `time.sleep` process-wide. A conftest teardown
+closes every live listener (found by walking the GC — a leaked one is
+registered nowhere) and every Assistant that really ran `__init__`, then
+asserts the count returned to zero. Measured with one probe sampling after
+fixture teardown, pristine `HEAD` vs this tree: boundaries with a live bubble
+thread **1372 → 0**, peak live **77 → 0**, accumulated `mic-health` **41578 →
+0** and `pipeline` **23290 → 0**.
+
 ## Every turn died with `system message must be at the beginning`
 
 **What was missing.** The request the bubble sent was one Ollama 0.32 refuses

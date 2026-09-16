@@ -5,6 +5,8 @@ from __future__ import annotations
 import atexit
 import contextlib
 import copy
+import functools
+import gc
 import importlib.util
 import os
 import random
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import numpy as np   # noqa: F401  (test modules rely on it being imported)
@@ -570,6 +573,113 @@ def _module_state_is_restored(H):
     snap = _snapshot_state(H)
     yield
     _restore_state(H, snap)
+
+
+#: Every thread a bubble or its listener starts. Named here so the teardown
+#: below can ask "is any of this still running?" with one `threading.enumerate()`
+#: — cheap enough for all 1400 tests — and walk the garbage collector only when
+#: the answer is yes.
+_BUBBLE_THREADS = frozenset({
+    "mic-health",       # ContinuousListener.__init__
+    "handsfree",        # ContinuousListener.start()
+    "pipeline",         # Assistant.__init__: unpacks a turn and runs it
+    "loader",           # Assistant.start(): models and warm-up
+    "reminders", "settings-watch", "missed-reminders", "announce",
+})
+
+
+def _live_bubble_threads() -> set:
+    """Ids of the live threads a bubble owns. Threads, not objects: the thread is
+    what leaks, and it is observable whether or not anything still points at the
+    listener that started it."""
+    return {id(t) for t in threading.enumerate()
+            if t.is_alive() and t.name in _BUBBLE_THREADS}
+
+
+def _fold_up_bubbles(H, built) -> None:
+    """Close every listener, and shut down every bubble, still alive in here.
+
+    Listeners are found by walking the garbage collector rather than through a
+    registry: the product has no business keeping a list of its objects for the
+    tests' sake, and a leaked one is exactly the object that is NOT registered
+    anywhere — it was dropped while its thread kept running.
+
+    Bubbles come from `built`, the set the constructor watcher fills. Sniffing
+    for a "real enough" bubble by its attributes was tried and measured: ~20
+    tests build an assistant with `__new__` on purpose, some of them leaving it
+    half-built and one injecting a `_shutdown_event` whose `set()` RAISES to
+    exercise a failure path — calling shutdown() on those two failed teardown
+    for a reason that had nothing to do with threads. Only `__init__` spawns the
+    threads, so only `__init__` is the marker.
+    """
+    listener_cls = getattr(H, "ContinuousListener", None)
+    for obj in gc.get_objects():
+        if listener_cls is not None and type(obj) is listener_cls:
+            obj.close()
+    for bubble in list(built):
+        if not getattr(bubble, "_closed", False):
+            bubble.shutdown()
+
+
+@pytest.fixture(scope="session")
+def _bubbles_built(H):
+    """Every Assistant that actually ran `Assistant.__init__`, for teardown.
+
+    A constructor watcher rather than a heuristic, because the marker has to be
+    exact: the `pipeline` worker and the mic reporter exist only in a bubble the
+    constructor built, and those are the threads this teardown is folding up.
+    """
+    built: "weakref.WeakSet" = weakref.WeakSet()
+    real_init = H.Assistant.__init__
+
+    @functools.wraps(real_init)
+    def init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        built.add(self)
+
+    H.Assistant.__init__ = init
+    try:
+        yield built
+    finally:
+        H.Assistant.__init__ = real_init
+
+
+@pytest.fixture(autouse=True)
+def _microphones_are_put_down(H, _bubbles_built):
+    """Every listener a test builds is CLOSED at teardown; a leak fails the test.
+
+    `ContinuousListener.__init__` spawns a `mic-health` reporter, and until the
+    stop path landed NOTHING could end it: `stop()` ends the capture stream,
+    `restart()` swaps the capture thread, and the reporter looped forever. The
+    suite therefore accumulated them — measured on one shuffled gate run, **4 922
+    test boundaries began with a live `mic-health` thread** left behind by an
+    earlier file — and a reporter whose 10 s poll came due during a later test
+    was steered by whatever that test had patched process-wide (`time.sleep` is
+    one module object; `_health_tick` used to be patched on the CLASS). Two
+    order dependencies in this suite had exactly that cause.
+
+    Closing here rather than at each construction site is the point: ~20 places
+    build an Assistant, and a rule that must be remembered in twenty places is
+    forgotten in the twenty-first — and the failure it produces is blamed on the
+    test that came next, not on the one that leaked.
+
+    The assertion is the other half. Closing everything means the count must
+    return to zero, so a listener that cannot be closed fails HERE, in the test
+    that ran it, rather than quietly arming a neighbour.
+    """
+    before = _live_bubble_threads()
+    yield
+    if _live_bubble_threads() - before:
+        _fold_up_bubbles(H, _bubbles_built)
+        still = sorted({t.name for t in threading.enumerate()
+                        if t.is_alive() and id(t) not in before
+                        and t.name in _BUBBLE_THREADS})
+        assert not still, (
+            f"{still} outlived this test and could not be stopped: a thread "
+            f"that survives its test shares every process-wide seam the next "
+            f"one patches (`time.sleep` is one module object; `_health_tick` "
+            f"used to be patched on the CLASS), which is how two order "
+            f"dependencies got into this suite")
 
 
 # `core.tools._CURRENT` (and core.doctor's) hold the dependency-injection host:

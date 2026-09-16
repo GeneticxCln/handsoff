@@ -3246,6 +3246,8 @@ class ContinuousListener:
     MIC_SILENT_REPORT_S = 20.0        # report 'silent' BEFORE the 45s reopen resets the clock
     SELFHEAL_GRACE_S = 60.0           # degraded this long → restart the capture stream
     SELFHEAL_MAX = 3                  # restarts per streak before journal-only
+    HEALTH_POLL_S = 10.0              # reporter poll: frequent enough to catch a transition
+    HEALTH_CLOSE_JOIN_S = 1.0         # close(): how long the reporter gets to end
 
     def __init__(self, assistant: "Assistant") -> None:
         self._assistant = assistant
@@ -3271,22 +3273,62 @@ class ContinuousListener:
         self._health_stalled_since = None  # monotonic: zero-frames streak start
         self._ever_started = False       # health reporting starts with the first start()
         self._lock = threading.RLock()   # guards the health snapshot above
+        # The reporter's ONLY stop path. `stop()` ends the capture stream,
+        # `restart()` swaps the capture thread, and neither has anything to say
+        # to this one — which looped forever, so a listener that was stopped,
+        # restarted and dropped still left a thread behind that nothing could
+        # ever end. `close()` is what sets this.
+        self._health_stop = threading.Event()
         # hourly "mic health" journal line — silent mic failures must be
         # visible without debug logging. Spawned ONCE here (never in start(),
         # which runs on every hands-free toggle): one reporter per process,
         # reporting state=stopped while hands-free is off.
-        threading.Thread(target=self._health_loop, name="mic-health",
-                         daemon=True).start()
+        self._health_thread = threading.Thread(target=self._health_loop,
+                                              name="mic-health", daemon=True)
+        self._health_thread.start()
 
     # -- hourly mic health line -------------------------------------------
+
+    def _health_wait(self, seconds: float) -> bool:
+        """Wait for the next poll. True means STOP, not that the wait expired.
+
+        `time.sleep` cannot be interrupted, which is why the reporter had no
+        exit: a five-line loop with a sleep in it is a thread the process can
+        only outlive. An Event is the smallest thing that makes it interruptible
+        — and it doubles as a deterministic seam the tests drive directly,
+        instead of patching `time.sleep` process-wide (one module object every
+        thread shares) and measuring whatever else happened to be sleeping.
+        """
+        return self._health_stop.wait(seconds)
+
+    def close(self) -> None:
+        """Stop this listener for good: the capture stream, then the reporter.
+
+        `stop()` is the hands-free toggle and `restart()` is the self-heal — both
+        deliberately leave the reporter alone, because one process wants one
+        reporter whether or not hands-free is on (that is what makes
+        state=stopped reportable at all). Teardown is the other case: a listener
+        being thrown away must take its thread with it. Idempotent, and safe to
+        call from any thread (it never joins itself).
+        """
+        self.stop()
+        stop = getattr(self, "_health_stop", None)
+        if stop is None:
+            # A listener built by hand (`__new__`, as several tests do) never ran
+            # the constructor, so it has no reporter to end. Teardown may close
+            # such an object, and "nothing was spawned" is not an error.
+            return
+        stop.set()
+        thread = getattr(self, "_health_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self.HEALTH_CLOSE_JOIN_S)
 
     def _health_loop(self) -> None:
         """Greppable 'mic health' journal lines without debug logging: an
         unconditional summary every hour, PLUS an immediate line the moment
         the state changes (silent, stalled, open-failing, recovered, stopped).
         Degraded states log at WARNING, healthy ones at INFO."""
-        while True:
-            time.sleep(10.0)
+        while not self._health_wait(self.HEALTH_POLL_S):
             try:
                 self._health_tick()
             except Exception:
@@ -4556,7 +4598,10 @@ class Assistant(QObject):
                 pass
         listener = getattr(self, "_listener", None)
         if listener is not None:
-            listener.stop()
+            # close(), not stop(): stop() ends the CAPTURE, and the hourly mic
+            # reporter is a second thread that the bubble's own shutdown used to
+            # leave running (a daemon, so only the process exit hid it).
+            listener.close()
         if getattr(self, "_tools", None) is not None:
             self._tools.stop_watchers()
         self._set_notification_reader(False)
