@@ -15,7 +15,7 @@ copy a size out of it into prose.
 | `core/bubble.py` | 4069 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |
 | `core/settings.py` | 883 | loader/writer/migrate/coerce/lock/merge, `Settings` object | app globals (paths as params) |
 | `core/audio.py` | 824 | `Recorder`, resample, whisper/TTS getters, `play_wav`, level hook | `handsoff` (`configure()` only) |
-| `core/web.py` | 972 | 6 backends, `_route`, TTL cache, `read_page`, SSRF guard | `handsoff` (resolvers via `configure()`) |
+| `core/web.py` | 972 | 6 backends behind `search`, `Result`, `_route`, TTL cache, `read_page`, SSRF guard | `handsoff` (resolvers via `configure()`) |
 | `core/calendar.py` | 548 | ICS fetch/unfold/parse/RRULE/format, scheme + label guards | anything (stdlib only) |
 | `core/assistant.py` | 595 | `PomodoroController`, `NotificationReader`, `ReminderStore`, mute/parse helpers | `handsoff` |
 | `core/doctor.py` | 515 | `run_doctor`/`doctor_json` via `DoctorDeps` | `handsoff` (deps injected) |
@@ -23,9 +23,9 @@ copy a size out of it into prose.
 | `core/brain.py` | 275 | `ollama_chat`/`ollama_chat_stream`, `TurnStream`, markup filter | — |
 | `core/theme.py` | 313 | `hex_to_rgb`, luminance, wallpaper match retune (Qt-free) | Qt |
 | `core/lifecycle.py` | 63 | `TurnState`, `next_turn` (atomic increment) | Qt/Assistant |
-| `settings_schema.py` | 974 | 59 defaults, vocabularies, looks catalogue, `look_matching` | — |
+| `settings_schema.py` | 974 | 59 defaults, `DEFAULT_SETTINGS`/`SETTINGS_VERSION`, `Field` rows (`SETTINGS_FIELDS`), `POLICY_RULES`, vocabularies, looks catalogue, `look_matching` | — |
 | `hardware.py` | 529 | 13-section `snapshot()`, TTLs, injectable probers, `--preflight` | SETTINGS/Qt/audio |
-| `handsoff-settings.py` | 5414 | 6-tab GUI, offscreen-capable, loads schema without the bubble | bubble module |
+| `handsoff-settings.py` | 5414 | `SettingsWindow` — 6-tab GUI, offscreen-capable, loads schema without the bubble | bubble module |
 
 Dependency direction: `handsoff.py` → `core.*` via `_load_module` handles
 (`_core_tools`, `_core_bubble`, `_core_settings`, `_brain`, `_audio`,

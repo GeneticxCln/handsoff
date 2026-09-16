@@ -8,7 +8,7 @@ Sources: `tests/` (25 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
 
 `tests/` — the FILE LIST is the contract: every `tests/test_*.py` must appear
 below, and `test_specs_freshness.py` fails when one does not. The counts are the
-2026-09-16 snapshot (1445 collected; 1343 `test_*` functions), so a stale count
+2026-09-16 snapshot (1451 collected; 1349 `test_*` functions), so a stale count
 in this table means nothing — a missing row does.
 
 | File | `test_*` fns | Area |
@@ -36,7 +36,7 @@ in this table means nothing — a missing row does.
 | `test_notify_coalesce.py` | 15 | notification batching/cooldown |
 | `test_hardware_watch.py` | 13 | hardware watch tick, disk/VRAM alerts |
 | `test_p0_fixes.py` | 6 | named P0 regressions |
-| `test_specs_freshness.py` | 12 | the specs' counts vs the code, the generated tables, and the file/module/spec lists |
+| `test_specs_freshness.py` | 18 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |
 | `test_settings_gui.py` | 1 (+ offscreen subprocess drivers) | Qt GUI incl. 10-design ink guard |
 | `conftest.py` / `fake_ollama.py` | 0 | module loader (`handsoff_core` + alias), order-shuffle, fake brain |
 

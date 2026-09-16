@@ -4739,3 +4739,60 @@ reason. The hole is smaller than the docstring claims.
 
 14 tests green in `test_specs_freshness.py`, the full suite in the commit hook,
 `deployment: in-sync` — a test and four spec files, no shipped byte.
+
+## The map's prose is checked now, and it was wrong in three cells (2026-09-16)
+
+The map's ownership sentences are the one part of the table no generator can
+produce — that is why they were the one part nothing read. Three guards read them
+as claims now:
+
+- **No dead claim.** Every backticked symbol in an `Owns` cell must still be in
+  that module: as an identifier, or inside a string literal (which is how
+  `--preflight` is claimed). All 17 rows held when first read.
+- **The biggest job is named.** The largest public class in a module must be
+  named — one name per module, and by construction the biggest thing it does, so
+  the day a new subsystem outgrows the old one the row has to say so. Plus: a
+  public name TWO OR MORE other modules reach by *module-qualified* access
+  (`web.search`, `_audio.play_wav`) is an interface, not an internal.
+- **The fourth column is a claim about imports.** `handsoff`/`app globals` (no
+  host import), `Qt`, `Assistant`, `SETTINGS`, `audio`, `bubble module`,
+  `anything` narrowed by `stdlib only`, and every backticked mechanism symbol
+  must exist. A prohibition the guard cannot read is a FAILURE, not a pass.
+
+Two rule shapes were measured and discarded before this one. "Name every public
+symbol" produced 11 gaps, almost all internals a cell describes in prose
+(`Recorder`, `WakeSpotter`, `ContinuousListener` are "voice pipeline"), and it
+would make a cell a second copy of `__all__`. And counting *any* identifier
+another file mentions produced 51 "seams" that were mostly the injected facade —
+`H.SETTINGS`, `H.log`, `H.subprocess` — because a core module reaching for the
+app's globals says nothing about what that module exposes.
+
+**What it found in the map, now fixed:** `core/web.py` never named `search` (the
+entry point seven files call) or `Result`. `settings_schema.py` named none of
+`DEFAULT_SETTINGS`, `SETTINGS_VERSION`, `SETTINGS_FIELDS` or `POLICY_RULES` — the
+four names other modules import from it — nor `Field`, the row type the whole
+table is built from. `handsoff-settings.py` never named `SettingsWindow`. The
+first attempt at the fix also silently broke the settings-key census: dropping
+"59 defaults" from that cell stopped the freshness guard reading the count, which
+is exactly the "a statement that stops matching is a failure" rule doing its job.
+
+**9/9 mutations caught, zero residue, every restore sha256-verified — and the
+sweep found two real defects while running.** (a) `ci/spec_tables.py --write`
+exited **1** after successfully rewriting the tables, because `main()` judged the
+run on the staleness it found *before* writing: the tool reporting failure for the
+only thing it is for. It now re-reads, and a new test drives the real tool against
+a throwaway tree (symlinked `core`, one deliberately wrong line count) to pin
+check-fails → write-exits-0 → check-passes. (b) The import check could not see
+`import core.bubble` at all — that form registers only the top-level name `core`,
+so a check reading the first component would have missed `import core.audio` in
+`hardware.py` too. Module names are kept dotted as well as top-level now.
+
+The sweep's own crash is worth recording for the same reason: it died mid-mutation
+on the assertion about `--write`'s exit code and left `core/theme.py` carrying the
+injected `WallpaperMatcher` class, which the *next* guard run then caught. It was
+restored from the sweep's backup and verified byte-identical to `HEAD` by sha256 —
+but the lesson is the ordering, and the sweep now restores in a `finally`.
+
+1451 tests green, `compile`/`shell`/`smoke` PASS, `deployment: in-sync` — specs,
+tests and a CI helper, no shipped byte. The plan's dated snapshot reads 1451
+collected / 1349 `test_*` functions.

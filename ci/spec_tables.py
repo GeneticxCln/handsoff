@@ -195,6 +195,11 @@ def main(argv: list) -> int:
             print(f"rewrote {path.relative_to(ROOT)} ({what})")
         if not stale:
             print("both tables already match the tree")
+        # Re-read: the write is supposed to BE the fix, so a non-zero exit after
+        # one means the rewrite did not stick (or a row is still undescribed).
+        # Exiting 1 on a successful write made the tool report failure for the
+        # only thing it is for — found by the sweep that mutated a module.
+        stale = pending()
     elif stale:
         for path, what, old, new in stale:
             print(f"STALE: {path.relative_to(ROOT)} — the {what} is not what "

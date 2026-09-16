@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import ast
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from conftest import _load as _load_module, sandbox_env
@@ -100,6 +102,123 @@ def _generated_lines(headers) -> set:
             out.add((name, row))
             row += 1
     return out
+
+
+def _map_rows() -> list:
+    """[(module, owns, must-not-import)] from the architecture map's table.
+
+    Read through the generator's own table parser, so the map has one reader of
+    its shape: the module set in these rows is the set it prices and the set the
+    deployment ships.
+    """
+    spec_tables = _generator()
+    rows = []
+    for cells in spec_tables._table_body(_spec("20-architecture.md"),
+                                         spec_tables.ARCH_HEADER):
+        label = cells[0].strip("`")
+        rows.append((label, cells[2].strip() if len(cells) > 2 else "",
+                     cells[3].strip() if len(cells) > 3 else ""))
+    assert len(rows) >= 15, (
+        f"the map now has {len(rows)} rows — it had 17, so this guard has "
+        f"stopped reading the table it checks")
+    return rows
+
+
+def _mentions(path: Path) -> tuple:
+    """(identifiers, string text) the module's own AST contains.
+
+    Deliberately loose: an ownership cell claims a name, and the question is
+    whether that name is still *somewhere* in the module — as a def, a class, an
+    attribute, a parameter, or inside a string literal (which is how a CLI flag
+    like `--preflight` is claimed).
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    identifiers = set()
+    strings = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            identifiers.add(node.attr)
+        elif isinstance(node, (ast.ClassDef, ast.FunctionDef,
+                               ast.AsyncFunctionDef)):
+            identifiers.add(node.name)
+        elif isinstance(node, ast.arg):
+            identifiers.add(node.arg)
+        elif isinstance(node, ast.alias):
+            identifiers.add((node.asname or node.name).split(".")[-1])
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            strings.append(node.value)
+    return identifiers, "\n".join(strings)
+
+
+def _largest_public_class(path: Path):
+    """(name, lines) of the biggest non-private top-level class, or None."""
+    body = ast.parse(path.read_text(encoding="utf-8")).body
+    classes = [n for n in body
+               if isinstance(n, ast.ClassDef) and not n.name.startswith("_")]
+    if not classes:
+        return None
+    biggest = max(classes, key=lambda c: c.end_lineno - c.lineno)
+    return biggest.name, biggest.end_lineno - biggest.lineno
+
+
+def _qualified_seams() -> dict:
+    """{module: {name: {files that reach it by module-qualified access}}}.
+
+    `web.search`, `_audio.play_wav`, `_core.bubble.install_pack` — a real
+    dependency. Bare names and attribute access on the injected facade are NOT
+    counted: a core module reaching for the app's globals says nothing about
+    what that module exposes, and counting it made every host global look like a
+    seam of every module.
+    """
+    spec_tables = _generator()
+    shipped = [label for label, _path in spec_tables.modules()]
+    trees = {label: ast.parse((HERE / label).read_text(encoding="utf-8"))
+             for label in shipped}
+    by_key = {}
+    for label in shipped:
+        by_key[label] = label
+        by_key[Path(label).stem] = label
+        by_key[f"core.{Path(label).stem}"] = label
+
+    def aliases(tree):
+        found = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name.startswith("core"):
+                        found[a.asname or a.name.split(".")[-1]] = a.name
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for a in node.names:
+                    if node.module.startswith("core"):
+                        found[a.asname or a.name] = f"{node.module}.{a.name}"
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                fn = node.value.func
+                if (getattr(fn, "id", "") or getattr(fn, "attr", "")) != "load_module":
+                    continue
+                if not node.value.args:
+                    continue
+                arg = node.value.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            found[target.id] = "core." + arg.value
+        return found
+
+    seams = {}
+    for user, tree in trees.items():
+        found = aliases(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            base = node.value
+            if not isinstance(base, ast.Name) or base.id == "H":
+                continue
+            owner = by_key.get(found.get(base.id, ""))
+            if owner and owner != user:
+                seams.setdefault(owner, {}).setdefault(node.attr, set()).add(user)
+    return seams
 
 
 def _spec(name: str) -> str:
@@ -200,6 +319,170 @@ class TestSpecFreshness:
             f"module nobody declared is a module nobody knows is there")
         stale = [name for name in listed if name not in on_disk]
         assert not stale, f"the architecture map lists core/{stale}, which is gone"
+
+    def test_the_map_names_only_symbols_that_still_exist(self):
+        """An ownership sentence naming a symbol the module no longer has.
+
+        The map is how someone finds the seam they are about to change, so a
+        name that was renamed or cut is a pointer into nothing — and it is the
+        one part of the table no generator can produce: what a module owns is a
+        sentence a person writes. Checked against the module's own AST, so the
+        row has to keep saying true things.
+        """
+        problems = []
+        for label, owns, _must_not in _map_rows():
+            identifiers, strings = _mentions(HERE / label)
+            for chunk in re.findall(r"`([^`]+)`", owns):
+                parts = [word for word in re.split(r"[^A-Za-z0-9_]+", chunk) if word]
+                if not parts:
+                    continue
+                if not any(word in identifiers or word in strings for word in parts):
+                    problems.append(
+                        f"{label}: the map names `{chunk}` and none of {parts} is "
+                        f"in the module")
+        assert not problems, (
+            "an ownership sentence names something that is no longer there:\n  "
+            + "\n  ".join(problems))
+
+    def test_the_map_names_each_modules_biggest_job(self):
+        """A module that gained a job must stop describing only its old one.
+
+        Two calibrated rules, rather than "name every public symbol" — that
+        would make a cell a second copy of `__all__` and turn every new function
+        into a two-file change:
+
+          * the LARGEST public class in the module is named. One name per
+            module, and by construction the biggest thing it does, so the day a
+            new subsystem outgrows the old one the row has to say so.
+          * a public name that TWO or more other modules reach by
+            module-qualified access is an interface, not an internal.
+
+        Not covered, and stated rather than implied: a job that exactly one
+        other module reaches. The map is also checked in the other direction — a
+        module arriving at all is the generator's `TODO` row.
+        """
+        seams = _qualified_seams()
+        rows = _map_rows()
+        assert seams, "no module-qualified access found anywhere — nothing read"
+        problems = []
+        for label, owns, must_not in rows:
+            cell = f"{owns} {must_not}"
+            biggest = _largest_public_class(HERE / label)
+            if biggest and not re.search(rf"\b{re.escape(biggest[0])}\b", cell):
+                problems.append(
+                    f"{label}: its largest class `{biggest[0]}` ({biggest[1]} lines) "
+                    f"is not named in the map")
+            shared = {name: users for name, users in seams.get(label, {}).items()
+                      if len(users) >= 2 and not name.startswith("_")}
+            for name, users in sorted(shared.items()):
+                if not re.search(rf"\b{re.escape(name)}\b", cell):
+                    problems.append(
+                        f"{label}: `{name}` is reached by {len(users)} modules "
+                        f"({', '.join(sorted(users))}) and the map never names it")
+        assert not problems, (
+            "the map describes a module in terms it has outgrown:\n  "
+            + "\n  ".join(problems))
+        # anti-vacuity: a module the rest of the tree reaches into must name at
+        # least one of the names it is reached by, or the rule above could pass
+        # on a row whose symbols have all been renamed out from under it.
+        speaking = []
+        for label, owns, must_not in rows:
+            reached = seams.get(label, {})
+            if reached and not any(
+                    re.search(rf"\b{re.escape(name)}\b", f"{owns} {must_not}")
+                    for name in reached):
+                speaking.append(label)
+        assert not speaking, (
+            f"{speaking} are reached by other modules and the map names none of "
+            f"those names — the row is describing something else")
+
+    def test_the_must_not_import_column_is_a_checkable_claim(self):
+        """The fourth column is a claim about imports, and imports are readable.
+
+        Each cell is a prohibition (before the parenthesis) optionally followed
+        by the mechanism that makes it true. Every prohibition must be a term
+        this guard knows how to check — an unreadable term is a claim nothing
+        checks, which is the failure mode this whole file exists to end — and
+        every backticked mechanism symbol must exist in the module it qualifies
+        (`configure()` in a row means the module still has one).
+        """
+        # Module names are kept DOTTED as well as top-level: `import core.bubble`
+        # registers the top-level name `core`, so a check that only read the
+        # first component could never see the import it exists to forbid. (The
+        # sweep missed exactly that, which is why it is spelled out here.)
+        def dotted_and_tops(text):
+            dotted = set()
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.Import):
+                    dotted |= {a.name for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    dotted.add(node.module)
+            return dotted, {name.split(".")[0] for name in dotted}
+
+        def names_of(qualified):
+            return lambda kind: any(
+                m == f"core.{kind}" or m.endswith(f".{kind}") for m in qualified)
+
+        predicates = {
+            "—": lambda k: None,
+            "handsoff": lambda k: ("imports the host module"
+                                   if "handsoff" in k["tops"] else None),
+            "app globals": lambda k: ("imports the host module"
+                                      if "handsoff" in k["tops"] else None),
+            "Qt": lambda k: ("imports Qt" if any(
+                m.startswith(("PySide", "PyQt")) for m in k["dotted"]) else None),
+            "Assistant": lambda k: ("names Assistant"
+                                    if "Assistant" in k["names"] else None),
+            "SETTINGS": lambda k: ("names SETTINGS"
+                                   if "SETTINGS" in k["names"] else None),
+            "audio": lambda k: ("imports core.audio"
+                                if names_of(k["dotted"])("audio") else None),
+            "bubble module": lambda k: ("imports the bubble module"
+                                        if names_of(k["dotted"])("bubble") else None),
+            "anything": lambda k: None,      # narrowed by the mechanism
+        }
+        stdlib = set(sys.stdlib_module_names)
+        seen = []
+        problems = []
+        for label, _owns, must_not in _map_rows():
+            prohibition = re.split(r"[(\n]", must_not)[0]
+            terms = [t.strip().strip("`") for t in re.split(r"[/,]", prohibition)]
+            terms = [t for t in terms if t]
+            dotted, tops = dotted_and_tops(
+                (HERE / label).read_text(encoding="utf-8"))
+            identifiers, _strings = _mentions(HERE / label)
+            known = {"dotted": dotted, "tops": tops, "names": identifiers}
+            for term in terms or ["—"]:
+                if term not in predicates:
+                    problems.append(
+                        f"{label}: the guard does not know how to check the "
+                        f"prohibition `{term}` — teach it or reword the cell")
+                    continue
+                seen.append(term)
+                complaint = predicates[term](known)
+                if complaint:
+                    problems.append(f"{label}: {complaint}, and its row forbids it")
+            if "stdlib only" in must_not:
+                outside = sorted(m for m in tops
+                                 if m not in stdlib and m not in ("core",))
+                if outside:
+                    problems.append(
+                        f"{label}: the row says stdlib only, and it imports "
+                        f"{outside}")
+            # mechanisms live INSIDE the parentheses; the prohibition in front
+            # of them is backticked too, and it names the host on purpose.
+            for chunk in re.findall(r"`([^`]+)`", " ".join(
+                    re.findall(r"\(([^)]*)\)", must_not))):
+                words = [w for w in re.split(r"[^A-Za-z0-9_]+", chunk) if w]
+                if words and not any(w in identifiers for w in words):
+                    problems.append(
+                        f"{label}: the mechanism `{chunk}` names something the "
+                        f"module does not have")
+        assert not problems, "\n  ".join(problems)
+        # anti-vacuity: the vocabulary above has to be used by the table, and
+        # the checks that actually forbid something have to be exercised.
+        assert len(set(seen)) >= 6, sorted(set(seen))
+        assert "handsoff" in seen and "Qt" in seen, sorted(set(seen))
 
     def test_the_test_plan_lists_every_test_file(self):
         """The inventory's COUNTS are a dated snapshot; its FILE LIST is not."""
@@ -354,6 +637,54 @@ class TestSpecFreshness:
             + "\n  ".join(offenders)
             + "\nspecs/20-architecture.md §1 is generated — point at it instead "
             "of copying out of it")
+
+    def test_write_mode_leaves_the_gate_green(self):
+        """`--write` is the fix, so it must exit 0 once it has written.
+
+        It did not: `main()` judged the run on the staleness it found BEFORE
+        rewriting, so a successful write still exited 1 — the tool reporting
+        failure for the only thing it is for. A sweep that mutated a module's
+        line count is what surfaced it. The check runs the real tool against a
+        throwaway tree whose only wrong number is a line count, so nothing in
+        the real specs is touched to test it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Path(tmp)
+            (tree / "ci").mkdir()
+            (tree / "specs").mkdir()
+            shutil.copy2(HERE / "ci" / "spec_tables.py", tree / "ci" / "spec_tables.py")
+            for name in ("20-architecture.md", "30-tools-api.md"):
+                shutil.copy2(SPECS / name, tree / "specs" / name)
+            (tree / "core").symlink_to(HERE / "core")
+            for name in ("install.sh", "handsoff.py", "settings_schema.py",
+                         "handsoff-settings.py", "hardware.py"):
+                (tree / name).symlink_to(HERE / name)
+            # one wrong number, in the file the generator prices
+            arch = tree / "specs" / "20-architecture.md"
+            arch.write_text(re.sub(r"\| `handsoff\.py` \| \d+ \|",
+                                   "| `handsoff.py` | 1 |",
+                                   arch.read_text(encoding="utf-8")),
+                            encoding="utf-8")
+            stale = subprocess.run(
+                [sys.executable, str(tree / "ci" / "spec_tables.py")],
+                capture_output=True, text=True, cwd=str(tree), env=sandbox_env(),
+                timeout=120)
+            assert stale.returncode == 1, (
+                f"a wrong line count did not fail the check: {stale.stdout}")
+            wrote = subprocess.run(
+                [sys.executable, str(tree / "ci" / "spec_tables.py"), "--write"],
+                capture_output=True, text=True, cwd=str(tree), env=sandbox_env(),
+                timeout=120)
+            assert wrote.returncode == 0, (
+                f"--write exited {wrote.returncode} after rewriting:\n"
+                f"{wrote.stdout}\n{wrote.stderr}")
+            assert "rewrote" in wrote.stdout, wrote.stdout
+            after = subprocess.run(
+                [sys.executable, str(tree / "ci" / "spec_tables.py")],
+                capture_output=True, text=True, cwd=str(tree), env=sandbox_env(),
+                timeout=120)
+            assert after.returncode == 0, (
+                f"the tree `--write` left is still stale:\n{after.stdout}")
 
     def test_the_census_is_not_vacuous(self):
         """Every quantity in the table was really read, and from a real file."""
