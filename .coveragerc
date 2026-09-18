@@ -23,6 +23,13 @@ omit =
     # unparseable phantom files.
     shibokensupport/*
     */signature_bootstrap.py
+    # The checkout-write guard's carrier: tests/conftest.py writes a one-module
+    # `sitecustomize.py` into a scratch directory (so every python CHILD the suite
+    # spawns is held to the same rule), and a child that starts coverage under
+    # COVERAGE_PROCESS_START measures it — a file outside the checkout, which the
+    # report then cannot find and refuses to print a TOTAL for. Not source, and
+    # not the suite's: omitted rather than left to pollute the gate's output.
+    */handsoff-guard-*/sitecustomize.py
 
 [report]
 # The floor tracks measured reality, not aspiration, and the PER-FILE shape is

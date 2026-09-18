@@ -27,9 +27,9 @@ import pytest
 import core
 from core import APP_MODULE_NAME, app_instance, app_module, load_app_module
 
-from conftest import HERE as ROOT, _REAL_HOME, _checkout_write_target, _load, \
-    _user_site, isolated_user_dirs, run_driver, sandbox_env, \
-    writes_into_the_checkout
+from conftest import HERE as ROOT, _GUARD_ENV, _REAL_HOME, \
+    _checkout_write_target, _load, _user_site, isolated_user_dirs, run_driver, \
+    sandbox_env, writes_into_the_checkout
 
 HERE = ROOT
 
@@ -473,6 +473,93 @@ class TestNoTestWritesInTheCheckout:
         assert _checkout_write_target("os.mkdir", (fresh, 0o777, -1)) == fresh
         # ...and removing something that IS there can succeed, so it is a write.
         assert _checkout_write_target("os.rmdir", (existing, -1)) == existing
+
+    #: The same child, run three ways. It takes the checkout as an ARGUMENT rather
+    #: than reading the guard variable, because that variable is the wiring under
+    #: test and a driver that needed it could not be the control for it.
+    CHILD_PROBE = '''\
+import pathlib, sys
+child = sys.modules.get("checkout_guard")
+print("root:", child.root() if child else "NONE")
+probe = pathlib.Path(sys.argv[1]) / "zz_child_write_probe.txt"
+try:
+    probe.write_text("child", encoding="utf-8")
+    print("WROTE")
+except AssertionError as exc:
+    print("REFUSED:", str(exc).splitlines()[0])
+print("exists:", probe.exists())
+if probe.exists():      # a guard that went quiet must still leave the tree clean
+    probe.unlink()
+    print("cleaned")
+'''
+
+    def test_a_child_the_suite_spawns_is_refused_too(self):
+        """The half the first version of this guard stated as a limit, and the
+        half that matters most: the suite's children are where most of its
+        behaviour runs — every offscreen GUI scenario, every `run_driver` driver
+        — so a property that stopped at the parent's process stopped short of
+        the interesting part. `sitecustomize` is what carries it: the one hook
+        CPython runs in every interpreter at start-up, whatever the argv is."""
+        proc = run_driver(["-", str(ROOT)], input=self.CHILD_PROBE,
+                          capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        assert "REFUSED:" in proc.stdout, (
+            "the child wrote into the checkout with no guard in it:\n"
+            + proc.stdout)
+        assert f"root: {ROOT}" in proc.stdout, (
+            "the child's guard has to judge the SAME tree this process does: one "
+            "pointed at the parent directory would refuse this write too, and "
+            "would also refuse the legitimate writes beside the checkout")
+        assert str(ROOT / "zz_child_write_probe.txt") in proc.stdout
+        assert "exists: False" in proc.stdout
+        assert not (ROOT / "zz_child_write_probe.txt").exists()
+
+    def test_the_variable_is_what_the_child_guard_hangs_on(self):
+        """The control for the test above, without which it would pass for a child
+        that simply cannot write anywhere. The SAME child, with the one variable
+        removed and nothing else changed — the shim is still first on its path —
+        writes the file and tidies up. That is what makes the pairing evidence:
+        the shim's presence is not the guard, the suite asking for it is."""
+        env = sandbox_env()
+        env.pop(_GUARD_ENV)
+        proc = subprocess.run([sys.executable, "-", str(ROOT)],
+                              input=self.CHILD_PROBE, env=env, cwd=str(ROOT),
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        assert "root: NONE" in proc.stdout, (
+            "the shim armed itself with no variable to hang on: it sits on every "
+            "child's path, so it may only act when the suite asks it to")
+        assert "WROTE" in proc.stdout and "exists: True" in proc.stdout
+        assert "cleaned" in proc.stdout, (
+            "the unguarded child was to clean up after itself, so this control "
+            "leaves the checkout as it found it")
+        assert not (ROOT / "zz_child_write_probe.txt").exists()
+
+    def test_the_child_environment_carries_the_shim_and_the_root(self):
+        env = sandbox_env()
+        assert env[_GUARD_ENV] == str(ROOT)
+        first = env["PYTHONPATH"].split(os.pathsep)[0]
+        assert Path(first, "sitecustomize.py").is_file(), (
+            "the shim has to be FIRST on the path: one that comes later is one a "
+            "developer's own sitecustomize shadows, and the guard never installs")
+        shim = Path(first, "sitecustomize.py").read_text(encoding="utf-8")
+        assert "checkout_guard" in shim
+        # ONE definition: the shim POINTS at the module rather than restating the
+        # rules, because two copies drift and the child's would be the wrong one.
+        assert "_WRITE_EVENTS" not in shim and "os.O_WRONLY" not in shim
+        assert Path(ROOT, "tests", "checkout_guard.py").is_file(), (
+            "the shim loads this file by path from the checkout it is told about")
+
+    def test_the_shim_is_not_measured_by_the_coverage_gate(self):
+        """A child that starts coverage under COVERAGE_PROCESS_START measures the
+        shim too — a one-module file in a scratch directory — and the report then
+        refuses to print a TOTAL for it: measured, the first gate run with guarded
+        children printed `No source for code: /tmp/handsoff-guard-*/sitecustomize.py`
+        instead. Pinned because the omission is invisible until the next gate run."""
+        text = (ROOT / ".coveragerc").read_text(encoding="utf-8")
+        assert "*/handsoff-guard-*/sitecustomize.py" in text, (
+            "the shim's scratch directory is not omitted from coverage, so the "
+            "coverage gate will refuse a TOTAL over a file outside the checkout")
 
     def test_the_predicate_judges_the_boundary_and_the_artifacts(self):
         """The decision table, one row per way it could be wrong."""

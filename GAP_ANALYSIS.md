@@ -7232,3 +7232,89 @@ hook still costs its four minutes. `install.sh`'s membership decision is the one
 line of shipped behaviour that changed (`HAVE_GIT`), and it changed only which of
 two refusal messages a user reads — both refuse the same files and ship the same
 set.
+
+## The checkout-write guard travels into the children the suite spawns (2026-09-18)
+
+**What was asked.** Extend the guard into the children the suite spawns, so the
+offscreen GUI scenarios are held to the same rule. The entry above closed by
+naming this as its limit, and the limit was large: the property held in the
+suite's own process, and the children are where most of its behaviour runs —
+every offscreen GUI scenario, every `run_driver` driver, everything a bash child
+starts.
+
+**How it travels.** `sitecustomize` is the one module CPython tries to import in
+EVERY interpreter at start-up, whatever the argv is (`-c`, a script on stdin,
+`-m pytest`, something a shell started), so no call site had to be taught
+anything: `sandbox_env` — already the one constructor every child the suite
+spawns goes through — writes one `sitecustomize.py` into a scratch directory, puts
+that directory FIRST on the child's `PYTHONPATH`, and names the checkout in
+`HANDSOFF_CHECKOUT_GUARD`. **The shim is a pointer, not a second copy of the
+rules:** it loads `tests/checkout_guard.py` from the checkout it was told about and
+calls its `install()`. Two copies of "what is forbidden" would drift, and the
+child's copy would be the wrong one. First-on-the-path is not decoration either —
+a developer's own `sitecustomize` would shadow a shim that came later and the
+guard would silently not install — which is what one of the wiring tests pins.
+
+**The property moved to be shareable, and the sweep had to move with it.** The
+rules left `tests/conftest.py` for `tests/checkout_guard.py`, which both kinds of
+process load; conftest installs it for this process and exports the means of
+installing it in a child. Everything the entry above established stayed true —
+enforced at the write, the event table and its per-event rules, the exemptions,
+the limits — and 13 of the sweep's mutants were re-pointed at the new home,
+because otherwise they would have reported SKIP against a file that no longer
+holds the code and read like passes.
+
+**Measured, and the result that matters is a negative one.** The whole suite with
+every child armed: **1 802 passed**, and not one child was refused anything — so
+no python child the suite spawns writes into the checkout today. That is the
+honest description of what this closed: nothing was broken, and nothing was
+watching. In a copy of the working tree with no `.git` anywhere: **1 802 passed,
+0 skipped in 249 s**.
+
+**One thing guarded children broke, found by the gate that measures.**
+`COVERAGE_PROCESS_START` makes a child measure the shim too, and the report then
+refuses to print a TOTAL over a file outside the checkout: the first run printed
+`No source for code: /tmp/handsoff-guard-*/sitecustomize.py` where the summary
+belongs. The scratch directory is omitted in `.coveragerc` now, with the reason
+beside the pattern and a test pinning it, because the omission is invisible until
+the next gate run.
+
+**Guards and sweep: 4 more tests in `tests/test_sandbox.py`** (16 in the class) —
+a real child, spawned the way the suite spawns them, is refused and leaves nothing
+behind, and it is asked WHICH TREE it is judging (a guard pointed at the parent
+directory would refuse the write the test watches for, and would also refuse the
+legitimate writes beside the checkout, so the answer is the assertion); the SAME
+child with the one variable removed and nothing else changed writes the file and
+cleans up, which is what makes the pair evidence rather than a hope; the wiring
+itself; and the coverage omission. **23/23 mutations caught, 0 missed, every
+restore sha256-verified** — the 16 of the entry above, re-pointed, plus seven
+aimed at the travel (the variable never exported, the shim directory never on the
+path, the shim directory put LAST instead of first, the shim installing the guard
+for the wrong tree, the shim pointing at a module that is not the guard, the
+coverage omission dropped, and the shim arming itself when nothing asked). That
+last mutant is worth recording: its first draft (`if _root:` → `if True:` with the
+root left as None) was MISSED, because a `sitecustomize` that RAISES is swallowed
+by `site` with one line on stderr — the child ran on unguarded and the control
+passed. The mutant that bites is the decline a real one would choose
+(`or os.getcwd()`), and the control is what catches it.
+
+**Green on the final bytes**, each invocation stamped and ending in the tree
+verdict: `tests` PASS 246 s (**1 802 passed** — the junit report says 0 failures,
+0 errors, 0 skipped), `coverage` PASS 527 s (**84.60%** ≥ 70 — 2 581 missing of
+16 754 statements), `order` PASS 498 s in BOTH orderings, `compile` / `shell` /
+`smoke` PASS, **`clean-checkout` PASS 8 s**, **`two-writer` PASS** (`worktree
+unchanged since the run started`), `all gates passed`, exit 0.
+
+**Limits, stated.** A bash child (`bash ci/gates.sh`, `git`, `install.sh` itself)
+is not a Python interpreter and cannot be reached by a `sitecustomize`; the
+`python3` such a child starts does inherit the shim, which is where an installer
+run would be judged. The shim directory goes first on `PYTHONPATH`, which shadows
+a developer's own `sitecustomize` inside the suite's children — the price of the
+one hook every child has. A child spawned with a hand-built environment rather
+than `sandbox_env()` does not carry the guard, which the wiring test pins at the
+constructor; the children that do that today are bash and git, not Python. The
+shim's silent no-op when the guard module is missing at the root it was given is
+deliberate — a child that died at start-up would fail for a reason unrelated to
+what it was testing — with the module's presence pinned at the source instead. And
+`clean-checkout` judges HEAD, so its PASS is a verdict about the commit and not
+about these uncommitted bytes.

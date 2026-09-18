@@ -254,13 +254,15 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    on import, written under `tests/` to prove a failed load cannot strand the
    sandbox). All three build under `tmp_path` now, so a run can no longer leave
    anything in the tree.
-9. A child process the suite spawns — a driver, an offscreen-GUI scenario,
-   `bash ci/gates.sh` — is outside the checkout-write guard, which is the suite's
-   own process. Inheriting it means a `sitecustomize.py` on the child's
-   PYTHONPATH, and `sandbox_env` is already the one constructor every child the
-   suite runs goes through, so the seam exists; no instance of the class has been
-   seen. Until then the lifecycle guards remain what catches a child's leftovers,
-   and only when they land in a shipped glob.
+9. **DONE (2026-09-18):** a child process the suite spawns is now held to the same
+   rule — see the section at the end of this file. `sitecustomize` is what carries
+   it (the one hook CPython runs in every interpreter at start-up, whatever the
+   argv is), `sandbox_env` is the one constructor every child goes through, and
+   the shim decides nothing itself: it loads `tests/checkout_guard.py` from the
+   checkout it is told about, so parent and child cannot drift about what is
+   forbidden. Measured, and this is the part worth knowing: no python child the
+   suite spawns writes into the checkout today, so the property was blind rather
+   than violated — 1 801 tests pass with every child armed.
 
 ## core/lifecycle.py seam exists but has no production caller — CLOSED (2026-09-17)
 
@@ -530,11 +532,93 @@ the measurement has a control — a pytest plugin that makes `addaudithook` a no
 turns the four refusal tests red while the allowed ones stay green, which is what
 makes "these tests do the refusing" a claim rather than a hope.
 
-**Limits.** It covers the suite's process, not the children it spawns (item 9
-above). The `open` audit event carries no directory fd, so a write opened by bare
+**Limits.** It covers the suite's process, and (since the same day) the python
+children it spawns — item 9 above, closed at the end of this file. A BASH child
+is not a Python interpreter and cannot be reached by a `sitecustomize`; the
+`python3` such a child starts does inherit the shim, which is where an installer
+run would be judged. The `open` audit event carries no directory fd, so a write opened by bare
 name against such a descriptor would be judged against the working directory — a
 refusal rather than a missed write, and nothing in the suite opens a file for
 writing that way. The exemptions are judged by NAME, so a test that deliberately
 created `pytest-cache-files-…` at the root would be allowed to write there; that
 is the price of a prefix rather than a syscall-level fact, and it costs more to
 attempt than it gains.
+
+## The guard travels into the children the suite spawns — CLOSED (2026-09-18)
+
+**What was asked.** Extend the checkout-write guard into the children the suite
+spawns, so the offscreen GUI scenarios are held to the same rule. The limit the
+previous section ended on was real and large: the property held in the suite's own
+process, and the child processes are where most of its behaviour actually runs —
+every offscreen GUI scenario, every `run_driver` driver, everything a bash child
+starts.
+
+**How it travels, and why that hook.** `sitecustomize` is the one module CPython
+tries to import in EVERY interpreter at start-up, whatever the argv is (`-c`, a
+script read from stdin, `-m pytest`, something a shell started), so no call site
+has to be taught anything: `sandbox_env` — already the one constructor every child
+the suite spawns goes through — writes one `sitecustomize.py` into a scratch
+directory, puts that directory FIRST on the child's `PYTHONPATH`, and names the
+checkout in `HANDSOFF_CHECKOUT_GUARD`. The shim is a POINTER, not a second copy of
+the rules: it loads `tests/checkout_guard.py` from the checkout it was told about
+and calls its `install()`. That is the design decision worth stating — two copies
+of "what is forbidden" would drift, and the child's copy would be the wrong one.
+First-on-the-path is not decoration either: a developer's own `sitecustomize`
+would otherwise shadow it, and the guard would silently not install.
+
+**The property had to move to be shareable, and that is how it is written down.**
+The rules left `tests/conftest.py` for `tests/checkout_guard.py`, which both kinds
+of process load; conftest now installs it for this process and exports the means
+of installing it in a child. Everything the previous section established stayed
+true — enforced at the write, the event table, the exemptions, the limits — and
+the sweep was re-pointed at the new home rather than left passing against a file
+that no longer holds the code (13 of its 22 mutants would otherwise have reported
+SKIP).
+
+**Measured, and the measurement is the good news.** The whole suite with every
+child armed: **1 802 passed**, no child refused anything — so no python child the
+suite spawns writes into the checkout today. The property was BLIND rather than
+violated, which is the honest description of what closing this changed: nothing
+was broken, and nothing was watching. In a copy of the working tree with no `.git`
+anywhere: 1 802 passed, 0 skipped in 249 s.
+
+**One thing guarded children broke, which the coverage gate found.** A child that
+starts coverage under `COVERAGE_PROCESS_START` measures the shim as well, and the
+report then refuses to print a TOTAL over a file outside the checkout: the first
+run printed `No source for code: /tmp/handsoff-guard-*/sitecustomize.py` where the
+summary belongs. The scratch directory is omitted in `.coveragerc` now, with the
+reason next to the pattern, and a test pins the omission because it is invisible
+until the next gate run.
+
+**Teeth: 4 more tests in `tests/test_sandbox.py`** (16 in the class) — a real
+child, spawned the way the suite spawns them, is refused and leaves nothing
+behind, and it is asked WHICH TREE it is judging (a guard pointed at the parent
+directory would refuse the write the test watches for, and would also refuse the
+legitimate writes beside the checkout, so the answer is the assertion); the SAME
+child with the one variable removed and nothing else changed writes the file and
+cleans up, which is what makes the pair evidence rather than a hope — the shim's
+presence is not the guard, the suite asking for it is; the wiring itself, the
+first-on-the-path rule plus the no-second-copy rule; and the coverage omission
+above. **23/23 mutations caught, 0 missed, every restore sha256-verified** — the 16
+of the previous section, re-pointed, plus seven aimed at the travel and the
+omission: the variable never exported, the shim
+directory never on the path, the shim directory put LAST instead of first, the
+shim installing the guard for the wrong tree, the shim pointing at a module that
+is not the guard, and the shim arming itself when nothing asked it to. That last
+mutant is worth recording for what its first draft taught: `if _root:` → `if True:`
+with the root left as None was MISSED, because a `sitecustomize` that RAISES is
+swallowed by `site` with one line on stderr — the child ran on unguarded and the
+control passed. The mutant that bites is the decline a real one would choose
+(`or os.getcwd()`), and the control is what catches it.
+
+**Limits.** A bash child (`bash ci/gates.sh`, `git`, `install.sh` itself) is not a
+Python interpreter and cannot be reached by a `sitecustomize`; the `python3` a
+bash child starts does inherit the shim, which is where an installer run would be
+judged. The shim directory goes first on `PYTHONPATH`, which shadows a developer's
+own `sitecustomize` inside the suite's children — the price of the one hook that
+every child has. A child spawned with a hand-built environment rather than
+`sandbox_env()` does not carry the guard, which the wiring test pins at the
+constructor; the children that do that today are bash and git, not Python. And the
+shim's silent no-op when the guard module is missing at the root it was given is
+deliberate — a child that died at start-up would fail for a reason unrelated to
+what it was testing — with the module's presence pinned at the source instead.
