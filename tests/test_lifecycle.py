@@ -1871,18 +1871,33 @@ class TestRestartResilience:
         assert 'ship_top "$rel" || continue' in gen, (
             "the manifest must use the same membership rule as staging")
 
-    def test_the_no_git_fallback_ships_only_the_declared_set(self):
-        """The git rule fixed `test.py` LEAVING a checkout — but the fallback
-        used when there is no git tree returned 0 for every path, so a tarball
-        built from the working directory (not from `git archive`, which carries
-        no untracked file) still shipped the scratch and hashed it into the
-        manifest. The incident came back through the other door.
+    # The files the rule has an opinion about, and what they are for: three
+    # declared entry points, two scratch files nobody should ship, and one module
+    # that is NOT declared but can still be TRACKED — the case that proves git is
+    # how a new module ships without editing the declared set.
+    SHIP_PROBES = ("handsoff.py", "handsoff-settings.py", "core/tools.py",
+                   "test.py", "scratch_probe.py", "core/zz_future.py")
+    SHIP_DECLARED = ("handsoff.py", "handsoff-settings.py", "core/tools.py")
 
-        With no git there is no ownership signal at all, so the fallback is the
-        DECLARED set — the same floor the stage already validates — rather than
-        `whatever the glob finds`. This runs the REAL `ship_file` out of
-        install.sh (extracted, not re-implemented) against both variable sets,
-        so it pins the behaviour and not the text.
+    def test_ship_file_ships_the_declared_set_and_the_tracked_list(self, tmp_path):
+        """Both branches of the installer's membership rule, in its own repo.
+
+        The git rule fixed `test.py` LEAVING a checkout — but the fallback used
+        when there is no git tree returned 0 for every path, so a tarball built
+        from the working directory (not from `git archive`, which carries no
+        untracked file) still shipped the scratch and hashed it into the
+        manifest. The incident came back through the other door, so: with no git
+        there is no ownership signal at all, and the fallback is the DECLARED set
+        rather than `whatever the glob finds`.
+
+        This runs the REAL `ship_file` out of install.sh (extracted, not
+        re-implemented) against all three states of `TRACKED_PY`, so it pins the
+        behaviour and not the text. The repository it runs in is its OWN, built
+        here: the property belongs to the rule, not to the developer's checkout,
+        and a tree with no `.git` at all (which is how the suite runs under the
+        pre-commit hook's staged copy) has no tracked list to consult — the
+        earlier version of this test died there on `set -e`, which made the whole
+        suite unrunnable in a file-only copy and hid this half of the rule.
         """
         text = (HERE / "install.sh").read_text()
 
@@ -1903,37 +1918,66 @@ class TestRestartResilience:
             'for m in $CORE_REQUIRED; do\n'
             '    DECLARED_PY="$DECLARED_PY core/$m.py"\n'
             'done\n')
-        # both branches of the rule, the declared set always winning
+        # Every probe reported by name, so an assertion can be about WHICH file
+        # took which branch instead of how many colons came back.
         body = (
-            'ship_file handsoff.py\n'
-            'ship_file handsoff-settings.py\n'
-            'ship_file core/tools.py\n'
-            'printf ":%s:" "$(ship_file test.py && echo SHIPPED || echo kept)"\n'
-            'printf ":%s:" "$(ship_file scratch_probe.py && echo SHIPPED || echo kept)"\n'
-            'printf ":%s:" "$(ship_file core/zz_future.py && echo SHIPPED || echo kept)"\n')
+            'for rel in ' + " ".join(self.SHIP_PROBES) + '; do\n'
+            '    if ship_file "$rel"; then verdict=ship; else verdict=keep; fi\n'
+            '    printf \'%s=%s\\n\' "$rel" "$verdict"\n'
+            'done\n')
+        root = tmp_path / "ship"
+        (root / "core").mkdir(parents=True)
+        for rel in self.SHIP_PROBES:
+            (root / rel).write_text("# probe\n", encoding="utf-8")
+        env = sandbox_env()
+        assert subprocess.run(["git", "-C", str(root), "init", "-q"],
+                              capture_output=True, text=True,
+                              env=env).returncode == 0
+        assert subprocess.run(["git", "-C", str(root), "add",
+                               *self.SHIP_DECLARED], capture_output=True,
+                              text=True, env=env).returncode == 0
 
-        # sandbox_env, not a bare launch: this child is bash, but the rule the
-        # suite enforces is that NO child inherits the developer's HOME/XDG,
-        # whatever it runs — and the guard in test_sandbox.py cannot tell a
-        # shell probe from an app load from the argv alone (these strings name
-        # `handsoff.py`, which is one of its markers).
-        no_git = subprocess.run(
-            ["bash", "-c", prelude + fn + '\nTRACKED_PY=""\n' + body],
-            cwd=HERE, capture_output=True, text=True, env=sandbox_env())
-        assert no_git.returncode == 0, no_git.stdout + no_git.stderr
-        assert no_git.stdout.count(":kept:") == 3, (
-            "a no-git tree must ship ONLY the declared set: " + no_git.stdout)
+        def verdicts(tracked: str) -> dict:
+            # sandbox_env, not a bare launch: this child is bash, but the rule
+            # the suite enforces is that NO child inherits the developer's
+            # HOME/XDG, whatever it runs — and the guard in test_sandbox.py
+            # cannot tell a shell probe from an app load from the argv alone
+            # (these strings name `handsoff.py`, one of its markers).
+            proc = subprocess.run(
+                ["bash", "-c", prelude + fn + f'\nTRACKED_PY="{tracked}"\n'
+                 + body],
+                cwd=root, capture_output=True, text=True, env=env)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            return dict(line.split("=", 1) for line in proc.stdout.splitlines())
 
-        # ...and in a git work tree the tracked list is what adds files
-        git_side = subprocess.run(
-            ["bash", "-c",
-             prelude + fn + '\nTRACKED_PY="$(git -C . ls-files -- \'*.py\')"\n'
-             + body],
-            cwd=HERE, capture_output=True, text=True, env=sandbox_env())
-        assert git_side.returncode == 0, git_side.stdout + git_side.stderr
-        assert git_side.stdout.count(":SHIPPED:") == 0, (
-            "the untracked scratch must not ship even where git exists: "
-            + git_side.stdout)
+        # 1. No git: the declared set is the whole answer.
+        nothing = verdicts("")
+        assert set(nothing) == set(self.SHIP_PROBES), nothing
+        assert [k for k, v in nothing.items() if v == "ship"] == \
+            list(self.SHIP_DECLARED), (
+                "a no-git tree must ship ONLY the declared set: " + str(nothing))
+
+        # 2. A tracked list that holds the declared files only: the scratch stays
+        #    home, whatever the glob would have found.
+        listed = verdicts('$(git -C . ls-files -- "*.py")')
+        assert [k for k, v in listed.items() if v == "ship"] == \
+            list(self.SHIP_DECLARED), (
+                "the untracked scratch must not ship even where git exists: "
+                + str(listed))
+
+        # 3. And the point of consulting git at all: a module that is tracked but
+        #    NOT declared ships, which is how a new file joins the deployment
+        #    without anyone editing install.sh.
+        assert subprocess.run(["git", "-C", str(root), "add", "core/zz_future.py"],
+                              capture_output=True, text=True,
+                              env=env).returncode == 0
+        grown = verdicts('$(git -C . ls-files -- "*.py")')
+        assert grown["core/zz_future.py"] == "ship", (
+            "a tracked module outside the declared set is exactly what the "
+            "tracked half of the rule is for: " + str(grown))
+        assert grown["test.py"] == "keep" and grown["scratch_probe.py"] == "keep", (
+            "and tracking the new module does not drag the scratch in: "
+            + str(grown))
 
     def test_no_untracked_scratch_sits_in_a_shipped_directory(self):
         """Excluding a scratch file is not the same as it not being there.

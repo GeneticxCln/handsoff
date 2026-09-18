@@ -198,13 +198,20 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    guard inside the staged tree — seconds, and no `.git` required. It refuses,
    rather than falling back to the working tree, when it cannot make the scratch
    directory; it removes it through a trap on every path, the refusal included;
-   and the refusal says why the developer cannot see the problem themselves,
-   which is that the working tree holds both halves of the change. The full suite
-   still runs against the WORKING tree, and the hook now says why rather than
-   leaving it to look like an oversight: a file-only copy has no `.git`, parts of
-   the suite legitimately read this repository, and a hook that refuses honest
-   commits is worse than one that misses — the file-shaped question is the
-   guard's job now.
+   and the refusal says why the developer   cannot see the problem themselves, which is that the working tree holds both
+   halves of the change. **The full suite runs against the staged tree too, as of
+   the same day:** the earlier version kept it in the working tree on the
+   assumption that a file-only copy needs a `.git`, and that assumption was wrong
+   — measured, the whole suite passes in a tree with no repository at all, and
+   exactly two checks skip there, both of them ABOUT the working checkout
+   (untracked scratch in a shipped directory, the installer's no-git fallback).
+   One test had to be fixed to make that true rather than assumed: the
+   installer's membership-rule test ran its git half against the developer's
+   checkout, so in a copy it died on `set -e` where `git ls-files` failed — it now
+   builds its own repository in `tmp_path` and, in doing so, gained the assertion
+   it was missing (a TRACKED module outside the declared set must ship, which is
+   the point of consulting git at all), and one test asserting the tracked-list
+   rule no longer needs a git work tree beside it.
 
 ## core/lifecycle.py seam exists but has no production caller — CLOSED (2026-09-17)
 

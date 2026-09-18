@@ -40,6 +40,23 @@ HOOK = HERE / "githooks" / "pre-commit"
 # hook materialises rather than a real module the generator would have to price.
 PLAN = "PLAN.md"
 INDEX = "INDEX.txt"
+# A code file and a test whose subject is its VALUE, so the behaviour half of the
+# rule has something to fail on: staged old value, working copy new value.
+FLAG_ON = "flag = True\n"
+BEHAVIOUR = '''"""A stand-in for a behaviour test: the flag has to be on in the COMMIT.
+
+Its subject is a value in a code file rather than a name in a plan, so it fails
+for a commit that stages the old value while the working copy holds the new one —
+the shape a suite run in the working tree could never see.
+"""
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+
+
+def test_the_flag_is_on():
+    assert "flag = True" in (HERE / "app.py").read_text(encoding="utf-8")
+'''
 
 STUB = '''"""A stand-in for the freshness guard: the plan must name every entry.
 
@@ -93,6 +110,8 @@ def repo(tmp_path: Path) -> Path:
     (root / "githooks").mkdir()
     shutil.copy2(HOOK, root / "githooks" / "pre-commit")
     _write(root, "tests/test_specs_freshness.py", STUB)
+    _write(root, "tests/test_behaviour.py", BEHAVIOUR)
+    _write(root, "app.py", FLAG_ON)
     _write(root, INDEX, "alpha\n")
     _write(root, PLAN, "# plan\n- alpha\n")
     env = _env()
@@ -155,16 +174,30 @@ class TestTheHookReadsTheStagedTree:
             "about files, and it is the whole point of materialising the index")
         assert "fail=1" in leg, "and its failure refuses the commit"
 
-    def test_the_full_suite_still_runs_against_the_working_tree(self, hook_source):
-        """Stated as a limit rather than left to look like an oversight."""
+    def test_the_full_suite_also_runs_against_the_staged_tree(self, hook_source):
+        """The behaviour half of the same question, and the same subject.
+
+        This leg used to run in the working tree, on the assumption that a
+        file-only copy needs a `.git`. Measured: it does not — the whole suite
+        passes in a tree with no repository, and only two checks skip, both of
+        them ABOUT the working checkout. So the suite is asked about the commit
+        too, which is the difference between judging a partial stage and judging
+        everything except its behaviour.
+        """
         suite = hook_source[hook_source.index("# 4. The full suite"):]
-        command = [l for l in suite.splitlines()
-                   if "pytest tests/ -q" in l and "specs_freshness" not in l]
-        assert command, "the suite leg is gone"
-        assert "$staged" not in command[0], (
-            "a file-only copy has no `.git` and parts of the suite read this "
-            "repository, so the suite stays on the working tree — the guard leg "
-            "is what asks the file-shaped question of the commit")
+        commands = [l for l in suite.splitlines() if "pytest tests/ -q" in l]
+        assert len(commands) == 1, (
+            f"one suite invocation and no second one: a leg in the working tree "
+            f"as well would double the hook's cost for a question already "
+            f"asked: {commands}")
+        assert 'cd "$staged"' in commands[0], (
+            "the suite has to run in the staged tree, or a partially staged "
+            "behaviour change is judged by the checkout that holds both halves")
+        assert 'if [ "$fail" -eq 0 ]' in suite, (
+            "and it is not run when a cheap leg already failed: the suite "
+            "contains the spec guard, so its verdict is known, and four minutes "
+            "is a long time to wait for a refusal the fast legs printed in "
+            "seconds")
 
 
 class TestTheStagedTreeDecides:
@@ -189,6 +222,29 @@ class TestTheStagedTreeDecides:
             f"and the refusal has to name the staged tree as the subject:\n{said}")
         assert "the working tree holds both halves" in said, (
             "and say why the developer cannot see it for themselves")
+        assert "running the test suite" not in said, (
+            f"and that refusal cost no suite run: the guard is inside the suite, "
+            f"so its verdict was already known:\n{said}")
+
+    def test_a_partial_stage_of_behaviour_is_refused(self, repo):
+        """The half the working-tree suite could never see.
+
+        `app.py` is staged with the flag OFF and the working copy has it ON, so
+        the behaviour test passes in the checkout and fails in the commit. Under
+        the old hook — the suite run in the working tree — this commit was
+        accepted, and the difference is the whole reason the suite leg moved.
+        """
+        env = _env()
+        _write(repo, "app.py", "flag = False\n")
+        assert _git(repo, "add", "app.py", env=env).returncode == 0
+        _write(repo, "app.py", FLAG_ON)          # the working copy only
+        out = _git(repo, "commit", "-q", "-m", "staged behaviour", env=env)
+        said = out.stdout + out.stderr
+        assert out.returncode != 0, (
+            f"the commit holds the failing value:\n{said}")
+        assert "test_behaviour" in said, (
+            f"and the refusal has to be the behaviour test the COMMIT fails, not "
+            f"one the checkout passes:\n{said}")
 
     def test_staging_both_halves_is_committable(self, repo):
         env = _env()

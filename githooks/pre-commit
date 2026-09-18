@@ -76,21 +76,29 @@ if [ -f "$staged/tests/test_specs_freshness.py" ]; then
     fi
 fi
 
-# 4. The full suite whenever shipped sources changed — against the WORKING tree.
+# 4. The full suite whenever shipped sources changed — also against the STAGED
+# tree, which is the behaviour half of the same question. This used to run in the
+# working tree, for one reason: a file-only copy was assumed to need a `.git`.
+# It does not — measured, the whole suite passes in a tree with no repository at
+# all, and the only two checks that skip are the two that are ABOUT the working
+# checkout (an untracked scratch file in a shipped directory, and the installer's
+# fallback when there is no git tree). They still run whenever the suite is run
+# directly, which the gates do. The copy is also where the run's artifacts land,
+# so the developer's tree is left exactly as it was found.
+#
 # Deliberately broad: handsoff.py is both app and self-edit target, and the suite
 # pins prompt text, tool census, and restart-script internals — narrow filters
-# miss rot. Measured, not guessed: the suite is ~2.5 min (this line used to say
+# miss rot. Measured, not guessed: the suite is ~4 min (this line used to say
 # ~10s, and the discrepancy is what makes a commit look HUNG — a 60s tool timeout
 # kills a commit that is running the gate it is supposed to run). Either wait for
 # it, or bypass deliberately with --no-verify and know what you skipped.
 #
-# The working tree and NOT the staged copy, on purpose, and it is a stated limit:
-# a file-only copy has no `.git`, and parts of the suite legitimately read this
-# repository. A hook that refuses honest commits is worse than one that misses,
-# and the file-shaped question is already asked of the staged tree in step 3.
-if echo "$changed" | grep -qE '\.(py|sh)$|^install\.sh$|^handsoff-restart$|^pytest\.ini$|\.github/|\.gitlab-ci\.yml$'; then
-    echo "pre-commit: running the test suite (~2.5 min)…"
-    python3 -m pytest tests/ -q || fail=1
+# SKIPPED when a leg above already failed: the suite CONTAINS the spec guard, so
+# its verdict is already known in that case, and four minutes is a long time to
+# wait to be told what the fast legs said in seconds.
+if [ "$fail" -eq 0 ] && echo "$changed" | grep -qE '\.(py|sh)$|^install\.sh$|^handsoff-restart$|^pytest\.ini$|\.github/|\.gitlab-ci\.yml$'; then
+    echo "pre-commit: running the test suite against the staged tree (~4 min)…"
+    (cd "$staged" && python3 -m pytest tests/ -q) || fail=1
 fi
 
 if [ "$fail" -ne 0 ]; then

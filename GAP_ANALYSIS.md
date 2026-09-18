@@ -6992,3 +6992,66 @@ that has already left the machine. And `--no-verify` remains the documented
 escape, which is why the ledger records the check rather than assuming it ran.
 `githooks/` is named nowhere in `install.sh`, so the deployment is untouched by
 all of this.
+
+## The whole suite runs against the commit too (2026-09-18)
+
+**The limit the hook wrote down for itself, measured instead of assumed.** Step 4
+kept the suite on the WORKING tree with the reason "a file-only copy has no
+`.git`, and parts of the suite read this repository". Measured: materialise the
+index into a directory with no repository at all and run the whole suite there —
+**1 failed, 1780 passed, 2 skipped**. One failure, and it was the assumption
+itself: `tests/test_lifecycle.py`'s installer membership-rule test ran its git
+half as `TRACKED_PY="$(git -C . ls-files -- '*.py')"` inside the DEVELOPER's
+checkout, so where there is no repository `git ls-files` failed and `set -e`
+killed the shell — the whole suite was unrunnable in a copy because one test
+wanted the checkout beside it.
+
+**The fix is a property, not a skip.** That test now builds its OWN repository in
+`tmp_path` (three declared entry points, two scratch files, one module that is
+untracked at first) and runs the real `ship_file` extracted from `install.sh`
+against all three states of `TRACKED_PY` — no git, a tracked list holding the
+declared set only, and tracked-plus-a-new-module. It reports every probe by name, so
+an assertion is about WHICH file took which branch instead of how many colons
+came back, and it gained the case it never had: a TRACKED module outside the
+declared set must SHIP, which is the entire reason the rule consults git. The two
+skips that remain are honest and both ABOUT the working checkout (untracked
+scratch in a shipped directory; the installer's fallback when there is no git
+tree) — they still run whenever the suite is run directly, which the gates do.
+
+**So the hook's suite leg moved into the staged tree**, which is the behaviour
+half of the question the file-shaped legs already ask: a partially staged
+behaviour change used to be judged by the checkout that holds both halves. The
+copy is also where the run's artifacts land, so a hook run leaves the developer's
+tree exactly as it found it. And a cheap leg that already failed now SKIPS the
+suite — the suite contains the spec guard, so in that case its verdict is already
+known, and four minutes is a long time to wait for a refusal the fast legs
+printed in seconds.
+
+**Guards and the sweep.** 12 guards in `tests/test_precommit_staged.py` (6 wiring,
+6 end-to-end), the new one being the behavioural shape: `app.py` staged with a
+flag OFF while the working copy holds it ON, so the behaviour test passes in the
+checkout and fails in the commit — accepted by the old hook, refused by this one.
+**16/16 mutations caught, 2/2 probes green, 0 misses**, every restore sha256- and
+mode-verified, the four new mutants being the suite leg back in the working tree,
+the suite running twice (once per tree), the staged suite's failure not refusing,
+and the fail-fast gate removed and inverted. The lifecycle test's own fix was
+mutated too: pointing its probe run at the developer's checkout instead of the
+repository it builds fails the tracked-module assertion.
+
+**The claim, verified rather than asserted.** The suite in a file-only copy was
+re-measured on the FINISHED tree, in a copy with no `.git` anywhere in it:
+**1 782 passed, 2 skipped in 250 s**, and the two skips are the working-checkout
+checks named above. The repository run passes 1 784, which is exactly those two
+plus these. That is the number the hook's step 4 now depends on.
+
+**Green on the final bytes**, each invocation stamped and ending in the tree
+verdict: `tests` PASS 247 s (**1 784 passed**), `coverage` PASS 251 s
+(**84.60%** ≥ 70, 2 581 missing of 16 754 statements), `order` PASS 497 s in BOTH
+orderings, `compile` / `shell` / `smoke` PASS, `clean-checkout` PASS 4 s,
+`two-writer` PASS, `all gates passed`, exit 0.
+
+**Limits, stated.** Two checks cannot run in a file-only copy and skip there,
+as above; they are reported as skips rather than hidden. The suite in the staged
+tree is the same suite, so it costs the same four minutes — the hook's total is
+unchanged. And the hook still only gates commits where `core.hooksPath` points at
+`githooks`.

@@ -39,7 +39,7 @@ nothing — a missing row does.
 | `test_notify_coalesce.py` | 15 | notification batching/cooldown |
 | `test_hardware_watch.py` | 13 | hardware watch tick, disk/VRAM alerts |
 | `test_idle_release.py` | 23 | the idle release: the drop and its locks, the quiet-window policy, re-arm vs one-per-spell |
-| `test_precommit_staged.py` | 11 | the pre-commit hook judging the STAGED tree: the index written out once, every file check reading it, a refusal instead of a fall back to the working tree, the cleanup on every path, and the three end-to-end shapes (a partial stage refused, both halves committable, the working tree NOT deciding) |
+| `test_precommit_staged.py` | 12 | the pre-commit hook judging the STAGED tree: the index written out once, every file check reading it, the spec guard AND the full suite run inside it (skipped when a cheap leg already failed), a refusal instead of a fall back to the working tree, the cleanup on every path, and the four end-to-end shapes (a partial stage refused, a partially staged BEHAVIOUR refused, both halves committable, the working tree NOT deciding) |
 | `test_p0_fixes.py` | 6 | named P0 regressions |
 | `test_specs_freshness.py` | 19 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |
 | `test_settings_gui.py` | 1 (+ offscreen subprocess drivers) | Qt GUI incl. 10-design ink guard |
@@ -119,10 +119,17 @@ nothing — a missing row does.
   removed on both exits.
 - `pytest.ini`: `PytestUnhandledThreadExceptionWarning` is an ERROR —
   a worker thread raising fails the build.
-- pre-commit (`githooks/`, opt-in via `core.hooksPath`): staged
-  `py_compile` + shebang `bash -n` + FULL suite (minutes — no duration is
-  copied here, because a copied one rots) when shipped sources/workflows
-  change; bypass only via `--no-verify`, deliberately.
+- pre-commit (`githooks/`, opt-in via `core.hooksPath`): the index is written
+  out once (`git checkout-index -a` into a scratch directory) and every check
+  reads THAT — staged `py_compile`, staged shebang `bash -n`, the spec guard in
+  the staged tree, and the FULL suite in the staged tree too (minutes — no
+  duration is copied here, because a copied one rots), so a partially staged
+  behaviour change is refused rather than judged by the checkout that holds both
+  halves. The suite leg is skipped when a cheaper leg already failed, since the
+  suite contains the spec guard. Two checks skip in a file-only copy, both of
+  them ABOUT the working checkout (untracked scratch in a shipped directory, the
+  installer's no-git fallback) and both still run whenever the suite is run
+  directly. Bypass only via `--no-verify`, deliberately.
 - GitLab: same gates + pip cache on the lock file, junit report, and
   `after_script` digest (`ci/pytest_summary.py --post`) that prints failing
   names + env-fix hints even when the job dies.
