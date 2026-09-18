@@ -187,6 +187,13 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    ignored paths must stay outside it), a real content change is still reported
    ONCE — as content — and a snapshot from before the field existed judges content
    exactly as well, only without the restored rows.
+6. The clean-checkout gate (see the section below) asks about HEAD, so it tells a
+   developer AFTER the commit exists. The class it found in the history — a
+   PARTIAL STAGE, where the working tree is self-consistent and the commit is not
+   — is invisible to every check run against the working tree, the pre-commit
+   hook included, which is exactly why that pair of commits landed. Next: have
+   the hook judge the STAGED tree (a checkout of the index) rather than the
+   working tree — the same device the gate already uses, one step earlier.
 
 ## core/lifecycle.py seam exists but has no production caller — CLOSED (2026-09-17)
 
@@ -302,3 +309,60 @@ about — the plan's file list, the key census, the citations — not "a clean
 checkout passes everything", which is a whole suite per run and is CI's job; and
 it judges HEAD, so a commit that agrees with itself while being wrong about the
 code is not its business.
+
+## The spec set's first two commits a clone refuses — and why the hook was green (2026-09-18)
+
+**What was asked.** That gate answers a question about ONE commit — would a fresh
+checkout of it pass its own freshness guard? — so the next question is the commits
+already on `main`. Each one was laid down in a scratch worktree of itself and the
+gate run there, carrying over only `ci/gates.sh`: the gate is the instrument, and
+everything it measures has to be the commit's own. **One correction, found by
+running it:** copying today's whole `ci/` into an old tree also carries today's
+spec GENERATOR into it, and the guard then compares that commit's generated tables
+against a generator they were never written for. Two of `baf58c5`'s five failures
+in the first run were that artifact, not drift, and the figures here are from the
+run where only the gate travels.
+
+**What is judgeable.** `main` holds ninety-seven commits and ELEVEN of them carry
+the freshness guard, which arrived with the spec set (`3ebcd64`, 2026-09-16). All
+eleven were judged, and the other eighty-six predate it and come back SKIP — not
+"consistent", merely unaskable by this gate, which is also most of the project's
+history. The verdicts are nine PASS and two FAIL.
+
+**The two refusals are the pair from 2026-09-18, four minutes apart, and they are
+one shape.** `bd9cf5a` fails three guards: the key census (the audit stated a count
+five higher than the committed schema, because those keys lived only in the
+working tree), the test plan (it named two test files the commit does not
+contain), and the size-in-prose guard (a DATED heading naming `core/lifecycle.py`
+was read as a line count — the date-stripping fix was not in yet). `baf58c5` fails
+five: the same census, the plan naming one absent test file, the same dated
+heading, and the generated architecture table, which prices `core/bubble.py` three
+lines short of the file that very commit contains — reported twice, once as the
+table mismatch and once as the generator refusing to exit zero.
+
+**Why the pre-commit hook was green, which is the finding rather than the trivia.**
+`baf58c5` staged `core/bubble.py` and its new test file — and NOT the regenerated
+architecture table, which was sitting in the working tree. The hook runs the suite
+against the WORKING TREE, where table and file agreed, so it passed and the commit
+went through; four minutes later the next commit swept the regenerated table in,
+and there the row agrees. `bd9cf5a` is the same shape one step worse: the plan
+counted keys and test files that the working tree held and the commit did not. **A
+partial stage therefore ships a commit whose own spec disagrees with its own code,
+and every check the project had — the hook included — reads the working tree.**
+That is precisely the gap the clean-checkout gate closes, and it is why the class
+turned up in history exactly once, in the two commits made while a large amount of
+neighbouring work sat uncommitted beside them.
+
+**Fixed forward.** Every commit after the pair PASSes, current `main` included, so
+nothing on the branch is broken now; the refusals are historical facts about those
+two revisions, visible only by checking them out. The class is now refused at
+make-time by the gate, and item 6 of the follow-ups above is the half that is
+still missing: the hook tests the working tree, so the write-time check the gate
+performs could still be defeated by the same partial stage.
+
+**Limits.** The verdict is the gate's: self-consistency of the plan, the census,
+the citations and the generated tables, never correctness of the code — a PASS is
+"a clone would not refuse it", not "it is right". Eighty-six commits cannot be
+asked at all, and the earliest of them predate the spec set entirely. The sweep
+ran against this checkout's `main`, which was level with the remote at the time,
+so it judged the published head and not some local variant of it.

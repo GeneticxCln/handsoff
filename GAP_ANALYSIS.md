@@ -6851,3 +6851,72 @@ OLDER commit as itself: the `bd9cf5a` proof works by copying the current
 `ci/gates.sh` into a scratch worktree of that commit, because a checkout that
 predates the gate cannot run it — so the history before this gate is unjudged by
 it, and only future commits are covered by default.
+
+## What the gate says about the commits already on main (2026-09-18)
+
+**Asked, not assumed.** Every commit was laid down in a scratch worktree of
+itself and the gate run there, carrying over ONLY `ci/gates.sh` — the gate is the
+measuring instrument, and everything it measures has to be the commit's own.
+**One correction, found by running it:** the first sweep copied today's whole
+`ci/` in, which carries today's spec GENERATOR into an old tree, and the guard
+then compares that commit's tables against a generator they were never written
+for. Two of `baf58c5`'s five failures in that run were the artifact; the figures
+here are from the run where only the gate travels.
+
+**Coverage.** `main` is 97 commits. Exactly **11** carry the freshness guard (it
+arrived with the spec set at `3ebcd64`, 2026-09-16, "Put the spec set in git, and
+make the counts it states a checked claim"), and all 11 were judged. The other
+**86** return SKIP — they predate the guard, so it has nothing to run there: not
+"consistent", merely unaskable. **Verdicts: 9 PASS, 2 FAIL, 0 unreadable.**
+(Both PASS counts and the SKIP boundary were read back from git rather than from
+the sweep's own log: `git rev-list --count main` = 97, and 11 commits contain
+tests/test_specs_freshness.py, the oldest being `3ebcd64`.)
+
+**The two refusals are a pair, four minutes apart on 2026-09-18, and they are one
+shape.**
+
+- `bd9cf5a` (11:00) — **3 guards.** `test_the_settings_key_census_matches_every_place_a_spec_states_it`:
+  `90-audit.md says 64 settings_keys — the code has 59. The spec is wrong`. The
+  five are the idle-release keys, which existed in the working tree and landed in
+  `5ae49f1` nineteen minutes later (its schema mentions them 21 times against 11
+  there). `test_the_test_plan_lists_every_test_file`: `the test plan names
+  tests/['test_bubble_anim.py', 'test_idle_release.py'], which is gone`.
+  `test_no_spec_restates_a_module_size_outside_the_tables`: `90-audit.md:191
+  restates ['core/lifecycle.py'] beside a number — '## core/lifecycle.py seam
+  exists but has no production caller — CLOSED'` — a DATE read as a line count,
+  because the date-stripping fix was itself uncommitted at that revision. Its
+  commit held `ci/gates.sh`, `ci/worktree_stamp.py`, `tests/test_ci_two_writer.py`,
+  the specs and the ledger (4 894 insertions) and none of the files its own plan
+  counts.
+- `baf58c5` (11:15) — **5 guards.** The same census; the plan naming one absent
+  file; the same dated heading; and the generated table:
+  `specs/20-architecture.md` prices `core/bubble.py` at 4069 while that commit's
+  own file is 4072, reported once as
+  `the spec's generated tables are not what the tree says: 20-architecture.md
+  (architecture module table)` and once as `ci/spec_tables.py exited 1`.
+
+**Why the pre-commit hook was green — the finding rather than the trivia.**
+`baf58c5` staged `core/bubble.py` (+5/−1) and `tests/test_bubble_anim.py`, and NOT
+`specs/20-architecture.md`, whose regenerated 4072 row was sitting in the working
+tree. The hook runs the suite against the WORKING TREE, where table and file
+agreed, so it passed and the commit went through; four minutes later `5ae49f1`
+swept the regenerated spec in, and there the row reads 4072. `bd9cf5a` is the same
+shape: its plan counted keys and test files the working tree had and the commit
+did not. **A partial stage therefore ships a commit whose own spec disagrees with
+its own code, and every check the project had — the hook included — reads the
+working tree.** That is the gap the clean-checkout gate closes, and it is why the
+class appears in history exactly once: in the two commits made while a large
+amount of neighbouring work sat uncommitted beside them.
+
+**Fixed forward.** Every commit after the pair PASSes, current `main` (`d0f7e87`)
+included, so nothing on the branch is broken now; the refusals are historical
+facts about those two revisions, visible only by checking them out.
+
+**Stated limits.** The verdict is the gate's — self-consistency of the plan, the
+census, the citations and the generated tables, never correctness of the code —
+so a PASS is "a clone would not refuse it", not "it is right". The 86 unguarded
+commits cannot be asked at all by this gate, and they are most of the history.
+The sweep ran against this checkout's `main`, which was level with the remote at
+the time, so it judged the published head. And the write-time half is still open,
+recorded as follow-up 6 in `specs/90-audit.md`: the hook tests the working tree,
+so the same partial stage can still defeat it.
