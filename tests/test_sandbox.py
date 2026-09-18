@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import types
@@ -26,8 +27,9 @@ import pytest
 import core
 from core import APP_MODULE_NAME, app_instance, app_module, load_app_module
 
-from conftest import HERE as ROOT, _REAL_HOME, _load, _user_site, \
-    isolated_user_dirs, run_driver, sandbox_env
+from conftest import HERE as ROOT, _REAL_HOME, _checkout_write_target, _load, \
+    _user_site, isolated_user_dirs, run_driver, sandbox_env, \
+    writes_into_the_checkout
 
 HERE = ROOT
 
@@ -324,22 +326,24 @@ class TestInProcessLoadsAreSandboxed:
         _load("sandbox_env_probe", HERE / "hardware.py")
         assert {k: os.environ.get(k) for k in before} == before
 
-    def test_the_sandbox_is_restored_even_when_a_load_raises(self):
+    def test_the_sandbox_is_restored_even_when_a_load_raises(self, tmp_path):
         """A module that fails to import must not strand HOME.
 
         The failing load is the interesting case: if the restore only happened
         on the success path, every later test in the session would resolve the
         throw-away HOME (or the temp dir would leak into the environment).
+
+        The broken module is built in the test's own fixture: the loader takes a
+        path, so where the file lives changes nothing, while a module written
+        under `tests/` is a write into the shared checkout — and one that a
+        killed run leaves behind.
         """
         before = {k: os.environ.get(k) for k in
                   ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME")}
-        broken = HERE / "tests" / "_sandbox_boom.py"
+        broken = tmp_path / "_sandbox_boom.py"
         broken.write_text("raise RuntimeError('boom')\n")
-        try:
-            with pytest.raises(RuntimeError):
-                _load("sandbox_boom_probe", broken)
-        finally:
-            broken.unlink(missing_ok=True)
+        with pytest.raises(RuntimeError):
+            _load("sandbox_boom_probe", broken)
         assert {k: os.environ.get(k) for k in before} == before
         assert "sandbox_boom_probe" not in sys.modules
 
@@ -364,6 +368,180 @@ class TestInProcessLoadsAreSandboxed:
             assert "written by the suite" not in real_niri.read_text(
                 encoding="utf-8", errors="replace"), \
                 "a test wrote the developer's niri config"
+
+
+class TestNoTestWritesInTheCheckout:
+    """The suite may not write into the tree it is running against.
+
+    The sibling of the sandbox above, and it fails the same way: not as an error
+    at the time, but as a file in a SHARED checkout that nobody meant to leave
+    there. Two tests used to do it — one seeded `.venv` and skipped itself
+    whenever a real one existed (which is the machine where the pruning it tests
+    matters most), the other planted a scratch module beside `handsoff.py` and
+    removed it in a `finally`, so an interrupted run left behind exactly the
+    untracked file the suite's own lifecycle guard then failed on.
+
+    conftest installs the hook (see the guard beside the user-dir sandbox); these
+    tests are its teeth, because a guard that stopped refusing would otherwise be
+    indistinguishable from a suite that had nothing to refuse.
+    """
+
+    def test_a_write_into_the_checkout_is_refused_before_it_lands(self):
+        probe = ROOT / "zz_suite_write_probe.py"
+        with pytest.raises(AssertionError, match="wrote inside the checkout"):
+            probe.write_text("a test's file\n", encoding="utf-8")
+        assert not probe.exists(), (
+            "the refusal has to arrive BEFORE the write: a guard that reports "
+            "afterwards has already left the file in the checkout")
+
+    def test_removing_a_checkout_file_is_refused_too(self):
+        """Create-then-delete is the shape BOTH incidents had, and the one no
+        comparison of the tree before and after a test can see."""
+        doomed = ROOT / "conftest-probe-that-is-not-there"
+        with pytest.raises(AssertionError, match="wrote inside the checkout"):
+            doomed.unlink()      # the guard refuses before the FileNotFoundError
+
+    def test_making_a_directory_in_the_checkout_is_refused(self):
+        with pytest.raises(AssertionError, match="wrote inside the checkout"):
+            (ROOT / "zz_suite_probe_dir").mkdir()
+        assert not (ROOT / "zz_suite_probe_dir").exists()
+
+    def test_reading_the_checkout_is_not_a_write(self):
+        """The other half of the property: every guard in this suite READS the
+        tree, and a hook that refused those would fail the whole file."""
+        assert (ROOT / "pytest.ini").read_text(encoding="utf-8")
+        assert list((ROOT / "core").glob("*.py"))
+
+    def test_the_flags_decide_not_the_path(self):
+        """Pinned on the event, because a mutant that judges the path alone does
+        not fail HERE — it fails at COLLECTION, since pytest reads the test files
+        themselves, and a red for the wrong reason is not a guard."""
+        target = str(ROOT / "pytest.ini")
+        assert _checkout_write_target("open", (target, "r", os.O_RDONLY)) == ""
+        assert _checkout_write_target(
+            "open", (target, "w", os.O_WRONLY | os.O_CREAT | os.O_TRUNC)) == target
+        assert _checkout_write_target(
+            "open", (str(ROOT / "__pycache__" / "x.pyc"), "w",
+                     os.O_WRONLY | os.O_CREAT)) == ""
+
+    def test_a_dir_fd_relative_name_is_resolved_against_its_directory(self, tmp_path):
+        """`shutil.rmtree` unlinks by BARE NAME against a directory fd, so the
+        name on its own says nothing: resolved against the cwd it would judge a
+        fixture under /tmp as if it were inside the checkout, which is every test
+        that tidies up after itself."""
+        (tmp_path / "kept.txt").write_text("x", encoding="utf-8")
+        fd = os.open(tmp_path, os.O_RDONLY)
+        try:
+            assert _checkout_write_target("os.remove", ("kept.txt", fd)) == ""
+        finally:
+            os.close(fd)
+        # ...and the same bare name with no fd IS the checkout's own cwd, which a
+        # test has no business writing into.
+        assert _checkout_write_target("os.remove", ("kept.txt", -1)) == \
+            str(ROOT / "kept.txt")
+
+    def test_a_fixture_may_symlink_the_checkout_into_itself(self, tmp_path):
+        """A symlink stores its target as TEXT and never touches it, so a fixture
+        tree linking the app's modules in is not writing into the checkout —
+        judging the target refused every suite that builds such a tree."""
+        link = tmp_path / "core"
+        link.symlink_to(ROOT / "core")
+        assert link.is_symlink()
+        # ...and the same for a target that is not there YET, which a fixture may
+        # link before it creates it: judging the target would refuse this, and an
+        # existing target cannot show it, because a creation that can only fail
+        # is allowed anyway.
+        ghost = tmp_path / "ghost"
+        ghost.symlink_to(ROOT / "core" / "not_there_yet.py")
+        assert ghost.is_symlink() and not ghost.exists()
+
+    def test_a_link_created_inside_the_checkout_is_refused(self, tmp_path):
+        with pytest.raises(AssertionError, match="wrote inside the checkout"):
+            (ROOT / "zz_suite_probe_link").symlink_to(tmp_path)
+        assert not (ROOT / "zz_suite_probe_link").is_symlink()
+
+    def test_a_creation_that_cannot_succeed_is_not_a_write(self):
+        """`os.makedirs(exist_ok=True)` — how pytest makes sure the junit report's
+        directory is there — reaches `os.mkdir` on a directory that already
+        exists, where the call can only fail and nothing is written. Pinned on
+        the event, because getting this wrong does not fail a test: it stops the
+        suite from STARTING under `ci/gates.sh`, which is how it was found."""
+        existing = str(ROOT / "tests")
+        assert os.path.isdir(existing)
+        assert _checkout_write_target("os.mkdir", (existing, 0o777, -1)) == ""
+        fresh = str(ROOT / "zz_suite_probe_dir")
+        assert _checkout_write_target("os.mkdir", (fresh, 0o777, -1)) == fresh
+        # ...and removing something that IS there can succeed, so it is a write.
+        assert _checkout_write_target("os.rmdir", (existing, -1)) == existing
+
+    def test_the_predicate_judges_the_boundary_and_the_artifacts(self):
+        """The decision table, one row per way it could be wrong."""
+        table = [
+            # A path under the checkout is a write into it.
+            (ROOT / "handsoff.py", True),
+            (ROOT / "tests" / "test_sandbox.py", True),
+            (ROOT / "core" / "tools.py", True),
+            # A SIBLING whose name happens to start with the checkout's path is
+            # not inside it — the prefix trap the tools' include-walk had.
+            (Path(str(ROOT) + "-evil") / "x.py", False),
+            (Path("/tmp") / "x", False),
+            # Gitignored artifacts of RUNNING the suite (pytest, coverage).
+            (ROOT / "__pycache__" / "x.pyc", False),
+            (ROOT / "tests" / "__pycache__" / "x.pyc", False),
+            (ROOT / ".coverage", False),
+            (ROOT / ".coverage.host.1234.abcd", False),
+            (ROOT / ".pytest_cache" / "v" / "cache" / "lastfailed", False),
+            (ROOT / "tests" / "report.xml", False),
+            (ROOT / "tests" / "report.first-failure.xml", False),
+            # pytest builds `.pytest_cache` in this directory and renames it in.
+            (ROOT / "pytest-cache-files-abcd1234", False),
+            (ROOT / "pytest-cache-files-abcd1234" / "CACHEDIR.TAG", False),
+            # ...but only the exact names, and only at the root: anything else
+            # beside them is a test's own file.
+            (ROOT / ".coverage-backup", True),
+            (ROOT / "tests" / "report.py", True),
+            (ROOT / "tests" / "notes.xml", True),
+            (ROOT / "tests" / "pytest-cache-files-abcd1234", True),
+            (ROOT / "pytest-cache-files", True),
+        ]
+        for path, forbidden in table:
+            assert bool(writes_into_the_checkout(path)) is forbidden, (
+                f"{path}: expected {'refused' if forbidden else 'allowed'}")
+
+    def test_a_links_source_is_read_but_its_destination_is_written(self, tmp_path):
+        """The source/destination rule, pinned on the EVENTS rather than by doing
+        it: a hard link needs both names on one filesystem, and a fixture lives
+        under /tmp while the checkout does not — `os.link` then fails with EXDEV,
+        a red that has nothing to do with the guard. (Measured: it did exactly
+        that, which is why this test asserts on the decision instead.)"""
+        # The source is inside the checkout and NOT THERE: a path the decision
+        # must ignore whether or not it exists (a fixture may link a module it is
+        # about to create). Naming an existing one instead would hide a mutant
+        # that judged the source behind the rule for creations that cannot
+        # succeed — measured, that is exactly what happened.
+        source = str(ROOT / "zz_suite_probe_source")
+        destination = str(tmp_path / "pytest.ini")      # outside the checkout
+        absent = str(ROOT / "zz_suite_probe_link")      # inside it, and not there
+        for event in ("os.link", "os.symlink", "shutil.copyfile",
+                      "shutil.copystat", "shutil.copymode"):
+            assert _checkout_write_target(event, (source, destination, -1)) == "", (
+                f"{event} judged its SOURCE as a write")
+            assert _checkout_write_target(event, (destination, absent, -1)) == absent, (
+                f"{event} did not judge its destination as a write")
+
+    def test_a_fixture_the_test_built_may_be_written(self, tmp_path):
+        """The property is about WHERE, not about writing at all — a test's own
+        fixture is the fix this guard exists to force, so it must stay writable."""
+        target = tmp_path / "artifact.txt"
+        target.write_text("mine\n", encoding="utf-8")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "kept.txt").write_text("x", encoding="utf-8")
+        assert target.read_text(encoding="utf-8") == "mine\n"
+        target.unlink()
+        # ...and so must the CLEANUP paths: `shutil.rmtree` walks a tree with a
+        # directory fd and unlinks by BARE NAME, so a guard that resolved those
+        # names against the cwd would refuse every test that tidies its fixture.
+        shutil.rmtree(tmp_path / "sub")
 
 
 class TestChildProcessDriversUseTheSameSandbox:

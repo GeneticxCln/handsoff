@@ -242,6 +242,26 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    found is now remembered (`HAVE_GIT`) rather than inferred, and both refusal
    reasons are pinned, since the advice they carry is the part a user acts on.
 
+8. **DONE (2026-09-18):** the suite must not write inside the checkout it is
+   running against, and that is now checked where it happens rather than hoped
+   for — see the section at the end of this file. One site was known from the
+   pass before it and the GUARD found two more, which is the argument for a
+   property over a fix: each of the three was a test building its fixture in the
+   wrong place (a `.venv` seeded beside the source, which also forced the test to
+   skip itself on the very machines where the pruning it proves matters; a probe
+   module planted beside `handsoff.py`, whose interrupted run left behind exactly
+   the file the suite's OWN lifecycle guard then failed on; a module that raises
+   on import, written under `tests/` to prove a failed load cannot strand the
+   sandbox). All three build under `tmp_path` now, so a run can no longer leave
+   anything in the tree.
+9. A child process the suite spawns — a driver, an offscreen-GUI scenario,
+   `bash ci/gates.sh` — is outside the checkout-write guard, which is the suite's
+   own process. Inheriting it means a `sitecustomize.py` on the child's
+   PYTHONPATH, and `sandbox_env` is already the one constructor every child the
+   suite runs goes through, so the seam exists; no instance of the class has been
+   seen. Until then the lifecycle guards remain what catches a child's leftovers,
+   and only when they land in a shipped glob.
+
 ## core/lifecycle.py seam exists but has no production caller — CLOSED (2026-09-17)
 
 **Observation (then):** `core/lifecycle.py` exported `TurnState` and
@@ -414,3 +434,107 @@ the citations and the generated tables, never correctness of the code — a PASS
 asked at all, and the earliest of them predate the spec set entirely. The sweep
 ran against this checkout's `main`, which was level with the remote at the time,
 so it judged the published head and not some local variant of it.
+
+## The suite may not write into the checkout — CLOSED (2026-09-18)
+
+**What was asked.** Make it a checked property that no test writes inside the
+repository — fail the suite when a test's writes touch a path under the checkout
+instead of a fixture it built — and fix the site that does.
+
+**Why it cannot be a comparison of the tree before and after a test.** Both
+incidents this closes were CREATE-THEN-DELETE: a probe module planted beside
+`handsoff.py` and removed in a `finally`, and a `.venv` seeded beside the source
+and removed in one. A diff cannot see either — the file is gone by the time
+anything could look — and what an interrupted run leaves behind is exactly the
+file such a test would have removed, which is how one of them ended up failing
+its own neighbour's guard. So the rule is enforced AT THE WRITE: `tests/conftest.py`
+installs an audit hook that refuses, before the syscall runs, any write, create,
+rename, metadata change or removal whose target resolves inside the repository.
+Nothing lands, the message names the file, and the failure lands on the test that
+tried rather than on whichever neighbour later trips over the leftovers. Its own
+tests sit beside the sandbox that owns the other half of the same idea (the suite
+must not resolve the developer's real user directories), and the property's tests
+are what make the guard a checked claim — a guard that went quiet is
+indistinguishable from a suite with nothing to refuse.
+
+**Three sites had the habit, and two of them were found by the guard rather than
+by reading.** The known one seeded `.venv` inside the checkout to prove the shell
+gate prunes a vendored tree, and it had to skip itself whenever a real `.venv` was
+already there — the machine where that pruning matters most — while writing and
+removing a directory in the developer's tree to make its point. It copies the gate
+and the one shell file it must find into a tree of its own under `tmp_path` now:
+the gate reads the tree it STANDS IN, so a copy is the whole fixture, and the
+vendored directory is seeded there. The other two write a file and then take it
+away — a broken-syntax probe at the checkout root for the pre-commit hook's
+compile leg, and a module that raises on import written under `tests/` to prove a
+failed load cannot strand the sandbox. Both take a path, neither cares where the
+file lives, and both now live in the fixture.
+
+**What the suite found in the guard, in the order it found it.** The first draft
+judged a LINK'S SOURCE as a write, which refused every fixture that symlinks the
+app's modules into a scratch tree — the freshness guard builds exactly that, so
+the suite went red immediately, and the rule is the destination only (a symlink
+stores its target as text, and a hard link leaves the source's contents alone). A
+copy with no repository then refused pytest's own start-up, because `.pytest_cache`
+is built inside a `pytest-cache-files-*` directory that is renamed into place — its
+CONTENTS are written at the root first — so that directory is exempt alongside the
+cache it becomes. A bare name arriving against a directory fd is resolved against
+THAT directory, not the working one: `shutil.rmtree` walks a tree and unlinks by
+bare name, so reading those names the obvious way judged a fixture under /tmp as
+if it were inside the checkout and refused every test that tidies up after itself.
+And the gates found the third, because a gate is a second way of running the same
+suite: `ci/gates.sh` asks pytest for a junit report under `tests/`, pytest makes
+sure that directory exists — `os.makedirs(exist_ok=True)` reaches `os.mkdir` on a
+directory that IS there — and the hook refused a creation that could only have
+failed, so the `tests` gate went red on `tests` before a single test ran. The rule
+now says what the syscall would: a creation that cannot succeed writes nothing
+(`os.mkdir` and a link's destination when the path already exists), while removal,
+a write-open, a rename, a truncation and a metadata change are judged whether or
+not they could succeed.
+
+**Exempt, and why the list is short.** The tooling's gitignored output: bytecode
+caches, `.pytest_cache`, `.ruff_cache`, the coverage data file and its parallel
+shards, the junit reports the gates ask pytest for, and the cache-probe directory
+above. Those are written by pytest and coverage rather than by a test, and without
+them the suite would refuse its own machinery. Everything else under the root is a
+test's, spec set and root ledgers included.
+
+**Teeth.** Twelve tests in `tests/test_sandbox.py` — the refusal at the write, a
+removal, a directory creation, a read that must NOT be refused, the decision table
+(with the sibling-prefix trap, every exemption and the names that must stay
+refused), the flags rule, the directory-fd rule, the link source/destination rule,
+the rule for creations that cannot succeed, and a fixture that must stay writable
+including the `rmtree` that tidies it — and a sweep of 16 mutants with 16 caught,
+0 missed, every restore sha256-verified: the hook never installed, the refusal
+unreachable, only `open` judged, the boundary turned back into a string prefix,
+the allowlist swallowing everything, the cache-probe and coverage exemptions
+dropped, reads counted as writes, a link's target judged again, the directory-fd
+resolution dropped, the cannot-succeed rule dropped (the case the gates hit), the
+junit exemption widened to any `.xml` under `tests/`, and the three repaired sites
+put back the way they were. Three mutants earned their keep by failing for the
+WRONG reason first, which is the sweep doing its job on the tests rather than on
+the guard: the hard-link row began as a real `os.link` from the checkout into
+`tmp_path`, where the kernel's `Invalid cross-device link` is a red that says
+nothing about the guard; the `.venv` mutant first reused the checkout root, so
+`shutil.copy2` raised `SameFileError` before the guard was consulted; and the
+symlink row named an EXISTING target, which the cannot-succeed rule then allowed —
+hiding a mutant that judged the source — so the pin names a path that is not there
+yet, which is also the honest case (a fixture links a module before creating it).
+
+**Measured.** The whole suite in a copy of the working tree with no `.git`
+anywhere: **1798 passed, 0 skipped in 245 s** (the 1786 the previous entry
+measured, plus these twelve). The checkout and gate figures are in the run entry
+in `GAP_ANALYSIS.md`. The guard costs nothing measurable: with it installed the
+copy runs in the same band (245–255 s) the suite measured before it existed, and
+the measurement has a control — a pytest plugin that makes `addaudithook` a no-op
+turns the four refusal tests red while the allowed ones stay green, which is what
+makes "these tests do the refusing" a claim rather than a hope.
+
+**Limits.** It covers the suite's process, not the children it spawns (item 9
+above). The `open` audit event carries no directory fd, so a write opened by bare
+name against such a descriptor would be judged against the working directory — a
+refusal rather than a missed write, and nothing in the suite opens a file for
+writing that way. The exemptions are judged by NAME, so a test that deliberately
+created `pytest-cache-files-…` at the root would be allowed to write there; that
+is the price of a prefix rather than a syscall-level fact, and it costs more to
+attempt than it gains.

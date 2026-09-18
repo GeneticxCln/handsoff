@@ -2216,18 +2216,22 @@ class TestPrecommitHook:
         assert "pytest" in text
         assert "--no-verify" in text   # documented escape hatch
 
-    def test_hook_blocked_commit_is_reproducible(self):
+    def test_hook_blocked_commit_is_reproducible(self, tmp_path):
         """Replay the refusal: run the hook's compile leg against a broken
-        file the way git would (staged, cwd = repo root)."""
-        import subprocess as sp
-        broken = HERE / "zz_hook_probe_broken.py"
+        file the way git would (a staged file, cwd = the tree being committed).
+
+        The file lives in the test's own fixture rather than at the checkout's
+        root: py_compile judges the SOURCE it is handed, so where that source
+        sits changes nothing — while a scratch module beside `handsoff.py` is
+        exactly the untracked file the suite's lifecycle guard fails on when a
+        run is interrupted. Written into the checkout, this test also had to
+        clean up after itself to leave the tree as it found it.
+        """
+        broken = tmp_path / "hook_probe_broken.py"
         broken.write_text("def broken(:\n    pass\n", encoding="utf-8")
-        try:
-            r = run_driver(["-m", "py_compile", str(broken)],
-                           capture_output=True)
-            assert r.returncode != 0, "py_compile must fail on broken syntax"
-        finally:
-            broken.unlink(missing_ok=True)
+        r = run_driver(["-m", "py_compile", str(broken)],
+                       capture_output=True)
+        assert r.returncode != 0, "py_compile must fail on broken syntax"
 
 
 class TestStagedRelease:

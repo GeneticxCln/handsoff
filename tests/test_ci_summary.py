@@ -516,23 +516,30 @@ class TestShellDiscovery:
             assert "'#!'*bash*|'#!'*'/sh'*) ;;" in self._text(rel), (
                 f"{rel} classifies shebangs differently from the others")
 
-    def test_the_gate_really_skips_a_pruned_tree_when_run(self):
+    def test_the_gate_really_skips_a_pruned_tree_when_run(self, tmp_path):
         """Behavioural, not textual: seed a vendored dir whose script WOULD be
-        found, run the gate, and require it to be ignored."""
-        venv = HERE / ".venv"
-        if venv.exists():
-            pytest.skip("a real .venv exists; refusing to write into it")
+        found, run the gate, and require it to be ignored.
+
+        In a tree of its own rather than in the checkout. Seeding `.venv` beside
+        the source meant this test wrote into the developer's tree, and that it
+        had to SKIP itself whenever a real `.venv` was already there — the one
+        machine where the pruning it tests matters most. What the gate reads is
+        the tree it stands in (its `find .` IS the discovery), so a copy of the
+        script plus the shell file it must find is the whole fixture.
+        """
+        tree = tmp_path / "gate-tree"
+        (tree / "ci").mkdir(parents=True)
+        shutil.copy2(HERE / "ci" / "gates.sh", tree / "ci" / "gates.sh")
+        shutil.copy2(HERE / "install.sh", tree / "install.sh")
+        venv = tree / ".venv"
         (venv / "bin").mkdir(parents=True)
         (venv / "bin" / "evil.sh").write_text("#!/usr/bin/env bash\n",
-                                             encoding="utf-8")
+                                              encoding="utf-8")
         # A newline-free blob, the file that made an unbounded first-line read
         # pull megabytes into a variable.
         (venv / "blob.bin").write_bytes(b"\x00\x01" * 40000)
-        try:
-            proc = subprocess.run(["bash", "ci/gates.sh", "shell"], cwd=HERE,
-                                  capture_output=True, text=True, timeout=120)
-        finally:
-            shutil.rmtree(venv, ignore_errors=True)
+        proc = subprocess.run(["bash", "ci/gates.sh", "shell"], cwd=tree,
+                              capture_output=True, text=True, timeout=120)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert ".venv" not in proc.stdout, (
             "the gate probed a vendored tree it is supposed to prune")

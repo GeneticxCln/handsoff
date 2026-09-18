@@ -7057,6 +7057,101 @@ unchanged. And the hook still only gates commits where `core.hooksPath` points a
 `githooks`. *(Both skips are gone as of the entry below — they now build what they
 were missing, so a copy runs the same suite with nothing skipped.)*
 
+## No test writes inside the checkout, and the rule is checked where it happens (2026-09-18)
+
+**What was asked.** Make it a checked property that no test writes inside the
+repository — fail the suite when a test's writes touch a path under the checkout
+instead of a fixture it built — and fix the site that does. The property now
+lives in `tests/conftest.py`, beside the sandbox that owns the other half of the
+same idea: an audit hook that refuses a write to the tree the suite is running
+against, at the syscall wrapper, so nothing lands. **Why not a diff of the tree
+before and after each test:** both incidents this closes were create-then-delete
+(a probe module planted beside `handsoff.py` and removed in a `finally`; a `.venv`
+seeded beside the source and removed the same way), the shape no comparison can
+see and exactly the shape whose interruption leaves the file behind. The failure
+names the file and lands on the test that tried, instead of on whichever test
+later trips over the leftovers.
+
+**A property found more than a fix would have.** One site was known from the pass
+before it — the gate test that seeded `.venv` inside the checkout, which also had
+to skip itself whenever a real `.venv` was already there, i.e. on the one machine
+where the pruning it proves matters most. The guard found two more: a
+broken-syntax probe written at the checkout root for the pre-commit hook's compile
+leg, and a module that raises on import written under `tests/` to prove a failed
+load cannot strand the sandbox. All three build under `tmp_path` now; the `.venv`
+one copies the gate and the one shell file it must find into a tree of its own,
+because the gate reads the tree it STANDS IN, so a copy is the whole fixture, and
+it no longer has a reason to skip anything.
+
+**The suite found three things wrong with the guard, which is the point of
+installing a property with teeth.** A first draft judged a LINK'S SOURCE as a
+write and refused every fixture that symlinks the app's modules into a scratch
+tree — the freshness guard builds exactly that, so it went red immediately; the
+rule is the destination only. A copy with no repository then refused pytest's own
+start-up, because `.pytest_cache` is built inside a `pytest-cache-files-*`
+directory that is renamed into place, so its CONTENTS are written at the root
+first. And the GATES found the third, because a gate is a second way of running
+the same suite: `ci/gates.sh` asks pytest for a junit report under `tests/`,
+pytest reaches `os.mkdir` on that directory to make sure it exists, and the hook
+refused a creation that could only have failed — the `tests` gate went red on
+`tests` before a single test ran. The rule now says what the syscall says: a
+creation that cannot succeed writes nothing, while removal, a write-open, a
+rename, a truncation and a metadata change are judged whether or not they could
+succeed. A bare name against a directory fd is resolved against THAT directory
+(`shutil.rmtree` unlinks by bare name, so the obvious reading judged a fixture
+under /tmp as if it were in the checkout and refused every test that tidies up).
+Exempt, and the list is short because it is only the tooling: bytecode caches,
+`.pytest_cache`, `.ruff_cache`, the coverage data file and its shards, the junit
+reports, and that cache-probe directory — all written by pytest and coverage
+rather than by a test.
+
+**Guards and sweep: 12 tests in `tests/test_sandbox.py`** (the refusal at the
+write, a removal, a directory creation, a read that must NOT be refused, the
+decision table with the sibling-prefix trap and every exemption, the flags rule,
+the directory-fd rule, the link source/destination rule, the cannot-succeed rule,
+and a fixture that must stay writable including the `rmtree` that tidies it);
+**16/16 mutations caught, 0 missed, every restore sha256-verified**
+(`/tmp/write_guard_sweep/sweep.py`: the hook never installed, the refusal
+unreachable, only `open` judged, the boundary turned back into a string prefix,
+the allowlist swallowing everything, the cache-probe and coverage exemptions
+dropped, reads counted as writes, a link's target judged again, the directory-fd
+resolution dropped, the cannot-succeed rule dropped, the junit exemption widened
+to any `.xml` under `tests/`, and the three repaired sites put back the way they
+were). Three mutants first failed for the WRONG reason, which the sweep reports
+rather than hides: a real `os.link` from the checkout into `tmp_path` gave
+`Invalid cross-device link`, the `.venv` mutant first reused the checkout root so
+`shutil.copy2` raised `SameFileError` before the guard was consulted, and the
+symlink pin named an EXISTING target, which the cannot-succeed rule then allowed
+— masking a mutant that judged the source. The pin names a path that is not there
+yet now, which is also the honest case (a fixture links a module before creating
+it). The measurement of the guard's cost has a control: a pytest plugin that makes
+`addaudithook` a no-op turns the four refusal tests red while the allowed ones
+stay green, so "these tests do the refusing" is a claim and not a hope.
+
+**The claim, measured in a copy of the working tree with no `.git` anywhere:
+1 798 passed, 0 skipped in 245 s** — the 1 786 of the previous entry plus these
+twelve — and the same number from the `tests` gate itself.
+
+**Green on the final bytes**, each invocation stamped and ending in the tree
+verdict: `tests` PASS 244 s (**1 798 passed**), `coverage` PASS 250 s (**84.60%**
+≥ 70 — 2 581 missing of 16 754 statements), `order` PASS 489 s in BOTH orderings
+(seed 1721b89, 1 798 each), `compile` / `shell` / `smoke` PASS, **`clean-checkout`
+PASS 4 s**, **`two-writer` PASS** (`worktree unchanged since the run started`),
+`all gates passed`, exit 0.
+
+**Limits, stated.** The guard covers the suite's PROCESS and not the children it
+spawns (a driver, an offscreen-GUI scenario, `bash ci/gates.sh`) — inheriting it
+means a `sitecustomize.py` on the child's PYTHONPATH, and `sandbox_env` is
+already the one constructor every child goes through, so the seam exists; no
+instance of the class has been seen, and it is follow-up 9 in
+`specs/90-audit.md`. The `open` audit event carries no directory fd, so a write
+opened by bare name against one would be judged against the working directory — a
+refusal rather than a missed write, and nothing in the suite opens a file for
+writing that way. The exemptions are judged by NAME: a test that deliberately
+created `pytest-cache-files-…` at the root would be allowed to write there, which
+costs more to attempt than it gains. And `clean-checkout` judges HEAD, so its PASS
+is a verdict about the commit and not about these uncommitted bytes.
+
 ## Nothing skips in a file-only copy any more (2026-09-18)
 
 **The last two skips, closed — and both were questions about the checkout the
