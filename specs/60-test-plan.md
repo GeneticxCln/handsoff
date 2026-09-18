@@ -21,7 +21,7 @@ nothing — a missing row does.
 | `test_bubble_anim.py` | 11 | the tick driven frame by frame: the step, the level chase, colour/energy, the radius spring |
 | `test_settings.py` | 81 | loader/coerce/migrate/merge/lock, looks catalogue |
 | `test_settings_contract.py` | 24 | the field table: coercion, controls, cards, companion rows, the window |
-| `test_lifecycle.py` | 80 | generations, staleness, PTT epoch, cancel/done |
+| `test_lifecycle.py` | 90 | generations, staleness, PTT epoch, cancel/done, installer membership + rehearsal (each on a fixture it builds) |
 | `test_ops.py` | 67 | deploy snapshot, restart, control socket, health/doctor |
 | `test_web.py` | 64 | router, backends, cache, reader, SSRF refusals |
 | `test_fault_injection.py` | 52 | boundary breakage, loud-degradation contract |
@@ -126,10 +126,11 @@ nothing — a missing row does.
   duration is copied here, because a copied one rots), so a partially staged
   behaviour change is refused rather than judged by the checkout that holds both
   halves. The suite leg is skipped when a cheaper leg already failed, since the
-  suite contains the spec guard. Two checks skip in a file-only copy, both of
-  them ABOUT the working checkout (untracked scratch in a shipped directory, the
-  installer's no-git fallback) and both still run whenever the suite is run
-  directly. Bypass only via `--no-verify`, deliberately.
+  suite contains the spec guard. Nothing skips in a file-only copy: the two
+  checks that used to (an untracked scratch in a shipped directory, the
+  installer's no-git fallback) now bring the repository and the checkout they
+  need, so the staged tree and the developer's tree run the same suite — same
+  tests, same verdict. Bypass only via `--no-verify`, deliberately.
 - GitLab: same gates + pip cache on the lock file, junit report, and
   `after_script` digest (`ci/pytest_summary.py --post`) that prints failing
   names + env-fix hints even when the job dies.

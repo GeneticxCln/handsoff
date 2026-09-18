@@ -7054,4 +7054,86 @@ orderings, `compile` / `shell` / `smoke` PASS, `clean-checkout` PASS 4 s,
 as above; they are reported as skips rather than hidden. The suite in the staged
 tree is the same suite, so it costs the same four minutes — the hook's total is
 unchanged. And the hook still only gates commits where `core.hooksPath` points at
-`githooks`.
+`githooks`. *(Both skips are gone as of the entry below — they now build what they
+were missing, so a copy runs the same suite with nothing skipped.)*
+
+## Nothing skips in a file-only copy any more (2026-09-18)
+
+**The last two skips, closed — and both were questions about the checkout the
+suite happened to be run in rather than about the code.** The rehearsal test
+skipped whenever no ambient repository was around, on a belief that had gone
+stale: that the installer's fallback without git was the bare glob. It has been
+the DECLARED set for far longer than the skip survived, so the skip was
+protecting nothing — and while it ran, it made its point by writing into the
+DEVELOPER's checkout: it planted a scratch module beside `handsoff.py` and
+removed it in a `finally`, so an interrupted run left behind exactly the untracked
+file its sibling guard fails on. The two tests were coupled through the tree.
+The directory guard was the mirror of it: it asked git about the tree it was run
+in, so in a copy there was no ownership signal at all and the tracked rule simply
+did not run.
+
+**Each check now brings the fixture it needs.** The rehearsal builds a checkout of
+the shipped files under `tmp_path` — the two globs the installer decides about by
+name, the script itself (its own directory IS the checkout it installs from), the
+artifact installed by name, and the requirement pair validated before the pip
+skip — and runs two shapes of it. **No repository** (the tarball, and the
+pre-commit hook's staged copy): the fallback is the declared set, the scratch is
+refused with "not a declared module", it never reaches the user's PATH, and it is
+never hashed into `deployment.json`, while the project's own modules still ship.
+**A repository it initialises itself**: a module that is in the index and outside
+the declared set SHIPS — the entire reason the rule consults git at all — while a
+file nobody staged is refused as "untracked in git". `git add` and not `git
+commit` is what "tracked" means here, because a staged module is what the
+installer will read.
+
+The directory guard keeps its two tracker-free checks in any tree — a
+scratch-SHAPED name, which catches a COMMITTED experiment (the tracked check calls
+a committed file "owned", and the incident's own file was `test.py`), and stray
+media beside `handsoff.py` — and asks git wherever git can answer. The teeth of
+the tracked rule are pinned by a fixture that builds its own repository and plants
+an unstaged scratch, so the rule is exercised in a copy, where no repository
+exists to ask. One detail the fixture had to get right: it runs under the hook,
+whose environment carries a `GIT_INDEX_FILE` pointing at the developer's index, so
+it builds its repository with the sandbox environment and not an inherited one.
+
+**Installing both shapes then exposed an ambiguity in the installer's own
+output.** `skip_unowned` decided "no repository" from an EMPTY tracked list — but
+a repository whose index holds nothing also ships only the declared set, for the
+right reason, and the remedy is `git add`, not `edit install.sh`. Whether a
+repository was found is now REMEMBERED (`HAVE_GIT`) rather than inferred from the
+list it produced, and both refusal reasons are pinned by the harness test, because
+the advice they carry is the part a user acts on.
+
+**Guards and the sweep.** The mutants are the ways this could go quiet: the
+no-repo answer reporting clean instead of unanswerable, the helper returning
+every shipped file, an untracked module landing in a shipped glob, a
+scratch-shaped module COMMITTED (only the shape check sees that one), stray media,
+the installer's fallback shipping the glob again, the tracked half of the rule
+ignored, the no-git fixture quietly becoming a repository, the fixture's scratch
+staged so it is owned, the fixture tree missing `core/`, the flag never set, and
+the refusal message keyed on an empty tracked list again. **12/12 caught, 2/2
+probes green, 0 misses, every restore sha256-verified** — and probe 2 is the claim
+itself: the whole lifecycle file in a copy **with no `.git` anywhere**, 0 skips.
+
+**Measured, not asserted.** The whole suite in a copy of the WORKING tree with no
+repository: **1 786 passed, 0 skipped in 255 s**. The control is the same copy
+materialised from the INDEX at HEAD, which predates these edits: **1 782 passed,
+2 skipped** — exactly the two skips this work removes, and the reason the number
+moved is the fix rather than a test quietly disappearing.
+
+**Green on the final bytes**, each invocation stamped and ending in the tree
+verdict: `tests` PASS 250 s (**1 786 passed** — the 1 784 of the last run plus
+these two former skips), `coverage` PASS 254 s (**84.61%** ≥ 70, 2 579 missing of
+16 754 statements), `order` PASS 499 s in BOTH orderings (seed 3ef899b),
+`compile` (52 files) / `shell` (5 scripts) / `smoke` PASS, **`clean-checkout`
+PASS 4 s** (19 passed), **`two-writer` PASS** (`worktree unchanged since the run
+started`), `all gates passed`, exit 0.
+
+**Limits, stated.** `clean-checkout` judges HEAD, so its PASS here is a verdict
+about the commit and not about these uncommitted bytes; the hook still gates a
+commit only where `core.hooksPath` points at `githooks`, with `--no-verify` as the
+documented escape; and the suite in the staged tree is the same suite, so the
+hook still costs its four minutes. `install.sh`'s membership decision is the one
+line of shipped behaviour that changed (`HAVE_GIT`), and it changed only which of
+two refusal messages a user reads — both refuse the same files and ship the same
+set.

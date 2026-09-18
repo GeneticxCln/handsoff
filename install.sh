@@ -97,13 +97,22 @@ is_exec() {   # 0 when the basename is an entry point (installed 0755)
 # floor the stage below already validates, so there is still exactly one
 # answer to "what ships" and it is written down.
 #
+# Whether a repository was found is REMEMBERED (HAVE_GIT) rather than inferred
+# from an empty tracked list. Those are not the same answer: a repo whose index
+# holds nothing also ships only the declared set, but the reason is that nothing
+# there is staged YET — so the advice belongs to "git add it", not to "edit
+# install.sh". Keying the message on an empty list sent that user to the wrong
+# file (and made the two cases indistinguishable to anyone reading the output).
+#
 # ADDING A MODULE: commit it (git installs pick it up automatically) and add
 # it to CORE_REQUIRED if it lives in core/, or a tarball install will not ship
 # it. The stage fails loudly on a missing CORE_REQUIRED entry, so the mistake
 # is caught at install time rather than at first import.
 TRACKED_PY=""
+HAVE_GIT=0
 if command -v git >/dev/null 2>&1 \
     && git -C "$HERE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    HAVE_GIT=1
     # repo-relative paths, exactly as the globs below name them
     TRACKED_PY="$(git -C "$HERE" ls-files -- '*.py' 2>/dev/null || true)"
 fi
@@ -115,9 +124,7 @@ ship_file() {   # $1 = repo-relative path; 0 → it is part of the project
     case " $DECLARED_PY " in
         *" $1 "*) return 0 ;;           # declared entry points always ship
     esac
-    if [ -z "$TRACKED_PY" ]; then
-        return 1                       # no git: nothing beyond the declared set
-    fi
+    [ "$HAVE_GIT" = "1" ] || return 1   # no repo: nothing beyond the declared set
     printf '%s\n' "$TRACKED_PY" | grep -qx -- "$1"
 }
 ship_top() { ship_file "$1"; }
@@ -443,7 +450,7 @@ stage_fail() {
 # hard-imported module has gone missing. Membership is decided in one place
 # (ship_file) so staging, the manifest and the rehearsal check cannot disagree.
 skip_unowned() {   # $1 = repo-relative path that failed the membership test
-    if [ -n "$TRACKED_PY" ]; then
+    if [ "$HAVE_GIT" = "1" ]; then
         echo "    NOT shipping $1 — untracked in git, so it is not part of the project"
         echo "      (commit it if it is a module; it would land in $BIN_DIR)"
     else

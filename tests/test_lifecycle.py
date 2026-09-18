@@ -10,6 +10,7 @@ import io
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +33,47 @@ HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 # Bytes planted in a fake deployment's core/ to prove a rollback restores the
 # whole saved module set (see TestInstallerRehearsal / the rollback tests).
 SENTINEL_CORE_BYTES = "# OLD core module bytes\n"
+
+# The root and core/ are the two directories install.sh decides about by GLOB,
+# so a file in either one is a file the installer must have an opinion on — and
+# SCRATCH_SHAPED is the shape of the file that got out: `test.py` from a TTS
+# experiment, shipped into the user's PATH and hashed into the deployment
+# manifest, then shipped again through the installer's no-git fallback.
+SHIPPED_GLOBS = ("*.py", "core/*.py")
+SCRATCH_SHAPED = ("test*.py", "scratch*.py", "tmp*.py", "*_probe.py")
+
+
+def shipped_glob_py(root):
+    """Every *.py the installer's globs would consider shipping."""
+    return sorted(p.relative_to(root).as_posix()
+                  for pat in SHIPPED_GLOBS for p in root.glob(pat))
+
+
+def _git(root, *args, env):
+    """Run git against `root`, never against whichever repo the caller is in."""
+    return subprocess.run(["git", "-C", str(root), *args],
+                          capture_output=True, text=True, env=env, check=True)
+
+
+def untracked_in_shipped_globs(root):
+    """Shipped *.py that git does not track — the installer's own question.
+
+    Returns None when there is no tracker to ask: no git binary, or the
+    directory is not a work tree. That is a DIFFERENT answer from the empty
+    list ("asked, and everything there is owned"), so no caller can read
+    "unanswerable" as "clean" — which is exactly how the first version of the
+    guard came to skip in a tree that merely had no `.git` in it.
+    """
+    try:
+        listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z"],
+                                capture_output=True, text=True,
+                                env=sandbox_env())
+    except FileNotFoundError:
+        return None
+    if listed.returncode != 0:
+        return None
+    tracked = {p for p in listed.stdout.split("\0") if p}
+    return [rel for rel in shipped_glob_py(root) if rel not in tracked]
 
 
 class TestCoreLifecycle:
@@ -1861,6 +1903,10 @@ class TestRestartResilience:
         assert 'git -C "$HERE" ls-files' in text, (
             "tracked files are how a new module ships without editing this")
         assert 'TRACKED_PY=""' in text, "the no-git fallback must be explicit"
+        assert "HAVE_GIT=0" in text, (
+            "whether a repository EXISTS is remembered rather than inferred from "
+            "an empty tracked list: the two cases ship the same set for "
+            "different reasons and give different advice")
         assert text.count("ship_top ") + text.count("ship_core ") >= 6, (
             "staging, the manifest and the rehearsal check must agree, for both")
         assert "CORE_REQUIRED=" in text and "DECLARED_PY=" in text, (
@@ -1891,8 +1937,8 @@ class TestRestartResilience:
         rather than `whatever the glob finds`.
 
         This runs the REAL `ship_file` out of install.sh (extracted, not
-        re-implemented) against all three states of `TRACKED_PY`, so it pins the
-        behaviour and not the text. The repository it runs in is its OWN, built
+        re-implemented) against both states of `HAVE_GIT` — no repository, and
+        one whose index answers — so it pins the behaviour and not the text. The repository it runs in is its OWN, built
         here: the property belongs to the rule, not to the developer's checkout,
         and a tree with no `.git` at all (which is how the suite runs under the
         pre-commit hook's staged copy) has no tracked list to consult — the
@@ -1908,13 +1954,15 @@ class TestRestartResilience:
 
         fn = text[text.index("ship_file() {"):]
         fn = fn[:fn.index("\n}\n") + 3]
-        assert "DECLARED_PY" in fn and "TRACKED_PY" in fn, fn
+        assert "DECLARED_PY" in fn and "TRACKED_PY" in fn and "HAVE_GIT" in fn, fn
 
         prelude = (
             'set -eu\n'
             f'TOP_REQUIRED="{var("TOP_REQUIRED")}"\n'
             f'CORE_REQUIRED="{var("CORE_REQUIRED")}"\n'
             'DECLARED_PY="$TOP_REQUIRED handsoff-settings.py"\n'
+            # skip_unowned names the destination in its advice
+            'BIN_DIR="/nonexistent/bin"\n'
             'for m in $CORE_REQUIRED; do\n'
             '    DECLARED_PY="$DECLARED_PY core/$m.py"\n'
             'done\n')
@@ -1937,7 +1985,7 @@ class TestRestartResilience:
                                *self.SHIP_DECLARED], capture_output=True,
                               text=True, env=env).returncode == 0
 
-        def verdicts(tracked: str) -> dict:
+        def verdicts(tracked: str, have_git: bool = True) -> dict:
             # sandbox_env, not a bare launch: this child is bash, but the rule
             # the suite enforces is that NO child inherits the developer's
             # HOME/XDG, whatever it runs — and the guard in test_sandbox.py
@@ -1945,17 +1993,44 @@ class TestRestartResilience:
             # (these strings name `handsoff.py`, one of its markers).
             proc = subprocess.run(
                 ["bash", "-c", prelude + fn + f'\nTRACKED_PY="{tracked}"\n'
-                 + body],
+                 f'HAVE_GIT={"1" if have_git else "0"}\n' + body],
                 cwd=root, capture_output=True, text=True, env=env)
             assert proc.returncode == 0, proc.stdout + proc.stderr
             return dict(line.split("=", 1) for line in proc.stdout.splitlines())
 
+        skip = text[text.index("skip_unowned() {"):]
+        skip = skip[:skip.index("\n}\n") + 3]
+
+        def message(tracked: str, have_git: bool) -> str:
+            """What the installer SAYS when it refuses a file — and why.
+
+            Run because the two refusal reasons carry different advice, and the
+            advice is the part a user acts on: no repository means "declare
+            it", while a repository that has not been told about the file yet
+            means "git add it".
+            """
+            proc = subprocess.run(
+                ["bash", "-c", prelude + skip + f'\nTRACKED_PY="{tracked}"\n'
+                 f'HAVE_GIT={"1" if have_git else "0"}\n'
+                 'skip_unowned scratch_probe.py\n'],
+                cwd=root, capture_output=True, text=True, env=env)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            return proc.stdout
+
         # 1. No git: the declared set is the whole answer.
-        nothing = verdicts("")
+        nothing = verdicts("", have_git=False)
         assert set(nothing) == set(self.SHIP_PROBES), nothing
         assert [k for k, v in nothing.items() if v == "ship"] == \
             list(self.SHIP_DECLARED), (
                 "a no-git tree must ship ONLY the declared set: " + str(nothing))
+
+        # 1b. A repository that has staged nothing ships the same set, for its
+        #     own reason — which is why the flag is remembered and not inferred.
+        empty_index = verdicts("", have_git=True)
+        assert [k for k, v in empty_index.items() if v == "ship"] == \
+            list(self.SHIP_DECLARED), (
+                "a repo with nothing staged ships the declared set only: "
+                + str(empty_index))
 
         # 2. A tracked list that holds the declared files only: the scratch stays
         #    home, whatever the glob would have found.
@@ -1979,6 +2054,14 @@ class TestRestartResilience:
             "and tracking the new module does not drag the scratch in: "
             + str(grown))
 
+        # 4. And the two refusal reasons are told apart, because the remedy
+        #    differs: with no repository the file has to be declared, and with
+        #    one that has not been told about it yet, staged. Both refuse the
+        #    scratch and ship the declared set — only the advice changes — which
+        #    is exactly what an empty tracked list cannot distinguish on its own.
+        assert "not a declared module" in message("", have_git=False)
+        assert "untracked in git" in message("", have_git=True)
+
     def test_no_untracked_scratch_sits_in_a_shipped_directory(self):
         """Excluding a scratch file is not the same as it not being there.
 
@@ -1991,40 +2074,86 @@ class TestRestartResilience:
 
         The root and `core/` are the directories the installer decides about by
         glob, so a file there is a file it must have an opinion on. Keep them
-        clean instead of merely ignored: anything in either one that git does
-        not track fails here, when it appears, rather than at the next install.
+        clean instead of merely ignored: a scratch module or stray media in
+        either one fails here, when it appears, rather than at the next install.
         Commit it if it is a module; otherwise it belongs outside the tree.
+
+        Three checks, because they answer different questions and only the last
+        one needs a tracker:
+
+        * a scratch-SHAPED name, which catches a COMMITTED experiment — the
+          tracked check below calls that file "owned", and the incident's own
+          file was `test.py`;
+        * stray media beside `handsoff.py`, which is how the voice-clip
+          experiment left its copies behind (the live reference is under the
+          config dir);
+        * nothing untracked, which is the installer's actual question, asked of
+          git wherever git can answer it. In a tree with no `.git` — a tarball,
+          or the pre-commit hook's staged copy — there is no ownership signal
+          at all, which is why the installer's fallback is the declared set;
+          the two checks above do not need one, and still run there. That is
+          why the teeth of the tracked rule are pinned by the fixture test
+          below rather than by a skip here.
         """
-        try:
-            listed = subprocess.run(
-                ["git", "-C", str(HERE), "ls-files", "-z"],
-                capture_output=True, text=True, env=sandbox_env())
-        except FileNotFoundError:
-            pytest.skip("no git — tracking cannot be consulted")
-        if listed.returncode != 0:
-            pytest.skip("not a git work tree — nothing to compare against")
-        tracked = {p for p in listed.stdout.split("\0") if p}
+        shaped = [rel for rel in shipped_glob_py(HERE)
+                  if any(Path(rel).match(pat) for pat in SCRATCH_SHAPED)]
+        assert not shaped, (
+            "a scratch-shaped module in a directory the installer ships by "
+            "glob — it would land in $BIN_DIR and be hashed into the "
+            f"deployment manifest: {shaped}")
 
-        # what the installer stages by glob, plus the one file it names
-        candidates = sorted(p.relative_to(HERE).as_posix()
-                            for p in list(HERE.glob("*.py"))
-                            + list((HERE / "core").glob("*.py")))
-        candidates.append("handsoff-restart")
-        offenders = [c for c in candidates
-                     if c != "handsoff-restart" and c not in tracked]
-        assert not offenders, (
-            "untracked scratch in a directory the installer ships by glob — it "
-            "would land in $BIN_DIR and be hashed into the deployment "
-            f"manifest: {offenders}")
-
-        # Media scratch is not shippable, but it is still 7 MB of clutter that
-        # nothing in the tree reads — and a stray `*.wav` beside handsoff.py is
-        # how the voice-clip experiment left its copies behind in the first
-        # place. The live reference lives in ~/.config/handsoff/voice-clips/.
+        # Media scratch is not shippable, but a stray clip there is clutter the
+        # tree does not read, and it is how the voice experiment left its
+        # copies behind in the first place.
         stray_media = sorted(p.name for p in HERE.glob("*.wav"))
         assert not stray_media, (
             "stray media beside handsoff.py — move it out of the tree (the "
             f"configured voice reference is under the config dir): {stray_media}")
+
+        offenders = untracked_in_shipped_globs(HERE)
+        if offenders is not None:
+            assert not offenders, (
+                "untracked scratch in a directory the installer ships by glob "
+                "— it would land in $BIN_DIR and be hashed into the deployment "
+                f"manifest: {offenders}")
+
+    def test_the_tracked_check_finds_an_unstaged_scratch_in_its_own_repo(
+            self, tmp_path):
+        """The tracked rule's teeth, on a repository this test builds itself.
+
+        The check above is only as good as the tracker it asks, and in a
+        file-only copy — which is how the pre-commit hook runs the suite —
+        there is no ambient repository to ask at all. So the rule gets one of
+        its own. A directory that is not a repository reports None, which is to
+        say unanswerable and NOT the same answer as clean; the same directory
+        after `git init` reports exactly the file nobody staged. Git the BINARY
+        is present in a copy like that; only the checkout is not.
+
+        `ls-files` reads the INDEX, so "tracked" here means "staged": the
+        question the installer asks is what the commit will own, not what some
+        earlier commit owned.
+        """
+        root = tmp_path / "checkout"
+        (root / "core").mkdir(parents=True)
+        (root / "handsoff.py").write_text("# a module\n")
+        (root / "core" / "theme.py").write_text("# a module\n")
+        assert untracked_in_shipped_globs(root) is None, (
+            "with no repository the question is unanswerable, and unanswerable "
+            "must not come back looking clean")
+
+        # sandbox_env supplies the identity and config and drops git's plumbing:
+        # the suite runs under the pre-commit hook, whose GIT_INDEX_FILE points
+        # at the developer's index, and a fixture repo built with that inherited
+        # would be asked about the wrong index entirely.
+        env = sandbox_env(tmp_path / "home")
+        _git(root, "init", "-q", env=env)
+        _git(root, "add", "handsoff.py", "core/theme.py", env=env)
+
+        (root / "scratch_experiment.py").write_text("# an experiment\n")
+        (root / "core" / "zz_probe.py").write_text("# another\n")
+        assert untracked_in_shipped_globs(root) == [
+            "core/zz_probe.py", "scratch_experiment.py"], (
+            "the tracked question must name exactly the files nobody staged")
 
     def test_lock_failure_logs_instead_of_silent_exit(self, H, monkeypatch):
         """If the lock can't be acquired, say so in the log (no more silent vanish)."""
@@ -2108,6 +2237,13 @@ class TestStagedRelease:
 
     REHEARSAL_HOME_NAME = "rehearsal-home"
 
+    # What a rehearsal reads out of the checkout before it can stage anything:
+    # the script itself (its own directory IS the checkout it installs from),
+    # the one artifact installed by name, and the requirement pair whose
+    # consistency is validated ahead of the rehearsal's pip skip.
+    SHIPPED_FROM_CHECKOUT = ("install.sh", "handsoff-restart",
+                             "requirements.txt", "requirements-lock.txt")
+
     def _fake_home(self, tmp_path, bin_py="# deployed handsoff\n"):
         """Rehearsal mode re-roots HOME at HANDSOFF_REHEARSAL_ROOT, so the
         pre-existing deployment must live inside that same tree."""
@@ -2127,56 +2263,118 @@ class TestStagedRelease:
             (bin_dir / "core" / "theme.py").write_text(SENTINEL_CORE_BYTES)
         return home, conf
 
-    def _run_rehearsal(self, tmp_path, home):
-        env = dict(os.environ)
+    def _run_rehearsal(self, home, tree=None):
+        """Run the real installer out of `tree` — this checkout by default.
+
+        The environment is the suite's sandbox one, which also drops git's
+        plumbing: install.sh asks git what the project owns, and the suite runs
+        under the pre-commit hook, whose GIT_INDEX_FILE points at the
+        developer's index — a fixture repository would otherwise be asked about
+        the wrong index entirely.
+        """
+        env = sandbox_env(home)
         env.update({
             "HOME": str(home),
             "XDG_STATE_HOME": str(home / ".local" / "state"),
+            "XDG_CONFIG_HOME": str(home / ".config"),
             "HANDSOFF_REHEARSAL_ROOT": str(home),
             "HANDSOFF_SKIP_SYSTEM_PKGS": "1",
             "HANDSOFF_NO_OLLAMA_SERVICE": "1",
         })
         return subprocess.run(
-            ["bash", str(HERE / "install.sh"), "--rehearsal"],
+            ["bash", str((tree or HERE) / "install.sh"), "--rehearsal"],
             env=env, capture_output=True, text=True, timeout=300,
         )
 
-    def test_rehearsal_never_delivers_a_scratch_file(self, tmp_path):
-        """End to end: an untracked *.py in the checkout stays out of ~/.local/bin.
+    def _fixture_tree(self, tmp_path):
+        """A checkout of this project's shipped files, built for one test.
 
-        The behavioural half of the membership rule above — a rehearsal in a
-        throw-away HOME, with a scratch module written beside handsoff.py the
-        way a user's experiment really sits there (removed again either way).
+        The rehearsal installs from the directory the SCRIPT is in, so the
+        fixture brings its own copy of that directory — which is what lets
+        these tests run from a file-only copy, and it stops the developer's
+        checkout being written to at all. The version this replaces planted its
+        scratch module beside the real `handsoff.py` and removed it in a
+        `finally`, so an interrupted run left behind exactly the untracked file
+        the guard above fails on: the two tests were coupled through the tree.
         """
-        probe = subprocess.run(["git", "-C", str(HERE), "rev-parse",
-                                "--is-inside-work-tree"],
-                               capture_output=True, text=True)
-        if probe.returncode != 0:
-            pytest.skip("not a git work tree: the installer falls back to the glob")
-        scratch = HERE / "test_zz_scratch_experiment.py"
-        assert not scratch.exists(), f"refusing to clobber an existing {scratch}"
-        home, conf = self._fake_home(tmp_path)
+        tree = tmp_path / "checkout"
+        (tree / "core").mkdir(parents=True)
+        for src in list(HERE.glob("*.py")) + list((HERE / "core").glob("*.py")):
+            shutil.copy2(src, tree / src.relative_to(HERE))
+        for name in self.SHIPPED_FROM_CHECKOUT:
+            if (HERE / name).is_file():
+                shutil.copy2(HERE / name, tree / name)
+        return tree
+
+    def test_rehearsal_never_delivers_a_scratch_file_without_a_tracker(
+            self, tmp_path):
+        """A tree with no repository has no ownership signal at all — so the
+        fallback is the DECLARED set — and the scratch still never leaves it.
+
+        That is the tarball install, and the file-only copy the pre-commit hook
+        stages. The version this replaces skipped here, on the belief that the
+        installer's fallback was `ship whatever the glob finds`, which is the
+        bug that let the file out in the first place; the fallback has been the
+        declared set for far longer than the skip survived.
+        """
+        tree = self._fixture_tree(tmp_path)
+        scratch = tree / "test_zz_scratch_experiment.py"
         scratch.write_text("print('a user experiment, not part of the app')\n")
-        try:
-            r = self._run_rehearsal(tmp_path, home)
-            assert r.returncode == 0, r.stderr[-3000:]
-            assert f"NOT shipping {scratch.name}" in r.stdout, r.stdout[-2000:]
-            assert not (home / ".local" / "bin" / scratch.name).exists(), \
-                "a scratch file was delivered into the user's PATH"
-            manifest = json.loads((conf / "deployment.json").read_text())
-            assert scratch.name not in manifest["files"], \
-                "doctor would track a file the bubble never uses"
-            # ...while the project's own modules still shipped
-            assert "handsoff.py" in manifest["files"]
-            assert "core/theme.py" in manifest["files"]
-        finally:
-            scratch.unlink(missing_ok=True)
+        home, conf = self._fake_home(tmp_path)
+
+        r = self._run_rehearsal(home, tree=tree)
+        assert r.returncode == 0, r.stderr[-3000:]
+        assert f"NOT shipping {scratch.name}" in r.stdout, r.stdout[-2000:]
+        assert "not a declared module, and this is not a git" in r.stdout, (
+            "the no-git branch must say WHY it refused: " + r.stdout[-2000:])
+        assert not (home / ".local" / "bin" / scratch.name).exists(), \
+            "a scratch file was delivered into the user's PATH"
+        manifest = json.loads((conf / "deployment.json").read_text())
+        assert scratch.name not in manifest["files"], \
+            "doctor would track a file the bubble never uses"
+        # ...while the project's own modules still shipped
+        assert "handsoff.py" in manifest["files"]
+        assert "core/theme.py" in manifest["files"]
+
+    def test_rehearsal_ships_a_staged_module_but_never_an_unstaged_scratch(
+            self, tmp_path):
+        """Both answers of the membership rule, on a repository this test builds.
+
+        A module that joined the project and is in the index SHIPS without
+        anyone editing install.sh — that is the whole reason the rule consults
+        git at all — while a file nobody staged stays home and is named as
+        untracked. Neither answer needs the developer's checkout to be a
+        repository, which is precisely what a file-only copy is not.
+        """
+        tree = self._fixture_tree(tmp_path)
+        env = sandbox_env(tmp_path / "fixture-home")
+        _git(tree, "init", "-q", env=env)
+        _git(tree, "add", "-A", env=env)          # "tracked" = in the index
+        (tree / "core" / "zz_future.py").write_text(
+            "# a module that joined the project\n")
+        _git(tree, "add", "core/zz_future.py", env=env)
+        # written AFTER the add, so nobody has staged it
+        scratch = tree / "scratch_experiment.py"
+        scratch.write_text("# an experiment\n")
+        home, conf = self._fake_home(tmp_path)
+
+        r = self._run_rehearsal(home, tree=tree)
+        assert r.returncode == 0, r.stderr[-3000:]
+        assert f"NOT shipping {scratch.name}" in r.stdout, r.stdout[-2000:]
+        assert "untracked in git, so it is not part of the project" in r.stdout
+        manifest = json.loads((conf / "deployment.json").read_text())
+        assert "core/zz_future.py" in manifest["files"], (
+            "a staged module outside the declared set is exactly how a new "
+            "module joins the deployment: " + str(sorted(manifest["files"])))
+        assert (home / ".local" / "bin" / "core" / "zz_future.py").exists()
+        assert scratch.name not in manifest["files"]
+        assert not (home / ".local" / "bin" / scratch.name).exists()
 
     def test_rehearsal_switches_and_saves_previous_release(self, tmp_path):
         """A rehearsal install must gate through the stage and keep the old
         deployed set at releases/prev for --rollback."""
         home, conf = self._fake_home(tmp_path, bin_py="# OLD deployed bytes\n")
-        r = self._run_rehearsal(tmp_path, home)
+        r = self._run_rehearsal(home)
         assert r.returncode == 0, r.stderr[-3000:]
         assert "previous release kept" in r.stdout
         prev = conf / "releases" / "prev"
@@ -2190,7 +2388,7 @@ class TestStagedRelease:
     def test_rollback_restores_previous_bytes(self, tmp_path):
         """install.sh --rollback must put the saved previous release back."""
         home, conf = self._fake_home(tmp_path, bin_py="# OLD deployed bytes\n")
-        r = self._run_rehearsal(tmp_path, home)
+        r = self._run_rehearsal(home)
         assert r.returncode == 0, r.stderr[-3000:]
         bin_handsoff = home / ".local" / "bin" / "handsoff.py"
         assert bin_handsoff.read_text() != "# OLD deployed bytes\n"

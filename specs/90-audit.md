@@ -202,9 +202,10 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    halves of the change. **The full suite runs against the staged tree too, as of
    the same day:** the earlier version kept it in the working tree on the
    assumption that a file-only copy needs a `.git`, and that assumption was wrong
-   — measured, the whole suite passes in a tree with no repository at all, and
-   exactly two checks skip there, both of them ABOUT the working checkout
-   (untracked scratch in a shipped directory, the installer's no-git fallback).
+   — measured, the whole suite passes in a tree with no repository at all. Two
+   checks still skipped there when that sentence was written (an untracked
+   scratch in a shipped directory, the installer's no-git fallback); both now
+   build what they were missing and nothing skips in a copy at all — see item 7.
    One test had to be fixed to make that true rather than assumed: the
    installer's membership-rule test ran its git half against the developer's
    checkout, so in a copy it died on `set -e` where `git ls-files` failed — it now
@@ -212,6 +213,34 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    it was missing (a TRACKED module outside the declared set must ship, which is
    the point of consulting git at all), and one test asserting the tracked-list
    rule no longer needs a git work tree beside it.
+
+7. **DONE (2026-09-18):** the two skips that remained in a file-only copy — both
+   of them questions about the checkout the suite happened to be run in rather
+   than about the code. The rehearsal test refused to run without an ambient
+   repository, on a belief that had gone stale (that the installer's no-git
+   fallback was the glob) and while mutating the developer's checkout to make its
+   point: it planted a scratch module beside `handsoff.py` and removed it in a
+   `finally`, so an interrupted run left exactly the file the sibling guard
+   fails on. Both checks now bring their own fixtures. The rehearsal builds a
+   checkout of the shipped files under `tmp_path` — the two globs the installer
+   decides about, the script itself (its own directory IS the checkout), the
+   artifact installed by name, the requirement pair validated before the pip
+   skip — and runs two shapes of it: no repository (the tarball, and the hook's
+   staged copy), where the fallback is the declared set, and a repository it
+   initialises itself, where a STAGED module ships while an unstaged scratch is
+   refused as untracked. `git add` and not `git commit` is what "tracked" means
+   here, because that is the question the installer asks. The directory guard
+   runs its tracker-free checks in any tree and asks git where git can answer,
+   with the teeth of the tracked rule pinned by a fixture that builds a
+   repository and plants an unstaged scratch — so the rule is exercised in a
+   copy, where no repository exists to ask. It also checks a scratch-SHAPED
+   name, which the tracked test cannot: a COMMITTED experiment is "owned", and
+   `test.py` was exactly that. Installing both shapes then exposed an ambiguity
+   in the installer's own output — it decided "no repository" from an EMPTY
+   tracked list, so a repository whose index held nothing was told to edit
+   `install.sh` when the remedy was to stage the file. Whether a repository was
+   found is now remembered (`HAVE_GIT`) rather than inferred, and both refusal
+   reasons are pinned, since the advice they carry is the part a user acts on.
 
 ## core/lifecycle.py seam exists but has no production caller — CLOSED (2026-09-17)
 
