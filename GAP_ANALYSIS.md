@@ -7318,3 +7318,93 @@ deliberate — a child that died at start-up would fail for a reason unrelated t
 what it was testing — with the module's presence pinned at the source instead. And
 `clean-checkout` judges HEAD, so its PASS is a verdict about the commit and not
 about these uncommitted bytes.
+
+## The same guard refuses the developer's real user dirs (2026-09-18)
+
+asked: the checkout is not the only tree a test can reach — extend the write guard
+to the developer's real user directories, so a test that hand-writes `~/.config`
+or `~/.local/state` fails instead of landing there.
+
+**A different failure from the checkout rule, and quieter.** The suite runs with
+the developer's OWN home live: the user-dir sandbox swaps HOME/XDG for the duration
+of a LOAD and restores it, so a test that resolves a config or state path by any
+other route — a module loaded before the sandbox, a child built by hand, a path
+resolved from `pwd` or from a constant — writes the developer's real files and
+leaves nothing behind to say so. That is not hypothetical here: the settings app's
+`apply_autostart` once wrote the real `~/.config/niri/config.kdl` from a test that
+believed it was writing into a temp home, and the fix then was to sandbox that
+load, because nothing else noticed the file. The checkout rule could not have fired
+either — that path is a sibling of the checkout, not a file in it.
+
+**The roots are PASSED IN, never read from the environment.** `install(root,
+protected=...)`; conftest captures them while it is imported (the same moment and
+the same reason as `_REAL_HOME` — before any sandbox can move HOME) and names them
+for a child in `HANDSOFF_GUARD_USER_DIRS`, a SECOND variable beside the checkout
+one. A child cannot answer the question itself: its HOME is a throw-away directory,
+so a guard deriving the roots from its own environment would protect a sandbox home
+and leave the developer's real one open, silently. Two variables, two rules, and
+the control removes one to show the other still works.
+
+**The checkout is asked first, and that order is load-bearing.** The checkout
+normally lives inside the protected home, so judging the user dirs first would
+refuse pytest's own `.pytest_cache` and the suite could not start. A checkout path
+keeps its exemptions, and a checkout file is still refused by the checkout rule.
+Both halves are pinned: the predicate table, and a test that creates and removes a
+`pytest-cache-files-*` directory at the root of the tree.
+
+**The sweep found a weakness in the guard itself — the reason to run one.** The
+mutant that made the rule follow the LIVE home (`os.path.expanduser("~")`) instead
+of the captured paths was refused with the message about the CHECKOUT: `_message`
+asked "which protected root matched this path?", and when none did it fell through
+to the checkout text. The refused path was in a sandbox home; the message named the
+wrong tree, from the guard, to a developer trying to read it. The dispatcher now
+asks WHERE the path is — the same question the hook asked — so the two cannot
+disagree. Two more facts reshaped the sweep: the blunt form of "reads count as
+writes" (drop the flags check for every path) used to be caught at collection and
+now dies earlier still, in the interpreter's start-up reads of the developer's user
+site-packages, so it proves nothing about this guard and the mutant is scoped to
+the checkout, where its evidence is the refusal text rather than a test assertion
+(reading is how the runner loads its own files).
+
+measured: the whole suite in the working tree **1 812 passed**; the same tree in a
+copy with no `.git` anywhere **1 812 passed, 0 skipped in 264 s** — and the
+protected roots still name the developer's real home there, so a copy is held to
+the rule too. No test writes into the developer's home today: the property was
+BLIND, not violated, which is the second time this one has been and the honest
+description of what closing it changed.
+
+tests: **10 more in `tests/test_sandbox.py`** (68 → 78,
+`TestNoTestWritesInTheDeveloperDirs`) — the refusal before the write lands (a bare
+home path, and the two real shapes `~/.config/handsoff/…` and
+`~/.local/state/handsoff/…`, neither of which exists in a fresh home, so the guard
+is what refuses them), the message naming the directory and the fix, the predicate
+table (the sibling-prefix trap in the rule added second, the home directory
+itself), the checkout's precedence, the roots captured before any sandbox and NOT
+moved by one, a sandbox home staying writable from inside a load, a child the suite
+spawns refusing it while the same child writing into a fixture is allowed, the
+per-rule variables with the control that removes one, and the environment plus shim
+carrying the roots. **31/31 mutations caught, 0 missed, every restore
+sha256-verified** — the 23 of the previous pass re-pointed, plus eight for this
+rule (the root pointing at the wrong directory; the guard installed without the
+dirs; the child never told them; the shim ignoring what it was handed; the hook
+dropping the second rule; the boundary becoming a string prefix; the checkout
+losing its precedence; the rule following the live HOME). No probe leaked into the
+developer's home across the sweep — the mutant that disarms this rule is the one
+that would, and the harness cleans the paths those tests would leave.
+
+gates: `tests` PASS 256 s (**1 812 passed**), `coverage` PASS 262 s (**84.61%** ≥
+70 — 2 579 missing of 16 754 statements), `order` PASS 523 s in BOTH orderings,
+`compile` / `shell` / `smoke` PASS, **`clean-checkout` PASS 4 s**, **`two-writer`
+PASS** (`worktree unchanged since the run started`), `all gates passed`, exit 0.
+
+**Limits, stated.** The three the child half already carries apply unchanged (a
+bash child is not a Python interpreter; a hand-built environment does not carry the
+shim; the shim is silent when the guard module is missing at the given root). The
+roots are the same three the sandbox pins — HOME and the two XDG dirs the app
+resolves — so an `XDG_CACHE_HOME` pointing outside the home is NOT protected:
+caches are not what this project's user dirs mean, and widening it would refuse
+third-party cache writes (fontconfig, Qt) that no test controls. The rule protects
+PATHS, not owning tests: a write that reaches the real home through a child spawned
+with a hand-built environment is still out of reach — the same seam, stated the
+same way. And `clean-checkout` judges HEAD, so its PASS is about the commit rather
+than these uncommitted bytes.

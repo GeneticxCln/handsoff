@@ -27,9 +27,10 @@ import pytest
 import core
 from core import APP_MODULE_NAME, app_instance, app_module, load_app_module
 
-from conftest import HERE as ROOT, _GUARD_ENV, _REAL_HOME, \
-    _checkout_write_target, _load, _user_site, isolated_user_dirs, run_driver, \
-    sandbox_env, writes_into_the_checkout
+from conftest import HERE as ROOT, _GUARD_ENV, _PROTECTED_ENV, _REAL_HOME, \
+    _REAL_USER_DIRS, _checkout_write_target, _load, _user_site, forbidden_write, \
+    guarded_user_dirs, isolated_user_dirs, run_driver, sandbox_env, \
+    writes_into_the_checkout
 
 HERE = ROOT
 
@@ -629,6 +630,214 @@ if probe.exists():      # a guard that went quiet must still leave the tree clea
         # directory fd and unlinks by BARE NAME, so a guard that resolved those
         # names against the cwd would refuse every test that tidies its fixture.
         shutil.rmtree(tmp_path / "sub")
+
+
+class TestNoTestWritesInTheDeveloperDirs:
+    """The checkout is not the only tree a test can reach, and the other one is
+    the developer's own.
+
+    The suite runs with the developer's REAL home live — the user-dir sandbox
+    above covers a LOAD and restores afterwards — so a test that resolves a config
+    or state path without it writes into the developer's `~/.config` or
+    `~/.local/state` and leaves no trace of having done so: the file is simply
+    there afterwards. Measured, the hard way: the settings app's `apply_autostart`
+    wrote the real `~/.config/niri/config.kdl` from a test that only believed it
+    was writing into a temp home. The fix then was to sandbox that LOAD; this is
+    the property that would have failed the test instead of the developer's disk.
+
+    Same hook, second rule, and the checkout is asked FIRST — it has exemptions of
+    its own and it normally lives inside the protected home, so judging the user
+    dirs first would refuse pytest's `.pytest_cache` and stop the suite starting.
+    """
+
+    def test_a_write_into_the_developer_home_is_refused_before_it_lands(self):
+        probe = _real_home() / "zz_suite_home_probe.txt"
+        with pytest.raises(AssertionError, match="real user dirs"):
+            probe.write_text("a test's file\n", encoding="utf-8")
+        assert not probe.exists(), (
+            "the refusal has to arrive BEFORE the write: one that reports "
+            "afterwards has already put the file in the developer's home")
+
+    def test_a_config_or_a_state_path_is_refused_even_when_nothing_is_there(self):
+        """The two shapes the audit found, named: a settings write, and a state
+        file appended to. Neither exists in a fresh home, so the guard — not the
+        path — is what refuses them."""
+        for probe in (_real_home() / ".config" / "handsoff" / "zz_probe.json",
+                      _real_home() / ".local" / "state" / "handsoff"
+                      / "zz_probe.jsonl"):
+            with pytest.raises(AssertionError, match="real user dirs"):
+                probe.unlink()      # the guard refuses before the FileNotFoundError
+            assert not probe.exists()
+
+    def test_the_message_names_the_directory_and_the_fix(self):
+        """What the developer reads when this fires, and it is the whole remedy:
+        which directory is the developer's, and what to build instead."""
+        with pytest.raises(AssertionError) as excinfo:
+            (_real_home() / "zz_probe.txt").write_text("x", encoding="utf-8")
+        message = str(excinfo.value)
+        assert str(_real_home()) in message, message
+        assert "tmp_path" in message and "real user dirs" in message, message
+
+    def test_the_checkout_keeps_precedence_over_the_home_it_sits_in(self):
+        """The ordering, pinned on the PREDICATE so it holds wherever the suite
+        is run (a file-only copy has no home above it), plus one behavioural pass
+        that only bites where the checkout really is inside the home.
+
+        It is not cosmetic: the checkout's gitignored artifacts have to stay
+        writable, and a home-first guard refuses them — `ci/gates.sh` could not
+        even start, because pytest writes `.pytest_cache` in the tree it was
+        started in.
+        """
+        assert forbidden_write(ROOT / ".coverage") == "", (
+            "the checkout's own artifacts are exempt, and the checkout normally "
+            "lives inside the home: the checkout rule has to be asked first")
+        assert forbidden_write(ROOT / "handsoff.py") == str(ROOT / "handsoff.py"), (
+            "a checkout file is refused by the CHECKOUT rule, which is the "
+            "message a home-first guard would get wrong too")
+        probe = ROOT / "pytest-cache-files-zzprobe"
+        probe.mkdir()
+        (probe / "CACHEDIR.TAG").write_text("x", encoding="utf-8")
+        shutil.rmtree(probe)
+        assert not probe.exists()
+
+    def test_the_decision_table_for_the_developer_dirs(self):
+        """One row per way the second rule could be wrong."""
+        table = [
+            (_real_home() / ".config" / "handsoff" / "settings.json", True),
+            (_real_home() / ".local" / "state" / "handsoff"
+             / "cap-events.jsonl", True),
+            (_real_home() / "notes.txt", True),
+            # The home DIRECTORY itself: `rmdir` is a write too, and so is
+            # anything that would replace or rename it.
+            (_real_home(), True),
+            # A SIBLING whose name starts the same way is not inside it — the
+            # prefix trap, in the rule that was added second.
+            (Path(str(_real_home()) + "-backup") / "x", False),
+            (Path("/tmp") / "fixture", False),
+            # The checkout, judged by its own rule and its own exemptions.
+            (ROOT / "handsoff.py", True),
+            (ROOT / ".coverage", False),
+            (ROOT / "__pycache__" / "x.pyc", False),
+        ]
+        for path, forbidden in table:
+            assert bool(forbidden_write(path)) is forbidden, (
+                f"{path}: expected {'refused' if forbidden else 'allowed'}")
+
+    def test_the_dirs_protected_are_the_ones_captured_before_any_sandbox(self):
+        """The wiring, and the one property this rule has to have: the roots come
+        from conftest's import time, not from whatever HOME says now. A root read
+        live would follow every sandbox and protect a throw-away directory while
+        the developer's real home stayed open — silently, which is the failure
+        mode all of this exists to stop looking like success."""
+        assert _REAL_USER_DIRS, "no user dirs were captured: nothing is protected"
+        assert str(_real_home()) in _REAL_USER_DIRS
+        for directory in _REAL_USER_DIRS:
+            assert os.path.isabs(directory) and directory != os.sep, (
+                f"{directory}: a relative root, or /, forbids every write there "
+                f"is — the guard has to protect the developer's dirs and no more")
+        assert tuple(guarded_user_dirs()) == tuple(_REAL_USER_DIRS), (
+            "the guard installed in this process was not told the dirs conftest "
+            "captured")
+        with isolated_user_dirs() as sandbox:
+            assert Path.home() == sandbox != _real_home(), (
+                "the sandbox did not move HOME, so this test proves nothing")
+            assert tuple(guarded_user_dirs()) == tuple(_REAL_USER_DIRS), (
+                "the protected dirs moved with the sandbox: they are supposed to "
+                "be the developer's, captured before any of this ran")
+
+    def test_the_sandbox_home_stays_writable_from_inside_one(self):
+        """The rule is against the CAPTURED paths, not against writing in a home:
+        a load's throw-away home is exactly the fixture the sandbox exists to
+        create, so refusing it would break every test that exercises the code the
+        way the app resolves its own directories."""
+        with isolated_user_dirs() as sandbox:
+            config = Path(sandbox) / ".config" / "handsoff"
+            config.mkdir(parents=True)
+            (config / "settings.json").write_text("{}", encoding="utf-8")
+            state = Path(sandbox) / ".local" / "state" / "handsoff"
+            state.mkdir(parents=True)
+            (state / "cap-events.jsonl").write_text("", encoding="utf-8")
+            # ...and the developer's real one is refused from in there too, which
+            # is the point of a rule that does not follow the live HOME.
+            with pytest.raises(AssertionError, match="real user dirs"):
+                (_real_home() / "zz_probe.json").write_text("x", encoding="utf-8")
+
+    #: The same child, taking the directory to write into as an ARGUMENT rather
+    #: than reading the guard's variables: those are the wiring under test.
+    CHILD_HOME_PROBE = '''\
+import pathlib, sys
+child = sys.modules.get("checkout_guard")
+print("protected:", child.protected() if child else "NONE")
+probe = pathlib.Path(sys.argv[1]) / "zz_child_home_probe.txt"
+try:
+    probe.write_text("child", encoding="utf-8")
+    print("WROTE")
+except AssertionError as exc:
+    print("REFUSED:", str(exc).splitlines()[0])
+print("exists:", probe.exists())
+if probe.exists():      # a guard that went quiet must still leave the home clean
+    probe.unlink()
+    print("cleaned")
+'''
+
+    def test_a_child_the_suite_spawns_is_refused_the_developer_dirs_too(
+            self, tmp_path):
+        """The suite's children are where most of its behaviour runs, and a child
+        cannot answer "which dirs are the developer's?" from its own environment —
+        its HOME is a throw-away one — so the parent has to name them."""
+        proc = run_driver(["-", str(_real_home())], input=self.CHILD_HOME_PROBE,
+                          capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        assert "REFUSED:" in proc.stdout and "real user dirs" in proc.stdout, (
+            "the child wrote into the developer's home:\n" + proc.stdout)
+        assert f"protected: ('{_real_home()}'" in proc.stdout, (
+            "the child has to protect the SAME dirs this process does: it cannot "
+            "derive them from its own HOME, which is a throw-away one\n"
+            + proc.stdout)
+        assert "exists: False" in proc.stdout
+        assert not (_real_home() / "zz_child_home_probe.txt").exists()
+        # The same child, the same code, a FIXTURE instead: a refusal is only
+        # evidence next to a write that still lands where it should.
+        ok = run_driver(["-", str(tmp_path)], input=self.CHILD_HOME_PROBE,
+                        capture_output=True, text=True)
+        assert ok.returncode == 0, ok.stderr
+        assert "WROTE" in ok.stdout and "exists: True" in ok.stdout \
+            and "cleaned" in ok.stdout, ok.stdout
+
+    def test_the_variable_is_what_the_child_protection_hangs_on(self):
+        """The control, and it deliberately does NOT write into the home to prove
+        the point the way the checkout half's control does: the difference would
+        have to be shown on the developer's real files. So it writes into the
+        CHECKOUT instead — refused, because that rule's variable is still set —
+        while the child reports protecting no user dirs at all. Two variables,
+        two rules, and the removal of one leaves the other working.
+        """
+        env = sandbox_env()
+        env.pop(_PROTECTED_ENV)
+        proc = subprocess.run([sys.executable, "-", str(ROOT)],
+                              input=self.CHILD_HOME_PROBE, env=env,
+                              cwd=str(ROOT), capture_output=True, text=True,
+                              timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        assert "protected: ()" in proc.stdout, (
+            "the child protected user dirs with nothing naming them:\n"
+            + proc.stdout)
+        assert "REFUSED:" in proc.stdout and "wrote inside the checkout" \
+            in proc.stdout, (
+            "dropping the user-dir variable dropped the checkout rule too, so "
+            "the two rules are not separate variables\n" + proc.stdout)
+
+    def test_the_child_environment_carries_the_protected_dirs(self):
+        env = sandbox_env()
+        assert env[_PROTECTED_ENV] == os.pathsep.join(_REAL_USER_DIRS)
+        assert env[_PROTECTED_ENV].split(os.pathsep)[0] != env["HOME"], (
+            "the child's own HOME is a sandbox, so the dirs it protects have to "
+            "be the developer's real ones, named by the parent")
+        shim = Path(env["PYTHONPATH"].split(os.pathsep)[0],
+                    "sitecustomize.py").read_text(encoding="utf-8")
+        assert _PROTECTED_ENV in shim and "protected=" in shim, (
+            "the shim has to hand the dirs to install(), or a child has the "
+            "checkout rule only")
 
 
 class TestChildProcessDriversUseTheSameSandbox:

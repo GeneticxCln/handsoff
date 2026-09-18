@@ -9,7 +9,7 @@ Sources: `tests/` (30 files + `conftest.py` + `checkout_guard.py` + `fake_ollama
 
 `tests/` — the FILE LIST is the contract: every `tests/test_*.py` must appear
 below, and `test_specs_freshness.py` fails when one does not. The counts are the
-2026-09-17 snapshot (1708 collected), so a stale count in this table means
+2026-09-18 snapshot (1812 collected), so a stale count in this table means
 nothing — a missing row does.
 
 | File | `test_*` fns | Area |
@@ -26,7 +26,7 @@ nothing — a missing row does.
 | `test_ops.py` | 67 | deploy snapshot, restart, control socket, health/doctor |
 | `test_web.py` | 64 | router, backends, cache, reader, SSRF refusals |
 | `test_fault_injection.py` | 52 | boundary breakage, loud-degradation contract |
-| `test_sandbox.py` | 68 | secret paths, edit boundaries, command validation, and the checkout-write guard's own teeth (the refusal, its decision table, the exemptions, the event rules, and the CHILD half — a spawned child is refused, the same child with the variable removed is not, and the shim it runs is the pointer rather than a second copy of the rules) |
+| `test_sandbox.py` | 78 | secret paths, edit boundaries, command validation, and the write guard's own teeth (the refusal, its decision table, the exemptions, the event rules, the CHILD half — a spawned child is refused, the same child with the variable removed is not, and the shim it runs is the pointer rather than a second copy of the rules — and the DEVELOPER'S USER DIRS, the second rule: `~/.config` and `~/.local/state` refused before the write lands, the message naming the directory and the fix, the roots captured before any sandbox (so they do not follow a load's throw-away HOME), the checkout keeping precedence over the home it sits inside, and one variable per rule) |
 | `test_calendar.py` | 45 | ICS parse/RRULE/format, scheme + label guards |
 | `test_ci_summary.py` | 42 | `ci/pytest_summary.py` digest |
 | `test_ci_clean_checkout.py` | 14 | the clean-checkout gate: HEAD in a scratch worktree, the guard run THERE (refusing a commit whose plan/key census/citations disagree with a clean checkout), the cleanup before the verdict, the SKIPs, the wiring, and the HARNESS ENVIRONMENT (git's plumbing — the `GIT_INDEX_FILE` and author identity a pre-commit hook is handed — dropped before a child builds its own repository, with a probe hook as the authority on what git really exports) |
@@ -45,7 +45,7 @@ nothing — a missing row does.
 | `test_specs_freshness.py` | 19 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |
 | `test_settings_gui.py` | 1 (+ offscreen subprocess drivers) | Qt GUI incl. 10-design ink guard |
 | `conftest.py` / `fake_ollama.py` | 0 | module loader (`handsoff_core` + alias), order-shuffle, the user-dir sandbox, the checkout-write audit hook installed for this process, the `sitecustomize` shim that carries it into every python child the suite spawns, fake brain |
-| `checkout_guard.py` | 0 | the checkout-write property's ONE home: the audit hook, the event table and its per-event rules, the exemptions, and the `install()` that both this process and every child call |
+| `checkout_guard.py` | 0 | the write property's ONE home: the audit hook, the event table and its per-event rules, the two rules it applies (the checkout, and the developer's real user dirs — the checkout first, because it has exemptions), the exemptions, and the `install()` that both this process and every child call |
 
 ## 2. CI gates (GitHub authoritative, GitLab mirrors)
 

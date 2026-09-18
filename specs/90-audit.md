@@ -263,6 +263,18 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    forbidden. Measured, and this is the part worth knowing: no python child the
    suite spawns writes into the checkout today, so the property was blind rather
    than violated — 1 801 tests pass with every child armed.
+10. **DONE (2026-09-18):** the same hook now refuses a write into the developer's
+   REAL user directories, which is the tree the checkout sits inside — see the
+   section at the end of this file. The failure this closes is quiet by
+   construction: the suite runs with the real HOME live (the user-dir sandbox
+   covers a LOAD and restores afterwards), so a test that resolves a config or
+   state path without it writes to `~/.config` or `~/.local/state` and nothing
+   downstream can tell it happened — measured once already, when the settings
+   app's `apply_autostart` wrote the real `~/.config/niri/config.kdl`. The roots
+   are captured before any sandbox runs and handed to children explicitly (a
+   child's HOME is a throw-away one, so it cannot name them itself), and the
+   checkout rule is applied FIRST because it has exemptions and normally lives
+   inside the protected home.
 
 ## core/lifecycle.py seam exists but has no production caller — CLOSED (2026-09-17)
 
@@ -622,3 +634,88 @@ constructor; the children that do that today are bash and git, not Python. And t
 shim's silent no-op when the guard module is missing at the root it was given is
 deliberate — a child that died at start-up would fail for a reason unrelated to
 what it was testing — with the module's presence pinned at the source instead.
+
+## The guard refuses the developer's real user dirs too — CLOSED (2026-09-18)
+
+**What was asked.** The checkout is not the only tree a test can reach. Extend the
+same hook to the developer's real user directories, so a test that hand-writes
+`~/.config` or `~/.local/state` fails instead of landing there.
+
+**Why it is a different failure from the checkout rule.** The suite runs with the
+developer's OWN home live: the user-dir sandbox swaps HOME/XDG for the duration of
+a LOAD and restores it, so a test that resolves a config or state path by any
+other route — a module loaded before the sandbox, a child built with a hand-made
+environment, a path resolved from `pwd` or from a constant — writes into the
+developer's real files and leaves nothing behind to say so. Not hypothetical, and
+not caught by anything: the settings app's `apply_autostart` wrote the real
+`~/.config/niri/config.kdl` from a test that only believed it was writing into a
+temp home, and the fix then was to sandbox that load. Nothing noticed the file.
+The checkout rule would not have fired either — the path is a sibling of the
+checkout, not a file in it.
+
+**The roots are passed in, never read from the environment.** `install(root,
+protected=...)` takes them, conftest captures them while it is imported — the same
+moment and the same reason as `_REAL_HOME`, before any sandbox can move HOME — and
+names them for a child in `HANDSOFF_GUARD_USER_DIRS`, a SECOND variable beside the
+checkout one. The child cannot answer the question itself: its HOME is a
+throw-away directory, so a guard that derived the roots from its own environment
+would protect a sandbox home and leave the developer's real one open, silently.
+Two variables, two rules, and the control removes one to show the other still
+works.
+
+**The checkout is asked first, and the order is load-bearing.** The checkout
+normally lives inside the protected home, so judging the user dirs first would
+refuse pytest's own `.pytest_cache` — the suite could not start. A checkout path
+is therefore exempt exactly as before (`.coverage*`, `report*.xml`, bytecode and
+cache directories), and a checkout file is still refused by the checkout rule,
+which is the message a home-first guard would get wrong. Both halves are pinned:
+the predicate table, and a test that creates and removes a `pytest-cache-files-*`
+directory at the root of the tree.
+
+**The sweep found a weakness in the guard itself, which is the reason to run it.**
+The mutant that made the rule follow the LIVE home instead of the captured paths
+was, at first, refused with the message about the CHECKOUT: `_message` asked "which
+protected root matched this path?" and, when none did, fell through to the
+checkout text. The refused path was in a sandbox home and the message named the
+wrong tree — from the guard, to a developer trying to read it. The dispatcher now
+asks WHERE the path is, which is the same question the hook asked, so the two
+cannot disagree. Two more mutants shaped the sweep itself: the blunt form of
+"reads count as writes" (drop the flags check for every path) used to be caught at
+collection and now dies even earlier, in the interpreter's start-up reads of the
+developer's user site-packages — so it proves nothing about this guard and the
+mutant is scoped to the checkout, where its evidence is the refusal text (reading
+is how the runner loads its own files, so no test assertion is reachable).
+
+**Measured.** The whole suite in the working tree: **1 812 passed**. The same tree
+in a copy with no `.git` anywhere: **1 812 passed, 0 skipped in 264 s** — where the
+protected roots still name the developer's real home, so the copy is held to the
+rule too. No test writes into the developer's home today, which is the second time
+this property has been BLIND rather than violated, and the honest description of
+what closing it changed.
+
+**Teeth: 10 more tests in `tests/test_sandbox.py`** (68 → 78), in
+`TestNoTestWritesInTheDeveloperDirs`: the refusal before the write lands, at a
+direct home path and at the two real shapes (`~/.config/handsoff/…`,
+`~/.local/state/handsoff/…`), the message naming the directory and the fix, the
+predicate table (including the sibling-prefix trap in the rule added second, and
+the home directory itself), the checkout's precedence, the roots captured before
+any sandbox and NOT moved by one, the sandbox home staying writable from inside a
+load, a child the suite spawns refusing it while the same child writing into a
+fixture is allowed, the per-rule variables with the control that removes one, and
+the environment plus shim carrying the roots. **31/31 mutations caught, 0 missed,
+every restore sha256-verified** — the 23 of the previous section re-pointed, plus
+eight for this rule: the protected root pointing at the wrong directory, the guard
+installed without the dirs, the child never told them, the shim ignoring what it
+was handed, the hook dropping the second rule, the boundary becoming a string
+prefix, the checkout losing its precedence, and the rule following the live HOME.
+
+**Limits.** The same three the child half states (a bash child is not a Python
+interpreter; a hand-built environment does not carry the shim; the shim is silent
+when the guard module is missing) apply here unchanged. The roots are the same
+three the sandbox pins — HOME and the two XDG dirs the app resolves — so a
+`XDG_CACHE_HOME` pointing outside the home is NOT protected: caches are not what
+this project's user dirs mean, and widening it would refuse third-party cache
+writes (fontconfig, Qt) that no test controls. And the rule protects PATHS, not
+owning tests: a write that reaches the real home through a child spawned with a
+hand-built environment is still out of reach, which is the same seam, stated the
+same way.

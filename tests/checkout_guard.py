@@ -24,11 +24,28 @@ suite spawns (the offscreen GUI scenarios, `run_driver` drivers, and any `python
 a bash child starts). A child is not a lesser case: it is where the largest part
 of the suite's behaviour actually runs.
 
-Exempt: the tooling's own gitignored output, which pytest and coverage write
-rather than a test — bytecode caches, `.pytest_cache` (and the
+The same hook also refuses a write into the developer's REAL user directories,
+because the checkout is not the only tree a test can reach. The suite runs with
+the developer's own HOME live — the user-dir sandbox swaps it for the duration of
+a LOAD and restores it — so a test that resolves a config or state path without
+going through that sandbox writes into the developer's `~/.config` or
+`~/.local/state` and reports nothing: the file is simply there afterwards.
+Measured, the hard way: the settings app's `apply_autostart` wrote the real
+`~/.config/niri/config.kdl` from a test that only believed it was writing into a
+temp home, and the fix was to sandbox the LOAD — nothing else noticed the file.
+The roots are named by whichever process installs the guard rather than read from
+the environment: conftest captures them at import, before any sandbox runs, and a
+CHILD's HOME is a throw-away one, so only a process that remembers the real paths
+can protect them.
+
+Exempt, for the checkout only: the tooling's own gitignored output, which pytest
+and coverage write rather than a test — bytecode caches, `.pytest_cache` (and the
 `pytest-cache-files-*` directory pytest builds it in and renames into place, which
 is what a suite run in a file-only copy writes first), `.ruff_cache`, the coverage
-data file and its shards, and the junit reports the gates ask pytest for.
+data file and its shards, and the junit reports the gates ask pytest for. The
+checkout rule is asked FIRST for exactly this reason: the checkout normally lives
+inside the developer's home, so judging the user dirs first would refuse pytest's
+own artifacts.
 """
 from __future__ import annotations
 
@@ -82,23 +99,50 @@ _CREATE_ONLY_EVENTS = ("os.mkdir", "os.link", "os.symlink")
 _ROOT = ""
 _ROOT_PREFIX = ""
 
+#: The developer's real user directories, set by `install()` — the paths a load
+#: that MISSED the sandbox bakes, and a test then writes into. Same refusal as the
+#: checkout root: empty means the guard does not know them yet, and answering
+#: "allowed" to everything is how a guard that was never told looks identical to a
+#: suite that had nothing to refuse.
+_PROTECTED: tuple = ()
 
-def install(root) -> None:
-    """Arm the guard for `root`, in this process. Idempotent, and never undone.
+
+def install(root, protected=()) -> None:
+    """Arm the guard for `root` and the developer's `protected` dirs, here.
 
     An audit hook cannot be removed once added, so this is deliberately a
     one-way switch: whoever asks first (the suite's conftest, or the shim in a
-    child) decides the tree, and a second call for a different root would be a
-    bug worth shouting about rather than quietly re-pointing the guard.
+    child) decides what is protected, and a second call that disagrees would be a
+    bug worth shouting about rather than quietly re-pointing the guard — so the
+    tree and the user dirs are both checked, not overwritten.
+
+    `protected` is passed IN rather than read from the environment, because a
+    child's HOME is a throw-away one: only the process that still remembers the
+    developer's real paths can name them, and `tests/conftest.py` captures them
+    at import time, before any sandbox runs.
     """
-    global _ROOT, _ROOT_PREFIX
+    global _ROOT, _ROOT_PREFIX, _PROTECTED
     root = os.path.normpath(str(root))
     if _ROOT and _ROOT != root:
         raise RuntimeError(
             f"the checkout-write guard is already installed for {_ROOT} and was "
             f"asked for {root}: one process, one checkout")
+    directories = []
+    for path in protected:
+        path = os.path.normpath(str(path))
+        # `/` is every path there is, and a relative name is not a directory: a
+        # root either of those would protect would forbid all writing at all.
+        if not path or path == os.sep or not os.path.isabs(path):
+            continue
+        if path not in directories:
+            directories.append(path)
+    if _PROTECTED and tuple(directories) != _PROTECTED:
+        raise RuntimeError(
+            f"the write guard already protects {_PROTECTED} and was asked for "
+            f"{tuple(directories)}: one process, one set of user dirs")
     _ROOT = root
     _ROOT_PREFIX = root + os.sep
+    _PROTECTED = tuple(directories)
     sys.addaudithook(_hook)
 
 
@@ -111,6 +155,26 @@ def root() -> str:
     directory would still refuse the write the test is watching for.
     """
     return _ROOT
+
+
+def protected() -> tuple:
+    """The developer's user dirs this process refuses to let a test write into.
+
+    Public for the same reason `root()` is: a CHILD has to be able to answer it.
+    Its own HOME is a sandbox, so a guard that read the dirs from its environment
+    instead of being TOLD them would protect the wrong home — silently, and in
+    the process where most of the suite's behaviour runs.
+    """
+    return _PROTECTED
+
+
+def _require_installed() -> None:
+    """Refuse to answer before `install()`: an unconfigured guard allows everything."""
+    if not _ROOT:
+        raise RuntimeError(
+            "the write guard was asked about a path before install() told it "
+            "which checkout to judge — refusing to answer, because an "
+            "unconfigured guard allows everything")
 
 
 def _writable_path(path, dir_fd=None) -> str:
@@ -162,19 +226,57 @@ def _exempt_checkout_artifact(path: str) -> bool:
 def writes_into_the_checkout(path, dir_fd=None) -> str:
     """The file this path would write inside the checkout, or "" when it may.
 
-    ONE definition of the property, so the hook and the tests that guard it can
-    never disagree about what it forbids: "" means allowed (outside the checkout,
-    or an artifact of the tooling), anything else is the path to refuse.
+    ONE definition of this half of the property, so the hook and the tests that
+    guard it can never disagree about what it forbids: "" means allowed (outside
+    the checkout, or an artifact of the tooling), anything else is the path to
+    refuse. `forbidden_write` is the two halves as one answer.
     """
-    if not _ROOT:
-        raise RuntimeError(
-            "the checkout-write guard was asked about a path before install() "
-            "told it which checkout to judge — refusing to answer, because an "
-            "unconfigured guard allows everything")
+    _require_installed()
     target = _writable_path(path, dir_fd)
     if not target or not target.startswith(_ROOT_PREFIX):
         return ""
     return "" if _exempt_checkout_artifact(target) else target
+
+
+def _in(path: str, root: str) -> bool:
+    """Containment by BOUNDARY, not by shared prefix: `/home/u-data` is not
+    inside `/home/u`. The string-prefix version of this admitted a sibling
+    directory whose name merely started the same way."""
+    return path == root or path.startswith(root + os.sep)
+
+
+def _protected_root_of(path: str) -> str:
+    """The developer's user dir this path is inside, or "" when it is not."""
+    for directory in _PROTECTED:
+        if _in(path, directory):
+            return directory
+    return ""
+
+
+def writes_into_the_developer_dirs(path, dir_fd=None) -> str:
+    """The developer's real user-dir file this would write, or "" when it may.
+
+    A path INSIDE the checkout is not this predicate's business: the checkout
+    rule owns everything under it, exemptions included, and the checkout normally
+    lives in the developer's home — so asking this one first would refuse
+    pytest's own `.coverage` and `.pytest_cache` and stop the suite from running.
+    """
+    _require_installed()
+    target = _writable_path(path, dir_fd)
+    if not target or target.startswith(_ROOT_PREFIX):
+        return ""
+    return target if _protected_root_of(target) else ""
+
+
+def forbidden_write(path, dir_fd=None) -> str:
+    """The path this write may not land on for ANY reason, or "" — one answer.
+
+    The hook and the tests both ask this, so the two cannot disagree about the
+    ORDER the rules are applied in: the checkout first, because it is the
+    narrower rule and it has exemptions, then the developer's user dirs.
+    """
+    return writes_into_the_checkout(path, dir_fd) \
+        or writes_into_the_developer_dirs(path, dir_fd)
 
 
 def target_of_event(event: str, args) -> str:
@@ -183,7 +285,7 @@ def target_of_event(event: str, args) -> str:
         flags = args[2] if len(args) > 2 else None
         if not isinstance(flags, int) or not flags & _WRITE_FLAGS:
             return ""
-        return writes_into_the_checkout(args[0])
+        return forbidden_write(args[0])
     spec = _WRITE_EVENTS.get(event)
     if spec is None:
         return ""
@@ -192,7 +294,7 @@ def target_of_event(event: str, args) -> str:
     for position in positions:
         if position >= len(args):
             continue
-        target = writes_into_the_checkout(args[position], fd)
+        target = forbidden_write(args[position], fd)
         if not target:
             continue
         if event in _CREATE_ONLY_EVENTS and os.path.exists(target):
@@ -202,6 +304,22 @@ def target_of_event(event: str, args) -> str:
 
 
 def _message(target: str, event: str) -> str:
+    # Which rule refused is decided by WHERE the path is, not by re-running the
+    # predicates: a message that asked "which root matched" would, for a path the
+    # user-dir rule refused and no captured root covers, fall through and blame
+    # the checkout — a message about the wrong tree, from the guard itself.
+    if not target.startswith(_ROOT_PREFIX):
+        root = _protected_root_of(target) or "the developer's real user dirs"
+        return (
+            f"a test wrote into the developer's real user dirs: {target} "
+            f"({event}), under {root}\n"
+            f"That is not a fixture: the suite runs with the developer's own HOME "
+            f"live, so a path resolved without the user-dir sandbox reads and "
+            f"writes their real config and state, and nothing downstream can tell "
+            f"it happened. Build the file under tmp_path, or point HOME/XDG_* at a "
+            f"throw-away home (`conftest.isolated_user_dirs` for a load, "
+            f"`conftest.sandbox_env` for a child) if the code under test resolves "
+            f"them itself.")
     return (
         f"a test wrote inside the checkout: {target} ({event})\n"
         f"Build it under tmp_path — a fixture the test owns — instead. The suite "

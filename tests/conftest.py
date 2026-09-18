@@ -33,8 +33,9 @@ from core import registry as _core_registry
 
 # The checkout-write property has ONE home (`tests/checkout_guard.py`) because it
 # has to hold in two kinds of process — see the block that installs it below.
-from checkout_guard import install as install_checkout_guard, \
-    target_of_event as _checkout_write_target, writes_into_the_checkout  # noqa: F401
+from checkout_guard import forbidden_write, install as install_checkout_guard, \
+    protected as guarded_user_dirs, target_of_event as _checkout_write_target, \
+    writes_into_the_checkout, writes_into_the_developer_dirs  # noqa: F401
 
 HERE = Path(__file__).resolve().parent.parent   # the repo root
 
@@ -138,6 +139,20 @@ _SANDBOX_VARS = ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME")
 # sandbox runs, and therefore still the real one whenever a later check needs to
 # ask "is this path the developer's?".
 _REAL_HOME = Path(os.path.expanduser("~"))
+
+# The developer's real user dirs, for the OTHER half of the write guard: the
+# checkout is not the only tree a test can reach. The suite runs with the real
+# HOME live (the sandbox covers a LOAD, and restores it afterwards), so a test
+# that resolves a config or state path without that sandbox writes into the
+# developer's ~/.config or ~/.local/state and nothing downstream can tell.
+# Captured at the same moment as `_REAL_HOME`, and passed to every child rather
+# than derived there: a child's HOME is a throw-away one, so only a process that
+# still remembers the real paths can protect them. Same three roots the sandbox
+# pins, which is what "the developer's user dirs" means in this suite.
+_REAL_USER_DIRS = tuple(dict.fromkeys(
+    [str(_REAL_HOME)] +
+    [os.path.normpath(os.environ[var]) for var in _SANDBOX_VARS[1:]
+     if os.environ.get(var)]))
 
 # Path constants a loaded module bakes from HOME/XDG at import. `_load` uses
 # them to REFUSE a load that kept the developer's real ones, so the property is
@@ -270,20 +285,30 @@ def sandbox_env(home=None) -> dict:
     # every driver the suite runs are children, so they are where the property was
     # blind until it learned to travel.
     env[_GUARD_ENV] = str(HERE)
+    # A child's HOME is a sandbox, so it cannot answer "which dirs are the
+    # developer's?" from its own environment — the parent NAMES them, and the shim
+    # hands them to the same module.
+    env[_PROTECTED_ENV] = os.pathsep.join(_REAL_USER_DIRS)
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in (_guard_shim_dir(), str(HERE), _user_site(),
                     env.get("PYTHONPATH", "")) if p)
     return env
 
 
-# ------------------------------------------- no test writes in the checkout
-# The property has ONE home — `tests/checkout_guard.py` — because it has to hold
-# in TWO kinds of process: the suite's own, and every python child it spawns
-# (`run_driver` drivers, the offscreen GUI scenarios, any `python3` a bash child
-# starts). This block installs it here and exports the means of installing it
-# there; the full story — why it is enforced at the write rather than diffed
-# afterwards, what is exempt, and the limits — is the module's docstring.
+# --------------------------------- no test writes where it must not, anywhere
+# ONE property, ONE home for it — `tests/checkout_guard.py` — because it has to
+# hold in TWO kinds of process (the suite's own, and every python child it spawns:
+# `run_driver` drivers, the offscreen GUI scenarios, any `python3` a bash child
+# starts) and over TWO trees (the checkout, and the developer's real user dirs,
+# which the checkout normally sits inside). This block installs it here and
+# exports the means of installing it there; the full story — why it is enforced at
+# the write rather than diffed afterwards, what is exempt, and the limits — is the
+# module's docstring.
 _GUARD_ENV = "HANDSOFF_CHECKOUT_GUARD"
+#: The developer's real user dirs, for the child to protect. Separate from the
+#: variable above because it answers a different question: a child points at the
+#: same checkout but cannot name the developer's home from its own environment.
+_PROTECTED_ENV = "HANDSOFF_GUARD_USER_DIRS"
 _GUARD_SHIM = '''\
 """Install the suite's checkout-write guard in this child.
 
@@ -293,6 +318,10 @@ python child has, whatever its argv (`-c`, a script, `-m pytest`, something bash
 started). Without HANDSOFF_CHECKOUT_GUARD set it does nothing, so its presence
 changes nothing outside the suite; with it set, the checkout's own guard module is
 what decides, so parent and child cannot drift about what is forbidden.
+
+The developer's user dirs come from a SECOND variable and are handed to
+`install()`: this child's own HOME is a throw-away one, so the paths to protect
+can only come from a parent that still remembers the real ones.
 """
 import importlib.util
 import os
@@ -307,7 +336,10 @@ if _root:
         _module = importlib.util.module_from_spec(_spec)
         sys.modules.setdefault("checkout_guard", _module)
         _spec.loader.exec_module(_module)
-        _module.install(_root)
+        _module.install(
+            _root,
+            protected=tuple(d for d in os.environ.get(
+                "HANDSOFF_GUARD_USER_DIRS", "").split(os.pathsep) if d))
 '''
 _GUARD_SHIM_DIR: list[str] = []
 
@@ -332,7 +364,7 @@ def _guard_shim_dir() -> str:
     return _GUARD_SHIM_DIR[0]
 
 
-install_checkout_guard(HERE)
+install_checkout_guard(HERE, protected=_REAL_USER_DIRS)
 
 
 
