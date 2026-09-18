@@ -6767,3 +6767,87 @@ silent, which is the honest answer, not a verdict); the resolution is the gate's
 window, so the placement says which part of the gate, never the instant; and a
 write to an IGNORED path is deliberately outside the rule, because those are the
 run's own artifacts.
+
+## The gate that is a clean checkout (2026-09-18)
+
+**What it is.** `ci/gates.sh` grew a ninth gate, `clean-checkout`, registered
+between `smoke` and `two-writer` —
+`ALL_GATES="tests order coverage compile shell smoke clean-checkout two-writer"`.
+HEAD is laid down in a scratch `git worktree` (`mktemp -d -t
+handsoff-clean-XXXXXX`, deliberately outside the repo) and
+tests/test_specs_freshness.py is run THERE, so a commit whose test plan, key
+census or spec citations disagree with a clean checkout is refused by the gate
+that made it instead of by whoever clones next. The GUARD rather than the suite,
+because that guard is the part of the suite whose verdict is about files rather
+than about behaviour: 4 s against the suite's 4 min.
+
+**Why the worktree is the whole trick.** `worktree add --detach --quiet "$tree"
+HEAD` — the tree a reader gets is the COMMIT, never a copy of this checkout,
+which would carry the same uncommitted files the gate exists to discount (a
+mutant that swapped in a `cp -a`, and one that checked out `HEAD~1`, are both
+caught). Disposal is the temp dir plus `worktree remove` + `rm -rf` + `worktree
+prune`, and all of it runs BEFORE any verdict is printed: a refusal that leaves a
+registration behind damages the very checkout it reports about, and `git worktree
+list` is how the developer would find it. A repo that is not a worktree, an
+unborn HEAD, a failed `worktree add`, or a HEAD carrying no such guard is a SKIP
+with its reason — never a pass. Registered before `two-writer`, which stays last
+because it compares the worktree, and nothing may run after that comparison.
+
+**Measured, live.** Here, on a dirty checkout (HEAD `5ae49f1`): `clean-checkout
+PASS 4s`, the guard's 19 tests green inside the scratch worktree — the tests it ran
+are the COMMITTED ones, which is the point. Against `bd9cf5a` (the commit a hand
+check found inconsistent): REFUSED, exit 1, with all three failures printed —
+`test_the_settings_key_census_matches_every_place_a_spec_states_it`,
+`test_the_test_plan_lists_every_test_file`,
+`test_no_spec_restates_a_module_size_outside_the_tables` — then the reproduce
+line. Against a scratch commit of the same class (the new test file committed, its
+plan row deleted): REFUSED again, naming `tests/test_ci_clean_checkout.py` as the
+file the plan does not mention. After every one of those runs `git worktree list`
+shows one entry: this checkout.
+
+**Found by committing: the suite runs UNDER the pre-commit hook, and git exports
+its plumbing to that hook.** The first attempt at this commit was rejected by the
+hook because three of the end-to-end tests here failed — only there, and never
+when they were run alone. Git hands that hook `GIT_INDEX_FILE=.git/index`,
+`GIT_PREFIX` and an author identity; the fixture environment was
+`dict(os.environ)`, so the scratch repo built from it could not lay HEAD down
+(`git worktree add` failed inside it) and the gate SKIPPED the thing it exists to
+check. The harness is the defect rather than the gate: a child that builds its
+OWN repository now drops git's plumbing (one constant, `GIT_PLUMBING`), held by
+two guards — one plants the variables and asserts the child environment comes out
+clean, one reads what a REAL probe hook is handed and asserts that list covers
+it. The probe is the authority on purpose: hand-written, the list was missing two
+of the names git actually exports.
+
+**Verification.** 14 guards in `tests/test_ci_clean_checkout.py` (7 wiring, 4
+end-to-end, 3 on the harness environment) on a scratch repo whose guard is
+committed and whose needed file is not, plus the `shell_function` slice moved into
+`tests/conftest.py` so both gate test files share one reader of `ci/gates.sh`.
+**20/20 mutations caught, 2/2 probes green, 0 misses, every restore
+sha256-verified** (`/tmp/clean_sweep/sweep.py`, five of the mutants aimed at the
+harness environment) —
+and the sweep is what found the hole in the guard: `"worktree add --detach" in
+body` was satisfied by the gate's own REPRODUCE HINT (it prints `git worktree add
+--detach /tmp/x HEAD`), so two mutants that removed `--detach` from the command
+that actually runs stayed green. The assertion pins `worktree add --detach --quiet
+"$tree" HEAD` now, and a mutant spelling `--detach` as its short form `-d` is
+caught with the rest.
+
+**Green on the final bytes**, each invocation stamped and ending in the tree
+verdict: `tests` PASS 245 s (**1 772 passed** — the 1 758 of the last run plus
+these fourteen), `coverage` PASS 250 s (**84.59%** ≥ 70, 2 581 missing of 16 754
+statements), `order` PASS 491 s in BOTH orderings (seed 5ae49f1, 1 772 each),
+`compile` / `shell` / `smoke` PASS, **`clean-checkout` PASS 4 s**, **`two-writer`
+PASS** (`worktree unchanged since the run started`), `all gates passed`, exit 0.
+(The seconds are this run's, not a promise: two runs of the same tree differ by
+seconds, which is why none of them is asserted anywhere.)
+
+**Stated limits.** One guard, not the suite: the gate answers "is this commit
+consistent with its own plan and citations", and "does a clean checkout pass
+everything" is still CI's job (the whole suite per run is what this gate
+unashamedly trades away). It judges HEAD, so a commit that agrees with itself
+while being wrong about the code is not its business. It also cannot judge an
+OLDER commit as itself: the `bd9cf5a` proof works by copying the current
+`ci/gates.sh` into a scratch worktree of that commit, because a checkout that
+predates the gate cannot run it — so the history before this gate is unjudged by
+it, and only future commits are covered by default.

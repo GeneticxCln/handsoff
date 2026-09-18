@@ -223,3 +223,82 @@ that ran outside it must be observed blocked), a spy on
 module, a property/view test fails if `_gen` stops reading the counter (a
 stored copy is how they would drift), and a source guard bans the raw increment
 from the host entirely while asserting the module still holds it.
+
+## A commit is only consistent with the checkout that made it — CLOSED (2026-09-18)
+
+**The gap, named by the entry above and left open in it.** The freshness guard
+reads the test plan, the settings-key census and the spec citations out of FILES,
+and every file it reads is committed while the checkout it runs in also holds
+files the commit does not. So a commit can be green here and red in a clone: the
+entry above closed that gap BY HAND, once (a fresh `git worktree` of HEAD, the
+whole suite green there), and said so itself — *nothing in the gate set does
+that*, so the next commit that adds a test file or regenerates a spec row can
+leave the same gap for whoever checks out `main` next. The local suite stays green
+because the working tree HAS the files the plan names; only a clone can see the
+mismatch.
+
+**Resolution: a gate that is the clone.** `clean-checkout` (ninth gate, registered
+between `smoke` and `two-writer`) lays HEAD down in a scratch `git worktree` —
+`mktemp -d -t handsoff-clean-XXXXXX`, deliberately OUTSIDE the repo, because a
+scratch tree written inside the worktree would move the very tree `two-writer`
+stamps — and runs `tests/test_specs_freshness.py` there under
+`QT_QPA_PLATFORM=offscreen`. It runs the GUARD rather than the suite on purpose:
+that guard is the part of the suite whose verdict is about files rather than about
+behaviour, and it costs seconds instead of minutes.
+
+**What it says when it refuses** is the guard's own output — its tail, because the
+failing assertion IS the finding and a paraphrase would hide which one failed —
+then a REFUSED block naming the class and the one-liner to reproduce it. **What it
+does when it cannot run** is a SKIP with its reason, never a pass: not a git
+worktree, an unborn HEAD, a scratch directory it cannot make, a `worktree add`
+that fails, or a HEAD that carries no such guard. **What it does before it says
+anything** is clean up — `worktree remove`, `rm -rf`, `worktree prune`, all before
+any verdict is printed, because a refusal that leaves a worktree behind damages
+the checkout it reports about, and `git worktree list` is how the developer would
+find it. It is registered before `two-writer`, which stays last: that gate
+compares the worktree, so anything running after it would invalidate the
+comparison.
+
+**Found by committing: the suite is run BY the pre-commit hook, and git exports
+its plumbing to that hook.** The first commit attempt was refused by the hook
+after three of the new end-to-end tests failed — only there, and every time they
+were run alone. The hook is handed `GIT_INDEX_FILE=.git/index`, `GIT_PREFIX` and
+an author identity, the fixture's environment was `dict(os.environ)`, and a
+scratch repository built with the caller's index therefore cannot lay HEAD down:
+`git worktree add` failed inside it and the gate SKIPPED. The root cause is not
+the gate but the harness — its child now drops git's own plumbing (one constant,
+`GIT_PLUMBING`) before the repository, the identity and the config it supplies
+itself, and two guards hold it: one plants the variables and asserts the child
+environment is clean, and one reads what a real probe hook is handed and asserts
+that list covers it. The probe is the authority on purpose — it is what caught two
+names missing from the list when it was written by hand.
+
+**Verification.** Fourteen guards in `tests/test_ci_clean_checkout.py` (seven
+wiring, four end-to-end, three on the harness environment), on a scratch repo
+whose guard is committed and whose needed file is NOT: the worktree passes, the
+clean checkout refuses, no worktree
+is left behind, a repo with no such guard is SKIPPED rather than passed, and the
+wiring pins the exact invocation, the disposal directory, the cleanup-before-verdict
+order, every SKIP path and the refusal's content. **20/20 mutations caught, 2/2
+probes green, 0 misses, every restore sha256-verified** (`/tmp/clean_sweep/sweep.py`,
+five of them aimed at the harness environment)
+— and the sweep earned its keep: the wiring guard read `"worktree add --detach" in
+body`, which the gate's OWN reproduce hint satisfies (it prints `git worktree add
+--detach /tmp/x HEAD`), so two mutants that took `--detach` off the command that
+actually runs stayed green. The assertion pins `worktree add --detach --quiet
+"$tree" HEAD` now, and a mutant spelling `--detach` as its short form `-d` is
+caught like the rest.
+
+**Live, three shapes.** On this (dirty) checkout the gate PASSes in four seconds,
+with the guard's nineteen tests run inside the scratch worktree of HEAD. Against
+`bd9cf5a` — the commit from this thread that the hand check found inconsistent —
+it REFUSES with all three failures printed: the key census, the plan naming two
+untracked tests, and a DATE read as a size. And a fresh scratch commit of the same
+class (the new test file committed, its plan row deleted) REFUSES naming exactly
+which file the plan does not mention.
+
+**The gate's own limit, stated:** it judges the class the freshness guard knows
+about — the plan's file list, the key census, the citations — not "a clean
+checkout passes everything", which is a whole suite per run and is CI's job; and
+it judges HEAD, so a commit that agrees with itself while being wrong about the
+code is not its business.

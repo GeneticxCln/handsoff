@@ -219,6 +219,18 @@ def isolated_user_dirs(prefix: str = "handsoff-testhome-"):
                 os.environ[key] = value
 
 
+# What git exports to whatever it runs — a pre-commit hook sees the first of
+# these above all — and what a child that builds its OWN repository must not
+# inherit. One constant because a guard checks it against a real hook's
+# environment, and a copy in the test file would be a second list to drift.
+GIT_PLUMBING = ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_PREFIX",
+                "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                "GIT_AUTHOR_DATE", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+                "GIT_COMMITTER_DATE", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
+
+
 def sandbox_env(home=None) -> dict:
     """A child-process environment whose user dirs are a throw-away directory.
 
@@ -228,6 +240,17 @@ def sandbox_env(home=None) -> dict:
     kept on PYTHONPATH alongside the repo root.
     """
     env = dict(os.environ)
+    # GIT'S PLUMBING DOES NOT BELONG TO A CHILD THAT MAKES ITS OWN REPOSITORY.
+    # Git exports its own environment to whatever it runs — a pre-commit hook
+    # sees GIT_INDEX_FILE=.git/index, GIT_PREFIX and an author identity — and the
+    # suite IS run by that hook, so a scratch repository built with the inherited
+    # environment gets a pointer into the caller's index: `git worktree add`
+    # failed inside the scratch repo, and the three end-to-end gate tests failed
+    # only while a commit was in progress. The harness supplies the repository,
+    # the identity and the config itself, so git's own plumbing is dropped here
+    # rather than passed on (found by committing, not by reading).
+    for name in GIT_PLUMBING:
+        env.pop(name, None)
     home = Path(home or tempfile.mkdtemp(prefix="handsoff-testhome-"))
     env.update({
         "HOME": str(home),
@@ -267,6 +290,30 @@ def method_source(source: str, name: str) -> str:
         if here <= indent and not lines[i].lstrip().startswith("#"):
             return "\n".join(lines[start:i])
     return "\n".join(lines[start:])
+
+
+def shell_function(source: str, name: str) -> str:
+    """The whole body of the bash function `name` in `source`, and nothing else.
+
+    The shell twin of `method_source`, for the guards that read `ci/gates.sh`: a
+    bash function ends at a `}` in column zero, and asking for a fixed slice of
+    characters instead is the same mistake `method_source` documents — the test
+    then fails the day somebody adds a line above the one it looks for, and says
+    "the code moved" rather than "the wiring is gone".
+
+    One home for both callers (the gate tests and the clean-checkout gate tests):
+    two copies of "what is a shell function body" could disagree about a nested
+    `}` or a heredoc, and the file that would be wrong is the one nobody reads.
+    """
+    lines = source.splitlines()
+    start = next((i for i, line in enumerate(lines)
+                  if line.startswith(f"{name}() {{")), None)
+    if start is None:
+        return ""
+    for i in range(start + 1, len(lines)):
+        if lines[i] == "}":
+            return "\n".join(lines[start:i + 1])
+    return ""
 
 
 def run_driver(argv, *, home=None, cwd=None, env_extra=None, **kwargs):

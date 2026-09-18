@@ -55,7 +55,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import _load as _load_module, run_driver, sandbox_env
+from conftest import _load as _load_module, run_driver, sandbox_env, shell_function
 
 HERE = Path(__file__).resolve().parent.parent
 GATES = HERE / "ci" / "gates.sh"
@@ -112,19 +112,12 @@ def repo(tmp_path: Path, git_env: dict) -> Path:
 def _shell_function(source: str, name: str) -> str:
     """The body of a bash function, from its opening brace to its closing one.
 
-    `conftest.method_source` slices a PYTHON `def`, and the gate this file pins
-    is a shell function — asking it for one returns the empty string, which
-    would make the wiring assertions below vacuous.
+    A thin name for conftest's `shell_function`, which the clean-checkout gate
+    tests read the same file with: "what is a shell function body" has one home,
+    so the two files cannot disagree about a nested `}` — and the assertions
+    below stay spelled the way they always were.
     """
-    lines = source.splitlines()
-    start = next((i for i, line in enumerate(lines)
-                  if line.startswith(f"{name}() {{")), None)
-    if start is None:
-        return ""
-    for i in range(start + 1, len(lines)):
-        if lines[i] == "}":
-            return "\n".join(lines[start:i + 1])
-    return ""
+    return shell_function(source, name)
 
 
 def _cli(*args: str) -> subprocess.CompletedProcess:

@@ -3,7 +3,7 @@
 #
 # Why this exists: the pipeline's gates are the project's definition of "green",
 # but the pipeline is a remote resource with a finite quota, and a run that
-# cannot happen is not a gate at all. This script runs the same six jobs a
+# cannot happen is not a gate at all. This script runs the same seven jobs a
 # developer can run here, using the same env vars (.gitlab-ci.yml's coverage
 # job sets COVERAGE_PROCESS_START/COVERAGE_FILE — omitting them is what made an
 # earlier local measurement read 62% instead of 82%), and prints the same
@@ -50,6 +50,13 @@
 # move changed the outcome — where an unchanged answer is evidence that the tree
 # the run lost was not the difference. A reader diffing two rows by eye cannot
 # tell either from a re-run that never happened.
+#
+# `clean-checkout` is not about this checkout at all: it lays HEAD down in a
+# scratch worktree and runs the freshness guard THERE, because that guard reads
+# the test plan, the key census and the spec citations out of files — and this
+# checkout can see files that are not committed. A commit whose plan names a test
+# file it does not contain passes every gate above and fails the moment anybody
+# clones it. Local only, like the stamp: a pipeline checkout is already clean.
 
 set -u
 
@@ -64,7 +71,7 @@ SEED=${HANDSOFF_ORDER_SEED:-$(git rev-parse --short HEAD 2>/dev/null || echo loc
 JUNIT="$ROOT/tests/report.xml"
 FIRST_FAILURE="$ROOT/tests/report.first-failure.xml"
 
-ALL_GATES="tests order coverage compile shell smoke two-writer"
+ALL_GATES="tests order coverage compile shell smoke clean-checkout two-writer"
 WANT_ORDER=1
 declare -a WANTED=()
 # Which gate failed FIRST. The failure digest below reads the first failing
@@ -439,6 +446,74 @@ gate_smoke() {
     out=$(bash install.sh --help) || return 1
     echo "$out" | grep -q "Options:" || return 1
     echo "$out" | grep -q -- "--uninstall"
+}
+
+# Does a fresh checkout of HEAD agree with itself? The freshness guard reads the
+# plan, the key census and the spec citations out of FILES, and in this shared
+# checkout it can see work that is not committed — so the one tree nobody ever
+# looks at, the committed one, is the one this gate looks at. Found live: bd9cf5a
+# was green here and had THREE red guards in a clean checkout (the key census,
+# the test plan's file list, and a date read as a module size).
+#
+# A WORKTREE of HEAD rather than a copy of this one, because a worktree is what a
+# reader gets from `git clone` of that commit without a second download. The
+# directory is outside the tree — a scratch copy written INSIDE the worktree would
+# move the tree the stamp is watching — and it is removed on EVERY path, the
+# refusal included, so `git worktree list` never grows a graveyard.
+#
+# SKIP (2) when there is nothing to lay down (not a git worktree, no commit yet,
+# no such guard in HEAD, or git could not make the worktree): a gate that cannot
+# run is SAID to be skipped, never counted as a pass.
+gate_clean_checkout() {
+    local guard="tests/test_specs_freshness.py" dir tree out="" rc=0
+    if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "not a git worktree — HEAD cannot be laid down here."
+        return 2
+    fi
+    if ! git -C "$ROOT" rev-parse --verify --quiet HEAD >/dev/null; then
+        echo "HEAD has no commit yet — there is no committed tree to check."
+        return 2
+    fi
+    dir=$(mktemp -d -t handsoff-clean-XXXXXX) || {
+        echo "could not make a scratch directory for the clean checkout."
+        return 2
+    }
+    tree="$dir/tree"
+    if ! git -C "$ROOT" worktree add --detach --quiet "$tree" HEAD >/dev/null 2>&1; then
+        rm -rf "$dir"
+        echo "could not lay down a clean checkout of HEAD (git worktree add failed)."
+        return 2
+    fi
+    if [ -f "$tree/$guard" ]; then
+        out=$(cd "$tree" && QT_QPA_PLATFORM=offscreen "$PYTHON" -m pytest "$guard" -q 2>&1)
+        rc=$?
+    else
+        rc=2
+    fi
+    # Cleaned up BEFORE any verdict is printed: a leftover worktree pollutes the
+    # next run's `git worktree list` (and the developer's), and a refusal is worth
+    # nothing if reporting it damages the checkout it reports about.
+    git -C "$ROOT" worktree remove --force "$tree" >/dev/null 2>&1 || rm -rf "$tree"
+    rm -rf "$dir"
+    git -C "$ROOT" worktree prune >/dev/null 2>&1
+    if [ "$rc" = 2 ]; then
+        echo "HEAD carries no $guard — this checkout has nothing to check."
+        return 2
+    fi
+    if [ "$rc" != 0 ]; then
+        printf '%s\n' "$out" | tail -n 25
+        echo
+        echo "REFUSED — this HEAD does not pass its own freshness guard in a clean"
+        echo "checkout: the plan, the key census or a spec citation disagrees with the"
+        echo "committed tree, or the guard could not run there (its output is above)."
+        echo "THIS checkout can hide it: the files the guard asks about may be here"
+        echo "and uncommitted, which is how this gate's class goes unnoticed."
+        echo "Reproduce with:"
+        echo "  git worktree add --detach /tmp/x HEAD && (cd /tmp/x && $PYTHON -m pytest $guard -q)"
+        return 1
+    fi
+    printf '%s\n' "$out" | tail -n 1
+    return 0
 }
 
 # The verdict on the TREE, after every gate has run. A collision is not a refusal

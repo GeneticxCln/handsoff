@@ -1,6 +1,6 @@
 # handsoff — test plan
 
-Sources: `tests/` (28 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
+Sources: `tests/` (29 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
 `.coveragerc`, `.github/workflows/ci.yml`, `.gitlab-ci.yml`,
 `githooks/pre-commit`, `ci/`.
 
@@ -28,6 +28,7 @@ nothing — a missing row does.
 | `test_sandbox.py` | 52 | secret paths, edit boundaries, command validation |
 | `test_calendar.py` | 45 | ICS parse/RRULE/format, scheme + label guards |
 | `test_ci_summary.py` | 42 | `ci/pytest_summary.py` digest |
+| `test_ci_clean_checkout.py` | 14 | the clean-checkout gate: HEAD in a scratch worktree, the guard run THERE (refusing a commit whose plan/key census/citations disagree with a clean checkout), the cleanup before the verdict, the SKIPs, the wiring, and the HARNESS ENVIRONMENT (git's plumbing — the `GIT_INDEX_FILE` and author identity a pre-commit hook is handed — dropped before a child builds its own repository, with a probe hook as the authority on what git really exports) |
 | `test_ci_two_writer.py` | 102 | the two-writer gate: the worktree stamp's movement (and the gate artifacts that must not move it — plus the paths that LEAVE a list, the shape a naive rewrite of "what moved" drops), the per-gate checkpoints and the gate they name, the baseline that moves only on an explicit rebase (and then says which tree it is), the CLI refusal, the WHEN lines (the clock each snapshot carries and the verdict ignores, the offset/fraction/band arithmetic placed by hand with `os.utime` against a window the test picked — never a sleep —, each band boundary sampled a point on either side of itself, the three shapes a write can have relative to its window, the two moves with no file clock to ask, the cap that counts what it does not print, and `at`/`--since` gone or stale degrading to a coarser answer instead of a wrong one), the WRITE THAT WAS PUT BACK (a file whose content every hash agrees about while its own write time moved — the shape that used to read as a still tree: a clean tracked file is watched, not only a dirty one, a read is not a write, a real content change is reported once and never also as restored, one nanosecond of difference is enough, ignored artifacts are outside the map, a snapshot from before the write times existed still judges, and the write time is placed in the window), the COMPARISON of a gate's attempts with its re-run (the shipped function on a fabricated record of attempts: a re-run that agreed, one that flipped — the move changing the outcome —, a flip a later re-run undid (`PASS → FAIL → PASS`), repeats not printed as repeated answers, a gate that ran once never compared, and a gate compared only with itself and not with the neighbours its attempts are interleaved with), the wiring in `ci/gates.sh`, eight end-to-end runs of the real script on a scratch repo whose interpreter edits, breaks or WRITES-AND-RESTORES a tracked file on chosen CALLS — a collision that resumes, one with nothing overtaken so no pass runs, one whose overtaken verdict is caught up (so the run ends as a verdict about one tree), one where a write inside the catch-up leaves the split, one where a pre-existing red skips the catch-up, one where a re-run flips a kept verdict and the run prints the flip, one where the write is put back inside a gate (a collision and a re-run with no content difference anywhere), one where it is put back after the LAST checkpoint (the refusal, placed in the tail of the run), and a window holding two writes that stops the run — and a source guard that no guard in the file pins a gate's elapsed seconds (a summary row is a SHAPE, and a guard pinned to `0s` reported a correct gate red on a loaded full-suite run before it was fixed) |
 | `test_hardware.py` | 35 | snapshot sections, TTLs, probers |
 | `test_theme.py` | 34 | hex parse, luminance, retune |
@@ -55,6 +56,20 @@ nothing — a missing row does.
 - `shell`: actions SHA-pinned (mutable `@vN` fails); `bash -n` over every
   file with a bash/sh shebang (finds extensionless `handsoff-restart`).
 - `smoke`: `bash install.sh --help` contains `Options:` + `--uninstall`.
+- `clean-checkout`: HEAD is laid down in a scratch `git worktree` (`mktemp -d`,
+  outside the repo) and `tests/test_specs_freshness.py` is run THERE. That guard
+  reads the test plan, the key census and the spec citations out of FILES, so a
+  commit inconsistent with its own plan passes in the checkout that happens to
+  hold the uncommitted files and fails in a clone — this gate is the clone.
+  `worktree add --detach --quiet "$tree" HEAD`, then the guard's own output (its
+  tail, so the failing assertion is the finding) plus a REFUSED block that says
+  why this checkout hid it and the one-liner to reproduce. A repo that is not a
+  worktree, an unborn HEAD, a `worktree add` that fails, or a HEAD that carries
+  no such guard is a SKIP with its reason — never a pass. The worktree is removed
+  AND pruned before any verdict is printed, because a refusal that damages the
+  checkout it reports about is worth nothing. It is registered before
+  `two-writer`, which stays last: that gate compares the worktree, and a scratch
+  write after it would invalidate the comparison.
 - `two-writer`: `ci/worktree_stamp.py` fingerprints the worktree before the
   first gate (HEAD, one content hash per tracked change, every untracked
   non-ignored file, and ONE WRITE TIME PER PATH — tracked clean or dirty, and
