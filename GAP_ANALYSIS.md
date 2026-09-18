@@ -5007,3 +5007,1763 @@ means a single coverage figure is reproducible only to ±0.1 point, so this
 ledger states the range and the sites rather than a false-precision number. It
 also means the documented figure was never wrong enough to be caught by
 disagreement; only a second measurement could see it.
+
+## The tick is driven by a test now, not by the clock (2026-09-16)
+
+**Both moving sites are pinned by tests that always run.** The previous pass
+localised the wobble to two places; neither is now reachable by timing.
+
+- `core/bubble.py`'s `_on_tick` was reached only by the 16 ms QTimer a
+  constructed widget starts, so coverage of it depended on whether some test's
+  event loop happened to spin for 16 ms. `tests/test_bubble_anim.py` drives it
+  frame by frame with a hand-advanced clock, and covers the tick body **on its
+  own**: run against `core/bubble.py` by itself, its missing set is
+  `... 2004-2005, 2008, 2052-2091 ...` — 2010–2048 (`_on_tick` and
+  `_radius_target`) is not in it.
+- `handsoff-settings.py` 1327–1328, the malformed-reply `except` in
+  `_json_command`, raced a socket timeout. `TestSettingsHealthBar` now feeds
+  five canned reply shapes (not JSON, JSON but not an object, a bare string,
+  empty, absent) and both lines are covered by that test alone: `-k HealthBar`
+  reports 12% of the file with 1327 and 1328 absent from the missing list.
+
+**The tests are a specification, not a transcription.** The harness is a
+`BubbleWidget` subclass whose `__init__` never touches Qt and whose `update()` —
+the tick's only Qt call — counts frames. The smoothing is written as this file's
+own closed form ("frame-rate independent exponential chase, 24/s attacking and
+7/s releasing"), so the assertions pin the RATE, not just the direction: the step
+is the clock in seconds; a five-second gap is ONE 50 ms frame and the gap is
+consumed; two ticks in the same instant still move by the 0.001 floor; attack
+moves more than twice as far as release; the colour walks the exact 5/s curve
+per channel without passing the target; an unknown state name falls back to
+idle; the first frame seeds the radius AT the target with zero velocity; the
+spring's first miss is ≤5% of the travel, every turn ≥5× smaller than the last,
+and it ends on the target; and a frame that changes nothing still repaints.
+
+**The comment above the spring was wrong, and this is what found it.** It read
+"critically-damped-ish chase, settles without overshoot". Measured: ζ ≈ 0.72, so
+it MISSES by 2.4% of the travel at 16 ms frames (3.9% at 1 ms) and rings down
+inside ~0.3 s. The comment states the measurement now — and the first version of
+the colour assertions pinned the SHAPE (moves, does not overshoot, converges)
+without pinning the rate, which "**double the crossfade rate**" sailed straight
+through: a MISS the sweep reported rather than hid. The tests walk the per-frame
+curve now, and the doubled rate, a one-frame pop, an over-1 gain and a halved
+energy chase all fail.
+
+**The driver is checked too, because no behaviour test can see it.** Every test
+above calls `_on_tick` itself, so all of them would pass with the timer never
+started or connected to nothing — the bubble would simply stop moving and only a
+person looking at the desktop would find out. A new offscreen scenario asserts
+the timer exists, is 16 ms and is active, and then waits for a frame THROUGH the
+event loop without calling the tick, using `_radius_ui` (None until a frame
+seeds it) as the frame counter nobody had to add.
+
+**Sweep: 17/17 mutations caught, 2 probes green, every restore
+sha256-verified.** Including: the timer moved to 160 ms; the timer never
+started; the spring's damping removed; the `_last_tick` update dropped; the seed
+branch removed (springs from `None`); the colour's `except`-less parse; and the
+energy chase halved.
+
+**Concurrent work, noted rather than absorbed.** While this pass ran, another
+thread was editing the same checkout (`core/calendar.py`, `core/tools.py`,
+`tests/test_calendar.py`, `tests/test_lifecycle.py`, 18:35–18:39). Two gate runs
+taken inside that window disagree — the later one red on
+`test_the_tables_are_what_the_generator_produces`, whose stale rows are
+`core/calendar.py` and `core/tools.py`, exactly the files that thread is
+changing. `core/bubble.py`'s generated row (4072) is current. Full suite at time
+of writing: 1465 passed, 2 failed (those two rows), 1 skipped. **Not deployed:**
+`core/bubble.py` changed, so the installed copy is one comment behind, and
+deploying now would also ship that thread's in-flight calendar/tools edits into
+the running bubble — left to whoever finishes that work.
+
+## The models' memory goes back when the bubble is idle (2026-09-16)
+
+**What the machine looked like, measured rather than inferred.** A full 16 GB
+card held 15.2 GB with ~1 GB free, and at that point `nvidia-drm` stopped being
+able to allocate DISPLAY buffers — 13 `Failed to allocate NVKMS memory for GEM
+object` errors in one boot, 1 180 in another, 8 993 in a third, and 0 in the boot
+where no model was ever loaded — while libinput reported 20-30 ms of input lag.
+Sampled live: 9 680 MiB to a `llama-server` holding `qwen3.8:27b`, 3 312 MiB to a
+python process (this bubble's chatterbox TTS on cuda), ~436 MiB to a 4K video
+wallpaper, and ~950 MiB left for the compositor. Two of those numbers were the
+bubble's own doing: `keep_alive` defaults to `1h` and no caller overrides it
+(the model stays resident an hour after every turn, and the bubble warms it at
+startup too), and nothing ever gave the speech model back — the only drops were
+live-settings reloads.
+
+**The release is a policy, and the policy is mostly about when NOT to fire.**
+`core/audio.py::drop_models` takes both locks NON-blocking (a busy lock means a
+generation owns the model — "not now", never a blocked tick or a torn model),
+drops whisper only when it was loaded on CUDA (on cpu it holds no GPU memory, so
+dropping it buys nothing and costs a reload), and clears `_tts_device` with the
+model so the NEXT load re-decides cuda-vs-cpu against that moment's free memory —
+which is the whole point of having released anything. `_empty_cuda_cache` looks
+torch up in `sys.modules` rather than importing it, because an idle tick must not
+drag 2 GB of framework in to hand memory back. `core/brain.py::ollama_unload`
+sends `keep_alive: 0` on the SAME field every turn sets the other way, so the two
+cannot drift into a separate API, and a stopped Ollama is a reported False rather
+than an exception on a timer. The host's `_idle_release_tick` (called from the
+existing per-second health tick) refuses to release while the state is anything
+but idle, while a recording is in flight, while a turn is queued, or while
+`_ANNOUNCE_LOCK` says a sentence is playing — and it marks itself done, so a
+bubble idle overnight sends one request, not one per tick.
+
+**Reload on demand needed no new machinery, and that is the design.** `get_tts`,
+`get_whisper` and both chat wrappers already load lazily, so the next utterance
+or turn pays a load and nothing else changes. `_touch_gpu()` sits in the getters
+AND in `ollama_chat`/`ollama_chat_stream` — the second half is not decoration: a
+turn that answers WITHOUT speaking still asked Ollama for a long keep-alive, so
+without those two touches the window's last arm would always be a spoken
+sentence and a silent conversation would leave the LLM resident. A mutation
+proved the point ("a chat turn stops counting as use" → caught).
+
+**Two guards were weak, and the sweep is what said so.** The first run caught
+15/17 and the two misses were both the tests' fault, not the code's:
+
+- "one release per quiet spell" passed with `_gpu_released = True` deleted,
+  because the tick's own `_gpu_last_use` stamp held it — the test never advanced
+  the clock past the window between ticks, so it was pinning the stamp and
+  calling it the flag. It rewinds the clock before EVERY tick now, so five ticks
+  that all satisfy "the window elapsed" must still produce one request.
+- "junk in the window raises on the timer path" passed with the read expression
+  replaced by `float(SETTINGS[...])`, because the `try/except` around it was the
+  actual guard. The mutation removes the whole body now.
+
+**17/17 mutations caught, 1 probe green, every restore sha256-verified.**
+Including: dropping a model mid-generation; dropping a cpu whisper; keeping the
+device choice; importing torch to empty the cache; an unload without
+`keep_alive: 0`; releasing during playback, mid-recording, mid-turn, with a turn
+queued, before the window, with the window set to 0; a missing
+`ollama_unload` raising inside the health tick; a mirror that keeps what the
+module dropped; and getters/chat wrappers that stop counting as use.
+
+**Stated limits.** (1) The desktop glitch is a correlation across four boots,
+not a controlled A/B — I did not unload the model or stop the wallpaper to
+isolate it, because that would disturb the machine in use. (2) The release
+cannot help a card that is already full at the moment you ask a question; it
+only prevents the bubble from BEING the resident tenant. (3) A model wider than
+the card (that 27b was 53% CPU / 47% GPU) is a model choice, not an idle-policy
+one. (4) The one place a full card would have been visible still says nothing:
+`_resource_usage` measures VRAM but `resource_alerts` defaults off and the
+doctor's GPU section reports only the card's name. (5) `_TTS_VRAM_MB = 3_000`
+understates the measured 3 312 MiB, and `tts_device_choice` and
+`_whisper_device_choice` still compare against the same free-VRAM reading
+independently, so both can pass and together overcommit — untouched here.
+
+**Proven against the live service, on the card that prompted it.** With a small
+model loaded on purpose (this is the machine the change is for, so the proof must
+not be the thing that fills it): the SHIPPED `core/brain.py::ollama_unload`
+returned True, the model left `/api/ps`, and `nvidia-smi` went from
+11 615 MiB to 6 267 MiB — **5 348 MiB handed back** — with the rest of that
+figure belonging to the bubble's speech model and the compositor. Calling it for a
+model that is not resident returned True rather than raising (the claim that makes
+sending it on a timer safe), and an unreachable host returned False rather than
+exception, which is what an idle tick needs.
+
+**Verified on this tree:** 1497 passed, the order gate PASS in both sub-runs
+(205.7 s / 204.7 s), coverage 84.45% ≥ 70, `compile`/`shell`/`smoke` PASS. The
+concurrent thread's `_deployment_snapshot` edit landed in `handsoff.py` AFTER
+those runs; `test_ops.py` + `test_idle_release.py` + `test_specs_freshness.py`
+are green on the merged tree (111 passed).
+
+## The idle release weighs the reload before it hands the memory back (2026-09-17)
+
+**The first version gave back memory the very next question had to buy again at
+22.6 seconds per GB.** The release treated every model the same: after
+`idle_release_seconds` of quiet it asked Ollama to drop whatever was resident.
+On this machine the configured model is `qwen3.8:27b` — 18 GB against a 16 GB
+card, so Ollama serves it SPLIT (53% CPU / 47% GPU) and the memory an unload
+actually frees is `size_vram`, about 9.7 GB of the 18 that must be reloaded.
+Measured cold load: **218.9 s**. So the release handed back 9.7 GB and charged
+the next question 3 minutes 39 seconds to get it back. The policy was right
+about memory and wrong about *that* model, which is a model choice rather than
+an idle-policy one — but it is the policy's job not to trade a minute of silence
+for three minutes of waiting.
+
+**The rule is now a measurement with a name, not a default.**
+`core/brain.py::ollama_resident` reads `/api/ps` — the only endpoint that
+reports the SPLIT (`size_vram` beside `size`) — and returns `None` for "could
+not ask", deliberately distinct from `{"loaded": False}`, because the two lead
+to different decisions and only one of them is a measurement.
+`core/brain.py::ollama_release_verdict` is pure: every branch is reachable by
+feeding it a dict, so the truth table is a test rather than a description. It
+HOLDS the model when the split is unknown, when the model is resident on CPU
+only (there is nothing on the card to give back), and when the measured reload
+costs more than `llm_release_wait_s_per_gb` per GB freed. An endpoint that does
+not answer, a reload that has not been measured, and a budget of 0 or junk all
+RELEASE: a missing measurement must not become a reason to keep memory the
+machine may need. A bundle without `core/brain.py` has no policy to consult and
+releases unconditionally, exactly as it did before the policy existed.
+
+**The number it weighs is taken on this machine, at the moment it matters.**
+`_arm_llm_reload_probe` starts the clock when the user ASKS (inside the chat
+wrappers — arming it at release time would count the quiet hours in the middle
+as reload) and `_finish_llm_reload_probe` stops it at the first spoken sentence,
+because everything after that is generation the user is already hearing. A
+non-streaming call is DISARMED instead: its whole duration is the answer being
+written, and timing it would report a long reply as an expensive reload and talk
+the policy into holding memory it should hand back. `_note_llm_load` keeps the
+SLOWEST load for the CURRENT model and starts the record over when the model
+changes — this machine logged 4.7 s for a load that found the model already
+resident, minutes after a 218.9 s cold load of the same model, and the release
+causes the cold one. The startup warm is where the first number comes from, so
+the first decision is not made blind.
+
+**Both outcomes are said out loud, in the journal and in doctor.** The tick logs
+`llm unloaded` / `llm kept` / `llm unload failed` followed by the verdict's own
+note, which always names the numbers it used — a release that stays silent about
+keeping a model is indistinguishable from one that failed. Doctor prints one
+read-only line:
+
+```
+llm memory: after 600s idle the release would KEEP qwen3.8:27b — nothing resident in VRAM to give back
+```
+
+with the age of the measurement appended ("last measured 12m ago") so a stale
+number reads as stale, and the window at 0 prints `idle release is OFF
+(idle_release_seconds 0)` instead of predicting a verdict that will never run.
+`core/doctor.py::_llm_memory_lines` renders whatever the host supplies and
+prints nothing when the dep is absent, like the appearance and web lines.
+
+**Guards.** `tests/test_idle_release.py` gained four classes: the resident split
+(empty-server-is-a-measurement, garbage-is-unknown, unit-shifted-size-refused,
+either-name-field, a reported zero stays zero), the verdict truth table (a split
+model kept with its numbers in the note, a model that fits released, the budget
+as a CEILING so exactly it releases, a zero budget never weighing, an unreadable
+budget not holding memory, an unreadable endpoint releasing, nothing resident not
+sending a request, a CPU-only model freeing no GPU memory, an unreadable split
+not being called CPU-only, an unmeasured reload unable to weigh anything), the
+host wiring (a kept model NOT re-asked every tick and re-opened next spell, a
+real release arming the measurement of its own reload, junk in the budget
+releasing, a policy-less bundle releasing), the measurement (the first sentence
+is the measurement, end-of-stream is not, a non-streaming call cannot price one,
+a warm load never making a cold reload look cheap, a new model starting its own
+record, a measurement belonging to the model it was taken on).
+
+**20 mutations, 20 caught, 2 probes green, every restore sha256-verified.**
+Caught: the budget stopping being a ceiling; a zero budget weighing again; an
+unreadable endpoint becoming a reason to hold; a CPU-only model no longer told
+apart; an unmeasured reload becoming a reason to hold; only the `name` field
+believed; an empty server becoming an unknown; a unit-shifted size believed; any
+model's record used for the configured one; the FASTEST load kept instead of the
+slowest; the probe never armed; a non-streaming call left armed; a zero or
+negative duration recorded; a junk duration raising on the tick path; a bundle
+without the rule stopping; a junk budget holding; a KEPT model still unloaded;
+the tick no longer saying WHY; an off release predicting a verdict; the host's
+llm lines dropped on the floor in `core/doctor.py`.
+
+**One mutation was EQUIVALENT, and the sweep reported it rather than absorbing
+it.** The first run came back 18/19 with one MISS: "a junk duration is recorded"
+replaced the `return` in `_note_llm_load`'s `except` with `value = 0.0` — and
+that changes nothing, because the very next line rejects non-positives. The
+mutation was wrong, not the guard, and the honest response was to say so in the
+sweep (a comment now records it) and replace it with two mutations that DO change
+behaviour: a zero/negative duration recorded, and a junk duration raising on the
+tick path. A sweep that reports its own equivalent mutant is the difference
+between a proof and a ritual.
+
+**Verified on this tree:** 1540 passed; the order gate PASS in both shuffled
+sub-runs (434 s, seeds differing); coverage 84.56% ≥ 70 (2463 missing — the same
+figure two runs give); `compile`/`shell`/`smoke` PASS.
+
+**Live, against the real service and the real card** (the shipped functions, not
+a copy, with this machine's settings: window 600 s, budget 20.0 s/GB, model
+`qwen3.8:27b`):
+
+```
+[1] /api/ps, after the startup warm, is the REAL split:
+    {'loaded': True, 'size': 17.11, 'size_vram': 7.30, 'expires_at': '...09:29:18...'}
+    (17.1 GiB total, 7.3 GiB of it on the card, keep-alive an hour out)
+[2] the verdict, fed that and this machine's measured 218.9 s cold reload:
+    KEEP     7.3 GB back would cost a measured 219 s reload (30.0 s/GB > 20);
+             raise llm_release_wait_s_per_gb to release anyway
+    RELEASE  4.5 GB on the card
+             4.5 GB back for a measured 4 s reload (0.9 s/GB <= 20)
+[3] the host's own doctor line:
+    llm memory: after 600s idle the release would UNLOAD qwen3.8:27b — 7.3 GB
+    to give back, but the reload is not measured yet — nothing to weigh it
+    against
+```
+
+The third line is the unmeasured branch, stated rather than guessed: doctor is a
+fresh process, so it has no reload of its own to weigh and says exactly that —
+the release it predicts is the pre-policy one, and it says why. A release is only
+KEPT when a number exists to justify it: with the machine's measured 219 s the
+same call reads
+
+```
+KEEP qwen3.8:27b — 7.3 GB back would cost a measured 219 s reload (30.0 s/GB > 20)
+```
+
+and with the earlier non-resident reading, `nothing resident in VRAM to give
+back`. Same rule, same card, four readings — which is the whole point of making
+it a decision about THIS model rather than a policy about memory in general.
+
+**Then the running bubble made its own decision with its own number**, and the
+journal says so. Six hundred seconds after the startup warm the tick fired
+(08:37:55, which is 600 s after `_touch_gpu` inside the warm call — the window
+starts when the model is USED, not when the bubble boots):
+
+```
+08:37:55 INFO handsoff: released idle models (tts=True whisper=False cuda cache=True)
+08:37:55 INFO handsoff: idle 600s: released {'tts': True, 'whisper': False,
+         'cache_cleared': True}, llm unloaded — 7.3 GB back for a measured
+         91 s reload (12.5 s/GB <= 20)
+```
+
+`nvidia-smi` went **14 536 MiB → 5 349 MiB** and `/api/ps` emptied: about 9.2 GB
+back on the card, which is the desktop glitch this feature exists to prevent.
+**Being exact about why that reading differs from the 219 s above matters:** this
+boot's warm measured **90.9 s** — the model had been loaded minutes earlier, so
+it came back warm with the prompt prefix cached — and the same rule that KEEPS at
+30.0 s/GB RELEASES at 12.5, on the same card, in the same hour. That is the rule
+behaving as specified (one measurement per model per process, the slowest seen in
+it) and it is the honest reason the keep branch is argued with numbers rather
+than assumed. `whisper=False` in the same line is the other half of the design:
+whisper is on cpu here, so dropping it would free no GPU memory and it is left
+alone instead of being reloaded for nothing.
+
+The same rule keeps the 27b and releases a model that fits, on the same card,
+from the same measurement — which is the whole point of making it a decision
+about THIS model. Deployment verified in the same pass: `deployment: in-sync`.
+
+**Stated limits.** (1) The rule believes the `size_vram` Ollama reports; a wrong
+number would be believed, and the only defence is that the endpoint is local. (2)
+The measurement is one number per model — the slowest seen in this process — so a
+machine whose reload time swings decides on the worst case it has actually seen,
+not on a distribution. (3) The release is a timer, not a watchdog: while the
+bubble is busy the memory stays resident by design. (4) The reload measurement is
+lost on restart, so the first decision after a boot rests on the startup warm or
+releases unweighed. (5) Nothing here addresses `resource_alerts` still defaulting
+off, `_TTS_VRAM_MB = 3_000` understating the measured 3 312 MiB, or the two
+device choices reading free VRAM independently — all still open from the audit
+that prompted this.
+
+## Doctor says how full the card is, and who filled it (2026-09-17)
+
+**The audit measured free VRAM by hand; the bubble had it all along and said it
+nowhere.** The whole chain of reasoning that produced the idle release started
+with a number someone had to go and get: 15.2 of 16.4 GB used, ~1 GB free, and
+at that point `nvidia-drm` could not allocate DISPLAY buffers. The bubble reads
+VRAM in `_resource_usage` — but `resource_alerts` defaults to `False`, so
+nothing spoke, and the doctor's GPU section reported the card's NAME and stopped
+there. A machine with no room left and a machine with ten gigabytes spare
+produced indistinguishable diagnostics.
+
+**One line, three facts, and the third is the one a user actually wants.**
+`gpu headroom: 1.4 GB free of 16.0 GB (91% used) — this bubble holds 3.2 GB
+(measured); idle release in 571 seconds of quiet`. Free VRAM (first GPU, since
+the bubble loads one device), what THIS process holds on it, and what the idle
+release is about to do about its own share.
+
+**The bubble's share is ATTRIBUTED, not assumed, and the difference is stated.**
+`_parse_own_vram` keeps only rows whose pid is ours out of
+`nvidia-smi --query-compute-apps=pid,used_memory`: the same card also serves
+Ollama's llama-server, the compositor, the wallpaper and the settings app, and
+folding those in would be wrong in both directions — blaming the bubble for
+someone else's memory and overstating what a release can hand back. When the
+driver cannot attribute anything (an older driver, a vGPU, `N/A`),
+`core/audio.py::gpu_footprint_mb` supplies an estimate from the SAME tables the
+device choices use, and the line says so in full: *"estimated from the loader
+tables — the driver attributed no memory to a pid"*. A number the driver
+measured and a number added up from a table are not the same evidence, and the
+reader is deciding whether to trust the headroom. A model on **cpu** contributes
+zero in that estimate, because counting it would promise memory the release
+cannot free.
+
+**An answer nobody gave is never rendered as a number.** `N/A, 16380` is not
+`0 MB free`, a non-zero exit is not output ("`nvidia-smi` prints its complaint on
+stdout and exits non-zero" — parsing that is how a driver error becomes a
+reading), and a query that attributes nothing is not "this pid holds zero". The
+no-GPU case prints `free VRAM unknown — nvidia-smi gave nothing usable` and
+`this bubble's own share could not be read`, which is what the reader needs
+precisely when something is wrong. `0 MB free` is the loudest claim this line can
+make, so it is only ever made from a number that arrived.
+
+**`pending` and `due` are different sentences.** The window having elapsed while
+the bubble is mid-turn is not the same state as a bubble that just booted: the
+first prints `idle release DUE after 10 minutes of quiet — fires on the next tick
+that finds the bubble idle`, the second `idle release in 8 minutes of quiet`, and
+a release that already fired says so instead of pretending it is still coming.
+Collapsing them would make the busy bubble the one that looks untouched.
+
+**One dict, two surfaces, no second copy of the vocabulary.** `_vram_headroom()`
+builds the facts; `_gpu_headroom_lines()` renders them for the text report and
+the same callable is handed to `doctor_json`, so `doctor` and `doctor --json`
+cannot describe the same moment differently. `core/doctor.py` gained a
+`gpu_lines` dep (rendered beside `llm memory`, and printing nothing for a host
+without it, exactly like the appearance/web/llm lines) and a `gpu_headroom` dep
+passed through into the JSON as the host built it — a host that supplies neither
+leaves both surfaces byte-for-byte as they were, which is what a partial deps
+object is for.
+
+**Guards: 12 new tests plus five for the estimate.** The parsers (first GPU
+only; `N/A` is not a reading; a zero-total GPU is refused), the attribution
+(other pids excluded; an unattributable query is not a zero; a measured zero IS a
+measurement), the fallback (labelled, with its cause named), the failure modes
+(a wedged binary, a non-zero exit, a raising probe yields no line rather than a
+traceback in the one tool that exists for when things are already wrong), the
+release's three states plus `pending` ≠ `due`, the wiring (the line reaches the
+text report; the dict reaches the JSON), and the partial-deps contract on both
+surfaces. `core/audio.py::gpu_footprint_mb` is covered separately: cpu models
+contribute nothing, cuda models contribute their table size, a missing model
+reports no device rather than "cpu", and an unknown whisper size falls back
+instead of raising.
+
+**22 mutations, 22 caught, 2 probes green, every restore sha256-verified — and
+the sweep found a weak guard rather than a bug.** The first run came back 21/22
+with one MISS: dropping *"— the driver attributed no memory to a pid"* from the
+estimated wording left the suite green, because the test pinned the word
+"estimated" and not the reason. An estimate that does not say why it is one reads
+exactly like a measurement, which is the confusion the line exists to avoid — so
+the guard was strengthened (the clause is asserted) and the sweep then caught it.
+
+**Verified on this tree:** 1563 passed; order gate PASS in both shuffled
+sub-runs (447 s); coverage 84.62% ≥ 70; `compile`/`shell`/`smoke` PASS.
+
+**Live, from the RUNNING bubble** (served over the control socket, so these are
+the numbers the live process has):
+
+```
+deployment: in-sync — installed copy matches the checkout
+llm memory: after 600s idle the release would UNLOAD qwen3.8:27b — 7.5 GB to
+            give back, but the reload is not measured yet — nothing to weigh it
+            against
+gpu headroom: 1.4 GB free of 16.0 GB (91% used) — this bubble holds 3.2 GB
+            (measured); idle release in 571 seconds of quiet
+```
+
+Ground truth, same minute: `nvidia-smi --query-gpu=memory.free` read **1426 MiB**
+and the compute-apps table read **3312 MiB** for the bubble's pid — 1.4 GB and
+3.2 GB, which is what the line says. That reading was taken while the bubble's
+startup warm was loading `qwen3.8:27b` onto the same card, which is why it is
+**91% used with under 1.5 GB free**: the state the audit caught by hand, now
+printed by the bubble unprompted, with the release that will give its own share
+back counted down in the same sentence.
+
+**Stated limits.** (1) The line reports the FIRST GPU; a machine with the models
+on a second card would read the wrong one (the bubble's own loaders have the same
+assumption, so this is consistent rather than new). (2) Attribution shows only
+what the driver books to this pid — memory a framework caches internally counts
+here, which is the intent, but a driver that rounds small allocations to zero
+will under-report. (3) The estimate is a table, not a measurement: a model loaded
+with a different quantisation or context length occupies something else. (4) The
+line is read-only and does not alert; `resource_alerts` remains off by default,
+so a full card is visible in doctor rather than spoken.
+
+## A nearly full card shortens the release, and the journal says so (2026-09-17)
+
+**Waiting ten minutes was the wrong trade on the machine this was all for.** The
+release exists because the DESKTOP was starved — 15.2 of 16.4 GB used, ~1 GB
+free, `nvidia-drm` failing to allocate display buffers — and yet the bubble
+happily waited its full configured window while that was true, because
+`idle_release_seconds` knew nothing about the card. Ten quiet minutes is a fine
+bargain on a roomy GPU and a bad one at 93% used. The audit had already measured
+the number; nothing acted on it.
+
+**Two settings, both generated from the field table.**
+`vram_pressure_floor_mb` (default **1024**) is the free-VRAM floor; below it the
+release stops waiting and uses `vram_pressure_seconds` (default **30**). The
+source text says the pair, and so does the doctor line, because the check the
+release makes is the same reading `gpu headroom` prints.
+
+**Pressure shortens WHEN, never WHAT.** The LLM's keep/release verdict is
+untouched (`llm unloaded — 7.3 GB back for a measured 74 s reload (10.1 s/GB ≤
+20)` in the live run below, which is the verdict speaking, not the pressure), and
+every busy check still applies: a turn in flight, a queued turn, a recording, or
+a sentence under the announce lock still postpones the whole thing to the next
+tick. That split is deliberate — `vram_pressure_seconds` decides *when* the
+question is asked, `llm_release_wait_s_per_gb` decides the answer.
+
+**Three ways the pressure path stays off, and each is a decision rather than an
+oversight.** (1) `floor 0` disables it. (2) `idle_release_seconds 0` — an
+explicit "never release" — outranks a full card, because the user asked. (3) An
+unreadable card is **not** evidence of pressure: `nvidia-smi` that is missing,
+wedged, or non-zero-exit means the reading is unknown, and rushing a release on
+an unknown would drop the models on a machine whose driver simply would not
+answer. (The verdict's own rule points the other way on purpose — a gap in the
+policy must not let the bubble HOLD memory — and the two are consistent: neither
+invents a fact, one declines to keep, the other declines to panic.)
+
+**Junk never rushes a release.** An unreadable floor is `0` (off) and an
+unreadable window falls back to the configured one, because `0` in that field
+means "release at the first quiet tick" — a value nobody can read must not be the
+most aggressive setting in the file. For the same reason the pressured window is
+clamped to the normal one, so the setting can only ever make a release EARLIER,
+and a breach that does not actually shorten anything is reported as exactly that
+(`… below the floor, but the pressure window is not shorter than the 600s one`)
+instead of announcing an early release that did not happen.
+
+**One cached reading, and one field for the window.** The idle tick runs every
+second and reading VRAM shells out, so `_free_vram_sample` re-reads at most once
+every 30 s and caches an unreadable card the same way (the next tick half a
+minute later asks again). `_idle_release_window()` returns a single dict whose
+`window_s` IS the window in force, so the tick, the journal and the doctor read
+one field rather than agreeing about a number kept in two places — a redundancy
+the mutation sweep caught as a dead copy before it could rot.
+
+**Guards, and what the sweep taught.** 20 new tests: the readers (junk floor is
+off, junk window falls back, the clamp, the shipped defaults), the decision
+(above/at/below the floor, floor 0, release 0, unreadable card, zero seconds),
+the cache (one probe across repeated calls, re-read after the cadence, an
+unknown is stamped too), the tick (fires early with the reason; does NOT fire
+without pressure; every busy shape still postpones; the verdict still decides),
+and both surfaces (the line names the pressure, the JSON carries the fields, a
+fired release does not explain itself with today's reading). **15 mutations, 15
+caught, 2 probes green, every restore sha256-verified.** One mutation was a
+no-op — removing the assignment of `window_s` while still returning the
+shortened value — because nothing read the field; the honest fix was to collapse
+the duplicate (the tuple return and the dict both carried the window) rather than
+to write a test for a dead line.
+
+**And one guard was machine-dependent, which is worse than weak.**
+`test_it_waits_for_the_window` started failing on this machine the moment
+pressure existed: 100 s of quiet is not a release on a roomy card and IS one
+under the floor, so the test's outcome depended on how full the DEVELOPER's GPU
+happened to be. The `idle` fixture now pins the floor to 0 — the suite's baseline
+is a card with room on it — every pressure test states its own floor and reading,
+and the shipped pair is pinned separately so pinning the fixture cannot hide a
+change to it.
+
+**Verified on this tree:** 1583 passed; order gate PASS in both shuffled
+sub-runs (444 s); coverage 84.67% ≥ 70; `compile`/`shell`/`smoke` PASS.
+
+**Live, on the running bubble, with the card at 91% used** (settings raised for
+the demonstration and then restored byte-for-byte — same sha256):
+
+```
+doctor, before the change:
+  gpu headroom: 1.5 GB free of 16.0 GB (91% used) — this bubble holds 3.2 GB
+                (measured); idle release in 520 seconds of quiet
+
+floor raised to 3551 MB, pressure window 20 s, reload-settings -> ok
+doctor, floor breached (served by the bubble):
+  gpu headroom: 1.5 GB free of 16.0 GB (91% used) — this bubble holds 3.2 GB
+                (measured); idle release DUE after 20 seconds of quiet — fires
+                on the next tick that finds the bubble idle (VRAM pressure —
+                1.5 GB free is below the 3.5 GB floor, so the 600s window is 20s)
+
+journal, 09:41:10:
+  idle 20s (early — 1.4 GB free is below the 3.5 GB floor, so the 600s window
+  is 20s): released {'tts': True, 'whisper': False, 'cache_cleared': True},
+  llm unloaded — 7.3 GB back for a measured 74 s reload (10.1 s/GB <= 20)
+
+free VRAM 1 503 MiB -> 10 666 MiB (about 9 GB handed back)
+
+settings restored: a798b78210df (was a798b78210df) — byte-for-byte
+doctor, after the restore (normal window back, no pressure clause):
+  gpu headroom: 10.4 GB free of 16.0 GB (35% used) — this bubble holds 3.1 GB
+                (measured); idle release already fired in this quiet spell —
+                the next use re-arms it
+```
+
+The last line is the honesty rule doing its job: the release already fired, so
+the current reading is not used to explain it.
+
+**Stated limits.** (1) The floor is an absolute MB threshold, not a percentage:
+it does not scale with the cards it runs on, and it can only compare against the
+FIRST GPU (the same assumption the loaders make). (2) The reading is up to 30 s
+old by design, so a spike in VRAM in that window does not shorten anything until
+the next sample. (3) This makes the release respond to pressure; it does not stop
+the bubble from *loading* into a full card in the first place. (4) The two
+device choices still read free VRAM independently, so both loaders can pass
+separately and overcommit — the audit's P1 item, untouched by THIS section and
+closed by the one below ("One budget for the card").
+
+
+## One budget for the card, so two loaders cannot each pass on their own (2026-09-17)
+
+**What was wrong, in one sentence:** the speech model and whisper each compared
+their own size against the same free-VRAM reading, so both could decide "cuda"
+while the card could hold only one of them. Measured live on this card inside
+this pass (qwen3:8b loaded to make it tight, free VRAM **4 826 MB**):
+
+```
+OLD rule : speech cuda, whisper cuda  -> both claims 4800 MB against 4826 MB free
+SHIPPED  : speech cuda, whisper cpu
+  speech  reason: 3400 MB claim fits: 4826 MB free less 1024 MB reserve = 3802 MB available
+  whisper reason: 1400 MB claim refused: 5824 MB needed (1024 MB reserve and 3400 MB
+                  held back for the speech model) but only 4826 MB is free
+```
+
+The old pair left **26 MB** for the compositor, the wallpaper and the settings
+window — the exact condition the machine was measured in when `nvidia-drm`
+could not allocate DISPLAY buffers and the desktop lagged 20-30 ms.
+
+**The fix is one function, `core/audio.vram_budget(free_mb, *, claim_mb,
+owner, entitled_mb=0, reserve_mb=_VRAM_RESERVE_MB)`**, and both loaders now ask
+it instead of comparing for themselves: `_whisper_plan` and `_tts_plan` are
+thin wrappers that turn the budget's answer into a device + compute type, and
+the old two-value questions (`_whisper_device_choice`, `tts_device_choice`)
+stay as the compatibility seam the host's partial-install shim and the suite
+already use. A claim is refused unless it fits after the reserve **and** after
+another tenant's entitlement, and the refusal carries its own arithmetic so the
+journal can say *why* a model went to cpu.
+
+**The asymmetry is the arbitration.** `_speech_vram_claim_mb()` is the only
+place that knows who yields: whisper reserves the speech model's footprint
+before its own claim (a spoken reply is what the user is waiting for, and the
+ears can lose a few hundred ms of latency), while speech yields to nothing — a
+resident whisper is already inside the driver's free reading. Two cases where
+that entitlement is deliberately **zero**: speech already resident on cuda (its
+memory is inside the reading, and reserving it again would withhold room nobody
+holds) and speech configured for cpu (nothing will want the card).
+
+**Unknowns stopped diverging.** They used to: `_whisper_device_choice` treated
+an unreadable card as cpu while `tts_device_choice` fell through to cuda — the
+speech docstring even claimed cpu, so the code had been disagreeing with its own
+contract since it was written. Now an unreadable card (`None`, blank, `N/A`,
+`[N/A]`, junk, `inf`/`nan` — bare `Infinity` is legal json and
+`int(float('inf'))` raises OverflowError) refuses the claim for **both** owners
+with the reason saying so. An explicitly configured device still wins (the user
+chose it), and the plan says `authority: configured` while still computing the
+budget: the loader now warns when speech is configured on cuda with 1.4 GB free,
+which is the fact that explains a load failing a moment later.
+
+**The measured table was understated, and the budget is only as honest as it.**
+`_TTS_VRAM_MB` was 3 000 ("~2.7 GB measured") while this process holds
+**3 172-3 312 MiB** on the card while generating (`nvidia-smi` for our pid, with
+whisper on cpu, so the figure is speech alone plus the CUDA context and the
+per-voice conditionals). It is 3 400 now, and the comment says which measurement
+it came from.
+
+**Guards (18 new tests, `tests/test_audio.py`).** `TestVramBudget` pins the
+arithmetic: the refusal, the reserve (a claim that exactly fills the card is not
+a fit), the entitlement, the exact-fit boundary, every shape of unreadable
+reading, junk/negative claims and reserves, and that a reason carries numbers
+rather than a verdict. `TestOneBudgetDecidesBothLoaders` pins the *property*: a
+spy on `vram_budget` proves **both** loaders ask the same function (whisper with
+the speech entitlement, speech with none), that whisper gives way when the pair
+does not fit and takes the card when it does, that a resident speech model is
+not reserved twice, that a cpu-configured speech model leaves whisper the whole
+card, that the unreadable card answers cpu for both, that a configured device
+beats the budget, that a host with no CUDA device is never sent to the card, and
+— end to end through a fake `faster_whisper` — that the loader's decision comes
+from the plan and that the journal explains it (`held back for the speech
+model`).
+
+**16/16 mutations caught, 2 probes green, every restore sha256-verified**
+(`/tmp/vram_budget_sweep/sweep.py`): the reserve dropped, the entitlement
+ignored, an exact fit refused, an unreadable card read as zero free, a refusal
+without numbers, a junk reserve raising, a junk claim trusted, the entitlement
+always zero, charged for a resident model, charged against a cpu-configured one,
+whisper back to its own comparison, speech back to cuda on an unreadable card,
+the budget overruling a configured device, a cardless host sent to the GPU, and
+**the budget re-implemented inside `_tts_plan`** (the divergence the spy test
+exists for) — each at its own named assertion. The probes are the two edits that
+must stay green: a comment, and the measured constant moving by a measurement.
+
+**Live, from the installed bytes** (`~/.local/bin/core/audio.py`,
+sha256 `d5d4c5121173…`), on the real card, with the module's own nvidia-smi
+reader: idle card 10 122 MB free → both cuda; qwen3:8b loaded → 4 826 MB free →
+speech cuda, whisper cpu with the arithmetic above; qwen3:8b unloaded →
+10 379 MB free again. Honest note about this machine: `whisper_device` is pinned
+to `cpu` in its settings, so whisper's loader does not consult the budget at all
+here (an explicit choice is not a budget question) — the arbitration above is
+what `whisper_device=auto` asks for, and it is the shipped rule either way.
+
+**Gates.** 1617 passed (earlier: 1615, 1597); order gate PASS in both shuffled sub-runs (seed
+d567fd1, 440 s); coverage 84.77% ≥ 70; `compile`/`shell`/`smoke` PASS; specs
+tables regenerated (the audio row now names `vram_budget`). Deployed in the same
+pass, `deployment: in-sync` (running sha256 `b8186b25849a…` — handsoff.py did
+not change; this is `core/audio.py`).
+
+**Stated limits.** (1) The budget believes the driver's reading and the loader
+tables: it is arithmetic over a measurement, not a reservation, so two decisions
+made a second apart from two different readings can still each pass if the card
+freed between them (the reading is taken once per decision). (2) The models are
+not swapped out to make room — a claim that does not fit goes to cpu rather than
+evicting the other tenant, so on a small card whisper may run on cpu while
+speech holds the GPU, which is the priority order chosen here and not a
+universal preference. (3) `_TTS_VRAM_MB` is still a figure for ONE engine on ONE
+card (a different quantisation or context length occupies something else), and
+the whisper table is nominal. (4) The first GPU is the GPU (the loaders already
+assumed one device), and the reserve is an absolute 1 024 MB rather than a
+fraction of the card. (5) Nothing here stops the LLM (Ollama, another process)
+from filling the card before a loader asks — this decides what the bubble's own
+two loaders do with what is left.
+
+## Speech asks the LLM for the card, then waits for the memory to show (2026-09-17)
+
+**What was added:** when a speech load is refused for want of VRAM, the bubble
+can now ask Ollama to release its model — but only when the reload-cost verdict
+says the memory is worth giving back. The reclaim then waits (bounded, polled)
+for the driver to show the freed memory before re-planning the device, so a
+reclaim that appears to free nothing cannot turn a refusal into a claim.
+
+The hook's answer says which tenant moved: the LLM unloaded, kept its memory on
+purpose (reload too expensive), or could not be asked. Whisper does NOT ask:
+it yields to speech by design, and a startup whisper load evicting the LLM
+would fight the model the bubble had just warmed.
+
+**Implementation:** `core/audio.py::_ask_for_the_card` (lines 408–441) calls
+the injected `gpu_reclaim` hook when a speech claim is refused, then re-plans
+against a fresh reading taken AFTER the hook returns.
+`handsoff.py::_reclaim_gpu_for_speech` (2510–2551) asks `_release_llm` for the
+verdict, unloads when it says to, then calls `_await_vram_gain` (2492–2507) to
+poll the driver reading with a 3-second ceiling and 200 ms intervals. The
+settle time is measured (2218 MB immediately after an 8.2 GB unload, 10417 MB a
+moment later) and documented in the constant.
+
+**Stated limits.** (1) The wait does not guarantee the gain will appear within
+the window — a card that never shows it is returned as-is rather than claiming
+memory the driver does not report. (2) The reclaim itself can fail: Ollama may
+not answer, or the verdict may keep the model. The hook's dict says which.
+(3) This decides what the bubble's two model loaders do; it does not control
+Ollama filling the card before a loader asks.
+
+**Verification.** The implementation was read and its call path traced. The
+latest test report records 1615 tests with zero failures, but that suite
+predates this source and does not prove this change is covered. A targeted test
+for the reclaim flow and wait was not observed in `tests/test_idle_release.py`
+or `tests/test_audio.py` at audit time.
+ Coverage: 79.92% (16225 statements, 3258 misses).
+
+**Since this audit was written, the guards landed — and the live proof found a
+real ordering bug, which is the subject of the section below.** The audit was
+taken while the change was still being written (it cites `_ask_for_the_card` at
+lines 408-441, which is where it still is, and `_reclaim_gpu_for_speech` at
+2510-2551, which has since moved down by the wait helper). Nothing in it is
+wrong; its own caveat — "no targeted test was observed" — is answered there:
+20 guards, a 19/19 mutation sweep, and a live run that caught the asynchronous
+unload before the gates ever saw it.
+
+## The speech reclaim, verified — and the live run that caught its own bug (2026-09-17)
+
+**What the guards pin (20 new tests).** `tests/test_audio.py`
+`TestTheSpeechModelAsksForTheCard` pins the core side: a refusal is escalated
+with its reason, the hook's `gave_way` is what entitles a re-decision (a tenant
+that did not move buys NO second measurement), the re-plan runs against the
+reading taken afterwards, an unreadable card is never asked about, a missing or
+raising hook leaves the refusal standing, a junk answer is not a reclaim, a
+configured device never evicts the LLM, and through a fake `chatterbox` the
+loader takes the device from the plan and the journal says which tenant moved
+both ways. `tests/test_idle_release.py` `TestTheSpeechModelAsksTheLlmForTheCard`
+pins the host side against the real HTTP path (a fake `/api/ps` and
+`/api/generate`): the LLM is asked only when the verdict says the memory is worth
+the reload, the gain is measured as a DELTA, an unmeasurable card is not zero, a
+card that never shows the gain within the budget is reported as exactly that, the
+cached 30 s reading is dropped after a reclaim, an Ollama that does not answer
+says so, and both `configure()` sites install the hook (a source count, because
+the reload site masks the import-time one in-process).
+
+**The live proof caught a real bug, which is why it exists.** The first run
+against the deployed bytes and the real card produced:
+
+```
+card before       : 2218 MB free
+claim             : 3400 MB claim refused: 4424 MB needed (1024 MB reserve)
+                    but only 2218 MB is free
+  journal says    : ollama dropped gemma4:12b for the speech model — 0 MB came back
+decision now      : cpu
+card after        : 10417 MB free      ← the memory DID come back
+```
+
+The model was gone and the card was freed, but the reading taken immediately
+after the unload still showed the memory held — Ollama answers `keep_alive: 0`
+before the driver updates, so the reclaim measured **0 MB** for a reclaim that
+freed **8.2 GB**, and the speech model gave way for a reason that was already
+untrue. `_await_vram_gain` fixes it: the post-unload reading is polled (200 ms,
+bounded at 3 s) until the card shows MORE than before the unload, and a card
+that never shows it is reported as such rather than as a gain. After the fix,
+the same probe on the same card:
+
+```
+card before       : 2698 MB free
+asked for the card (took 0.4s)
+  journal says    : ollama dropped gemma4:12b for the speech model — 8197 MB came back
+  decision now    : cuda
+  3400 MB claim fits: 10679 MB free less 1024 MB reserve = 9655 MB available
+card after        : 10679 MB free
+resident now      : []          ← nothing to undo: the feature unloaded it
+```
+
+**19/19 mutations caught, 2 probes green, every restore sha256-verified**
+(`/tmp/reclaim_sweep/sweep.py`): the loader never asking, a configured device
+asking anyway, an unreadable card asked about, the hook's answer not checked,
+a raising hook taking the load with it, the re-plan using the old reading, the
+tenant sentence dropped, whisper evicting the LLM, the journal line removed,
+the giving-way line losing the tenant, the LLM dropped without weighing the
+reload, the gain measured as the reading rather than the delta, an unmeasurable
+gain reported as zero, the stale reading left cached, **the gain read once
+without waiting**, the wait accepting an unchanged reading, a card that never
+showed the gain reported as one, an unanswered Ollama reported as a reclaim, and
+the hook never installed. **The sweep's first run reported its two MISSES rather
+than absorbing them** (14/16), and both were weak GUARDS rather than bad code:
+"the hook's answer is not checked before re-planning" survived because the only
+test of that path re-read the same tight reading, so the re-plan and the refusal
+agreed — which is why "a refusal buys no second measurement" is asserted now —
+and "the policy is never installed" survived because the settings-reload site
+re-installs the hook in-process, which is why both sites are counted in the
+source as well as called.
+
+**The unload is only granted on the same exchange rate as the idle release:**
+`llm_release_wait_s_per_gb` is the budget, so a model whose measured reload
+costs more per GB than it frees is KEPT and the voice goes to cpu — the journal
+says which: `speech model fell back to cpu — <the refusal with its arithmetic>;
+the LLM did not give the card back — 7.3 GB back would cost a measured 219 s
+reload (30.0 s/GB > 20)`. A reclaim that cannot be asked for reads `ollama did
+not answer, so the card could not be asked back` and no claim is upgraded.
+
+**One guard false positive, fixed because it was wrong, not because it failed:**
+another thread added an audit entry headed `## core/lifecycle.py seam exists but
+has no production caller (2026-09-17)`, and the size-restatement guard read the
+date as a line count beside a module label. Dates are now stripped like line
+citations — a guard that calls a date a size teaches people to stop writing
+dates.
+
+**Gates.** 1617 passed; order gate PASS in both shuffled sub-runs (seed
+d567fd1, 461 s); coverage 84.84% ≥ 70; `compile`/`shell`/`smoke` PASS; specs
+tables regenerated (the audio row names `_ask_for_the_card` and the
+`gpu_reclaim` seam); deployed in the same pass and `deployment: in-sync`
+(`handsoff.py` 954ee652ce0f…, `core/audio.py` 928688298d84…, both equal to the
+checkout's). Live, the running bubble then loaded its voice on the card at
+startup (`loading chatterbox-turbo on cuda`) with no reclaim needed — the card
+was roomy at that moment — and `/api/ps` was empty when the doctor was read.
+
+**Stated limits.** (1) The wait is bounded: a driver slower than 3 s returns the
+unchanged reading and the Refusal stands, which is the honest outcome rather
+than a claim on memory nobody showed. (2) A reclaim can evict the model the
+bubble has just warmed — on this machine the startup warm of the 27b can be
+handed back seconds later so the voice can load on the GPU, and the next question
+pays that reload; that is the trade the request asked for, and
+`llm_release_wait_s_per_gb` is the knob that refuses it. (3) Only the speech
+model asks: whisper yields, and a process that loads the speech model without
+this host (an embedder calling `core.audio.configure()` without a hook) refuses
+exactly as before. (4) The reclaim is one unload per refused load attempt —
+repeated attempts cannot evict anything that is not resident, because the
+verdict says so before the request is sent. (5) It still does not stop Ollama
+from filling the card before a loader asks.
+
+## The turn counter has one home now, and the host reads it (2026-09-17)
+
+**What was missing.** `core/lifecycle.py` was extracted in the fourth cut
+phase and then never called: the host comment that introduced the handle
+claimed `_core_lifecycle.next_turn(...)` "where the app needs it", while the
+live increment sat in `Assistant._bump_gen`. The audit entry that recorded
+this read it as an unused module. The real shape was worse — the counter had
+TWO homes: `self._gen` was the int attribute every reader used (`gen !=
+self._gen` is the staleness test, and `_gen` keys the transcript cache), so the
+number the whole turn lifecycle trusts existed both as an attribute and, in
+theory, as the module's container.
+
+**What changed.** The module owns the counter and the host reads it.
+`core/lifecycle.py` gained `GenerationCounter` (storage plus `value` for the
+readers that rebase a stream) and `new_counter()`; `claim()` returns the whole
+`TurnState`, so the generation and the fresh cancel/done events are built
+inside ONE critical section under the module's `_COUNTER_LOCK`. In the host,
+`Assistant._gen` became a **property** over that counter and `_bump_gen`
+delegates to `claim()`. A property rather than a second attribute is the point:
+the twenty-odd readers and the tests that plant a generation still work
+unchanged, and there is nothing left for them to disagree with.
+
+**The lock's job moved rather than disappearing.** The host's `_gen_lock` no
+longer guards the increment (the module does, for every caller including an
+embedder that holds the same counter). It guards the one-time CREATION of the
+per-instance counter, double-checked, because `__new__`-built instances have
+no counter until something asks for one and two counters for one instance hand
+out the same generation twice — the exact defect the atomic claim exists to
+prevent.
+
+**Verification.** The gates ran locally in two passes (`bash ci/gates.sh
+--no-order`, then `bash ci/gates.sh order`): 1624 passed; order gate PASS over
+both orderings (seed d567fd1, 449 s); coverage 84.88% ≥ 70;
+`compile`/`shell`/`smoke` PASS. Guards: the module's own
+contract (the container shape, the claim advancing it, distinct claims across
+threads), the deterministic probe re-pointed at `_COUNTER_LOCK` (a claim that
+ran outside it must be observed BLOCKED), a spy proving `_bump_gen` claims
+through the module rather than beside it, a view test that fails if `_gen`
+stops reading the counter, the one-counter-per-instance test, and a source
+guard banning the raw increment from the host. **12/12 mutations caught, 2
+probes green, every restore sha256-verified** — including a mutation that left
+`claim()` in place and added a SECOND writer beside it, which only the source
+guard sees.
+
+**Live.** Against the installed bytes (`~/.local/bin/handsoff.py`
+f6d533b965f9…, `~/.local/bin/core/lifecycle.py` a9a7dbd8e44a…, both equal to
+the checkout's), driven in a throwaway HOME: `_gen = 5` reached the module's
+counter, `_bump_gen()` claimed through `GenerationCounter.claim` (spy saw 6),
+the host and the module then interleaved on ONE number (6,7,8,9,10,11,12 — no
+duplicates, none skipped), and 8 threads x 50 claims produced 400 distinct
+generations. Deployed in the same pass: `--ptt doctor` reports `deployment:
+in-sync — installed copy matches the checkout`, running sha256
+f6d533b965f9…, service active, no new errors in the journal.
+
+**Stated limits.** (1) The move makes the counter atomic and singular; it does
+not add a live surface for the generation — no socket verb reports it, so the
+live proof drives the installed module rather than the running process. (2)
+`handsoff-settings.py` has its own unrelated `_gen` (a run generation for the
+settings app's audio probes) and was deliberately left alone: it is a different
+stream in a different process. (3) The counter is per-instance, not
+per-process: two `Assistant` objects in one process have independent streams,
+which only tests do. (4) A reader that caches the number in its own variable
+would still drift — the property makes that a deliberate act instead of the
+default.
+
+## A turn asks the speech model for the card (2026-09-17)
+
+**The mirror of the reclaim, closed the same day it was named as the gap: when a
+turn's LLM does not fit on the card, the tenant that gives way is this process's
+own speech model — the cheap one to reload — instead of letting Ollama offload
+half the model to the CPU, where every token costs a multiple of the card's
+price.** `core/audio.py::yield_to_llm_verdict(free_mb, claim_mb, *, held_mb,
+reserve_mb)` is the speech path's own question asked again with the memory PUT
+BACK (`free + held`) rather than a second kind of arithmetic: the two decisions
+are one budget read from opposite sides, and the interesting half of the mirror
+is that its NOs are not symmetrical with the speech path's.
+
+**Five ways it answers NO, each a different fact** — nothing of ours is on the
+card (cpu speech, nothing loaded), the LLM's size could not be read, the card
+could not be read, the claim fits as things stand, or the claim does not fit
+even with this process's memory back (a model wider than the card: the release
+would hand back memory that cannot change the outcome, which is this machine's
+USER's own model — `qwen3.8:27b`, 17 GB on a 16 GB card). `tight` marks the only
+case worth a journal line, and the mundane NOs are logged at debug because
+"fits already" is the common case and is not news. **The direction of the
+unknown is deliberately the OPPOSITE of the speech path's:** there an unreadable
+card releases, because the alternative is a stalled utterance; here it does not,
+because the alternative is only that Ollama makes the offload decision for
+itself — and what this decision spends is a reload the user HEARS. Neither
+function invents a fact; they disagree about which way to fail, on purpose.
+
+**The claim's size comes from Ollama's catalogue, not from a table:**
+`core/brain.py::ollama_model_size_mb` reads `/api/tags` (per-model blob size =
+what a full offload costs the card) because `/api/ps` can only price a model
+that is ALREADY loaded and this question is asked before the turn loads one; a
+size below `_MIN_PLAUSIBLE_BYTES` is refused as some other unit, the model name
+has to match, and an unreachable server is `None` ("unknown") rather than 0 —
+the distinction the whole pair of features rests on.
+
+**The policy is one function, and every step before the release is a way NOT to
+release.** `handsoff.py::_free_the_card_for_llm` (called from `ollama_chat_stream`
+and nowhere else — `ollama_chat`, the non-streaming path memory extraction uses,
+never evicts the voice to help work nobody is waiting for, and a test pins that)
+checks the setting, reads what this process holds, takes a FRESH reading with
+`_free_vram_now()` rather than the 30 s sample (the same number is then the
+baseline the gain is measured against, so the journal's "what came back" belongs
+to the arithmetic that asked), asks the verdict, and only THEN spends an HTTP
+call on `/api/ps`: a resident model means this turn loads nothing, so the voice
+must not be spent. Something already speaking (`_ANNOUNCE_LOCK`, non-blocking)
+and a generation or load in flight (`_release_models`, whose locks are
+non-blocking by design) both mean "not now" rather than a torn model or a
+clipped sentence. The gain is waited for with the reclaim's own
+`_await_vram_gain` (an unload is asynchronous — the driver had not shown the
+memory yet) and the cached reading, the pressure window and the doctor line are
+all invalidated afterwards.
+
+**Said, not hoped:** the doctor's `gpu headroom` line carries what a turn WOULD
+ask — and only when there is something to ask for, because with nothing of this
+process's on the card the sentence would be about a policy rather than about
+this machine. `_speech_yield_state` reads the LLM's size from the turn path's
+per-model cache and never from the wire (doctor must not add HTTP seconds to a
+diagnostic, and a wedged Ollama would). The whole thing is one generated row,
+`speech_yields_to_llm` (default true), so it has a real control with a real tip
+in the Voice page.
+
+**Verification.** 34 new guards across `tests/test_audio.py`
+(`TestTheSpeechYieldsToTheLlm`) and `tests/test_idle_release.py`
+(`TestModelFootprint`, `TestTheTurnAsksTheSpeechModel`): the verdict's truth
+table, the memory put back with the reserve intact, every unreadable input at
+both ends, the catalogue reader (unit-shifted size, rounding up not down, name
+match, unreachable server), the policy (setting off, nothing held, a resident
+model, something speaking, a release that dropped nothing, the gain read without
+waiting, the stale reading, the background call not asking, and the doctor
+sentence). **17/17 mutations caught, 2/2 probes green, 0 misses, every restore
+sha256-verified** (`/tmp/llm_ask_sweep/sweep.py`) — the mutation "the memory is
+not put back before asking again" is the one that makes the mirror a mirror.
+Gates run locally: `tests` PASS (232 s), `coverage` PASS (239 s), `compile`,
+`shell`, `smoke` PASS (472 s total); **1656 passed**; order gate PASS in BOTH
+orderings (seed d567fd1, tests shuffled 234 s, file order shuffled 231 s);
+coverage **84.89%** (2 479 missing of 16 408 statements) ≥ 70.
+
+**Live, on the real card and the real Ollama, from the installed bytes**
+(`~/.local/bin/handsoff.py` sha256 88dc6ce3dff6…, equal to the checkout's;
+`--ptt doctor` reports `deployment: in-sync`, running sha256 88dc6ce3dff6…). The
+probe loaded this process's OWN whisper large-v3 through the module's budget, on
+the real card, and drove the shipped policy:
+
+```
+this process holds: 3600 MB (whisper on cuda)
+verdict for qwen3:8b: yield=False tight=False
+  the LLM's claim fits already: 4984 MB claim fits: 6663 MB free less 1024 MB reserve = 5639 MB available
+candidate that fits: gemma4:12b — 3600 MB of this card is this process's own models, and the
+  LLM's claim fits once they are back (7207 MB claim fits: 10263 MB free less 1024 MB reserve = 9239 MB available)
+ask result     : gave_way=True freed=3616 MB
+detail         : released whisper for the LLM — 3616 MB came back (the voice reloads in seconds; …)
+card after     : 10279 MB free (was 6663) — 3616 MB came back
+```
+
+Both NO branches are in that trace and neither is a guess: the configured model
+fit as things stood, so nothing was taken; a bigger real catalogue model did not
+fit, so the voice went and the driver confirmed 3 616 MB back. Nothing was left
+behind — `resident now nothing`, this process holding 0 MB, card at 10 279 MB.
+
+**Stated limits.** (1) The trade is real and the user pays it: the voice comes
+back COLD for the next reply (seconds), and this machine's settings pin
+`whisper_device` to **cpu**, so on THIS machine the probe had to load whisper on
+cuda itself — the feature is what `whisper_device=auto` (the shipped default)
+asks for. (2) It fires on the user's own turn only, so a background call can
+still find the card full. (3) The claim is `/api/tags` blob size, not residency:
+a model already partly offloaded claims its whole size. (4) `_await_vram_gain`
+is bounded (3 s), so a driver slower than that reports the release without the
+measurement rather than inventing one. (5) Another process can take the memory
+between the ask and the load — this makes room, it does not reserve any. (6)
+Whisper never asks (it yields to speech by design), and the two loaders still
+only arbitrate what the bubble's own processes hold: Ollama can fill the card
+before either asks.
+
+## The gates refuse a run on a tree that moved (2026-09-17)
+
+**The audit's §1 false red, closed where it is produced: a local run takes four
+minutes, this checkout is SHARED (an editor, another agent, a `git checkout`),
+and a verdict about a tree in motion is evidence about neither revision — green
+on a mixture is worse than red, because nobody re-runs a green.**
+`ci/worktree_stamp.py` fingerprints the worktree, `ci/gates.sh` takes that
+fingerprint BEFORE the first gate runs and compares it after the last one, and a
+tree that moved REFUSES the run, exits non-zero and names what moved.
+
+**What is stamped, and why each part earns its place.** HEAD (a commit or
+checkout mid-run changes the tree under test), ONE CONTENT HASH PER TRACKED
+CHANGE, the whole `git diff HEAD` as a second hash (mode and deletion edges that
+no content hash can see), and every untracked file git does not ignore (an
+untracked file is still code the suite imported). **The per-file hashes are not
+an optimisation, they are the message:** the first version hashed only the whole
+diff and, run against this repo, its refusal listed all 28 files that were
+already dirty when the run started — a refusal that sends the reader hunting for
+the one a second writer touched. Live after the change: `tracked files changed:
+newly dirty install.sh`, and nothing else.
+
+**It cannot refuse its own run.** The gates write `.coverage`, `tests/report*.xml`,
+`__pycache__` and `.pytest_cache` every time, and a stamp that counted those
+would fail every run it was added to. They are excluded through the repo's REAL
+`.gitignore`, not a list kept in the stamp: the guard copies that file into a
+scratch worktree, creates every one of those artifacts, and asserts the stamp
+did not move — so un-ignoring one of them fails the guard instead of turning
+every future run into a refusal. A directory that is not a git worktree (a
+tarball install) gets NO OPINION rather than a clean bill, and the gate maps
+that to SKIP.
+
+**Two real bugs were found by running it, not by reading it.** (1) `run_gate`
+built `"gate_$name"`, so the first live run of the gate reported
+`gate_two-writer: command not found` — a FAIL for entirely the wrong reason,
+which is the mistake this gate exists to prevent; the mapping is now
+`gate_${name//-/_}` and a guard pins it. (2) The failure digest read a junit
+report left by a PREVIOUS session (it described "1 failed of 1617" while the run
+had collected 1 680, and printed a failure from another tree) — stale reports are
+now pruned at the start of every run, the way the coverage gate already prunes
+its shards, and the digest is printed only when the FIRST failure was a suite
+gate (`tests|order|coverage`); under a refusal it points at the refusal's own
+message instead of explaining a gate that passed.
+
+**The sweep made the guards better in two ways, both recorded rather than
+absorbed.** It found a HOLE IN MY GUARDS: replacing every per-file hash with one
+constant left the suite green, because every test's baseline had the edited file
+CLEAN — a mutation that only a file edited twice can see, so
+`test_an_already_dirty_file_that_changes_again_is_named` exists now. And it
+reported one EQUIVALENT mutant (deleting the missing-fields check while leaving
+the line that follows it changes only the wording, since a HEAD mismatch refuses
+anyway), which was replaced by a behaviour-changing one that makes a truncated
+snapshot a clean bill.
+
+**Verification.** `tests/test_ci_two_writer.py` — 26 guards: the stamp's
+movement (edit, new untracked file, untracked edit, already-dirty edit, deletion,
+commit, mode change, and the already-dirty-file naming), the artifacts that must
+NOT move it, "outside git" and "truncated snapshot" as no-opinion cases, the CLI
+refusal through the shipped script (exit 1 + the named file + the
+"cannot be trusted" sentence, exit 2 for a missing baseline, exit 2 outside
+git), and the wiring in `ci/gates.sh` (registered LAST, baseline before any gate,
+baseline outside the tree, compare-not-restamp, cleanup on both exits, digest
+scoped to suite gates, stale reports pruned, the hyphen mapping, and that a
+Python stamp script is never fed to `bash -n`). **14/14 mutations caught, 2/2
+probes green, 0 misses, every restore sha256-verified**
+(`/tmp/two_writer_sweep/sweep.py`). Gates run locally: `tests` PASS (233 s),
+`coverage` PASS (239 s), `compile` (51 files) / `shell` / `smoke` PASS,
+**`two-writer` PASS** (473 s, exit 0); **1682 passed**; order gate PASS in BOTH
+orderings (seed d567fd1: 238 s shuffled, 227 s file order); coverage **84.69%**
+(2 532 missing of 16 539 statements) ≥ 70.
+
+**Live, the way a second writer actually behaves.** With a comment appended to
+`install.sh` 90 seconds into a real `bash ci/gates.sh --no-order` run:
+
+```
+tests      PASS 240s
+coverage   PASS 247s
+compile    PASS 0s
+shell      PASS 0s
+smoke      PASS 0s
+two-writer FAIL 0s
+──────────────── two-writer ────────────────
+REFUSED — the worktree changed while the gates were running:
+  - tracked files changed: newly dirty install.sh
+This run cannot be trusted as evidence about either revision: re-run it on a still tree
+============ failures ============
+first failure: the two-writer gate (its own message is above).
+```
+
+The suite was GREEN and the run still refused: that is the whole point — the red
+it replaces would have said "install.sh is broken" about a tree the suite never
+saw. `install.sh` was restored byte-for-byte afterwards (sha256 identical), and
+the clean run of the same gate before that printed `worktree unchanged since the
+run started`.
+
+**Stated limits.** (1) It judges the TREE: an index-only change (`git add`,
+`update-index`) is deliberately not a change, because what the suite imported is
+the worktree — pinned by a test that says so. (2) A write that lands after the
+comparison, or one that is edited and reverted inside the run, is invisible;
+the window is the run, and the fingerprint is only taken at its two ends. (3) It
+names the files that moved, not the moment or the gate they moved during (a
+mid-run checkpoint per gate would say more — built the same day, see the section
+that follows). (4) It is the
+LOCAL gate: the GitLab pipeline is untouched, because a pipeline checkout has one
+writer and a gate that cannot fire is not worth the minutes. (5) Ignored files
+are exempt by design, so a second writer that edits something git ignores
+(`*.log`, runtime state) will not be noticed.
+
+## The refusal now says WHICH gate the tree moved under (2026-09-17)
+
+**The first version could only say "it moved": the fingerprint was taken at the
+two ends of a four-minute run, which tells a reader the verdict is worthless but
+not where to look.** `ci/worktree_stamp.py` gained `--checkpoint DIR --label
+NAME`: one snapshot per gate, compared against the previous one, and a change is
+appended to `DIR/moves.txt` under the label of the gate that just ran. The
+verdict therefore carries two answers — WHICH files moved, and which gate they
+moved under:
+
+```
+REFUSED — the worktree changed while the gates were running:
+during the tests gate:
+  - tracked files changed: newly dirty install.sh
+```
+
+**The names in the checkpoint directory are fixed so the shell keeps no
+bookkeeping:** `first.json` (written ONCE — it is what the run started from, and
+the final comparison is against it, because a baseline rewritten on every
+checkpoint would quietly forget a change made early in the run), `latest.json`,
+`NNN-<label>.json` per checkpoint, and `moves.txt`. One file per gate is what
+makes the log appendable and the attribution auditable.
+
+**Two design points that are really one.** The interval belongs to the gate whose
+checkpoint CLOSED it, so a change during `coverage` is reported as `during the
+coverage gate` and the gates after it add nothing (an unchanged checkpoint writes
+no log line, pinned by its own test). And the LAST gate skips its own checkpoint,
+because `two-writer`'s run-wide comparison against `first.json` is the last word;
+checkpointing after it would only describe the sliver of time after the verdict.
+
+**`--compare FILE --save FILE2` came out of this**: a checkpoint needs both the
+verdict and the next snapshot, and asking for them separately stamped the tree
+twice per gate. One call, one stamp of the tree.
+
+**One bug was found by reading the output, not by a test:** the closing sentence
+of the refusal was written with a backslash-newline INSIDE single quotes, which
+in bash is a LITERAL backslash, so it printed `...either revision: \re-run it on
+a still tree...`. The sentence is one physical line now, and a guard asserts that
+it is (a word-level assertion would never have seen it).
+
+**Verification.** 13 new guards (39 in the file): the checkpoint's attribution
+(`moves.txt` names the gate and the file), an unchanged checkpoint writing
+nothing, `first.json` never replaced across three checkpoints, `latest.json`
+being the current tree, a non-git tree's FIRST checkpoint also being "no opinion"
+(it used to return "unchanged", because `before is None` short-circuited ahead of
+the vcs check), a truncated checkpoint reading as "no previous" rather than a
+refusal, the chained `--compare --save`, the wiring (a checkpoint after every
+gate, labelled, two-writer excluded, the intervals printed before the total,
+`first.json` as the baseline, the directory in `/tmp` and removed on both exits,
+the refusal sentence on one line) — **and one END-TO-END run of the real
+`ci/gates.sh`** on a scratch repo whose `$PYTHON` is a wrapper that appends to a
+tracked file on its SECOND call: the first call is the baseline stamp, so the
+edit provably lands inside the compile gate, and the run has to refuse and name
+it. Deterministic, no timing, no mock of the gate.
+
+**23/23 mutations caught, 2/2 probes green, 0 misses, every restore
+sha256-verified** (`/tmp/two_writer_sweep/sweep.py`, 9 new mutations: no
+checkpoint per gate, a fixed label, the intervals ignored, the verdict compared
+against `latest.json` instead of `first.json`, `first.json` rewritten every
+checkpoint, the log written even when nothing moved, a non-git first checkpoint
+as a clean bill, the chained compare not saving, two-writer checkpointed after
+its own verdict). The sweep is also what DEMANDED the end-to-end test: mutating
+the interval branch to look at a file that is never written stayed green, because
+the wiring guard only looked for the word `moves.txt` in the gate body — the
+assertion was about the text, the property is about the behaviour, and the
+scratch-repo test is what tells them apart.
+
+**Live:** with a comment appended to `install.sh` 100 seconds into a real
+`bash ci/gates.sh tests two-writer` run, the suite came back green
+(`tests PASS 234s`) and the refusal named the interval and the file
+(`during the tests gate: - tracked files changed: newly dirty install.sh`), exit
+1, no suite digest; `install.sh` restored byte-for-byte (sha256 identical).
+
+**Stated limits.** (1) The interval is the gate whose checkpoint closed it, so a
+file edited DURING a gate and reverted before its checkpoint leaves no trace —
+the log is a sequence of endpoint comparisons, not a watch. (2) A truncated
+`latest.json` is treated as "no previous" rather than as a change: the safe
+direction, a missed interval rather than a false refusal. (3) The cost is one
+tree stamp per gate (a few hundred milliseconds on this repo) and only on the
+local gate — the GitLab pipeline does not run it. (4) It still says nothing about
+WHERE inside a gate's window the write landed, only which gate's window it was.
+
+## A collision resumes the run instead of throwing it away (2026-09-17)
+
+**The refusal was right and still wasteful.** A local run of the suite is four
+minutes and the full list is eight; this checkout is shared; and one write in the
+last gate discarded every verdict the run had already earned — the documented
+behaviour, and the reason nobody re-runs a red. It also left the reader's second
+question ("so what do I re-run?") unanswered. Now a checkpoint that sees the tree
+move RESUMES instead of refusing: the collided gate's attempt is discarded, the
+baseline moves onto the state the collision left, and that gate is re-run against
+it — so every verdict from the collision onward is about the tree as it now
+stands. Measured on this checkout, with a real second writer appending to a
+tracked file during the compile gate:
+
+```
+──────────────── compile ────────────────
+byte-compiled 51 files
+compile    VOID 0s   (discarded — it had PASS; the tree moved during the attempt)
+
+──────────────── compile (re-run — the tree moved) ────────────────
+byte-compiled 51 files
+compile    PASS 1s   (re-run after the move)
+
+──────────────── two-writer ────────────────
+worktree unchanged since the tree moved during the compile gate
+
+============ resumed ============
+during the compile gate:
+  - tracked files changed: rewritten GAP_ANALYSIS.md
+verdicts about the tree as it now stands: compile two-writer
+carried over: none — no verdict above describes an earlier tree
+
+all gates passed — the run resumed, and every verdict describes the tree as it
+now stands.   (exit 0)
+```
+
+**The baseline has to MOVE, and it has to say what it is.** The gates after the
+collision are judged against the state the collision left, so
+`ci/worktree_stamp.py` grew `--rebase DIR --label NAME`: it moves `first.json`
+onto the newest checkpoint and annotates it (`"baseline": "the tree moved during
+the compile gate"`). Without the move the end comparison would be a verdict about
+a tree that no longer exists — the refusal this replaces; without the annotation
+the run's closing line would say "since the run started" about a tree it never
+saw. A checkpoint still never rewrites the baseline (that is what makes an early
+change unforgettable), a rebase is an explicit act, once per leg, and a rebase
+that cannot happen (no snapshot, no git) is "no opinion" — the run then refuses
+exactly as it did before this existed rather than claiming a resume.
+
+**What a resumed run is NOT, stated in the output rather than in a comment.** A
+run whose collision is in a later gate has verdicts from two trees, and the
+summary says which are which instead of printing "all gates passed" over a
+mixture:
+
+```
+============ resumed ============
+during the shell gate:
+  - tracked files changed: rewritten GAP_ANALYSIS.md
+verdicts about the tree as it now stands: shell two-writer
+carried over (they describe the tree BEFORE the move): compile
+
+every gate passed, but the carried-over verdicts describe the earlier tree
+(see resumed above).   (exit 0)
+```
+
+That is the honest half of the feature, and it is the half a user has to be able
+to see: a collision in the FIRST gate leaves nothing carried over and the run is
+still a verdict about one revision, while a collision in a later one is a partial
+verdict, named as such. The split is taken at the LAST collision, because a
+verdict from an earlier leg — even one this feature re-ran — describes the tree
+the earlier write left, not the current one.
+
+**Bounds, so a moving checkout cannot loop or lie.** One re-run per gate is the
+whole budget: a window holding TWO writes has no verdict in it, so the run stops,
+says the tree "keeps moving", and does not run the remaining gates. A write after
+the LAST checkpoint has no gate left to re-run, so the end comparison still
+refuses it (now saying "changed AGAIN after the run resumed"). And the failure
+bookkeeping (which junit report the digest prints) moved to where an attempt is
+KEPT, so a red from a mixture can never be explained as this run's failure — the
+same defect as the stale report the digest already had.
+
+**Reading the output found two lines that lied.** The first version of the
+resumed section said "the run resumed from the collision instead of refusing the
+whole thing" even in the STOP case, and closed with "carried over: none — every
+verdict above is about the tree as it now stands" when there were no verdicts at
+all (the give-up path, where both attempts are VOID). The section now branches on
+the stop ("moved again before the run could certify that window — so it stopped
+rather than report a mixture") and says "no verdict survived: every attempt under
+the collided gate straddled a write" instead of offering a split of nothing.
+**The scratch-repo probe had the same class of bug**: its call counter and marker
+files lived INSIDE the worktree, where counting a call made an untracked file
+appear — so the collision the old test credited to `app.py` was joined by a move
+the probe itself caused. The markers live outside the tree now, and the wrapper
+breaks a file on chosen calls as well as moving one, which is how the
+discarded-versus-kept red path got its own test.
+
+**Verification.** 13 new guards (52 in the file): the rebase unit and CLI (the
+baseline's content, its annotation, "no opinion" with no checkpoint, and the
+closing line naming the tree), the status not being swallowed after the stamp
+(asserted as the helper's LAST statement, because a `return 0` there is a silent
+off switch for the whole feature), the rebase label, the stop message on whole
+physical lines, the split at the last collision, the discarded attempt not
+carrying the run's failure, and three end-to-end runs of the real `ci/gates.sh`
+on a scratch repo whose `$PYTHON` writes on chosen calls: a collision that
+resumes, one that carries an earlier verdict over, and a window with two writes
+that stops the run. **16/16 mutations caught, 2/2 probes green, 0 misses, every
+restore sha256-verified** (`/tmp/resume_sweep/sweep.py`) — including the rebase
+that announces without moving, the split taken at the first collision, the
+verdict line keyed on the wrong half of the split, rows losing their notes, and
+the failure bookkeeping moved back into the discarded attempt. Gates, each
+invocation stamped and ending in the tree verdict: `tests` PASS (230 s),
+`compile` (51 files) / `shell` (5 scripts) / `smoke` PASS, **`two-writer`
+PASS**; then, on the final bytes after these ledger rows were written,
+`coverage` PASS (237 s, **84.62%** ≥ 70 — 2 555 missing of 16 613 statements)
+and `order` PASS in BOTH orderings (seed d567fd1, **1 708 passed** each,
+466 s), with `two-writer PASS` — `worktree unchanged since the run started`,
+`all gates passed`, exit 0 — in every one. **Live, on this checkout, a real
+second writer appending to a tracked file**: the resumed run
+above (exit 0, `carried over: none`); the carried-over run at
+`bash ci/gates.sh compile shell two-writer` (exit 0, `carried over …: compile`);
+and two writes under one gate (`compile two-writer`, calls 2 and 5) which
+REFUSED with `the worktree moved again while the compile gate was re-running`,
+`no verdict survived`, `first failure: the two-writer gate`, exit 1, and no
+`two-writer` banner at all — the run stopped. The victim file was restored
+byte-for-byte (`GAP_ANALYSIS.md` sha256 `99bffaffdca8…`, `sha256sum -c` clean),
+and `ci/` is in no shipped list (`TOP_REQUIRED`/`TOP_EXECUTABLE` name no `ci/`
+path), so the deployment is unaffected by this change.
+
+**Stated limits.** A resumed run is not a verdict about one revision unless its
+collision was in the first gate, and the carried-over verdicts are only
+re-validated for the current tree if those gates are run again — the run names
+them rather than pretending, which is all a gate can honestly do. The interval
+attribution is unchanged (the gate whose checkpoint closed the window); a write
+during a gate and reverted before its checkpoint still leaves no trace; one
+re-run per gate means a burst of writes stops the run instead of chasing them;
+the discarded attempt's time is spent and shows in the total but not in a row's
+seconds; and this is the LOCAL gate — the GitLab pipeline does not run it,
+because a pipeline checkout has one writer.
+
+## The resumed run catches up, so it ends as a verdict about one tree (2026-09-17)
+
+**The section above ended with a limit, and this is it paid off: a resumed run
+that stops at "these rows describe an earlier tree" is not a verdict about
+anything.** The move-victims are now RE-RUN, in order, before the tree verdict,
+so a green run ends about ONE tree. Measured live on this checkout, with a real
+second writer appending to a tracked file during the shell gate:
+
+```
+the run is catching up: re-running the verdicts the move overtook (compile)
+so this run ends as a verdict about one tree rather than two.
+
+──────────── compile (catch-up — the move overtook it) ────────────
+byte-compiled 51 files
+compile    PASS 1s   (caught up after the move)
+
+──────────── two-writer ────────────
+worktree unchanged since the tree moved during the shell gate
+
+============ summary ============
+compile    PASS 0s   (superseded — the catch-up re-ran it against the tree as it now stands)
+shell      VOID 0s   (discarded — it had PASS; the tree moved during the attempt)
+shell      PASS 0s   (re-run after the move)
+compile    PASS 1s   (caught up after the move)
+two-writer PASS 0s
+
+============ resumed ============
+during the shell gate:
+  - tracked files changed: rewritten GAP_ANALYSIS.md
+caught up (re-run against the tree as it now stands): compile
+verdicts about the tree as it now stands: compile shell two-writer
+carried over: none — no verdict above describes an earlier tree
+
+all gates passed — the run resumed, and every verdict describes the tree as it
+now stands.   (exit 0)
+```
+
+**The split had to become per-LEG, not per-collision.** With a catch-up in the
+picture, "which verdicts are current" is no longer answered by *which collision
+was last*: a gate the catch-up re-ran is current even when the collision that
+prompted it was two collisions ago, and a gate the catch-up did NOT get to —
+because the next write came first — is stale however recently it ran. So every
+row carries the leg it was kept in, and the split is computed from the LAST KEPT
+row per gate (a counted VOID row is a discarded attempt, not a verdict). The
+live consequence is the case the old keying would have got wrong:
+
+```
+caught up (re-run against the tree as it now stands): compile
+verdicts about the tree as it now stands: compile two-writer
+carried over (they describe the tree BEFORE the move): shell
+every gate passed, but the carried-over verdicts describe the earlier tree
+```
+
+— a write inside the catch-up (a real second writer, this time during the
+catch-up's own compile run) leaves the SHELL verdict overtaken, and the run says
+so instead of calling everything current because the last collision happened to
+be called `compile`.
+
+**Bounded and conditional on purpose.** The catch-up is SKIPPED when the run
+already has a failure to report, and the reason is structural rather than shy:
+the failure bookkeeping (which junit report the digest prints, FIRST_FAILED,
+the one stashed copy) is built for ONE tree's worth of red, and catching up a red
+run would mean unpicking it to decide whose red the digest explains — a red is
+already a verdict, and the rows say which tree it belongs to — a carried row is
+`compile    FAIL <n>s   (before the move)`. One pass only: a write inside the
+catch-up makes the gates it re-ran stale again, and that is REPORTED (the split
+above) rather than chased, because chasing it is how a gate turns into a loop on
+a busy checkout.
+And the tree verdict was moved OUT of the gate loop so it always runs last:
+`catch_up` sits between the body gates and `two-writer`, since anything running
+after the comparison would invalidate it.
+
+**Verification.** 7 new guards (59 in the file): the catch-up announcing itself
+and labelling its attempt, the superseded row, `caught up …: compile`, the run
+ending whole, the skipped-catch-up on a pre-existing red, a clean resume with
+nothing overtaken doing NO pass, a write inside the catch-up leaving the split,
+the tree verdict running exactly once and AFTER the catch-up, a source guard that
+no guard in the file pins a gate's elapsed seconds (below), and the wiring
+(carried gates only, one pass, in order, through `run_gate`, superseded rows
+marked, the red check before the re-runs, the summary labelling carried rows).
+
+**The whole-suite run found a guard that measured where it should have asserted.**
+The carried-red guard was pinned to the summary row down to the second — the gate
+name, the verdict, `0s`, the marker; the mechanism was right, and the same row
+carried a different number under the load of a whole-suite run, so a correct tree
+was reported red: the single failure in an otherwise 1 714-test run, and a guard
+that passed alone every single time. The assertion is a SHAPE now (the gate, the
+verdict, whatever elapsed seconds, the marker), and a source guard in the same
+file forbids the practice file-wide — tested in BOTH directions, because it has to
+SEE a pinned second when there is one and find none in this file: a check that
+only looks at the tree cannot be told from a check that looks at nothing. The
+sample inside that guard is built by concatenation so the file does not itself
+contain the literal it forbids.
+
+**Green on the final bytes, every invocation ending in the tree verdict:**
+`tests` PASS 231 s (**1 715 passed**), `order` PASS 455 s in BOTH orderings
+(seed d567fd1, 1 715 each), `coverage` PASS 231 s (**84.60%** — 2 558 missing of
+16 613 statements) ≥ 70, `compile` (51 files) / `shell` (5 scripts) / `smoke`
+PASS, **`two-writer` PASS** (`worktree unchanged since the run started`), `all
+gates passed`, exit 0.
+
+**29/29 mutations caught, 2/2 probes green, 0 misses, every restore
+sha256-verified** (`/tmp/resume_sweep/sweep.py`: 13 new for the catch-up — the
+pass with nothing overtaken starting anyway, a gate's leg taken from its FIRST
+kept row, rows losing their leg, the leg never advancing, the catch-up re-running
+the whole list, running after the tree verdict, losing its phase, and a carried
+verdict printed as if it were current — plus 4 for the flake fix: the literal
+restored, the carried row's note emptied, and each half of the elapsed-seconds
+check broken). **Live on this checkout:** the catch-up completed
+(above, exit 0); and with a pre-existing red (a temporary untracked
+`probe_broken.py`, removed after), the run printed `the move overtook these
+verdicts: compile`, `catch-up skipped: this run has a failure to report`, the
+carried red marked `(before the move)`, and `first failure: the compile gate` —
+exit 1, no catch-up. The victim file was restored byte-for-byte (`GAP_ANALYSIS.md`
+sha256 `d77cd9f92278…`, `sha256sum -c` clean) and the probe file is gone.
+
+**What the section above no longer means.** Its stated limit — "a resumed run is
+not a verdict about one revision unless its collision was in the first gate" — now
+holds only for a run that already has a red to report: a green run completes
+itself. The remaining limits are narrower: the catch-up re-runs the overtaken
+gates ONCE, so a checkout being written to throughout can still end with a split
+(which it names); a red run's carried verdicts stay carried, by design; the pass
+costs the time of the gates it re-runs (visible in the total); and `two-writer`
+still cannot absorb a write that lands after the last checkpoint, because there
+is no gate left to re-run — that comparison still refuses.
+
+## The refusal says roughly WHEN inside the gate the write landed (2026-09-17)
+
+The row above closed with its own limit: the checkpoint could name WHICH gate's
+window the tree moved in, and nothing about WHERE inside that window. The two
+readings of "the tree moved during the tests gate" are not the same news — a write
+90 seconds into a four-minute suite is somebody editing while the tests ran, and
+the same write ten seconds before the checkpoint is usually the run settling — so
+the half of the answer a reader needs to tell a collision from a coincidence was
+missing.
+
+**How it is answered.** Every snapshot now carries the clock it finished at (`at`)
+— the moment after which nothing in it was read, which is what makes it an honest
+right edge for a window. A checkpoint that sees a change places each changed
+path's own `mtime` inside the window its two checkpoints bracket, and writes it
+under the gate's heading beside what moved:
+
+```
+during the tests gate:
+  - tracked files changed: newly dirty install.sh
+  - when: install.sh was last written 96s into the tests gate's window (231s
+    long), about 42% through — the middle of it, at 14:03:47
+```
+
+A HEAD move has no file to ask, so it is timed by the commit itself (`git log -1
+--format=%ct`). The CLI prints the same lines for a hand-run checkpoint, the tree
+verdict's refusal prints them too, and the resumed section states in the output
+that they are a PLACEMENT rather than an observation — nothing watches the tree,
+so the evidence is the timestamp the writer left behind, and a reader who is not
+told that will read "96s into the window" as something the gate saw happen.
+
+**Every shape it cannot place says so in words instead of inventing a number.**
+An `mtime` before the window is real, not an error — the earlier snapshot read
+that file before the write and finished after it — so it reads
+`was last written 42s BEFORE the tests gate's window opened (14:02:41), so the
+previous checkpoint read it while that write was still landing` rather than being
+clamped to zero, which would have said "at the very start of the gate": a
+different fact about a different write. An `mtime` past the close is `at the very
+end of the tests gate's window or just after it`, with no fraction, because a
+fraction of a window the write is outside of is arithmetic about nothing. A
+deletion has no clock at all (nothing to stat) and is skipped without an error. A
+window under two seconds loses the fraction and keeps the offset — "3% through
+0.4s" is noise, and the E2E runs are exactly that shape, so the omission is a case
+that ships. A snapshot from before the clock existed (no `at`) loses the timing
+and keeps the refusal. Eight paths get a line and the rest are COUNTED
+(`(and 3 more changed path(s), not timed)`), because a `git checkout` can move
+hundreds and a wall of lines points at nothing.
+
+**The tree verdict opens its window at the checkpoint, not at the baseline.**
+Its `gate_two_writer` now passes `--since "$STAMP_DIR/latest.json"`, because the
+one write that comparison catches is the write NO gate saw — it landed after the
+final checkpoint — and a whole-run window would report it as "4 800s into the
+run": true, and no use to anybody. The VERDICT is still against `first.json` (the
+baseline a resumed run is judged against), and a `--since` that is missing,
+unreadable, or older than that baseline is ignored rather than used: a window the
+verdict is not about is a worse answer than a coarse one, and a reader cannot see
+the difference.
+
+**The refactor that came with it, and the case its guard found.** "What moved" now
+has ONE computation (`_moves`), because a refusal that names a file the timing
+lines then ignore is worse than no timing: `differences` renders its rows as
+sentences and `when_notes` asks the clock about exactly the paths in them. The
+risk in a rewrite like that is the paths that LEAVE a list — a tracked file
+restored to HEAD's bytes, an untracked file deleted — which a naive version drops
+silently while still refusing for some other reason. `test_the_shapes_that_leave_a_list_are_named_too`
+pins them, and the sweep confirms it: deleting that branch from `_moves` is a
+caught mutation, not a green tree.
+
+**A guard that failed on its first run, in the right direction.** The band test
+walks eight placements — each `_band` boundary sampled a percentage point either
+side of itself — and its first run raised `IndexError` because the shared test
+helper wrote the SAME bytes on every call: the second case had no changed path, so
+`when_notes` returned nothing and the assertion would have been checking an empty
+list for a property about placement. The helper now puts the clock into the bytes
+it writes, so consecutive calls always differ; a guard that could pass on an empty
+answer is not a guard.
+
+**Verification.** 18 new guards (**77** in `tests/test_ci_two_writer.py`): the
+clock each snapshot carries and the verdict's blindness to it, the offset/fraction/
+band/clock arithmetic placed by hand with `os.utime` against windows the test
+chose (never a sleep, so the numbers are exact), all four band boundaries sampled
+on both sides, the three shapes a write can have relative to its window, the
+deletion and the clockless snapshot degrading to nothing rather than to a wrong
+answer, the cap and what it counts, `--since` narrowing the window and a stale or
+missing one being ignored, `opened_at` moving the placement, the CLI's refusal and
+checkpoint output, and the wiring (`--since`/`latest.json` in `gate_two_writer`,
+`first.json` still the verdict, `report_resume` explaining the lines). **25/25
+mutations caught, 2/2 probes green, 0 misses, every restore sha256-verified**
+(`/tmp/when_sweep/sweep.py`, including mutations that remove the clock, keep it in
+`fingerprint`, clamp a pre-window write into the window, fabricate a clock for a
+deletion or a clockless snapshot, drop the cap or move it by one, silence the
+`when:` lines in the log or the CLI, ignore `--since`, accept a stale one, and
+compare the verdict against the checkpoint). **Live on this checkout, with a real
+second writer and a real window:** `install.sh` appended 80 seconds into a
+230-second window produced `install.sh was last written 80s into the tests gate's
+window (230s long), about 35% through — the early part of it, at 21:47:40` — the
+wall clock matching the `date` taken at the moment of the write — and a real
+`bash ci/gates.sh compile shell smoke two-writer` run whose writer fired 0.4s in
+resumed with `during the compile gate: … - when: install.sh was last written 0.32s
+into the compile gate's window (0.53s long), at 21:50:25` plus the placement-is-not-
+an-observation footnote, ending `all gates passed — the run resumed, and every
+verdict describes the tree as it now stands`. The refusal path, through the real
+CLI with the real `--since`: `REFUSED … - when: install.sh was last written 2.0s
+into the window since the last checkpoint (12s long), about 17% through — the early
+part of it, at 21:50:35`, exit 1. The victim file was restored byte-for-byte
+(`sha256sum -c` clean) after each run.
+
+**Stated limits.** The clock is the file's LAST write, so a file written twice
+inside one window reports only the second — the window is a placement, not an
+event log. The seconds include the checkpoint's own hashing, a fraction of a
+second today, which is why the window is named as the gate's rather than as the
+suite's. A write that lands and is reverted before its checkpoint is still
+invisible. A fraction is only offered for windows of two seconds or more. The
+clock is the machine's, so a `touch`-ed or `--reference`-dated file is placed
+where its timestamp says; a file with no readable clock is skipped silently. And
+this is the LOCAL gate — the GitLab pipeline does not run it, because a pipeline
+checkout has one writer.
+
+## The resume says whether the move changed the outcome (2026-09-18)
+
+The row above closed with a limit, and this is the narrower one behind it. A
+resumed run could name the file that moved, the gate it moved under, and roughly
+when inside that gate's window the write landed — and none of those answers the
+question a reader actually has: did the move MATTER? Two rows said `compile PASS
+(superseded — the catch-up re-ran it against the tree as it now stands)` and
+`compile FAIL (caught up after the move)`, and the finding — the same gate, the
+same suite, one tree that compiles and one that does not, which is what makes the
+write the difference rather than noise — was left to be diffed out by eye.
+
+**How it is answered.** Each attempt's own RESULT is recorded as it happens
+(`ATTEMPTS="$ATTEMPTS $name|$status"` in `run_gate`, taken BEFORE the checkpoint
+decides whether that attempt is kept or discarded, because a discarded attempt is
+not a verdict but it is half of the comparison), and the resumed section holds a
+gate's attempts up against each other:
+
+```
+the move changed the outcome: compile PASS → FAIL
+```
+
+Repeats are collapsed and every change is kept, so three attempts read
+`PASS → FAIL → PASS` — a re-run that answered as the first attempt did after a move
+that flipped it, which a first-against-last reading erases. The agreeing case gets
+a line of its own (`every re-run reached the result its earlier attempt did
+(compile) — the move changed no verdict.`), because silence there is
+indistinguishable from "not compared".
+
+**Why it lives there and not in the stamp.** The stamp knows the tree moved and
+nothing about a gate's verdict; the row knows a verdict, but two rows for one gate
+read like two gates. The record is per ATTEMPT precisely because the interesting
+half of it is the attempt the run no longer stands behind — a mixture's red giving
+way to a green on the tree the collision left is the flip that matters.
+
+**Found by running it: the sequence lost the space before the first result.**
+`${seq# → }` strips a leading space as well as the arrow, so the first live line
+read `the move changed the outcome: compilePASS → FAIL` — caught by the exact
+string the end-to-end assertion looks for, the first time that run existed, which
+is what an assertion about the OUTPUT buys over one about the code.
+
+**Guards, and the one that has to be a shape.** 11 new (88 in the file): the
+comparison run as the shipped bash function over fabricated records of attempts
+(an agreement, a flip, a flip a later re-run undid, repeats not printed as repeated
+answers, a gate that ran once never compared, a gate compared only with itself and
+never with the neighbours its attempts are interleaved with, two gates that both
+flipped named in run order), one end-to-end run of the real script whose writer
+breaks a file inside the SHELL gate's window so the compile verdict kept before the
+move is caught up on a tree that no longer compiles (`the move changed the outcome:
+compile PASS → FAIL`, exit 1, `first failure: the compile gate`), the agreeing line
+asserted where a resume agrees, and the wiring (the record written before
+keep-or-discard — inside the KEPT branch the comparison would hold a re-run up
+against itself —, the record holding the attempt's own result rather than the row's
+`VOID`, and the comparison printed in the resumed section). The
+`elif [ -n "$RERAN" ]` guarding the agreeing line is the one SHAPE guard here, and
+it says so: an `else` is behaviourally identical under every reachable input, since
+a resume always has a re-run, so no end-to-end run can tell them apart. The sweep
+classified that mutation as equivalent, and the block is held behaviourally too by
+moving the same line in a way the output can see.
+
+**Verification.** **15/15 mutations caught, 2/2 probes green, 0 misses, every
+restore sha256-verified** (`/tmp/outcome_sweep/sweep.py`: the record filed as
+`VOID`, the record not taken at all, every attempt filed under one gate's name, the
+record taken inside the KEPT branch, a gate that ran once compared anyway, every
+re-run read as a change, repeats printed as repeated answers, a result matched by
+position instead of by gate, a flipped gate missing from the re-run list, the
+sequence losing its space, the comparison never running, the agreeing line printed
+as well as the flip, the changed line printing the gate list or no answers, and the
+agreeing line claiming nothing changed after a flip). **Gates, each invocation
+stamped and ending in the tree verdict:** `tests` PASS 242 s, `coverage` PASS 241 s
+(**84.57%** ≥ 70, **1 744 passed**), `order` PASS 466 s in BOTH orderings (seed
+d567fd1, 1 744 each), `compile` (52 files) / `shell` / `smoke` PASS, **`two-writer`
+PASS** (`worktree unchanged since the run started`) in every one, `all gates
+passed`, exit 0.
+
+**Live, on this checkout, with a real writer.** The proof runs the wrapper it
+always has — an interpreter that acts as the second writer on a chosen CALL, so the
+write lands provably inside a gate window with no timing and no sleep — against the
+REAL tree: a file that does not compile, dropped 0.35 s into the SHELL gate's
+window (0.43 s long), produced `during the shell gate: - untracked file appeared:
+zz_live_probe.py` with its `when:` line, `caught up (re-run against the tree as it
+now stands): compile`, then `the move changed the outcome: compile PASS → FAIL`,
+exit 1, `first failure: the compile gate`; a file that DOES compile, dropped 0.01 s
+into the COMPILE gate's own window, produced `every re-run reached the result its
+earlier attempt did (compile) — the move changed no verdict.` and
+`all gates passed — the run resumed, and every verdict describes the tree as it now
+stands`. The probe file was removed and the tree checked against a pre-run
+`sha256sum -c` plus a status hash: byte-for-byte the same, 35 entries before and
+after.
+
+**Stated limits.** The comparison is between ATTEMPTS, so a gate that ran once is
+never compared — there is nothing to compare it with — and the line is about the
+gates the resume touched, not about the run; it reports a result, never a cause: a
+flip says the tree the run lost and the tree it kept differ under that gate, not
+which edit inside the window did it; a flip-flop needs a third attempt, which the
+one-re-run-per-gate budget makes reachable only through the catch-up, so the
+end-to-end shapes a real run can produce are the two the guards use; and the
+`when:` line standing beside it is still a placement, so "0.35 s in" is where the
+writer's timestamp fell, not something the gate watched.
+
+## A write that was put back is still a write (2026-09-18)
+
+The gate carried its oldest limit in the same sentence it used to describe itself:
+a write reverted before its checkpoint leaves no trace, because the fingerprint is
+an endpoint comparison of CONTENT. Every stated limit up to this point was about
+precision — which gate, roughly when, whether the verdict changed — while this one
+was about the case the gate existed for and could not see at all: the suite reads a
+file mid-edit, the editor saves and reverses, and every hash the run holds agrees
+with every hash it took, so the run is green with no collision and no caveat about
+a file that was read in two different states.
+
+**How it is caught.** Content cannot answer that question, so the snapshot now
+carries a second kind of evidence: ONE WRITE TIME PER PATH, nanoseconds, for every
+tracked file and every untracked one. A path the two snapshots agree about (same
+recorded content, including a CLEAN tracked file, which has no hash to differ)
+whose write time moved is reported under the gate that closed the window:
+
+```
+during the shell gate:
+  - written during the window and restored: specs/60-test-plan.md — the content
+    is what the checkpoint read, and only the file's own write time moved
+  - when: specs/60-test-plan.md was last written 0.36s into the shell gate's
+    window (0.44s long), at 10:36:14
+```
+
+The `when:` line is the same clock machinery the row above built, and here it is
+not decoration: the timestamp IS the evidence, so the placement is the whole
+case. Nanoseconds rather than `st_mtime`'s float seconds because a save-and-revert
+lands well inside one second — the guard for it sets a write time one nanosecond
+past the snapshot's own and asserts the difference survives.
+
+**The rule has to know what is NOT a second writer, or the gate refuses its own
+run.** The map is built from `git ls-files` plus the untracked, non-ignored files
+— never from a bare walk — because the gates rewrite `.coverage`,
+`tests/report*.xml` and `__pycache__` on every run: a change to the content of
+those is already outside the fingerprint, and their write times have to be outside
+it too, which is now pinned by a test that rewrites both artifacts between two
+snapshots and expects silence. Reading a file never moves its write time, and a
+file whose CONTENT changed is reported once — as content, never also as restored —
+which is the one shape that could have been double-counted.
+
+**Degradation, because snapshots outlive the code that wrote them.** `written` is
+deliberately not in `REQUIRED_FIELDS`: a pair from before the field existed still
+judges content exactly as well, only silently about a reverted write, and there is
+a test for both halves (silence on the revert, a normal verdict on the change).
+The field is also not in `fingerprint` — "the same tree stamps the same" stays a
+claim about content, with the write times grouped with `at` as clocks.
+
+**Verification.** **11/11 mutations caught, 2/2 probes green, 0 misses, every
+restore sha256-verified** (`/tmp/revert_sweep/sweep.py`: the map not recorded at
+all, only DIRTY tracked files watched, ignored paths watched too, a whole-second
+clock instead of nanoseconds, the write times let into the fingerprint, an old
+snapshot made unjudgeable, every path counted as restored, a content change also
+reported as restored, the restored rows never rendered, a tracked restored row
+joining the content line, and a restored untracked file also reported as untracked
+movement). **Gates, each invocation stamped and ending in the tree verdict:**
+`tests` PASS 241 s (**1 758 passed**), `coverage` PASS 242 s (**84.59%** ≥ 70 —
+2 581 missing of 16 754 statements), `order` PASS 486 s in BOTH orderings (seed
+d567fd1), `compile` / `shell` / `smoke` PASS, **`two-writer` PASS** (`worktree
+unchanged since the run started`) in every one, `all gates passed`, exit 0. The
+long suite runs are the point here as much as the guards: a mtime-only rule that
+fired on anything the gates themselves rewrite would have turned every future run
+into a refusal of itself, so three real four-minute runs that came back
+`unchanged` are evidence about the rule, not only about the code.
+
+**Live, on this checkout, with a real writer that reverts.** The interpreter
+wrapper writes `specs/60-test-plan.md` and copies the original bytes back inside
+the same call, so every hash the run takes agrees with every hash it took: fired
+0.36 s into the SHELL gate's window (0.44 s long) it produced the two lines above,
+`caught up (re-run against the tree as it now stands): compile`, `every re-run
+reached the result its earlier attempt did (compile shell)`, and `all gates passed
+— the run resumed, and every verdict describes the tree as it now stands`; fired
+into the tree verdict's own window (after the last checkpoint, no gate left to
+re-run) it REFUSED with the same line placed in `the window since the last
+checkpoint` and `first failure: the two-writer gate`, exit 1. Both times the file
+was restored byte-for-byte and the tree checked against a pre-run `sha256sum -c`
+plus a status hash: identical, and its mtime moved from 10:12:38 to 10:36:14,
+which is the whole evidence in one line of `ls`.
+
+**Stated limits.** It is a write time, not an intention: a `touch` reads exactly
+like an edit that was put back, and the line says "written … and restored" about
+both; a file CREATED and deleted inside one window is in neither snapshot's map,
+so it still leaves no trace — there is no path left to compare; a snapshot from
+before the field existed cannot report a reverted write at all (the older pair is
+silent, which is the honest answer, not a verdict); the resolution is the gate's
+window, so the placement says which part of the gate, never the instant; and a
+write to an IGNORED path is deliberately outside the rule, because those are the
+run's own artifacts.

@@ -1,6 +1,6 @@
 # handsoff — test plan
 
-Sources: `tests/` (25 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
+Sources: `tests/` (28 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
 `.coveragerc`, `.github/workflows/ci.yml`, `.gitlab-ci.yml`,
 `githooks/pre-commit`, `ci/`.
 
@@ -8,8 +8,8 @@ Sources: `tests/` (25 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
 
 `tests/` — the FILE LIST is the contract: every `tests/test_*.py` must appear
 below, and `test_specs_freshness.py` fails when one does not. The counts are the
-2026-09-16 snapshot (1455 collected; 1353 `test_*` functions), so a stale count
-in this table means nothing — a missing row does.
+2026-09-17 snapshot (1708 collected), so a stale count in this table means
+nothing — a missing row does.
 
 | File | `test_*` fns | Area |
 |---|---|---|
@@ -18,7 +18,8 @@ in this table means nothing — a missing row does.
 | `test_desktop.py` | 119 | niri/typing/windows/clipboard/screens, guards |
 | `test_policy.py` | 100 | DecisionPolicy, gates, confirm flow, whitelist/blocked |
 | `test_design_packs.py` | 98 | packs, image design, palettes, ink guard |
-| `test_settings.py` | 80 | loader/coerce/migrate/merge/lock, looks catalogue |
+| `test_bubble_anim.py` | 11 | the tick driven frame by frame: the step, the level chase, colour/energy, the radius spring |
+| `test_settings.py` | 81 | loader/coerce/migrate/merge/lock, looks catalogue |
 | `test_settings_contract.py` | 24 | the field table: coercion, controls, cards, companion rows, the window |
 | `test_lifecycle.py` | 80 | generations, staleness, PTT epoch, cancel/done |
 | `test_ops.py` | 67 | deploy snapshot, restart, control socket, health/doctor |
@@ -27,6 +28,7 @@ in this table means nothing — a missing row does.
 | `test_sandbox.py` | 52 | secret paths, edit boundaries, command validation |
 | `test_calendar.py` | 45 | ICS parse/RRULE/format, scheme + label guards |
 | `test_ci_summary.py` | 42 | `ci/pytest_summary.py` digest |
+| `test_ci_two_writer.py` | 102 | the two-writer gate: the worktree stamp's movement (and the gate artifacts that must not move it — plus the paths that LEAVE a list, the shape a naive rewrite of "what moved" drops), the per-gate checkpoints and the gate they name, the baseline that moves only on an explicit rebase (and then says which tree it is), the CLI refusal, the WHEN lines (the clock each snapshot carries and the verdict ignores, the offset/fraction/band arithmetic placed by hand with `os.utime` against a window the test picked — never a sleep —, each band boundary sampled a point on either side of itself, the three shapes a write can have relative to its window, the two moves with no file clock to ask, the cap that counts what it does not print, and `at`/`--since` gone or stale degrading to a coarser answer instead of a wrong one), the WRITE THAT WAS PUT BACK (a file whose content every hash agrees about while its own write time moved — the shape that used to read as a still tree: a clean tracked file is watched, not only a dirty one, a read is not a write, a real content change is reported once and never also as restored, one nanosecond of difference is enough, ignored artifacts are outside the map, a snapshot from before the write times existed still judges, and the write time is placed in the window), the COMPARISON of a gate's attempts with its re-run (the shipped function on a fabricated record of attempts: a re-run that agreed, one that flipped — the move changing the outcome —, a flip a later re-run undid (`PASS → FAIL → PASS`), repeats not printed as repeated answers, a gate that ran once never compared, and a gate compared only with itself and not with the neighbours its attempts are interleaved with), the wiring in `ci/gates.sh`, eight end-to-end runs of the real script on a scratch repo whose interpreter edits, breaks or WRITES-AND-RESTORES a tracked file on chosen CALLS — a collision that resumes, one with nothing overtaken so no pass runs, one whose overtaken verdict is caught up (so the run ends as a verdict about one tree), one where a write inside the catch-up leaves the split, one where a pre-existing red skips the catch-up, one where a re-run flips a kept verdict and the run prints the flip, one where the write is put back inside a gate (a collision and a re-run with no content difference anywhere), one where it is put back after the LAST checkpoint (the refusal, placed in the tail of the run), and a window holding two writes that stops the run — and a source guard that no guard in the file pins a gate's elapsed seconds (a summary row is a SHAPE, and a guard pinned to `0s` reported a correct gate red on a loaded full-suite run before it was fixed) |
 | `test_hardware.py` | 35 | snapshot sections, TTLs, probers |
 | `test_theme.py` | 34 | hex parse, luminance, retune |
 | `test_hardening.py` | 34 | perms, symlink/0600, token, caps, the no-core fallbacks (audio, brain) |
@@ -35,6 +37,7 @@ in this table means nothing — a missing row does.
 | `test_world_events.py` | 24 | fixed queries, severity, seen-store, cooldowns |
 | `test_notify_coalesce.py` | 15 | notification batching/cooldown |
 | `test_hardware_watch.py` | 13 | hardware watch tick, disk/VRAM alerts |
+| `test_idle_release.py` | 23 | the idle release: the drop and its locks, the quiet-window policy, re-arm vs one-per-spell |
 | `test_p0_fixes.py` | 6 | named P0 regressions |
 | `test_specs_freshness.py` | 19 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |
 | `test_settings_gui.py` | 1 (+ offscreen subprocess drivers) | Qt GUI incl. 10-design ink guard |
@@ -52,6 +55,52 @@ in this table means nothing — a missing row does.
 - `shell`: actions SHA-pinned (mutable `@vN` fails); `bash -n` over every
   file with a bash/sh shebang (finds extensionless `handsoff-restart`).
 - `smoke`: `bash install.sh --help` contains `Options:` + `--uninstall`.
+- `two-writer`: `ci/worktree_stamp.py` fingerprints the worktree before the
+  first gate (HEAD, one content hash per tracked change, every untracked
+  non-ignored file, and ONE WRITE TIME PER PATH — tracked clean or dirty, and
+  untracked) and every gate is CHECKPOINTED after it runs. The write times are
+  what catch a write that was REVERTED inside a window: the content matches the
+  checkpoint's exactly, so no hash can see it, and the file was still written
+  under the suite's feet — reported as `written during the window and restored:
+  app.py — the content is what the checkpoint read, and only the file's own write
+  time moved`, and placed by the same clock. Ignored paths are outside the map
+  (the gates rewrite `.coverage` and `tests/report*.xml` every run), and a
+  snapshot from before the write times existed still judges content, only without
+  the restored rows. A collision is
+  not a refusal any more: the collided gate's attempt is reported VOID (its
+  window held the write, so its result is about a mixture), the baseline is moved
+  onto the state the collision left (`--rebase`, annotated with what it now is),
+  and that gate is re-run against it — so every verdict from the collision onward
+  is about the tree as it now stands, and the ones before it are printed as
+  CARRIED OVER ("they describe the tree BEFORE the move"). Those overtaken
+  verdicts are then RE-RUN in order before the tree verdict (`catch-up`), so a
+  green run ends as a verdict about ONE tree; the row each re-run supersedes is
+  marked, and the split is computed per LEG rather than per collision (a write
+  inside the catch-up is reported as leaving the split, not chased). The catch-up
+  is skipped when the run already has a red — that is a verdict, and the failure
+  digest is built for one tree's red — and runs once, since a second write makes
+  the gates it re-ran stale again. A gate that ran twice is also held up against
+  itself: each attempt's own RESULT is recorded (a discarded one included — it is
+  not a verdict, but it is half of the comparison) and the resumed section prints
+  either `the move changed the outcome: compile PASS → FAIL` or, when every
+  re-run answered as its earlier attempt did, one line saying so — because two
+  rows in a summary can be diffed by eye and the results of one gate across two
+  trees cannot. A tree that moves twice inside one gate's
+  window stops the run, and a write after the LAST checkpoint — no gate left to
+  re-run — refuses it. Each snapshot also carries the CLOCK it was taken at, so a
+  checkpoint can say roughly WHERE INSIDE the gate the write landed: each changed
+  path's own `mtime` (or the new HEAD's commit time) is placed in the window the
+  two checkpoints bracket, as `  - when: app.py was last written 96s into the
+  tests gate's window (231s long), about 42% through — the middle of it, at
+  14:03:47`, with the resumed section stating that it is a placement rather than
+  something the gate watched. The tree verdict passes `--since` (the newest
+  checkpoint) so the one write it catches — the write no gate saw — is placed in
+  the tail of the run instead of "4 800s into the run", while its VERDICT stays
+  against the baseline. Artifacts the gates
+  themselves write are ignored through `.gitignore`, which is what keeps the
+  gate from refusing its own run; a directory that is not a git worktree gets no
+  opinion (SKIP), never a clean bill. The checkpoints live in a temp dir and are
+  removed on both exits.
 - `pytest.ini`: `PytestUnhandledThreadExceptionWarning` is an ERROR —
   a worker thread raising fails the build.
 - pre-commit (`githooks/`, opt-in via `core.hooksPath`): staged

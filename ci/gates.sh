@@ -15,6 +15,25 @@
 # A missing one is reported by name instead of being silently pip-installed
 # over the environment you are debugging in.
 #
+# The last gate is `two-writer`, and it is not about the code: this checkout is
+# SHARED (an editor, another agent, a `git checkout`), the suite takes minutes,
+# and a verdict about a tree that moved while it ran is a false red or a false
+# green — the audit's §1 complaint. So the worktree is stamped before the first
+# gate, CHECKPOINTED after every gate, and compared after the last one.
+#
+# A tree that moves mid-run does not throw the run away any more. The collided
+# gate's attempt is DISCARDED (its window contains the write, so its result is
+# about a mixture), the baseline moves onto the state the collision left, and the
+# gate is RE-RUN against it, so the gates after it are judged against one tree.
+# The gates BEFORE the collision keep their rows — they describe the tree as it
+# was — and the summary says which verdicts describe which tree instead of
+# pretending one revision sits behind all of them. A tree that moves AGAIN inside
+# the same gate's window stops the run: nothing can be resumed about a tree
+# somebody is still writing to.
+#
+# ci/worktree_stamp.py is the stamp; a directory that is not a git worktree gets
+# no opinion (SKIP) rather than a clean bill.
+#
 # Usage:
 #   bash ci/gates.sh                  every gate, in CI's order
 #   bash ci/gates.sh --no-order       skip the two ordering re-runs (~5 min)
@@ -25,6 +44,12 @@
 # on this machine (pytest-cov missing) is SKIPped and said so, because a gate
 # that silently passes because it never ran is the failure mode this whole
 # script exists to avoid.
+#
+# A re-run is also compared with the attempt it replaces, and the comparison is
+# printed: the same gate, on two trees, giving two answers is the proof that the
+# move changed the outcome — where an unchanged answer is evidence that the tree
+# the run lost was not the difference. A reader diffing two rows by eye cannot
+# tell either from a re-run that never happened.
 
 set -u
 
@@ -39,12 +64,18 @@ SEED=${HANDSOFF_ORDER_SEED:-$(git rev-parse --short HEAD 2>/dev/null || echo loc
 JUNIT="$ROOT/tests/report.xml"
 FIRST_FAILURE="$ROOT/tests/report.first-failure.xml"
 
-ALL_GATES="tests order coverage compile shell smoke"
+ALL_GATES="tests order coverage compile shell smoke two-writer"
 WANT_ORDER=1
 declare -a WANTED=()
+# Which gate failed FIRST. The failure digest below reads the first failing
+# junit report, and the two-writer gate fails without ever writing one —
+# printing the tests report under a refusal would explain the wrong failure.
+FIRST_FAILED=""
 
 usage() {
-    sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+    # The header, through the last line of the usage list (line 41 — the range has
+    # to be kept in step with the comment block it prints).
+    sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -73,12 +104,228 @@ fi
 
 declare -a REPORT=()
 FAILED=0
+# Set when a collision inside one gate's window ends the run (see refuse_moving),
+# when a collision RESUMED the run, which gates the catch-up re-ran, and how many
+# times the baseline has MOVED. The leg is what the summary splits on: a verdict
+# from the current leg is about the tree this run is judging, one from an earlier
+# leg is history — and a gate re-run after the move is current even when the
+# collision that prompted it happened two collisions ago.
+STOP=0
+RESUMED=0
+CAUGHT_UP=""
+LEG=1
 START_ALL=$SECONDS
+# Every attempt's RESULT, in order, as `gate|status` — a discarded attempt
+# included, because it produced one, and the whole point of the record is to hold
+# it up against the attempt that replaced it.
+ATTEMPTS=""
+# Set when the two-writer gate is part of this run: the directory the per-gate
+# checkpoints live in, outside the worktree. The checkpoints are also what a
+# collision is detected by, so this is what makes a resume possible.
+STAMP_DIR=""
 
-record() {   # name, status, seconds
-    REPORT+=("$1|$2|$3")
+# Never explain THIS run with the PREVIOUS one's red: the digest reads the first
+# failing junit report, and a leftover copy from an earlier session describes a
+# different tree — found live, where the digest said "1 failed of 1617" while
+# this run collected 1676. Same reason the coverage gate prunes its shards.
+rm -f "$JUNIT" "$FIRST_FAILURE"
+
+# The first checkpoint, taken BEFORE the first gate runs (the point of the
+# comparison is everything the run did in between). Only when the gate that
+# reads it is part of this run: stamping a repo for a gate nobody asked for is
+# work for nothing.
+for g in "${WANTED[@]}"; do
+    [ "$g" = two-writer ] || continue
+    STAMP_DIR=$(mktemp -d -t handsoff-stamp-XXXXXX) || STAMP_DIR=""
+    if [ -n "$STAMP_DIR" ]; then
+        "$PYTHON" ci/worktree_stamp.py --root "$ROOT" --checkpoint "$STAMP_DIR" \
+            --label start \
+            || echo "could not stamp the worktree — the two-writer gate will SKIP"
+    fi
+done
+
+# The checkpoints live in /tmp, never in the worktree: a snapshot written INSIDE
+# the tree it fingerprints would move the tree it is measuring.
+#
+# Each snapshot carries the clock it was taken at, so a checkpoint can also say
+# roughly WHERE INSIDE its gate's window the write landed: the changed file's own
+# last-write time placed between the two checkpoints, printed as `when:` lines
+# under the gate's heading. Roughly, and the resumed section says so.
+drop_stamp() { [ -n "$STAMP_DIR" ] && rm -rf "$STAMP_DIR" ; return 0 ; }
+
+# One checkpoint per gate, labelled with the gate that just ran. Cheap, and it is
+# the only way to answer the question a collision provokes: WHICH gate was it?
+#
+# The STATUS is deliberately not swallowed: 0 unchanged, 1 the tree moved inside
+# this gate's window, 2 no opinion (not a git worktree). 1 is what the caller
+# resumes on, so the stamp's last command has to BE the return value — a
+# `return 0` after it would report every collision as "unchanged" and turn this
+# whole feature off silently.
+checkpoint_gate() {
+    [ -n "$STAMP_DIR" ] || return 2
+    [ "$1" = two-writer ] && return 0     # its own comparison is the last word
+    "$PYTHON" ci/worktree_stamp.py --root "$ROOT" --checkpoint "$STAMP_DIR" \
+        --label "$1" > /dev/null
+}
+
+# Move the baseline onto the state the collision left, because the resumed leg is
+# judged against that tree and not against the one the run started with. If it
+# cannot happen (no snapshot to move onto) the run does not claim to have resumed:
+# the end comparison refuses exactly as it did before this feature existed.
+rebase_stamp() {   # gate
+    [ -n "$STAMP_DIR" ] || return 1
+    "$PYTHON" ci/worktree_stamp.py --root "$ROOT" --rebase "$STAMP_DIR" \
+        --label "$1" > /dev/null
+}
+
+record() {   # name, status, seconds, note
+    REPORT+=("$1|$2|$3|$4|$LEG")
     [ "$2" = FAIL ] && FAILED=1
     return 0
+}
+
+# One row, spelled once: the line printed under the gate as it happens and the
+# line in the summary are the same format, so the two cannot drift.
+print_row() {   # name, status, seconds, note
+    printf '%-10s %-4s %ss%s\n' "$1" "$2" "$3" "${4:+   ($4)}"
+}
+
+# The leg a gate's LAST KEPT verdict came from — "" when it has none. A VOID row
+# is a discarded attempt, not a verdict, and a gate re-run later supersedes the
+# row it re-ran: the LAST one is what the run stands behind.
+gate_leg() {   # gate
+    local want="$1" row name status _ _ leg found=""
+    for row in "${REPORT[@]}"; do
+        IFS='|' read -r name status _ _ leg <<<"$row"
+        [ "$name" = "$want" ] && [ "$status" != VOID ] && found="$leg"
+    done
+    printf '%s' "$found"
+}
+
+# The run's kept verdicts, split by LEG rather than by which collision was last: a
+# verdict from the current leg is about the tree this run is judging (AFTER), one
+# from an earlier leg was overtaken by a move (CARRIED). The leg is what makes the
+# catch-up report itself honestly — the gate it just re-ran is current, while the
+# gate a LATER write overtook is not, however recently it ran.
+split_verdicts() {   # → AFTER, CARRIED
+    AFTER=""; CARRIED=""
+    local g leg
+    for g in "${WANTED[@]}"; do
+        leg=$(gate_leg "$g")
+        [ -n "$leg" ] || continue
+        if [ "$leg" = "$LEG" ]; then AFTER="$AFTER $g"; else CARRIED="$CARRIED $g"; fi
+    done
+    AFTER="${AFTER# }"; CARRIED="${CARRIED# }"
+}
+
+# Mark the row the catch-up supersedes. The run no longer stands behind it, and a
+# summary showing two rows for one gate would leave the reader to guess which is
+# the verdict — the note says which, and the new row is written below it.
+supersede() {   # gate
+    local want="$1" i row name status secs note leg last=""
+    for i in "${!REPORT[@]}"; do
+        IFS='|' read -r name status secs note leg <<<"${REPORT[$i]}"
+        [ "$name" = "$want" ] && [ "$status" != VOID ] && last="$i"
+    done
+    [ -n "$last" ] || return 0
+    IFS='|' read -r name status secs note leg <<<"${REPORT[$last]}"
+    REPORT[$last]="$name|$status|$secs|superseded — the catch-up re-ran it against the tree as it now stands|$leg"
+}
+
+# Did the move CHANGE anything? A gate that ran twice did so because its earlier
+# attempt was a mixture, so the two RESULTS are the two facts worth holding up
+# against each other: the same gate, the same suite, two trees, two answers is
+# proof the move was the difference, and one answer across every attempt is
+# evidence it was not. Stated, because two ROWS in a summary can be diffed by eye
+# while the results of one gate across trees cannot. More than two attempts keep
+# only the changes — `PASS → FAIL → PASS` says a re-run answered as the first one
+# did after a move that flipped it, which a first-against-last reading erases.
+compare_attempts() {   # → CHANGED ("gate PASS → FAIL"), RERAN (gates run twice)
+    CHANGED=""
+    RERAN=""
+    local g seen distinct last seq row name status
+    for g in "${WANTED[@]}"; do
+        seen=0
+        distinct=0
+        last=""
+        seq=""
+        for row in $ATTEMPTS; do
+            IFS='|' read -r name status <<<"$row"
+            [ "$name" = "$g" ] || continue
+            seen=$((seen + 1))
+            # Only a CHANGE of result goes in the sequence: three attempts that
+            # all passed read `PASS`, not `PASS → PASS → PASS`.
+            if [ "$status" != "$last" ]; then
+                distinct=$((distinct + 1))
+                seq="$seq → $status"
+                last="$status"
+            fi
+        done
+        [ "$seen" -gt 1 ] || continue
+        RERAN="$RERAN $g"
+        [ "$distinct" -gt 1 ] || continue
+        CHANGED="$CHANGED, $g ${seq# → }"
+    done
+    RERAN="${RERAN# }"
+    CHANGED="${CHANGED#, }"
+}
+
+# What a resumed run has to say for itself: the collision (which file moved under
+# which gate), WHAT IT CHANGED (the verdicts that differ between an attempt and its
+# re-run), which verdicts are about the tree as it now stands, and which were
+# carried over from before the move. A section, not a refusal — the point of
+# resuming is that the run still has a verdict to give.
+report_resume() {
+    printf '\n============ resumed ============\n'
+    if [ "$STOP" = 1 ]; then
+        printf 'the worktree moved while the gates were running, and moved again before the run\n'
+        printf 'could certify that window — so it stopped rather than report a mixture:\n'
+    else
+        printf 'the worktree moved while the gates were running, so the run resumed from the\n'
+        printf 'collision instead of refusing the whole thing:\n'
+    fi
+    cat "$STAMP_DIR/moves.txt"
+    # The `when:` lines are a PLACEMENT, not an observation: nobody watches the
+    # tree, so the stamp places each changed file's own last-write time inside
+    # the window the two checkpoints bracket. Say so where a reader meets them,
+    # or "96s into the window" reads as something the gate saw happen.
+    if grep -q -- '  - when: ' "$STAMP_DIR/moves.txt" 2>/dev/null; then
+        printf "(each when: line places the changed file's own last-write time inside that gate's\n"
+        printf " window, so it is roughly which part of the gate the write landed in — not an instant)\n"
+    fi
+    [ -n "$CAUGHT_UP" ] && printf 'caught up (re-run against the tree as it now stands): %s\n' "$CAUGHT_UP"
+    compare_attempts
+    if [ -n "$CHANGED" ]; then
+        printf 'the move changed the outcome: %s\n' "$CHANGED"
+    elif [ -n "$RERAN" ]; then
+        printf 'every re-run reached the result its earlier attempt did (%s) — the move\n' "$RERAN"
+        printf 'changed no verdict.\n'
+    fi
+    split_verdicts
+    if [ -n "$AFTER" ]; then
+        printf 'verdicts about the tree as it now stands: %s\n' "$AFTER"
+    else
+        printf 'no verdict survived: every attempt under the collided gate straddled a write\n'
+    fi
+    if [ -n "$CARRIED" ]; then
+        printf 'carried over (they describe the tree BEFORE the move): %s\n' "$CARRIED"
+    else
+        printf 'carried over: none — no verdict above describes an earlier tree\n'
+    fi
+}
+
+# A second write inside the SAME gate's window: the re-run is evidence about a
+# mixture too, so there is nothing left to resume. The run stops rather than
+# looping on a tree somebody is writing to, and the remaining gates are not run at
+# all — no verdict about this tree is available until the writing stops.
+refuse_moving() {   # gate
+    printf '\nREFUSED — the worktree moved again while the %s gate was re-running, so there is\n' "$1"
+    printf 'nothing left to resume: a tree that keeps moving cannot be certified. Stop the\n'
+    printf 'other writer and run the gates again on a still tree; the remaining gates were\n'
+    printf 'not run.\n'
+    FAILED=1
+    [ -n "$FIRST_FAILED" ] || FIRST_FAILED=two-writer
+    STOP=1
 }
 
 # Keep the FIRST failing report: later gates overwrite tests/report.xml, and the
@@ -194,39 +441,212 @@ gate_smoke() {
     echo "$out" | grep -q -- "--uninstall"
 }
 
-run_gate() {
-    local name="$1" start=$SECONDS status=PASS
-    printf '\n──────────────── %s ────────────────\n' "$name"
-    "gate_$name"
+# The verdict on the TREE, after every gate has run. A collision is not a refusal
+# any more — the run resumed at it, and `report_resume` says which verdicts that
+# left about which tree — so moves.txt is NOT read here: refusing on it would
+# refuse every resumed run, which is the behaviour this gate no longer has. What
+# it does is compare the tree against the baseline, which after a resume is the
+# state the collision left. That is what still catches the one move no gate can
+# absorb: a write that lands after the LAST checkpoint, when there is no gate left
+# to re-run. The stamp prints the refusal (and names the files) in that case.
+gate_two_writer() {
+    [ -n "$STAMP_DIR" ] || return 2             # nothing stamped: no opinion
+    # The window the timing lines are placed in starts at the LAST checkpoint,
+    # not at the baseline: the write THIS comparison catches is the one no gate
+    # saw (it landed after the final checkpoint), and a whole-run window would
+    # report it as "4 800s into the run" — true, and no use to anybody. The
+    # VERDICT is still against the baseline, which is what a resumed run judges.
+    local since=()
+    [ -f "$STAMP_DIR/latest.json" ] && since=(--since "$STAMP_DIR/latest.json")
+    "$PYTHON" ci/worktree_stamp.py --root "$ROOT" --compare "$STAMP_DIR/first.json" \
+        ${since[@]+"${since[@]}"}
+}
+
+# ONE ATTEMPT at a gate: the banner, the gate itself, its verdict — and NO row.
+# The row is written by the caller only after the checkpoint has had its say,
+# because an attempt whose window contains a write is discarded rather than
+# reported: a row for it would be a verdict about a tree that existed for part of
+# its run and not the rest. (The failure digest is deferred for the same reason —
+# a red from a discarded attempt explains a tree the run is not judging.)
+attempt_gate() {   # name, banner suffix
+    local name="$1" suffix="${2:-}" start=$SECONDS status=PASS
+    printf '\n──────────────── %s%s ────────────────\n' "$name" "$suffix"
+    # A gate's name is what the user types on the command line (`two-writer`),
+    # and a bash function cannot be asked for by that name with a hyphen in
+    # front of it cleanly — so the mapping to `gate_two_writer` lives here, in
+    # one place, instead of in every gate's own spelling.
+    "gate_${name//-/_}"
     case $? in
         0) status=PASS ;;
         2) status=SKIP ;;
-        *) status=FAIL; stash_report ;;
+        *) status=FAIL ;;
     esac
-    record "$name" "$status" "$((SECONDS - start))"
-    printf '%-10s %s (%ss)\n' "$name" "$status" "$((SECONDS - start))"
+    GATE_SECS=$((SECONDS - start))
+    GATE_STATUS=$status
+}
+
+# One gate, run until the run can KEEP a verdict for it. A checkpoint that sees
+# the tree move no longer throws the run away: the collided attempt is discarded,
+# the baseline moves onto the state the collision left, and the gate is RE-RUN
+# against it, so every gate after it is judged against one tree. The gates before
+# the collision keep their rows — they describe the tree as it was, and the
+# summary says so rather than pretending one revision sits behind all of them.
+# One re-run per gate is the whole budget: a window that held TWO writes is not a
+# window anything can be certified about, so the run stops there.
+run_gate() {   # name, phase ("catch-up" when a move overtook this verdict)
+    local name="$1" phase="${2:-}" attempt=1 status secs checkpoint=0 redo="" note=""
+    while :; do
+        redo=""
+        note=""
+        if [ "$attempt" -gt 1 ]; then
+            redo=" (re-run — the tree moved)"
+            note="re-run after the move"
+        elif [ "$phase" = catch-up ]; then
+            redo=" (catch-up — the move overtook it)"
+            note="caught up after the move"
+        fi
+        attempt_gate "$name" "$redo"
+        status=$GATE_STATUS
+        secs=$GATE_SECS
+        # Recorded whoever keeps or discards it (below): a discarded attempt is
+        # not a verdict, and it is still half of the comparison.
+        ATTEMPTS="$ATTEMPTS $name|$status"
+        checkpoint=0
+        checkpoint_gate "$name" || checkpoint=$?
+        if [ "$checkpoint" != 1 ]; then
+            # Kept: this attempt's window held no write.
+            if [ "$status" = FAIL ]; then
+                [ -n "$FIRST_FAILED" ] || FIRST_FAILED="$name"
+                stash_report
+            fi
+            record "$name" "$status" "$secs" "$note"
+            print_row "$name" "$status" "$secs" "$note"
+            return 0
+        fi
+        note="discarded — it had $status; the tree moved during the attempt"
+        record "$name" VOID "$secs" "$note"
+        print_row "$name" VOID "$secs" "$note"
+        if [ "$attempt" -gt 1 ]; then
+            refuse_moving "$name"
+            return 0
+        fi
+        if rebase_stamp "$name"; then
+            RESUMED=1
+            LEG=$((LEG + 1))
+        else
+            printf 'the baseline could not be moved onto the state the collision left —\n'
+            printf 'the run cannot resume, so the final comparison will refuse it.\n'
+        fi
+        attempt=2
+    done
+}
+
+# Re-run the verdicts a move overtook, in run order, against the tree the run is
+# judging now. This is what makes a resumed run END as a verdict about one tree
+# instead of a report that says "these rows describe an earlier tree" — the point
+# of the whole feature, since a partial verdict is exactly what nobody acts on.
+#
+# Bounded and conditional on purpose:
+#   * only when the run has NO failure to report yet. A red is already a verdict
+#     (the rows say which tree each one is about), and the failure bookkeeping —
+#     which junit report the digest prints — is built for ONE tree's worth of red,
+#     so catching up a red run would have to unpick that. Fix the red and run
+#     again; the catch-up is for completing a green.
+#   * ONE pass. A write inside the catch-up makes the gates re-run before it stale
+#     again, and that is reported rather than chased: the split is by leg, so the
+#     summary says exactly which verdicts are about which tree.
+#   * each gate keeps its own budget inside run_gate (one re-run per window).
+catch_up() {
+    split_verdicts
+    [ -n "$CARRIED" ] || return 0
+    if [ "$FAILED" = 1 ]; then
+        printf '\nthe move overtook these verdicts: %s\n' "$CARRIED"
+        printf 'catch-up skipped: this run has a failure to report, and the rows above say\n'
+        printf 'which tree each verdict is about — fix the red and run again.\n'
+        return 0
+    fi
+    printf '\nthe run is catching up: re-running the verdicts the move overtook (%s)\n' "$CARRIED"
+    printf 'so this run ends as a verdict about one tree rather than two.\n'
+    local g
+    for g in $CARRIED; do
+        supersede "$g"
+        run_gate "$g" catch-up
+        CAUGHT_UP="$CAUGHT_UP $g"
+        [ "$STOP" = 1 ] && { CAUGHT_UP="${CAUGHT_UP# }"; return 0; }
+    done
+    CAUGHT_UP="${CAUGHT_UP# }"
 }
 
 printf 'handsoff local gates — %s, order seed %s\n' "$PYTHON" "$SEED"
+
+# The tree verdict is last, whatever was asked for: it compares the tree against
+# the baseline, and anything running after it would invalidate that comparison. So
+# it is held back here and run after the catch-up pass.
+TREE_GATE=""
+declare -a BODY=()
 for g in "${WANTED[@]}"; do
-    run_gate "$g"
+    if [ "$g" = two-writer ]; then TREE_GATE="$g"; else BODY+=("$g"); fi
 done
+
+for g in "${BODY[@]}"; do
+    run_gate "$g"
+    [ "$STOP" = 1 ] && break
+done
+
+[ "$STOP" = 1 ] || catch_up
+
+if [ -n "$TREE_GATE" ] && [ "$STOP" != 1 ]; then
+    run_gate "$TREE_GATE"
+fi
 
 printf '\n============ summary ============\n'
 for row in "${REPORT[@]}"; do
-    IFS='|' read -r name status secs <<<"$row"
-    printf '%-10s %-4s %ss\n' "$name" "$status" "$secs"
+    # The leg is the last field and is not printed: it is what the split is
+    # computed from. But a verdict from an earlier leg is MARKED where it is read
+    # — a bare row in a list invites being read as current, and the resumed
+    # section is further down.
+    IFS='|' read -r name status secs note leg <<<"$row"
+    if [ -z "$note" ] && [ "$leg" != "$LEG" ]; then note="before the move"; fi
+    print_row "$name" "$status" "$secs" "$note"
 done
 printf 'total %ss\n' "$((SECONDS - START_ALL))"
 
+# A resumed run has to say which of its verdicts are about which tree: the
+# summary above reads like one run, and only this section can tell a reader that
+# the first rows of it describe a tree that no longer exists.
+[ "$RESUMED" = 1 ] && report_resume
+
 if [ "$FAILED" = 1 ]; then
     printf '\n============ failures ============\n'
-    if [ -f "$FIRST_FAILURE" ]; then
-        # Same digest the pipeline's after_script prints, minus the MR comment.
-        "$PYTHON" ci/pytest_summary.py "$FIRST_FAILURE" || true
-    else
-        echo "a gate failed before any junit report was written (compile/shell/smoke)."
-    fi
+    # The digest is the SUITE's digest, so it is printed for a suite gate only.
+    # Under any other first failure it would be a report about a gate that
+    # passed, which is how a refusal gets read as a test failure.
+    case "$FIRST_FAILED" in
+        tests|order|coverage)
+            if [ -f "$FIRST_FAILURE" ]; then
+                # Same digest the pipeline's after_script prints, minus the MR comment.
+                "$PYTHON" ci/pytest_summary.py "$FIRST_FAILURE" || true
+            else
+                echo "a gate failed before any junit report was written (compile/shell/smoke)."
+            fi
+            ;;
+        *)
+            echo "first failure: the $FIRST_FAILED gate (its own message is above)."
+            ;;
+    esac
+    drop_stamp
     exit 1
 fi
-printf '\nall gates passed\n'
+drop_stamp
+# The verdict, qualified by what the resume left unresolved: with verdicts carried
+# over from before the move, "all gates passed" would be a claim about ONE tree
+# that this run cannot make.
+if [ "$RESUMED" = 0 ]; then
+    printf '\nall gates passed\n'
+elif [ -n "$CARRIED" ]; then
+    printf '\nevery gate passed, but the carried-over verdicts describe the earlier tree\n'
+    printf '(see resumed above).\n'
+else
+    printf '\nall gates passed — the run resumed, and every verdict describes the tree as it\n'
+    printf 'now stands.\n'
+fi
