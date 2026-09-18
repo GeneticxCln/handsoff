@@ -6920,3 +6920,75 @@ The sweep ran against this checkout's `main`, which was level with the remote at
 the time, so it judged the published head. And the write-time half is still open,
 recorded as follow-up 6 in `specs/90-audit.md`: the hook tests the working tree,
 so the same partial stage can still defeat it.
+
+## The hook judges what the commit will contain (2026-09-18)
+
+**What it was.** `githooks/pre-commit` read every file check from the working tree:
+`py_compile` on the staged path as it exists on DISK, `bash -n` with the shebang
+read from disk, and the whole suite run in the working tree. So the hook answered
+"is this checkout consistent" while a commit asks "is the tree I am about to
+create consistent" — and the two differ by exactly the partial stage that shipped
+`bd9cf5a` and `baf58c5`.
+
+**What it is now.** The index is written out ONCE, into a scratch directory from
+`mktemp -d -t handsoff-staged-XXXXXX`, with `git checkout-index -a --prefix` — the
+only tool that writes exactly the index (a worktree checks out HEAD; stashing to
+test would disturb the developer's other work, which is regularly another agent's).
+Every file-shaped check reads from there: byte-compile, the shebang-then-`bash -n`
+leg, and a NEW leg that runs `tests/test_specs_freshness.py` inside the staged
+tree. That leg is the class closed: it is the part of the suite whose verdict is
+about files and counts rather than behaviour, it costs seconds, and it needs
+nothing but the files — no `.git`. The scratch tree is removed through a `trap` on
+every path, the refusal included, and a hook that cannot make it REFUSES rather
+than falling back to the working tree, because that fallback would answer the
+wrong question. The refusal says why the developer cannot see it for themselves:
+the working tree holds both halves of the change, so it agrees with itself.
+
+**Validated before it was tested.** The index materialised into a scratch
+directory is 84 files, and the real freshness guard runs green there in about
+three seconds (so no `.git` is needed). Appending ONE line to `core/bubble.py` in
+that copy — the `baf58c5` shape, staged code whose regenerated table is not —
+produced exactly the two guards that commit failed:
+`test_the_tables_are_what_the_generator_produces` and
+`test_the_generator_exits_zero_on_a_current_tree`.
+
+**Measured, end to end, in a scratch repo running the real hook** (fixture: a
+stand-in freshness guard whose subject is a plan file, so the property under test
+is which tree it is asked about): a partial stage — the entry staged, its plan row
+only on disk — is REFUSED with exit 1 and the message; staging both halves is
+committable; and a commit whose STAGED tree is consistent goes through even when
+the working copy beside it is not, which is the half that proves the fix is about
+the commit rather than about being stricter. A staged syntax error is refused even
+when the working copy has been fixed, which is the byte-compile leg's own version
+of the same defect. No scratch directory survives either verdict.
+
+**Guards and the sweep.** 11 guards in `tests/test_precommit_staged.py` (6 wiring,
+5 end-to-end), and the file is listed in `specs/60-test-plan.md` because that file
+list is a contract. **12/12 mutations caught, 2/2 probes green, 0 misses**, every
+restore sha256- AND mode-verified — the mutants are the ways this hook could go
+back to reading the working tree (`py_compile "$f"`, the shebang read from disk,
+no materialisation, HEAD archived instead of the index, the guard leg run in the
+working tree, the guard leg gated on the working copy of the guard) plus the
+refusals that could quietly stop refusing (a scratch directory worked around
+rather than refused, the guard leg skipped, its failure not refusing, the suite leg
+moved into the staged tree, the cleanup trap gone, the scratch tree surviving a
+refusal).
+
+**Green on the final bytes**, each invocation stamped and ending in the tree
+verdict: `tests` PASS 244 s (**1 783 passed** — the 1 772 of the last run plus
+these eleven), `coverage` PASS 250 s (**84.60%** ≥ 70, 2 579 missing of 16 754
+statements), `order` PASS 498 s in BOTH orderings (seed 9bc7110), `compile` (52
+files) / `shell` (5 scripts) / `smoke` PASS, **`clean-checkout` PASS 3 s**,
+**`two-writer` PASS** (`worktree unchanged since the run started`), `all gates
+passed`, exit 0.
+
+**Limits, stated.** The full suite still runs against the WORKING tree, on purpose
+and documented in the hook: a file-only copy has no `.git`, parts of the suite read
+this repository, and a hook that refuses honest commits is worse than one that
+misses — the file-shaped question is asked of the staged tree instead. The hook
+gates a commit only where `core.hooksPath` points at `githooks`, so a clone that
+never enabled it has no such check; the clean-checkout gate is what covers a commit
+that has already left the machine. And `--no-verify` remains the documented
+escape, which is why the ledger records the check rather than assuming it ran.
+`githooks/` is named nowhere in `install.sh`, so the deployment is untouched by
+all of this.

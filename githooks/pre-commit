@@ -13,34 +13,81 @@ if [ -z "$changed" ]; then
     exit 0
 fi
 
+# THE COMMIT, NOT THE WORKING TREE. Every file-shaped check below answers a
+# question about the tree the commit will CONTAIN, and the file on disk is a
+# different tree: a stage holding only part of a change ships a commit whose own
+# spec disagrees with its own code, and the working tree hides it, because there
+# the two agree. Measured, not theorised — two commits on main (`bd9cf5a`,
+# `baf58c5`) each passed this hook and were refused by a clean checkout of
+# themselves, the second because the regenerated architecture table was staged
+# nowhere while the module it prices was. So the index is written out ONCE here
+# and the checks read from it. `checkout-index` is the only tool that writes
+# exactly the index: a worktree checks out HEAD, and stashing to test would
+# disturb the developer's other work — which is regularly another agent's.
+staged=$(mktemp -d -t handsoff-staged-XXXXXX) || {
+    echo "✗ pre-commit could not make a scratch directory for the staged tree,"
+    echo "  and judging the working tree instead would answer a different question."
+    exit 1
+}
+trap 'rm -rf "$staged"' EXIT INT TERM
+if ! git checkout-index -a --prefix="$staged/"; then
+    echo "✗ pre-commit could not write the staged tree out (git checkout-index)."
+    exit 1
+fi
+
 fail=0
 
 # 1. Byte-compile every staged Python source (cheap, catches syntax rot first).
+# The STAGED copy: a file staged with a syntax error and then fixed on disk is
+# still a broken commit, and compiling the working copy would call it good.
 while IFS= read -r f; do
-    if [ -f "$f" ]; then
-        python3 -m py_compile "$f" || fail=1
-    fi
+    [ -f "$staged/$f" ] || continue
+    python3 -m py_compile "$staged/$f" || fail=1
 done < <(echo "$changed" | grep '\.py$' || true)
 
 # 2. Shell syntax for staged shell scripts — by SHEBANG, so an extensionless
 # one (`handsoff-restart`, this hook itself) cannot slip past the check the
-# way `*.sh` alone would miss it. Only the first line is read.
+# way `*.sh` alone would miss it. The first line comes from the STAGED copy too:
+# a script whose shebang is being added in this same commit is exactly the case
+# the working-tree read got wrong.
 while IFS= read -r f; do
-    [ -f "$f" ] || continue
-    case "$(head -1 "$f")" in
+    [ -f "$staged/$f" ] || continue
+    case "$(head -1 "$staged/$f")" in
         '#!'*bash*|'#!'*'/sh'*) ;;
         *) continue ;;
     esac
-    bash -n "$f" || fail=1
+    bash -n "$staged/$f" || fail=1
 done < <(echo "$changed" || true)
 
-# 3. The full suite whenever shipped sources changed. Deliberately broad:
-# handsoff.py is both app and self-edit target, and the suite pins prompt
-# text, tool census, and restart-script internals — narrow filters miss rot.
-# Measured, not guessed: the suite is ~2.5 min (this line used to say ~10s, and
-# the discrepancy is what makes a commit look HUNG — a 60s tool timeout kills a
-# commit that is running the gate it is supposed to run). Either wait for it, or
-# bypass deliberately with --no-verify and know what you skipped.
+# 3. The spec-vs-tree guard, against the STAGED tree. This is the check that
+# closes the hole above: it is the one part of the suite whose verdict is about
+# files and counts rather than behaviour, it needs nothing but the files
+# themselves (no `.git`), and it costs seconds. The working tree passing proves
+# nothing here, which is the entire point — it holds both halves of the change.
+if [ -f "$staged/tests/test_specs_freshness.py" ]; then
+    if ! (cd "$staged" && python3 -m pytest tests/test_specs_freshness.py -q \
+              --tb=line -p no:cacheprovider); then
+        echo
+        echo "  The STAGED tree is what this commit will contain, and it does not"
+        echo "  agree with its own spec. Stage the regenerated spec too (or unstage"
+        echo "  the code), then commit again — the working tree holds both halves,"
+        echo "  so it cannot show you this."
+        fail=1
+    fi
+fi
+
+# 4. The full suite whenever shipped sources changed — against the WORKING tree.
+# Deliberately broad: handsoff.py is both app and self-edit target, and the suite
+# pins prompt text, tool census, and restart-script internals — narrow filters
+# miss rot. Measured, not guessed: the suite is ~2.5 min (this line used to say
+# ~10s, and the discrepancy is what makes a commit look HUNG — a 60s tool timeout
+# kills a commit that is running the gate it is supposed to run). Either wait for
+# it, or bypass deliberately with --no-verify and know what you skipped.
+#
+# The working tree and NOT the staged copy, on purpose, and it is a stated limit:
+# a file-only copy has no `.git`, and parts of the suite legitimately read this
+# repository. A hook that refuses honest commits is worse than one that misses,
+# and the file-shaped question is already asked of the staged tree in step 3.
 if echo "$changed" | grep -qE '\.(py|sh)$|^install\.sh$|^handsoff-restart$|^pytest\.ini$|\.github/|\.gitlab-ci\.yml$'; then
     echo "pre-commit: running the test suite (~2.5 min)…"
     python3 -m pytest tests/ -q || fail=1

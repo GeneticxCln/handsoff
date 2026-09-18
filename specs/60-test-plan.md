@@ -1,6 +1,6 @@
 # handsoff — test plan
 
-Sources: `tests/` (29 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
+Sources: `tests/` (30 files + `conftest.py` + `fake_ollama.py`), `pytest.ini`,
 `.coveragerc`, `.github/workflows/ci.yml`, `.gitlab-ci.yml`,
 `githooks/pre-commit`, `ci/`.
 
@@ -39,6 +39,7 @@ nothing — a missing row does.
 | `test_notify_coalesce.py` | 15 | notification batching/cooldown |
 | `test_hardware_watch.py` | 13 | hardware watch tick, disk/VRAM alerts |
 | `test_idle_release.py` | 23 | the idle release: the drop and its locks, the quiet-window policy, re-arm vs one-per-spell |
+| `test_precommit_staged.py` | 11 | the pre-commit hook judging the STAGED tree: the index written out once, every file check reading it, a refusal instead of a fall back to the working tree, the cleanup on every path, and the three end-to-end shapes (a partial stage refused, both halves committable, the working tree NOT deciding) |
 | `test_p0_fixes.py` | 6 | named P0 regressions |
 | `test_specs_freshness.py` | 19 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |
 | `test_settings_gui.py` | 1 (+ offscreen subprocess drivers) | Qt GUI incl. 10-design ink guard |

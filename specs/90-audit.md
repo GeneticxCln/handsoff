@@ -187,13 +187,24 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    ignored paths must stay outside it), a real content change is still reported
    ONCE — as content — and a snapshot from before the field existed judges content
    exactly as well, only without the restored rows.
-6. The clean-checkout gate (see the section below) asks about HEAD, so it tells a
-   developer AFTER the commit exists. The class it found in the history — a
+6. **DONE (2026-09-18):** the clean-checkout gate asks about HEAD, so it told a
+   developer AFTER the commit existed, and the class it found in the history — a
    PARTIAL STAGE, where the working tree is self-consistent and the commit is not
-   — is invisible to every check run against the working tree, the pre-commit
-   hook included, which is exactly why that pair of commits landed. Next: have
-   the hook judge the STAGED tree (a checkout of the index) rather than the
-   working tree — the same device the gate already uses, one step earlier.
+   — was invisible to every check run against the working tree, the pre-commit
+   hook included. That is exactly how that pair of commits landed. The hook now
+   writes the index out once (`git checkout-index -a` into a scratch directory
+   from `mktemp -d`) and the file-shaped checks read THAT: the byte-compile leg,
+   the shebang/bash-n leg, and a new spec-vs-tree leg that runs the freshness
+   guard inside the staged tree — seconds, and no `.git` required. It refuses,
+   rather than falling back to the working tree, when it cannot make the scratch
+   directory; it removes it through a trap on every path, the refusal included;
+   and the refusal says why the developer cannot see the problem themselves,
+   which is that the working tree holds both halves of the change. The full suite
+   still runs against the WORKING tree, and the hook now says why rather than
+   leaving it to look like an oversight: a file-only copy has no `.git`, parts of
+   the suite legitimately read this repository, and a hook that refuses honest
+   commits is worse than one that misses — the file-shaped question is the
+   guard's job now.
 
 ## core/lifecycle.py seam exists but has no production caller — CLOSED (2026-09-17)
 
@@ -356,9 +367,10 @@ neighbouring work sat uncommitted beside them.
 **Fixed forward.** Every commit after the pair PASSes, current `main` included, so
 nothing on the branch is broken now; the refusals are historical facts about those
 two revisions, visible only by checking them out. The class is now refused at
-make-time by the gate, and item 6 of the follow-ups above is the half that is
-still missing: the hook tests the working tree, so the write-time check the gate
-performs could still be defeated by the same partial stage.
+make-time by the gate, and item 6 of the follow-ups above has since closed the
+other half: the hook judges the STAGED tree now, so the partial stage that
+shipped these two commits is refused at the moment of committing instead of by
+the next clone.
 
 **Limits.** The verdict is the gate's: self-consistency of the plan, the census,
 the citations and the generated tables, never correctness of the code — a PASS is
