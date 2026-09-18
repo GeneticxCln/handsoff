@@ -821,6 +821,13 @@ class TestSpecFreshness:
         two of them had also gone stale. A number under three digits beside a
         module name is not matched — `handsoff-settings.py` really is a 6-tab
         GUI, and that is a count of tabs, not of lines.
+
+        DATES are stripped for the same reason as citations: a dated heading
+        that names a module (`## core/lifecycle.py seam exists but has no
+        production caller (2026-09-17)`) is a date, not a size, and it was
+        flagged as one the first time an audit entry was headed that way — a
+        guard that calls a date a line count teaches people to stop writing
+        dates.
         """
         spec_tables = _generator()
         labels = sorted({label for label, _path in spec_tables.modules()})
@@ -836,6 +843,7 @@ class TestSpecFreshness:
                 if (path.name, number) in generated:
                     continue
                 text_ = re.sub(r"`?[\w/]+\.py`?:\d+", "", line)   # citations
+                text_ = re.sub(r"\d{4}-\d{2}-\d{2}", "", text_)     # dates
                 if not re.search(r"\d{3,}", text_):
                     continue
                 named = [label for label in labels if label in text_]

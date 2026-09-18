@@ -85,7 +85,8 @@ class DoctorDeps:
         "control_sock", "crash_log", "remote_ollama_allowed",
         "remote_ollama_optin_source",
         "cap_refusal_note", "cap_refusals",
-        "appearance_look", "web_lines",
+        "appearance_look", "web_lines", "llm_lines",
+        "gpu_lines", "gpu_headroom",
         "shutil", "sounddevice", "log",
     )
 
@@ -132,6 +133,14 @@ class DoctorDeps:
         # host owns the vocabulary (which backends exist, which reader was used)
         # and the doctor owns the placement, so the two cannot disagree.
         self.web_lines: Callable[[], list] = lambda: []
+        self.llm_lines: Callable[[], list] = lambda: []
+        # The card's own arithmetic: free VRAM, this process's share of it, and
+        # whether an idle release is about to give that share back. Lines for
+        # the same reason as the two above (the host owns the vocabulary), plus
+        # the structured form the JSON surface needs — one dict behind both, so
+        # the words and the numbers cannot drift.
+        self.gpu_lines: Callable[[], list] = lambda: []
+        self.gpu_headroom: Callable[[], dict] = lambda: {}
         self.shutil = shutil
         self.sounddevice = None
         self.log = log
@@ -224,6 +233,35 @@ def _web_lookup_lines(deps: "DoctorDeps") -> list[str]:
     return [str(line) for line in lines if line]
 
 
+def _llm_memory_lines(deps: "DoctorDeps") -> list[str]:
+    """The idle-release line, when the host has a memory policy to report.
+
+    Empty for a host without the dep, exactly like the appearance and web
+    lines, so a partial deps object prints what it printed before. The content
+    is the host's: the decision it would make about the model it is configured
+    with, in the same words it logs — two surfaces describing one release.
+    """
+    try:
+        lines = deps.llm_lines() or []
+    except Exception:
+        lines = []
+    return [str(line) for line in lines if line]
+
+
+def _gpu_headroom_lines(deps: "DoctorDeps") -> list[str]:
+    """The card's headroom, when the host has a GPU story to tell.
+
+    Empty for a host without the dep, exactly like the appearance, web and llm
+    lines, so a partial deps object prints what it printed before. The content
+    is the host's: it is the process that knows what it is holding.
+    """
+    try:
+        lines = deps.gpu_lines() or []
+    except Exception:
+        lines = []
+    return [str(line) for line in lines if line]
+
+
 def _remote_brain_lines(deps: "DoctorDeps") -> list[str]:
     """Trust warning appended after the brain line when the endpoint is not
     on this machine: conversation history, screenshots, and tool schemas
@@ -310,6 +348,8 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append(
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
+        lines.extend(_llm_memory_lines(deps))
+        lines.extend(_gpu_headroom_lines(deps))
         lines.extend(_appearance_lines(deps))
         lines.extend(_web_lookup_lines(deps))
 
@@ -353,6 +393,8 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append(
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
+        lines.extend(_llm_memory_lines(deps))
+        lines.extend(_gpu_headroom_lines(deps))
         lines.extend(_appearance_lines(deps))
         lines.extend(_web_lookup_lines(deps))
 
@@ -508,6 +550,16 @@ def doctor_json() -> dict:
                 re.search(r"^Restart=(always|on-failure|on-abnormal)$", txt, re.M))
         except OSError:
             pass
+    # Only when the host measured or estimated something: a host without the
+    # dep leaves the JSON exactly as it was, the same way its text report is
+    # unchanged. The dict is passed through as the host built it — this module
+    # formats, it does not adjudicate.
+    try:
+        headroom = deps.gpu_headroom() or {}
+    except Exception:
+        headroom = {}
+    if isinstance(headroom, dict) and headroom:
+        out["gpu_headroom"] = dict(headroom)
     snap = deps.hardware_snapshot(deps.doctor_ttl)
     if snap is not None:
         out["hardware"] = snap

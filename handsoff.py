@@ -755,6 +755,388 @@ def _web_lines() -> list:
         return []
 
 
+def _llm_memory_lines() -> list:
+    """One doctor line: what an idle release would do with the LLM, and why.
+
+    Read-only, and honest about the one thing that is not live: the reload the
+    decision rests on is a MEASUREMENT, so the line says when it was taken
+    rather than implying the number is being watched. The window at `0` says
+    the release is off instead of reporting a verdict that will never run, and
+    a host that cannot ask Ollama says the resident state is unknown rather
+    than guessing it.
+    """
+    window = _idle_release_seconds()
+    if window <= 0.0:
+        return ["llm memory: idle release is OFF (idle_release_seconds 0)"]
+    try:
+        verdict = _llm_release_verdict()
+    except Exception:
+        log.exception("llm release verdict failed")
+        return []
+    line = (f"llm memory: after {window:.0f}s idle the release would "
+            f"{'UNLOAD' if verdict['release'] else 'KEEP'} {OLLAMA_MODEL} — "
+            f"{verdict['note']}")
+    if _measured_llm_reload() is not None:
+        age = max(0.0, time.time() - _llm_load["at"])
+        loads = int(_llm_load["loads"])
+        line += (f" (slowest of {loads} load" + ("s" if loads != 1 else "")
+                 + f"; last measured {_fmt_dur(age)} ago)")
+    return [line]
+
+
+def _parse_vram_pool(text: str) -> "tuple[int, int] | None":
+    """(free, total) MiB from `nvidia-smi --query-gpu=memory.free,memory.total`.
+
+    The FIRST row is the first GPU: the bubble loads one device, and summing
+    cards would report headroom on a card the models are not on. `N/A` (a
+    driver that cannot answer, a vGPU) parses to None rather than to zero,
+    because "0 MB free" is the loudest claim this line can make and it must
+    never be invented from an answer nobody gave.
+    """
+    for line in (text or "").splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            free, total = int(float(parts[0])), int(float(parts[1]))
+        except ValueError:
+            continue                    # `N/A`, or a reshaped reply
+        if total > 0:
+            return (free, total)
+    return None
+
+
+def _parse_own_vram(text: str, pid: int) -> "int | None":
+    """VRAM the driver attributes to `pid`, or None when it attributes none.
+
+    Attributed BY PID rather than assumed: the same card also serves Ollama's
+    llama-server, the compositor and the wallpaper, and folding those into
+    "what the bubble holds" would be wrong in both directions — it would blame
+    the bubble for someone else's memory AND overstate what an idle release
+    could hand back.
+
+    None means "this query tells us nothing here" (unsupported, `N/A`), which
+    is deliberately different from 0 — "it answered, and this pid holds
+    nothing on the card". The two lead to different sentences in doctor.
+    """
+    answered = False
+    total = 0
+    for line in (text or "").splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            row_pid, used = int(parts[0]), int(float(parts[1]))
+        except ValueError:
+            continue                    # `N/A` in the used_memory column
+        answered = True
+        if row_pid == pid:
+            total += used
+    return total if answered else None
+
+
+def _nvidia_query(*args: str) -> "str | None":
+    """One nvidia-smi query's stdout, or None — never an exception.
+
+    Doctor is the tool the user runs when something is already wrong, so a
+    missing binary, a wedged driver, a timeout or a non-zero exit are all
+    answers ("cannot be asked") rather than failures to report.
+    """
+    try:
+        proc = subprocess.run(["nvidia-smi", *args], capture_output=True,
+                              text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout or ""
+
+
+def _vram_pool_mb() -> "tuple[int, int] | None":
+    """(free, total) MiB for the first GPU, or None when it cannot be asked."""
+    text = _nvidia_query("--query-gpu=memory.free,memory.total",
+                         "--format=csv,noheader,nounits")
+    return _parse_vram_pool(text) if text is not None else None
+
+
+def _own_vram_mb() -> "int | None":
+    """VRAM this process holds, as the driver attributes it, or None."""
+    text = _nvidia_query("--query-compute-apps=pid,used_memory",
+                         "--format=csv,noheader,nounits")
+    return _parse_own_vram(text, os.getpid()) if text is not None else None
+
+
+# The idle tick runs every second and reading free VRAM shells out, so the
+# reading is cached: a card does not go from roomy to starved between one second
+# and the next, and a probe per tick would spend more CPU than the release saves.
+_VRAM_SAMPLE_SECONDS = 30.0
+_vram_sample = {"at": 0.0, "free_mb": None}
+
+# Sentinel for `_idle_release_window(free_mb=...)`: "no reading supplied, take
+# one". Deliberately distinct from None, which is a real answer — "the card
+# could not be asked" — and leads to a different decision.
+_SAMPLE_NOW = object()
+
+
+def _free_vram_sample() -> "int | None":
+    """Free VRAM in MiB, re-read at most every `_VRAM_SAMPLE_SECONDS`.
+
+    A fresh process always reads (the first call has no stamp to trust), and an
+    unreadable card is cached as `None` exactly like a reading — the next tick a
+    half-minute later asks again, which is the right cadence for a value that
+    only decides whether to stop waiting.
+    """
+    now = _tick_now()
+    if _vram_sample["at"] and now - _vram_sample["at"] < _VRAM_SAMPLE_SECONDS:
+        return _vram_sample["free_mb"]
+    pool = _vram_pool_mb()
+    _vram_sample["at"] = now
+    _vram_sample["free_mb"] = pool[0] if pool else None
+    return _vram_sample["free_mb"]
+
+
+def _idle_release_window(free_mb=_SAMPLE_NOW) -> dict:
+    """The quiet the release needs NOW, and why it is not the configured one.
+
+    Returns ONE dict rather than a window plus a side note: `window_s` in it is
+    the window in force, so the decision, the journal and the doctor read the
+    same field instead of agreeing about a number kept in two places.
+
+    The audit's lesson was that the card's pressure is the machine's problem:
+    waiting the full ten minutes while the desktop cannot allocate display
+    buffers is the wrong trade even when the release itself is right. So a card
+    with less than `vram_pressure_floor_mb` free uses `vram_pressure_seconds`
+    instead — and the REASON travels with the answer, so the journal and the
+    doctor both say why a release came early rather than leaving it looking
+    arbitrary.
+
+    Three ways the pressure path stays off, deliberately: the feature is off
+    (`floor 0`); the release is off (`window 0` — an explicit "never release"
+    outranks a full card, because the user asked); and the card cannot be read
+    (`free is None`) — an unknown free VRAM is not evidence of pressure, and
+    inventing it would drop the models on a machine whose driver simply would
+    not answer.
+
+    `free_mb` is the reading to judge; the sentinel means "sample it now". A
+    caller that already has one (the doctor line) passes it, so that line costs
+    one nvidia-smi call rather than two.
+    """
+    window = _idle_release_seconds()
+    floor = _vram_pressure_floor_mb()
+    info = {"floor_mb": floor, "free_mb": None, "under": False,
+            "window_s": window, "configured_s": window, "reason": ""}
+    if window <= 0.0 or floor <= 0.0:
+        return info
+    free = _free_vram_sample() if free_mb is _SAMPLE_NOW else free_mb
+    info["free_mb"] = free
+    if free is None:
+        info["reason"] = ("free VRAM could not be read, so the normal window "
+                          "stands")
+        return info
+    if free >= floor:
+        return info
+    shortened = _vram_pressure_seconds(window)
+    info["window_s"] = shortened
+    # `under` means "the short window is in force", which is the only thing the
+    # journal clause and the doctor sentence claim. A floor that is breached
+    # while the pressure window is not actually shorter (set to the window, or
+    # unreadable and fallen back) is a real fact with no early release in it,
+    # and the reason says so rather than announcing one that did not happen.
+    info["under"] = shortened < window
+    if info["under"]:
+        info["reason"] = (f"{free / 1024:.1f} GB free is below the "
+                          f"{floor / 1024:.1f} GB floor, so the "
+                          f"{window:.0f}s window is {shortened:.0f}s")
+    else:
+        info["reason"] = (f"{free / 1024:.1f} GB free is below the "
+                          f"{floor / 1024:.1f} GB floor, but the pressure "
+                          f"window is not shorter than the {window:.0f}s one")
+    return info
+
+
+def _vram_headroom() -> dict:
+    """The card's headroom, this bubble's share of it, and the release's state.
+
+    One dict behind both doctor surfaces (the line and `doctor_json`), so the
+    words and the numbers cannot disagree. Read-only, and honest where it is
+    blind: a probe that cannot answer says `None` rather than raising, because
+    doctor is exactly where a raise costs the most.
+
+    `bubble_source` is part of the answer, not decoration. A number the driver
+    attributed to this pid and a number added up from the loader tables are not
+    equally good evidence, and the reader is deciding whether to trust the
+    headroom — so which one they are looking at is stated rather than implied.
+    """
+    pool = _vram_pool_mb()
+    measured = _own_vram_mb()
+    try:
+        footprint = _audio.gpu_footprint_mb() or {}
+    except Exception:
+        log.debug("gpu footprint probe failed", exc_info=True)
+        footprint = {}
+    if measured is None:
+        hold_mb = int(footprint.get("total_mb") or 0)
+        source = "estimated" if footprint else "unknown"
+    else:
+        hold_mb, source = measured, "measured"
+    # The window the release would ACTUALLY use, not the configured one: a card
+    # under the pressure floor is on the short window, and a doctor that
+    # reported the configured 600 s would be describing a release that is not
+    # about to happen. The reading above is passed in so this costs no second
+    # nvidia-smi call.
+    pressure = _idle_release_window(pool[0] if pool else None)
+    window = pressure["window_s"]
+    if window <= 0.0:
+        state, due_in = "off", None
+    elif _gpu_released:
+        state, due_in = "released", None
+    else:
+        due_in = max(0.0, window - (_tick_now() - _gpu_last_use))
+        # `pending` and `due` are different answers: the first says there is
+        # still quiet left to spend, the second says the window HAS elapsed and
+        # the release is waiting for the bubble to stop being busy. Collapsing
+        # them would make a bubble that is mid-turn look like one that just
+        # booted.
+        state = "pending" if due_in > 0.0 else "due"
+    return {
+        "free_mb": pool[0] if pool else None,
+        "total_mb": pool[1] if pool else None,
+        "bubble_mb": hold_mb,
+        "bubble_source": source,
+        "bubble_models": {
+            "tts_mb": int(footprint.get("tts_mb") or 0),
+            "whisper_mb": int(footprint.get("whisper_mb") or 0),
+            "tts_device": str(footprint.get("tts_device") or ""),
+            "whisper_device": str(footprint.get("whisper_device") or ""),
+        },
+        "idle_release": {"window_s": window,
+                          "configured_s": pressure["configured_s"],
+                          "state": state, "due_in_s": due_in,
+                          "under_pressure": pressure["under"],
+                          "floor_mb": pressure["floor_mb"],
+                          "pressure_reason": pressure["reason"]},
+        "speech_yields": _speech_yield_state(pool[0] if pool else None),
+    }
+
+
+def _speech_yield_state(free_mb) -> dict:
+    """What a turn would ask of the speech model, as facts rather than a hope.
+
+    The mirror of the idle release's slot beside it: the policy (`the setting`),
+    what there is to give (`held_mb`), what the LLM needs (`claim_mb`, from the
+    per-model cache — None until a turn has read it) and, when both numbers are
+    known, the verdict the turn would reach right now. A doctor that only said
+    "the speech model may yield" would be describing a policy; this says whether
+    it WOULD, and why not when it would not.
+
+    `held_mb` is read from the same place the release reads it
+    (`core.audio.gpu_footprint_mb`, the loader tables for what is loaded on the
+    card), NOT from the measured share the line above reports: the two are
+    different measurements of different things, and this state predicts what
+    `drop_models` would free.
+    """
+    try:
+        held = max(0, int((_audio.gpu_footprint_mb() or {}).get("total_mb") or 0))
+    except Exception:
+        log.debug("gpu footprint probe failed in doctor", exc_info=True)
+        held = 0
+    state = {"enabled": bool(_setting_flag("speech_yields_to_llm", True)),
+             "held_mb": held, "claim_mb": None, "would_yield": None,
+             "note": ""}
+    if not state["enabled"]:
+        state["note"] = "speech_yields_to_llm is off"
+        return state
+    if state["held_mb"] <= 0:
+        state["note"] = "nothing of this process's is on the card"
+        return state
+    # Read from the CACHE only: doctor must not start an HTTP call (a wedged
+    # Ollama would add seconds to it) and the turn path is what fills this in.
+    claim = (_llm_footprint["mb"]
+             if _llm_footprint["model"] == OLLAMA_MODEL else None)
+    state["claim_mb"] = claim
+    if claim is None:
+        state["note"] = ("the LLM's size has not been read yet — a turn reads "
+                         "it before it asks")
+        return state
+    verdict = _audio.yield_to_llm_verdict(free_mb, claim,
+                                          held_mb=state["held_mb"])
+    state["would_yield"] = bool(verdict["yield"])
+    state["note"] = verdict["note"]
+    return state
+
+
+def _gpu_headroom_lines() -> list:
+    """One doctor line: free VRAM, this bubble's share, the release's state.
+
+    The three facts that decide whether the DESKTOP is about to be starved:
+    what the card has left, how much of what it lost belongs to this process,
+    and whether the idle release is about to hand its own share back. The LLM's
+    half of the memory story is the `llm memory` line beside this one — this is
+    the card's own arithmetic, which no other line reports (the GPU section
+    names the card and stops there).
+
+    Read-only, so it is safe to ask at any moment and cheap enough to ask from
+    a diagnostic.
+    """
+    try:
+        info = _vram_headroom()
+    except Exception:
+        log.exception("gpu headroom probe failed")
+        return []
+    free, total = info["free_mb"], info["total_mb"]
+    if free is None or total is None:
+        head = "free VRAM unknown — nvidia-smi gave nothing usable"
+    else:
+        used = 0.0 if total <= 0 else (1.0 - free / total) * 100.0
+        head = (f"{free / 1024:.1f} GB free of {total / 1024:.1f} GB "
+                f"({used:.0f}% used)")
+    source, hold = info["bubble_source"], info["bubble_mb"]
+    if source == "measured":
+        holds = f"this bubble holds {hold / 1024:.1f} GB (measured)"
+    elif source == "estimated":
+        holds = (f"this bubble holds about {hold / 1024:.1f} GB (estimated from "
+                 "the loader tables — the driver attributed no memory to a pid)")
+    else:
+        holds = "this bubble's own share could not be read"
+    rel = info["idle_release"]
+    if rel["state"] == "off":
+        state = "idle release OFF (idle_release_seconds 0)"
+    elif rel["state"] == "released":
+        state = ("idle release already fired in this quiet spell — the next use "
+                 "re-arms it")
+    elif rel["state"] == "due":
+        state = (f"idle release DUE after {_fmt_dur(rel['window_s'])} of quiet — "
+                 "fires on the next tick that finds the bubble idle")
+    else:
+        state = f"idle release in {_fmt_dur(rel['due_in_s'])} of quiet"
+    # Only while the release is still AHEAD of us. After it has fired the
+    # current reading says nothing about why it fired, and a doctor line that
+    # explained a past decision with a present number would be inventing it.
+    if rel["under_pressure"] and rel["state"] in ("pending", "due"):
+        state += f" (VRAM pressure — {rel['pressure_reason']})"
+    line = f"gpu headroom: {head} — {holds}; {state}"
+    # What a TURN would ask of the same memory, said only when there is
+    # something to ask for: with nothing of ours on the card (or the feature
+    # off) the sentence would be about a policy rather than about this machine.
+    ask = info["speech_yields"]
+    if not ask["enabled"]:
+        line += ("; a turn never asks the speech model for the card "
+                 "(speech_yields_to_llm off)")
+    elif ask["held_mb"] > 0:
+        held_gb = ask["held_mb"] / 1024
+        if ask["claim_mb"] is None:
+            line += (f"; a turn that cannot fit its LLM can ask the speech "
+                     f"model for its {held_gb:.1f} GB")
+        elif ask["would_yield"]:
+            line += (f"; the speech model's {held_gb:.1f} GB goes back to a "
+                     f"turn whose LLM ({ask['claim_mb']} MB) does not fit "
+                     f"without it")
+        else:
+            line += (f"; the speech model keeps its {held_gb:.1f} GB — "
+                     f"{ask['note']}")
+    return [line]
+
+
 def _deployment_snapshot() -> dict:
     """Describe the code actually running and whether it matches the checkout.
 
@@ -796,8 +1178,22 @@ def _deployment_snapshot() -> dict:
     # deployment and then went missing from it while doctor still said
     # `in-sync`.
     manifest_files = manifest.get("files")
-    tracked = sorted(set(_DEPLOY_FILES) | (
-        set(manifest_files) if isinstance(manifest_files, dict) else set()))
+    tracked = set(_DEPLOY_FILES) | (
+        set(manifest_files) if isinstance(manifest_files, dict) else set())
+    # _DEPLOY_FILES is only the TOP-LEVEL floor (handsoff.py, the settings app,
+    # the schema, hardware.py, the restart script) plus three core modules, and
+    # install.sh declares thirteen. A manifest-less or hand-rolled install
+    # therefore compared eight files and reported `in-sync` while half the
+    # modules differed — the same class of defect the manifest-driven set fixed
+    # for an exported manifest, one install shape over. The checkout's own core
+    # set is the honest ceiling for that case, and it is the same glob
+    # install.sh stages by, so a module that exists only in the checkout is
+    # drift. With no checkout there is nothing to compare against and every
+    # entry reports a null source hash, which is why the fallback is harmless.
+    if repo_dir is not None:
+        tracked |= {f"core/{path.name}"
+                    for path in sorted((repo_dir / "core").glob("*.py"))}
+    tracked = sorted(tracked)
     files: dict = {}
     all_match = True
     partial_source = False  # installed file exists but its source is missing
@@ -937,6 +1333,9 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         crash_log=CRASH_LOG,
         appearance_look=_appearance_note,
         web_lines=_web_lines,
+        llm_lines=_llm_memory_lines,
+        gpu_lines=_gpu_headroom_lines,
+        gpu_headroom=_vram_headroom,
         cap_refusal_note=_cap_refusal_note,
         cap_refusals=_cap_refusal_summary,
         remote_ollama_allowed=_ollama_remote_opted_in,
@@ -1097,14 +1496,15 @@ def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -
             try:
                 clip_before = subprocess.run(
                     ["wl-paste", "--no-newline"], capture_output=True,
-                    text=True).stdout or ""
+                    text=True, timeout=8).stdout or ""
             except Exception:
                 clip_before = None
             o1, e1 = belt.execute("press_keys", {"combo": "ctrl+a"})
             o2, e2 = belt.execute("press_keys", {"combo": "ctrl+c"})
             time.sleep(0.8)
             clip = subprocess.run(["wl-paste", "--no-newline"],
-                                  capture_output=True, text=True).stdout
+                                  capture_output=True, text=True,
+                                  timeout=8).stdout
             match = not e1 and not e2 and clip == token
             _selftest_check(results, "clipboard round-trip",
                             "PASS" if match else "FAIL",
@@ -1310,6 +1710,67 @@ def _followup_seconds() -> float:
         return 0.0
 
 
+def _idle_release_seconds() -> float:
+    """The idle-release window, read defensively like `_followup_seconds`.
+
+    Read on a timer path, so an unreadable value must mean "never release"
+    rather than an exception inside the health tick; `0` is the switch that
+    turns the release off, and that is also what junk degrades to.
+    """
+    try:
+        return max(0.0, float(SETTINGS.get("idle_release_seconds", 600) or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _llm_release_wait_s_per_gb() -> float:
+    """How much reload wait one GB of freed GPU memory may buy.
+
+    Read on the same timer path as the window, so junk must not raise there.
+    Unlike the window, junk here degrades to `0` — "do not weigh the cost" —
+    because that is the behaviour the release had before there was anything to
+    weigh, and a value nobody can read must not become a reason to keep memory
+    the machine may be about to need.
+    """
+    try:
+        return max(0.0, float(SETTINGS.get("llm_release_wait_s_per_gb", 20.0)
+                               or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _vram_pressure_floor_mb() -> float:
+    """The free-VRAM floor that shortens the release window; 0 = never rush.
+
+    Read on the same timer path as the window, so junk must not raise there.
+    Unlike the window, junk degrades to `0` — "never rush" — because the other
+    direction is a value nobody can read deciding to hand the models back
+    early, and a release that fires for no stated reason is the thing this
+    setting exists to explain.
+    """
+    try:
+        return max(0.0, float(SETTINGS.get("vram_pressure_floor_mb", 1024)
+                              or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _vram_pressure_seconds(window: float) -> float:
+    """The quiet the release needs while the card is below the floor.
+
+    Clamped to the normal window, so this can only ever make a release
+    EARLIER — a value above the window would otherwise silently disable the
+    pressure path. An unreadable one falls back to the normal window rather
+    than to 0: `0` here means "release at the first quiet tick", which is not a
+    safe default for a setting nobody could read.
+    """
+    try:
+        value = float(SETTINGS.get("vram_pressure_seconds", 30))
+    except (TypeError, ValueError, OverflowError):
+        return window
+    return max(0.0, min(value, window))
+
+
 def set_setting(key: str, value) -> bool:
     """Single entry point for every SETTINGS mutation.
 
@@ -1455,6 +1916,10 @@ def reload_derived_settings() -> None:
             whisper_device=WHISPER_DEVICE,
             whisper_model_dir=WHISPER_MODEL_DIR,
             tts_reference=TTS_REFERENCE,
+            # Deferred through a lambda on purpose: this runs at import time,
+            # and the policy it installs is defined with the rest of the LLM
+            # memory policy further down the file.
+            gpu_reclaim=lambda reason="": _reclaim_gpu_for_speech(reason),
             settings=SETTINGS,
             logger=log,
         )
@@ -1614,6 +2079,7 @@ _audio.configure(
     whisper_device=WHISPER_DEVICE,
     whisper_model_dir=WHISPER_MODEL_DIR,
     tts_reference=TTS_REFERENCE,
+    gpu_reclaim=lambda reason="": _reclaim_gpu_for_speech(reason),
     settings=SETTINGS,
     logger=log,
 )
@@ -1888,7 +2354,407 @@ def _adopt_model(attr: str, loaded):
     return loaded
 
 
+# When a model was last used, for the idle release below. Monotonic seconds
+# (`_tick_now`), because the only question ever asked of it is "how long ago".
+_gpu_last_use = _tick_now()
+_gpu_released = False
+
+
+def _touch_gpu() -> None:
+    """Remember that a model was used — every getter below calls this.
+
+    Deliberately called from the GETTERS and not only from the loaders: the
+    getters are what every speech and chat path goes through, so a turn that
+    reuses an already-loaded model still counts as use (and still holds the
+    models, since holding them is what makes the next turn fast).
+    """
+    global _gpu_last_use, _gpu_released
+    _gpu_last_use = _tick_now()
+    _gpu_released = False
+
+
+def _release_models() -> dict:
+    """Drop both copies of both speech caches and give the memory back.
+
+    The mirror follows core.audio inside `_model_cache_lock` — the lock the
+    push/adopt pair uses — so a release can never be undone by a load that read
+    the old model a moment earlier (the resurrection `_adopt_model`'s identity
+    check exists for). Only what was actually dropped is cleared here: a cache
+    whose lock was busy is still holding its model, and the mirror must keep
+    saying so.
+    """
+    with _model_cache_lock:
+        dropped = _audio.drop_models(logger=log)
+        if dropped["tts"]:
+            globals()["_tts_model"] = None
+        if dropped["whisper"]:
+            globals()["_whisper_model"] = None
+    return dropped
+
+
+def unload_ollama() -> bool:
+    """Ask Ollama to drop the configured model now (`keep_alive: 0`)."""
+    unload = getattr(_brain, "ollama_unload", None)
+    if unload is None:
+        # The no-core/brain bundle: there is nothing to call and the model
+        # stays resident. Debug, not a warning — the bubble still works, it
+        # just cannot hand this memory back.
+        log.debug("brain module has no ollama_unload; the model stays resident")
+        return False
+    return bool(unload(base=OLLAMA_BASE, model=OLLAMA_MODEL,
+                       guard=_guard_ollama_endpoint, logger=log,
+                       urlopen=urllib.request.urlopen))
+
+
+# What this model has cost to load, and for WHICH model. Both halves matter: a
+# measurement belongs to the model it was taken on, so a swapped `ollama_model`
+# starts a fresh record rather than pricing the new model with the old one's
+# reload.
+#
+# `slowest` is what the policy weighs, not the most recent one. The same model on
+# this machine produced a 4.7 s warm (already resident: prefill only) minutes
+# after a 218.9 s cold load — and the reload an idle release causes is always the
+# cold one. A number that is sometimes ten times too cheap is worse than no
+# number, because it argues for a release whose cost it cannot see.
+_llm_load = {"model": "", "slowest": None, "last": None, "loads": 0,
+             "at": 0.0}
+
+# Set when the idle release really unloaded the model. The next streaming turn
+# then measures its own reload — the cost the release weighed — instead of the
+# policy deciding forever on a number taken at startup.
+_llm_reload = {"pending": False, "started": 0.0}
+
+
+def _note_llm_load(model: str, seconds) -> None:
+    """Remember what loading a model cost; the measured half of the release rule.
+
+    Keeps the SLOWEST load seen for the current model, and starts over when the
+    model does. A load that started with the model already resident measures only
+    the prefill (this machine: 4.7 s against a 218.9 s cold load of the same
+    model), and the reload a release causes is always the cold one.
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if value <= 0.0:
+        return
+    name = str(model)
+    if _llm_load["model"] != name:
+        _llm_load.update({"slowest": None, "last": None, "loads": 0})
+    _llm_load["model"] = name
+    _llm_load["last"] = value
+    _llm_load["slowest"] = max(_llm_load["slowest"] or 0.0, value)
+    _llm_load["loads"] = int(_llm_load["loads"]) + 1
+    _llm_load["at"] = time.time()
+
+
+def _measured_llm_reload() -> "float | None":
+    """The slowest reload measured for the CONFIGURED model, or None."""
+    if _llm_load["model"] != OLLAMA_MODEL:
+        return None
+    return _llm_load["slowest"]
+
+
+def _arm_llm_reload_probe() -> None:
+    """Start the clock on a call that has to reload the model, if one is due.
+
+    Called by the chat wrappers, not by the release: the wait we care about
+    begins when the user asks something, not when the model was let go. Arming
+    it at release time would count the quiet hours in the middle as reload.
+    """
+    if _llm_reload["pending"]:
+        _llm_reload["started"] = time.monotonic()
+
+
+def _finish_llm_reload_probe() -> None:
+    """The model has spoken: measure what that reload cost, once."""
+    if not _llm_reload["pending"]:
+        return
+    started = _llm_reload["started"]
+    _llm_reload["pending"] = False
+    if started <= 0.0:
+        return                      # never armed: nothing to measure against
+    _note_llm_load(OLLAMA_MODEL, time.monotonic() - started)
+    log.info("LLM reload after an idle release: %.1fs to first sentence "
+             "(slowest for this model: %.1fs)",
+             _llm_load["last"] or 0.0, _llm_load["slowest"] or 0.0)
+
+
+def _disarm_llm_reload_probe() -> None:
+    """Drop a pending probe a non-streaming call cannot answer.
+
+    That call's whole duration is the answer being generated, not the load, so
+    timing it would report a long reply as an expensive reload and talk the
+    policy into keeping memory it should give back. The measurement it does not
+    take is simply not taken; the earlier one still stands.
+    """
+    _llm_reload["pending"] = False
+    _llm_reload["started"] = 0.0
+
+
+def _resident_llm() -> "dict | None":
+    """What Ollama says is loaded, or None when it cannot be asked."""
+    probe = getattr(_brain, "ollama_resident", None)
+    if probe is None:
+        return None                 # bundle without the endpoint: unknown
+    try:
+        return probe(base=OLLAMA_BASE, model=OLLAMA_MODEL,
+                     guard=_guard_ollama_endpoint, logger=log,
+                     urlopen=urllib.request.urlopen)
+    except Exception:
+        log.debug("ollama resident probe failed", exc_info=True)
+        return None
+
+
+# What the configured LLM needs on the card, per MODEL and with a timestamp: a
+# size belongs to the model it was read for, so a swapped `ollama_model` starts
+# a fresh read instead of weighing the new turn with the old model's footprint.
+# Cached because the ask below sits on the TURN path and a model's blob size
+# does not change between two questions; a failed read is cached too, so a
+# wedged Ollama is asked once per window rather than once per turn.
+_LLM_FOOTPRINT_SECONDS = 600.0
+_llm_footprint = {"model": "", "mb": None, "at": 0.0}
+
+
+def _llm_footprint_mb() -> "int | None":
+    """The configured model's size in MiB, or None when Ollama cannot say.
+
+    Read from `/api/tags` (the blob size, which is what a full offload costs the
+    card) rather than estimated from a table: the number decides whether the
+    speech model is asked to move, and asking for the wrong amount of room is
+    how a voice gets evicted for a claim that could never have fitted. A bundle
+    without the reader answers None, which the verdict treats as unmeasured
+    rather than as zero.
+    """
+    now = time.time()
+    if (_llm_footprint["model"] == OLLAMA_MODEL
+            and now - _llm_footprint["at"] < _LLM_FOOTPRINT_SECONDS):
+        return _llm_footprint["mb"]
+    read = getattr(_brain, "ollama_model_size_mb", None)
+    mb = None
+    if read is not None:
+        try:
+            mb = read(base=OLLAMA_BASE, model=OLLAMA_MODEL,
+                      guard=_guard_ollama_endpoint, logger=log,
+                      urlopen=urllib.request.urlopen)
+        except Exception:
+            log.debug("ollama model size probe failed", exc_info=True)
+            mb = None
+    _llm_footprint.update({"model": OLLAMA_MODEL, "mb": mb, "at": now})
+    return mb
+
+
+def _llm_release_verdict() -> dict:
+    """Would an idle release drop the LLM, and why — one call, one answer."""
+    decide = getattr(_brain, "ollama_release_verdict", None)
+    if decide is None:
+        # The no-core/brain bundle: there is no /api/ps reader to weigh, so the
+        # release stays unconditional — exactly what it did before the policy
+        # existed. A missing policy must not become a reason to hold memory.
+        return {"release": True, "model": OLLAMA_MODEL, "freed_gb": None,
+                "wait_per_gb": None, "budget": 0.0,
+                "note": "brain module has no release policy — releasing as before"}
+    return decide(_resident_llm(), reload_s=_measured_llm_reload(),
+                  wait_s_per_gb=_llm_release_wait_s_per_gb(), model=OLLAMA_MODEL)
+
+
+def _release_llm() -> dict:
+    """Hand the LLM's memory back — when handing it back is worth the wait.
+
+    Returns the verdict with `unloaded` added: True only if Ollama was actually
+    asked and answered, so the caller can tell "kept on purpose" from "could not".
+    """
+    verdict = _llm_release_verdict()
+    verdict["unloaded"] = bool(unload_ollama()) if verdict["release"] else False
+    if verdict["unloaded"]:
+        _llm_reload["pending"] = True
+        _llm_reload["started"] = 0.0
+    return verdict
+
+
+def _free_vram_now() -> "int | None":
+    """Free VRAM in MiB, read NOW rather than from the 30 s sample.
+
+    The sample exists so a per-second tick does not shell out; a reclaim is the
+    opposite case — the card changed a moment ago, and the cached reading would
+    measure the change as zero.
+    """
+    pool = _vram_pool_mb()
+    return pool[0] if pool else None
+
+
+# How long a reclaim waits for the DRIVER to show the memory an unload released.
+# Ollama answers the unload before the card is updated, so a reading taken
+# straight afterwards still shows the model's memory held — measured live: 2 218
+# MB free immediately after an 8.2 GB unload, 10 417 MB a moment later. Without
+# the wait the reclaim reports "0 MB came back" for a reclaim that freed 8 GB,
+# and the speech model gives way for a reason that is not true any more.
+_RECLAIM_SETTLE_SECONDS = 3.0
+_RECLAIM_POLL_SECONDS = 0.2
+
+
+def _await_vram_gain(before: "int | None",
+                     timeout: float = _RECLAIM_SETTLE_SECONDS) -> "int | None":
+    """Free VRAM after an unload, waiting (bounded) for the gain to appear.
+
+    Returns the last reading taken. A card that never shows the gain within the
+    budget is returned as it is, because the alternative is claiming memory the
+    driver does not have. With no `before` reading there is nothing to compare
+    against, so the first reading is the answer rather than a guess.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    free = _free_vram_now()
+    while (before is not None and free is not None and free <= before
+           and time.monotonic() < deadline):
+        time.sleep(_RECLAIM_POLL_SECONDS)
+        free = _free_vram_now()
+    return free
+
+
+def _reclaim_gpu_for_speech(reason: str = "") -> dict:
+    """Ask the LLM to hand the card back so the speech model can use it.
+
+    core/audio calls this (through the `gpu_reclaim` hook it is configured with)
+    when a speech load was refused for want of room. The LLM is usually the
+    tenant holding it, and the bubble can ask it to let go — but NOT
+    unconditionally: the same verdict the idle release weighs decides here,
+    because it answers the same question (is the memory worth the reload it
+    costs?). A reload that costs more per GB than `llm_release_wait_s_per_gb`
+    keeps the model, and then the speech model is the one that gives way.
+
+    Asking is not the same as succeeding, so the answer says which: the LLM
+    moved, kept its memory on purpose, or could not be asked at all.
+    """
+    before = _free_vram_now()
+    verdict = _release_llm()
+    model = verdict["model"]
+    if not verdict["unloaded"]:
+        if verdict["release"]:
+            detail = (f"ollama did not answer, so the card could not be asked "
+                      f"back ({verdict['note']})")
+        else:
+            detail = f"the LLM did not give the card back — {verdict['note']}"
+        return {"gave_way": False, "freed_mb": None, "detail": detail}
+    # The card changed a moment ago: drop the cached reading so the pressure
+    # decision, the release window and the doctor see the new one.
+    _vram_sample["at"] = 0.0
+    after = _await_vram_gain(before)
+    freed = None if before is None or after is None else max(0, after - before)
+    if freed is None:
+        detail = (f"ollama dropped {model} for the speech model (the card could "
+                  f"not be re-read to measure what came back)")
+    elif not freed:
+        detail = (f"ollama dropped {model} for the speech model, but the card "
+                  f"had not shown the memory after "
+                  f"{_RECLAIM_SETTLE_SECONDS:.0f}s")
+    else:
+        detail = (f"ollama dropped {model} for the speech model — "
+                  f"{freed} MB came back")
+    log.info("speech model asked for the card: %s (the claim that led to it: "
+             "%s)", detail, reason or "not given")
+    return {"gave_way": True, "freed_mb": freed, "detail": detail}
+
+
+def _dropped_names(dropped: dict) -> str:
+    """What actually went back, named the way the journal says it."""
+    names = [label for key, label in (("tts", "the speech model"),
+                                      ("whisper", "whisper"))
+             if (dropped or {}).get(key)]
+    if not names:
+        return "nothing"
+    return names[0] if len(names) == 1 else " and ".join(names)
+
+
+def _free_the_card_for_the_llm(reason: str = "") -> dict:
+    """Ask this process's own models for the card, so a turn's LLM can load.
+
+    The mirror of `_reclaim_gpu_for_speech`. There the speech loader was refused
+    and asked the LLM to move; here the LLM is about to load and the tenant that
+    can move is the speech model — the cheap one to reload, and the one that
+    would otherwise make Ollama offload half the model to the CPU, where every
+    token costs a multiple of what it costs on the card.
+
+    The verdict (`core.audio.yield_to_llm_verdict`) is the same budget the two
+    loaders ask, with the roles swapped: the LLM claims, and this process's
+    memory is the entitlement that may have to yield. Every step before the
+    release is a way NOT to release — an explicit no from the setting, nothing
+    of ours on the card, a claim the card can already hold, a size nobody could
+    read, or memory that would not change the outcome — and each says which.
+
+    The release itself is the call the idle release already makes
+    (`_release_models`: non-blocking locks, so a generation or a load in flight
+    means "not now" rather than a torn model), and the gain is waited for and
+    measured exactly as the speech reclaim's is.
+    """
+    if not _setting_flag("speech_yields_to_llm", True):
+        return {"gave_way": False, "freed_mb": None,
+                "detail": ("speech_yields_to_llm is off — a turn never asks "
+                           "the speech model for the card")}
+    try:
+        held = int((_audio.gpu_footprint_mb() or {}).get("total_mb") or 0)
+    except Exception:
+        log.debug("gpu footprint probe failed while weighing a turn",
+                  exc_info=True)
+        return {"gave_way": False, "freed_mb": None,
+                "detail": ("what this process holds on the card could not be "
+                           "read, so nothing was asked for it")}
+    # The reading the decision rests on is taken NOW, not from the 30 s sample:
+    # the same number is then the baseline the gain is measured against, so the
+    # journal's "what came back" belongs to the arithmetic that asked.
+    free = _free_vram_now()
+    verdict = _audio.yield_to_llm_verdict(free, _llm_footprint_mb(), held_mb=held)
+    if not verdict["yield"]:
+        if verdict.get("tight"):
+            log.info("the turn needed the card and the models stayed — %s",
+                     verdict["note"])
+        else:
+            log.debug("turn card check: %s", verdict["note"])
+        return {"gave_way": False, "freed_mb": None, "detail": verdict["note"]}
+    # Only now is it worth asking Ollama what is loaded: a model that is already
+    # resident means this turn loads nothing and the voice must not be spent.
+    resident = _resident_llm()
+    if resident is not None and resident.get("loaded"):
+        detail = (f"the LLM is already on the card, so the turn will not load "
+                  f"it ({verdict['note']})")
+        log.info("the turn needed the card and the models stayed — %s", detail)
+        return {"gave_way": False, "freed_mb": None, "detail": detail}
+    if not _ANNOUNCE_LOCK.acquire(blocking=False):
+        detail = ("something is speaking, so the speech model was left alone "
+                  "(the next turn can ask)")
+        log.info("the turn needed the card and the models stayed — %s", detail)
+        return {"gave_way": False, "freed_mb": None, "detail": detail}
+    try:
+        dropped = _release_models()
+    finally:
+        _ANNOUNCE_LOCK.release()
+    if not (dropped["tts"] or dropped["whisper"]):
+        detail = ("a load or a generation is holding the models, so the turn "
+                  "left the card as it was")
+        log.info("the turn needed the card and the models stayed — %s", detail)
+        return {"gave_way": False, "freed_mb": None, "detail": detail}
+    # The card changed a moment ago: the cached reading, the pressure window and
+    # the doctor line all read the new one from here on.
+    _vram_sample["at"] = 0.0
+    after = _await_vram_gain(free)
+    freed = None if free is None or after is None else max(0, after - free)
+    what = _dropped_names(dropped)
+    if freed is None:
+        detail = (f"released {what} for the LLM (the card could not be re-read "
+                  f"to measure what came back)")
+    elif not freed:
+        detail = (f"released {what} for the LLM, but the card had not shown the "
+                  f"memory after {_RECLAIM_SETTLE_SECONDS:.0f}s")
+    else:
+        detail = (f"released {what} for the LLM — {freed} MB came back "
+                  f"(the voice reloads in seconds; {verdict['note']})")
+    log.info("the turn asked for the card: %s (what led to it: %s)", detail,
+             reason or "a turn that needs the LLM")
+    return {"gave_way": True, "freed_mb": freed, "detail": detail}
+
+
 def get_whisper():
+    _touch_gpu()
     _push_model("_whisper_model")
     return _adopt_model("_whisper_model", _audio.get_whisper())
 
@@ -1896,6 +2762,7 @@ def get_whisper():
 def get_tts():
     # Keep old H.get_tts monkeypatches effective without coupling core.audio
     # back to this module (same seam shape as get_whisper above).
+    _touch_gpu()
     _push_model("_tts_model")
     return _adopt_model("_tts_model", _audio.get_tts())
 
@@ -1912,6 +2779,7 @@ def warm_tts() -> int:
 
 
 def transcribe(audio_int16: np.ndarray) -> str:
+    _touch_gpu()
     # Keep old H.get_whisper monkeypatches effective without coupling core.audio
     # back to this module. The model itself is published through `get_whisper`
     # (core.audio calls it via model_getter), so only the cpu-fallback flag is
@@ -1926,6 +2794,7 @@ def transcribe(audio_int16: np.ndarray) -> str:
 
 
 def tts_to_wav(text: str, wav_path: Path) -> None:
+    _touch_gpu()
     return _audio.tts_to_wav(text, wav_path, voice_getter=get_tts)
 
 
@@ -2337,13 +3206,46 @@ def ollama_available() -> bool:
 
 
 def ollama_chat(messages: list[dict], tools: list[dict] | None = None) -> dict:
-    return _brain.ollama_chat(messages, tools, **_brain_deps())
+    _touch_gpu()
+    try:
+        return _brain.ollama_chat(messages, tools, **_brain_deps())
+    finally:
+        # A non-streaming call cannot price a reload: see `_disarm_llm_reload_probe`.
+        _disarm_llm_reload_probe()
 
 
 def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                        cancel: threading.Event | None = None,
                        tools: list[dict] | None = None) -> dict:
+    _touch_gpu()
+    # This is the turn the user is waiting for, so it is the one allowed to ask
+    # the speech model for the card (the mirror of the speech loader asking the
+    # LLM). Before arming the reload probe, because what the probe times is the
+    # LLM's load — and making room for it is preparation, not part of it. A
+    # background call (`ollama_chat`, memory extraction) does not ask: evicting
+    # the voice to help work nobody is waiting for is not a trade worth making.
+    try:
+        _free_the_card_for_the_llm()
+    except Exception:
+        log.exception("asking the speech model for the card failed")
+    _arm_llm_reload_probe()
     return _brain.ollama_chat_stream(messages, q, cancel, tools, **_brain_deps())
+
+
+class _SentenceQueue(queue.Queue):
+    """The streaming reply queue, which also reports time-to-first-sentence.
+
+    The first sentence after an idle release is the moment the reload is over:
+    model read back into memory, prompt re-prefilled, first words generated.
+    Everything after it is generation the user is already hearing, which is why
+    the probe listens here instead of timing the whole call — a long answer must
+    not be mistaken for a slow reload and talk the policy into keeping memory.
+    """
+
+    def put(self, item, *args, **kwargs):
+        if item is not None:            # None is the end-of-stream terminator
+            _finish_llm_reload_probe()
+        return super().put(item, *args, **kwargs)
 
 
 # ------------------------------------------------------------------------ audio in
@@ -3437,6 +4339,10 @@ class ContinuousListener:
             self._assistant._hardware_tick()              # live hardware watch (opt-in)
         except Exception:
             log.exception("hardware watch check failed")
+        try:
+            self._assistant._idle_release_tick()          # give idle memory back
+        except Exception:
+            log.exception("idle model release check failed")
 
         now = time.monotonic()
         with self._lock:
@@ -3796,13 +4702,21 @@ class Assistant(QObject):
     sigCommand = Signal(str)          # control-socket commands → main thread
     # Class-level so it exists on an instance built with __new__ (tests do this)
     # as well as a normally constructed one; one Assistant per process anyway.
-    _gen_lock = threading.Lock()      # makes the generation increment atomic
+    # It no longer guards the increment — core.lifecycle owns the counter and
+    # the lock that makes a claim atomic — it guards the ONE-TIME creation of
+    # the counter object below, which has to be a single shared object before
+    # any increment can be atomic in the first place.
+    _gen_lock = threading.Lock()
 
     def __init__(self) -> None:
         super().__init__()
         self._lifecycle_ensure()
         self._state = IDLE
-        self._gen = 0                     # increments per interaction; stale
+        # core.lifecycle owns the turn counter: this object is the ONE home of
+        # `_gen` (read through the property below), and `_bump_gen` is the only
+        # way to advance it. The generation keys the transcript cache and the
+        # staleness checks, so a second copy of the number would drift.
+        self._gen_counter = _core_lifecycle.GenerationCounter()
         self._cancel = threading.Event()  # workers check their own event
         self._recorder: Recorder | None = None
         self._ptt_lock = threading.RLock()  # guards PTT epoch + staleness+submit
@@ -4020,20 +4934,57 @@ class Assistant(QObject):
 
     # -- mic self-heal -------------------------------------------------------
 
+    def _gen_counter_get(self):
+        """The turn counter, created once for constructed and __new__ objects.
+
+        `__init__` makes it, so this is the lazy path for instances built with
+        `__new__` (tests do this and assign `_gen` directly). Double-checked
+        under `_gen_lock`: two threads that each built their own counter would
+        be two counters, and two counters hand out the same generation — the
+        exact defect the atomic claim exists to prevent.
+        """
+        counter = self.__dict__.get("_gen_counter")
+        if counter is None:
+            with self._gen_lock:
+                counter = self.__dict__.get("_gen_counter")
+                if counter is None:
+                    counter = _core_lifecycle.GenerationCounter()
+                    self.__dict__["_gen_counter"] = counter
+        return counter
+
+    @property
+    def _gen(self) -> int:
+        """The current turn generation — core.lifecycle's counter, not a copy.
+
+        `gen != self._gen` is the staleness test and `_gen` keys the transcript
+        cache, so every reader has to see the same number the claim wrote. A
+        stored attribute is how the two would drift; this reads the counter.
+        """
+        counter = self.__dict__.get("_gen_counter")
+        return counter.value if counter is not None else 0
+
+    @_gen.setter
+    def _gen(self, value: int) -> None:
+        self._gen_counter_get().value = value
+
     def _bump_gen(self) -> "tuple[int, threading.Event]":
         """Atomically claim the next turn generation and a fresh cancel event.
 
-        `self._gen += 1` followed by `gen = self._gen` is two steps, and the
-        callers live on different threads (Qt input, the listener, PTT, the
-        reminder worker, the health tick). Interleaved, two turns can be
-        claimed with the SAME generation — which is exactly the value the
+        Callers live on different threads (Qt input, the listener, PTT, the
+        reminder worker, the health tick), and the generation is what the
         staleness checks (`gen != self._gen`) and the gen-keyed transcript
-        cache trust, so one utterance can be answered with another's text.
-        One lock, one writer: every increment goes through here.
+        cache trust — so two turns claiming the SAME value is how one
+        utterance gets answered with another's text.
+
+        The claim itself is `core.lifecycle.GenerationCounter.claim()`, whose
+        increment is the single one in the program: the module's lock is held
+        across the increment AND the construction of the fresh events, so an
+        embedder that drives the same counter through the module cannot race
+        this method either. What is left here is the per-instance counter and
+        the `(generation, cancel)` shape the callers are written against.
         """
-        with self._gen_lock:
-            self._gen += 1
-            return self._gen, threading.Event()
+        turn = self._gen_counter_get().claim()
+        return turn.generation, turn.cancel
 
     def _say_now(self, text: str) -> None:
         """Standalone announcement: speak text outside any turn pipeline."""
@@ -4237,6 +5188,72 @@ class Assistant(QObject):
                         kind, value, limits[kind])
             self._announce_now(
                 f"Warning: {labels[kind]} is at {value:.0f} percent.")
+
+    def _idle_release_tick(self) -> None:
+        """Hand the models' memory back after a quiet spell.
+
+        The bubble holds ~3 GB of GPU memory for the speech model and asks
+        Ollama to keep the LLM for an hour after every turn, so a card that is
+        already full keeps both long after the last word — which is how a
+        desktop's own buffers end up failing to allocate (the sample that
+        prompted this held 15.2 of 16.4 GB, ~1 GB of it free). After
+        `idle_release_seconds` with nothing happening, both go back and the
+        next utterance or turn loads them again.
+
+        Nothing is released while the bubble could still be about to speak or
+        think: a state other than idle, a queued turn, a recording in flight or
+        a speech actually playing all postpone it to the next tick. The release
+        itself is non-blocking (core.audio takes its locks without waiting), so
+        the worst case is "not now".
+
+        The two halves are not the same bargain and are not treated the same:
+        the speech model costs a few seconds to reload, so it always goes back,
+        while the LLM's reload can be minutes and is weighed against the memory
+        it would free (`_release_llm`). Both outcomes are logged with the
+        numbers the decision used, because a release that stays quiet about
+        keeping a model is indistinguishable from one that failed.
+
+        Pressure shortens WHEN, not WHAT: a card below
+        `vram_pressure_floor_mb` uses the shorter window
+        (`_idle_release_window`), but the LLM is still released only if the
+        verdict says the memory is worth the reload, and a turn in flight still
+        postpones the whole thing.
+        """
+        global _gpu_last_use, _gpu_released
+        pressure = _idle_release_window()
+        window = pressure["window_s"]
+        if window <= 0.0 or _gpu_released:
+            return
+        if _tick_now() - _gpu_last_use < window:
+            return
+        if self.state != IDLE or getattr(self, "_recorder", None) is not None:
+            return
+        queued = getattr(self, "_pipeline_q", None)
+        if queued is not None and not queued.empty():
+            return
+        if not _ANNOUNCE_LOCK.acquire(blocking=False):
+            return                       # something is playing; try again later
+        try:
+            dropped = _release_models()
+            verdict = _release_llm()
+        finally:
+            _ANNOUNCE_LOCK.release()
+        # One release per quiet spell, not one per tick: without this the tick
+        # would re-send the unload every second for as long as the bubble sat
+        # idle, which is a request per second to say nothing changed. A model
+        # the verdict KEEPS is also a decision this spell has made — it is not
+        # re-argued every tick, and the next turn re-arms the whole question.
+        _gpu_last_use = _tick_now()
+        _gpu_released = True
+        outcome = ("unloaded" if verdict["unloaded"]
+                   else "unload failed" if verdict["release"] else "kept")
+        # The window is reported with what it was: a release 20x earlier than
+        # the configured one reads as a bug unless the line says the card was
+        # nearly full when it fired.
+        log.info("idle %.0fs%s: released %s, llm %s — %s",
+                 window,
+                 f" (early — {pressure['reason']})" if pressure["under"] else "",
+                 dropped, outcome, verdict["note"])
 
     def _world_tick(self) -> None:
         """Proactive severe-world-event warnings; mirrors _resource_tick.
@@ -4701,20 +5718,8 @@ class Assistant(QObject):
             log.error("startup: %s", e)
         if errors:
             notify("handsoff: " + " | ".join(errors))
-        # warm the LLM now (after whisper/tts, which load first). This is
-        # MORE than a VRAM load: it sends the REAL system prompt + tool
-        # schemas (+ history) so Ollama's KV cache holds the exact prefix a
-        # real turn uses — the first question then only evaluates its own
-        # few tokens (~0.4 s) instead of the full ~7 s prefill.
-        try:
-            t0 = time.time()
-            warm_msgs = ([{"role": "system", "content": SYSTEM_PROMPT}]
-                         + list(self._history)
-                         + [{"role": "user", "content": "hi"}])
-            ollama_chat(warm_msgs, TOOLS)
-            log.info("LLM warmed in %.1fs (prompt prefix cached)", time.time() - t0)
-        except Exception:
-            log.exception("LLM warmup failed (will load on first question)")
+        # warm the LLM now (after whisper/tts, which load first).
+        self._warm_llm()
         try:
             note = json.loads(PENDING_FILE.read_text()).get("note", "")
             PENDING_FILE.unlink(missing_ok=True)
@@ -4725,6 +5730,32 @@ class Assistant(QObject):
             log.info("speaking pending restart note")
             self._speak(note, self._gen, self._cancel)
             self._set(self._gen, IDLE)
+
+    def _warm_llm(self) -> None:
+        """Load the model with the REAL prefix, then remember what it cost.
+
+        The warm call is MORE than a VRAM load: it sends the system prompt, the
+        tool schemas and the history so Ollama's KV cache holds the exact prefix
+        a real turn uses — the first question then only evaluates its own few
+        tokens (~0.4 s) instead of the full ~7 s prefill.
+
+        Its duration is also the first MEASUREMENT of what this model costs to
+        load, which the idle release weighs its decision on: the policy that
+        keeps a big model resident rests on a number this machine produced, not
+        on a size in bytes. A warm that fails records nothing rather than a
+        garbage duration — an unmeasured reload releases, and should.
+        """
+        try:
+            t0 = time.time()
+            warm_msgs = ([{"role": "system", "content": SYSTEM_PROMPT}]
+                         + list(self._history)
+                         + [{"role": "user", "content": "hi"}])
+            ollama_chat(warm_msgs, TOOLS)
+            elapsed = time.time() - t0
+            _note_llm_load(OLLAMA_MODEL, elapsed)
+            log.info("LLM warmed in %.1fs (prompt prefix cached)", elapsed)
+        except Exception:
+            log.exception("LLM warmup failed (will load on first question)")
 
     # -- state ------------------------------------------------------------------
 
@@ -5812,7 +6843,7 @@ class Assistant(QObject):
             if stream_enabled:
                 # speak sentences while the model is still generating; tool
                 # calls still collected from the stream so the loop keeps working
-                turn = _brain.TurnStream(gen, cancel, queue.Queue())
+                turn = _brain.TurnStream(gen, cancel, _SentenceQueue())
 
                 def _run_stream() -> None:
                     try:

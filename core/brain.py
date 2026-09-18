@@ -141,6 +141,225 @@ def ollama_available(*, base: str, guard: Callable[[], None],
         return False
 
 
+def ollama_unload(*, base: str, model: str, guard: Callable[[], None],
+                  logger: logging.Logger,
+                  urlopen: Callable = urllib.request.urlopen,
+                  timeout: float = 10.0) -> bool:
+    """Ask Ollama to drop `model` from memory now, and say whether it answered.
+
+    `keep_alive: 0` on a generate call is the documented unload, and using it
+    here rather than a second API deliberately reuses the ONE field the chat
+    path already sets: every turn asks for a long keep-alive, so the thing that
+    takes it back is the same knob instead of a separate call that can drift
+    from it. Unloading a model that is not loaded is not an error (Ollama
+    answers 200 with `done_reason: unload`), which is what makes this safe to
+    send on a timer without checking first.
+
+    A failure is reported, never raised: the caller is an idle tick, and a
+    stopped Ollama, a wrong host or an unreachable port all mean the same
+    thing — no process is holding that memory to give back.
+    """
+    guard()
+    payload = {"model": model, "keep_alive": 0}
+    req = urllib.request.Request(
+        base + "/api/generate", data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            response.read()
+        return True
+    except Exception as exc:
+        logger.debug("ollama unload of %s skipped (%s): %s",
+                     model, type(exc).__name__, exc)
+        return False
+
+
+#: Below this many bytes, a `size`/`size_vram` report is not a model at all.
+#: Guards the unit: a server that answered in MB instead of bytes would read as
+#: a 0.006 GB model, and the policy would skip a release it should make for a
+#: reason that is really a parsing accident.
+_MIN_PLAUSIBLE_BYTES = 1_000_000
+
+
+def _gib(value) -> float | None:
+    """A byte count as GiB: 0.0 for a reported zero, None for anything else.
+
+    The two are kept apart because they mean different things downstream: zero
+    VRAM is a model that is genuinely all on the CPU, while an unreadable size
+    is missing telemetry — and the release decision says so differently.
+    """
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0:
+        return 0.0
+    if size < _MIN_PLAUSIBLE_BYTES:
+        return None                 # not a model size: some other unit
+    return size / float(1024 ** 3)
+
+
+def ollama_resident(*, base: str, model: str, guard: Callable[[], None],
+                    logger: logging.Logger,
+                    urlopen: Callable = urllib.request.urlopen,
+                    timeout: float = 3.0) -> dict | None:
+    """What Ollama has loaded, and how much of it is actually on the card.
+
+    `/api/ps` is the only endpoint that reports the SPLIT. A model larger than
+    the GPU is served partly from system memory, and `size_vram` is then the
+    fraction that really occupies the card — which is the number an idle release
+    has to weigh, since a split model costs a full reload of its whole self to
+    hand back that fraction.
+
+    Returns None when the answer is UNKNOWN (unreachable, malformed, no
+    models list) — deliberately distinct from `{"loaded": False}`, because the
+    two lead to different decisions and only one of them is a measurement.
+    """
+    guard()
+    req = urllib.request.Request(base + "/api/ps")
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        logger.debug("ollama /api/ps probe failed (%s): %s",
+                     type(exc).__name__, exc)
+        return None
+    entries = body.get("models") if isinstance(body, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        names = {str(entry.get(key) or "") for key in ("name", "model")}
+        if model in names:
+            return {"loaded": True,
+                    "size": _gib(entry.get("size")),
+                    "size_vram": _gib(entry.get("size_vram")),
+                    "expires_at": str(entry.get("expires_at") or "")}
+    return {"loaded": False, "size": None, "size_vram": None,
+            "expires_at": ""}
+
+
+def ollama_model_size_mb(*, base: str, model: str, guard: Callable[[], None],
+                         logger: logging.Logger,
+                         urlopen: Callable = urllib.request.urlopen,
+                         timeout: float = 3.0) -> int | None:
+    """How much card the configured model needs, as Ollama reports it (MiB).
+
+    `/api/ps` can only price a model that is LOADED, and the question this
+    answers is asked before a turn loads one: `/api/tags` lists every model with
+    its blob size, which is what a full offload of it costs the card. A reader
+    who needs the split (how much is on the card right now) wants
+    `ollama_resident` instead; this is the footprint, not the residency.
+
+    None means "unknown" — an unreachable server, a malformed body, or a model
+    the server does not list — and never zero, because zero would read as "fits
+    anywhere" to the arithmetic that consumes it. Sizes round UP: the point of
+    the number is deciding whether a claim fits, and under-claiming the card's
+    cost is the direction that asks another tenant to move for nothing.
+    """
+    guard()
+    req = urllib.request.Request(base + "/api/tags")
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        logger.debug("ollama /api/tags probe failed (%s): %s",
+                     type(exc).__name__, exc)
+        return None
+    entries = body.get("models") if isinstance(body, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        # The same name field and the same exact match `ollama_resident` uses,
+        # so the two readers cannot disagree about which entry is the model.
+        names = {str(entry.get(key) or "") for key in ("name", "model")}
+        if model not in names:
+            continue
+        try:
+            size = int(entry.get("size"))
+        except (TypeError, ValueError):
+            return None
+        if size < _MIN_PLAUSIBLE_BYTES:
+            return None             # not a model size: some other unit
+        return -(-size // (1024 * 1024))
+    return None
+
+
+def ollama_release_verdict(resident: dict | None, *, reload_s, wait_s_per_gb,
+                           model: str = "") -> dict:
+    """Should an idle release hand this model's memory back? With the reason.
+
+    The release is not free: the next question pays the model's whole load
+    again, and the prompt-prefix cache with it. Measured on the machine this was
+    written for, an 18 GB model that Ollama had split across CPU and GPU took
+    218.9 s to come back while holding 9.7 GB of the card — 22.6 s of next-turn
+    wait for every GB handed back. A model that fits in VRAM loads in seconds,
+    so the same rule keeps releasing that one. Weighing the two quantities the
+    machine actually reports (`size_vram`, and the reload the host measured)
+    is what makes this a decision about THIS model rather than a policy about
+    memory in general.
+
+    Pure on purpose: every branch is reachable by feeding it a dict, so the
+    truth table is a test rather than a description. `note` is the reason, in
+    the words both the journal and the doctor print, and it always names the
+    numbers the decision used.
+    """
+    # No budget (0, junk, absent) means "do not weigh the cost at all": the
+    # exchange rate is the user's to set, and a value nobody can read must not
+    # become a reason to hold memory the machine may need. The default lives in
+    # the settings table, so there is one place it is written down.
+    try:
+        budget = max(0.0, float(wait_s_per_gb))
+    except (TypeError, ValueError):
+        budget = 0.0
+
+    def verdict(release: bool, note: str, freed_gb=None, per_gb=None) -> dict:
+        return {"release": bool(release), "note": note, "model": model,
+                "freed_gb": freed_gb, "wait_per_gb": per_gb, "budget": budget}
+
+    if resident is None:
+        return verdict(True, "Ollama did not answer /api/ps, so the resident "
+                             "state is unknown — releasing, as before")
+    if not resident.get("loaded"):
+        return verdict(False, "nothing resident in VRAM to give back")
+    freed_gb = resident.get("size_vram")
+    if freed_gb is None:
+        return verdict(False, "the /api/ps entry carries no usable size_vram, "
+                              "so what the unload would actually free is "
+                              "unknown")
+    if not freed_gb:
+        return verdict(False, "resident on CPU only; unloading would free no "
+                              "GPU memory")
+    if reload_s is None:
+        return verdict(True, f"{freed_gb:.1f} GB to give back, but the reload "
+                              "is not measured yet — nothing to weigh it "
+                              "against", freed_gb=freed_gb)
+    try:
+        cost = float(reload_s)
+    except (TypeError, ValueError):
+        cost = 0.0
+    if cost <= 0.0:
+        cost = 0.0
+    per_gb = cost / freed_gb
+    if budget <= 0.0:
+        return verdict(True, f"cost is not weighed "
+                              f"(llm_release_wait_s_per_gb 0) — releasing "
+                              f"{freed_gb:.1f} GB", freed_gb=freed_gb,
+                       per_gb=per_gb)
+    if per_gb <= budget:
+        return verdict(True, f"{freed_gb:.1f} GB back for a measured "
+                              f"{cost:.0f} s reload ({per_gb:.1f} s/GB ≤ "
+                              f"{budget:.0f})", freed_gb=freed_gb,
+                       per_gb=per_gb)
+    return verdict(False, f"{freed_gb:.1f} GB back would cost a measured "
+                          f"{cost:.0f} s reload ({per_gb:.1f} s/GB > "
+                          f"{budget:.0f}); raise llm_release_wait_s_per_gb to "
+                          f"release anyway", freed_gb=freed_gb, per_gb=per_gb)
+
+
 def ollama_chat(messages: list[dict], tools: list[dict] | None = None, *,
                 base: str, model: str, num_ctx: int,
                 guard: Callable[[], None], logger: logging.Logger,

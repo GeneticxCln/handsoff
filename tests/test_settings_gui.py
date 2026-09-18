@@ -503,6 +503,12 @@ def bubble_designs_render_at_energy_extremes():
 
     widget = appearance.BubbleWidget(_Stub())
     widget.resize(appearance.WINDOW_PX, appearance.WINDOW_PX)
+    # Stop the 16 ms timer: grab() drains the event queue, so an active timer
+    # runs _on_tick between two grabs and the measured difference stops being
+    # the knob under test. The tick's own behaviour is pinned frame by frame in
+    # tests/test_bubble_anim.py, and its DRIVER in
+    # the_widget_animates_from_its_own_timer below.
+    widget._anim.stop()
     from PySide6.QtGui import QImage
 
     def _pixels():
@@ -631,6 +637,39 @@ def bubble_designs_render_at_energy_extremes():
     assert energies == sorted(energies), "more energy must never dim the glow"
     assert all(0.0 <= e <= 1.0 for e in energies), "glow energy must stay bounded"
     appearance.ANIM_ENERGY = 1.0
+
+
+@scenario
+def the_widget_animates_from_its_own_timer():
+    # The tick has exactly one driver: the 16 ms QTimer started in __init__.
+    # Every behaviour test of the smoothing calls _on_tick() itself, and those
+    # would keep passing if the timer were never started or were connected to
+    # nothing — the bubble would simply stop moving, and only a person looking
+    # at the desktop would find out. So the frame is waited for here, through
+    # the event loop, the way the real widget gets it.
+    class _Signal:
+        def connect(self, *_a, **_k):
+            return None
+
+    class _Stub:
+        sigState = _Signal()
+        sigLevel = _Signal()
+
+    widget = appearance.BubbleWidget(_Stub())
+    assert widget._anim.isActive(), "the animation timer was never started"
+    assert widget._anim.interval() == 16, widget._anim.interval()
+
+    # _radius_ui stays None until a frame seeds it, so it is the frame counter
+    # nobody had to add to the widget to observe.
+    assert widget._radius_ui is None
+    deadline = time.time() + 2.0
+    while time.time() < deadline and widget._radius_ui is None:
+        app.processEvents()
+        time.sleep(0.005)
+    assert widget._radius_ui is not None, (
+        "two seconds with the timer running and not one frame arrived: the "
+        "timer does not drive _on_tick")
+    widget._anim.stop()
 
 
 @scenario
@@ -4725,6 +4764,7 @@ SCENARIO_NAMES = [
     "loading_the_form_is_still_not_an_edit",
     "wallpaper_tuning_buttons_retune_palette",
     "bubble_designs_render_at_energy_extremes",
+    "the_widget_animates_from_its_own_timer",
     "sauron_eye_reacts_to_voice_level",
     "every_design_reacts_to_voice_level",
     "every_design_shows_the_state_colour",

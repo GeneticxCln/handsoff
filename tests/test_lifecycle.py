@@ -96,6 +96,76 @@ class TestCoreLifecycle:
         assert ts2.generation == 2
         assert counter["gen"] == 2
 
+    def test_new_counter_makes_the_container_next_turn_advances(self):
+        """The container shape is the module's contract, not the caller's.
+
+        `next_turn` advances the `"gen"` key, so a hand-rolled
+        `{"generation": n}` would be handed generation 0 for every turn.
+        """
+        import core.lifecycle as lifecycle
+
+        box = lifecycle.new_counter()
+        assert box == {"gen": 0}
+        assert lifecycle.next_turn(box).generation == 1
+        assert box["gen"] == 1
+        assert lifecycle.new_counter(41)["gen"] == 41
+        assert lifecycle.new_counter() is not box, "counters must not be shared"
+
+    def test_generation_counter_claims_and_exposes_its_value(self):
+        """One counter per turn stream: claim advances it, value reads it."""
+        import core.lifecycle as lifecycle
+
+        counter = lifecycle.GenerationCounter(7)
+        assert counter.value == 7
+
+        first = counter.claim()
+        assert first.generation == 8 and counter.value == 8
+        assert isinstance(first.cancel, threading.Event)
+        assert not first.cancel.is_set() and not first.done.is_set()
+
+        second = counter.claim()
+        assert second.generation == 9
+        assert second.cancel is not first.cancel, "fresh events per claim"
+        assert second.done is not first.done
+
+        counter.value = 30
+        assert counter.claim().generation == 31
+
+    def test_generation_counters_are_not_shared_between_instances(self):
+        """Two streams must not advance one number."""
+        import core.lifecycle as lifecycle
+
+        a = lifecycle.GenerationCounter()
+        b = lifecycle.GenerationCounter()
+        a.claim()
+        assert a.value == 1
+        assert b.value == 0, "a second counter has to start where it was made"
+
+    def test_concurrent_claims_on_one_counter_are_all_distinct(self):
+        """The claim is what the bubble calls from five kinds of thread."""
+        import core.lifecycle as lifecycle
+
+        counter = lifecycle.GenerationCounter()
+        seen: list = []
+        guard = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def _claim() -> None:
+            barrier.wait(timeout=5)
+            gen = counter.claim().generation
+            with guard:
+                seen.append(gen)
+
+        threads = [threading.Thread(target=_claim) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(seen) == 8, "a claimant never returned"
+        assert sorted(seen) == list(range(1, 9)), (
+            f"generations were handed out twice or skipped: {sorted(seen)}")
+
 
 class _YieldingList(list):
     """A list whose item access releases the GIL.
@@ -801,8 +871,14 @@ class TestControlSocket:
         assert len(seen) == 8 * 150
         assert len(set(seen)) == len(seen), "two turns claimed the same generation"
 
-    def test_bump_gen_holds_its_lock_across_the_claim(self, H):
+    def test_bump_gen_holds_the_counter_lock_across_the_claim(self, H,
+                                                             monkeypatch):
         """Deterministic proof that the claim happens under the lock.
+
+        The counter lives in core.lifecycle, so the lock that makes a claim
+        atomic is the MODULE's and the probe points at it: a claim that ran
+        outside it would hand out a duplicate generation no matter which
+        thread called which entry point.
 
         The reproducible failure was the WIDE shape: `self._gen += 1`, then
         `self._cancel = threading.Event()`, then `gen = self._gen`. Building
@@ -812,12 +888,13 @@ class TestControlSocket:
         did NOT reproduce under the GIL — which is exactly why a stress test
         is too weak to pin this and why the lock is asserted directly.
         """
+        import core.lifecycle as lifecycle
         from PySide6.QtCore import QCoreApplication
         app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
         asst = H.Assistant()
         claimed: dict = {}
         reached = threading.Event()  # set when the claimer is inside __enter__
-        real_lock = asst._gen_lock
+        real_lock = lifecycle._COUNTER_LOCK
 
         class Probe:
             """Delegates to the real lock, announcing the attempt first.
@@ -841,7 +918,7 @@ class TestControlSocket:
             def release(self):
                 return real_lock.release()
 
-        asst._gen_lock = Probe()
+        monkeypatch.setattr(lifecycle, "_COUNTER_LOCK", Probe())
 
         def _claim() -> None:
             claimed["gen"] = asst._bump_gen()[0]
@@ -852,21 +929,114 @@ class TestControlSocket:
             t = threading.Thread(target=_claim)
             t.start()
             assert reached.wait(2.0), "the claimer never reached the lock"
-            assert "gen" not in claimed, "_bump_gen claimed without its lock"
+            assert "gen" not in claimed, "the claim ignored the counter lock"
         finally:
             real_lock.release()
         t.join(2.0)
         assert claimed.get("gen") == before + 1
 
-    def test_generation_is_only_bumped_inside_the_locked_helper(self):
-        """Source guard: a new call site must use _bump_gen, not `+= 1`. """
-        src = (HERE / "handsoff.py").read_text(encoding="utf-8")
-        raw = [i for i, line in enumerate(src.splitlines())
-               if line.strip() == "self._gen += 1"]
-        assert len(raw) == 1, (
-            f"{len(raw)} raw generation increments bypass _bump_gen's lock")
-        helper_start = src[:src.index("def _bump_gen")].count("\n")
-        assert raw[0] > helper_start, "the increment must live inside _bump_gen"
+    def test_bump_gen_claims_through_the_module(self, H, monkeypatch):
+        """The claim has to go through core.lifecycle, not around it.
+
+        A parallel increment left inside the host would keep every
+        number-only test green while creating a second writer the module's
+        lock does not cover — which is the whole defect. The spy is on the
+        module's own method, so only a real delegation satisfies it.
+        """
+        import core.lifecycle as lifecycle
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+        asst = H.Assistant()
+        claims: list = []
+        real = lifecycle.GenerationCounter.claim
+
+        def spy(self):
+            state = real(self)
+            claims.append(state.generation)
+            return state
+
+        monkeypatch.setattr(lifecycle.GenerationCounter, "claim", spy)
+        before = asst._gen
+        gen, cancel = asst._bump_gen()
+
+        assert claims == [before + 1], (
+            "_bump_gen did not advance the module's counter")
+        assert gen == before + 1 and asst._gen == gen
+        assert isinstance(cancel, threading.Event)
+        assert not cancel.is_set(), "a claimed cancel event must start clear"
+
+    def test_gen_is_a_view_of_the_counter_not_a_copy(self, H):
+        """`_gen` has to read the counter, and write back to it.
+
+        The twenty-odd readers (`gen != self._gen`, the gen-keyed transcript
+        cache) and the tests that plant a generation (`a._gen = 5`) both go
+        through the property. A stored attribute beside the counter would let
+        them disagree, which is how a stale turn reads a fresh number.
+        """
+        from PySide6.QtCore import QCoreApplication
+        app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
+        asst = H.Assistant()
+
+        asst._gen = 5
+        assert asst._gen == 5 and asst._gen_counter_get().value == 5
+
+        state = asst._gen_counter_get().claim()
+        assert state.generation == 6
+        assert asst._gen == 6, "a claim has to be visible through _gen"
+
+    def test_a___new___instance_gets_exactly_one_counter(self, H):
+        """Instances built with __new__ must not end up with two counters.
+
+        `__new__` skips `__init__` (tests do this), so the counter is created
+        lazily — and two threads each creating their own would be two counters
+        handing out the same generation, the defect the atomic claim exists to
+        prevent. Double-checked creation under `_gen_lock` is the guard.
+        """
+        asst = H.Assistant.__new__(H.Assistant)
+        assert asst._gen == 0, "a fresh instance starts at generation 0"
+
+        seen: list = []
+        guard = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def _ask() -> None:
+            barrier.wait(timeout=5)
+            counter = asst._gen_counter_get()
+            with guard:
+                seen.append(counter)
+
+        threads = [threading.Thread(target=_ask) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(seen) == 8, "a counter claimant never returned"
+        assert len({id(c) for c in seen}) == 1, "two counters for one instance"
+        asst._gen = 3
+        assert seen[0].value == 3, "_gen must write the one counter in place"
+
+    def test_generation_is_only_bumped_inside_the_module(self):
+        """Source guard: the host must not advance the counter by hand.
+
+        `_gen` is a property and `_bump_gen` delegates, so there is no legal
+        `self._gen += 1` left in handsoff.py — and a new call site that adds
+        one bypasses the module's lock exactly like the pre-fix code did.
+        """
+        host = (HERE / "handsoff.py").read_text(encoding="utf-8")
+        raw = [i + 1 for i, line in enumerate(host.splitlines())
+               if line.strip() in ("self._gen += 1",
+                                   "self._gen_counter.value += 1",
+                                   'self._gen_counter._box["gen"] += 1')]
+        assert not raw, (
+            f"raw generation increments at handsoff.py:{raw} bypass "
+            f"core.lifecycle's lock")
+        assert ".claim()" in host, (
+            "_bump_gen has to claim through the module's counter")
+
+        core = (HERE / "core" / "lifecycle.py").read_text(encoding="utf-8")
+        assert 'counter["gen"] = counter.get("gen", 0) + 1' in core, (
+            "core/lifecycle.next_turn is the home of the only increment")
 
     def test_clear_history_roundtrip_empties_memory_and_disk(self, H, tmp_path, monkeypatch):
         """A model switch in Settings must clear the RUNNING bubble.
@@ -999,29 +1169,6 @@ class TestSharedVoiceLevel:
         a._emit_level(0.33, "ptt")
         snap = a.level_snapshot()
         assert snap["ui"] == 0.33 and snap["source"] == "ptt"
-
-    def test_the_playback_hook_is_a_tagged_publisher(self, H):
-        # core.audio calls whatever Assistant.__init__ registered, and that
-        # callable is now the tagged publisher — which is what lets the meter
-        # say "the bubble's own voice" instead of showing a bare number while
-        # the mic is deliberately blanked.
-        from PySide6.QtCore import QCoreApplication
-        app = QCoreApplication.instance() or QCoreApplication([])  # noqa: F841
-        mod = getattr(H, "_audio", None)
-        if not hasattr(mod, "_level_hook_lock"):
-            pytest.skip("core.audio is a stub in this environment")
-        a = H.Assistant()
-        try:
-            with mod._level_hook_lock:
-                hook = mod._level_hook
-            assert hook is not None, "playback must feed the visual level"
-            hook(0.37)
-            snap = a.level_snapshot()
-            assert snap["raw"] == 0.37 and snap["source"] == "tts", snap
-        finally:
-            with mod._level_hook_lock:
-                mod._level_hook = None
-            a.shutdown()
 
     def test_the_playback_hook_is_a_tagged_publisher(self, H):
         # core.audio calls whatever Assistant.__init__ registered, and that

@@ -182,9 +182,15 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
         return one
     parts = dict(p.split("=", 1) for p in rrule.split(";") if "=" in p)
     freq = (parts.get("FREQ") or "").upper()
+    # RFC COUNT is the TOTAL instance count INCLUDING DTSTART; when the rule
+    # omits it the recurrence is unbounded and the window ends it. The old
+    # `or 500` fused the two meanings: a bounded-looking default quietly
+    # FINISHED every old unbounded recurrence 500 instances after DTSTART —
+    # so a daily meeting created more than 500 days ago vanished from "today".
+    _ABS = 10**9                              # stand-in when RFC COUNT is absent
     try:
         interval = max(1, int(parts.get("INTERVAL") or 1))
-        count = int(parts.get("COUNT") or 500)
+        count = int(parts["COUNT"]) if parts.get("COUNT") else _ABS
     except ValueError:
         return one
     # UNTIL is inclusive; a date-only UNTIL parses to that day's midnight.
@@ -206,14 +212,41 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
 
     out: list = []
     k = 0                                     # absolute instance counter
+    # Window-hit guard, NOT the recurrence cap: RFC COUNT bounds TOTAL
+    # instances and is honoured separately below; this bound stops an
+    # unterminated rule from marching towards `until` (years away) when the
+    # window stopped matching — the thing the old `i < 500` also did.
+    misses = 0
+    MAX_WINDOW_MISSES = 400
     if freq == "DAILY":
-        i = 0
+        # Jump straight to the window: stepping from DTSTART one interval at a
+        # time burned the fixed instance cap on instances nobody asked about,
+        # so a daily event created more than ~500 days ago silently stopped
+        # appearing (the loop hit its cap before reaching today) — "no events"
+        # for a meeting that is on every single day. The first occurrence that
+        # could still overlap the window is derived arithmetically; the counter
+        # counts ABSOLUTE instances, so COUNT keeps its RFC meaning (total
+        # instances since DTSTART, incl. DTSTART).
+        first_index = 0
+        if win_start > dtstart:
+            gap = (win_start - dur) - dtstart
+            if gap > datetime.timedelta(0):
+                step = datetime.timedelta(days=interval)
+                first_index = gap // step + 1
+        i = first_index
         while i < count:
             t = dtstart + datetime.timedelta(days=i * interval)
             if t >= win_end:
                 break
             if want(t):
                 out.append(t)
+            else:
+                # Only a past UNTIL can miss here (first_index already puts t
+                # past DTSTART and inside the overlap), so the misses bound
+                # stops a march to a far-future UNTIL.
+                misses += 1
+                if misses > MAX_WINDOW_MISSES:
+                    break
             i += 1
     elif freq == "WEEKLY":
         wd = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
@@ -231,7 +264,18 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
         clock = (dtstart.hour, dtstart.minute, dtstart.second,
                  dtstart.microsecond)
         w = 0
-        while w < 200 and k < count:
+        # Jump to the first week that could still overlap the window — the
+        # same family as the DAILY jump: 200 iterations from DTSTART is about
+        # four years, after which a weekly event silently vanished.
+        if win_start - dur > week0 + datetime.timedelta(weeks=interval):
+            ahead = (win_start - dur) - week0
+            w = max(0, ahead // datetime.timedelta(weeks=interval) - 1)
+        # 200 weeks CAPS THE DISTANCE FROM DTSTART, not the work done: with
+        # the jump above the loop now starts near the window, so bound it by
+        # the distance to the window instead (a fortnight past win_end is
+        # more than enough to cover an INTERVAL > 1's next match).
+        w_cap = w + 24
+        while w < w_cap and k < count:
             base = week0 + datetime.timedelta(weeks=w * interval)
             if base > win_end:
                 break
@@ -243,6 +287,13 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                     k += 1
                     if want(t):
                         out.append(t)
+                    elif t + dur <= win_start:
+                        # Still short of the window (the week jump lands
+                        # within a fortnight of it): bounded so an old rule
+                        # cannot march to a far-future UNTIL.
+                        misses += 1
+                        if misses > MAX_WINDOW_MISSES:
+                            return out
             w += 1
     elif freq == "MONTHLY":
         wd = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}

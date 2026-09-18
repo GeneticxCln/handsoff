@@ -1155,6 +1155,31 @@ class TestSettingsHealthBar:
         assert mod._health_query(tmp_path / "nope.sock") is None
         assert mod._health_query(None) is None
 
+    def test_query_refuses_a_reply_that_is_not_a_json_object(self, tmp_path, monkeypatch):
+        """A socket that answered SOMETHING has not answered `health`.
+
+        Driven with a canned reply rather than by racing a real one: which of
+        these branches a live socket takes depends on what arrives inside a
+        timeout, and a coverage figure that depends on that is a coverage
+        figure that moves. Every shape but the last must read as NO ANSWER,
+        because the caller renders whatever it gets as a status line and a
+        half-parsed reply would be shown as `mic: ?` beside a real timestamp.
+        """
+        mod = self._mod()
+        sock = tmp_path / "c.sock"
+
+        def reply(text):
+            monkeypatch.setattr(mod, "_socket_command", lambda *a, **k: text)
+            return mod._json_command(sock, "health", 1.0)
+
+        assert reply("pong: not json at all") is None
+        assert reply("[1, 2]") is None                 # JSON, but not a snapshot
+        assert reply('"just a string"') is None
+        assert reply("") is None                       # answered, then closed
+        assert reply(None) is None                      # the bubble is down
+        assert reply('{"mic": {"state": "listening"}}') == {
+            "mic": {"state": "listening"}}
+
     def test_query_against_real_server(self, H, tmp_path):
         """_health_query speaks to the real ControlServer implementation."""
         from PySide6.QtCore import QCoreApplication

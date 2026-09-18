@@ -341,6 +341,19 @@ DEFAULT_SETTINGS: dict = {
     "resource_alerts": False,  # opt-in RAM/VRAM threshold announcements
     "ram_alert_percent": 90.0,
     "vram_alert_percent": 90.0,
+    "idle_release_seconds": 600,  # give the models' memory back after this
+                                  # much quiet; 0 = never release
+    "llm_release_wait_s_per_gb": 20.0,  # keep the LLM when handing its memory
+                                  # back would cost more than this much
+                                  # next-turn wait per GB freed; 0 = never weigh
+                                  # the cost (always release)
+    "vram_pressure_floor_mb": 1024,  # shorten the idle release while the card
+                                  # has less than this much free; 0 = never
+                                  # rush, always use the full window
+    "vram_pressure_seconds": 30,  # the quiet needed while below that floor
+    "speech_yields_to_llm": True,  # a turn that cannot fit its LLM may ask
+                                   # the speech model to give the card back
+                                   # (it reloads in seconds)
     "notification_reader": False,  # desktop notifications are private by default
     "notification_mute_apps": [],
 }
@@ -813,6 +826,53 @@ SETTINGS_FIELDS: tuple = (
        title="RAM alert threshold", suffix=" %", group="hands-free"),
     _f("vram_alert_percent", "float", lo=50.0, hi=99.0, tab="voice",
        title="VRAM alert threshold", suffix=" %", group="hands-free"),
+    _f("idle_release_seconds", "int", lo=0, hi=86400, step=60, tab="voice",
+       title="Free memory when idle", suffix=" s",
+       tip="Unload the speech model (about 3 GB of GPU memory) and ask Ollama "
+           "to drop the model after this much quiet. They load again on the "
+           "next question, so a short setting costs a slower first word after "
+           "idle — and a long one keeps your card full for as long as the "
+           "bubble sits idle. 0 = never release.", group="hands-free"),
+    _f("llm_release_wait_s_per_gb", "float", lo=0.0, hi=3600.0, step=5.0,
+       tab="voice",
+       title="Keep the model if reloading it costs more than this",
+       suffix=" s/GB",
+       tip="The speech model is always unloaded (a few seconds to reload). "
+           "The language model is only dropped when handing its memory back "
+           "is worth the wait: this is the most next-turn seconds one GB of "
+           "freed GPU memory may cost. A model that fits on the card reloads "
+           "in seconds and is released; a big one Ollama has split across CPU "
+           "and GPU can take minutes to come back, so it is kept. 0 = never "
+           "weigh the cost. The doctor line `llm memory` shows what the "
+           "current model would do.", group="hands-free"),
+    _f("vram_pressure_floor_mb", "int", lo=0, hi=16384, step=256, tab="voice",
+       title="Free memory early when VRAM is below this", suffix=" MB",
+       tip="An idle release normally waits the whole quiet window. Below this "
+           "much free GPU memory it stops waiting and uses the shorter window "
+           "below, so a card the desktop is struggling on empties as soon as "
+           "nothing is being said or written. The models load again on the "
+           "next question. 0 = never rush (always the normal window). The "
+           "doctor line `gpu headroom` shows the free memory this compares "
+           "against.", group="hands-free"),
+    _f("vram_pressure_seconds", "int", lo=0, hi=3600, step=5, tab="voice",
+       title="Quiet needed while VRAM is below that", suffix=" s",
+       tip="The window the idle release uses while the card is below the floor "
+           "above. 0 = release at the first tick that finds the bubble idle. "
+           "It is clamped to the normal window (it can only make a release "
+           "EARLIER), and it is ignored when the floor is 0 or the release "
+           "itself is off.", group="hands-free"),
+    _f("speech_yields_to_llm", "bool", tab="voice",
+       title="Let a turn borrow the speech model's GPU memory",
+       tip="The mirror of the idle release: when a turn's language model does "
+           "not fit on the card and the speech model is holding part of it, "
+           "the speech model gives its memory back first and the answer is "
+           "spoken with a freshly loaded voice — a few seconds — instead of "
+           "Ollama offloading half the model to the CPU, where every token "
+           "costs a multiple of the on-card price. Nothing is released when "
+           "the claim already fits, when the model is already loaded, when "
+           "the release would not make room, or while something is speaking. "
+           "The doctor line `gpu headroom` shows what would be asked for.",
+       group="hands-free"),
     _f("notification_reader", "bool", tab="voice",
        title="Read desktop notifications aloud (opt-in)",
        tip="Private by default. When enabled, future notifications are spoken; "

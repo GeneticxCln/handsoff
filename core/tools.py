@@ -3038,8 +3038,12 @@ class ToolBelt:
             return "REFUSED: mouse control ('operator') is disabled in handsoff settings"
         try:
             x, y = (int(x), int(y))
-            assert 0 <= x <= 20000 and 0 <= y <= 20000
-        except (TypeError, ValueError, AssertionError):
+            # NOT an `assert`: a bounds guard that `python -O` strips is a guard
+            # that disappears in the one build where it still decides what
+            # reaches ydotool. The bounds are a refusal, so they raise.
+            if not (0 <= x <= 20000 and 0 <= y <= 20000):
+                raise ValueError(f'out of range: {x},{y}')
+        except (TypeError, ValueError):
             return f'ERROR: invalid click target ({x}, {y})'
         pre_note = self._stale_scan_note()
         scale = getattr(self, '_pointer_scale', 1.0) or 1.0

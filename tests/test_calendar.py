@@ -636,6 +636,89 @@ class TestICSMonthlyYearly:
         assert [e["start"].day for e in ev] == [1, 2, 3]
 
 
+class TestICSDailyOldEvent:
+    """DAILY expansion must reach the window even when DTSTART is long past.
+
+    The expander used to step from DTSTART one interval at a time under a
+    500-instance cap, so a daily event created more than ~500 days ago burned
+    its whole budget before reaching today and silently vanished from the
+    answer — "no events" for a meeting that is on every single day.
+    """
+
+    def _events(self, H, dtstart, rrule, win_s, win_e, summary="Ev"):
+        text = "\r\n".join([
+            "BEGIN:VCALENDAR", "VERSION:2.0",
+            "BEGIN:VEVENT", "UID:old-daily@test",
+            f"DTSTART:{dtstart}", "DTEND:20240101T103000",
+            f"SUMMARY:{summary}", f"RRULE:{rrule}",
+            "END:VEVENT",
+            "END:VCALENDAR",
+        ])
+        ws = H.datetime.datetime(*win_s)
+        we = H.datetime.datetime(*win_e)
+        return _core_calendar.ics_events_from_text(text, ws, we)
+
+    def test_a_daily_event_older_than_the_instance_cap_still_appears(self, H):
+        # 800 days before today: past the old 500-instance COUNT budget.
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        start = today - H.datetime.timedelta(days=800)
+        ev = self._events(
+            H, start.strftime("%Y%m%dT090000"), "FREQ=DAILY",
+            (today.year, today.month, today.day),
+            (today.year, today.month, today.day + 1))
+        assert len(ev) == 1, ev
+        assert ev[0]["start"].date() == today.date()
+
+    def test_count_still_bounds_absolute_instances(self, H):
+        """The jump must not change COUNT's RFC meaning: the cap counts TOTAL
+        instances since DTSTART (incl. DTSTART), so an old event with
+        COUNT=500 and DTSTART 800 days ago is FINISHED — nothing in the
+        window, not a resurrected stream."""
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        start = today - H.datetime.timedelta(days=800)
+        ev = self._events(
+            H, start.strftime("%Y%m%dT090000"), "FREQ=DAILY;COUNT=500",
+            (today.year, today.month, today.day),
+            (today.year, today.month, today.day + 1))
+        assert ev == [], f"a COUNT-finished recurrence came back from the dead: {ev}"
+
+    def test_interval_alignment_is_preserved_across_the_jump(self, H):
+        # INTERVAL=3, DTSTART 901 days ago: 901 % 3 == 1, so the naive
+        # "start at the window" shortcut lands on a day the event does NOT
+        # occur on. The arithmetic jump must preserve DTSTART's phase.
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        start = today - H.datetime.timedelta(days=901)
+        ev = self._events(
+            H, start.strftime("%Y%m%dT090000"), "FREQ=DAILY;INTERVAL=3",
+            (today.year, today.month, today.day),
+            (today.year, today.month, today.day + 3))
+        days = [e["start"].date() for e in ev]
+        phase = (start.date() - days[0]).days % 3 if days else None
+        assert days and phase == 0, (days, phase)
+
+    def test_a_weekly_event_older_than_the_week_cap_still_appears(self, H):
+        # The WEEKLY branch's own `w < 200` cap is a distance from DTSTART,
+        # not a work bound: past ~4 years a weekly event stopped appearing.
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        start = today - H.datetime.timedelta(days=5 * 365)
+        text = "\r\n".join([
+            "BEGIN:VCALENDAR", "VERSION:2.0",
+            "BEGIN:VEVENT", "UID:old-weekly@test",
+            f"DTSTART:{start.strftime('%Y%m%dT090000')}",
+            f"DTEND:{start.strftime('%Y%m%dT093000')}",
+            "SUMMARY:Old weekly", "RRULE:FREQ=WEEKLY",
+            "END:VEVENT", "END:VCALENDAR",
+        ])
+        win_s = today.replace(hour=0, minute=0, second=0, microsecond=0)
+        win_e = win_s + H.datetime.timedelta(days=8)
+        ev = _core_calendar.ics_events_from_text(text, win_s, win_e)
+        assert ev and ev[0]["summary"] == "Old weekly", ev
+
+
 class TestCalendarSourceSafety:
     """A Google-style "secret iCal address" is a bearer credential: whoever
     reads the URL reads the whole calendar (where the user is and who they

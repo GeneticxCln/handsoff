@@ -25,11 +25,12 @@ omit =
     */signature_bootstrap.py
 
 [report]
-# Floor tracks measured reality, not aspiration: handsoff.py 71% (the offscreen
-# bubble-render scenario took the ten designs out of the dark), hardware.py ~84%,
-# core/assistant.py ~84%, core/theme.py 100%, ci/pytest_summary.py 94%, and the Qt
-# settings GUI (handsoff-settings.py) ~68% since tests/test_settings_gui.py began
-# driving it in offscreen subprocesses — TOTAL 75%. Raise further only with new
-# tests, not omit-patterns.
+# The floor tracks measured reality, not aspiration, and the PER-FILE shape is
+# what `coverage report` prints — it is not restated here. An earlier version of
+# this comment carried five per-file percentages and a TOTAL, and every one of
+# them rotted: the suite's TOTAL has since moved well above this floor. A figure
+# copied out of the report is a figure nobody recomputes, so the gate holds the
+# one number that matters and the report holds the shape. Raise the floor only
+# with new tests, never with omit-patterns.
 fail_under = 70
 show_missing = True

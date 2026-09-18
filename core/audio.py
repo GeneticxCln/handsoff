@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import wave
 from contextlib import contextmanager
@@ -49,11 +50,13 @@ _MIC_OPERATION_OWNER = None
 def configure(*, sample_rate: int = 16_000, whisper_size: str = "base",
               whisper_device: str = "auto", whisper_model_dir: Path | None = None,
               tts_reference: str = "", tts_device: str = "auto",
+              gpu_reclaim=None,
               settings: dict | None = None,
               logger: logging.Logger | None = None) -> None:
     """Set application-owned paths/settings without importing the application."""
     global SAMPLE_RATE, WHISPER_SIZE, WHISPER_DEVICE
     global WHISPER_MODEL_DIR, TTS_REFERENCE, TTS_DEVICE, SETTINGS, log
+    global _GPU_RECLAIM
     SAMPLE_RATE = int(sample_rate)
     WHISPER_SIZE = str(whisper_size)
     WHISPER_DEVICE = str(whisper_device)
@@ -61,6 +64,8 @@ def configure(*, sample_rate: int = 16_000, whisper_size: str = "base",
         WHISPER_MODEL_DIR = Path(whisper_model_dir)
     TTS_REFERENCE = str(tts_reference or "")
     TTS_DEVICE = str(tts_device or "auto")
+    if gpu_reclaim is not None:
+        _GPU_RECLAIM = gpu_reclaim if callable(gpu_reclaim) else None
     if settings is not None:
         SETTINGS = settings
     if logger is not None:
@@ -254,6 +259,7 @@ def _stop_recorder_bounded(rec, timeout: float = 3.0):
 
 
 _whisper_model = None
+_whisper_device_used = ""        # what the LOADED model actually got
 _whisper_lock = threading.Lock()
 _TRANSCRIBE_LOCK = threading.Lock()
 _whisper_cpu_fallback = False
@@ -266,7 +272,13 @@ _tts_lock = threading.Lock()
 # — a spoken reply and the settings app's voice preview. Loading does not hold
 # this, so a slow first load never blocks a reply that is already speaking.
 _TTS_RUN_LOCK = threading.Lock()
-_TTS_VRAM_MB = 3_000            # measured ~2.7 GB for turbo on a 16 GB card
+# Measured, not guessed: turbo's weights are ~2.7 GB, but the PROCESS holds
+# 3 172–3 312 MiB on the card while generating (nvidia-smi for our pid on this
+# 16 GB card, whisper on cpu so the figure is speech alone — the rest is the
+# CUDA context and the per-voice conditionals). The budget reserves the larger
+# number, because the smaller one is what the model occupies at rest rather
+# than what asking it to speak takes.
+_TTS_VRAM_MB = 3_400
 _TTS_FLOAT32_PATCHED = False
 _WHISPER_VRAM_MB = {
     "tiny": 600, "base": 800, "small": 1400, "medium": 2600,
@@ -288,11 +300,349 @@ def _nvidia_free_vram_mb() -> "int | None":
     return None
 
 
+# The room a loader must leave unused on the card. The compositor, the
+# wallpaper and the settings window all draw from the same GPU, and a card with
+# nothing left free is how the desktop starts glitching rather than the model
+# failing to load — so a claim that would take the last of the card is refused
+# before it is made, by one comparison rather than two.
+_VRAM_RESERVE_MB = 1024
+
+# How the speech model asks another tenant for the card before it gives way.
+# The host injects this through `configure(gpu_reclaim=...)` because what a
+# reclaim COSTS (the LLM it evicts has to load again on the next question, and
+# that price is the application's to measure and weigh) belongs to the host,
+# while asking for it belongs to the loader. None means "no such policy here" —
+# a partial install, the settings app, a bundle without the host — and then the
+# refusal simply stands.
+_GPU_RECLAIM = None
+
+
+def _int_or_none(value) -> "int | None":
+    """The reading as an int, or None when it is not a number at all.
+
+    `N/A`, `[N/A]`, a blank field and a junk value are not zero free memory and
+    not a figure in MB: they are the ABSENCE of a measurement, and the loader's
+    response to that is the same as to an unreadable card. `inf`/`nan` are here
+    because Python's json module parses bare `Infinity` into a float.
+    """
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def vram_budget(free_mb, *, claim_mb, owner: str, entitled_mb=0,
+                reserve_mb=_VRAM_RESERVE_MB) -> dict:
+    """ONE budget for the card, consulted by both model loaders.
+
+    Two loaders each comparing their own size against the same free-VRAM
+    reading can each pass while the card can hold only one of them: 3.4 GB of
+    speech and 3.9 GB of whisper "fit" in 4.5 GB free when neither decision
+    knows about the other. This is the single arithmetic both ask instead, so a
+    claim is refused when it would not fit after the reserve and after the
+    memory another tenant is entitled to.
+
+    `free_mb` is the driver's LIVE reading, so it already excludes whatever
+    this process has resident. A caller passes `entitled_mb` only for a model
+    that is not loaded yet: withholding a loaded model's size again would
+    reserve its memory twice.
+
+    `entitled_mb` is the asymmetry between the two tenants, in one place:
+    whisper yields to the speech model (a spoken reply is what the user is
+    waiting for; the ears can lose a few hundred ms of latency), and speech
+    yields to nothing — a resident whisper is inside `free_mb` already. An
+    unreadable card is unknown room, never room: `free_mb is None` refuses the
+    claim, so the two loaders cannot answer "can't tell" differently.
+
+    The result carries its own arithmetic, because the caller has to be able to
+    say WHY a model went to cpu instead of leaving the choice unexplained.
+    """
+    claim = max(0, _int_or_none(claim_mb) or 0)
+    entitled = max(0, _int_or_none(entitled_mb) or 0)
+    reserve = max(0, _int_or_none(reserve_mb) or 0)
+    free = _int_or_none(free_mb)
+    held = f"{reserve} MB reserve"
+    if entitled:
+        held += f" and {entitled} MB held back for the speech model"
+    out = {"owner": str(owner), "claim_mb": claim, "entitled_mb": entitled,
+           "reserved_mb": reserve, "free_mb": free, "available_mb": None,
+           "fits": False, "reason": ""}
+    if free is None:
+        out["reason"] = (f"{claim} MB claim refused: the card's free memory "
+                         f"could not be read, and an unreadable card is not "
+                         f"room")
+        return out
+    available = free - reserve - entitled
+    out["available_mb"] = available
+    out["fits"] = claim <= available
+    if out["fits"]:
+        out["reason"] = (f"{claim} MB claim fits: {free} MB free less {held} "
+                         f"= {available} MB available")
+    else:
+        out["reason"] = (f"{claim} MB claim refused: {claim + reserve + entitled} MB "
+                         f"needed ({held}) but only {free} MB is free")
+    return out
+
+
+def yield_to_llm_verdict(free_mb, claim_mb, *, held_mb,
+                         reserve_mb=_VRAM_RESERVE_MB) -> dict:
+    """Should the models THIS process holds give the card to the LLM? Why?
+
+    The mirror of `_ask_for_the_card`. There the speech loader was refused and
+    asked the LLM to move; here a TURN needs the card and the tenant that can
+    move is this process's own speech model — the cheap one to reload (seconds),
+    where Ollama's own answer to a full card is to offload half the model to the
+    CPU and serve every token at a fraction of the speed.
+
+    `held_mb` is what this process occupies on the card (`gpu_footprint_mb`),
+    `claim_mb` what the LLM needs (the model's own size, from Ollama), and
+    `free_mb` the driver's reading — which already EXCLUDES `held_mb`, so the
+    question "would releasing help?" is the same budget asked again with that
+    memory put back, rather than a second kind of arithmetic.
+
+    Four ways this answers NO, and each is a different fact:
+
+      * nothing of ours is on the card (cpu speech, nothing loaded) — there is
+        nothing to give back;
+      * the claim fits as things stand — the card does not need the memory, and
+        releasing it would cost a reload on the next reply for nothing;
+      * the card could not be read — an unreadable card is not pressure, and
+        what this decision spends is a reload, so an unknown is not a reason to
+        spend it (the speech path releases on an unknown because its alternative
+        is a stalled utterance; this one's alternative is only that Ollama makes
+        the offload decision for itself);
+      * the claim does not fit even with the memory back — the model is larger
+        than the card, or someone else holds the rest, so the release would hand
+        back memory that cannot change the outcome.
+
+    NO is also the answer when `claim_mb` is unknown: nothing was weighed, and
+    evicting a voice on a guess is exactly the kind of unmeasured decision this
+    pair of functions exists to avoid.
+
+    `tight` in the result means "the claim does not fit as things stand", which
+    is the condition under which the caller has something worth saying in the
+    journal — the mundane answers (fits already, nothing held) are the common
+    case and are not news.
+    """
+    free = _int_or_none(free_mb)
+    claim = _int_or_none(claim_mb)
+    held = max(0, _int_or_none(held_mb) or 0)
+    out = {"yield": False, "tight": False, "held_mb": held, "claim_mb": claim,
+           "free_mb": free, "available_after_mb": None, "note": ""}
+    if held <= 0:
+        out["note"] = ("this process holds nothing on the card, so a turn has "
+                       "nothing to ask it for")
+        return out
+    if claim is None:
+        out["note"] = ("how much the LLM needs could not be read, so nothing "
+                       f"was asked for the card ({held} MB is held here)")
+        return out
+    if free is None:
+        out["note"] = ("the card's free memory could not be read, so the "
+                       f"speech model was not asked for it ({held} MB is held "
+                       "here)")
+        return out
+    already = vram_budget(free, claim_mb=claim, owner="llm",
+                          reserve_mb=reserve_mb)
+    if already["fits"]:
+        out["note"] = f"the LLM's claim fits already: {already['reason']}"
+        return out
+    after = vram_budget(free + held, claim_mb=claim, owner="llm",
+                        reserve_mb=reserve_mb)
+    out["tight"] = True
+    out["available_after_mb"] = after["available_mb"]
+    if not after["fits"]:
+        out["note"] = (f"releasing the {held} MB this process holds would not "
+                       f"make room: {after['reason']}")
+        return out
+    out["yield"] = True
+    out["note"] = (f"{held} MB of this card is this process's own models, and "
+                   f"the LLM's claim fits once they are back "
+                   f"({after['reason']})")
+    return out
+
+
+def _whisper_vram_mb(size: str) -> int:
+    """The table's footprint for a whisper size, defaulting to the largest."""
+    return int(_WHISPER_VRAM_MB.get(str(size or "").lower(), 3600))
+
+
+def _speech_vram_claim_mb() -> int:
+    """What the speech model is entitled to before whisper's claim.
+
+    Zero when speech is configured for cpu (nothing will want the card), and
+    zero once it is resident on cuda — its memory is inside the driver's free
+    reading by then, so reserving it a second time would withhold room nobody
+    is using. Anything else (`auto`, an explicit `cuda`) means the voice is
+    still coming and whisper must leave it room.
+    """
+    if str(TTS_DEVICE).strip().lower() == "cpu":
+        return 0
+    if _tts_model is not None and str(_tts_device or "").strip().lower() == "cuda":
+        return 0
+    return _TTS_VRAM_MB
+
+
+def _ask_for_the_card(plan: dict, device: str = "auto") -> dict:
+    """Ask the other tenant for the card before the speech model gives way.
+
+    A refusal here means the card had no room left, and the tenant usually
+    holding it is the LLM — which the HOST can ask to let go (`keep_alive: 0`).
+    The policy is the host's, so this calls the injected hook and then re-plans
+    against a reading taken AFTERWARDS: a reclaim that frees nothing must never
+    turn a refusal into a claim, and a reclaim cannot be a way to guess at a
+    card that could not be read in the first place.
+
+    The hook's own sentence is kept in `plan["reclaim"]` so the loader can say
+    in the journal WHICH tenant gave way — the LLM, or the speech model.
+    Whisper does NOT ask: it is the ears, it yields to speech by design, and a
+    startup whisper load that evicted the LLM would fight the model the bubble
+    had just warmed.
+    """
+    reclaim = _GPU_RECLAIM
+    if reclaim is None or plan["free_mb"] is None:
+        return plan
+    try:
+        outcome = reclaim(plan["reason"])
+    except Exception:
+        log.warning("the gpu reclaim hook raised — the refusal stands",
+                    exc_info=True)
+        return plan
+    note = str(outcome.get("detail") or "") if isinstance(outcome, dict) else ""
+    gave_way = bool(outcome.get("gave_way")) if isinstance(outcome, dict) else False
+    if not gave_way:
+        if note:
+            plan["reclaim"] = note
+        return plan
+    again = _tts_plan(_nvidia_free_vram_mb(), device)
+    again["reclaim"] = note
+    return again
+
+
+def _whisper_plan(size: str, free_mb: "int | None") -> dict:
+    """The whisper device AND the budget that decided it."""
+    plan = vram_budget(free_mb, claim_mb=_whisper_vram_mb(size),
+                       owner="whisper", entitled_mb=_speech_vram_claim_mb())
+    plan["device"] = "cuda" if plan["fits"] else "cpu"
+    plan["compute"] = "float16" if plan["fits"] else "int8"
+    return plan
+
+
 def _whisper_device_choice(size: str, free_mb: "int | None") -> tuple[str, str]:
-    if free_mb is None:
-        return ("cpu", "int8")
-    need = _WHISPER_VRAM_MB.get(size, 3600)
-    return (("cuda", "float16") if free_mb >= need + 1024 else ("cpu", "int8"))
+    """The device and compute type for a whisper size on this card.
+
+    Kept as a two-value answer because the host's partial-install shim and the
+    no-audio probe in the suite both call it that way; the reason travels in
+    `_whisper_plan`, which is what the loader logs.
+    """
+    plan = _whisper_plan(size, free_mb)
+    return (plan["device"], plan["compute"])
+
+
+def _empty_cuda_cache() -> bool:
+    """Hand torch's cached blocks back, without importing torch to do it.
+
+    Looked up in `sys.modules` rather than imported: this runs on an idle tick,
+    and the suite asserts that a test never drags torch in. When nothing has
+    imported torch there is no allocator to empty and no allocation to give
+    back, so the answer is simply False.
+    """
+    torch = sys.modules.get("torch")
+    cuda = getattr(torch, "cuda", None) if torch is not None else None
+    if cuda is None:
+        return False
+    try:
+        cuda.empty_cache()
+    except Exception:
+        log.debug("torch.cuda.empty_cache() failed", exc_info=True)
+        return False
+    return True
+
+
+def drop_models(logger=None) -> dict:
+    """Drop the loaded models so their memory goes back to the machine.
+
+    This is what an idle bubble calls (handsoff's `_idle_release_tick`), and it
+    is safe by construction rather than by timing luck:
+
+      * both locks are taken NON-blocking, because a load or a generation owns
+        the model object it is using. A busy lock means "not now, ask again on
+        the next tick" — never a blocked tick or a torn model.
+      * whisper is dropped only when it was loaded on CUDA. On cpu it holds no
+        GPU memory, and dropping it would cost a reload on the next turn for
+        nothing.
+      * `_tts_device` is cleared with the model, so the NEXT load re-decides
+        cuda-vs-cpu against the free memory of that moment (which is the whole
+        point of having released anything).
+
+    Nothing else is required for the bubble to keep working: `get_tts`,
+    `get_whisper` and the chat path all load on demand, so the next utterance
+    or turn pays a load and nothing else changes. Returns what was dropped.
+    """
+    global _tts_model, _tts_device, _whisper_model, _whisper_device_used
+    out = {"tts": False, "whisper": False, "cache_cleared": False}
+    if _TTS_RUN_LOCK.acquire(blocking=False):
+        try:
+            with _tts_lock:
+                if _tts_model is not None:
+                    _tts_model = None
+                    _tts_device = ""
+                    out["tts"] = True
+        finally:
+            _TTS_RUN_LOCK.release()
+    if _whisper_device_used == "cuda" and _TRANSCRIBE_LOCK.acquire(blocking=False):
+        try:
+            with _whisper_lock:
+                if _whisper_model is not None:
+                    _whisper_model = None
+                    _whisper_device_used = ""
+                    out["whisper"] = True
+        finally:
+            _TRANSCRIBE_LOCK.release()
+    if out["tts"] or out["whisper"]:
+        out["cache_cleared"] = _empty_cuda_cache()
+        (logger or log).info(
+            "released idle models (tts=%s whisper=%s cuda cache=%s)",
+            out["tts"], out["whisper"], out["cache_cleared"])
+    return out
+
+
+def gpu_footprint_mb() -> dict:
+    """Which of this process's loaded models occupy the card, and how much.
+
+    The ESTIMATE half of the host's headroom line. `nvidia-smi` can usually say
+    what a pid holds, but not on every driver, and a bubble that cannot be
+    measured must still be able to say what it believes it is holding instead
+    of reporting nothing.
+
+    Only a model loaded on CUDA contributes: a model on cpu occupies no card
+    memory, so counting it would make the number wrong in exactly the case the
+    idle release exists for (and would claim a release could hand back memory
+    it never had). Sizes come from the same tables the device choices use
+    (`_TTS_VRAM_MB`, `_WHISPER_VRAM_MB`), so this cannot drift from what the
+    loaders decided a model needs. These are FOOTPRINTS, not measurements —
+    the measured number is the one the driver attributes to the pid.
+
+    The devices are reported even at zero, because "tts on cpu" is the fact
+    that explains the zero, and a reader who sees only `0` cannot tell a cpu
+    model from a missing one.
+    """
+    tts_loaded = _tts_model is not None
+    whisper_loaded = _whisper_model is not None
+    tts_device = (_tts_device or "cpu") if tts_loaded else ""
+    whisper_device = (_whisper_device_used or "cpu") if whisper_loaded else ""
+    tts_mb = _TTS_VRAM_MB if tts_device == "cuda" else 0
+    whisper_mb = (_WHISPER_VRAM_MB.get(str(WHISPER_SIZE).lower(), 3600)
+                  if whisper_device == "cuda" else 0)
+    return {
+        "tts_mb": tts_mb,
+        "whisper_mb": whisper_mb,
+        "total_mb": tts_mb + whisper_mb,
+        "tts_loaded": tts_loaded,
+        "whisper_loaded": whisper_loaded,
+        "tts_device": tts_device,
+        "whisper_device": whisper_device,
+    }
 
 
 def get_whisper():
@@ -306,24 +656,32 @@ def get_whisper():
     model, from where, and what to do. Nothing is cached: the model stays None
     after a failure, so the next attempt (after install.sh) retries cleanly.
     """
-    global _whisper_model
+    global _whisper_model, _whisper_device_used
     with _whisper_lock:
         if _whisper_model is None:
             try:
                 from faster_whisper import WhisperModel
-                device, compute = "cpu", "int8"
+                device, compute, why = "cpu", "int8", ""
                 if not _whisper_cpu_fallback:
                     if WHISPER_DEVICE == "cuda":
                         device, compute = "cuda", "float16"
                     elif WHISPER_DEVICE == "auto":
-                        device, compute = _whisper_device_choice(
-                            WHISPER_SIZE, _nvidia_free_vram_mb())
+                        plan = _whisper_plan(WHISPER_SIZE, _nvidia_free_vram_mb())
+                        device, compute = plan["device"], plan["compute"]
+                        if device == "cpu":
+                            why = plan["reason"]
+                if why:
+                    # The fallback costs latency on every utterance, so it is
+                    # said at WARNING with its own arithmetic rather than
+                    # buried in the load line.
+                    log.warning("whisper '%s' on cpu — %s", WHISPER_SIZE, why)
                 log.info("loading whisper '%s' on %s (%s) from %s",
                          WHISPER_SIZE, device, compute, WHISPER_MODEL_DIR)
                 try:
                     _whisper_model = WhisperModel(
                         WHISPER_SIZE, device=device, compute_type=compute,
                         download_root=str(WHISPER_MODEL_DIR), local_files_only=True)
+                    _whisper_device_used = device
                 except Exception:
                     if device == "cpu":
                         raise
@@ -331,6 +689,7 @@ def get_whisper():
                     _whisper_model = WhisperModel(
                         WHISPER_SIZE, device="cpu", compute_type="int8",
                         download_root=str(WHISPER_MODEL_DIR), local_files_only=True)
+                    _whisper_device_used = "cpu"
             except ImportError as exc:
                 raise RuntimeError(
                     f"faster_whisper is not installed ({exc}) — run install.sh") from exc
@@ -431,21 +790,38 @@ def _torch_cuda_available() -> bool:
         return False
 
 
-def tts_device_choice(free_mb: "int | None", device: str = "auto") -> str:
-    """Which device to load the speech model on.
+def _tts_plan(free_mb: "int | None", device: str = "auto") -> dict:
+    """The speech device AND the budget that decided it.
 
-    `auto` prefers CUDA but only when the card can actually hold the model
-    (~2.7 GB measured) alongside whisper and the LLM. An unreadable nvidia-smi
-    is not evidence of a GPU, so it means cpu — and the caller says so LOUDLY,
-    because CPU synthesis is not real time and a spoken turn may not keep up.
+    `auto` puts the model on the card only when the shared budget says it fits
+    after the reserve. An unreadable nvidia-smi is not evidence of a GPU, so it
+    means cpu — and the caller says so LOUDLY, because CPU synthesis is not
+    real time and a spoken turn may not keep up.
+
+    An explicitly configured device is not a budget question — the user chose
+    it — but the budget is still computed and reported, because "configured
+    cuda with 1.4 GB free" is the fact that explains a load failing a moment
+    later.
     """
-    if device in ("cuda", "cpu"):
-        return device
+    plan = vram_budget(free_mb, claim_mb=_TTS_VRAM_MB, owner="speech")
+    configured = str(device).strip().lower()
+    if configured in ("cuda", "cpu"):
+        plan["device"] = configured
+        plan["authority"] = "configured"
+        return plan
+    plan["authority"] = "budget"
     if not _torch_cuda_available():
-        return "cpu"
-    if free_mb is not None and free_mb < _TTS_VRAM_MB:
-        return "cpu"
-    return "cuda"
+        plan["device"] = "cpu"
+        plan["reason"] = ("no CUDA device is visible to torch, so the card's "
+                          "free memory is not the question")
+        return plan
+    plan["device"] = "cuda" if plan["fits"] else "cpu"
+    return plan
+
+
+def tts_device_choice(free_mb: "int | None", device: str = "auto") -> str:
+    """Which device to load the speech model on (`auto` asks the budget)."""
+    return _tts_plan(free_mb, device)["device"]
 
 
 def _patch_float32_norm(model) -> None:
@@ -502,7 +878,15 @@ def get_tts():
             except ImportError as exc:
                 raise RuntimeError(
                     f"chatterbox is not installed ({exc}) — run install.sh") from exc
-            device = tts_device_choice(_nvidia_free_vram_mb(), TTS_DEVICE)
+            plan = _tts_plan(_nvidia_free_vram_mb(), TTS_DEVICE)
+            if plan["device"] == "cpu" and plan["authority"] == "budget":
+                plan = _ask_for_the_card(plan, TTS_DEVICE)
+            device = plan["device"]
+            # Which tenant moved is the fact that explains what the next
+            # question will cost, so it is said in the journal either way.
+            reclaim = plan.get("reclaim") or ""
+            if reclaim and device == "cuda":
+                log.info("speech model takes the card — %s", reclaim)
             if TTS_REFERENCE:
                 # Checked BEFORE the load: the message below is about weights,
                 # and a bad clip would otherwise be reported as "the weights are
@@ -517,6 +901,13 @@ def get_tts():
                     "chatterbox is loading on CPU: synthesis is slower than "
                     "real time there (measured ~3x FASTER than real time on a "
                     "GPU), so spoken replies will lag behind the conversation")
+                if plan["authority"] == "budget":
+                    log.warning("speech model fell back to cpu — %s%s",
+                                plan["reason"],
+                                f"; {reclaim}" if reclaim else "")
+            elif plan["authority"] == "configured" and not plan["fits"]:
+                log.warning("speech model is configured on %s — %s",
+                            device, plan["reason"])
             log.info("loading %s on %s (voice: %s)", TTS_ENGINE, device,
                      TTS_REFERENCE or "built-in")
             try:
@@ -816,10 +1207,12 @@ __all__ = [
     "_resample_to_16k", "_open_input",
     "_stop_recorder_bounded", "get_whisper", "get_tts", "transcribe",
     "synthesize", "resample_speed", "tts_device_choice", "TTS_REPO_ID",
+    "vram_budget", "yield_to_llm_verdict",
     "tts_weights_cached", "tts_weights_dir", "MIN_REFERENCE_S", "WARM_TEXT",
     "warm_tts",
     "reference_clip_seconds", "reference_problem",
-    "tts_to_wav", "play_wav", "configure",
+    "tts_to_wav", "play_wav", "configure", "drop_models",
+    "gpu_footprint_mb",
     "portaudio_in_use", "portaudio_busy", "set_level_hook",
     "MIC_OPERATION_LOCK",
     # The lock above and the four names below are the seam the HOST shares with

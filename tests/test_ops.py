@@ -225,6 +225,69 @@ class TestDeploymentReporting:
         assert snap["files"]["core/theme.py"]["match"] is False
         assert snap["status"] == "installed-drift"
 
+    def test_a_manifestless_install_compares_every_module(self, H, monkeypatch, tmp_path):
+        """_DEPLOY_FILES is the top-level floor; the checkout's core set is the
+        ceiling a hand-rolled install must be compared against.
+
+        The floor lists eight entries, three of them core modules, while
+        install.sh declares thirteen — so an install with no manifest compared
+        eight files and reported `in-sync` while half the modules differed.
+        Driven from the checkout, every module the tree ships is compared.
+        """
+        checkout = tmp_path / "checkout"
+        installed = tmp_path / "home" / ".local" / "bin"
+        checkout.mkdir()
+        (checkout / "core").mkdir()
+        installed.mkdir(parents=True)
+        (checkout / ".git").mkdir()
+        (checkout / "handsoff.py").write_text("# checkout\n")
+        for rel in H._DEPLOY_FILES:
+            src = checkout / rel
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_text("# checkout\n")
+            dst = installed / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text("# checkout\n")
+        for name in ("audio", "brain", "tools", "bubble", "web", "theme"):
+            (checkout / "core" / f"{name}.py").write_text("# checkout\n")
+            (installed / "core" / f"{name}.py").write_text("# checkout\n")
+        # One module the checkout ships never reached the deployment.
+        (checkout / "core" / "voice.py").write_text("# checkout\n")
+        monkeypatch.setattr(H, "SELF_PATH", checkout / "handsoff.py")
+        monkeypatch.setattr(H, "HOME", tmp_path / "home")
+        monkeypatch.setattr(H, "DEPLOYMENT_FILE", tmp_path / "deployment.json")
+        snap = H._deployment_snapshot()
+        assert snap["manifest"] == {}, "no manifest is the case under test"
+        assert "core/voice.py" in snap["files"], (
+            "a module only the checkout has must still be compared")
+        assert snap["files"]["core/voice.py"]["match"] is False
+        assert snap["status"] == "installed-drift"
+
+    def test_the_compared_set_covers_what_the_installer_declares(self, H, monkeypatch, tmp_path):
+        """The real install.sh, the real tree: every declared module is compared.
+
+        A manifest names the deployed files, so the declared set is what covers
+        the install WITHOUT one. This is that claim, read from the installer's
+        own declaration rather than from a second list kept here.
+        """
+        text = (HERE / "install.sh").read_text(encoding="utf-8")
+        line = next(ln for ln in text.splitlines()
+                    if ln.startswith("CORE_REQUIRED="))
+        declared = line.split('"')[1].split()
+        assert declared, "install.sh's CORE_REQUIRED must be readable"
+        monkeypatch.setattr(H, "SELF_PATH", HERE / "handsoff.py")
+        monkeypatch.setattr(H, "HOME", tmp_path / "home")
+        monkeypatch.setattr(H, "DEPLOYMENT_FILE", tmp_path / "deployment.json")
+        snap = H._deployment_snapshot()
+        assert snap["manifest"] == {}
+        compared = set(snap["files"])
+        missing = sorted(f"core/{name}.py" for name in declared
+                         if f"core/{name}.py" not in compared)
+        assert missing == [], (
+            f"a manifest-less install would not compare {missing} — the floor "
+            f"covers a manifest-less install, so it must hold every module "
+            f"install.sh declares")
+
     def test_health_includes_deployment(self, H, monkeypatch):
         """`--ptt health` must answer 'is the running code the tested code?'"""
         a = H.Assistant.__new__(H.Assistant)

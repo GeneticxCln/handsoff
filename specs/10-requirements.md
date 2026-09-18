@@ -1,13 +1,13 @@
 # handsoff — requirements
 
-Sources: `settings_schema.py` (59 keys, `DEFAULT_SETTINGS`, `BUBBLE_DESIGNS`,
+Sources: `settings_schema.py` (64 keys, `DEFAULT_SETTINGS`, `BUBBLE_DESIGNS`,
 `APPEARANCE_LOOKS`), `core/tools.py` (`@tool`, `DecisionPolicy`, `ALLOWED`,
 `BLOCKED`), `handsoff.py` (`PTT_ACTIONS`, `PTT_READ_ONLY`, assistant states).
 
 ## 1. Voice loop
 
 - R1.1 Push-to-talk: hold bubble left button → record → release → transcribe →
-  answer → speak. 60 s cap per press (`core/audio.py:117` `MAX_PTT_S`).
+  answer → speak. 60 s cap per press (`core/audio.py:484` `MAX_PTT_S`).
 - R1.2 Hands-free: wake-name utterance or openWakeWord spotter opens an
   engagement window (`engage_seconds` default 45.0); `followup_seconds`
   default 6.0 re-listens after each reply without the wake word.
@@ -27,7 +27,7 @@ Sources: `settings_schema.py` (59 keys, `DEFAULT_SETTINGS`, `BUBBLE_DESIGNS`,
   strict arg coercion (`coerce_bool_arg`, `coerce_number_arg`) — malformed args
   refuse as "bad arguments", never guess 0/True.
 - R2.3 History budget: estimated tokens chars/4, auto = `num_ctx` − fixed
-  prompt − 1024 reply reserve, floor 1024 (`handsoff.py:1393`).
+  prompt − 1024 reply reserve, floor 1024 (`handsoff.py:1421`).
 - R2.4 Durable memory: ≤24 facts (`MAX_MEMORY_FACTS`), extracted per
   utterance, merged, surviving history trim and restarts (`memory.json`).
 - R2.5 Control-token hygiene: `<think>`/`tool_calls`/`im_start` leakage

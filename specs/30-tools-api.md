@@ -51,13 +51,13 @@ ungated. Descriptions are the pinned model-facing strings in the decorator.
 | `start_command` | `run_command` | 2904 |
 | `job_status` | `run_command` | 2948 |
 | `handsoff_doctor` | — | 2996 |
-| `screen_elements` | `screen_access` | 3092 |
-| `click_element` | `operator` | 3114 |
-| `click_at` | `operator` | 3131 |
-| `scroll` | `operator` | 3136 |
-| `open_app` | `run_command` | 3169 |
-| `read_file` | `read_file` | 3259 |
-| `edit_file` | `edit_file` | 3289 |
+| `screen_elements` | `screen_access` | 3096 |
+| `click_element` | `operator` | 3118 |
+| `click_at` | `operator` | 3135 |
+| `scroll` | `operator` | 3140 |
+| `open_app` | `run_command` | 3173 |
+| `read_file` | `read_file` | 3263 |
+| `edit_file` | `edit_file` | 3293 |
 
 ## Result contract
 

@@ -3,7 +3,7 @@
 Sources: `settings_schema.py`, `core/settings.py`,
 `handsoff.py` paths/caps, `core/calendar.py`, `core/web.py`, `hardware.py`.
 
-## 1. settings.json (59 keys, `SETTINGS_VERSION = 2`)
+## 1. settings.json (64 keys, `SETTINGS_VERSION = 2`)
 
 Precedence: built-in defaults ← environment ← `settings.json`.
 Stamped `version` on every write. v0→v2 migration stepwise
@@ -31,6 +31,24 @@ Web/place: `searxng_url` (`http://127.0.0.1:8888`, "" disables),
 `world_cooldown_min` 60.0, `hardware_watch` False,
 `hardware_cooldown_min` 60.0, `hardware_disk_gb` 5.0, `resource_alerts`
 False, `ram_alert_percent` 90.0, `vram_alert_percent` 90.0,
+`idle_release_seconds` 600 (after this much quiet the speech model is dropped
+and the LLM release is decided: kept unless the measured reload is worth the
+memory it frees; 0 = never release), `llm_release_wait_s_per_gb` 20.0 (the most
+next-turn reload seconds one GB of freed VRAM may cost — `size_vram` from
+Ollama's `/api/ps` against the reload measured at the last load; 0 = never
+weigh the cost), `vram_pressure_floor_mb` 1024 (while less than this much VRAM
+is free the release stops waiting for the full window and uses the one below,
+so a card the desktop is struggling on is emptied as soon as nothing is being
+said or written; 0 = never rush), `vram_pressure_seconds` 30 (the quiet needed
+while below that floor; clamped to `idle_release_seconds`, so it can only ever
+make a release EARLIER — unreadable means the normal window, because 0 here
+means "the first quiet tick"), `speech_yields_to_llm` True (the mirror of the
+idle release: a turn whose LLM does not fit on the card may ask the speech
+model for its memory first, and speaks its reply with a freshly loaded voice
+rather than letting the model be offloaded to the CPU. Nothing is asked for
+when the model is already loaded, when the claim fits, when the release would
+not make room, when the size could not be read, while something is speaking, or
+when this is off),
 `notification_reader` False, `notification_mute_apps` [].
 
 Env overrides (only where settings.json has no value): `HANDSOFF_MODEL`,
@@ -53,7 +71,7 @@ atomic + 0600 (`atomic_private_write`, mkstemp in-dir, no predictable
 
 | Path | Format | Cap / note |
 |---|---|---|
-| `CONFIG_DIR/settings.json` | JSON + `version` | the 59 keys above |
+| `CONFIG_DIR/settings.json` | JSON + `version` | the 64 keys above |
 | `CONFIG_DIR/deployment.json` | `{files: {rel: {source_sha256, installed_sha256}}, …}` | written by install.sh; read by `_deployment_snapshot` |
 | `CONFIG_DIR/history.json` | [{role, content, images?}] | token-budget trimmed, images stripped on save |
 | `CONFIG_DIR/memory.json` | [{key, fact}] | ≤24, oldest dropped |

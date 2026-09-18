@@ -25,7 +25,7 @@ settings GUI, systemd service, control socket for keybinds.
 | `10-requirements.md` | functional + non-functional + permission model | `settings_schema.py`, `core/tools.py` |
 | `20-architecture.md` | modules, DI, threads, state machine, voice pipeline | `handsoff.py`, `core/*` |
 | `30-tools-api.md` | 48-tool census, gates, whitelist, confirm/job/watcher contracts | `core/tools.py` (AST) |
-| `40-data.md` | 59 settings keys, state files, caps, formats | `settings_schema.py`, `core/settings.py` |
+| `40-data.md` | 64 settings keys, state files, caps, formats | `settings_schema.py`, `core/settings.py` |
 | `50-ops.md` | install, deploy manifest, systemd, socket, doctor | `install.sh`, `handsoff.py` |
 | `60-test-plan.md` | test inventory, CI gates, coverage | `tests/`, `.github/workflows/ci.yml` |
 | `90-audit.md` | audit findings, ranked risks, drift notes | this audit (2026-09-15) |

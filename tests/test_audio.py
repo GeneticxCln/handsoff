@@ -38,6 +38,528 @@ _core_audio = core_module("audio")
 HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 
 
+class TestGpuFootprint:
+    """What this process is holding on the card, when nothing can measure it.
+
+    `gpu_footprint_mb` is the ESTIMATE behind doctor's `gpu headroom` line —
+    used when the driver attributes no memory to a pid, which not every driver
+    can do. The property that matters is the one the idle release also turns
+    on: a model on cpu occupies NO card memory, so counting it would claim a
+    release could hand back memory it never had. And the devices are reported
+    even at zero, because "tts on cpu" is the fact that explains the zero.
+    """
+
+    def _loaded(self, monkeypatch, *, tts=None, tts_device="", whisper=None,
+                whisper_device="", size="base"):
+        monkeypatch.setattr(_core_audio, "_tts_model", tts)
+        monkeypatch.setattr(_core_audio, "_tts_device", tts_device)
+        monkeypatch.setattr(_core_audio, "_whisper_model", whisper)
+        monkeypatch.setattr(_core_audio, "_whisper_device_used", whisper_device)
+        monkeypatch.setattr(_core_audio, "WHISPER_SIZE", size)
+
+    def test_nothing_loaded_holds_nothing(self, monkeypatch):
+        self._loaded(monkeypatch)
+        out = _core_audio.gpu_footprint_mb()
+        assert out["total_mb"] == 0
+        assert out["tts_loaded"] is False and out["whisper_loaded"] is False
+        assert out["tts_device"] == "" and out["whisper_device"] == "", (
+            "no model means no device to name — not 'cpu'")
+
+    def test_a_cuda_tts_is_its_table_size_and_a_cpu_one_is_nothing(
+            self, monkeypatch):
+        self._loaded(monkeypatch, tts=object(), tts_device="cuda")
+        assert _core_audio.gpu_footprint_mb()["total_mb"] == _core_audio._TTS_VRAM_MB
+
+        self._loaded(monkeypatch, tts=object(), tts_device="cpu")
+        out = _core_audio.gpu_footprint_mb()
+        assert out["total_mb"] == 0 and out["tts_device"] == "cpu", (
+            "a model on cpu occupies no card memory; counting it would be a "
+            "promise the release cannot keep")
+
+    def test_whisper_contributes_its_own_size_only_on_cuda(self, monkeypatch):
+        self._loaded(monkeypatch, whisper=object(), whisper_device="cuda",
+                     size="large-v3")
+        assert _core_audio.gpu_footprint_mb()["whisper_mb"] == 3600
+
+        self._loaded(monkeypatch, whisper=object(), whisper_device="cpu",
+                     size="large-v3")
+        out = _core_audio.gpu_footprint_mb()
+        assert out["whisper_mb"] == 0 and out["whisper_device"] == "cpu"
+
+    def test_the_two_models_add_up(self, monkeypatch):
+        self._loaded(monkeypatch, tts=object(), tts_device="cuda",
+                     whisper=object(), whisper_device="cuda", size="medium")
+        out = _core_audio.gpu_footprint_mb()
+        assert out["total_mb"] == _core_audio._TTS_VRAM_MB + 2600
+
+    def test_an_unknown_size_falls_back_instead_of_raising(self, monkeypatch):
+        self._loaded(monkeypatch, whisper=object(), whisper_device="cuda",
+                     size="no-such-size")
+        assert _core_audio.gpu_footprint_mb()["whisper_mb"] == 3600
+
+
+class TestVramBudget:
+    """ONE budget for the card, so two loaders cannot each pass on their own.
+
+    The failure this exists for: whisper (3.9 GB claim) and speech (3.4 GB) each
+    compared their own size against the SAME free reading and each went cuda
+    into 4.5 GB free. One arithmetic, asked twice, cannot pass twice.
+    """
+
+    def test_a_claim_that_would_take_the_last_of_the_card_is_refused(self):
+        budget = _core_audio.vram_budget(3_500, claim_mb=3_400, owner="speech")
+        assert budget["fits"] is False
+        assert budget["available_mb"] == 3_500 - _core_audio._VRAM_RESERVE_MB
+        assert "4424 MB needed" in budget["reason"], budget["reason"]
+        assert "only 3500 MB is free" in budget["reason"], budget["reason"]
+
+    def test_the_reserve_is_not_optional(self):
+        """A claim that exactly fills the card leaves the desktop nothing."""
+        assert _core_audio.vram_budget(3_400, claim_mb=3_400,
+                                       owner="speech")["fits"] is False
+        free = 3_400 + _core_audio._VRAM_RESERVE_MB
+        at_the_edge = _core_audio.vram_budget(free, claim_mb=3_400,
+                                              owner="speech")
+        assert at_the_edge["fits"] is True
+        assert at_the_edge["available_mb"] - at_the_edge["claim_mb"] == 0, (
+            "a claim that exactly uses the available room fits with nothing to spare")
+
+    def test_memory_another_tenant_is_entitled_to_is_counted(self):
+        """The entitlement is what turns two comparisons into one decision."""
+        refused = _core_audio.vram_budget(5_000, claim_mb=1_400,
+                                          owner="whisper", entitled_mb=3_400)
+        assert refused["fits"] is False
+        assert "3400 MB held back for the speech model" in refused["reason"], (
+            refused["reason"])
+        roomy = _core_audio.vram_budget(9_000, claim_mb=1_400,
+                                        owner="whisper", entitled_mb=3_400)
+        assert roomy["fits"] is True and roomy["available_mb"] == 4_576
+
+    def test_an_unreadable_card_is_never_reported_as_room(self):
+        """N/A is the absence of a reading: not zero free memory, and not a fit."""
+        for reading in (None, "", "   ", "N/A", "[N/A]", "junk", object(),
+                        float("nan"), float("inf"), []):
+            budget = _core_audio.vram_budget(reading, claim_mb=600,
+                                             owner="whisper")
+            assert budget["fits"] is False, reading
+            assert budget["free_mb"] is None, reading
+            assert budget["available_mb"] is None, reading
+            assert "could not be read" in budget["reason"], budget["reason"]
+
+    def test_a_junk_or_negative_claim_is_no_claim(self):
+        """The tables hold ints; a corrupt one must not decide anything oddly."""
+        for claim in (-5, "junk", None, float("inf")):
+            budget = _core_audio.vram_budget(4_000, claim_mb=claim,
+                                             owner="whisper")
+            assert budget["claim_mb"] == 0 and budget["fits"] is True, claim
+        unguarded = _core_audio.vram_budget(600, claim_mb=600, owner="whisper",
+                                            reserve_mb="junk")
+        assert unguarded["reserved_mb"] == 0 and unguarded["fits"] is True, (
+            "a corrupt reserve must not make the budget refuse or crash")
+
+    def test_the_reason_carries_its_arithmetic(self):
+        """A refusal nobody can explain is a device choice nobody can debug."""
+        budget = _core_audio.vram_budget(6_267, claim_mb=1_400, owner="whisper")
+        assert budget["reason"] == (
+            "1400 MB claim fits: 6267 MB free less 1024 MB reserve "
+            "= 5243 MB available"), budget["reason"]
+
+
+class TestOneBudgetDecidesBothLoaders:
+    """The property rather than the arithmetic: ONE budget, asked by both.
+
+    Each loader keeps its own two-value answer and its own fallback, but the
+    card's arithmetic exists once — so the day the reserve, the entitlement or
+    the unknown-card rule changes, both loaders change together.
+    """
+
+    def _auto(self, monkeypatch, *, tts_device="auto", tts_model=None,
+              tts_loaded_device="", cuda=True):
+        # _torch_cuda_available is pinned in every test here: the real one
+        # imports torch, which this suite forbids, and its answer would make a
+        # test's outcome depend on the machine running it.
+        monkeypatch.setattr(_core_audio, "_torch_cuda_available", lambda: cuda)
+        monkeypatch.setattr(_core_audio, "TTS_DEVICE", tts_device)
+        monkeypatch.setattr(_core_audio, "_tts_model", tts_model)
+        monkeypatch.setattr(_core_audio, "_tts_device", tts_loaded_device)
+
+    def test_both_loaders_ask_the_same_budget(self, monkeypatch):
+        seen = []
+
+        def spy(free_mb, **kwargs):
+            seen.append((free_mb, kwargs))
+            return {"fits": True, "available_mb": 9_999, "reason": "spy"}
+
+        self._auto(monkeypatch)
+        monkeypatch.setattr(_core_audio, "vram_budget", spy)
+
+        assert _core_audio._whisper_device_choice("base", 9_000) == ("cuda", "float16")
+        assert _core_audio.tts_device_choice(9_000) == "cuda"
+
+        assert [kwargs["owner"] for _free, kwargs in seen] == ["whisper", "speech"]
+        assert seen[0][1]["entitled_mb"] == _core_audio._TTS_VRAM_MB, (
+            "whisper must leave the speech model room")
+        assert seen[1][1].get("entitled_mb", 0) == 0, (
+            "speech yields to nothing: a resident whisper is already inside "
+            "the free reading")
+
+    def test_whisper_gives_way_to_a_speech_model_that_has_not_loaded_yet(
+            self, monkeypatch):
+        self._auto(monkeypatch)
+        # Room for whisper alone, not for the pair: whisper is the one that moves.
+        assert _core_audio._whisper_device_choice("small", 4_500) == ("cpu", "int8")
+        assert _core_audio._whisper_device_choice("small", 9_000) == ("cuda", "float16")
+
+    def test_a_resident_speech_model_is_not_reserved_twice(self, monkeypatch):
+        self._auto(monkeypatch, tts_model=object(), tts_loaded_device="cuda")
+        assert _core_audio._speech_vram_claim_mb() == 0, (
+            "its memory is already inside the driver's free reading")
+        assert _core_audio._whisper_device_choice("small", 3_000) == ("cuda", "float16")
+
+    def test_speech_configured_for_cpu_leaves_whisper_the_whole_card(
+            self, monkeypatch):
+        self._auto(monkeypatch, tts_device="cpu")
+        assert _core_audio._speech_vram_claim_mb() == 0
+        assert _core_audio._whisper_device_choice("small", 3_000) == ("cuda", "float16")
+
+    def test_an_unreadable_card_answers_cpu_for_both(self, monkeypatch):
+        self._auto(monkeypatch)
+        assert _core_audio._whisper_device_choice("small", None) == ("cpu", "int8")
+        assert _core_audio.tts_device_choice(None) == "cpu"
+        assert "could not be read" in _core_audio._tts_plan(None)["reason"]
+
+    def test_a_configured_device_beats_the_budget_and_still_says_so(
+            self, monkeypatch):
+        self._auto(monkeypatch)
+        plan = _core_audio._tts_plan(1_000, "cuda")
+        assert plan["device"] == "cuda", (
+            "the user's choice is not a budget question")
+        assert plan["authority"] == "configured" and plan["fits"] is False
+        assert "only 1000 MB is free" in plan["reason"], plan["reason"]
+        assert _core_audio.tts_device_choice(99_000, "cpu") == "cpu"
+
+    def test_no_cuda_device_means_cpu_whatever_the_card_says(self, monkeypatch):
+        self._auto(monkeypatch, cuda=False)
+        plan = _core_audio._tts_plan(99_000)
+        assert plan["device"] == "cpu" and plan["authority"] == "budget"
+        assert "no CUDA device" in plan["reason"], plan["reason"]
+
+    def test_the_whisper_loader_asks_the_budget_and_says_why(
+            self, monkeypatch, caplog):
+        """End to end: the plan reaches the loader, and the journal explains it."""
+        loaded = []
+
+        class _WhisperModel:
+            def __init__(self, size, device=None, compute_type=None,
+                         download_root=None, local_files_only=None):
+                loaded.append((size, device, compute_type))
+
+        module = types.ModuleType("faster_whisper")
+        module.WhisperModel = _WhisperModel
+        monkeypatch.setitem(sys.modules, "faster_whisper", module)
+        monkeypatch.setattr(_core_audio, "_whisper_model", None)
+        monkeypatch.setattr(_core_audio, "_whisper_cpu_fallback", False)
+        monkeypatch.setattr(_core_audio, "WHISPER_DEVICE", "auto")
+        monkeypatch.setattr(_core_audio, "WHISPER_SIZE", "small")
+        monkeypatch.setattr(_core_audio, "WHISPER_MODEL_DIR", Path("/nonexistent"))
+        monkeypatch.setattr(_core_audio, "_nvidia_free_vram_mb", lambda: 4_500)
+        self._auto(monkeypatch)          # speech is still coming: whisper yields
+
+        with caplog.at_level("WARNING", logger="handsoff"):
+            _core_audio.get_whisper()
+
+        assert loaded == [("small", "cpu", "int8")], loaded
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "held back for the speech model" in said, said
+
+
+class TestTheSpeechYieldsToTheLlm:
+    """`yield_to_llm_verdict` — the mirror of the speech model's reclaim.
+
+    A turn needs the card, and the tenant that can move is this process's own
+    speech model: seconds to reload, where Ollama's own answer to a full card is
+    to offload half the model to the CPU and serve every token at a fraction of
+    the on-card speed. The verdict is the SAME budget the two loaders ask
+    (`vram_budget`), with the roles swapped — the LLM claims, and this process's
+    memory is the entitlement that may have to yield — so the two cannot
+    disagree about what fits.
+    """
+
+    def test_nothing_of_ours_on_the_card_is_nothing_to_ask_for(self):
+        out = _core_audio.yield_to_llm_verdict(900, 5_000, held_mb=0)
+
+        assert out["yield"] is False and out["tight"] is False
+        assert "holds nothing on the card" in out["note"]
+
+    def test_a_claim_that_already_fits_is_not_a_reason_to_evict(self):
+        out = _core_audio.yield_to_llm_verdict(9_000, 5_000, held_mb=3_400)
+
+        assert out["yield"] is False and out["tight"] is False, (
+            "releasing memory the card does not need buys nothing and costs a "
+            "voice reload on the next reply")
+        assert "fits already" in out["note"]
+        assert "7976 MB available" in out["note"], out["note"]
+
+    def test_the_yield_is_the_loaders_budget_with_the_memory_put_back(self):
+        free, claim, held = 3_000, 5_000, 3_400
+        out = _core_audio.yield_to_llm_verdict(free, claim, held_mb=held)
+
+        assert out["yield"] is True, out["note"]
+        assert out["tight"] is True, "the claim does not fit as things stand"
+        assert _core_audio.vram_budget(free, claim_mb=claim, owner="llm",
+                                       entitled_mb=held)["fits"] is False
+        assert _core_audio.vram_budget(free + held, claim_mb=claim,
+                                       owner="llm")["fits"] is True
+        assert out["available_after_mb"] == (free + held) - _core_audio._VRAM_RESERVE_MB, (
+            "the room the claim would have once this process's memory is back")
+        assert "3400 MB of this card is this process's own models" in out["note"]
+
+    def test_the_reserve_is_never_traded_away(self):
+        """The compositor's room is not the speech model's to give."""
+        free, held = 3_000, 3_400
+        one_too_many = free + held - _core_audio._VRAM_RESERVE_MB + 1
+
+        assert _core_audio.yield_to_llm_verdict(
+            free, one_too_many, held_mb=held)["yield"] is False
+        assert _core_audio.yield_to_llm_verdict(
+            free, one_too_many, held_mb=held,
+            reserve_mb=0)["yield"] is True, (
+            "the refusal came from the reserve, and this proves it")
+
+    def test_memory_that_would_not_make_room_is_not_handed_back(self):
+        out = _core_audio.yield_to_llm_verdict(2_000, 20_000, held_mb=3_400)
+
+        assert out["yield"] is False and out["tight"] is True
+        assert "would not make room" in out["note"], out["note"]
+        assert "21024 MB needed" in out["note"], out["note"]
+
+    def test_an_unreadable_claim_is_not_weighed(self):
+        for claim in (None, "junk", "", float("inf"), "N/A"):
+            out = _core_audio.yield_to_llm_verdict(2_000, claim, held_mb=3_400)
+
+            assert out["yield"] is False and out["tight"] is False, claim
+            assert "could not be read" in out["note"], out["note"]
+
+    def test_an_unreadable_card_is_not_evidence_for_an_eviction(self):
+        """What this decision spends is a reload, so an unknown is not a reason.
+
+        The speech half of this pair releases on an unreadable card because its
+        alternative is a stalled utterance; here the alternative is only that
+        Ollama decides the offload for itself.
+        """
+        out = _core_audio.yield_to_llm_verdict(None, 5_000, held_mb=3_400)
+
+        assert out["yield"] is False and out["tight"] is False
+        assert "free memory could not be read" in out["note"]
+        assert "3400 MB is held here" in out["note"], out["note"]
+
+    def test_the_arithmetic_travels_with_the_answer(self):
+        out = _core_audio.yield_to_llm_verdict(3_000, 5_000, held_mb=3_400)
+
+        assert out["free_mb"] == 3_000 and out["claim_mb"] == 5_000
+        assert out["held_mb"] == 3_400
+        assert "5376 MB available" in out["note"], out["note"]
+
+
+class TestTheSpeechModelAsksForTheCard:
+    """A refused speech claim asks the LLM for the card before giving way.
+
+    The budget's refusal is about ROOM, and the tenant holding it is usually
+    the LLM — which the HOST can ask to let go. The policy belongs to the host
+    (it is the one that knows what a reload costs), so this calls an injected
+    hook and re-plans against a reading taken AFTERWARDS. Two properties
+    matter: a reclaim that frees nothing must never turn a refusal into a
+    claim, and the journal has to say which tenant moved.
+    """
+
+    def _ready(self, monkeypatch, readings, *, hook=None, tts_device="auto"):
+        """Speech on auto, no model loaded, nvidia-smi readings in order.
+
+        `readings` is what each nvidia-smi read inside the call returns, the
+        last one repeating — the core module takes no reading of its own before
+        the hook, so one value is the normal case. Returns the list of readings
+        SERVED, so a test can assert that no second measurement was taken.
+        """
+        monkeypatch.setattr(_core_audio, "_torch_cuda_available", lambda: True)
+        monkeypatch.setattr(_core_audio, "TTS_DEVICE", tts_device)
+        monkeypatch.setattr(_core_audio, "_tts_model", None)
+        monkeypatch.setattr(_core_audio, "_tts_device", "")
+        rest = list(readings)
+        served = []
+
+        def read():
+            value = rest.pop(0) if len(rest) > 1 else rest[0]
+            served.append(value)
+            return value
+
+        monkeypatch.setattr(_core_audio, "_nvidia_free_vram_mb", read)
+        monkeypatch.setattr(_core_audio, "_GPU_RECLAIM", hook)
+        return served
+
+    WON = "ollama dropped qwen3.8:27b for the speech model — 7206 MB came back"
+
+    def test_a_refusal_is_escalated_and_the_card_can_be_won(self, monkeypatch):
+        asked = []
+
+        def hook(reason):
+            asked.append(reason)
+            return {"gave_way": True, "freed_mb": 7_206, "detail": self.WON}
+
+        self._ready(monkeypatch, [9_000], hook=hook)
+
+        plan = _core_audio._ask_for_the_card(_core_audio._tts_plan(1_500), "auto")
+
+        assert plan["device"] == "cuda" and plan["fits"] is True
+        assert plan["reclaim"] == self.WON, "the sentence the journal prints"
+        assert asked and "claim refused" in asked[0], (
+            "the host decides on the refusal, so it is told the refusal")
+
+    def test_a_reclaim_is_re_planned_against_the_reading_after_it(self, monkeypatch):
+        """The gain is measured, not assumed: the new reading is what decides."""
+        self._ready(monkeypatch, [3_000],
+                    hook=lambda reason: {"gave_way": True, "detail": self.WON})
+
+        plan = _core_audio._ask_for_the_card(_core_audio._tts_plan(1_500), "auto")
+
+        assert plan["device"] == "cpu", (
+            "3000 MB free is still not a 3400 MB model plus the reserve")
+        assert "only 3000 MB is free" in plan["reason"], plan["reason"]
+        assert plan["reclaim"] == self.WON, (
+            "the tenant that moved is still the fact worth saying")
+
+    def test_a_tenant_that_does_not_move_changes_nothing(self, monkeypatch):
+        """A refusal is the answer, and a refusal buys no second measurement.
+
+        The hook's `gave_way` is what entitles a re-decision: without it the
+        claim is not re-planned at all, so a card that happens to have room on
+        a second look cannot turn "the LLM kept its memory" into a GPU load.
+        """
+        served = self._ready(monkeypatch, [1_500, 9_000],
+                             hook=lambda reason: {
+                                 "gave_way": False, "freed_mb": None,
+                                 "detail": "the LLM did not give the card "
+                                           "back — nothing resident"})
+
+        plan = _core_audio._ask_for_the_card(_core_audio._tts_plan(1_500), "auto")
+
+        assert plan["device"] == "cpu" and plan["fits"] is False
+        assert "nothing resident" in plan["reclaim"]
+        assert served == [], (
+            "nobody promised the memory back, so there is nothing to re-measure")
+
+    def test_a_card_that_could_not_be_read_is_not_asked_about(self, monkeypatch):
+        asked = []
+        self._ready(monkeypatch, [None],
+                    hook=lambda reason: asked.append(reason) or {})
+
+        plan = _core_audio._ask_for_the_card(_core_audio._tts_plan(None), "auto")
+
+        assert asked == [], (
+            "a reclaim is not a way to guess at a card nobody can read")
+        assert plan["device"] == "cpu" and "could not be read" in plan["reason"]
+
+    def test_without_a_hook_the_refusal_stands(self, monkeypatch):
+        self._ready(monkeypatch, [1_500], hook=None)
+
+        plan = _core_audio._ask_for_the_card(_core_audio._tts_plan(1_500), "auto")
+
+        assert plan["device"] == "cpu" and "reclaim" not in plan
+
+    def test_a_hook_that_raises_leaves_the_refusal_standing(
+            self, monkeypatch, caplog):
+        def hook(reason):
+            raise RuntimeError("the policy is broken")
+
+        self._ready(monkeypatch, [1_500], hook=hook)
+
+        with caplog.at_level("WARNING", logger="handsoff"):
+            plan = _core_audio._ask_for_the_card(_core_audio._tts_plan(1_500),
+                                                 "auto")
+
+        assert plan["device"] == "cpu" and "reclaim" not in plan
+        assert any("reclaim hook raised" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_a_junk_answer_is_not_a_reclaim(self, monkeypatch):
+        for answer in (None, "yes", 7, [], {}):
+            self._ready(monkeypatch, [1_500],
+                        hook=lambda reason, a=answer: a)
+            plan = _core_audio._ask_for_the_card(_core_audio._tts_plan(1_500),
+                                                 "auto")
+            assert plan["device"] == "cpu", answer
+            assert not plan.get("reclaim"), answer
+
+    def _fake_tts(self, monkeypatch):
+        """Chatterbox as the loader imports it: records the device it was given."""
+        loaded = []
+
+        class _FakeTTS:
+            @classmethod
+            def from_pretrained(cls, device=None):
+                loaded.append(device)
+                return cls()
+
+        package = types.ModuleType("chatterbox")
+        package.__path__ = []
+        module = types.ModuleType("chatterbox.tts_turbo")
+        module.ChatterboxTurboTTS = _FakeTTS
+        monkeypatch.setitem(sys.modules, "chatterbox", package)
+        monkeypatch.setitem(sys.modules, "chatterbox.tts_turbo", module)
+        monkeypatch.setattr(_core_audio, "TTS_REFERENCE", "")
+        return loaded
+
+    def test_the_loader_wins_the_card_and_the_journal_says_which_tenant_moved(
+            self, monkeypatch, caplog):
+        loaded = self._fake_tts(monkeypatch)
+        # The loader's own read is tight; the read AFTER the reclaim has room.
+        self._ready(monkeypatch, [1_500, 9_000],
+                    hook=lambda reason: {"gave_way": True, "detail": self.WON})
+
+        with caplog.at_level("INFO", logger="handsoff"):
+            model = _core_audio.get_tts()
+
+        assert loaded == ["cuda"], loaded
+        assert _core_audio._tts_device == "cuda" and _core_audio._tts_model is model
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "ollama dropped qwen3.8:27b" in said, said
+        assert "speech model takes the card" in said, said
+
+    def test_the_loader_gives_way_and_the_journal_names_both_reasons(
+            self, monkeypatch, caplog):
+        loaded = self._fake_tts(monkeypatch)
+        self._ready(monkeypatch, [1_500], hook=lambda reason: {
+            "gave_way": False, "detail": "the LLM did not give the card back"})
+
+        with caplog.at_level("WARNING", logger="handsoff"):
+            _core_audio.get_tts()
+
+        assert loaded == ["cpu"], loaded
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "fell back to cpu" in said and "the LLM did not give the card back" in said, said
+
+    def test_a_configured_device_never_evicts_the_llm(self, monkeypatch):
+        """An explicit `cpu` is not a budget refusal, so there is nothing to ask."""
+        loaded = self._fake_tts(monkeypatch)
+        asked = []
+        self._ready(monkeypatch, [1_500], tts_device="cpu",
+                    hook=lambda reason: asked.append(reason) or {})
+
+        _core_audio.get_tts()
+
+        assert asked == [] and loaded == ["cpu"], (asked, loaded)
+
+    def test_a_whisper_load_never_evicts_the_llm(self, monkeypatch):
+        """The ears yield to speech by design; they do not evict the LLM."""
+        asked = []
+        self._ready(monkeypatch, [1_500],
+                    hook=lambda reason: asked.append(reason) or {})
+
+        assert _core_audio._whisper_device_choice("small", 1_500) == ("cpu", "int8")
+        assert asked == [], (
+            "a startup whisper load must not evict the model the bubble just "
+            "warmed — whisper is the one that yields")
+
+
 class TestModelCacheDropIsFinal:
     """A settings reload drops the model caches; a call in flight must not undo it.
 
