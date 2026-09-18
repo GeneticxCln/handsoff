@@ -2024,7 +2024,10 @@ class BubbleWidget(QWidget):
         # animation energy follows the state (halo/specular intensity)
         ke = 1.0 - math.exp(-dt * 4.0)
         self._energy_ui += (_fx_energy(self._state) - self._energy_ui) * ke
-        # radius spring: critically-damped-ish chase, settles without overshoot
+        # radius spring: a damped chase (zeta ~0.72), so it MISSES the target
+        # once by ~2-4% of the travel and rings down inside ~0.3 s of frames.
+        # Measured and pinned in tests/test_bubble_anim.py — an earlier comment
+        # here claimed "no overshoot", which the arithmetic never did.
         want = self._radius_target(now)
         if self._radius_ui is None:
             self._radius_ui, self._radius_vel = want, 0.0
