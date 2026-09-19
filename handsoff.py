@@ -5540,19 +5540,36 @@ class Assistant(QObject):
 
     def mic_health(self) -> dict:
         """One JSON-ready snapshot of the assistant's vital signs: mic health
-        (same state machine as the journal lines), brain (Ollama + model) and
-        TTS (chatterbox) status. Served over the control socket as `health`;
-        kept free of Qt/logging side effects so it is trivially testable.
+        (same state machine as the journal lines), the notification reader's
+        own counters, brain (Ollama + model) and TTS (chatterbox) status.
+        Served over the control socket as `health`; kept free of Qt/logging side
+        effects so it is trivially testable.
 
         `tts.engine` and `tts.reference` are reported rather than just ready/
         not, because "ready" is not enough to tell a built-in-voice bubble from
-        one that failed to condition on a reference clip."""
+        one that failed to condition on a reference clip. `notifications` is
+        there for the same reason on the other input: the reader says nothing
+        when it works AND said nothing when its monitor was wedged, so "quiet"
+        cannot be read as health without its pass count and retry budget."""
         snap = {
             "assistant": self.state,
             "handsfree": bool(self._handsfree),
             "followup_armed": _tick_now() < self._followup_until,
         }
         snap["mic"] = self._listener.mic_snapshot()
+        reader = getattr(self, "_notifications", None)
+        # Through the strict flag reader, like every other boolean setting: it
+        # never writes (no `repair`), so this stays side-effect free, and a
+        # hand-edited `"false"` cannot report the reader as on.
+        reader_on = _setting_flag("notification_reader", False)
+        # getattr, not self._notifications: an embedder (and the suite) builds an
+        # Assistant with __new__ for the turn pipeline alone, and this snapshot
+        # is queried on hosts that never built a reader — it must not be the one
+        # call that raises there.
+        snap["notifications"] = (
+            reader.health(enabled=reader_on) if reader is not None
+            else _core_assistant.NotificationReader.absent_health(
+                enabled=reader_on))
         snap["brain"] = {
             "model": OLLAMA_MODEL,
             "host": OLLAMA_BASE,

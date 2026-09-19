@@ -21,7 +21,7 @@ nothing — a missing row does.
 | `test_policy.py` | 100 | DecisionPolicy, gates, confirm flow, whitelist/blocked |
 | `test_design_packs.py` | 98 | packs, image design, palettes, ink guard |
 | `test_bubble_anim.py` | 11 | the tick driven frame by frame: the step, the level chase, colour/energy, the radius spring |
-| `test_settings.py` | 82 | loader/coerce/migrate/merge/lock, looks catalogue |
+| `test_settings.py` | 84 | loader/coerce/migrate/merge/lock, looks catalogue, health snapshot |
 | `test_settings_contract.py` | 24 | the field table: coercion, controls, cards, companion rows, the window |
 | `test_lifecycle.py` | 99 | generations, staleness, PTT epoch, cancel/done, installer membership + rehearsal, restart-script behaviour (each on a fixture it builds) |
 | `test_ops.py` | 76 | deploy snapshot, restart, control socket, health/doctor, and what the installer provisions from (the shipped resolvers RUN against fixture settings: the configured whisper size and its refusal of a size the app would not accept, the configured model, the configured server with the app's strict remote opt-in on both channels, the speech repo read out of `core/audio.py`, the app-id read out of `handsoff.py` and substituted into the niri rule, and every `DEFAULT_*` held against the app's own default — plus the rehearsal end-to-end where step 5 says 'small' and the manifest records it) |
@@ -36,7 +36,7 @@ nothing — a missing row does.
 | `test_theme.py` | 34 | hex parse, luminance, retune |
 | `test_hardening.py` | 34 | perms, symlink/0600, token, caps, the no-core fallbacks (audio, brain) |
 | `test_registry.py` | 30 | BoundedRegistry admission, Offer arm/consume |
-| `test_assistant.py` | 26 | pomodoro/notifications/reminders/watcher ticks |
+| `test_assistant.py` | 32 | pomodoro/notifications/reminders/watcher ticks, reader health |
 | `test_world_events.py` | 24 | fixed queries, severity, seen-store, cooldowns |
 | `test_notify_coalesce.py` | 15 | notification batching/cooldown |
 | `test_hardware_watch.py` | 13 | hardware watch tick, disk/VRAM alerts |

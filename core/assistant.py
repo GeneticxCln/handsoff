@@ -252,6 +252,12 @@ class NotificationReader:
 
     APP_COOLDOWN = 60.0  # one spoken digest per app per minute, max
     SLOT = "dbus-monitor"  # the one name the reader slot is registered under
+    # The retry policy, as numbers the health snapshot reports rather than
+    # prose the docstring repeats: what `--ptt health` shows as the budget and
+    # the wait is exactly what `run` enforces.
+    ATTEMPT_BUDGET = 5    # monitor respawns/retries before the reader gives up
+    BACKOFF_START = 1.0   # seconds before the first retry; doubles to…
+    BACKOFF_MAX = 30.0    # …this ceiling
 
     def __init__(self, *, spawn, is_closed, announce, muted, popen_factory,
                  persist) -> None:
@@ -264,6 +270,14 @@ class NotificationReader:
         self._runs = BoundedRegistry("notification-reader", 1)
         self._cooldown_lock = threading.Lock()
         self._app_last: dict[str, float] = {}
+        # What `--ptt health` reads. This reader is silent BY DESIGN — it speaks
+        # only when someone else's notification arrives — so "nothing was said"
+        # is the healthy state, and it was also the state of a reader wedged in
+        # a retry loop (which logged one traceback per pass and nothing else).
+        # These counters are the difference. One lock, so a snapshot can never
+        # see half a pair: a failure with no attempt spent, or the reverse.
+        self._health_lock = threading.Lock()
+        self._health = self._blank_health()
 
     # -- the live run, as views onto the registered slot -----------------------
     # Kept as attributes' names because the assistant, the doctor and the tests
@@ -283,11 +297,126 @@ class NotificationReader:
         run = self._runs.get(self.SLOT)
         return run.stop if run is not None else None
 
+    # -- health, for the `health` snapshot ------------------------------------
+    @staticmethod
+    def _blank_health() -> dict:
+        """The reader's own counters, all zero. One dict, one shape."""
+        return {
+            "passes": 0,              # loop() sessions entered (monitor lives)
+            "notifications": 0,       # Notify messages the monitor printed
+            "failures": 0,            # passes that raised, respawns that failed
+            "attempts_used": 0,       # retry budget spent so far
+            "backoff_seconds": 0.0,   # the wait the next retry will take
+            "pass_started_at": None,  # monotonic; None between passes
+            "gave_up": False,         # budget spent, so it turned itself off
+            "last_failure": None,     # {"where", "error", "at"} (at=monotonic)
+        }
+
+    def _health_update(self, **fields) -> None:
+        with self._health_lock:
+            self._health.update(fields)
+
+    def _health_bump(self, key: str, by: int = 1) -> None:
+        with self._health_lock:
+            self._health[key] += by
+
+    def _note_failure(self, where: str, error: BaseException) -> None:
+        """Count a failure AND remember it.
+
+        The count alone cannot tell a wedged monitor from an unreadable one,
+        and the journal says nothing at all once the reader gives up — so the
+        last failure rides along, aged from the same monotonic clock the rest
+        of the snapshot uses rather than a wall clock that needs calibrating.
+        """
+        with self._health_lock:
+            self._health["failures"] += 1
+            self._health["last_failure"] = {
+                "where": where,
+                "error": f"{type(error).__name__}: {error}"[:200],
+                "at": time.monotonic(),
+            }
+
+    def _note_attempt(self, attempts: int, backoff: float) -> None:
+        self._health_update(attempts_used=attempts, backoff_seconds=backoff)
+
+    @classmethod
+    def _snapshot(cls, counters: dict, *, enabled, running: bool) -> dict:
+        """The JSON-ready snapshot: counters + liveness -> one shape."""
+        now = time.monotonic()
+        last = counters["last_failure"]
+        started = counters["pass_started_at"]
+        if running:
+            # `stopping` is a real state, not a nicety: `off` joins the worker,
+            # and a worker that outlived its join budget keeps the slot — so the
+            # setting can read off while a reader is still up.
+            state = ("stopping" if enabled is False else
+                     ("retrying" if counters["attempts_used"] else "running"))
+        elif counters["gave_up"]:
+            state = "gave-up"
+        elif enabled:
+            # The worst state this reader can be in: the toggle says on and
+            # nothing is left to hear anything. Before this it looked exactly
+            # like a quiet desktop.
+            state = "stalled"
+        else:
+            state = "off"
+        return {
+            "enabled": enabled,
+            "state": state,
+            "running": running,
+            "passes": counters["passes"],
+            "notifications": counters["notifications"],
+            "failures": counters["failures"],
+            "attempts_used": counters["attempts_used"],
+            "attempts_budget": cls.ATTEMPT_BUDGET,
+            "backoff_seconds": counters["backoff_seconds"],
+            # How long the monitor has been parked on stdout. Normal to be
+            # LARGE — notifications are rare — which is why the wedge signal is
+            # `failures`, never this.
+            "pass_seconds": None if started is None else round(now - started, 3),
+            "gave_up": counters["gave_up"],
+            "last_failure": None if last is None else {
+                "where": last["where"],
+                "error": last["error"],
+                "age_seconds": round(now - last["at"], 3),
+            },
+        }
+
+    def health(self, *, enabled: bool | None = None) -> dict:
+        """One JSON-ready snapshot of the reader's own vital signs.
+
+        Served as part of `--ptt health`; free of Qt, logging and I/O so it is
+        trivially testable. `enabled` is the live setting, passed in because the
+        reader does not read SETTINGS — and it is what makes `stalled` visible,
+        the one state a caller cannot infer from the reader's internals.
+        """
+        with self._health_lock:
+            counters = dict(self._health)
+        run = self._runs.get(self.SLOT)
+        return self._snapshot(counters, enabled=enabled,
+                              running=run is not None and run.alive())
+
+    @classmethod
+    def absent_health(cls, *, enabled: bool | None = None) -> dict:
+        """`health()` for a host that has no reader object at all.
+
+        Not a test artifact: `Assistant` is built with `__new__` by the suite
+        and by an embedder that only wants the turn pipeline, and the health
+        snapshot must not be the one call that raises on such a host. The
+        absent case reports the SAME keys, with the state of a reader that
+        never ran, so `--ptt health` has one shape whatever it is asked.
+        """
+        return cls._snapshot(cls._blank_health(), enabled=enabled, running=False)
+
     def set_enabled(self, enabled: bool):
         """Start/stop the monitor; muted apps are filtered before TTS."""
         if enabled:
             if self._is_closed():
                 return "ERROR: assistant is shut down"
+            # Fresh counters for a fresh run, reset BEFORE the worker starts:
+            # resetting after it would wipe its first pass. `health` describes
+            # the reader that is live now, not the one before the last toggle.
+            self._health_update(**self._blank_health())
             slot = self._runs.reserve(
                 self.SLOT, reclaim=lambda run: not run.alive())
             if slot is None:
@@ -354,6 +483,8 @@ class NotificationReader:
 
     def loop(self, proc, stop: threading.Event) -> None:
         values: list[str] | None = None  # None: between messages, ignore trailers
+        self._health_bump("passes")
+        self._health_update(pass_started_at=time.monotonic())
         try:
             for line in proc.stdout or ():
                 if stop.is_set():
@@ -376,6 +507,10 @@ class NotificationReader:
                 if len(values) >= 4:
                     app, _icon, summary, body = values[:4]
                     values = None  # consumed: one utterance per message
+                    # Observed, not spoken: this counts what the monitor handed
+                    # us, so a reader whose mute list swallowed everything is
+                    # distinguishable from a monitor that printed nothing.
+                    self._health_bump("notifications")
                     try:
                         if self._muted(app, summary, body):
                             log.info("notification muted from %s", app)
@@ -405,6 +540,7 @@ class NotificationReader:
             if not stop.is_set():
                 log.exception("notification reader stopped unexpectedly")
         finally:
+            self._health_update(pass_started_at=None)
             if proc is not None and proc.poll() is None:
                 try:
                     proc.terminate()
@@ -414,8 +550,8 @@ class NotificationReader:
     def run(self, stop: threading.Event, run=None) -> None:
         """Production wrapper: run loop(), respawning dbus-monitor with
         bounded backoff when its stdout is exhausted OR a pass raises. At most
-        5 respawns/retries, 1s→30s exponential backoff; gives up quietly when
-        disabled.
+        ATTEMPT_BUDGET respawns/retries, 1s→30s exponential backoff; gives up
+        quietly when disabled.
 
         `run` is the registered slot record when this worker was started by
         set_enabled(); a direct call (tests, embedding) has none, and then there
@@ -423,9 +559,9 @@ class NotificationReader:
         """
         if run is None:
             run = self._runs.get(self.SLOT)
-        backoff = 1.0
+        backoff = self.BACKOFF_START
         attempts = 0
-        while not stop.is_set() and attempts < 5:
+        while not stop.is_set() and attempts < self.ATTEMPT_BUDGET:
             proc = run.proc if run is not None else None
             if proc is None or (hasattr(proc, "poll") and proc.poll() is not None):
                 # previous monitor died — respawn it under backoff
@@ -440,16 +576,19 @@ class NotificationReader:
                     if run is not None:
                         run.proc = proc
                     log.warning("notification reader respawned (attempt %d)", attempts + 1)
-                except Exception:
+                except Exception as e:
                     log.exception("notification reader respawn failed")
-                    backoff = min(backoff * 2.0, 30.0)
+                    self._note_failure("respawn", e)
+                    backoff = min(backoff * 2.0, self.BACKOFF_MAX)
                     attempts += 1
+                    self._note_attempt(attempts, backoff)
                     continue
-                backoff = min(backoff * 2.0, 30.0)
+                backoff = min(backoff * 2.0, self.BACKOFF_MAX)
                 attempts += 1
+                self._note_attempt(attempts, backoff)
             try:
                 self.loop(proc, stop)
-            except Exception:
+            except Exception as e:
                 # A pass that RAISES is not exhaustion. The monitor can still
                 # poll as alive (a wedged dbus-monitor whose stdout read died),
                 # and then the branch above is skipped on the next iteration —
@@ -459,10 +598,12 @@ class NotificationReader:
                 # an attempt, so a permanent error gives up like a dead monitor
                 # rather than burning a core silently.
                 log.exception("notification reader pass failed")
+                self._note_failure("pass", e)
                 if stop.wait(backoff):
                     return
-                backoff = min(backoff * 2.0, 30.0)
+                backoff = min(backoff * 2.0, self.BACKOFF_MAX)
                 attempts += 1
+                self._note_attempt(attempts, backoff)
                 continue
             if stop.is_set():
                 return
@@ -475,6 +616,9 @@ class NotificationReader:
         if not stop.is_set():
             log.error("notification reader gave up after %d monitor respawns — "
                       "turning it off", attempts)
+            # Recorded before the persist, so a snapshot taken while the write
+            # is in flight already says `gave-up` rather than `stalled`.
+            self._health_update(gave_up=True)
             if run is not None:
                 # The corpse stays registered: the slot is still occupied by
                 # this (still-running) worker, and the reclaim predicate frees

@@ -564,3 +564,145 @@ def test_a_pass_that_raises_spends_the_budget_instead_of_spinning():
         "no backoff between passes — a permanent error burned a core")
     assert saved and saved[-1] == ("notification_reader", False), (
         "giving up must still take the toggle with it")
+
+
+# ------------------------------------------------ the reader's own health
+# What `--ptt health` reads. This reader is silent BY DESIGN — it speaks only
+# when someone else's notification arrives — so "it said nothing" cannot tell a
+# working reader from a wedged one, and that was exactly the state a wedged one
+# was in. These pin the counters that can, and the states they resolve to.
+
+_HEALTH_KEYS = {
+    "enabled", "state", "running", "passes", "notifications", "failures",
+    "attempts_used", "attempts_budget", "backoff_seconds", "pass_seconds",
+    "gave_up", "last_failure",
+}
+
+
+def _one_notify_lines(app="Firefox", summary="hi", body="there"):
+    """One minimal dbus-monitor Notify message: the header, then the four
+    payload strings `loop()` consumes."""
+    return [
+        ("method call time=1.0 sender=:1.5 -> destination=:1.6 serial=7 "
+         "path=/org/freedesktop/Notifications; "
+         "interface=org.freedesktop.Notifications; member=Notify"),
+        f'   string "{app}"',
+        "   uint32 0",
+        '   string ""',
+        f'   string "{summary}"',
+        f'   string "{body}"',
+    ]
+
+
+def test_reader_health_has_one_shape_before_it_ever_runs():
+    """`--ptt health` answers with the same keys whether or not a reader was
+    ever built: the bubble serves this from its control-socket thread, where a
+    KeyError is the whole snapshot lost."""
+    from core.assistant import NotificationReader
+    reader = _reader([])
+    h = reader.health(enabled=False)
+    assert set(h) == _HEALTH_KEYS, set(h) ^ _HEALTH_KEYS
+    assert (h["state"], h["running"], h["passes"], h["notifications"],
+            h["failures"], h["gave_up"], h["last_failure"]) == (
+        "off", False, 0, 0, 0, False, None)
+    assert h["attempts_used"] == 0
+    assert h["attempts_budget"] == reader.ATTEMPT_BUDGET
+    assert h["pass_seconds"] is None
+    json.dumps(h)          # the socket hands this out as JSON, always
+    # ...and a host with no reader object at all reports the same shape.
+    assert set(NotificationReader.absent_health(enabled=True)) == _HEALTH_KEYS
+
+
+def test_reader_health_counts_passes_and_notifications():
+    """A pass, and the messages it carried: the only evidence that a monitor
+    nobody can see is actually producing anything."""
+    reader = _reader([])
+    proc = types.SimpleNamespace(stdout=iter(_one_notify_lines()), poll=lambda: 0)
+    reader.loop(proc, threading.Event())
+    h = reader.health(enabled=True)
+    assert h["passes"] == 1 and h["notifications"] == 1, h
+    assert h["failures"] == 0 and h["last_failure"] is None
+    assert h["pass_seconds"] is None, "a finished pass must not read as quiet"
+
+
+def test_reader_health_calls_a_quiet_reader_healthy_not_wedged():
+    """The point of the exercise: running, with its whole budget, and nothing
+    to say. Silence has to be readable as health — otherwise the surface that
+    exists to find a wedged reader cries wolf on a quiet desktop."""
+    reader = _reader([], spawn=lambda *a, **k: types.SimpleNamespace(
+        is_alive=lambda: True), popen_factory=lambda *a, **k: _FakeProc())
+    assert reader.set_enabled(True) == "notification reader enabled"
+    h = reader.health(enabled=True)
+    assert h["state"] == "running" and h["running"] is True
+    assert h["passes"] == 0, "parked on stdout, waiting for a notification"
+    assert h["attempts_used"] == 0 and h["failures"] == 0
+
+
+def test_reader_health_shows_the_stall_the_toggle_hides():
+    """Enabled, and nothing left listening. The toggle and the settings file
+    both call this "on", and before this it looked exactly like a quiet
+    desktop — the worst state the reader can be in, and the only one a caller
+    cannot infer from the reader's own counters."""
+    reader = _reader([])
+    assert reader.health(enabled=True)["state"] == "stalled"
+    assert reader.health(enabled=False)["state"] == "off"
+
+
+def test_reader_health_names_the_last_failure_and_what_it_cost():
+    """A wedged monitor has to be actionable from the snapshot alone: which
+    pass failed, why, how long ago, and how much of the retry budget is gone."""
+    saved: list = []
+
+    class AliveProc:
+        stdout: tuple = ()
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    class InstantStop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            pass
+
+        def wait(self, timeout):
+            return False
+
+    reader = _reader([], popen_factory=lambda *a, **k: AliveProc(),
+                     persist=lambda k, v: saved.append((k, v)))
+    reader.loop = lambda proc, stop: (_ for _ in ()).throw(
+        OSError("monitor said no"))
+    reader.run(InstantStop(), run=types.SimpleNamespace(proc=AliveProc()))
+
+    h = reader.health(enabled=True)
+    assert h["gave_up"] is True and h["state"] == "gave-up", h
+    assert h["failures"] >= 1 and h["last_failure"] is not None
+    assert h["last_failure"]["where"] == "pass"
+    assert "OSError" in h["last_failure"]["error"]
+    assert "monitor said no" in h["last_failure"]["error"]
+    assert h["last_failure"]["age_seconds"] >= 0
+    assert h["attempts_used"] >= h["attempts_budget"], (
+        "a reader that gave up must show the budget spent, not a retry left")
+    assert saved and saved[-1] == ("notification_reader", False), saved
+
+
+def test_re_enabling_the_reader_starts_the_counters_over():
+    """`health` describes the reader that is live NOW: carrying the previous
+    run's failures forward would report a healthy reader as a failing one.
+    The reset lands before the worker starts — after it, it would wipe the
+    first pass."""
+    reader = _reader([], spawn=lambda *a, **k: types.SimpleNamespace(
+        is_alive=lambda: True), popen_factory=lambda *a, **k: _FakeProc())
+    reader._health_update(failures=4, gave_up=True, attempts_used=5,
+                          backoff_seconds=16.0,
+                          last_failure={"where": "pass", "error": "old",
+                                        "at": time.monotonic()})
+    assert reader.set_enabled(True) == "notification reader enabled"
+    h = reader.health(enabled=True)
+    assert (h["failures"], h["gave_up"], h["attempts_used"],
+            h["backoff_seconds"], h["last_failure"]) == (0, False, 0, 0.0, None)
+    assert h["state"] == "running"

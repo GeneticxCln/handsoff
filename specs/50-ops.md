@@ -99,8 +99,15 @@ niri/compositor, systemd unit, ydotool socket (DGRAM-first probe mirroring
 `ToolBelt._socket_connectable`), voices, restart script, control socket,
 crash log, cap-refusal note, appearance look, web backend record
 (observed-only: `untried`/ok/named failure). `--ptt health` = JSON snapshot
-(status/state/handsfree/model/deployment/look/followup). `--ptt selftest` =
-typing checks of ACCEPTANCE §5. Settings health bar renders
+(assistant/handsfree/followup_armed + `mic`, `notifications`, `brain`, `tts`,
+`appearance`, `deployment` sections). `notifications` is the reader's own
+vital signs — `state` (off/running/retrying/stopping/**stalled**/gave-up),
+`passes`, `notifications`, `failures`, `attempts_used`/`attempts_budget`,
+`backoff_seconds`, `pass_seconds`, `last_failure{where,error,age_seconds}` —
+because a reader that says nothing is the healthy state AND was the state a
+wedged one sat in; `stalled` (the setting says on, nothing listening) is the
+one state the reader cannot report about itself, so the host passes the live
+setting in. `--ptt selftest` = typing checks of ACCEPTANCE §5. Settings health bar renders
 `mic: … · brain: ok <model> · tts/stt: ok · deploy: ok` via `_fmt_health()`.
 
 ## 6. Restart + crash recovery

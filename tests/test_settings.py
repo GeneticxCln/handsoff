@@ -1142,6 +1142,45 @@ class TestHealthCommand:
             except OSError:
                 pass
 
+    def test_snapshot_carries_the_notification_reader(self, H, monkeypatch):
+        """`--ptt health` has to be able to say "the reader is wedged", not
+        just "the reader is quiet".
+
+        A monitor that gives up logs once and is then silent for the rest of
+        the session while the toggle still reads "on" — so the snapshot needs
+        the reader's own counters, and it needs them on EVERY host: this one is
+        built with `__new__` and never had a reader object at all.
+        """
+        from core.assistant import NotificationReader
+        monkeypatch.setattr(H, "ollama_available", lambda: True)
+        a = self._mk_assistant(H, self._mk_listener(H))
+        snap = a.mic_health()
+        notif = snap["notifications"]
+        for key in ("enabled", "state", "running", "passes", "notifications",
+                    "failures", "attempts_used", "attempts_budget",
+                    "backoff_seconds", "pass_seconds", "gave_up",
+                    "last_failure"):
+            assert key in notif, key
+        assert notif["state"] == "off" and notif["running"] is False
+        assert notif["attempts_budget"] == NotificationReader.ATTEMPT_BUDGET
+        json.dumps(snap)       # must be JSON-serializable, always
+
+    def test_snapshot_shows_the_stall_the_toggle_hides(self, H, monkeypatch):
+        """The one state a caller cannot infer from the reader's counters:
+        the setting says on and nothing is left listening."""
+        from core.assistant import NotificationReader
+        monkeypatch.setattr(H, "ollama_available", lambda: True)
+        monkeypatch.setitem(H.SETTINGS, "notification_reader", True)
+        a = self._mk_assistant(H, self._mk_listener(H))
+        a._notifications = NotificationReader(
+            spawn=lambda *a, **k: None, is_closed=lambda: False,
+            announce=lambda text: None, muted=lambda a, s, b: False,
+            popen_factory=None, persist=lambda k, v: None)
+        notif = a.mic_health()["notifications"]
+        assert notif["enabled"] is True
+        assert notif["state"] == "stalled" and notif["running"] is False
+        assert notif["attempts_used"] == 0 and notif["last_failure"] is None
+
     def test_health_roundtrip_over_socket(self, server):
         H, _delivered, _app = server
         monkey = pytest.MonkeyPatch()
@@ -1161,6 +1200,13 @@ class TestHealthCommand:
         assert set(payload["tts"]) == {"ready", "whisper_ready", "engine",
                                        "device", "reference"}
         assert payload["tts"]["engine"] == H.TTS_ENGINE
+        # The notification reader rides the same snapshot: a control socket
+        # that answers `health` is the only way to ask a running bubble whether
+        # its monitor is still alive.
+        notif = payload["notifications"]
+        assert notif["state"] in ("off", "running", "retrying", "stalled",
+                                   "stopping", "gave-up")
+        assert notif["attempts_budget"] == 5
 
     def test_health_listed_in_usage_and_actions(self, H):
         assert "health" in H.PTT_ACTIONS
