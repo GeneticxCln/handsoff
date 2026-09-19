@@ -69,9 +69,35 @@ def idle(H, monkeypatch):
     monkeypatch.setattr(H, "_vram_sample", {"at": 0.0, "free_mb": None})
     # The LLM's size, once read, is cached for ten minutes on the turn path; a
     # fresh record per test keeps one test's model out of the next one's ask.
+    # `resident`/`resident_at` are the same record's other half — what Ollama
+    # reported loaded, which the descriptive surfaces read.
+    # `resident_at` is set FRESH with `resident` None: the descriptive surfaces
+    # take a cached residency, so pinning it here is what keeps a test's story
+    # off the developer's live Ollama. A test that wants a residency sets one
+    # (through `_server`), which is also how the turn path fills the cache.
     monkeypatch.setattr(H, "_llm_footprint",
-                        {"model": "", "mb": None, "need_mb": None, "at": 0.0})
+                        {"model": "", "mb": None, "need_mb": None, "at": 0.0,
+                         "resident": None, "resident_at": time.time(),
+                         "resident_model": H.OLLAMA_MODEL})
     return H
+
+
+def _story_line(H, label: str) -> str:
+    """The card section's line with this indented label, or a loud failure.
+
+    The section is the unit: a test that asserted on a LINE INDEX would pass
+    while the fact it cares about moved to another line, which is exactly the
+    confusion one story is supposed to end.
+    """
+    lines = H._vram_story_lines()
+    for line in lines:
+        if line.strip().startswith(label + ":"):
+            return line
+    raise AssertionError(f"no {label!r} line in {lines}")
+
+
+def _story_text(H) -> str:
+    return "\n".join(H._vram_story_lines())
 
 
 def _server(H, monkeypatch, *, size_gb=None, vram_gb=None, model=None,
@@ -1290,11 +1316,13 @@ class TestTheTurnAsksTheSpeechModel:
         idle._llm_footprint.update({"model": idle.OLLAMA_MODEL, "mb": 5_000,
                                     "at": time.time()})
 
-        line = idle._gpu_headroom_lines()[0]
+        line = _story_line(idle, "next turn")
 
-        assert "goes back to a turn whose LLM (5000 MB) does not fit" in line, line
-        state = idle.doctor_json()["gpu_headroom"]["speech_yields"]
+        assert "asks 4.9 GB" in line, line
+        assert "this bubble's 3.3 GB goes back to make room" in line, line
+        state = idle.doctor_json()["gpu_headroom"]["next_turn"]
         assert state["would_yield"] is True and state["claim_mb"] == 5_000
+        assert state["speech_gives_mb"] == state["held_mb"] > 0
 
     def test_the_line_says_when_the_voice_keeps_its_memory(self, idle,
                                                           monkeypatch):
@@ -1304,23 +1332,33 @@ class TestTheTurnAsksTheSpeechModel:
         idle._llm_footprint.update({"model": idle.OLLAMA_MODEL, "mb": 26_000,
                                     "at": time.time()})
 
-        line = idle._gpu_headroom_lines()[0]
+        line = _story_line(idle, "next turn")
 
-        assert "keeps its 3.3 GB — releasing the 3400 MB" in line, line
-        assert idle.doctor_json()["gpu_headroom"]["speech_yields"][
-            "would_yield"] is False
+        assert "asks 25.4 GB" in line, line
+        assert "would not make room" in line, line
+        assert idle.doctor_json()["gpu_headroom"]["next_turn"][
+            "would_yield"] is False, "the voice cannot make room for 26 GB"
+        assert idle.doctor_json()["gpu_headroom"]["next_turn"][
+            "speech_gives_mb"] == 0
 
     def test_the_line_says_when_the_ask_is_off_or_unread(self, idle,
                                                        monkeypatch):
         _nvidia(idle, monkeypatch, pool="3000, 16380",
                 procs=f"{os.getpid()}, 3400")
         self._speech_on_card(idle, monkeypatch)
+        # The cache says "asked, and the size could not be read" — pinning it is
+        # what makes this the unread case rather than a read of whichever model
+        # the developer's Ollama happens to be serving.
+        monkeypatch.setattr(idle, "_llm_footprint",
+                            {"model": idle.OLLAMA_MODEL, "mb": None,
+                             "need_mb": None, "at": time.time(),
+                             "resident": None, "resident_at": time.time()})
 
-        line = idle._gpu_headroom_lines()[0]     # no size read yet
-        assert "can ask the speech model for its 3.3 GB" in line, line
+        line = _story_line(idle, "next turn")   # no size read yet
+        assert "the LLM's size has not been read yet" in line, line
 
         monkeypatch.setitem(idle.SETTINGS, "speech_yields_to_llm", False)
-        line = idle._gpu_headroom_lines()[0]
+        line = _story_line(idle, "next turn")
         assert "never asks the speech model for the card " \
                "(speech_yields_to_llm off)" in line, line
 
@@ -1331,7 +1369,7 @@ class TestTheTurnAsksTheSpeechModel:
 
         Measured live on 2026-09-18: `qwen3.8:27b` at 17.7 GB on a 16.0 GB
         card, 7 min 49 s from key release to spoken reply — while `brain:`
-        said "reachable" and `gpu headroom:` counted free bytes. The same turn
+        said "reachable" and the card's line counted free bytes. The same turn
         took 10 s after the model was changed to a 7.6 GB one.
         """
         monkeypatch.setattr(idle, "_llm_footprint_mb", lambda: 18_124)   # 17.7 GB
@@ -1356,7 +1394,7 @@ class TestTheTurnAsksTheSpeechModel:
         # ...and it rides the doctor's own line list, so `--ptt doctor` says it.
         _nvidia(idle, monkeypatch, pool="10000, 16380",
                 procs=f"{os.getpid()}, 3400")
-        lines = idle._gpu_headroom_lines()
+        lines = idle._vram_story_lines()
         assert any("brain fit:" in ln for ln in lines), lines
 
 
@@ -1483,19 +1521,26 @@ class TestReloadMeasurement:
         assert idle._measured_llm_reload() is None
 
 
-class TestDoctorLine:
+class TestTheReleaseLine:
+    """The card section's `release:` line — the policy, inside the story.
+
+    It used to be a line of its own (`llm memory:`), which is how the LLM's
+    memory came to be reported TWICE: once as a policy there and once as a
+    number in the headroom line. The sentence is unchanged; where it lives is
+    what changed.
+    """
+
     def test_it_says_which_way_it_would_go_with_the_numbers(self, idle, monkeypatch):
         idle._note_llm_load(idle.OLLAMA_MODEL, 218.9)
         idle._llm_load["at"] = time.time() - 120.0
         _server(idle, monkeypatch, size_gb=18.0, vram_gb=9.68)
 
-        lines = idle._llm_memory_lines()
+        sentence = idle._llm_release_sentence()
 
-        assert len(lines) == 1
-        assert lines[0].startswith("llm memory: ")
-        assert "would KEEP" in lines[0] and idle.OLLAMA_MODEL in lines[0]
-        assert "22.6 s/GB > 20" in lines[0]
-        assert "slowest of 1 load; last measured 2 minutes ago" in lines[0], (
+        assert "after 600s idle the release would KEEP" in sentence
+        assert idle.OLLAMA_MODEL in sentence
+        assert "22.6 s/GB > 20" in sentence
+        assert "slowest of 1 load; last measured 2 minutes ago" in sentence, (
             "the number is a measurement, so the line has to say how old it is "
             "and whether it is the worst case")
 
@@ -1503,34 +1548,41 @@ class TestDoctorLine:
         idle._note_llm_load(idle.OLLAMA_MODEL, 41.0)
         _server(idle, monkeypatch, size_gb=5.2, vram_gb=5.2)
 
-        line = idle._llm_memory_lines()[0]
+        sentence = idle._llm_release_sentence()
 
-        assert "would UNLOAD" in line and "7.9 s/GB ≤ 20" in line
+        assert "would UNLOAD" in sentence and "7.9 s/GB ≤ 20" in sentence
 
     def test_an_off_release_says_off_instead_of_predicting(self, idle, monkeypatch):
         monkeypatch.setitem(idle.SETTINGS, "idle_release_seconds", 0)
         srv = _server(idle, monkeypatch, size_gb=5.2, vram_gb=5.2)
 
-        assert idle._llm_memory_lines() == [
-            "llm memory: idle release is OFF (idle_release_seconds 0)"]
+        assert idle._llm_release_sentence() == \
+            "idle release is OFF (idle_release_seconds 0)"
         assert srv.asks == [], "an off switch must not probe the model server"
 
-    def test_the_doctor_prints_the_line_the_host_supplies(self, idle, monkeypatch):
+    def test_the_doctor_prints_the_sentence_inside_the_card_section(
+            self, idle, monkeypatch):
         idle._note_llm_load(idle.OLLAMA_MODEL, 218.9)
         _server(idle, monkeypatch, size_gb=18.0, vram_gb=9.68)
 
         text = idle.run_doctor()
 
-        assert "llm memory: after 600s idle the release would KEEP" in text, text
-        assert "22.6 s/GB > 20" in text
+        release = _story_line(idle, "release")
+        assert "after 600s idle the release would KEEP" in release, release
+        assert "22.6 s/GB > 20" in release, release
+        assert "\n  release: " in text, (
+            "the release belongs to the card's section, not to a line of its "
+            "own beside it")
 
-    def test_a_host_without_the_policy_prints_nothing_new(self):
+    def test_a_host_without_the_collector_prints_nothing_new(self):
         """A partial deps object is what the legacy path is tested with."""
         doctor = core_module("doctor")
         deps = doctor.DoctorDeps(ollama_base="http://127.0.0.1:11434",
                                  ollama_model="m",
                                  ollama_available=lambda: True)
-        assert doctor._llm_memory_lines(deps) == []
+        assert doctor._gpu_story_lines(deps) == []
+        assert not hasattr(deps, "llm_lines"), (
+            "the LLM's memory is reported by the card's one collector now")
 
 
 def _nvidia(H, monkeypatch, *, pool=None, procs=None):
@@ -1551,7 +1603,7 @@ def _nvidia(H, monkeypatch, *, pool=None, procs=None):
 
 
 class TestGpuHeadroom:
-    """`gpu headroom` — the card's own arithmetic, not the LLM's policy.
+    """The card's section — its own arithmetic, built from the driver's rows.
 
     The line that would have made the desktop glitch legible BEFORE it happened:
     how much of the card is left, how much of what it lost is THIS process, and
@@ -1575,28 +1627,64 @@ class TestGpuHeadroom:
         assert idle._parse_vram_pool("garbage") is None
         assert idle._parse_vram_pool("10061, 0") is None, "a zero-total GPU"
 
-    def test_only_this_process_is_counted(self, idle):
-        rows = "1941, 436\n75758, 3172\n75758, 100\n35088, 719"
-        assert idle._parse_own_vram(rows, 75758) == 3272, (
+    def test_only_this_process_is_counted(self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch,
+                procs=f"1941, gslapper, 436\n"
+                      f"{os.getpid()}, /usr/bin/python3, 3172\n"
+                      f"{os.getpid()}, /usr/bin/python3, 100\n"
+                      f"35088, chrome, 719")
+        assert idle._own_vram_mb() == 3272, (
             "the compositor's, ollama's and the wallpaper's memory is not the "
             "bubble's — and folding it in overstates what a release can free")
 
-    def test_an_unattributable_query_is_not_a_zero(self, idle):
-        assert idle._parse_own_vram("N/A, N/A", 1) is None
-        assert idle._parse_own_vram("", 1) is None
-        assert idle._parse_own_vram("1941, 436", 999) == 0, (
+    def test_an_unattributable_query_is_not_a_zero(self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch, procs="N/A, N/A, N/A")
+        assert idle._own_vram_mb() is None
+        _nvidia(idle, monkeypatch, procs="")
+        assert idle._own_vram_mb() == 0, (
             "the query answered and this pid is not on the card: a measurement "
             "of nothing, not an unknown")
+
+    def test_a_process_name_holding_commas_is_one_tenant(self, idle):
+        """nvidia-smi prints the whole argv, and a browser's is full of commas.
+
+        Splitting on every comma turns one 382 MB tenant into a dozen
+        unparsable fragments — and the card's total stops adding up, which is
+        the one property this whole section rests on.
+        """
+        rows = idle._parse_card_tenants(
+            "161850, /opt/google/chrome/chrome --type=gpu-process "
+            "--field-trial-handle=3?i=1,2?3,382")
+        assert rows == [{"pid": 161850,
+                         "name": "/opt/google/chrome/chrome --type=gpu-process "
+                                 "--field-trial-handle=3?i=1,2?3",
+                         "mb": 382}], rows
+
+    def test_a_driver_that_says_there_are_no_processes_answered(self, idle):
+        """`No running processes found` is an answer; `N/A` is not an answer."""
+        assert idle._parse_card_tenants("No running processes found") == []
+        assert idle._parse_card_tenants("") == []
+        assert idle._parse_card_tenants("N/A, N/A, N/A") is None
+        assert idle._parse_card_tenants(None) is None
 
     def test_the_line_names_free_vram_and_this_bubbles_measured_share(
             self, idle, monkeypatch):
         _nvidia(idle, monkeypatch, pool="10061, 16380",
                 procs=f"{os.getpid()}, 3172")
 
-        line = idle._gpu_headroom_lines()[0]
+        lines = idle._vram_story_lines()
 
-        assert line.startswith("gpu headroom: 9.8 GB free of 16.0 GB (39% used)")
-        assert "this bubble holds 3.1 GB (measured)" in line
+        assert lines[0].startswith("card: 9.8 GB free of 16.0 GB (39% used)"), \
+            lines[0]
+        tenants = _story_line(idle, "tenants")
+        assert "this bubble holds 3.1 GB (measured)" in tenants, tenants
+
+    def test_the_header_names_the_card_when_the_driver_reports_one(
+            self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch, pool="NVIDIA GeForce RTX 4060 Ti, 10061, 16380")
+
+        assert idle._vram_story_lines()[0].startswith(
+            "card: NVIDIA GeForce RTX 4060 Ti — 9.8 GB free of 16.0 GB")
 
     def test_a_driver_that_cannot_attribute_falls_back_and_says_so(
             self, idle, monkeypatch):
@@ -1610,21 +1698,24 @@ class TestGpuHeadroom:
 
         assert info["bubble_source"] == "estimated"
         assert info["bubble_mb"] == 3000
-        line = idle._gpu_headroom_lines()[0]
-        assert "estimated from the loader tables" in line
-        assert "the driver attributed no memory to a pid" in line, (
+        tenants = _story_line(idle, "tenants")
+        assert "estimated from the loader tables" in tenants
+        assert "the driver attributed no memory to a pid" in tenants, (
             "an estimate has to say WHY it is one — 'about 2.9 GB' with no "
             "cause reads like a measurement, which is the confusion this "
-            "line exists to avoid")
+            "section exists to avoid")
+        assert "what else is on the card could not be attributed" in tenants, (
+            "when the driver cannot attribute anything, claiming 'no other "
+            "process is on the card' would be inventing an answer")
 
     def test_a_measured_zero_is_not_the_same_as_an_estimate(self, idle, monkeypatch):
         """Answering 'this pid holds nothing' is better evidence than a guess."""
-        _nvidia(idle, monkeypatch, pool="10061, 16380", procs="1941, 436")
+        _nvidia(idle, monkeypatch, pool="10061, 16380", procs="1941, gslapper, 436")
 
         info = idle._vram_headroom()
 
         assert info["bubble_mb"] == 0 and info["bubble_source"] == "measured"
-        assert "holds 0.0 GB (measured)" in idle._gpu_headroom_lines()[0]
+        assert "holds 0.0 GB (measured)" in _story_line(idle, "tenants")
 
     def test_no_gpu_at_all_is_said_rather_than_zeroed(self, idle, monkeypatch):
         _nvidia(idle, monkeypatch, pool=None, procs=None)
@@ -1633,9 +1724,10 @@ class TestGpuHeadroom:
         info = idle._vram_headroom()
 
         assert info["free_mb"] is None and info["bubble_source"] == "unknown"
-        line = idle._gpu_headroom_lines()[0]
-        assert "free VRAM unknown" in line
-        assert "this bubble's own share could not be read" in line
+        lines = idle._vram_story_lines()
+        assert "free VRAM unknown" in lines[0]
+        assert "this bubble's own share could not be read" in \
+            _story_line(idle, "tenants")
 
     def test_a_broken_probe_returns_no_line_instead_of_raising(self, idle,
                                                                monkeypatch):
@@ -1644,7 +1736,7 @@ class TestGpuHeadroom:
 
         monkeypatch.setattr(idle, "_vram_headroom", explode)
 
-        assert idle._gpu_headroom_lines() == [], (
+        assert idle._vram_story_lines() == [], (
             "doctor is the tool for when things are already wrong")
 
     def test_the_probe_asks_the_driver_the_two_questions(self, idle, monkeypatch):
@@ -1659,17 +1751,20 @@ class TestGpuHeadroom:
         def run(argv, **kwargs):
             seen.append(argv)
             return _Proc("10061, 16380" if "--query-gpu" in argv[1]
-                         else f"{os.getpid()}, 512")
+                         else f"{os.getpid()}, /usr/bin/python3, 512")
 
         monkeypatch.setattr(idle.subprocess, "run", run)
 
         info = idle._vram_headroom()
 
-        assert any("--query-gpu=memory.free,memory.total" in a[1] for a in seen)
-        assert any("--query-compute-apps=pid,used_memory" in a[1] for a in seen), (
-            "attribution needs the pid column; used_memory alone cannot be "
-            "assigned to a process")
+        assert any("--query-gpu=name,memory.free,memory.total" in a[1]
+                   for a in seen), "the card's own name is part of the header"
+        assert any("--query-compute-apps=pid,process_name,used_memory" in a[1]
+                   for a in seen), (
+            "naming the tenants needs the process column; a pid and its bytes "
+            "alone cannot say WHO is on the card")
         assert info["free_mb"] == 10061 and info["bubble_mb"] == 512
+        assert info["card"]["name"] == "" and info["tenants"]["attributed"]
 
     def test_a_wedged_driver_is_an_answer_not_an_exception(self, idle, monkeypatch):
         def run(argv, **kwargs):
@@ -1699,7 +1794,7 @@ class TestGpuHeadroom:
 
         assert info["free_mb"] is None and info["bubble_source"] == "unknown", (
             "a failed query is not a reading")
-        assert "free VRAM unknown" in idle._gpu_headroom_lines()[0]
+        assert "free VRAM unknown" in idle._vram_story_lines()[0]
 
     # -- the third fact: what the release is about to do ---------------------
 
@@ -1708,7 +1803,8 @@ class TestGpuHeadroom:
         monkeypatch.setitem(idle.SETTINGS, "idle_release_seconds", 0)
 
         assert idle._vram_headroom()["idle_release"]["state"] == "off"
-        assert "OFF (idle_release_seconds 0)" in idle._gpu_headroom_lines()[0]
+        assert _story_line(idle, "release") == \
+            "  release: idle release is OFF (idle_release_seconds 0)"
 
     def test_pending_says_how_much_quiet_is_left(self, idle, monkeypatch):
         _nvidia(idle, monkeypatch, pool="10061, 16380", procs=None)
@@ -1718,7 +1814,7 @@ class TestGpuHeadroom:
 
         assert rel["state"] == "pending"
         assert rel["due_in_s"] == pytest.approx(480.0, abs=1.0)
-        assert "idle release in 8 minutes of quiet" in idle._gpu_headroom_lines()[0]
+        assert "in 8 minutes of quiet" in _story_line(idle, "release")
 
     def test_due_is_not_the_same_answer_as_pending(self, idle, monkeypatch):
         """The window elapsed and the tick has not run: the bubble is busy.
@@ -1732,42 +1828,51 @@ class TestGpuHeadroom:
         rel = idle._vram_headroom()["idle_release"]
 
         assert rel["state"] == "due" and rel["due_in_s"] == 0.0
-        assert "DUE after 10 minutes of quiet" in idle._gpu_headroom_lines()[0]
+        assert "DUE after 10 minutes of quiet" in _story_line(idle, "release")
 
     def test_released_says_the_next_use_re_arms_it(self, idle, monkeypatch):
         _nvidia(idle, monkeypatch, pool="10061, 16380", procs=None)
         monkeypatch.setattr(idle, "_gpu_released", True)
 
         assert idle._vram_headroom()["idle_release"]["state"] == "released"
-        assert "already fired in this quiet spell" in idle._gpu_headroom_lines()[0]
+        assert "already fired in this quiet spell" in _story_line(idle, "release")
 
     # -- one dict behind both surfaces ---------------------------------------
 
-    def test_the_doctor_prints_the_hosts_line(self, idle, monkeypatch):
+    def test_the_doctor_prints_the_section(self, idle, monkeypatch):
         _nvidia(idle, monkeypatch, pool="10061, 16380",
-                procs=f"{os.getpid()}, 3172")
+                procs=f"{os.getpid()}, /usr/bin/python3, 3172")
 
         text = idle.run_doctor()
 
-        assert "gpu headroom: 9.8 GB free of 16.0 GB" in text
+        assert "card: 9.8 GB free of 16.0 GB" in text
         assert "this bubble holds 3.1 GB (measured)" in text
+        assert "\n  tenants: " in text and "\n  speech: " in text, (
+            "the four facts a user has about their card are one section")
+        assert "\n  llm: " in text and "\n  next turn: " in text
 
-    def test_json_carries_the_three_facts(self, idle, monkeypatch):
+    def test_json_carries_the_whole_story(self, idle, monkeypatch):
         _nvidia(idle, monkeypatch, pool="10061, 16380",
-                procs=f"{os.getpid()}, 3172")
+                procs=f"{os.getpid()}, /usr/bin/python3, 3172")
 
         head = idle.doctor_json()["gpu_headroom"]
 
-        assert set(head) == {"free_mb", "total_mb", "bubble_mb",
-                             "bubble_source", "bubble_models", "idle_release",
-                             "speech_yields"}
+        assert set(head) == {"card", "free_mb", "total_mb", "bubble_mb",
+                             "bubble_source", "tenants", "speech", "llm",
+                             "next_turn", "idle_release", "llm_release"}
         assert head["free_mb"] == 10061 and head["total_mb"] == 16380
         assert head["bubble_mb"] == 3172 and head["bubble_source"] == "measured"
+        assert head["card"] == {"name": "", "free_mb": 10061,
+                                "total_mb": 16380, "used_mb": 6319}
         assert head["idle_release"]["state"] == "pending"
-        assert set(head["speech_yields"]) == {"enabled", "held_mb", "claim_mb",
-                                             "would_yield", "note"}, (
-            "the mirror of the release's slot: the policy, what there is to "
-            "give, what the LLM needs, and the verdict")
+        assert set(head["next_turn"]) == {"enabled", "held_mb", "claim_mb",
+                                         "free_mb", "already_resident",
+                                         "would_yield", "speech_gives_mb",
+                                         "note"}, (
+            "what a turn will ask for: the policy, what there is to give, what "
+            "the LLM needs, and the verdict")
+        assert head["llm_release"]["window_s"] == pytest.approx(600.0)
+        assert isinstance(head["llm_release"]["sentence"], str)
 
     def test_a_host_without_the_probe_adds_nothing_to_either_surface(self):
         """The same contract the llm line keeps: a partial deps is unchanged."""
@@ -1775,13 +1880,221 @@ class TestGpuHeadroom:
         deps = doctor.DoctorDeps(ollama_base="http://127.0.0.1:11434",
                                  ollama_model="m",
                                  ollama_available=lambda: True)
-        assert doctor._gpu_headroom_lines(deps) == []
+        assert doctor._gpu_story_lines(deps) == []
 
         token = doctor.set_dependencies(doctor.DoctorDeps())
         try:
             assert "gpu_headroom" not in doctor.doctor_json()
         finally:
             doctor.reset_dependencies(token)
+
+
+def _residency_is_cold(H, monkeypatch):
+    """Let the section ASK: invalidate the cached residency so it probes.
+
+    The `idle` fixture pins a FRESH record with `resident` None, which is what
+    keeps every other test off the developer's live Ollama. A test that wants a
+    real residency (through `_server`) starts from a cold cache instead.
+    """
+    monkeypatch.setattr(H, "_llm_footprint",
+                        {**H._llm_footprint, "resident": None,
+                         "resident_at": 0.0, "resident_model": ""})
+
+
+class TestTheCardSection:
+    """One story for the card: every tenant, and what the next turn asks for.
+
+    The four facts a user with a glitching desktop actually has — who is on the
+    card, what the bubble's own speech models hold, what the LLM holds, and what
+    the next turn will do — are ONE section built from ONE dict, which is also
+    what `doctor_json` publishes. These tests pin each line's substance and the
+    property that makes it a story rather than four numbers: the tenants add up
+    to the used bytes on the header line.
+    """
+
+    def test_every_tenant_is_named(self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch, pool="4690, 16380", procs=(
+            "1941, gslapper, 436\n"
+            f"{os.getpid()}, /usr/bin/python3, 3172\n"
+            "4242, /usr/local/bin/ollama runner, 7000\n"
+            "161850, /opt/google/chrome/chrome --type=gpu-process "
+            "--field-trial-handle=1,2,382\n"))
+
+        tenants = _story_line(idle, "tenants")
+
+        assert "this bubble holds 3.1 GB (measured)" in tenants, tenants
+        assert "an Ollama process holds 6.8 GB (pid 4242)" in tenants, tenants
+        assert ("2 other processes hold 0.8 GB (gslapper 0.4 GB, chrome 0.4 GB)"
+                in tenants), tenants
+        assert "the driver attributes 0.7 GB to no process" in tenants, tenants
+        # The parts are the used bytes: 436 + 3172 + 7000 + 382 + 700 = 11690,
+        # which is what the card is missing from its 16380 total. A story whose
+        # numbers do not add up is three numbers, not a story.
+        head = idle.doctor_json()["gpu_headroom"]
+        assert (head["card"]["used_mb"] == head["bubble_mb"]
+                + head["tenants"]["llm_mb"] + head["tenants"]["others_mb"]
+                + head["tenants"]["unattributed_mb"])
+
+    def test_the_turn_that_asks_nothing_says_so(self, idle, monkeypatch):
+        """A resident model is the case the old arithmetic got wrong."""
+        _nvidia(idle, monkeypatch, pool="4690, 16380", procs=None)
+        _residency_is_cold(idle, monkeypatch)
+        _server(idle, monkeypatch, size_gb=7.0, vram_gb=7.0, tags_gb=7.0)
+
+        assert "is resident 7.0 GB and ALL of it is on the card" in \
+            _story_line(idle, "llm")
+        assert "asks nothing" in _story_line(idle, "next turn")
+        head = idle.doctor_json()["gpu_headroom"]
+        assert head["llm"]["need_mb"] == 0
+        assert head["next_turn"]["already_resident"] is True
+
+    def test_a_split_model_is_described_as_split(self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch, pool="4690, 16380", procs=None)
+        _residency_is_cold(idle, monkeypatch)
+        _server(idle, monkeypatch, size_gb=18.0, vram_gb=9.68, tags_gb=18.0)
+
+        line = _story_line(idle, "llm")
+
+        assert "is SPLIT" in line, line
+        assert "9.7 GB on the card of 18.0 GB" in line, line
+        assert "8.3 GB is served from system memory" in line, line
+        head = idle.doctor_json()["gpu_headroom"]
+        assert head["llm"]["on_card_mb"] == 9912
+        assert head["llm"]["offloaded_mb"] == head["llm"]["need_mb"] == 8520, (
+            "what a turn must load IS the offloaded remainder")
+
+    def test_an_unreadable_residency_is_not_a_guess(self, idle, monkeypatch):
+        """`/api/ps` down, `/api/tags` answering: the size is known, the split is
+        not — and 'not loaded' is a measurement nobody made."""
+        _nvidia(idle, monkeypatch, pool="4690, 16380", procs=None)
+        _residency_is_cold(idle, monkeypatch)
+        _server(idle, monkeypatch, tags_gb=7.0)      # /api/ps says nothing loaded
+
+        def nowhere(req, timeout=None):
+            if req.full_url.endswith("/api/ps"):
+                raise OSError("connection refused")
+            return _Reply(json.dumps({"models": [{
+                "name": idle.OLLAMA_MODEL, "model": idle.OLLAMA_MODEL,
+                "size": int(7.0 * 1024 ** 3)}]}).encode("utf-8"))
+
+        monkeypatch.setattr(idle.urllib.request, "urlopen", nowhere)
+
+        assert "could not be read" in _story_line(idle, "llm")
+        assert idle.doctor_json()["gpu_headroom"]["llm"]["loaded"] is None, (
+            "an endpoint that did not answer is not 'nothing is loaded'")
+        assert idle.doctor_json()["gpu_headroom"]["llm"]["blob_mb"] == 7168
+
+    def test_the_speech_line_names_both_models_and_their_device(self, idle,
+                                                               monkeypatch):
+        _nvidia(idle, monkeypatch, pool="4690, 16380", procs=None)
+        monkeypatch.setattr(idle._audio, "gpu_footprint_mb", lambda: {
+            "tts_mb": 1900, "whisper_mb": 1200, "total_mb": 3100,
+            "tts_loaded": True, "whisper_loaded": True,
+            "tts_device": "cuda", "whisper_device": "cuda"})
+
+        line = _story_line(idle, "speech")
+
+        assert ("whisper 1.2 GB on cuda and the speech model 1.9 GB on cuda"
+                in line), line
+        assert "3.0 GB together" in line, line
+        assert idle.doctor_json()["gpu_headroom"]["speech"]["whisper_mb"] == 1200
+
+    def test_nothing_loaded_names_which_half_is_missing(self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch, pool="4690, 16380", procs=None)
+        monkeypatch.setattr(idle._audio, "gpu_footprint_mb", lambda: {
+            "tts_mb": 1900, "whisper_mb": 0, "total_mb": 1900,
+            "tts_loaded": True, "whisper_loaded": False,
+            "tts_device": "cuda", "whisper_device": ""})
+
+        line = _story_line(idle, "speech")
+
+        assert "the speech model 1.9 GB on cuda" in line, line
+        assert "whisper" not in line, (
+            "a model that is not on the card is not counted into the total")
+        assert idle.doctor_json()["gpu_headroom"]["speech"]["whisper_mb"] == 0
+
+    def test_nothing_loaded_at_all_says_both_halves(self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch, pool="4690, 16380", procs=None)
+        monkeypatch.setattr(idle._audio, "gpu_footprint_mb", lambda: {
+            "tts_mb": 0, "whisper_mb": 0, "total_mb": 0,
+            "tts_loaded": False, "whisper_loaded": False,
+            "tts_device": "", "whisper_device": ""})
+
+        assert ("nothing of this bubble's is on the card (the speech model "
+                 "and whisper not loaded)") in _story_line(idle, "speech")
+
+    def test_the_descriptive_read_is_cached_and_the_turn_keeps_it_warm(
+            self, idle, monkeypatch):
+        """Doctor describes; it must not probe the model server per line."""
+        _residency_is_cold(idle, monkeypatch)
+        srv = _server(idle, monkeypatch, size_gb=7.0, vram_gb=7.0, tags_gb=7.0)
+
+        assert idle._resident_llm_cached() == idle._resident_llm_cached()
+        assert len(srv.urls("/api/ps")) == 1, srv.asks
+
+        idle._llm_need_mb(idle._resident_llm())     # a turn's live decision
+        idle._resident_llm_cached()
+
+        assert len(srv.urls("/api/ps")) == 2, (
+            "the turn's reading is the section's — the cache is what the two "
+            "surfaces share")
+
+    def test_a_swapped_model_does_not_inherit_the_old_residency(
+            self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch, pool="4690, 16380", procs=None)
+        _residency_is_cold(idle, monkeypatch)
+        srv = _server(idle, monkeypatch, size_gb=7.0, vram_gb=7.0, tags_gb=7.0)
+        assert idle._resident_llm_cached()["loaded"] is True
+        assert idle._resident_llm_cached()["loaded"] is True
+        assert len(srv.urls("/api/ps")) == 1, (
+            "one read, cached — and the cache is stamped for the model it was "
+            "read for, which is what the swap below tests")
+
+        monkeypatch.setattr(idle, "OLLAMA_MODEL", "a-smaller:4b")
+        srv2 = _server(idle, monkeypatch, size_gb=4.0, vram_gb=4.0, tags_gb=4.0)
+        holdings = idle._vram_headroom()["llm"]
+
+        assert srv2.urls("/api/ps"), (
+            "a residency belongs to the model it was read for: after a swap the "
+            "section must ASK rather than describe the previous model")
+        assert holdings["model"] == "a-smaller:4b"
+        assert holdings["size_mb"] == 4096, "the NEW model's size, not the old"
+
+
+class TestTheCardSectionIsNotMachines:
+    """The section's numbers come from the probes, never from this machine."""
+
+    def test_every_line_survives_a_card_that_cannot_be_asked(
+            self, idle, monkeypatch):
+        _nvidia(idle, monkeypatch, pool=None, procs=None)
+        monkeypatch.setattr(idle._audio, "gpu_footprint_mb", lambda: {})
+
+        lines = idle._vram_story_lines()
+
+        assert lines[0].startswith("card: free VRAM unknown"), lines[0]
+        for label in ("tenants", "speech", "llm", "next turn", "release"):
+            assert _story_line(idle, label), label
+
+    def test_the_section_is_the_same_reading_as_the_json(self, idle, monkeypatch):
+        """One dict behind both, so the words and the numbers cannot drift."""
+        _nvidia(idle, monkeypatch, pool="4690, 16380",
+                procs=f"{os.getpid()}, /usr/bin/python3, 3172")
+
+        head = idle.doctor_json()["gpu_headroom"]
+        text = idle.run_doctor()
+
+        assert f"card: {head['free_mb'] / 1024:.1f} GB free" in text
+        assert f"this bubble holds {head['bubble_mb'] / 1024:.1f} GB " \
+               "(measured)" in text
+        again = idle._vram_headroom()
+        for key in ("card", "tenants", "speech"):
+            assert head[key] == again[key], key
+        # `*_age_s` counts the seconds since the reading, so it moves between
+        # two calls by design; everything else about the LLM must not.
+        at_rest = lambda holdings: {k: v for k, v in holdings.items()
+                                    if not k.endswith("_age_s")}
+        assert at_rest(head["llm"]) == at_rest(again["llm"])
+        assert head["next_turn"]["claim_mb"] == again["next_turn"]["claim_mb"]
 
 
 def _free_vram(H, monkeypatch, free_mb):
@@ -2003,9 +2316,9 @@ class TestVramPressure:
         _nvidia(idle, monkeypatch, pool="900, 16380", procs=None)
         monkeypatch.setitem(idle.SETTINGS, "vram_pressure_floor_mb", 1024)
 
-        line = idle._gpu_headroom_lines()[0]
+        line = _story_line(idle, "release")
 
-        assert "idle release in 30 seconds of quiet" in line
+        assert "in 30 seconds of quiet" in line
         assert ("(VRAM pressure — 0.9 GB free is below the 1.0 GB floor, so the "
                 "600s window is 30s)") in line, line
 
@@ -2028,7 +2341,7 @@ class TestVramPressure:
         monkeypatch.setitem(idle.SETTINGS, "vram_pressure_floor_mb", 1024)
         monkeypatch.setattr(idle, "_gpu_released", True)
 
-        line = idle._gpu_headroom_lines()[0]
+        line = _story_line(idle, "release")
 
         assert "already fired in this quiet spell" in line
         assert "VRAM pressure" not in line
@@ -2036,7 +2349,7 @@ class TestVramPressure:
     def test_no_pressure_means_no_clause(self, idle, monkeypatch):
         _nvidia(idle, monkeypatch, pool="10240, 16380", procs=None)
 
-        line = idle._gpu_headroom_lines()[0]
+        line = _story_line(idle, "release")
 
-        assert "idle release in 10 minutes of quiet" in line
+        assert "in 10 minutes of quiet" in line
         assert "VRAM pressure" not in line

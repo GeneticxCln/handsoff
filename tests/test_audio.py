@@ -41,7 +41,7 @@ HERE = ROOT   # the repo root (conftest resolves it from conftest.py's parent)
 class TestGpuFootprint:
     """What this process is holding on the card, when nothing can measure it.
 
-    `gpu_footprint_mb` is the ESTIMATE behind doctor's `gpu headroom` line —
+    `gpu_footprint_mb` is the ESTIMATE behind doctor's card section —
     used when the driver attributes no memory to a pid, which not every driver
     can do. The property that matters is the one the idle release also turns
     on: a model on cpu occupies NO card memory, so counting it would claim a

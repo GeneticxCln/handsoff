@@ -85,7 +85,7 @@ class DoctorDeps:
         "control_sock", "crash_log", "remote_ollama_allowed",
         "remote_ollama_optin_source",
         "cap_refusal_note", "cap_refusals",
-        "appearance_look", "web_lines", "llm_lines",
+        "appearance_look", "web_lines",
         "gpu_lines", "gpu_headroom",
         "shutil", "sounddevice", "log",
     )
@@ -133,12 +133,14 @@ class DoctorDeps:
         # host owns the vocabulary (which backends exist, which reader was used)
         # and the doctor owns the placement, so the two cannot disagree.
         self.web_lines: Callable[[], list] = lambda: []
-        self.llm_lines: Callable[[], list] = lambda: []
-        # The card's own arithmetic: free VRAM, this process's share of it, and
-        # whether an idle release is about to give that share back. Lines for
-        # the same reason as the two above (the host owns the vocabulary), plus
-        # the structured form the JSON surface needs — one dict behind both, so
-        # the words and the numbers cannot drift.
+        # The card's WHOLE story: every tenant on it, what this bubble's speech
+        # models hold, what the LLM holds, and what the next turn would ask for.
+        # Lines for the same reason as the two above (the host owns the
+        # vocabulary), plus the structured form the JSON surface needs — one
+        # dict behind both, so the words and the numbers cannot drift. There is
+        # deliberately no second `llm_lines` dep: the LLM's memory was reported
+        # by a line here AND counted by a line there, which is two descriptions
+        # of one card.
         self.gpu_lines: Callable[[], list] = lambda: []
         self.gpu_headroom: Callable[[], dict] = lambda: {}
         self.shutil = shutil
@@ -233,27 +235,14 @@ def _web_lookup_lines(deps: "DoctorDeps") -> list[str]:
     return [str(line) for line in lines if line]
 
 
-def _llm_memory_lines(deps: "DoctorDeps") -> list[str]:
-    """The idle-release line, when the host has a memory policy to report.
+def _gpu_story_lines(deps: "DoctorDeps") -> list[str]:
+    """The card's story, when the host has one to tell.
 
     Empty for a host without the dep, exactly like the appearance and web
     lines, so a partial deps object prints what it printed before. The content
-    is the host's: the decision it would make about the model it is configured
-    with, in the same words it logs — two surfaces describing one release.
-    """
-    try:
-        lines = deps.llm_lines() or []
-    except Exception:
-        lines = []
-    return [str(line) for line in lines if line]
-
-
-def _gpu_headroom_lines(deps: "DoctorDeps") -> list[str]:
-    """The card's headroom, when the host has a GPU story to tell.
-
-    Empty for a host without the dep, exactly like the appearance, web and llm
-    lines, so a partial deps object prints what it printed before. The content
-    is the host's: it is the process that knows what it is holding.
+    is the host's: it is the process that knows what it is holding, and it is
+    the SAME collector `gpu_headroom` returns — the section's sentences and the
+    JSON's numbers are one reading, not two that agree.
     """
     try:
         lines = deps.gpu_lines() or []
@@ -348,8 +337,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append(
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
-        lines.extend(_llm_memory_lines(deps))
-        lines.extend(_gpu_headroom_lines(deps))
+        lines.extend(_gpu_story_lines(deps))
         lines.extend(_appearance_lines(deps))
         lines.extend(_web_lookup_lines(deps))
 
@@ -393,8 +381,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append(
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
-        lines.extend(_llm_memory_lines(deps))
-        lines.extend(_gpu_headroom_lines(deps))
+        lines.extend(_gpu_story_lines(deps))
         lines.extend(_appearance_lines(deps))
         lines.extend(_web_lookup_lines(deps))
 

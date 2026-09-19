@@ -39,7 +39,7 @@ nothing — a missing row does.
 | `test_world_events.py` | 24 | fixed queries, severity, seen-store, cooldowns |
 | `test_notify_coalesce.py` | 15 | notification batching/cooldown |
 | `test_hardware_watch.py` | 13 | hardware watch tick, disk/VRAM alerts |
-| `test_idle_release.py` | 23 | the idle release: the drop and its locks, the quiet-window policy, re-arm vs one-per-spell |
+| `test_idle_release.py` | 149 | the idle release: the drop and its locks, the quiet-window policy, re-arm vs one-per-spell — and the card's ONE story (every tenant named and adding up to the used bytes, the speech models per model and device, the LLM's residency/split/blob, what the next turn asks for, the release sentence, and the readings the two surfaces share) |
 | `test_precommit_staged.py` | 12 | the pre-commit hook judging the STAGED tree: the index written out once, every file check reading it, the spec guard AND the full suite run inside it (skipped when a cheap leg already failed), a refusal instead of a fall back to the working tree, the cleanup on every path, and the four end-to-end shapes (a partial stage refused, a partially staged BEHAVIOUR refused, both halves committable, the working tree NOT deciding) |
 | `test_p0_fixes.py` | 6 | named P0 regressions |
 | `test_specs_freshness.py` | 19 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |

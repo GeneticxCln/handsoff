@@ -756,84 +756,114 @@ def _web_lines() -> list:
         return []
 
 
-def _llm_memory_lines() -> list:
-    """One doctor line: what an idle release would do with the LLM, and why.
+def _llm_release_sentence() -> str:
+    """What an idle release would do with the LLM, and why — one sentence.
 
-    Read-only, and honest about the one thing that is not live: the reload the
-    decision rests on is a MEASUREMENT, so the line says when it was taken
-    rather than implying the number is being watched. The window at `0` says
-    the release is off instead of reporting a verdict that will never run, and
-    a host that cannot ask Ollama says the resident state is unknown rather
-    than guessing it.
+    The card section's `release:` line. Read-only, and honest about the one
+    thing that is not live: the reload the decision rests on is a MEASUREMENT,
+    so the sentence says when it was taken rather than implying the number is
+    being watched. The window at `0` says the release is off instead of
+    reporting a verdict that will never run, and a host that cannot ask Ollama
+    says the resident state is unknown rather than guessing it.
     """
     window = _idle_release_seconds()
     if window <= 0.0:
-        return ["llm memory: idle release is OFF (idle_release_seconds 0)"]
+        return "idle release is OFF (idle_release_seconds 0)"
     try:
         verdict = _llm_release_verdict()
     except Exception:
         log.exception("llm release verdict failed")
-        return []
-    line = (f"llm memory: after {window:.0f}s idle the release would "
-            f"{'UNLOAD' if verdict['release'] else 'KEEP'} {OLLAMA_MODEL} — "
-            f"{verdict['note']}")
+        return ""
+    sentence = (f"after {window:.0f}s idle the release would "
+                f"{'UNLOAD' if verdict['release'] else 'KEEP'} {OLLAMA_MODEL} — "
+                f"{verdict['note']}")
     if _measured_llm_reload() is not None:
         age = max(0.0, time.time() - _llm_load["at"])
         loads = int(_llm_load["loads"])
-        line += (f" (slowest of {loads} load" + ("s" if loads != 1 else "")
-                 + f"; last measured {_fmt_dur(age)} ago)")
-    return [line]
+        sentence += (f" (slowest of {loads} load" + ("s" if loads != 1 else "")
+                     + f"; last measured {_fmt_dur(age)} ago)")
+    return sentence
 
 
-def _parse_vram_pool(text: str) -> "tuple[int, int] | None":
-    """(free, total) MiB from `nvidia-smi --query-gpu=memory.free,memory.total`.
+def _parse_card(text: str) -> "dict | None":
+    """(name, free, total) for the FIRST card, or None when it cannot be read.
 
-    The FIRST row is the first GPU: the bubble loads one device, and summing
+    The first row is the first GPU: the bubble loads one device, and summing
     cards would report headroom on a card the models are not on. `N/A` (a
     driver that cannot answer, a vGPU) parses to None rather than to zero,
-    because "0 MB free" is the loudest claim this line can make and it must
-    never be invented from an answer nobody gave.
+    because "0 MB free" is the loudest claim the card's section can make and it
+    must never be invented from an answer nobody gave. A row WITHOUT a name is
+    still a reading — the name column is the only optional part, so this parser
+    serves both the named query and a two-column one.
     """
     for line in (text or "").splitlines():
         parts = [x.strip() for x in line.split(",")]
         if len(parts) < 2:
             continue
+        name = ""
+        if len(parts) >= 3:
+            name, parts = parts[0], parts[1:]
         try:
             free, total = int(float(parts[0])), int(float(parts[1]))
         except ValueError:
             continue                    # `N/A`, or a reshaped reply
         if total > 0:
-            return (free, total)
+            return {"name": name, "free_mb": free, "total_mb": total}
     return None
 
 
-def _parse_own_vram(text: str, pid: int) -> "int | None":
-    """VRAM the driver attributes to `pid`, or None when it attributes none.
+def _parse_vram_pool(text: str) -> "tuple[int, int] | None":
+    """(free, total) MiB — the pair, for the callers that want nothing else.
 
-    Attributed BY PID rather than assumed: the same card also serves Ollama's
-    llama-server, the compositor and the wallpaper, and folding those into
-    "what the bubble holds" would be wrong in both directions — it would blame
-    the bubble for someone else's memory AND overstate what an idle release
-    could hand back.
-
-    None means "this query tells us nothing here" (unsupported, `N/A`), which
-    is deliberately different from 0 — "it answered, and this pid holds
-    nothing on the card". The two lead to different sentences in doctor.
+    Kept as the tick path's and the tests' entry point: `_parse_card` is the
+    same reading with the card's name attached, so the two can never disagree
+    about what the driver said.
     """
-    answered = False
-    total = 0
+    card = _parse_card(text)
+    return (card["free_mb"], card["total_mb"]) if card else None
+
+
+def _parse_card_tenants(text: str) -> "list[dict] | None":
+    """Rows of `{pid, name, mb}` the driver attributes VRAM to, or None.
+
+    None means the query tells us NOTHING (unsupported, `N/A`, a driver that
+    cannot attribute by pid); an empty list means it answered and nothing is on
+    the card. The two lead to different sentences and only one of them is a
+    measurement — the same distinction `_own_vram_mb` has always kept.
+
+    The row is split at the FIRST comma and the LAST: nvidia-smi prints the
+    process's whole command line in the name column, and a browser's
+    gpu-process row carries its entire argv — commas included. Splitting on
+    every comma turns one tenant into a dozen unparsable fragments.
+    """
+    if text is None:
+        return None                     # the query itself could not be run
+    rows: list = []
     for line in (text or "").splitlines():
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) < 2:
+        line = line.strip()
+        if not line:
             continue
+        head, sep, rest = line.partition(",")
+        if not sep:
+            continue
+        name, sep2, tail = rest.rpartition(",")
+        if not sep2:
+            # `pid, used_memory` with no name column: a driver (or an older
+            # nvidia-smi) that reports attribution without the process. Still a
+            # tenant, just an unnamed one — the bytes are what must not be lost.
+            name, tail = "", rest
         try:
-            row_pid, used = int(parts[0]), int(float(parts[1]))
+            pid, mb = int(head.strip()), int(float(tail.strip()))
         except ValueError:
-            continue                    # `N/A` in the used_memory column
-        answered = True
-        if row_pid == pid:
-            total += used
-    return total if answered else None
+            continue                    # `N/A` in either column
+        rows.append({"pid": pid, "name": (name.strip() or "?"), "mb": mb})
+    if rows:
+        return rows
+    if not (text or "").strip():
+        return []                       # answered, with nothing on the card
+    if "no running process" in text.lower():
+        return []                       # the same fact, spelled out in prose
+    return None
 
 
 def _nvidia_query(*args: str) -> "str | None":
@@ -853,18 +883,61 @@ def _nvidia_query(*args: str) -> "str | None":
     return proc.stdout or ""
 
 
+def _card_info() -> "dict | None":
+    """The first card's name and memory, in ONE nvidia-smi call, or None."""
+    text = _nvidia_query("--query-gpu=name,memory.free,memory.total",
+                         "--format=csv,noheader,nounits")
+    return _parse_card(text) if text is not None else None
+
+
 def _vram_pool_mb() -> "tuple[int, int] | None":
     """(free, total) MiB for the first GPU, or None when it cannot be asked."""
-    text = _nvidia_query("--query-gpu=memory.free,memory.total",
+    card = _card_info()
+    return (card["free_mb"], card["total_mb"]) if card else None
+
+
+def _card_tenants() -> "list[dict] | None":
+    """Every process the driver attributes VRAM to, or None when it cannot say."""
+    text = _nvidia_query("--query-compute-apps=pid,process_name,used_memory",
                          "--format=csv,noheader,nounits")
-    return _parse_vram_pool(text) if text is not None else None
+    return _parse_card_tenants(text)
+
+
+def _tenant_kind(row: dict) -> str:
+    """Which tenant a driver row belongs to: us, the LLM, or somebody else.
+
+    Ours by PID, which is exact and was already the rule (folding the
+    compositor's and the wallpaper's memory into "what the bubble holds" would
+    be wrong in both directions — it would blame the bubble for someone else's
+    memory AND overstate what a release can hand back).
+
+    The LLM's by PROCESS NAME, which is a reading of how Ollama ships its
+    runner (`ollama`, `llama-server`) rather than a promise: a runtime that
+    renames itself lands under `other`, and the section still accounts for its
+    memory — under a different heading, and summed into the same total. The
+    alternative would be asking Ollama for its pid, which it does not offer.
+    """
+    if int(row.get("pid") or -1) == os.getpid():
+        return "bubble"
+    name = str(row.get("name") or "").lower()
+    if "ollama" in name or "llama" in name:
+        return "llm"
+    return "other"
 
 
 def _own_vram_mb() -> "int | None":
-    """VRAM this process holds, as the driver attributes it, or None."""
-    text = _nvidia_query("--query-compute-apps=pid,used_memory",
-                         "--format=csv,noheader,nounits")
-    return _parse_own_vram(text, os.getpid()) if text is not None else None
+    """VRAM this process holds, as the driver attributes it, or None.
+
+    Summed over the rows, because a process can appear more than once (one row
+    per device context). An answered query with no row for this pid is a
+    MEASUREMENT of nothing, deliberately different from None — "cannot ask" —
+    and the two lead to different sentences in doctor.
+    """
+    rows = _card_tenants()
+    if rows is None:
+        return None
+    return sum(int(row["mb"]) for row in rows
+               if int(row["pid"]) == os.getpid())
 
 
 # The idle tick runs every second and reading free VRAM shells out, so the
@@ -956,20 +1029,35 @@ def _idle_release_window(free_mb=_SAMPLE_NOW) -> dict:
 
 
 def _vram_headroom() -> dict:
-    """The card's headroom, this bubble's share of it, and the release's state.
+    """The card's whole story: who holds what, and what the next turn asks for.
 
-    One dict behind both doctor surfaces (the line and `doctor_json`), so the
+    One dict behind both doctor surfaces (the section and `doctor_json`), so the
     words and the numbers cannot disagree. Read-only, and honest where it is
     blind: a probe that cannot answer says `None` rather than raising, because
     doctor is exactly where a raise costs the most.
+
+    The tenants are the point. `free_mb` says how much the card has left and
+    nothing about who took the rest, which is the question a user staring at a
+    glitching desktop is actually asking: this bubble's own models (measured by
+    pid or estimated from the loader tables), the LLM (whose residency Ollama
+    reports and whose process the driver attributes), and every OTHER process on
+    the card, named. The residue the driver attributes to nobody is reported
+    too, so the three parts add up to the number on the header line.
+
+    `speech` is what this bubble's two models hold and where, `llm` is the
+    model, its blob and its split, `next_turn` is the claim a turn would make
+    (the same arithmetic the turn path runs), and `idle_release`/`llm_release`
+    are what the bubble would do about all of it when quiet.
 
     `bubble_source` is part of the answer, not decoration. A number the driver
     attributed to this pid and a number added up from the loader tables are not
     equally good evidence, and the reader is deciding whether to trust the
     headroom — so which one they are looking at is stated rather than implied.
     """
-    pool = _vram_pool_mb()
-    measured = _own_vram_mb()
+    card = _card_info()
+    pool = ((card["free_mb"], card["total_mb"]) if card else None)
+    rows = _card_tenants()
+    measured = _own_vram_mb() if rows is not None else None
     try:
         footprint = _audio.gpu_footprint_mb() or {}
     except Exception:
@@ -980,6 +1068,9 @@ def _vram_headroom() -> dict:
         source = "estimated" if footprint else "unknown"
     else:
         hold_mb, source = measured, "measured"
+    tenants = _card_tenant_rows(rows, pool, source == "estimated")
+    speech = _speech_holdings(footprint)
+    llm = _llm_holdings()
     # The window the release would ACTUALLY use, not the configured one: a card
     # under the pressure floor is on the short window, and a doctor that
     # reported the configured 600 s would be describing a release that is not
@@ -1000,76 +1091,168 @@ def _vram_headroom() -> dict:
         # booted.
         state = "pending" if due_in > 0.0 else "due"
     return {
+        "card": {"name": card["name"] if card else "",
+                 "total_mb": pool[1] if pool else None,
+                 "free_mb": pool[0] if pool else None,
+                 "used_mb": (pool[1] - pool[0]) if pool else None},
+        # The three flat numbers stay: they are what the tick path, the pressure
+        # floor and every existing reader of this dict ask for, and `card`
+        # carries the same two with the name attached.
         "free_mb": pool[0] if pool else None,
         "total_mb": pool[1] if pool else None,
         "bubble_mb": hold_mb,
         "bubble_source": source,
-        "bubble_models": {
-            "tts_mb": int(footprint.get("tts_mb") or 0),
-            "whisper_mb": int(footprint.get("whisper_mb") or 0),
-            "tts_device": str(footprint.get("tts_device") or ""),
-            "whisper_device": str(footprint.get("whisper_device") or ""),
-        },
+        "tenants": tenants,
+        "speech": speech,
+        "llm": llm,
+        "next_turn": _next_turn_card_state(pool[0] if pool else None,
+                                          held_mb=hold_mb, llm=llm),
         "idle_release": {"window_s": window,
                           "configured_s": pressure["configured_s"],
                           "state": state, "due_in_s": due_in,
                           "under_pressure": pressure["under"],
                           "floor_mb": pressure["floor_mb"],
                           "pressure_reason": pressure["reason"]},
-        "speech_yields": _speech_yield_state(pool[0] if pool else None),
+        "llm_release": {"window_s": _idle_release_seconds(),
+                         "sentence": _llm_release_sentence()},
     }
 
 
-def _speech_yield_state(free_mb) -> dict:
-    """What a turn would ask of the speech model, as facts rather than a hope.
-
-    The mirror of the idle release's slot beside it: the policy (`the setting`),
-    what there is to give (`held_mb`), what the LLM needs (`claim_mb`, from the
-    per-model cache — None until a turn has read it) and, when both numbers are
-    known, the verdict the turn would reach right now. A doctor that only said
-    "the speech model may yield" would be describing a policy; this says whether
-    it WOULD, and why not when it would not.
-
-    `held_mb` is read from the same place the release reads it
-    (`core.audio.gpu_footprint_mb`, the loader tables for what is loaded on the
-    card), NOT from the measured share the line above reports: the two are
-    different measurements of different things, and this state predicts what
-    `drop_models` would free.
-    """
+def _mib(gib) -> "int | None":
+    """Ollama reports GiB; the card's arithmetic is in MiB."""
     try:
-        held = max(0, int((_audio.gpu_footprint_mb() or {}).get("total_mb") or 0))
-    except Exception:
-        log.debug("gpu footprint probe failed in doctor", exc_info=True)
-        held = 0
+        return int(round(float(gib) * 1024.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _card_tenant_rows(rows, pool, estimated: bool) -> dict:
+    """The card's occupants, named: us, the LLM, everyone else, and the rest.
+
+    `rows` is the driver's attribution (None when it cannot attribute at all).
+    The parts add up to the used bytes on the header line, which is the property
+    that makes this a story rather than three unrelated numbers: the bubble's
+    share, whatever the driver pinned on an Ollama process, every other named
+    process, and — `unattributed_mb` — the residue the driver attributes to no
+    process at all (kernel, display engines, a driver that reports only some
+    contexts).
+
+    `estimated` says the bubble's own share came from the loader tables rather
+    than a pid, which matters to the reader: an estimate must not be added to a
+    measured total as though the two were the same kind of evidence.
+    """
+    out = {"attributed": rows is not None, "bubble_estimated": bool(estimated),
+           "llm_mb": None, "llm_pids": [], "others": [], "others_mb": None,
+           "attributed_mb": None, "unattributed_mb": None}
+    if rows is None:
+        return out
+    llm_rows = [row for row in rows if _tenant_kind(row) == "llm"]
+    other_rows = [row for row in rows if _tenant_kind(row) == "other"]
+    out["llm_mb"] = sum(int(row["mb"]) for row in llm_rows)
+    out["llm_pids"] = [int(row["pid"]) for row in llm_rows]
+    out["others"] = [{"pid": int(row["pid"]), "name": str(row["name"]),
+                      "mb": int(row["mb"])} for row in other_rows]
+    out["others_mb"] = sum(row["mb"] for row in out["others"])
+    out["attributed_mb"] = sum(int(row["mb"]) for row in rows)
+    if pool:
+        used = int(pool[1]) - int(pool[0])
+        out["unattributed_mb"] = max(0, used - out["attributed_mb"])
+    return out
+
+
+def _speech_holdings(footprint: dict) -> dict:
+    """What this bubble's speech models hold, per model and per device.
+
+    From `core.audio.gpu_footprint_mb` — the loader tables, which is the same
+    source the idle release and the turn's yield verdict weigh, so the section
+    and those decisions describe one set of models. A model on the CPU counts
+    zero here because it is not on the card; the device field is what says so.
+    """
+    def _mb(key: str) -> int:
+        return max(0, int(footprint.get(key) or 0))
+
+    return {"whisper_mb": _mb("whisper_mb"), "tts_mb": _mb("tts_mb"),
+            "total_mb": _mb("total_mb"),
+            "whisper_device": str(footprint.get("whisper_device") or ""),
+            "tts_device": str(footprint.get("tts_device") or ""),
+            "whisper_loaded": bool(footprint.get("whisper_loaded")),
+            "tts_loaded": bool(footprint.get("tts_loaded"))}
+
+
+def _llm_holdings() -> dict:
+    """What the LLM holds on the card: the model, its blob, and the split.
+
+    The same two readings the turn path uses — `/api/tags` for what a full load
+    costs, `/api/ps` for how much of it is really on the card — so the section's
+    sentence and the decision behind it cannot disagree. `need_mb` is what a
+    turn would still have to find room for: zero when the model is entirely
+    resident, the offloaded remainder when Ollama has split it, and the whole
+    blob when nothing is loaded or residency could not be read.
+
+    The residency read is CACHED (see `_resident_llm_cached`): a decision must
+    be live, a description must be cheap, and `age_s` is what keeps the second
+    honest instead of implying it is watching.
+    """
+    resident = _resident_llm_cached()
+    blob = _llm_footprint_mb()
+    need = _llm_need_mb(resident)
+    loaded = None
+    size_mb = on_card_mb = off_mb = None
+    if isinstance(resident, dict):
+        loaded = bool(resident.get("loaded"))
+        if loaded:
+            size_mb = _mib(resident.get("size"))
+            on_card_mb = _mib(resident.get("size_vram"))
+            if size_mb is not None and on_card_mb is not None:
+                off_mb = max(0, size_mb - on_card_mb)
+    cached = _llm_footprint.get("model") == OLLAMA_MODEL
+    return {"model": OLLAMA_MODEL, "loaded": loaded, "blob_mb": blob,
+            "size_mb": size_mb, "on_card_mb": on_card_mb,
+            "offloaded_mb": off_mb, "need_mb": need,
+            "blob_age_s": (max(0.0, time.time() - _llm_footprint["at"])
+                           if cached and _llm_footprint["at"] else None),
+            "resident_age_s": (max(0.0, time.time() - _llm_footprint["resident_at"])
+                               if cached and _llm_footprint.get("resident_at")
+                               else None)}
+
+
+def _next_turn_card_state(free_mb, *, held_mb, llm: dict) -> dict:
+    """What the next turn will ask the card for, and what it would cost.
+
+    The same arithmetic the turn path runs (`core.audio.yield_to_llm_verdict`,
+    one budget for both loaders), reached in the same order: an explicit no from
+    the setting, a model already resident (the turn loads nothing), an unread
+    size, then the verdict. A doctor that reached a different answer than the
+    turn would be describing a different machine.
+
+    `claim_mb` is what a turn asks FOR — the unmet remainder of the model, not
+    its whole blob — and `speech_gives_mb` is what this bubble's own models
+    would hand back if the verdict was to yield.
+    """
+    claim = llm.get("need_mb") if isinstance(llm, dict) else None
+    resident = bool(llm.get("loaded")) if isinstance(llm, dict) else False
     state = {"enabled": bool(_setting_flag("speech_yields_to_llm", True)),
-             "held_mb": held, "claim_mb": None, "would_yield": None,
-             "note": ""}
+             "held_mb": max(0, int(held_mb or 0)), "claim_mb": claim,
+             "free_mb": free_mb, "already_resident": bool(resident and claim == 0),
+             "would_yield": None, "speech_gives_mb": None, "note": ""}
     if not state["enabled"]:
         state["note"] = "speech_yields_to_llm is off"
         return state
-    if state["held_mb"] <= 0:
-        state["note"] = "nothing of this process's is on the card"
-        return state
-    # Read from the CACHE only: doctor must not start an HTTP call (a wedged
-    # Ollama would add seconds to it) and the turn path is what fills this in.
-    # `need_mb` when a turn has recorded one, because that is what the turn will
-    # actually ask the card for — a resident model's unmet remainder, not its
-    # whole blob — and a doctor that weighed the blob would disagree with the
-    # decision it is describing. `mb` is the fallback: a size read but no
-    # residency yet means the fresh-load footprint is the best available claim.
-    claim = None
-    if _llm_footprint.get("model") == OLLAMA_MODEL:
-        claim = _llm_footprint.get("need_mb")
-        if claim is None:
-            claim = _llm_footprint.get("mb")
-    state["claim_mb"] = claim
     if claim is None:
         state["note"] = ("the LLM's size has not been read yet — a turn reads "
                          "it before it asks")
         return state
+    if state["already_resident"]:
+        state["note"] = ("the LLM is already on the card in full, so a turn "
+                         "loads nothing")
+        return state
+    if state["held_mb"] <= 0:
+        state["note"] = "nothing of this process's is on the card"
+        return state
     verdict = _audio.yield_to_llm_verdict(free_mb, claim,
                                           held_mb=state["held_mb"])
     state["would_yield"] = bool(verdict["yield"])
+    state["speech_gives_mb"] = state["held_mb"] if verdict["yield"] else 0
     state["note"] = verdict["note"]
     return state
 
@@ -1114,23 +1297,162 @@ def _brain_fit_note(total_mb) -> str:
             f"smaller model (Settings → Brain)")
 
 
-def _gpu_headroom_lines() -> list:
-    """One doctor line: free VRAM, this bubble's share, the release's state.
+def _gb(mb) -> str:
+    return f"{float(mb or 0) / 1024.0:.1f} GB"
 
-    The three facts that decide whether the DESKTOP is about to be starved:
-    what the card has left, how much of what it lost belongs to this process,
-    and whether the idle release is about to hand its own share back. The LLM's
-    half of the memory story is the `llm memory` line beside this one — this is
-    the card's own arithmetic, which no other line reports (the GPU section
-    names the card and stops there).
 
-    Read-only, so it is safe to ask at any moment and cheap enough to ask from
-    a diagnostic.
+def _short_name(raw: str) -> str:
+    """The least a process name needs to be recognisable on one line.
+
+    nvidia-smi prints the process's whole command line, so a browser's
+    gpu-process row is hundreds of characters of argv. The basename before the
+    first argument is what a reader can place. `/proc/…` is kept whole: some
+    processes (a compositor, for one) are seen by the driver through their own
+    procfs entry, and its basename ("exe") names nothing.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "?"
+    text = text.split(" ", 1)[0]
+    if text.startswith("/proc/"):
+        return text
+    return os.path.basename(text) or text
+
+
+def _bubble_holds_note(info: dict) -> str:
+    """This bubble's own share, with the KIND of evidence it rests on.
+
+    A number the driver attributed to this pid and a number added up from the
+    loader tables are not equally good evidence, so which one it is gets said.
+    """
+    hold, source = info["bubble_mb"], info["bubble_source"]
+    if source == "measured":
+        return f"this bubble holds {_gb(hold)} (measured)"
+    if source == "estimated":
+        return (f"this bubble holds about {_gb(hold)} (estimated from the "
+                "loader tables — the driver attributed no memory to a pid)")
+    return "this bubble's own share could not be read"
+
+
+def _llm_process_note(tenants: dict) -> str:
+    """The LLM as a PROCESS on the card, from the driver's attribution."""
+    mb = tenants.get("llm_mb") or 0
+    if not mb:
+        return "no Ollama process is on the card"
+    pids = tenants.get("llm_pids") or []
+    where = f" (pid {', '.join(str(p) for p in pids)})" if pids else ""
+    return f"an Ollama process holds {_gb(mb)}{where}"
+
+
+def _other_processes_note(tenants: dict) -> str:
+    """Everybody else the driver attributes card memory to, named.
+
+    Named because "4.2 GB is somebody else's" is the answer that leaves the user
+    exactly where they were; three names plus a count is what they can act on.
+    """
+    others = tenants.get("others") or []
+    if not others:
+        return "no other process is on the card"
+    count = len(others)
+    shown = ", ".join(f"{_short_name(row['name'])} {_gb(row['mb'])}"
+                      for row in others[:3])
+    if count > 3:
+        shown += f", and {count - 3} more"
+    holds = "holds" if count == 1 else "hold"
+    return (f"{count} other process{'' if count == 1 else 'es'} {holds} "
+            f"{_gb(tenants.get('others_mb'))} ({shown})")
+
+
+def _llm_holdings_note(info: dict) -> str:
+    """What the LLM holds, from Ollama's own answer plus the driver's rows."""
+    llm = info["llm"]
+    model = str(llm.get("model") or "the model")
+    blob = llm.get("blob_mb")
+    process = _llm_process_note(info["tenants"])
+    if llm.get("loaded") is None:
+        if blob is None:
+            return ("the model's size has not been read yet — a turn reads it "
+                    "before it asks")
+        return (f"how much of {model} is on the card could not be read "
+                f"(blob {_gb(blob)}) — {process}")
+    if not llm["loaded"]:
+        tail = f"; {process}" if (info["tenants"].get("llm_mb") or 0) else ""
+        if blob is None:
+            return f"{model} is NOT loaded{tail}"
+        return (f"{model} is NOT loaded (blob {_gb(blob)} — that is what a turn "
+                f"must load){tail}")
+    size, on_card = llm.get("size_mb"), llm.get("on_card_mb")
+    if size is None or on_card is None:
+        return f"{model} is loaded, but how much of it is on the card was not reported"
+    blob_note = f" (blob {_gb(blob)})" if blob else ""
+    if not llm.get("offloaded_mb"):
+        return (f"{model} is resident {_gb(size)} and ALL of it is on the "
+                f"card{blob_note}")
+    return (f"{model} is SPLIT: {_gb(on_card)} on the card of {_gb(size)}, "
+            f"so {_gb(llm['offloaded_mb'])} is served from system memory"
+            f" (a turn reloads the whole {_gb(blob) if blob else _gb(size)})")
+
+
+def _next_turn_note(info: dict) -> str:
+    """What the next turn asks the card for, in the words the turn would use."""
+    ask = info["next_turn"]
+    if not ask["enabled"]:
+        return ("a turn never asks the speech model for the card "
+                "(speech_yields_to_llm off)")
+    if ask["already_resident"]:
+        return ("asks nothing — the LLM is already on the card in full, so a "
+                "turn loads nothing")
+    if ask["claim_mb"] is None:
+        return ("the LLM's size has not been read yet — a turn reads it before "
+                "it asks")
+    if ask["would_yield"]:
+        return (f"asks {_gb(ask['claim_mb'])}; this bubble's "
+                f"{_gb(ask['held_mb'])} goes back to make room — {ask['note']}")
+    return f"asks {_gb(ask['claim_mb'])} — {ask['note']}"
+
+
+def _release_note(info: dict) -> str:
+    """When the bubble would give its own memory back, and whether it would."""
+    rel = info["idle_release"]
+    if rel["state"] == "off":
+        # The sentence would say exactly this again, so the line stops here.
+        return "idle release is OFF (idle_release_seconds 0)"
+    if rel["state"] == "released":
+        state = ("already fired in this quiet spell — the next use re-arms it")
+    elif rel["state"] == "due":
+        state = (f"DUE after {_fmt_dur(rel['window_s'])} of quiet — fires on the "
+                 "next tick that finds the bubble idle")
+    else:
+        state = f"in {_fmt_dur(rel['due_in_s'])} of quiet"
+    # Only while the release is still AHEAD of us. After it has fired the
+    # current reading says nothing about why it fired, and a section that
+    # explained a past decision with a present number would be inventing it.
+    if rel["under_pressure"] and rel["state"] in ("pending", "due"):
+        state += f" (VRAM pressure — {rel['pressure_reason']})"
+    sentence = str((info.get("llm_release") or {}).get("sentence") or "")
+    return f"{state}; {sentence}" if sentence else state
+
+
+def _vram_story_lines() -> list:
+    """The card's story, in one doctor section: every tenant, and the next ask.
+
+    The four questions a user with a glitching desktop actually has — who is on
+    my card, what do the bubble's own models hold, what does the LLM hold, and
+    what will the next turn ask for — used to be spread over three lines
+    (`brain fit`, `llm memory`, `gpu headroom`) that each answered one of them
+    while omitting the others' numbers, so the arithmetic could not be checked
+    by eye. It is one section now, built from ONE dict (`_vram_headroom`), which
+    is also what `doctor_json` publishes — so the sentence and the numbers are
+    the same reading.
+
+    Read-only, and cheap enough for a diagnostic: two nvidia-smi queries and at
+    most one cached Ollama probe, each of which already answers "cannot tell"
+    rather than raising.
     """
     try:
         info = _vram_headroom()
     except Exception:
-        log.exception("gpu headroom probe failed")
+        log.exception("the card's story could not be read")
         return []
     free, total = info["free_mb"], info["total_mb"]
     if free is None or total is None:
@@ -1139,54 +1461,49 @@ def _gpu_headroom_lines() -> list:
         used = 0.0 if total <= 0 else (1.0 - free / total) * 100.0
         head = (f"{free / 1024:.1f} GB free of {total / 1024:.1f} GB "
                 f"({used:.0f}% used)")
-    source, hold = info["bubble_source"], info["bubble_mb"]
-    if source == "measured":
-        holds = f"this bubble holds {hold / 1024:.1f} GB (measured)"
-    elif source == "estimated":
-        holds = (f"this bubble holds about {hold / 1024:.1f} GB (estimated from "
-                 "the loader tables — the driver attributed no memory to a pid)")
+    name = str((info.get("card") or {}).get("name") or "").strip()
+    lines = [f"card: {name} — {head}" if name else f"card: {head}"]
+    tenants = info["tenants"]
+    parts = [_bubble_holds_note(info)]
+    if tenants["attributed"]:
+        parts.append(_llm_process_note(tenants))
+        parts.append(_other_processes_note(tenants))
+        if tenants.get("unattributed_mb"):
+            parts.append(f"the driver attributes "
+                         f"{_gb(tenants['unattributed_mb'])} to no process")
     else:
-        holds = "this bubble's own share could not be read"
-    rel = info["idle_release"]
-    if rel["state"] == "off":
-        state = "idle release OFF (idle_release_seconds 0)"
-    elif rel["state"] == "released":
-        state = ("idle release already fired in this quiet spell — the next use "
-                 "re-arms it")
-    elif rel["state"] == "due":
-        state = (f"idle release DUE after {_fmt_dur(rel['window_s'])} of quiet — "
-                 "fires on the next tick that finds the bubble idle")
+        parts.append("what else is on the card could not be attributed (this "
+                     "driver does not report per-process memory)")
+    lines.append("  tenants: " + "; ".join(parts))
+    speech = info["speech"]
+    if speech["total_mb"] > 0:
+        held = []
+        if speech["whisper_mb"]:
+            held.append(f"whisper {_gb(speech['whisper_mb'])}"
+                        + (f" on {speech['whisper_device']}"
+                           if speech["whisper_device"] else ""))
+        if speech["tts_mb"]:
+            held.append(f"the speech model {_gb(speech['tts_mb'])}"
+                        + (f" on {speech['tts_device']}"
+                           if speech["tts_device"] else ""))
+        lines.append(f"  speech: {' and '.join(held)} — "
+                     f"{_gb(speech['total_mb'])} together, all of it this "
+                     f"bubble's")
     else:
-        state = f"idle release in {_fmt_dur(rel['due_in_s'])} of quiet"
-    # Only while the release is still AHEAD of us. After it has fired the
-    # current reading says nothing about why it fired, and a doctor line that
-    # explained a past decision with a present number would be inventing it.
-    if rel["under_pressure"] and rel["state"] in ("pending", "due"):
-        state += f" (VRAM pressure — {rel['pressure_reason']})"
-    line = f"gpu headroom: {head} — {holds}; {state}"
-    # What a TURN would ask of the same memory, said only when there is
-    # something to ask for: with nothing of ours on the card (or the feature
-    # off) the sentence would be about a policy rather than about this machine.
-    ask = info["speech_yields"]
-    if not ask["enabled"]:
-        line += ("; a turn never asks the speech model for the card "
-                 "(speech_yields_to_llm off)")
-    elif ask["held_mb"] > 0:
-        held_gb = ask["held_mb"] / 1024
-        if ask["claim_mb"] is None:
-            line += (f"; a turn that cannot fit its LLM can ask the speech "
-                     f"model for its {held_gb:.1f} GB")
-        elif ask["would_yield"]:
-            line += (f"; the speech model's {held_gb:.1f} GB goes back to a "
-                     f"turn whose LLM ({ask['claim_mb']} MB) does not fit "
-                     f"without it")
-        else:
-            line += (f"; the speech model keeps its {held_gb:.1f} GB — "
-                     f"{ask['note']}")
-    # ...and the one question the rest of the diagnostics never ask: whether
-    # the configured model fits this card at all.
+        missing = [label for key, label in (("tts_loaded", "the speech model"),
+                                            ("whisper_loaded", "whisper"))
+                   if not speech.get(key)]
+        lines.append("  speech: nothing of this bubble's is on the card"
+                     + (f" ({' and '.join(missing)} not loaded)" if missing else ""))
+    lines.append(f"  llm: {_llm_holdings_note(info)}")
+    lines.append(f"  next turn: {_next_turn_note(info)}")
+    lines.append(f"  release: {_release_note(info)}")
+    # ...and the one question the others never ask: whether the configured model
+    # fits this card at all.
     fit = _brain_fit_note(total)
-    return [line, fit] if fit else [line]
+    if fit:
+        lines.append("  " + fit)
+    return lines
 
 
 def _deployment_snapshot() -> dict:
@@ -1385,8 +1702,10 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         crash_log=CRASH_LOG,
         appearance_look=_appearance_note,
         web_lines=_web_lines,
-        llm_lines=_llm_memory_lines,
-        gpu_lines=_gpu_headroom_lines,
+        # ONE story for the card: the tenants, the speech models, the LLM and
+        # what the next turn asks for are one host collector behind one doctor
+        # section, so no two lines can describe the same memory differently.
+        gpu_lines=_vram_story_lines,
         gpu_headroom=_vram_headroom,
         cap_refusal_note=_cap_refusal_note,
         cap_refusals=_cap_refusal_summary,
@@ -2569,7 +2888,13 @@ _LLM_FOOTPRINT_SECONDS = 600.0
 # `mb` is the model's whole blob (the fresh-load footprint the doctor's fit line
 # asks about); `need_mb` is what a TURN still has to find room for, which counts
 # the part Ollama already has resident. Both belong to `model`.
-_llm_footprint = {"model": "", "mb": None, "need_mb": None, "at": 0.0}
+# `resident`/`resident_at` are the OTHER half of the same answer — what Ollama
+# reported loaded, and when — kept here so the descriptive surfaces (the card
+# section and `doctor_json`) cost one probe per window instead of one per line,
+# and so they can say how old the reading is instead of implying it is watched.
+_llm_footprint = {"model": "", "mb": None, "need_mb": None, "at": 0.0,
+                  "resident": None, "resident_at": 0.0,
+                  "resident_model": ""}
 
 
 def _llm_footprint_mb() -> "int | None":
@@ -2622,6 +2947,7 @@ def _llm_need_mb(resident) -> "int | None":
     that carries no sizes) falls back to the fresh-load footprint, so a bundle
     that cannot ask /api/ps keeps the old behaviour rather than claiming zero.
     """
+    _note_resident(resident)
     if isinstance(resident, dict) and resident.get("loaded"):
         size, vram = resident.get("size"), resident.get("size_vram")
         if size is None or vram is None:
@@ -2632,6 +2958,37 @@ def _llm_need_mb(resident) -> "int | None":
             _llm_footprint["need_mb"] = need
         return need
     return _llm_footprint_mb()
+
+
+def _note_resident(resident, at=None) -> None:
+    """Record what Ollama reported loaded, for the descriptive surfaces.
+
+    Stamps the model it was read FOR, because a residency belongs to a model
+    exactly as a size does: after a swap the record must read as cold rather
+    than describing a model nobody has loaded.
+    """
+    _llm_footprint["resident"] = resident if isinstance(resident, dict) else None
+    _llm_footprint["resident_at"] = float(at if at is not None else time.time())
+    _llm_footprint["resident_model"] = OLLAMA_MODEL
+
+
+def _resident_llm_cached() -> "dict | None":
+    """What Ollama has loaded, CACHED — the reader the descriptions use.
+
+    `_resident_llm` is the decision's probe and stays LIVE: a turn's claim
+    cannot rest on a residency read ten minutes ago, when Ollama may since have
+    unloaded the model. Doctor and the card section describe rather than decide,
+    so they take this — the same reading, kept for the same window as the blob
+    beside it, which is also why they can report how old it is.
+    """
+    now = time.time()
+    if (_llm_footprint.get("resident_model") == OLLAMA_MODEL
+            and _llm_footprint.get("resident_at")
+            and now - _llm_footprint["resident_at"] < _LLM_FOOTPRINT_SECONDS):
+        return _llm_footprint.get("resident")
+    resident = _resident_llm()
+    _note_resident(resident, at=now)
+    return resident
 
 
 def _llm_release_verdict() -> dict:

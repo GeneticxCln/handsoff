@@ -719,6 +719,127 @@ writes (fontconfig, Qt) that no test controls. And the rule protects PATHS, not
 owning tests: a write that reaches the real home through a child spawned with a
 hand-built environment is still out of reach, which is the same seam, stated the
 same way.
+
+## The card tells one story — every tenant, and what the next turn asks for (2026-09-19)
+
+**What was asked.** Give the bubble one VRAM story: a doctor section that names
+every tenant on the card, what the speech models hold, what the LLM holds, and
+what the next turn would ask for.
+
+**Why it was not one story.** Three lines each answered a piece of it — `brain
+fit:` (can this model EVER fit the card), `llm memory:` (what an idle release
+would do with the model), `gpu headroom:` (free bytes, this bubble's share, the
+release's state) — and none of them could be checked against the others by eye.
+The number a user needs first is the one nobody printed: **who took the rest of
+the card**. The audit that produced the idle release had to measure free VRAM by
+hand for exactly that reason.
+
+**One collector, one section, two surfaces.** `handsoff._vram_headroom()` builds
+one dict — `card`, `tenants`, `speech`, `llm`, `next_turn`, `idle_release`,
+`llm_release` — and `_vram_story_lines()` renders THAT dict as a section:
+
+```
+card: NVIDIA GeForce RTX 4060 Ti — 10.1 GB free of 16.0 GB (37% used)
+  tenants: this bubble holds 3.1 GB (measured); an Ollama process holds 6.8 GB
+  (pid 4242); 2 other processes hold 0.8 GB (gslapper 0.4 GB, chrome 0.4 GB);
+  the driver attributes 0.7 GB to no process
+  speech: whisper 1.2 GB on cuda and the speech model 1.9 GB on cuda — 3.0 GB
+  together, all of it this bubble's
+  llm: gemma4:12b is resident 7.0 GB and ALL of it is on the card (blob 7.0 GB)
+  next turn: asks nothing — the LLM is already on the card in full, so a turn
+  loads nothing
+  release: in 8 minutes of quiet; after 600s idle the release would KEEP …
+  brain fit: gemma4:12b needs 7.0 GB of the card's 16.0 GB, leaving room …
+```
+
+`doctor_json` publishes the same dict (as `gpu_headroom`, its documented key),
+so the words and the numbers are one reading rather than two that agree. The
+doctor's `llm_lines` dep is RETIRED with the `llm memory:` line it fed: the LLM's
+memory was being reported twice — as a policy there and as a number in the
+headroom line — which is the defect a single story removes.
+
+**The tenants are the new part, and the driver is asked properly.** One query
+(`--query-compute-apps=pid,process_name,used_memory`) classifies each attributed
+process: this pid is the bubble, a process whose name carries `ollama`/`llama` is
+the LLM, everything else is named. Two things the section states rather than
+implies: the LLM classification is a READING of how Ollama ships its runner (a
+runtime that renames itself lands under `other` and its memory still appears),
+and the bytes the driver attributes to no process at all get their own clause —
+which is what makes the parts add up to the used bytes on the header line, the
+property that turns four numbers into a story (and a test).
+
+**The comma trap, found live.** nvidia-smi prints the process's whole command
+line in the name column, and a browser's gpu-process row carries its entire argv
+— commas included (measured here: `/opt/google/chrome/chrome --type=gpu-process
+--field-trial-handle=3?i=1,2?3`). Splitting the row on every comma turns one 382 MB
+tenant into a dozen unparsable fragments and the card's total stops adding up, so
+the row is split at the FIRST and the LAST comma, and a two-column reply (no name
+column, an older nvidia-smi) is still a tenant — unnamed, but counted.
+
+**Speech, LLM, and the ask.** Speech comes from `core.audio.gpu_footprint_mb` —
+the loader tables the idle release and the turn's yield verdict already weigh — so
+per-model bytes, device and the total describe the same models those decisions
+move. The LLM's half reads `/api/tags` for the blob and `/api/ps` for the split,
+with `need_mb` = `size - size_vram` (the unmet remainder a turn actually asks
+for). The `next turn:` line runs the SAME `yield_to_llm_verdict` the turn runs, in
+the same order, and short-circuits on the case the old arithmetic got wrong: a
+fully resident model asks for NOTHING and says so, instead of being weighed
+against its whole blob.
+
+**Two real defects the work exposed, both fixed at the cause.**
+
+1. *An unreadable residency was reported as "NOT loaded".* `ollama_resident`
+   answers `{"loaded": False}` when `/api/ps` answers with no models and `None`
+   when it cannot be asked; collapsing the two would have made a wedged endpoint
+   read as a measurement. The section's `llm:` line keeps them apart ("could not
+   be read" vs "is NOT loaded"), pinned by a test whose stub fails `/api/ps`
+   while `/api/tags` still answers.
+2. *The cold-cache order wiped the residency it had just read.* `_llm_footprint_mb`
+   dropped the record's residency whenever the MODEL key did not match — which is
+   true of a cold record, so the section probed, then the blob read reset it, and
+   the next line probed again. The residency is now stamped with the model it was
+   read for (`resident_model`), which is the honest form of the same rule (a
+   residency belongs to a model) and makes a swap read as cold instead of
+   inheriting the previous model's answer.
+
+**Measured on the final bytes.** `tests` **PASS — 1 874 passed in 261 s** (was
+1 860); `coverage` **PASS, 84.90%** (2 593 missing of 17 169) ≥ 70;
+`compile`/`shell`/`smoke`/`clean-checkout` PASS; specs freshness **19 passed**
+after the generated module table was rewritten from the code. Live section from
+this machine, run through the real loader: the header names the RTX 4060 Ti,
+the tenants line names four processes plus the 1.6 GB nobody is attributed, the
+`speech:` line names what is loaded, the `llm:` line names the configured model
+and its blob, and `release:` carries both the window and the verdict.
+
+**Teeth: 14 new tests in `tests/test_idle_release.py`** (135 → 149 `def test_`,
+140 → 154 collected): every tenant named; the parts add up to the used bytes;
+the header names the card; a comma-bearing process name is one tenant; a driver
+that cannot attribute says so rather than claiming an empty card; the resident
+model's turn asks nothing; a split model is described as split with the
+remainder as the ask; an unreadable residency is not "not loaded"; the speech
+line names both models and their device and refuses to count what is not on the
+card; the descriptive read is cached while the turn keeps it warm; a swapped
+model does not inherit the old residency; every line survives a card that cannot
+be asked; and the section and the JSON are the same reading. **11/11 mutations
+caught, 0 missed, every restore sha256-verified**: the row split at the first
+comma, an Ollama runner classified as somebody else, the LLM's bytes attributed
+to nobody, only the LLM counted as attributed, the unattributed residue dropped,
+a resident model asked for its whole blob, the speech device dropped, an
+unreadable residency reported as not-loaded, the descriptive read never cached,
+the residency unstamped, and the host wiring the section out of the doctor.
+
+**Stated limits.** The tenants are the driver's attribution, so a driver that
+reports no per-process memory leaves the section saying exactly that (and the
+bubble's own share falls back to the loader tables, labelled as an estimate).
+The LLM's tenant appears under its PROCESS NAME, which is a reading of Ollama's
+naming and not an interface it publishes. The bubble's measured share and the
+speech models' table footprint are different measurements of different things
+(the first includes CUDA context and library overhead), and the section says
+which is which rather than reconciling them. And the section is a snapshot: it
+is built when doctor runs, so it cannot show a card that filled a second ago.
+
+## The address that was checked is the address that is fetched — CLOSED (2026-09-19)
+
 **What was asked.** Close the DNS-rebinding TOCTOU in the web reader: pin the
 address that was validated for the actual fetch and bound the resolver, or state
 precisely why pinning cannot work there.

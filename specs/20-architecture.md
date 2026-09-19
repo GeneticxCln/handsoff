@@ -9,7 +9,7 @@ copy a size out of it into prose.
 
 | Module | Lines | Owns | Must not import |
 |---|---|---|---|
-| `handsoff.py` | 8533 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
+| `handsoff.py` | 8890 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
 | `core/__init__.py` | 306 | `APP_MODULE_NAME="handsoff_core"`, `claim_app_instance`, `load_module`, origin rule, stdlib-shadow guard | app globals |
 | `core/tools.py` | 3573 | 48 `@tool`s, `ToolBelt`, `set_dependencies` (the host installs its runtime with this), `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
 | `core/bubble.py` | 4072 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |
@@ -18,7 +18,7 @@ copy a size out of it into prose.
 | `core/web.py` | 1084 | 6 backends behind `search`, `Result`, `_route`, TTL cache, `read_page`, and the two-stage SSRF guard: `_public_target` validates ONE address, `_read_fetch` walks the redirect chain a hop at a time with every hop rechecked, and the addresses it approved travel with the fetch (`connect_to`) so the address dialled is the address checked; a name is looked up under `_DNS_TIMEOUT_S` | `handsoff` (resolvers via `configure()`) |
 | `core/calendar.py` | 613 | `ics_fetch`/`ics_events_from_text`/`fmt_events` (its whole interface, promoted from five private names), ICS unfold/parse/RRULE, `DAY_NAMES`/`MONTH_NAMES`, scheme + label guards | anything (stdlib only) |
 | `core/assistant.py` | 601 | `PomodoroController`, `NotificationReader`, `ReminderStore`, mute/parse helpers | `handsoff` |
-| `core/doctor.py` | 567 | `run_doctor`/`doctor_json` via `DoctorDeps` — text lines and one structured dict per host dep (appearance, web, llm memory, gpu headroom), so both surfaces describe one reading | `handsoff` (deps injected) |
+| `core/doctor.py` | 554 | `run_doctor`/`doctor_json` via `DoctorDeps` — text lines and one structured dict per host dep (appearance, web, the card's story: `gpu_lines` renders as the section and `gpu_headroom` is the same dict), so both surfaces describe one reading | `handsoff` (deps injected) |
 | `core/registry.py` | 435 | `BoundedRegistry` (admission under lock), `Offer` (arm/read/consume) | — |
 | `core/brain.py` | 503 | `ollama_chat`/`ollama_chat_stream`, `ollama_unload` (`keep_alive: 0` on the same knob every turn sets the other way), `ollama_resident` (`/api/ps`: what is loaded and how much of it is on the card), `ollama_model_size_mb` (`/api/tags`: what a model that is NOT loaded yet would cost the card — the claim side of the mirror below), `ollama_release_verdict` (keep the LLM when the measured reload costs more than the memory it frees), `TurnStream`, markup filter | — |
 | `core/theme.py` | 313 | `hex_to_rgb`, luminance, wallpaper match retune (Qt-free) | Qt |
@@ -109,7 +109,10 @@ runtime → `core/tools.py` + host `ToolBelt` subclass, (4d) doctor →
   The seam is DETECTED (`_accepts_connect_to`) rather than required, and a seam
   without it is warned about, never silently unpinned.
 - `core/doctor.py`: `DoctorDeps` struct; partial deps still render (safe
-  defaults per field).
+  defaults per field). The card is ONE dep pair and deliberately not two: the
+  host builds one dict (`_vram_headroom`), `gpu_lines` renders it as the
+  section and `gpu_headroom` publishes it as JSON, so a memory story cannot be
+  told twice with different numbers.
 - `core/audio.py`: `configure(sample_rate, whisper_*, tts_*, settings, logger)`.
 
 ## 4. Concurrency
