@@ -1,6 +1,7 @@
 """Historical audit pins: regressions from past review rounds."""
 from __future__ import annotations
 
+import ast
 import base64
 import importlib.util
 import inspect
@@ -2380,3 +2381,267 @@ class TestWatcherPatternSafety:
         # …and the rest was deferred to the next poll, not skipped
         assert len(seen) == total, len(seen)
         assert [int(s.split()[-1]) for s in seen] == list(range(total))
+
+
+class TestTheScansShapesAreCheckedProperties:
+    """Two shapes a full-tree scan found, as PROPERTIES rather than instances.
+
+    Both were fixed at the one site each was found: a loader that rolled a
+    `sys.modules` registration back in an `except Exception` handler (an
+    interruption then left a half-executed module registered for the life of
+    the process, and every later import adopted the corpse), and a bounded
+    registry whose give-back was reachable only on the success path (a raising
+    build permanently shrank the cap, so the registry refused work the machine
+    could do). Repairing the instance is how such a shape comes back, so the
+    properties are checked over the shipped source instead: a third instance
+    fails here, where it is cheap.
+
+    What they deliberately do NOT do: the loader rule judges each handler on
+    its own, so a rollback in a narrow handler is refused even when a sibling
+    handler would also roll back (conservative in the safe direction — it can
+    demand a redundant rollback, never accept a hole); and the registry rule
+    follows a lease lexically, so it pins the ONE place where caller-supplied
+    code runs on behalf of a reservation rather than tracking leases across
+    calls, and states that instead of implying more.
+    """
+
+    #: The cap that makes a class a bounded registry by SHAPE. Anything that
+    #: refuses work at a cap and leases the slots it hands out is one of these,
+    #: whatever it is called and wherever it lives.
+    CAP_ATTR = "_cap"
+
+    @staticmethod
+    def _shipped():
+        """Every shipped Python source: tests/ and attic/ are not shipped."""
+        skip = {"attic", "tests", ".git", ".venv", "__pycache__", "build"}
+        return [p for p in sorted(HERE.rglob("*.py"))
+                if not any(part in skip for part in p.relative_to(HERE).parts)]
+
+    @staticmethod
+    def _self_attr(node):
+        """`self.x` -> "x", else None."""
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"):
+            return node.attr
+        return None
+
+    @classmethod
+    def _leases(cls, node) -> set:
+        """Attributes `node` both increments and decrements — i.e. a LEASE.
+
+        A counter with no decrement is a statistic (keys minted, refusals
+        recorded) and owes nothing on any path; one with both is capacity being
+        held, and that is the kind whose give-back has to be unconditional.
+        Both decrement spellings count: `self._x -= 1` and `max(0, self._x - 1)`.
+        """
+        inc, dec = set(), set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.AugAssign):
+                name = cls._self_attr(n.target)
+                if name is None:
+                    continue
+                if isinstance(n.op, ast.Add):
+                    inc.add(name)
+                elif isinstance(n.op, ast.Sub):
+                    dec.add(name)
+            if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "max":
+                for arg in n.args:
+                    if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Sub):
+                        name = cls._self_attr(arg.left)
+                        if name:
+                            dec.add(name)
+        return inc & dec
+
+    def _rolls_back_sys_modules(self, handler) -> bool:
+        """True when this handler restores or pops a sys.modules registration."""
+        for node in ast.walk(handler):
+            if (isinstance(node, ast.Subscript)
+                    and self._self_attr(node.value) is None
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "modules"):
+                return True
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("pop", "setdefault")
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr == "modules"):
+                return True
+        return False
+
+    def test_every_loader_rollback_catches_base_exception(self):
+        """A rollback that catches `Exception` is a rollback with a hole.
+
+        `except Exception` does not see KeyboardInterrupt, SystemExit or
+        MemoryError, so those exit the handler with the half-executed module
+        still registered under the name the loader just wrote — against the
+        `no half-initialized squat` promise each of these loaders makes in its
+        own docstring. A handler may still CONTINUE for an ordinary exception
+        and re-raise the rest (the host's candidate loop does exactly that);
+        what it may not do is roll back and let a BaseException through with
+        the registration left in place.
+        """
+        offenders = []
+        scanned = 0
+        for path in self._shipped():
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Try):
+                    continue
+                for handler in node.handlers:
+                    if not self._rolls_back_sys_modules(handler):
+                        continue
+                    scanned += 1
+                    caught = handler.type
+                    if caught is None:
+                        continue          # bare `except:` IS a BaseException catch
+                    if isinstance(caught, ast.Name) and caught.id == "BaseException":
+                        continue
+                    offenders.append(f"{path.relative_to(HERE)}:{handler.lineno} "
+                                     f"catches {ast.unparse(caught)}")
+        assert scanned >= 3, (
+            f"only {scanned} sys.modules rollback(s) found — a sweep that finds "
+            "nothing is a broken sweep, not a passing one (the loaders in "
+            "core/__init__.py and handsoff.py are its subjects)")
+        assert not offenders, (
+            "a loader rolls back a sys.modules registration in a handler that "
+            "cannot see a BaseException, so an interruption leaves the "
+            "half-executed module registered:\n" + "\n".join(offenders))
+
+    def _bounded_registries(self):
+        """Every shipped class that bounds admissions at a cap, by shape."""
+        found = {}
+        for path in self._shipped():
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+                holds_cap = any(
+                    isinstance(n, ast.Assign)
+                    and any(self._self_attr(t) == self.CAP_ATTR for t in n.targets)
+                    or (isinstance(n, ast.AnnAssign)
+                        and self._self_attr(n.target) == self.CAP_ATTR)
+                    for n in ast.walk(cls))
+                if holds_cap:
+                    found[f"{path.relative_to(HERE)}::{cls.name}"] = cls
+        return found
+
+    def test_the_bounded_registry_census_is_pinned(self):
+        """A second bounded registry must be a decision, not a discovery.
+
+        The discipline below (take under the lock, give back on every path) is
+        what makes a cap trustworthy, and it is only as good as the census: a
+        new class that refuses work at a cap inherits none of it by default, so
+        it fails here and is added deliberately — with these tests taught what
+        it leases.
+        """
+        assert sorted(self._bounded_registries()) == [
+            "core/registry.py::BoundedRegistry"], (
+            "the set of cap-holding classes changed — teach "
+            "TestTheScansShapesAreCheckedProperties what the new one leases "
+            "(and that its gives-back are unconditional) before listing it here")
+
+    def test_the_leased_slot_is_taken_under_the_lock(self):
+        """The take is the lease, so it happens inside the registry's lock.
+
+        Both halves matter: a take outside the lock races the room check that
+        authorised it, and a second take site needs the give-back discipline
+        applied there too — which this asserts by counting them.
+        """
+        registry = self._bounded_registries()["core/registry.py::BoundedRegistry"]
+        leased = self._leases(registry)
+        # Exactly ONE lease, found by shape rather than by name (so a rename is
+        # not a failure) — a SECOND one is a second resource whose give-back
+        # these tests would not be checking.
+        assert len(leased) == 1, (
+            f"leased counters (both incremented and decremented) = "
+            f"{sorted(leased) or 'none'} — capacity being held, and this test "
+            "checks exactly one")
+        takes = [n for n in ast.walk(registry)
+                 if isinstance(n, ast.AugAssign)
+                 and self._self_attr(n.target) in leased
+                 and isinstance(n.op, ast.Add)]
+        assert len(takes) == 1, (
+            f"{len(takes)} places take the slot; each needs its give-back "
+            "checked on every path")
+        take = takes[0]
+        # Inside the SAME locked block as the room check, not merely inside SOME
+        # `with self._lock`: two acquisitions make the take a second step, so a
+        # second caller can pass `_has_room` in between and the cap admits one
+        # more than it holds — the exact race the one-slot design prevents.
+        same_step = False
+        for n in ast.walk(registry):
+            if not isinstance(n, ast.With):
+                continue
+            if not any(isinstance(item.context_expr, ast.Attribute)
+                       and item.context_expr.attr == "_lock" for item in n.items):
+                continue
+            holds_take = take.lineno in range(n.lineno, (n.end_lineno or n.lineno) + 1)
+            checks_room = any(
+                isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "_has_room"
+                for stmt in n.body for c in ast.walk(stmt))
+            if holds_take and checks_room:
+                same_step = True
+        assert same_step, (
+            f"the slot is taken (line {take.lineno}) outside the locked block "
+            "that ran the room check, so admitting and taking are two steps")
+
+    def test_caller_supplied_work_gives_the_slot_back_in_a_finally(self):
+        """The give-back is a `finally`, not a success-path line.
+
+        `build(key)` is the caller's code: it is the one thing here that can
+        raise while a slot is held, and the give-back that used to sit after it
+        is exactly how a failed `Popen` shrank the cap for ever. A `finally`
+        cannot be made conditional by moving one line, which is why the shape
+        is pinned rather than an equivalent `except BaseException: release;
+        raise` handler.
+        """
+        registry = self._bounded_registries()["core/registry.py::BoundedRegistry"]
+        leased = self._leases(registry)
+
+        def releases(node) -> bool:
+            for n in ast.walk(node):
+                if (isinstance(n, ast.AugAssign)
+                        and self._self_attr(n.target) in leased
+                        and isinstance(n.op, ast.Sub)):
+                    return True
+                if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "max":
+                    for arg in n.args:
+                        if (isinstance(arg, ast.BinOp)
+                                and isinstance(arg.op, ast.Sub)
+                                and self._self_attr(arg.left) in leased):
+                            return True
+            return False
+
+        # The methods that DO release (by name), so a `finally` may give the
+        # slot back through either of them rather than inline.
+        releasers = {fn.name for fn in registry.body
+                     if isinstance(fn, ast.FunctionDef)
+                     and any(releases(n) for n in fn.body)}
+        assert releasers, "nothing in the class gives the leased slot back"
+
+        checked, offenders = 0, []
+        for fn in [n for n in registry.body if isinstance(n, ast.FunctionDef)]:
+            params = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Try):
+                    continue
+                if not any(isinstance(c, ast.Call)
+                           and isinstance(c.func, ast.Name)
+                           and c.func.id in params
+                           for stmt in node.body for c in ast.walk(stmt)):
+                    continue        # not caller-supplied work
+                checked += 1
+                gives_back = any(
+                    releases(stmt) or any(
+                        isinstance(c, ast.Call)
+                        and getattr(c.func, "attr", None) in releasers
+                        for c in ast.walk(stmt))
+                    for stmt in node.finalbody)
+                if not gives_back:
+                    offenders.append(f"{fn.name}() at line {node.lineno}")
+        assert checked >= 1, (
+            "no caller-supplied call is wrapped in a try any more — this "
+            "sweep has lost its subject")
+        assert not offenders, (
+            "caller-supplied work runs with a slot held and the give-back is "
+            "not in the try's `finally`, so a raise here leaks capacity "
+            "for ever:\n" + "\n".join(offenders))

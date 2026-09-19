@@ -285,12 +285,22 @@ def _load_core_package():
         sys.modules["core"] = pkg
         try:
             spec.loader.exec_module(pkg)
-        except Exception as e:
-            last_err = e
+        except BaseException as e:
+            # Rolled back for ANY exit, not just an Exception: the promise
+            # above is "no half-initialized squat", and a Ctrl-C during exec
+            # (or SystemExit, or an exhausted MemoryError) used to leave the
+            # half-executed package registered under `core` for the life of the
+            # process — every later import then adopted the corpse instead of
+            # the file. Only an ordinary exception moves on to the next
+            # candidate; anything else is the user or the interpreter leaving,
+            # so the rollback happens and then it propagates.
             if prev is None:
                 sys.modules.pop("core", None)
             else:
                 sys.modules["core"] = prev
+            if not isinstance(e, Exception):
+                raise
+            last_err = e
             continue
         import core.settings as _cs2
         return _cs2

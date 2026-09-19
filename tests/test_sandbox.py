@@ -1403,6 +1403,41 @@ class TestLoaderFailurePaths:
         assert "core.synth_sigint" not in sys.modules, \
             "a half-executed module stayed under the namespaced name"
 
+    def test_a_baseexception_during_the_package_load_leaves_no_squat(
+            self, H, monkeypatch, tmp_path):
+        """The host's OWN loader, which was the third copy of the same hole.
+
+        `handsoff._load_core_package` registers the `core` PACKAGE and then
+        exec's it, and its rollback caught `Exception` just like the support
+        loader's did — so a Ctrl-C inside core/__init__ left the half-executed
+        package registered under a name every later import adopts. Its docstring
+        promises "no half-initialized squat" in so many words, so this pins the
+        PROPAGATION (a BaseException that is not an Exception is the user or the
+        interpreter leaving, and only an ordinary failure moves on to the next
+        candidate) as well as the rollback: swallowing it here would be the
+        other half of the same bug.
+        """
+        synth = tmp_path / "__init__.py"
+        synth.write_text("raise KeyboardInterrupt('ctrl-c during import')\n",
+                         encoding="utf-8")
+        real_spec = importlib.util.spec_from_file_location
+
+        def spec_of(name, location, *args, **kwargs):
+            # Only the PACKAGE candidate is redirected: the real
+            # core/__init__.py is a real file on disk, so the failing body has
+            # to be supplied (the loader never imports it, it exec's it).
+            if Path(location).name == "__init__.py":
+                return real_spec(name, synth, *args, **kwargs)
+            return real_spec(name, location, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "spec_from_file_location", spec_of)
+        monkeypatch.delitem(sys.modules, "core", raising=False)
+        with pytest.raises(KeyboardInterrupt):
+            H._load_core_package()
+        assert "core" not in sys.modules, (
+            "the half-executed package stayed registered — every later import "
+            "of `core` then adopts that corpse instead of the file")
+
     def test_a_module_already_imported_by_its_bare_name_is_adopted(
             self, monkeypatch):
         """A plain `import hardware` is not a second copy of it.

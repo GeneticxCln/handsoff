@@ -287,17 +287,17 @@ class BoundedRegistry:
             displaced = self._items.get(key)
             try:
                 self._items[key] = build(key) if callable(build) else build
-            except BaseException:
-                # A raising build used to leave this reservation counted for
-                # ever: `_release` was only reachable on the success path, so a
-                # `Popen` that failed under the lock permanently shrank the
-                # registry by one slot — the cap then refused work the machine
-                # could do, and nothing pointed at the build that failed.
-                # Released here (never settled, so a retry still works) because
-                # a slot given back is the honest state: nothing was registered.
+            finally:
+                # In a `finally`, so the give-back does not depend on WHICH exit
+                # this takes. A raising build used to leave this reservation
+                # counted for ever — `_release` was reachable only on the
+                # success path — so a `Popen` that failed under the lock
+                # permanently shrank the registry by one slot: the cap then
+                # refused work the machine could do, and nothing pointed at the
+                # build that failed. Released here, never settled, so a retry
+                # still works: a slot given back is the honest state, because
+                # nothing was registered.
                 self._release(reservation)
-                raise
-            self._release(reservation)
             return key, displaced
 
     def _release(self, reservation: "_Reservation") -> None:
