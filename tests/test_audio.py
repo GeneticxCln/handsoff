@@ -4209,6 +4209,59 @@ class TestAMicrophoneThatIsNotOnTheMachine:
         """The push-to-talk assistant the other PTT tests already wire up."""
         return TestPttReleaseNonBlocking()._mk_ptt(H, monkeypatch)
 
+    def test_a_non_string_setting_is_not_a_device_named_None(
+            self, H, monkeypatch, caplog):
+        """A review found this one, and it is latent rather than live.
+
+        The loader coerces this key to a str (measured: null, 5, "  ", ["a"]
+        and {"x": 1} all become ""), so the file route cannot produce None.
+        But SETTINGS is a plain dict that embedders and tests assign into
+        directly, and `str(None)` is the TRUTHY string "None" — a device name
+        no machine has, which would warn and notify on every open.
+        """
+        calls = []
+        monkeypatch.setattr(H._audio, "sd", self._sd(set(), calls))
+        with caplog.at_level("WARNING", logger="handsoff"):
+            for raw in (None, 5, [], {"x": 1}, True):
+                assert H._mic_device_to_open(raw) == (None, False), raw
+        assert calls == [], "a non-string was probed as if it were a device name"
+        assert not [r for r in caplog.records if "not on this machine" in r.getMessage()], \
+            "a non-string setting produced a phantom missing-device warning"
+
+    def test_an_uncheckable_device_is_kept_rather_than_replaced(
+            self, H, monkeypatch, caplog):
+        """Only a CONFIRMED absence substitutes the default.
+
+        `query_devices` raises ValueError for a device that is not present
+        (measured: the same type for a stale ALSA pin and for a name that never
+        existed). Anything else — a broken audio backend, or a wiring mistake
+        in the resolver itself — is "unknown", and unknown must not be read as
+        gone: keeping the pin makes the open fail loudly, which is the honest
+        shape, while substituting would silently record from another mic.
+        """
+        class _SD:
+            @staticmethod
+            def query_devices(dev, kind=None):
+                raise RuntimeError("PortAudio backend is not initialised")
+
+        monkeypatch.setattr(H._audio, "sd", _SD)
+        with caplog.at_level("WARNING", logger="handsoff"):
+            assert H._mic_device_to_open("Yeti") == ("Yeti", False)
+        assert any("could not check" in r.getMessage() for r in caplog.records), \
+            "an unreadable check must say so rather than pass silently"
+
+    def test_the_assistant_names_the_fallback_note_it_reads(self, H):
+        """The attribute is declared in __init__, and read through getattr.
+
+        Both halves matter: the declaration is what makes it discoverable, and
+        the getattr is what lets the tests drive begin_listening on an instance
+        built without __init__ (the same shape the listener loop documents).
+        """
+        source = inspect.getsource(H.Assistant.__init__)
+        assert "self._mic_fallback = False" in source
+        body = inspect.getsource(H.Assistant.begin_listening)
+        assert 'getattr(self, "_mic_fallback", False)' in body
+
     def test_push_to_talk_opens_the_default_and_says_so_once(self, H, monkeypatch):
         monkeypatch.setattr(H._audio, "sd", self._sd(set()))
         opened, notes = [], []

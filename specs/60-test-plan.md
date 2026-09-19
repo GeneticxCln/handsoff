@@ -10,12 +10,12 @@ Sources: `tests/` (30 files + `conftest.py` + `checkout_guard.py` + `fake_ollama
 
 `tests/` — the FILE LIST is the contract: every `tests/test_*.py` must appear
 below, and `test_specs_freshness.py` fails when one does not. The counts are the
-2026-09-19 snapshot (1880 collected), so a stale count in this table means
+2026-09-19 snapshot (1890 collected), so a stale count in this table means
 nothing — a missing row does.
 
 | File | `test_*` fns | Area |
 |---|---|---|
-| `test_audio.py` | 151 | Recorder, resample, whisper/TTS seams, levels, playback cancel |
+| `test_audio.py` | 200 | Recorder, resample, whisper/TTS seams, levels, playback cancel |
 | `test_regression.py` | 144 | cross-cutting pins: prompt text, tool census, marker, restart internals |
 | `test_desktop.py` | 119 | niri/typing/windows/clipboard/screens, guards |
 | `test_policy.py` | 100 | DecisionPolicy, gates, confirm flow, whitelist/blocked |

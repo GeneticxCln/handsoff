@@ -2624,7 +2624,7 @@ def _open_input(device, rate: int, blocksize: int, cb) -> tuple:
         _audio.MIC_OPERATION_LOCK.release()
 
 
-def _mic_device_to_open(configured: str) -> tuple:
+def _mic_device_to_open(configured) -> tuple:
     """(device, fell_back) — the system default when the pinned device is gone.
 
     A pinned device carries its ALSA card index inside its name
@@ -2641,16 +2641,37 @@ def _mic_device_to_open(configured: str) -> tuple:
     default there would record from the wrong microphone without saying so.
     `None` is how this app says "the system default" everywhere else.
     """
-    device = (configured or "").strip() or None
+    # The loader coerces this key to a str (measured: null, 5, "  ", ["a"] and
+    # {"x": 1} all become ""), so `configured` is a string in every path the
+    # file writes -- but SETTINGS is a plain dict that embedders and tests
+    # assign into directly, and `str(None)` is the TRUTHY string "None": a
+    # device name no machine has, which would have warned and notified on every
+    # open. Anything that is not a string means "nothing pinned".
+    if isinstance(configured, str):
+        device = configured.strip() or None
+    else:
+        device = None
     if device is None or _audio is None:
         return device, False
     try:
         _audio.sd.query_devices(device, kind="input")
-        return device, False
-    except Exception as e:
+    except ValueError as e:
+        # ValueError is sounddevice's own "No input device matching '<name>'" —
+        # a CONFIRMED absence, and the only answer that justifies standing in
+        # for the user's choice with the default (measured: the same type for a
+        # stale ALSA pin and for a name that never existed).
         log.warning("configured microphone %r is not on this machine (%s) — "
                     "using the system default instead", device, e)
         return None, True
+    except Exception as e:                  # noqa: BLE001 -- unknown is not absent
+        # A broken audio backend, or a wiring mistake in this function itself,
+        # must NOT read as "the device is gone": keeping the pin makes the open
+        # fail loudly, which is the old and honest shape. Only a known absence
+        # substitutes anything.
+        log.warning("could not check whether microphone %r is present (%s) — "
+                    "keeping it", device, e)
+        return device, False
+    return device, False
 
 
 def _stop_stream_owned(stream) -> None:
@@ -5165,7 +5186,7 @@ class ContinuousListener:
         open_failures = 0
         while self._running and self._run_id == run_id:
             # re-resolve the device each (re)open so settings changes apply live
-            device, fell_back = _mic_device_to_open(str(SETTINGS["mic_device"]))
+            device, fell_back = _mic_device_to_open(SETTINGS["mic_device"])
             # getattr: this loop is also driven by a listener built without
             # __init__ (the tests construct one to exercise _run alone), and the
             # absence of a "was it falling back" note is simply "it was not".
@@ -5344,6 +5365,11 @@ class Assistant(QObject):
         self._last_spoken = ""
         self._recently_spoken: list[str] = []   # last TTS lines, for echo rejection
         self._handsfree = _setting_flag("handsfree", False, repair=True)
+        # True while a missing pinned microphone is being stood in for by the
+        # system default (see _mic_device_to_open). Named here so the attribute
+        # is discoverable; the two open paths read it through getattr anyway,
+        # because both are exercised on instances built without __init__.
+        self._mic_fallback = False
         self._listener = ContinuousListener(self)
         self._notifications = _core_assistant.NotificationReader(
             spawn=self._start_worker, is_closed=self._is_closed,
@@ -6507,7 +6533,10 @@ class Assistant(QObject):
                 self._ptt_epoch = int(getattr(self, "_ptt_epoch", 0) or 0) + 1
             except Exception:
                 pass
-        device, fell_back = _mic_device_to_open(str(SETTINGS["mic_device"]))
+        device, fell_back = _mic_device_to_open(SETTINGS["mic_device"])
+        # getattr for the same reason the listener uses it: push-to-talk's
+        # helpers build an Assistant without __init__ (the tests do), and a
+        # missing note simply means "was not falling back".
         if bool(fell_back) != bool(getattr(self, "_mic_fallback", False)):
             self._mic_fallback = bool(fell_back)
             if fell_back:
