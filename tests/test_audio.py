@@ -4146,3 +4146,183 @@ class TestWatchdogReopenLoop:
         self._run_capped(H, monkeypatch, ln, tick, max_ticks=2)
         assert ln._stream is None, "the dead stream must be released"
         assert ln._running is False
+
+
+class TestAMicrophoneThatIsNotOnTheMachine:
+    """A pinned device is a name with an ALSA card index inside it, and the
+    index moves when the hardware does.
+
+    Measured on the deployed bubble (2026-09-19): `mic_device` was
+    "Blue Microphones: USB Audio (hw:4,0)" while the Yeti was card 3 after the
+    replug, so every open failed with "Cannot get card index for 4" and
+    push-to-talk died outright — the assistant was unusable over a settings
+    value, instead of recording from the microphone the machine actually has.
+    """
+
+    @staticmethod
+    def _sd(present, calls=None):
+        class _SD:
+            @staticmethod
+            def query_devices(dev, kind=None):
+                if calls is not None:
+                    calls.append((dev, kind))
+                if dev in present:
+                    return {"name": dev, "default_samplerate": 48000.0}
+                raise ValueError(f"Cannot get card index for {dev!r}")
+
+        return _SD
+
+    def test_a_pinned_device_that_is_gone_opens_the_system_default(
+            self, H, monkeypatch):
+        monkeypatch.setattr(H._audio, "sd", self._sd(set()))
+        device, fell_back = H._mic_device_to_open(
+            "Blue Microphones: USB Audio (hw:4,0)")
+        assert device is None, "the dead pin must become 'the system default'"
+        assert fell_back is True, "and the caller must be able to say so"
+
+    def test_a_device_that_is_present_is_not_second_guessed(self, H, monkeypatch):
+        monkeypatch.setattr(H._audio, "sd", self._sd({"Yeti"}))
+        assert H._mic_device_to_open("Yeti") == ("Yeti", False)
+
+    def test_a_busy_device_is_not_papered_over(self, H, monkeypatch):
+        """Present-but-busy is a different problem with a different answer.
+
+        query_devices answers for a device that exists even when it cannot be
+        opened, so the resolution keeps it and the open failure stays the
+        caller's to report — quietly opening the default here would record from
+        the wrong microphone without saying so.
+        """
+        monkeypatch.setattr(H._audio, "sd", self._sd({"Yeti"}))
+        device, fell_back = H._mic_device_to_open("Yeti")
+        assert (device, fell_back) == ("Yeti", False)
+
+    def test_an_unset_device_is_the_system_default_and_not_a_fallback(
+            self, H, monkeypatch):
+        calls = []
+        monkeypatch.setattr(H._audio, "sd", self._sd(set(), calls))
+        assert H._mic_device_to_open("") == (None, False)
+        assert H._mic_device_to_open("   ") == (None, False)
+        assert calls == [], "nothing to check when nothing is pinned"
+
+    @staticmethod
+    def _ptt_assistant(H, monkeypatch):
+        """The push-to-talk assistant the other PTT tests already wire up."""
+        return TestPttReleaseNonBlocking()._mk_ptt(H, monkeypatch)
+
+    def test_push_to_talk_opens_the_default_and_says_so_once(self, H, monkeypatch):
+        monkeypatch.setattr(H._audio, "sd", self._sd(set()))
+        opened, notes = [], []
+        monkeypatch.setattr(H, "notify", lambda msg, **k: notes.append(msg))
+
+        class _Rec:
+            def __init__(self, on_level=None, device=None, threshold=0, **kw):
+                opened.append(device)
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(H, "Recorder", _Rec)
+        a = self._ptt_assistant(H, monkeypatch)
+        H.SETTINGS["mic_device"] = "Blue Microphones: USB Audio (hw:4,0)"
+        a.begin_listening()
+        a._recorder = None          # a second press, so "once" is testable
+        a.begin_listening()
+        assert opened == [None, None], "the default is what gets opened"
+        assert len(notes) == 1, \
+            f"the fallback is said once, not on every press: {notes}"
+        assert "system default" in notes[0]
+
+    def test_a_push_to_talk_open_failure_reaches_the_mic_problem_stream(
+            self, H, monkeypatch, tmp_path):
+        """opens_failed is the LISTENER's counter, and PTT never touched it, so
+        a bubble whose PTT could not open a microphone at all read
+        opens_failed=0 — measured live on the deployed copy. The mic-event
+        stream is shared by both, and 'open-failing' is what it summarises."""
+        monkeypatch.setattr(H, "MIC_EVENTS_FILE", tmp_path / "mic-events.json")
+        monkeypatch.setattr(H._audio, "sd", self._sd({"Yeti"}))
+
+        class _Rec:
+            def __init__(self, **kw):
+                pass
+
+            def start(self):
+                raise OSError("device busy")
+
+        monkeypatch.setattr(H, "Recorder", _Rec)
+        a = self._ptt_assistant(H, monkeypatch)
+        # The apology is spoken from a worker thread that first waits for the
+        # models; let it through and record it, so the failure path is asserted
+        # rather than left as a thread that outlives the test.
+        spoken = []
+        a._models_ready = threading.Event()
+        a._models_ready.set()
+        monkeypatch.setattr(a, "_speak", lambda *args, **kw: spoken.append(args),
+                            raising=False)
+        H.SETTINGS["mic_device"] = "Yeti"
+        a.begin_listening()
+        doc = json.loads((tmp_path / "mic-events.json").read_text())
+        assert doc["events"][-1]["to"] == "open-failing", doc
+        assert doc["events"][-1]["from"] == "ptt"
+        assert "open-failing" in H._recent_mic_problems(since=0.0)
+        assert wait_for(lambda: spoken), \
+            "a press that cannot open a microphone must still say so"
+        assert "microphone" in " ".join(str(x) for x in spoken[0])
+
+    def test_the_listener_opens_the_default_and_marks_health(self, H, monkeypatch):
+        monkeypatch.setattr(H._audio, "sd", self._sd(set()))
+        notes = []
+        monkeypatch.setattr(H, "notify", lambda msg, **k: notes.append(msg))
+        opened = []
+        monkeypatch.setattr(H, "_open_input",
+                            lambda dev, rate, bs, cb: (opened.append(dev)
+                                                       or self._stream(), rate))
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._assistant = types.SimpleNamespace()
+        ln._running = True
+        ln._run_id = 7
+        ln._suspended = False
+        ln._discard = False
+        ln._spotter = None
+        ln._stream = None
+        ln._frames_seen = 0
+        ln._last_nonzero = 0.0
+        ln._health_utt = 0
+        ln._health_opens_ok = 0
+        ln._health_opens_failed = 0
+        ln._health_open_device = ""
+        ln._health_last_open = "never"
+        ln._health_state = ""
+        ln._health_failing_since = None
+        ln._health_recovered_after = None
+        ln._health_stalled_since = None
+        ln._capture_rate = 0
+        ln._lock = threading.RLock()
+        ln._process_frame = lambda *a: None
+        ln._scale = None
+        H.SETTINGS["mic_device"] = "Blue Microphones: USB Audio (hw:4,0)"
+
+        def tick(s):
+            if s == 0.5:
+                ln._running = False
+        self._run_and_cap(H, monkeypatch, ln, tick)
+        assert opened and opened[0] is None, opened
+        assert ln._mic_fallback is True, "the health line has to carry it"
+        assert ln.mic_snapshot()["fallback"] is True
+        assert len(notes) == 1, notes
+
+    @staticmethod
+    def _stream():
+        return types.SimpleNamespace(start=lambda: None)
+
+    @staticmethod
+    def _run_and_cap(H, monkeypatch, ln, tick, max_ticks=40):
+        ticks = {"n": 0}
+
+        def fake_sleep(s):
+            ticks["n"] += 1
+            tick(s)
+            if ticks["n"] > max_ticks:
+                ln._running = False
+
+        monkeypatch.setattr(H.time, "sleep", fake_sleep)
+        ln._run(7)

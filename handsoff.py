@@ -2624,6 +2624,35 @@ def _open_input(device, rate: int, blocksize: int, cb) -> tuple:
         _audio.MIC_OPERATION_LOCK.release()
 
 
+def _mic_device_to_open(configured: str) -> tuple:
+    """(device, fell_back) — the system default when the pinned device is gone.
+
+    A pinned device carries its ALSA card index inside its name
+    ('Blue Microphones: USB Audio (hw:4,0)'), and that index moves when the
+    hardware does. Measured on this machine: the Yeti pinned at hw:4,0 while it
+    was card 3 after a replug, so every open failed with 'Cannot get card index
+    for 4' and push-to-talk died outright — instead of recording from the
+    microphone the machine actually has. The bubble was unusable over a stale
+    index, which is a settings value, not a hardware fact.
+
+    `query_devices` is the check, and deliberately the only one: a device that
+    EXISTS but is busy still queries fine and still fails at open, which is a
+    different problem with a different answer (retry), and quietly opening the
+    default there would record from the wrong microphone without saying so.
+    `None` is how this app says "the system default" everywhere else.
+    """
+    device = (configured or "").strip() or None
+    if device is None or _audio is None:
+        return device, False
+    try:
+        _audio.sd.query_devices(device, kind="input")
+        return device, False
+    except Exception as e:
+        log.warning("configured microphone %r is not on this machine (%s) — "
+                    "using the system default instead", device, e)
+        return None, True
+
+
 def _stop_stream_owned(stream) -> None:
     """Run stream teardown under the same owner as InputStream construction."""
     if stream is None:
@@ -4756,6 +4785,10 @@ class ContinuousListener:
         self._health_utt = 0             # hourly health line: utterances emitted
         self._health_opens_ok = 0        # hourly health line: successful stream opens
         self._health_opens_failed = 0    # hourly health line: failed open attempts
+        # True while the pinned mic is missing and the system default stands in
+        # (_mic_device_to_open decides it on every open, so a settings fix or a
+        # replug clears it without a restart).
+        self._mic_fallback = False
         self._health_open_device = ""    # device the last successful open used
         self._health_last_open = "never"  # human time of the last successful open
         self._health_state = ""          # last reported state (transition detection)
@@ -4854,6 +4887,7 @@ class ContinuousListener:
                 "last_open": self._health_last_open,
                 "opens_ok": self._health_opens_ok,
                 "opens_failed": self._health_opens_failed,
+                "fallback": bool(getattr(self, "_mic_fallback", False)),
                 "failing_since": (max(0.0, time.monotonic()
                                       - self._health_failing_since)
                                   if self._health_failing_since else None),
@@ -5131,7 +5165,15 @@ class ContinuousListener:
         open_failures = 0
         while self._running and self._run_id == run_id:
             # re-resolve the device each (re)open so settings changes apply live
-            device = str(SETTINGS["mic_device"]) if SETTINGS["mic_device"] else None
+            device, fell_back = _mic_device_to_open(str(SETTINGS["mic_device"]))
+            # getattr: this loop is also driven by a listener built without
+            # __init__ (the tests construct one to exercise _run alone), and the
+            # absence of a "was it falling back" note is simply "it was not".
+            if bool(fell_back) != bool(getattr(self, "_mic_fallback", False)):
+                self._mic_fallback = bool(fell_back)
+                if fell_back:
+                    notify("the configured microphone is not available — "
+                           "using the system default")
             try:
                 # devices that reject 16 kHz (e.g. StreamCam) are opened at
                 # their native rate instead; utterances are resampled to
@@ -6465,17 +6507,30 @@ class Assistant(QObject):
                 self._ptt_epoch = int(getattr(self, "_ptt_epoch", 0) or 0) + 1
             except Exception:
                 pass
+        device, fell_back = _mic_device_to_open(str(SETTINGS["mic_device"]))
+        if bool(fell_back) != bool(getattr(self, "_mic_fallback", False)):
+            self._mic_fallback = bool(fell_back)
+            if fell_back:
+                notify("the configured microphone is not available — using "
+                       "the system default")
         rec = Recorder(
             # push-to-talk is its own source: the Settings meter distinguishes
             # "hands-free is hearing me" from "my PTT key is recording"
             on_level=lambda v: self._emit_level(v, "ptt"),
-            device=str(SETTINGS["mic_device"]) if SETTINGS["mic_device"] else None,
+            device=device,
             threshold=int(SETTINGS["mic_threshold"]),
         )
         try:
             rec.start()
         except Exception as e:
             log.exception("cannot open microphone")
+            # The health line's open counter belongs to the listener, and
+            # push-to-talk never touched it — so a bubble whose PTT could not
+            # open a microphone at all still read opens_failed=0 (measured live
+            # on the deployed copy). The mic-event stream is shared by both and
+            # 'open-failing' is the state it already summarises, so the failure
+            # lands on the surface a mic problem is read from.
+            _record_mic_event("ptt", "open-failing")
             self._set(gen, IDLE)
             message = ("I can't open the microphone."
                        if not isinstance(e, ValueError)
