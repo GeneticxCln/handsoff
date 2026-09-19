@@ -2164,7 +2164,11 @@ class TestHandsfreeConfirm:
                                     ("handsfree-status", None)):
             a, spoken = self._mk(H, "listening")
             seen = []
-            a._confirm_handsfree = lambda: seen.append(1)
+            # Bound at definition: the assistant outlives this iteration, and a
+            # confirmation that arrives late (the queued-command path the
+            # neighbouring test documents) would otherwise append to whichever
+            # `seen` the loop is on by then.
+            a._confirm_handsfree = lambda seen=seen: seen.append(1)
             a._on_command(action)
             assert seen, f"{action} must speak a confirmation"
             if expected_on is not None:

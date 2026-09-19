@@ -1019,7 +1019,7 @@ def _searxng_alive(url: str) -> bool:
         return False
 
 
-def search_note(now: float = None) -> str:
+def search_note(now: float | None = None) -> str:
     """One doctor line: what this process has OBSERVED, per backend."""
     now = time.time() if now is None else now
     parts = []
@@ -1043,7 +1043,7 @@ def search_note(now: float = None) -> str:
     return ", ".join(parts)
 
 
-def reader_note(now: float = None) -> str:
+def reader_note(now: float | None = None) -> str:
     """One doctor line: which reader served pages, and how it went."""
     now = time.time() if now is None else now
     out = []

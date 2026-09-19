@@ -142,6 +142,32 @@ class TestPackIdentity:
 
 
 class TestPackResolution:
+    def test_a_non_finite_fps_is_refused_by_the_bounds(self, bubble, tmp_path):
+        """NaN and inf are refused by the RANGE check, not by a NaN test.
+
+        The condition read `not MIN <= fps <= MAX or fps != fps`, and the second
+        term was dead: every comparison against a NaN is False, so the bounds
+        already refuse it. Kept as a test because the dead term is what a reader
+        would trust if the range check were ever loosened — and because a
+        manifest is somebody else's file, so `NaN` and `Infinity` reach
+        `float()` through `json` (Python parses both).
+        """
+        for raw in (float("nan"), float("inf"), float("-inf"), 0.4, 30.5):
+            src = tmp_path / f"bad-{raw}"
+            png(src / "base.png")
+            manifest(src, {"name": f"Bad {raw}",
+                           "any": {"frames": ["base.png"], "fps": raw}})
+            slug, message = bubble.install_pack(src)
+            assert slug == "", f"fps={raw!r} must not install"
+            assert "fps" in message and "between" in message, message
+        # ...and a value INSIDE the bounds still installs, so the guard is not
+        # passing because every animation is refused.
+        src = tmp_path / "fine"
+        png(src / "base.png")
+        manifest(src, {"name": "Fine",
+                       "any": {"frames": ["base.png"], "fps": 12}})
+        assert bubble.install_pack(src)[0] == "fine"
+
     def _full(self, bubble, tmp_path, folder="full", name="Full"):
         src = tmp_path / folder
         for state in bubble.PACK_STATES:

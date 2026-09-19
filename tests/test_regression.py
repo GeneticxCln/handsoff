@@ -2645,3 +2645,105 @@ class TestTheScansShapesAreCheckedProperties:
             "caller-supplied work runs with a slot held and the give-back is "
             "not in the try's `finally`, so a raise here leaks capacity "
             "for ever:\n" + "\n".join(offenders))
+
+    # -- the third shape: a worker defined inside a loop ----------------------
+
+    @staticmethod
+    def _assigned_in(node) -> set:
+        """Names this statement's body assigns, without entering a nested scope.
+
+        A `def` inside the loop is its own scope, and so is a comprehension: the
+        names they bind are theirs, not the loop's, so they cannot be the ones a
+        worker reads back on a later pass.
+        """
+        out: set[str] = set()
+
+        def targets(t) -> None:
+            if isinstance(t, ast.Name):
+                out.add(t.id)
+            elif isinstance(t, ast.Starred):
+                targets(t.value)
+            elif isinstance(t, (ast.Tuple, ast.List)):
+                for el in t.elts:
+                    targets(el)
+
+        def visit(n) -> None:
+            for child in ast.iter_child_nodes(n):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.Lambda, ast.ClassDef,
+                                      ast.comprehension)):
+                    continue
+                if isinstance(child, ast.Assign):
+                    for t in child.targets:
+                        targets(t)
+                elif isinstance(child, (ast.AugAssign, ast.AnnAssign)):
+                    targets(child.target)
+                elif isinstance(child, (ast.For, ast.AsyncFor)):
+                    targets(child.target)
+                elif isinstance(child, ast.withitem) \
+                        and child.optional_vars is not None:
+                    targets(child.optional_vars)
+                elif isinstance(child, ast.ExceptHandler) and child.name:
+                    out.add(child.name)
+                visit(child)
+
+        visit(node)
+        return out
+
+    @classmethod
+    def _reads_and_defaults(cls, fn) -> tuple:
+        """(names the def reads from its enclosing scope, names bound as defaults)."""
+        local = {a.arg for a in (fn.args.posonlyargs + fn.args.args
+                                 + fn.args.kwonlyargs)}
+        if fn.args.vararg:
+            local.add(fn.args.vararg.arg)
+        if fn.args.kwarg:
+            local.add(fn.args.kwarg.arg)
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                local.add(n.id)
+        bound = {n.id for d in (list(fn.args.defaults)
+                                + [d for d in fn.args.kw_defaults if d])
+                 for n in ast.walk(d) if isinstance(n, ast.Name)}
+        reads = {n.id for n in ast.walk(fn)
+                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        return reads - local, bound
+
+    def test_a_worker_defined_in_a_loop_binds_what_it_reads(self):
+        """A nested def in a loop must bind the loop's names at DEFINITION time.
+
+        A closure reads the NAME, not the value: `turn` assigned once per pass
+        of `for _round in range(MAX_TOOL_ROUNDS)` means a worker that outlives
+        its round writes into the NEXT round's object. Measured 2026-09-18, the
+        journal carries "stream worker slow to finish; waiting" twice — that is
+        the window, and it is the same shape the PTT worker already avoids by
+        writing `def _work(_rec=rec, _gen=gen, …)`. Binding is a one-line fix
+        and an invisible one, which is exactly why it is checked here.
+        """
+        scanned, offenders = 0, []
+        for path in self._shipped():
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            for loop in ast.walk(tree):
+                if not isinstance(loop, (ast.For, ast.AsyncFor, ast.While)):
+                    continue
+                rebound = self._assigned_in(loop)
+                if not rebound:
+                    continue
+                for fn in [n for n in ast.walk(loop)
+                           if isinstance(n, (ast.FunctionDef,
+                                             ast.AsyncFunctionDef))]:
+                    scanned += 1
+                    reads, bound = self._reads_and_defaults(fn)
+                    leaked = sorted((reads & rebound) - bound)
+                    if leaked:
+                        offenders.append(
+                            f"{path.relative_to(HERE)}:{fn.lineno} "
+                            f"{fn.name}() reads {leaked} from the loop")
+        assert scanned >= 3, (
+            f"only {scanned} nested def(s) inside a loop found — the subjects "
+            "are the PTT worker and the two brain workers, so a sweep that "
+            "finds fewer is a broken sweep, not a passing one")
+        assert not offenders, (
+            "a function defined inside a loop reads a name the loop rebinds, "
+            "unbound: it will see whichever object the next pass put there — "
+            "bind it as a default (def f(x=x)):\n" + "\n".join(offenders))

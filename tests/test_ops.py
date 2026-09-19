@@ -114,6 +114,59 @@ class TestTypingSelftestWiring:
         assert "type_text" in text and "SKIP" in text   # no editor available
         assert terminated["flag"], "scratch terminal must be terminated"
 
+    def test_selftest_failure_names_the_reason(self, H, monkeypatch):
+        """The FAIL row has to carry the REFUSAL, not the success text.
+
+        It read `str(out) if not err else str(out)` — both arms the same
+        expression — so a failed type_text landing check reported the text a
+        SUCCESS would have produced, and the refusal that caused it was dropped.
+        This is the one row a person reads when typing is broken (verified in
+        source, 2026-09-19). `err` is a bool, so the reason lives in the tool's
+        own text plus the KIND the result carries.
+        """
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        editor_win = {"id": 11, "app_id": "org.gnome.TextEditor",
+                      "title": "scratch", "is_focused": True}
+        foot_win = {"id": 7, "app_id": "foot", "title": "foot",
+                    "is_focused": True}
+        reason = "ERROR: the focused window is not the scratch editor"
+
+        class FakeMsg:
+            returncode = 0
+            stdout = json.dumps([foot_win, editor_win])
+
+        def fake_execute(self, name, args):
+            if name == "type_text" and str(args.get("text", "")).startswith(
+                    "handsoff selftest"):
+                return _core_tools.ToolResult(reason, "error")
+            return _core_tools.ToolResult("REFUSED: terminal (foot)", "refused")
+
+        monkeypatch.setattr(H.ToolBelt, "_niri_msg",
+                            staticmethod(lambda *a, **k: FakeMsg()))
+        monkeypatch.setattr(H.shutil, "which",
+                            lambda n: f"/usr/bin/{n}"
+                            if n in ("foot", "gnome-text-editor") else None)
+        monkeypatch.setattr(H.ToolBelt, "_ydotool_socket",
+                            staticmethod(lambda: "/tmp/fake-ydotool.sock"))
+        monkeypatch.setattr(H.ToolBelt, "_socket_connectable",
+                            staticmethod(lambda p: True))
+        monkeypatch.setattr(H.ToolBelt, "_terminal_marker",
+                            classmethod(lambda cls, w: "foot"))
+        monkeypatch.setattr(H.ToolBelt, "_typing_guard",
+                            lambda self: foot_win)
+        monkeypatch.setattr(H.ToolBelt, "execute", fake_execute)
+        monkeypatch.setattr(H.subprocess, "run",
+                            lambda *a, **k: types.SimpleNamespace(stdout=""))
+        monkeypatch.setattr(H.subprocess, "Popen",
+                            lambda *a, **k: types.SimpleNamespace(
+                                poll=lambda: None, terminate=lambda: None))
+        text = H.run_typing_selftest(belt=belt, timeout=5)
+        row = next(l for l in text.splitlines() if "[FAIL] type_text" in l)
+        assert row, text
+        assert reason in row, (
+            f"the FAIL row must name what refused the typing, got: {row}")
+        assert "error" in row, "the result's KIND is part of the diagnosis"
+
     def test_ptt_selftest_runs_locally_without_bubble(self, H, monkeypatch, capsys):
         """The CLI action works when the bubble is dead (local execution,
         same contract as `settings`)."""

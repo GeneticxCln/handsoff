@@ -1868,10 +1868,21 @@ def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -
             ed = wait_for("org.gnome.TextEditor")
             scratch.append(ed)
             focus(ed)
-            out, err = belt.execute("type_text", {"text": token})
+            res = belt.execute("type_text", {"text": token})
+            out, err = res
             ok = not err and "typed" in str(out) and "WARNING" not in str(out)
+            # The FAIL row has to name the REASON. This read
+            # `str(out) if not err else str(out)` — both arms the same
+            # expression — so a failed type_text check reported the success
+            # text while the refusal that caused it was dropped: the one row a
+            # person reads when typing is broken said "typed …" (verified
+            # 2026-09-19). `err` is a bool, so the useful half is the tool's own
+            # text plus the KIND the result carries (`refused` and `error` are
+            # different diagnoses, which is what that flag is for).
             _selftest_check(results, "type_text", "PASS" if ok else "FAIL",
-                            str(out) if not err else str(out))
+                            f"typed {len(token)} chars with no warning" if ok
+                            else f"type_text {getattr(res, 'kind', '')}: "
+                                 f"{str(out).strip()[:160]}")
 
             # 5. ctrl+a/ctrl+c round-trip proves what landed, byte-for-byte
             try:
@@ -7567,7 +7578,14 @@ class Assistant(QObject):
                 # calls still collected from the stream so the loop keeps working
                 turn = _brain.TurnStream(gen, cancel, _SentenceQueue())
 
-                def _run_stream() -> None:
+                # Bound at DEFINITION, not read from the enclosing scope. This
+                # round is one pass of `for _round in range(MAX_TOOL_ROUNDS)`,
+                # and the names below are REBOUND by the next pass: a worker
+                # that outlives its round (the "stream worker slow to finish"
+                # path, which the journal has caught twice) would then write its
+                # `turn.result` into the NEXT round's turn — the same shape the
+                # PTT worker already avoids with `_rec=rec, _gen=gen` defaults.
+                def _run_stream(turn=turn, tools=tools) -> None:
                     try:
                         turn.result = ollama_chat_stream(
                             conversation, turn.sentence_q, turn.cancel, tools)
@@ -7618,7 +7636,10 @@ class Assistant(QObject):
                 # simply discarded (the turn is over).
                 box: dict = {}
 
-                def _run_call() -> None:
+                # Same binding as the streaming worker above: `box` is rebuilt
+                # every round, so an abandoned call must not write into the
+                # dictionary the next round will read.
+                def _run_call(box=box, tools=tools) -> None:
                     try:
                         box["msg"] = ollama_chat(conversation, tools)
                     except Exception as e:

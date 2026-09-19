@@ -203,7 +203,6 @@ def _stop_recorder_bounded(rec, timeout: float = 3.0):
     A timeout only returns control to the caller; it never touches the
     stream. The owner thread performs the final state transition.
     """
-    global _MIC_OPERATION_OWNER
     box: dict = {}
 
     def _call() -> None:

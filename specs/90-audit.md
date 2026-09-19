@@ -1127,3 +1127,109 @@ normalises tuples to lists, which is what the file format needs); the
 silently flip `bind_bare` for the next load — a behaviour change with no
 observable benefit); and `tests/fake_ollama.py`'s malformed-request handling (a
 test double whose caller is the suite itself).
+
+## The re-audit after the fix rounds: four real defects, and five claims that were noise (2026-09-19)
+
+Everything below was measured on the tree as it stood at `58b71f9`, with four
+independent instruments, because a repeat of the same scan that produced the
+last round's list would mostly repeat its findings:
+
+1. **ruff by rule, not by count** — 969 findings, but the density is the story:
+   `UP037` (quoted annotations), `I001` (import order) and `F401` are style, and
+   the rules that can name a defect were read one by one (`B023`, `PLR0124`,
+   `RUF013`, `PLW0602`, `SIM115`, `DTZ*`, `S110`, `PLW1510`).
+2. **an AST sweep for shapes no rule covers** — identical arms on both sides of
+   a ternary, identical if/else bodies, `assert` outside tests, duplicate dict
+   keys, and handlers that swallow a `BaseException`-wide error with no log.
+3. **an adversarial probe of the live predicates** — `_validate_command` and
+   `denied_secret_path`, driven with 23 command forms and 14 paths.
+4. **the running bubble's own journal** — 3 402 lines, because a real failure
+   that has already happened on this machine beats any amount of reading.
+
+### Real, fixed, each with a guard that fails on the broken code
+
+**The typing selftest's FAIL row named no reason.** `run_typing_selftest` read
+`str(out) if not err else str(out)` — both arms the same expression — so a
+failed `type_text` landing check printed the text a *success* produces, and the
+refusal that caused it was dropped. This is the one row a person reads when
+typing is broken, and it said `typed …`. The `err` half is a bool (the failure
+flag `ToolResult` carries), so the useful half is the tool's own text plus the
+`kind` that separates `refused` from `error`. Guard:
+`tests/test_ops.py::test_selftest_failure_names_the_reason`, which drives the
+whole stage with a fake window world and asserts the reason is IN the row.
+
+**A brain worker could write its result into the next round's turn.** `_brain_turn`
+runs `for _round in range(MAX_TOOL_ROUNDS)`, and `turn`, `tools` and `box` are
+assigned once per pass. Both worker closures read those names from the enclosing
+scope, and a closure reads the NAME, not the value — so a worker that outlives
+its round writes `turn.result` into whatever object the next pass put there.
+That window is not hypothetical: the journal carries `stream worker slow to
+finish; waiting` twice (2026-09-18 21:18 and 21:23), and the code's own comment
+says the worker may still be finishing after 32 s. The PTT path already avoided
+this shape (`def _work(_rec=rec, _gen=gen, …)`); the two brain workers now match
+it. Guard: a **new source-shape property** in
+`tests/test_regression.py::TestTheScansShapesAreCheckedProperties` — a `def`
+inside a loop that reads a name the loop assigns is refused unless it is bound as
+a default, with a `scanned >= 3` self-check so a sweep that finds nothing is a
+broken sweep rather than a passing one.
+
+**A dead NaN term that read like a safety net.** `pack_animation` refused
+`not MIN <= fps <= MAX or fps != fps`. The second term can never be the reason:
+every comparison against a NaN is False, so the bounds already refuse `nan` and
+`inf`. Kept as a test rather than a comment, because a manifest is somebody
+else's file and Python's `json` parses both `NaN` and `Infinity` into `float`s.
+Guard: `tests/test_design_packs.py::test_a_non_finite_fps_is_refused_by_the_bounds`,
+which also installs an in-range animation so the check cannot pass by refusing
+everything.
+
+**A `global` with nothing to assign.** `_stop_recorder_bounded` declared
+`global _MIC_OPERATION_OWNER` while only the nested `_call` assigns it; the outer
+statement was a no-op that read as if the outer function owned the transition.
+Removed. Also `search_note`/`reader_note` typed `now: float = None` while the
+body branches on `None` — an annotation that lies to every reader and checker;
+now `float | None`.
+
+**Mutation sweep: 4/4 caught, 0 missed, every restore verified green** — the
+selftest row back to naming nothing, each worker unbound again, and the fps
+bounds replaced by the dead term.
+
+### Refuted — five things that look like defects and are not
+
+- **`cat` can read `~/.config/handsoff/settings.json`, and that is by design.**
+  The probe flagged it, then the code refuted the probe: `read_file` refuses only
+  `denied_secret_path` matches, and settings.json is the app's own configuration,
+  not a credential. What is refused is *writing* it (a different predicate,
+  `_classify_edit_path`), because it also carries the permission switches. The
+  probe's expectation was wrong, not the validator.
+- **`PLW1510` (45 `subprocess.run` without `check=`) is already handled at the
+  call site.** Every shipped site either returns/examines `.returncode`
+  (`nvidia-smi`, `git`, `fastfetch`, `mpc`, `pgrep`, `systemctl`) or raises on a
+  non-zero exit (`hardware.cmd`). The rule flags the *absence of the argument*,
+  not the absence of the check — turning it on wholesale would rewrite working
+  code into `check=True` plus try/except for nothing.
+- **Naive datetimes are normalised downstream, deliberately.** The 13 `DTZ*`
+  sites build local-time windows and local-time displays (`upcoming_events`,
+  `_today_events_summary`, `_fmt_when`, `_next_occurrence`), and
+  `ics_events_from_text` converts a naive window with `.astimezone()` in its
+  first three lines — the aware-vs-naive comparison that would raise is not
+  reachable. The all-day DATE branch does the same before comparing.
+- **`except Exception: pass` at 56 sites is teardown, not swallowing.** Read one
+  by one, they are `t.cancel()`, closing a stream at shutdown, terminating a
+  scratch process, a best-effort desktop notification, a timing callback. Each
+  is a failure whose answer is "carry on", and several sit in `finally` blocks
+  where logging would be the only alternative.
+- **The hardware prober's `niri_windows` returning a `CompletedProcess` while
+  every other prober returns a string is handled, not a leak.**
+  `_compositor` checks `.returncode` on exactly that object before parsing.
+
+### Stated limits
+
+The AST sweep judges a handler's `except` type and whether it logs, so a narrow
+handler that swallows something meaningful still passes; the closure rule is
+lexical (it does not follow a worker's lifetime); the probe exercised the
+validator and the secret-path predicate, not `edit_file`'s path classifier,
+whose own tests already cover it; the two `dt`/`_dt` annotation fixes have no
+mutation behind them because nothing at runtime can observe a type hint; and the
+journal evidence is from this machine's session on 2026-09-18, so the "slow to
+finish" window it documents is the shape that was fixed, not a reproduction of a
+lost turn.

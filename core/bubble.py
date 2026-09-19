@@ -654,7 +654,11 @@ def pack_animation(raw, folder=None):
         fps = float(fps_raw)
     except (TypeError, ValueError):
         return None, f"\"fps\" must be a number ({fps_raw!r} is not)"
-    if not PACK_FPS_MIN <= fps <= PACK_FPS_MAX or fps != fps:
+    # No separate NaN test: every comparison against a NaN is False, so the
+    # range check below already refuses `float("nan")` and `float("inf")`. The
+    # `or fps != fps` that used to sit here was dead code that read as if a NaN
+    # could slip past the bounds.
+    if not PACK_FPS_MIN <= fps <= PACK_FPS_MAX:
         return None, (f"\"fps\" must be between {PACK_FPS_MIN:g} and "
                       f"{PACK_FPS_MAX:g} ({fps:g} is not)")
     return {"frames": frames, "fps": fps}, ""
