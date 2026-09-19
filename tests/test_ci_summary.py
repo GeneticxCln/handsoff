@@ -80,6 +80,49 @@ def _write(tmp_path, text, name="report.xml"):
     return path
 
 
+def _gitlab_blocks():
+    """Top-level key -> its block of text. No yaml dependency for CI config.
+
+    Everything, including `name: value` lines like `.qt_deps: &qt_deps`, is
+    a block here — treating only `name:` lines as keys folds the anchors
+    into whichever job came before them, which is how a first attempt at
+    this test accused `default:` of running pytest.
+
+    A real parser is not an option: PyYAML is not in requirements.txt, and the
+    suite jobs install exactly that manifest, so importing it would make these
+    tests fail in the container they exist to protect.
+    """
+    blocks, name, lines = {}, None, []
+    text = (HERE / ".gitlab-ci.yml").read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if line and not line[0].isspace() and not line.startswith("#"):
+            if name:
+                blocks[name] = "\n".join(lines)
+            name = line.split(":", 1)[0].strip()
+            lines = []
+        elif name:
+            lines.append(line)
+    if name:
+        blocks[name] = "\n".join(lines)
+    return blocks
+
+
+def _gitlab_effective(name, blocks, seen=()):
+    """A job's text plus what it inherits — via `extends:` and `<<: *shared`.
+
+    A job that runs pytest through an `extends:` template must be covered
+    too, or deleting the apt layer from the template would leave this test
+    green and vacuous.
+    """
+    text = blocks[name]
+    for ref in re.findall(r"^\s*extends:\s*([\w.]+)", text, re.M):
+        if ref in blocks and ref not in seen:
+            text += "\n" + _gitlab_effective(ref, blocks, seen + (name,))
+    if "<<: *shared" in text and ".shared" in blocks and ".shared" not in seen:
+        text += "\n" + blocks[".shared"]
+    return text
+
+
 class TestSuiteJobsGetTheAudioRuntime:
     """A suite job without `.qt_deps` dies at import, before any test runs.
 
@@ -92,43 +135,10 @@ class TestSuiteJobsGetTheAudioRuntime:
     with no test names in it, which is why this is pinned.
     """
 
-    @staticmethod
-    def _blocks():
-        """Top-level key -> its block of text. No yaml dependency for CI config.
-
-        Everything, including `name: value` lines like `.qt_deps: &qt_deps`, is
-        a block here — treating only `name:` lines as keys folds the anchors
-        into whichever job came before them, which is how a first attempt at
-        this test accused `default:` of running pytest.
-        """
-        blocks, name, lines = {}, None, []
-        text = (HERE / ".gitlab-ci.yml").read_text(encoding="utf-8")
-        for line in text.splitlines():
-            if line and not line[0].isspace() and not line.startswith("#"):
-                if name:
-                    blocks[name] = "\n".join(lines)
-                name = line.split(":", 1)[0].strip()
-                lines = []
-            elif name:
-                lines.append(line)
-        if name:
-            blocks[name] = "\n".join(lines)
-        return blocks
-
-    def _effective(self, name, blocks, seen=()):
-        """A job's text plus what it inherits — via `extends:` and `<<: *shared`.
-
-        A job that runs pytest through an `extends:` template must be covered
-        too, or deleting the apt layer from the template would leave this test
-        green and vacuous.
-        """
-        text = blocks[name]
-        for ref in re.findall(r"^\s*extends:\s*([\w.]+)", text, re.M):
-            if ref in blocks and ref not in seen:
-                text += "\n" + self._effective(ref, blocks, seen + (name,))
-        if "<<: *shared" in text and ".shared" in blocks and ".shared" not in seen:
-            text += "\n" + blocks[".shared"]
-        return text
+    # Module-level so the order job's own guard can read the same config without
+    # inheriting every audio-runtime assertion above.
+    _blocks = staticmethod(_gitlab_blocks)
+    _effective = staticmethod(_gitlab_effective)
 
     def test_every_job_that_runs_pytest_inherits_the_runtime_libraries(self):
         blocks = self._blocks()
@@ -544,3 +554,125 @@ class TestShellDiscovery:
         assert ".venv" not in proc.stdout, (
             "the gate probed a vendored tree it is supposed to prune")
         assert "install.sh" in proc.stdout, "the gate found nothing at all"
+
+
+class TestBothOrderRunsKeepTheirOwnReport:
+    """The GitLab `order` job runs the suite twice and used to keep ONE report.
+
+    Both invocations ended in `--junitxml=tests/report.xml`, so the second run's
+    report replaced the first's: a FILE-order failure overwrote the seed-order
+    run's verdict in GitLab's Test tab, and the single report the shared anchor
+    uploads described only whichever run happened to be last. Each run has its
+    own file now — and both halves of that (the artifact list and the log
+    digest) have to stay wired, or the second run goes back to being invisible.
+
+    The upload is pinned here rather than left to the schema: a job that declares
+    `artifacts` REPLACES the one it inherits through `<<: *shared`, so dropping
+    the job-level block would silently revert to the single-report upload —
+    which is exactly the bug this guard exists for. A junit ARRAY is part of
+    GitLab's schema (checked against its own ci.json), so both reports really
+    are accepted, not merely listed.
+    """
+
+    def test_each_ordered_run_writes_its_own_report(self):
+        block = _gitlab_blocks()["order"]
+        script = block.split("\n  script:", 1)[1]
+        flags = re.findall(r'--junitxml="([^"]+)"', script)
+        assert len(flags) == 2, (
+            f"the job runs the suite twice and must write two reports: {flags}")
+        assert len(set(flags)) == 2, (
+            f"both ordered runs write the same file ({flags[0]}) — the second "
+            f"run's report then REPLACES the first's")
+        assert {pathlib.PurePath(f).name for f in flags} == {
+            "report.xml", "report-order-files.xml"}
+        # ...and each report belongs to the run directly above it. The digest
+        # labels them by order, so a swapped pair would report one run's
+        # failures under the other run's name.
+        seed = script.index("HANDSOFF_TEST_ORDER_SEED")
+        files = script.index("HANDSOFF_TEST_ORDER_FILES")
+        first = script.index(flags[0])
+        second = script.index(flags[1], first + 1)
+        assert seed < first < files < second, (
+            "the SEED run must write the first report and the FILE-order run the "
+            "second — the artifact list and the digest both assume that order")
+
+    def test_the_job_uploads_both_reports(self):
+        block = _gitlab_blocks()["order"]
+        assert "artifacts:" in block, (
+            "without a job-level artifacts block the inherited single-report "
+            "upload returns and the second run's failures vanish from the tab")
+        artifacts = block.split("artifacts:", 1)[1].split("after_script:", 1)[0]
+        for rel in ("tests/report.xml", "tests/report-order-files.xml"):
+            assert f"- {rel}" in artifacts, (
+                f"{rel} is written but never uploaded — that run's failures "
+                f"would be missing from the Test tab")
+        # In the same order the digest reads them, so GitLab's Test tab and the
+        # log name the two runs identically. Listed in the other order the tab
+        # shows the FILE-order entry first while the note describes the seed
+        # run — both present, and a reader comparing them is misled.
+        assert (artifacts.index("- tests/report.xml")
+                < artifacts.index("- tests/report-order-files.xml")), (
+            "the artifact list names the FILE-order report first, so the Test "
+            "tab's first entry is not the run the --post note summarizes")
+        # The restatement has to be complete: overriding `artifacts` drops the
+        # anchor's `when: always`, and without it a failing run uploads nothing.
+        assert "when: always" in artifacts and "expire_in:" in artifacts
+
+    def test_the_digest_reads_both_and_posts_one_summary(self):
+        block = _gitlab_blocks()["order"]
+        after = block.split("after_script:", 1)[1]
+        # COMMAND lines, not prose: the comment above this block discusses
+        # `--post` in words, and a raw text count cannot tell the two apart.
+        lines = after.splitlines()
+        digests = [line for line in lines if "ci/pytest_summary.py" in line]
+        assert len(digests) == 2, (
+            "both reports belong in the log digest; the shared anchor's single "
+            "digest is replaced by this one, so it has to name both")
+        # WHICH report each digest reads, not just how many there are: the pair
+        # is written as `python …/pytest_summary.py` on one line and the report
+        # path on the next, so the count stays 2 and both paths stay present
+        # when the two are swapped — which silently points the merge-request
+        # note at the FILE-order run instead of the seed run it follows.
+        idx = [n for n, line in enumerate(lines)
+               if "ci/pytest_summary.py" in line]
+        targets = [lines[n + 1].strip() for n in idx]
+        assert targets[0].startswith('"$CI_PROJECT_DIR/tests/report.xml"'), (
+            f"the first digest reads {targets[0]!r}: it follows the job's first "
+            f"invocation, so it must read the seed run's report")
+        assert targets[1].startswith(
+            '"$CI_PROJECT_DIR/tests/report-order-files.xml"'), (
+            f"the second digest reads {targets[1]!r}: it follows the job's "
+            f"second invocation, so it must read the FILE-order run's report")
+        posts = [n for n, line in enumerate(lines)
+                 if line.strip().endswith("--post")]
+        assert len(posts) == 1, (
+            "the merge-request note is one summary — a second --post would "
+            "comment on the same pipeline twice")
+        assert posts[0] == idx[0] + 1, (
+            "--post must ride the FIRST digest: the note then summarizes the "
+            "run the artifact list and the first Test-tab entry describe")
+
+    def test_only_the_order_job_overrides_the_shared_upload(self):
+        blocks = _gitlab_blocks()
+        owners = sorted(name for name in blocks
+                        if not name.startswith(".") and "artifacts:" in blocks[name])
+        assert owners == ["order"], (
+            f"a suite job that declares its own artifacts silently drops the "
+            f"shared junit upload: {owners}")
+        assert "junit: tests/report.xml" in blocks[".shared"], (
+            "the anchor every other suite job inherits must still upload one")
+        # ...and every job that runs the suite must carry a report, inherited or
+        # its own. The `tests:3.12` / `tests:3.13` pair shares one key here: the
+        # block parser splits a key at its FIRST colon, and the two jobs are
+        # `extends:`-identical apart from the image.
+        runners = {name: _gitlab_effective(name, blocks) for name in blocks
+                   if not name.startswith(".")
+                   and "python -m pytest" in _gitlab_effective(name, blocks)}
+        assert runners, "no job runs pytest — this assertion would be vacuous"
+        for name, text in runners.items():
+            # The UPLOAD, not the writing flag: `--junitxml=` is in the script of
+            # every suite job, so requiring the word "junit" would be satisfied
+            # by a job that writes a report and never hands it to GitLab.
+            assert "junit: tests/report.xml" in text, (
+                f"{name} runs the suite but uploads no junit report, so its "
+                f"failures are a log to read rather than a Test-tab entry")

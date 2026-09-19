@@ -104,6 +104,25 @@ order:
     QT_QPA_PLATFORM: offscreen
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
   <<: *shared
+  # Restated rather than inherited: a job that declares `artifacts` REPLACES the
+  # shared block's, so the `when`/`expire_in` have to be here too or the upload
+  # would only happen on success. The junit list is the whole point — both
+  # reports reach the Test tab, so neither run's verdict can hide the other's.
+  artifacts:
+    when: always
+    expire_in: 1 week
+    reports:
+      junit:
+        - tests/report.xml
+        - tests/report-order-files.xml
+  # The shared digest reads the first report and posts the MR note; this adds
+  # the second report to the log as a section of its own. Deleting the shared
+  # one is not an option (every suite job needs it), so the override is here.
+  after_script:
+    - python "$CI_PROJECT_DIR/ci/pytest_summary.py"
+      "$CI_PROJECT_DIR/tests/report.xml" --post
+    - python "$CI_PROJECT_DIR/ci/pytest_summary.py"
+      "$CI_PROJECT_DIR/tests/report-order-files.xml"
   script:
     - *qt_deps
     - python -m pip install --upgrade pip
@@ -111,10 +130,11 @@ order:
     # Two runs, two reports. Both used to write tests/report.xml, so the second
     # overwrote the first: a FILE-order failure replaced the seed-order run's
     # report in GitLab's Test tab, and the report the shared anchor uploads
-    # described only whichever run happened to be last. The artifact still
-    # uploads tests/report.xml — the first run, whose seed is the commit — and
-    # the second run's report is kept beside it (and named in the log digest)
-    # rather than replacing it.
+    # described only whichever run happened to be last. Each run now has its own
+    # file, and BOTH are accepted — the artifact below lists both (a junit array
+    # is part of the schema: verified against GitLab's own ci.json) and the log
+    # digest reads both, the second one WITHOUT --post so the merge-request note
+    # stays a single summary rather than two.
     - HANDSOFF_TEST_ORDER_SEED="$CI_COMMIT_SHA" python -m pytest tests/ -q
       --junitxml="$CI_PROJECT_DIR/tests/report.xml"
     - HANDSOFF_TEST_ORDER_FILES="$CI_COMMIT_SHA" python -m pytest tests/ -q
