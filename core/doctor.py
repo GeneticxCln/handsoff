@@ -323,7 +323,11 @@ def _lines(deps: DoctorDeps) -> list[str]:
     # sibling module is absent.
     snap = deps.hardware_snapshot({})
     if snap is not None:
-        if snap["ollama"].get("ok"):
+        # `.get(...) or {}` rather than `snap[...]`: the snapshot comes from the
+        # host, and a section it did not fill must read as "no reading" in a
+        # DIAGNOSTIC, never as a KeyError that takes down the whole doctor —
+        # which is the tool you reach for precisely when something is wrong.
+        if (snap.get("ollama") or {}).get("ok"):
             lines.append(
                 f"brain: Ollama reachable at {deps.ollama_base} "
                 f"(model {deps.ollama_model})")
@@ -341,7 +345,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.extend(_appearance_lines(deps))
         lines.extend(_web_lookup_lines(deps))
 
-        audio = snap["audio"]
+        audio = snap.get("audio") or {}
         if audio.get("ok") and audio.get("count"):
             lines.append(f"mic: {audio['count']} input device(s) visible")
         elif audio.get("ok"):
@@ -349,7 +353,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         else:
             lines.append(f"mic: audio subsystem error: {audio.get('error', 'unknown')}")
 
-        comp = snap["compositor"]
+        comp = snap.get("compositor") or {}
         if comp.get("ok"):
             lines.append(f"niri IPC: ok ({comp.get('windows', 0)} window(s))")
         elif comp.get("error"):
@@ -357,7 +361,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
         else:
             lines.append("niri IPC: refused — desktop actions will fail")
 
-        ydo = snap["ydotool"]
+        ydo = snap.get("ydotool") or {}
         if not ydo.get("installed", True):
             lines.append("ydotool: NOT INSTALLED (typing tools will fail)")
         elif ydo.get("reachable"):

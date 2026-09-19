@@ -769,6 +769,53 @@ class TestSettingsSplit:
         H.SETTINGS.pop("zz_not_a_schema_key", None)
         assert json.loads(f.read_text(encoding="utf-8"))["zz_not_a_schema_key"] == "raw"
 
+    def test_coercion_never_writes_into_the_callers_object(
+            self, H, tmp_path, monkeypatch):
+        """The writer must not depend on coercers REPLACING their container.
+
+        Measured 2026-09-19: colours, permissions, command_policy,
+        workspace_aliases and spotter_models are each rebuilt rather than
+        written into, so neither writer was observably mutating anything. That
+        is a property of how they happen to be written, and the two writers
+        were relying on it: `probe` shared the caller's nested containers, so
+        the first coercer that normalises IN PLACE would have edited the rest
+        of the user's file (or the caller's dict) on the way past, silently,
+        and only for values that were not already normal. This installs exactly
+        such a coercer and holds both writers to the contract.
+        """
+        from core import settings as _core_settings
+
+        def in_place(s, field, log):
+            colors = s.get(field.key)
+            if isinstance(colors, dict):
+                colors.setdefault("idle", "#000000")   # a write INTO the dict
+            s[field.key] = colors or {}
+
+        monkeypatch.setitem(_core_settings._CUSTOM_COERCERS, "colors", in_place)
+
+        # (a) coerce_setting: the object the caller passed stays as it was.
+        handed = {"listening": "#ff0000"}
+        before = dict(handed)
+        H._core_settings.coerce_setting("colors", handed)
+        assert handed == before, (
+            f"coercion wrote into the caller's dict: {handed}")
+
+        # (b) persist_setting: an unrelated key's save leaves the rest of the
+        #     file alone. The file holds ONE state colour, which is the shape a
+        #     hand-edited file has — and the state the patched coercer adds.
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"colors": {"listening": "#ff0000"},
+                                 "version": H.SETTINGS_VERSION}),
+                     encoding="utf-8")
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        monkeypatch.setitem(H.SETTINGS, "mic_threshold",
+                            H.SETTINGS["mic_threshold"])
+        assert H._persist_setting("mic_threshold", 700) is True
+        on_disk = json.loads(f.read_text(encoding="utf-8"))
+        assert on_disk["colors"] == {"listening": "#ff0000"}, (
+            f"saving mic_threshold rewrote the file's colours: {on_disk['colors']}")
+
     def test_persist_failure_does_not_leave_memory_disagreeing_with_disk(
             self, H, tmp_path, monkeypatch):
         """A swallowed write error used to still update the in-memory copy.

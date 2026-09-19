@@ -108,10 +108,17 @@ order:
     - *qt_deps
     - python -m pip install --upgrade pip
     - pip install -r requirements.txt -c requirements-lock.txt
+    # Two runs, two reports. Both used to write tests/report.xml, so the second
+    # overwrote the first: a FILE-order failure replaced the seed-order run's
+    # report in GitLab's Test tab, and the report the shared anchor uploads
+    # described only whichever run happened to be last. The artifact still
+    # uploads tests/report.xml — the first run, whose seed is the commit — and
+    # the second run's report is kept beside it (and named in the log digest)
+    # rather than replacing it.
     - HANDSOFF_TEST_ORDER_SEED="$CI_COMMIT_SHA" python -m pytest tests/ -q
       --junitxml="$CI_PROJECT_DIR/tests/report.xml"
     - HANDSOFF_TEST_ORDER_FILES="$CI_COMMIT_SHA" python -m pytest tests/ -q
-      --junitxml="$CI_PROJECT_DIR/tests/report.xml"
+      --junitxml="$CI_PROJECT_DIR/tests/report-order-files.xml"
 
 # --- Coverage floor (GH: `coverage` job) ------------------------------------
 coverage:

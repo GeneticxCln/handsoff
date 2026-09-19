@@ -1030,3 +1030,100 @@ pinned like any other. A pinned fetch bypasses an environment proxy and asks for
 identity encoding (both above). A host that injects no hop seam reads unpinned and
 is warned. The bound on DNS is a thread the reader abandons, not a cancel. And the
 watcher's `(a|aa)+` ReDoS remains open, as stated in the section before this one.
+
+## A 200-comment full-tree scan: seven real defects, and the four claims that were wrong (2026-09-19)
+
+Method: a full-repository OCR scan (32 files, 200 comments) triaged against source,
+one claim at a time, by reading the code it cites and reproducing each one that
+turned out to be real. The scan's own severity labels were not trusted: three of
+its `[bug · critical/high]` findings do not survive contact with the file they
+quote, and several of its `[maintainability · low]` ones do.
+
+**Fixed, each with a guard that fails on the unfixed code (9/9 mutations
+caught, every restore sha256-checked):**
+
+1. **The notification reader could hot-spin at full CPU.** A `loop()` pass that
+   *raises* is not exhaustion: the monitor can still `poll()` as alive, so the
+   respawn branch is skipped and the call was re-entered immediately, logging one
+   traceback per pass for as long as the reader stayed enabled — while still
+   reporting itself enabled. `attempts` was only incremented on the spawn path, so
+   it never gave up. A raising pass now spends an attempt and backs off
+   (1s→30s), so a permanent error gives up like a dead monitor.
+2. **A raising `build` leaked a registry slot for ever.** `_release` was reachable
+   only on the success path, so a `Popen` that failed under the lock left the
+   reservation counted: the cap then refused work the machine could do, and
+   nothing pointed at the failure. Released before the re-raise, in the same
+   `try` that already documents "a failed prepare gives the slot back".
+3. **`GenerationCounter.value` was the one writer that skipped the lock.** The
+   setter writes the field `claim()` read-modify-writes, so a planted generation
+   could land between the read and the store and two turns would share a number —
+   the collision the class exists to prevent. Tests are the only caller today;
+   the lock makes that an invariant rather than a convention.
+4. **The doctor died on a snapshot that filled only some sections.**
+   `snap["audio"]`/`["compositor"]`/`["ydotool"]`/`["ollama"]` raised
+   KeyError, against `DoctorDeps`' own documented contract ("a partial deps object
+   still produces a coherent report"). Now `.get(...) or {}`, so a section the
+   host did not fill reads as no-reading — and the doctor is what you run when
+   something is already wrong.
+5. **A `BaseException` during a support-module load left a half-executed module
+   in `sys.modules` under both names**, for the life of the process, so every
+   later load adopted the corpse instead of the file. The app-module loader
+   already caught `BaseException`; this is the support-module twin.
+6. **`handsoff-restart` faked success with an interpreter that cannot run.** The
+   launch is `nohup ... &` and its pid is echoed whether or not the process
+   survived, so a typo in `HANDSOFF_PYTHON` stopped a healthy bubble and left
+   nothing running while printing "handsoff restarted (pid N)". Checked before
+   anything is killed; the scan's *"command injection"* framing is wrong (the
+   value is quoted everywhere, so metacharacters are one unusable path).
+7. **`hardware.first()` handed a non-record back to its `.get()` callers**, so
+   fastfetch answering one type with a scalar (or a list of scalars) raised
+   `AttributeError` inside the section — a machine that is merely unusual read as
+   a crashed probe. `strang()`'s `v or ""` was the same shape for a falsy 0; both
+   tightened. Stated limit: no current caller passes a falsy numeric to `strang`,
+   so that half has no mutation behind it — it removes a trap, not a live bug.
+
+Also hardened with the measured reason written at the site: `persist_setting`
+and `coerce_setting` now deep-copy the containers they hand to coercion (MEASURED:
+all five nested coercers replace their container rather than writing into it, so
+neither writer was observably mutating anything — the copy removes the dependence
+on that staying true); `os.scandir` iterators in `core/theme.py` are closed
+without breaking the injected-listing seam the suite uses; the GitHub workflow
+pins `permissions: contents: read`, cancels superseded runs and bounds every job
+with a timeout; and the GitLab `order` job's second run no longer overwrites the
+first one's junit report.
+
+**Refuted, with the mechanism rather than an opinion:**
+
+- **`settings_schema` `also=` (labelled `[bug · critical]`).** `also=(tuple(...)
+  if … else ())` is *grouping parentheses*, not a tuple — so the first state's
+  field gets a FLAT three-key tuple and the others get `()`. `also_pairs()`
+  unpacks exactly two per entry and the module would not import otherwise; the
+  scan's "tuple containing a tuple → too many values to unpack" would fail at
+  collection, and 1899 tests collect.
+- **`.coveragerc`'s `*/site-packages/*` omit.** Narrowing it to
+  `*/.venv/**/site-packages/*` would stop matching this machine's real layout
+  (`~/.local/lib/python3.14/site-packages`, where `perth`/`diffusers` live) and
+  CI's `/usr/local/lib/python3.x/site-packages` — reintroducing exactly the
+  phantom-file pollution the comment explains.
+- **The GitLab pip-cache key.** `PIP_CACHE_DIR` is pip's *download* cache:
+  content-addressed and selected by interpreter tags, so a 3.12 wheel is never
+  handed to a 3.13 job. The scan compares it to a venv or a `--find-links` cache.
+- **`sys.stdlib_module_names` on Python < 3.10.** The project's floor is 3.12
+  (CI matrix 3.12/3.13; the unit runs 3.14), so the fallback it asks for cannot
+  be reached.
+- **`_allowed_dirs()` caching the resolved dirs at import.** The suite rebinds
+  HOME per test on purpose; a module-level cache would poison every later test
+  with the first sandbox's home — the opposite of the property the sandbox tests
+  exist to hold.
+
+**Noise, judged and left alone (not worth a diff, with the reason):** the
+`except Exception: pass` volumes in the doctor's probes (the degraded state is
+already printed in the line itself, so a debug log adds nothing the doctor's own
+output does not say); `quarantine_file`'s pid+timestamp suffix vs a uuid (the
+same-second collision it worries about is already closed by the pid, and the
+suffix stays readable); `load_settings`'s JSON round-trip vs `deepcopy` (it also
+normalises tuples to lists, which is what the file format needs); the
+`_STDLIB_NAMES`/`__import__` fallback popping a foreign module (removing it would
+silently flip `bind_bare` for the next load — a behaviour change with no
+observable benefit); and `tests/fake_ollama.py`'s malformed-request handling (a
+test double whose caller is the suite itself).

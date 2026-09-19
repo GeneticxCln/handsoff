@@ -342,6 +342,30 @@ class TestFastfetch:
                                      "note": "fastfetch not installed"}
         assert calls == []
 
+    def test_a_scalar_list_is_not_a_record(self, HW, tmp_path):
+        """fastfetch answers some types with a scalar or a list of scalars.
+
+        `first()` handed such a value straight back and the `.get()` calls after
+        it raised `AttributeError` on a machine that was merely unusual rather
+        than broken — the whole section reported a crash instead of the facts it
+        had. Pinned with the exact shape: a list where a record was expected.
+        """
+        payload = json.dumps([
+            {"type": "OS", "result": {"prettyName": "CachyOS"}},
+            {"type": "Host", "result": ["Micro-Star"]},        # scalars, not dicts
+            {"type": "WM", "result": "niri"},                # a bare scalar
+            {"type": "Uptime", "result": 0},                  # a falsy result
+        ])
+        snap = HW.snapshot(_ctx(tmp_path),
+                           self._probers(fastfetch_json=lambda: payload), {})
+        ff = snap["fastfetch"]
+        assert ff["ok"] is True, ff
+        assert ff["os"] == "CachyOS"
+        assert ff["host"] == "" and ff["wm"] == "", (
+            "a non-record is not a host name — it must read as missing, not "
+            "as the first element of a list")
+        assert ff["uptime_s"] == 0
+
     def test_error_entries_skipped_and_shell_ignored(self, HW, tmp_path):
         snap = HW.snapshot(_ctx(tmp_path), self._probers(), {})
         ff = snap["fastfetch"]

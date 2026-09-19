@@ -1348,3 +1348,37 @@ class TestClockJumpsBackwards:
             first = H._tick_now()
             second = H._tick_now()
         assert second >= first > 0, "session timing followed the wall clock"
+
+
+# ------------------------------------------------- a host that fills SOME of it
+
+class TestASparseHardwareSnapshot:
+    """DoctorDeps' own contract: "a partial deps object still produces a
+    coherent report".
+
+    A host that filled only SOME snapshot sections used to take the whole
+    doctor down with KeyError — and the doctor is what you run when something
+    is wrong, so the crash landed exactly where the report was needed.
+    """
+
+    def _deps(self):
+        doctor = core_module("doctor")
+        return doctor, doctor.DoctorDeps(
+            ollama_base="http://127.0.0.1:11434", ollama_model="gemma4:12b",
+            ollama_available=lambda: True,
+            # One section of the five; the rest are simply absent.
+            hardware_snapshot=lambda _ttl: {"ollama": {"ok": True}})
+
+    def test_the_doctor_still_reports_with_missing_sections(self):
+        doctor, deps = self._deps()
+        lines = doctor._lines(deps)
+        assert any("brain: Ollama reachable" in line for line in lines), lines
+        assert any(line.startswith("mic:") for line in lines), (
+            "a section the host did not fill must read as no-reading, not "
+            "vanish from the report")
+        assert any(line.startswith("ydotool:") for line in lines), lines
+
+    def test_an_empty_snapshot_is_not_a_crash_either(self):
+        doctor, deps = self._deps()
+        deps.hardware_snapshot = lambda _ttl: {}
+        assert doctor._lines(deps)

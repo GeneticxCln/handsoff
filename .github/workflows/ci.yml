@@ -1,8 +1,20 @@
 name: CI
 
+# Least privilege: every job here reads the checkout and nothing more. Without
+# this block the default token is broad (contents/issues/PRs WRITE), which is
+# more authority than any of these jobs uses.
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
+
+# One run per ref: a superseded push cancels the older run instead of racing it
+# for runners and for the artifacts both write.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # The full test suite. Single source of truth: requirements.txt (pinned
@@ -15,6 +27,9 @@ jobs:
   tests:
     name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # A ceiling, not a budget: the suite is ~5 min, and a hung test otherwise
+    # holds a runner until GitHub's own 6-hour limit.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +57,7 @@ jobs:
   coverage:
     name: Coverage floor (>= 70%)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -76,6 +92,9 @@ jobs:
   order:
     name: Ordering-dependence probe
     runs-on: ubuntu-latest
+    # Two full suite runs — the only job that needs more than the suite's own
+    # time.
+    timeout-minutes: 35
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -101,6 +120,7 @@ jobs:
   compile:
     name: Byte-compile sources
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -118,6 +138,7 @@ jobs:
   shell:
     name: Shell syntax checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify actions are SHA-pinned
@@ -157,6 +178,7 @@ jobs:
   smoke:
     name: Installer smoke (--help)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: bash install.sh --help

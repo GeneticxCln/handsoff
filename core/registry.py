@@ -285,7 +285,18 @@ class BoundedRegistry:
                 self._auto += 1
                 key = f"{self.name}-{self._auto}"
             displaced = self._items.get(key)
-            self._items[key] = build(key) if callable(build) else build
+            try:
+                self._items[key] = build(key) if callable(build) else build
+            except BaseException:
+                # A raising build used to leave this reservation counted for
+                # ever: `_release` was only reachable on the success path, so a
+                # `Popen` that failed under the lock permanently shrank the
+                # registry by one slot — the cap then refused work the machine
+                # could do, and nothing pointed at the build that failed.
+                # Released here (never settled, so a retry still works) because
+                # a slot given back is the honest state: nothing was registered.
+                self._release(reservation)
+                raise
             self._release(reservation)
             return key, displaced
 

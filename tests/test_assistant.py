@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import types
 
 from core.assistant import PomodoroController, ReminderStore, split_due_reminders
 
@@ -498,3 +499,68 @@ def test_reader_gives_up_loudly_instead_of_claiming_to_be_on():
     reader.run(InstantStop())
     assert saved and saved[-1] == ("notification_reader", False), saved
     assert reader._proc is None
+
+
+
+def test_a_pass_that_raises_spends_the_budget_instead_of_spinning():
+    """A loop() that RAISES is not exhaustion, and must not hot-spin.
+
+    The monitor can still poll as ALIVE while its pass raises (a wedged
+    dbus-monitor whose stdout read died), so the respawn branch is skipped on
+    the next iteration and the call used to be re-entered immediately: a
+    full-CPU spin that logged one traceback per pass and never gave up, because
+    `attempts` was only incremented on the spawn path. Spinning is invisible
+    from outside — the reader still reports itself enabled — so it is pinned
+    here rather than left to the next load average.
+    """
+
+    class AliveProc:
+        stdout: tuple = ()
+
+        def poll(self):
+            return None                  # looks healthy to the respawn check
+
+        def terminate(self):
+            pass
+
+    class BudgetedStop:
+        """Bounded, so a hot-spinning reader fails rather than hangs the
+        suite, and it records the waits it was asked for."""
+
+        def __init__(self, passes: int):
+            self.passes = passes
+            self.calls = 0
+            self.waits = 0
+            self._set = False
+
+        def is_set(self):
+            return self._set
+
+        def set(self):
+            self._set = True
+
+        def wait(self, timeout):
+            self.waits += 1
+            return False
+
+    saved: list = []
+    stop = BudgetedStop(passes=12)
+    reader = _reader([], popen_factory=lambda *a, **k: AliveProc(),
+                     persist=lambda k, v: saved.append((k, v)))
+
+    def bad_loop(proc, stop_event):
+        stop.calls += 1
+        if stop.calls > stop.passes:
+            stop.set()                   # never let the fixed loop spin here
+        raise RuntimeError("stdout vanished")
+
+    reader.loop = bad_loop
+    reader.run(stop, run=types.SimpleNamespace(proc=AliveProc()))
+
+    assert stop.calls <= 5, (
+        f"the raising pass ran {stop.calls} times: it did not spend the "
+        "respawn budget, which is a hot spin rather than a retry")
+    assert stop.waits >= 5, (
+        "no backoff between passes — a permanent error burned a core")
+    assert saved and saved[-1] == ("notification_reader", False), (
+        "giving up must still take the toggle with it")

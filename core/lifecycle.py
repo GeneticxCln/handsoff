@@ -79,7 +79,15 @@ class GenerationCounter:
 
     @value.setter
     def value(self, new: int) -> None:
-        self._box["gen"] = int(new)
+        # Under the same lock as claim(), because this writes the one field the
+        # staleness checks trust while `claim()` is a read-modify-write of it.
+        # Unlocked, a planted value could land between claim()'s read and its
+        # store and two turns would be handed the same generation — the exact
+        # collision the lock exists to prevent. Tests are the only caller today
+        # (nothing in the bubble rebases a stream), which is why this was a
+        # convention rather than an invariant; now it is the latter.
+        with _COUNTER_LOCK:
+            self._box["gen"] = int(new)
 
     def claim(self) -> TurnState:
         """Advance this counter and return a fresh TurnState for the turn."""

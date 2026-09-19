@@ -1378,6 +1378,31 @@ class TestLoaderFailurePaths:
         assert "synth_boom2" not in sys.modules
         assert "core.synth_boom2" not in sys.modules
 
+    def test_a_baseexception_during_a_load_leaves_no_squat_behind(
+            self, monkeypatch, tmp_path):
+        """KeyboardInterrupt/SystemExit are not `Exception`.
+
+        The rollback caught `Exception`, so a Ctrl-C landing inside a module
+        body left a HALF-EXECUTED module in `sys.modules` under both names for
+        the life of the process — and every later load adopted that corpse
+        instead of the file, so the module could never be loaded again no
+        matter how it was fixed. The app-module loader already used
+        `BaseException`; this is the support-module twin.
+        """
+        pkg = tmp_path / "core"
+        pkg.mkdir()
+        (pkg / "synth_sigint.py").write_text(
+            "raise KeyboardInterrupt('ctrl-c during import')\n", encoding="utf-8")
+        monkeypatch.setattr(core, "_HERE", pkg)
+        monkeypatch.delitem(sys.modules, "synth_sigint", raising=False)
+        monkeypatch.delitem(sys.modules, "core.synth_sigint", raising=False)
+        with pytest.raises(KeyboardInterrupt):
+            core.load_module("synth_sigint")
+        assert "synth_sigint" not in sys.modules, \
+            "a half-executed module stayed under the bare name"
+        assert "core.synth_sigint" not in sys.modules, \
+            "a half-executed module stayed under the namespaced name"
+
     def test_a_module_already_imported_by_its_bare_name_is_adopted(
             self, monkeypatch):
         """A plain `import hardware` is not a second copy of it.

@@ -452,8 +452,19 @@ def _fastfetch(probers: dict) -> dict:
                    if isinstance(m, dict) and m.get("result") is not None}
     except Exception as e:
         return _deg(e)
-    strang = lambda v: str(v or "")
-    first = lambda v: (v or [{}])[0] if isinstance(v, list) else (v or {})
+    def strang(v) -> str:
+        # `v or ""` turned a legitimate 0 into "" — a value that is falsy is
+        # still a value, and only a missing one should read as empty.
+        return "" if v is None else str(v)
+
+    def first(v) -> dict:
+        # The dict (or the first dict of the list), never a non-dict: fastfetch
+        # answers some types with scalars or lists of scalars, and handing one
+        # back made the `.get()` calls below raise on a machine that is merely
+        # unusual rather than broken.
+        if isinstance(v, list):
+            return v[0] if v and isinstance(v[0], dict) else {}
+        return v if isinstance(v, dict) else {}
     os_r, host, cpu = first(by_type.get("OS")), first(by_type.get("Host")), \
         first(by_type.get("CPU"))
     gpus = [strang(g.get("name")) for g in (by_type.get("GPU") or [])

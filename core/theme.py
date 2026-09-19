@@ -204,7 +204,19 @@ def _newest_media(directory, *, exists=os.path.isfile) -> str | None:
     """Newest image/video in a directory tree level, or None."""
     best, best_mtime = None, -1.0
     try:
-        entries = list(os.scandir(directory))
+        # The iterator holds a directory fd, so it is closed on EVERY path — an
+        # exception while reading the directory otherwise leaves it to the
+        # collector, and this runs per state per look. `getattr(it, "close")`
+        # rather than `with`: the suite injects a plain list here (the
+        # listing seam in tests/test_theme.py), and a bare list is still a
+        # perfectly good answer to "what is in this directory".
+        it = os.scandir(directory)
+        try:
+            entries = list(it)
+        finally:
+            close = getattr(it, "close", None)
+            if close is not None:
+                close()
     except OSError:
         return None
     for entry in entries:
@@ -274,9 +286,17 @@ def wallpaper_candidates(config_file: Path | str | None = None, *,
                           "wallpapers" / sub, exists=exists))
     # swww keeps one file per output; the newest is the one on screen now.
     try:
-        for entry in os.scandir(home / ".cache" / "swww"):
-            if entry.is_dir():
-                add(_newest_media(entry.path, exists=exists))
+        # Closed explicitly, for the same reason as above and with the same
+        # tolerance for an injected listing.
+        it = os.scandir(home / ".cache" / "swww")
+        try:
+            for entry in it:
+                if entry.is_dir():
+                    add(_newest_media(entry.path, exists=exists))
+        finally:
+            close = getattr(it, "close", None)
+            if close is not None:
+                close()
     except OSError:
         pass
     try:

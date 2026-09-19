@@ -68,6 +68,29 @@ class TestBoundedRegistry:
         assert slot is not None, "the slot leaked on the failure path"
         slot.cancel()
 
+    def test_a_raising_build_gives_the_slot_back(self, H):
+        """The other leak: a `build` callable that raises.
+
+        `_release` was reachable only on the success path, so a build that
+        raised under the lock left the reservation counted for ever — the cap
+        then refused work the machine could do and nothing named the failure.
+        The registry hands the slot back before re-raising, so what it counts
+        describes what exists rather than what was attempted.
+        """
+        reg = _core_registry.BoundedRegistry("t", 1)
+        slot = reg.reserve()
+        assert slot is not None
+
+        def boom(_key):
+            raise OSError("Popen failed")
+
+        with pytest.raises(OSError):
+            slot.commit(boom)
+        assert reg.room(), "the cap shrank when the build raised"
+        again = reg.reserve()
+        assert again is not None, "the slot leaked on the build's failure path"
+        again.cancel()
+
     def test_commit_mints_unique_keys_inside_the_lock(self, H):
         """Key allocation and insertion are one critical section.
 

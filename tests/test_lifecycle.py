@@ -292,6 +292,38 @@ class TestTurnGenerationIsAtomic:
             f"two turns claimed the same generation: {sorted(results)}")
         assert counter["gen"] == 4
 
+    def test_the_setter_shares_the_lock_with_claim(self):
+        """`counter.value = n` writes the field `claim()` read-modify-writes.
+
+        The setter was the one writer that did not take the lock (tests are the
+        only caller; nothing in the bubble rebases a stream). Unlocked, a
+        planted generation could land between claim()'s read and its store, and
+        two turns would share a number — the collision this class exists to
+        prevent. Proven the only way it can be: hold the lock and watch the
+        setter wait for it.
+        """
+        import core.lifecycle as lifecycle
+
+        counter = lifecycle.GenerationCounter()
+        started = threading.Event()
+        done = threading.Event()
+
+        def plant():
+            started.set()
+            counter.value = 99
+            done.set()
+
+        with lifecycle._COUNTER_LOCK:
+            th = threading.Thread(target=plant, daemon=True)
+            th.start()
+            assert started.wait(timeout=5), "the planting thread never started"
+            assert not done.wait(timeout=0.25), (
+                "the setter wrote while the counter lock was held — it does not "
+                "share the lock with claim()")
+        th.join(timeout=5)
+        assert done.is_set(), "the setter never finished after the lock freed"
+        assert counter.value == 99
+
 
 class TestSourceIntegrity:
     @pytest.mark.parametrize("name", ["handsoff.py", "handsoff-settings.py"])
@@ -1995,6 +2027,40 @@ class TestRestartScriptSystemdAware:
         assert "systemctl --user is-active" in text
         assert "systemctl --user restart handsoff.service" in text
         assert "exit 0" in text      # systemd path must not fall through to nohup
+
+    def test_an_unrunnable_interpreter_is_refused_not_faked(self, tmp_path):
+        """A bad HANDSOFF_PYTHON used to report a restart it never performed.
+
+        The launch is `nohup ... &` and its pid is echoed whether or not the
+        process survived, so a typo in HANDSOFF_PYTHON stopped a healthy bubble
+        and left nothing running while saying "handsoff restarted (pid N)".
+        EXECUTED rather than grepped, with a stub systemd/pgrep on PATH and a
+        sandboxed HOME/STATE so the real unit is never touched by the test — or
+        by a mutation of it.
+        """
+        stub = tmp_path / "bin"
+        stub.mkdir()
+        for name in ("systemctl", "pgrep", "flock"):
+            tool = stub / name
+            tool.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            tool.chmod(0o755)
+        (tmp_path / "home").mkdir()
+        # sandbox_env, not a hand-built dict: the suite's own guard fails any
+        # subprocess in the suite whose environment did not come through it, and
+        # the throw-away HOME is the property that guard protects.
+        env = sandbox_env(tmp_path / "home")
+        env.update({"PATH": f"{stub}:/usr/bin:/bin",
+                    "XDG_STATE_HOME": str(tmp_path / "state"),
+                    "HANDSOFF_PYTHON": str(tmp_path / "no-such-python3")})
+        result = subprocess.run(
+            ["bash", str(HERE / "handsoff-restart")],
+            env=env, capture_output=True, text=True, timeout=30)
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, (
+            "the script reported success with an interpreter that cannot run")
+        assert "not executable" in combined, combined
+        assert "restarted (pid" not in result.stdout, (
+            "a pid was announced for a process that never started")
 
 
 class TestToolSchemaFromCode:

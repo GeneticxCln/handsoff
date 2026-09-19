@@ -276,7 +276,7 @@ def load_module(mod_name: str):
         sys.modules[f"core.{mod_name}"] = mod
         try:
             spec.loader.exec_module(mod)
-        except Exception:
+        except BaseException:
             if bind_bare:
                 if prev_bare is None:
                     sys.modules.pop(mod_name, None)

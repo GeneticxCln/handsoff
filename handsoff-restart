@@ -7,6 +7,18 @@ LOG="$STATE/handsoff.log"
 SCRIPT="$HOME/.local/bin/handsoff.py"
 # ponytail: resolve once; venv's python3 wins when activated, system fallback otherwise.
 PYBIN="${HANDSOFF_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
+# A PYBIN that cannot run makes this script report a success it did not have:
+# the launch is `nohup ... &` and its pid is echoed whether or not the process
+# survived, so a bad HANDSOFF_PYTHON stopped a healthy bubble and left nothing
+# running while saying "handsoff restarted (pid N)". Checked BEFORE anything is
+# killed, so the failure is loud and costs nothing. This is not an injection
+# guard: "$PYBIN" is quoted everywhere, so a value carrying shell
+# metacharacters is one unusable path, not a command.
+if [ ! -x "$PYBIN" ]; then
+    echo "handsoff-restart: interpreter '$PYBIN' is not executable — set" \
+         "HANDSOFF_PYTHON to a python3 this machine has" >&2
+    exit 1
+fi
 mkdir -p "$STATE"
 
 is_bubble_pid() {  # $1 = pid: python exe + EXACT cmdline match (never editors/pytest)

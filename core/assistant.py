@@ -413,8 +413,9 @@ class NotificationReader:
 
     def run(self, stop: threading.Event, run=None) -> None:
         """Production wrapper: run loop(), respawning dbus-monitor with
-        bounded backoff when its stdout is exhausted. At most 5 respawns,
-        1s→30s exponential backoff; gives up quietly when disabled.
+        bounded backoff when its stdout is exhausted OR a pass raises. At most
+        5 respawns/retries, 1s→30s exponential backoff; gives up quietly when
+        disabled.
 
         `run` is the registered slot record when this worker was started by
         set_enabled(); a direct call (tests, embedding) has none, and then there
@@ -449,7 +450,20 @@ class NotificationReader:
             try:
                 self.loop(proc, stop)
             except Exception:
+                # A pass that RAISES is not exhaustion. The monitor can still
+                # poll as alive (a wedged dbus-monitor whose stdout read died),
+                # and then the branch above is skipped on the next iteration —
+                # so this call was re-entered immediately, spinning at full CPU
+                # and logging one exception per pass for as long as the reader
+                # stayed enabled. Treated as a death instead: back off and spend
+                # an attempt, so a permanent error gives up like a dead monitor
+                # rather than burning a core silently.
                 log.exception("notification reader pass failed")
+                if stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2.0, 30.0)
+                attempts += 1
+                continue
             if stop.is_set():
                 return
             # loop() returned via exhaustion: loop to respawn.

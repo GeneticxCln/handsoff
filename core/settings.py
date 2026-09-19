@@ -762,7 +762,12 @@ def coerce_setting(key: str, value):
     keys it knows), which is what keeps `set_setting` usable for a key this
     build has no rule for.
     """
-    probe = {**copy.deepcopy(DEFAULT_SETTINGS), key: value}
+    # `value` is copied, not shared, for the same reason as `data` below and
+    # with the same measurement behind it: a coercer that replaced its
+    # container is why nothing was ever observed to change, and the copy is what
+    # keeps "what does this value BECOME" a question rather than a mutation once
+    # one of them normalises in place.
+    probe = {**copy.deepcopy(DEFAULT_SETTINGS), key: copy.deepcopy(value)}
     coerce_settings(probe)
     return probe[key]
 
@@ -796,7 +801,19 @@ def persist_setting(key: str, value, settings_file: Path,
         # happens to hold. So it is completed from the defaults, coerced, and
         # only THIS key's coerced value is written back — the rest of the file
         # is left byte-for-byte as the user had it.
-        probe = {**copy.deepcopy(DEFAULT_SETTINGS), **data}
+        #
+        # `data` is deep-copied so that last sentence is structural rather than
+        # a property of how today's coercers happen to be written. MEASURED
+        # 2026-09-19, with the shared-container merge this replaces: colours,
+        # permissions, command_policy, workspace_aliases and spotter_models are
+        # all REPLACED by their coercer, never written into, so no user file was
+        # being rewritten by a save of an unrelated key — this is not a live
+        # defect. What it removes is the dependence on that staying true: one
+        # future coercer that normalises in place (`colors["idle"] = ...`) would
+        # have edited the rest of the file on the way past, silently, and only
+        # for users whose values were not already normal. The guard in
+        # tests/test_settings.py installs exactly such a coercer.
+        probe = {**copy.deepcopy(DEFAULT_SETTINGS), **copy.deepcopy(data)}
         coerce_settings(probe)
         data[key] = probe[key]
         data["version"] = SETTINGS_VERSION   # every on-disk write is stamped
