@@ -941,6 +941,87 @@ differ from `~/.local/bin/…`.
 
 ## The installer stopped deciding what the app already decided (2026-09-19)
 
+**The finding.** The pass that fixed step 8 judging `qwen3:8b` while the bubble
+ran `gemma4:12b` was read at the time as one hardcoded default. It was a class:
+four more places in `install.sh` provisioned something the app already decides,
+and each duplicate could drift in the same direction — the script preparing a
+machine for a configuration nobody has.
+
+* **Step 4 downloaded `WHISPER_SIZE="${HANDSOFF_WHISPER:-tiny}"`** while the
+  bubble loads `SETTINGS["whisper_size"]`. A user who set `small` got `tiny`
+  fetched into the cache the bubble reads **from**, and `tiny` recorded in the
+  deployment manifest — the bubble then fetched `small` itself at the first
+  reply, or failed to offline, with the manifest agreeing with nobody. A size
+  the app would not accept was passed straight to `WhisperModel(...)`, which is
+  a traceback mid-install instead of a refusal naming `WHISPER_SIZES`.
+* **Step 8 probed `curl … http://127.0.0.1:11434/api/tags`** while the app reads
+  `OLLAMA_BASE = SETTINGS["ollama_host"]`, and the `ollama` CLI behind `pull`
+  and `show` resolved its own default endpoint. On a machine pointed at a remote
+  brain the script reported "not running", ran `sudo systemctl enable --now
+  ollama` (starting a local server the bubble never talks to), pulled gigabytes
+  into it, and judged **that** server's tool support.
+* **Step 6 primed `HANDSOFF_TTS_REPO:-ResembleAI/chatterbox-turbo`**, a second
+  copy of `core.audio.TTS_REPO_ID` — the constant the bubble builds its cache
+  path from. This one had already bitten: piper → chatterbox renamed the engine,
+  and the copy would have primed 3.8 GB the app never reads while the script's
+  own "snapshot is usable" check passed.
+* **Step 7 wrote a niri rule for `app-id=r#"^handsoff$"#`** while the app sets
+  `setDesktopFileName(APP_NAME)`. A renamed id stops the rule matching silently:
+  the bubble would simply stop floating where the user put it, with a snippet
+  that still looks right.
+
+**The fix.** Two failure-tolerant readers — `_read_setting` over
+`settings.json`, `_app_constant` over a module-level literal via `ast` (never an
+import: `handsoff.py` builds a QApplication at import) — and one resolver shape
+(`_resolve_whisper_size`, `_resolve_ollama_endpoint`, assignment-time reads for
+the model, repo and app-id). The fallbacks stay for a bare machine, named in one
+block (`DEFAULT_MODEL`, `DEFAULT_WHISPER_SIZE`, `DEFAULT_TTS_REPO`,
+`DEFAULT_APP_ID`, `OLLAMA_DEFAULT`) so one test can hold all five against the
+app's own defaults. `_resolve_ollama_endpoint` mirrors the app's remote rule
+exactly: settings compared **strictly** (`is True`, core's fail-closed contract),
+then the send guard's env tokens; without either, it says the bubble would refuse
+that endpoint and checks loopback instead. The niri rule takes an `@APP_ID@`
+placeholder and `sed` substitutes it — an unquoted heredoc would read `$"` as a
+bash locale expansion.
+
+**Teeth: 6 new tests in `tests/test_ops.py`** (70 → 76 collected) — the
+configured size, its refusal of `huge` with the list named, the env knob still
+winning, the bare-machine default; the endpoint in five shapes (loopback port,
+bare `host:port` gaining the scheme, a real bool opt-in, a hand-edited string
+that is NOT one, the env token, and the un-opted remote falling back with the
+warning); the repo read out of `core/audio.py` **with the constant renamed in a
+copy of the module and the answer following**; the app-id read out of
+`handsoff.py` with the rule carrying no copy of it; every fallback against
+`DEFAULT_SETTINGS`/`WHISPER_SIZES`/`TTS_REPO_ID`/`APP_NAME`; and a rehearsal
+end-to-end where a seeded `whisper_size: small` makes step 5 say 'small', the
+manifest record `small`, and step 8 name the configured server. **18/18
+mutations caught, 0 missed, every restore sha256-verified** (the hardcoded size
+back, the resolution ignoring settings, the manifest recording a literal, the
+accepted-size check gone, the hardcoded model back, loopback back, the opt-in
+read loosely, the remote branch never falling back, step 8 probing a literal,
+the CLI keeping its own server, the local service started for a remote host, the
+repo literal back, the `ast` reader returning nothing, the rule naming its own
+id, the placeholder never substituted, and each of the three fallbacks drifting).
+
+**Stated limits.** `_read_setting` prints only scalars: a list or dict setting
+is not a value any caller here can use, and printing one as text would be a
+lie — so `spotter_models`-shaped settings resolve to their fallback by
+construction. The readers fail soft by design, so a settings file that cannot be
+parsed provisions the defaults rather than refusing the install (said in the
+notes only where the value is refused for being out of range). `_app_constant`
+reads module-level literals; a constant that becomes computed would resolve to
+its fallback. And the CLI tools the app shells out to (`ydotool`, `grim`,
+`tesseract`, `mpc`, `wl-clipboard`) have **no** app-side single source to read —
+they are named at their call sites with their own `pacman -S` advice — so the
+package list remains a provisioning decision this script owns, not a duplicate of
+the app's.
+
+**Measured on the final bytes.** `tests` **PASS — 1 880 passed in 258 s**;
+`coverage` **PASS, 84.9%** ≥ 70; `compile`, `shell`, `smoke` PASS; specs
+freshness 19 passed after the test-plan row and snapshot sentence were
+corrected. The tree is **checkout only**: `install.sh` is not in the deployment
+manifest, so the in-sync verdict is unaffected by this section.
+
 **Stated limits (the earlier section).** The pin covers the READER's hop seam. The plain `http_get`
 seam still resolves names, and deliberately so: its URLs are the module's own
 backend constants, and the one place a model-supplied address rides through it is

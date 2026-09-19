@@ -56,7 +56,14 @@ Env overrides (only where settings.json has no value): `HANDSOFF_MODEL`,
 `HANDSOFF_KEEP_ALIVE` (default `1h`). Install-time: `HANDSOFF_MODEL`,
 `HANDSOFF_WHISPER`, `HANDSOFF_WHISPER_REVISION`, `HANDSOFF_TTS_REPO`
 (`ResembleAI/chatterbox-turbo`), `HANDSOFF_PYTHON`,
-`HANDSOFF_NO_OLLAMA_SERVICE`.
+`HANDSOFF_NO_OLLAMA_SERVICE`, `HANDSOFF_ALLOW_REMOTE_OLLAMA` (the same tokens
+the send guard accepts). Each install-time override is the FIRST source, not the
+only one: with no override, install.sh reads `model`, `whisper_size` and
+`ollama_host` from this file, `TTS_REPO_ID` from `core/audio.py` and `APP_NAME`
+from `handsoff.py`, and each named fallback (`DEFAULT_MODEL` `qwen3:8b`,
+`DEFAULT_WHISPER_SIZE` `tiny`, `OLLAMA_DEFAULT` `http://127.0.0.1:11434`,
+`DEFAULT_TTS_REPO`, `DEFAULT_APP_ID`) is pinned to the app's own default by
+`tests/test_ops.py::TestInstallerProvisionsWhatTheAppDecided`.
 
 Coercion (`coerce_settings`): enums clamp to vocabularies, numbers to
 ranges, bools strict (`_bool_flag` — `bool("false")` is not True),

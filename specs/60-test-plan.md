@@ -1,6 +1,7 @@
 # handsoff — test plan
 
 Sources: `tests/` (30 files + `conftest.py` + `checkout_guard.py` + `fake_ollama.py`),
+`install.sh` (what it provisions from),
 `pytest.ini`,
 `.coveragerc`, `.github/workflows/ci.yml`, `.gitlab-ci.yml`,
 `githooks/pre-commit`, `ci/`.
@@ -9,7 +10,7 @@ Sources: `tests/` (30 files + `conftest.py` + `checkout_guard.py` + `fake_ollama
 
 `tests/` — the FILE LIST is the contract: every `tests/test_*.py` must appear
 below, and `test_specs_freshness.py` fails when one does not. The counts are the
-2026-09-18 snapshot (1812 collected), so a stale count in this table means
+2026-09-19 snapshot (1880 collected), so a stale count in this table means
 nothing — a missing row does.
 
 | File | `test_*` fns | Area |
@@ -23,7 +24,7 @@ nothing — a missing row does.
 | `test_settings.py` | 81 | loader/coerce/migrate/merge/lock, looks catalogue |
 | `test_settings_contract.py` | 24 | the field table: coercion, controls, cards, companion rows, the window |
 | `test_lifecycle.py` | 90 | generations, staleness, PTT epoch, cancel/done, installer membership + rehearsal (each on a fixture it builds) |
-| `test_ops.py` | 67 | deploy snapshot, restart, control socket, health/doctor |
+| `test_ops.py` | 76 | deploy snapshot, restart, control socket, health/doctor, and what the installer provisions from (the shipped resolvers RUN against fixture settings: the configured whisper size and its refusal of a size the app would not accept, the configured model, the configured server with the app's strict remote opt-in on both channels, the speech repo read out of `core/audio.py`, the app-id read out of `handsoff.py` and substituted into the niri rule, and every `DEFAULT_*` held against the app's own default — plus the rehearsal end-to-end where step 5 says 'small' and the manifest records it) |
 | `test_web.py` | 75 | router, backends, cache, reader, SSRF refusals, the redirect walk, and the DNS pin (`connect_to` at the reader and at the host's dial, the seam that cannot pin, the bounded resolver) |
 | `test_fault_injection.py` | 52 | boundary breakage, loud-degradation contract |
 | `test_sandbox.py` | 78 | secret paths, edit boundaries, command validation, and the write guard's own teeth (the refusal, its decision table, the exemptions, the event rules, the CHILD half — a spawned child is refused, the same child with the variable removed is not, and the shim it runs is the pointer rather than a second copy of the rules — and the DEVELOPER'S USER DIRS, the second rule: `~/.config` and `~/.local/state` refused before the write lands, the message naming the directory and the fix, the roots captured before any sandbox (so they do not follow a load's throw-away HOME), the checkout keeping precedence over the home it sits inside, and one variable per rule) |

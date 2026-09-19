@@ -163,45 +163,166 @@ case "${1:-}" in
         ;;
 esac
 
-WHISPER_SIZE="${HANDSOFF_WHISPER:-tiny}"
-# Which model step 8 judges and pulls. Resolved just below, once the interpreter
-# is known: the app reads its model from settings.json (`model` — see
-# `OLLAMA_MODEL = str(SETTINGS["model"])`), and the deployment default is only
-# the last resort. The monolith has no `HANDSOFF_MODEL` in its unit either, so a
-# machine that has been running a while has the user's choice on disk and the
-# hardcoded name is a model NOTHING loads: this machine's settings.json said
-# `gemma4:12b` while step 8 warned about `qwen3:8b`, and on a host that did not
-# already have that model the installer would have PULLED it (several GB) and
-# then judged its tool support — work about the wrong model, reported to a user
-# who never chose it.
-OLLAMA_MODEL=""
-# Speech engine weights. chatterbox-turbo replaced Piper, so this is a
-# Hugging Face repo (a directory of safetensors) rather than a single .onnx
-# voice file. huggingface_hub fetches content-addressed blobs and verifies
-# them on download, so there is no sha256 to pin here.
-TTS_REPO="${HANDSOFF_TTS_REPO:-ResembleAI/chatterbox-turbo}"
-# ponytail: resolve once; venv's python3 shadows system when activated.
+# --- what the app is configured with ----------------------------------------
+# Four steps of this script provision something the APP already decides, and
+# each used to decide it again from a hardcoded literal. That is the same
+# mistake every time, and it has already cost real work twice:
+#
+#   * step 8 judged `qwen3:8b` (a named deployment default) while the bubble ran
+#     `gemma4:12b` from settings.json — and on a host without it the installer
+#     would have pulled several GB of a model nothing loads;
+#   * pipi → chatterbox renamed the speech repo and the installer's copy of the
+#     name would have kept priming the old 3.8 GB one, with its own "snapshot is
+#     usable" check passing for a cache the bubble never reads.
+#
+# So the values below are READ from the two places the answer already exists —
+# the settings file the bubble loads, and the app's own source for the things
+# that are constants rather than settings — and the literals here are only the
+# last resort for a bare machine. Every read is failure-tolerant by construction
+# (a missing file, a missing key, an interpreter that will not answer, a module
+# that will not parse): it prints nothing and leaves the default in force, so
+# nothing in this script can be stopped by the state of the user's config.
+#
+# The fallbacks are pinned to the app's own defaults by tests in
+# tests/test_ops.py, which RUN these functions against fixture settings files
+# rather than reading this file for the literals.
 PYBIN="${HANDSOFF_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
-WHISPER_REVISION="${HANDSOFF_WHISPER_REVISION:-main}"
 
-# The model the app is actually configured with, read from the same file the app
-# reads. Every failure (no file yet, no key, an interpreter that will not answer)
-# prints nothing and leaves the default below in force, so a first install on a
-# bare machine still has a model to pull and nothing here can stop the install.
-_configured_model() {
-    "$PYBIN" - "$CONF_DIR/settings.json" <<'PY_EOF' 2>/dev/null || true
+# A setting exactly as the bubble will see it: `true`/`false` for a bool, the
+# number or text otherwise, nothing at all when it is absent or unusable. Only
+# scalars are printed — a list is not a value any caller here can use, and a
+# dict printed as text would be a lie ("{'a': 1}" is not the setting).
+_read_setting() {   # $1 = settings key
+    "$PYBIN" - "$CONF_DIR/settings.json" "$1" <<'PY_EOF' 2>/dev/null || true
+import json, sys
+key = sys.argv[2]
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        value = json.load(fh).get(key)
+except Exception:
+    value = None
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif isinstance(value, (int, float, str)) and str(value).strip():
+    print(value)
+PY_EOF
+}
+
+# A bool setting, read STRICTLY: prints `true` for a JSON true, `false` for a
+# JSON false, and nothing for anything else. The app's own opt-in check is
+# `settings.get(k) is True` (core's fail-closed contract), so a hand-edited
+# `"allow_remote_ollama": "true"` is NOT an opt-in there — and a reader that
+# accepted the string would have this script provisioning and judging a server
+# the bubble refuses every request to.
+_read_bool_setting() {   # $1 = settings key
+    "$PYBIN" - "$CONF_DIR/settings.json" "$1" <<'PY_EOF' 2>/dev/null || true
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
-        value = json.load(fh).get("model")
+        value = json.load(fh).get(sys.argv[2])
 except Exception:
     value = None
-if isinstance(value, str) and value.strip():
-    sys.stdout.write(value.strip())
+if isinstance(value, bool):   # bool BEFORE int: True is an int in Python
+    print("true" if value else "false")
 PY_EOF
 }
-OLLAMA_MODEL="${HANDSOFF_MODEL:-$(_configured_model)}"
-[ -n "$OLLAMA_MODEL" ] || OLLAMA_MODEL="qwen3:8b"
+
+# A module-level literal in one of the app's own files — read with `ast`, never
+# imported: handsoff.py builds a QApplication at import, and the installer must
+# not run the app to ask it a question about itself. A tuple prints as its
+# members, space-separated, which is the form the shell wants to test against.
+_app_constant() {   # $1 = path relative to $HERE, $2 = constant name
+    "$PYBIN" - "$HERE/$1" "$2" <<'PY_EOF' 2>/dev/null || true
+import ast, sys
+name = sys.argv[2]
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+except Exception:
+    raise SystemExit(0)
+for node in tree.body:
+    if not isinstance(node, ast.Assign):
+        continue
+    if not any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+        continue
+    try:
+        value = ast.literal_eval(node.value)
+    except Exception:
+        break
+    if isinstance(value, bool):
+        print("true" if value else "false")
+    elif isinstance(value, (list, tuple)):
+        print(" ".join(str(item) for item in value))
+    elif isinstance(value, (int, float, str)):
+        print(value)
+    break
+PY_EOF
+}
+
+WHISPER_REVISION="${HANDSOFF_WHISPER_REVISION:-main}"
+# --- last-resort fallbacks, in one place -------------------------------------
+# What each resolver below uses when the setting is missing or unusable. They
+# are named (rather than sprinkled through the script) so that exactly one test
+# can hold every one of them against the app's OWN default — settings_schema's
+# DEFAULT_SETTINGS for the settings, core/audio.py for the repo, handsoff.py for
+# the app-id, env for the endpoint knob. A fallback that drifts from the app is
+# a machine provisioned for a configuration nobody has.
+DEFAULT_MODEL="qwen3:8b"
+DEFAULT_WHISPER_SIZE="tiny"
+DEFAULT_TTS_REPO="ResembleAI/chatterbox-turbo"
+DEFAULT_APP_ID="handsoff"
+#: The endpoint `[8/8]` falls back to when the setting is missing, unusable, or
+#: names a server the bubble itself refuses.
+OLLAMA_DEFAULT="http://127.0.0.1:11434"
+
+# whisper: step 5 DOWNLOADS this model into the cache the bubble loads from, so
+# it has to be the size the bubble asks for (`WHISPER_SIZE = SETTINGS[...]`).
+# The old literal meant a user who set `small` got tiny downloaded and recorded
+# in the deployment manifest, and the bubble then fetched `small` itself at the
+# first reply — or failed to, offline, with the manifest agreeing with nobody.
+# An unusable value is REFUSED rather than passed on: the app accepts only
+# settings_schema.WHISPER_SIZES, and a size outside that list sends
+# faster-whisper at a repo that does not exist — a traceback mid-install instead
+# of the two note lines below, which also say which list said no.
+_resolve_whisper_size() {
+    local size
+    size="${HANDSOFF_WHISPER:-$(_read_setting whisper_size)}"
+    if [ -n "$size" ] \
+        && ! printf '%s\n' $(_app_constant settings_schema.py WHISPER_SIZES) \
+            | grep -qx -- "$size"; then
+        echo "    note: whisper_size '$size' is not a size this app accepts"
+        echo "      (settings_schema.WHISPER_SIZES) — using $DEFAULT_WHISPER_SIZE"
+        size=""
+    fi
+    printf '%s' "${size:-$DEFAULT_WHISPER_SIZE}"
+}
+WHISPER_SIZE="$(_resolve_whisper_size)"
+
+# Which model step 8 judges and pulls. The monolith has no `HANDSOFF_MODEL` in
+# its unit, so a machine that has been running a while has the user's choice on
+# disk and the hardcoded name is a model NOTHING loads.
+OLLAMA_MODEL="${HANDSOFF_MODEL:-$(_read_setting model)}"
+[ -n "$OLLAMA_MODEL" ] || OLLAMA_MODEL="$DEFAULT_MODEL"
+
+# Which SERVER step 8 probes, pulls into and judges is resolved at step 8
+# itself (`_resolve_ollama_endpoint`), because a teardown must not care.
+
+# Speech engine weights. chatterbox-turbo replaced Piper, so this is a
+# Hugging Face repo (a directory of safetensors) rather than a single .onnx
+# voice file. huggingface_hub fetches content-addressed blobs and verifies
+# them on download, so there is no sha256 to pin here — but the REPO NAME is
+# still the app's decision (`core.audio.TTS_REPO_ID`, the same constant
+# `weights_dir()` builds the cache path from), so step 6 primes the one the
+# bubble will read instead of a copy of the name that can drift.
+TTS_REPO="${HANDSOFF_TTS_REPO:-$(_app_constant core/audio.py TTS_REPO_ID)}"
+[ -n "$TTS_REPO" ] || TTS_REPO="$DEFAULT_TTS_REPO"
+
+# The app-id the niri window rule must match. The bubble sets it at runtime
+# (`setDesktopFileName(APP_NAME)`), so the rule is written from the same
+# constant: a renamed id would silently stop the bubble floating where the user
+# put it, with a snippet that still looks right.
+APP_ID="$(_app_constant handsoff.py APP_NAME)"
+[ -n "$APP_ID" ] || APP_ID="$DEFAULT_APP_ID"
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Uninstalling handsoff"
@@ -852,12 +973,68 @@ else
     echo "    WARN: systemd user session not reachable; keeping niri spawn-at-startup as the autostart"
 fi
 
-echo "==> [8/8] Checking ollama"
+# Which SERVER step 8 probes, pulls into and judges. The app reads
+# `OLLAMA_BASE = SETTINGS["ollama_host"]`, so a hardcoded loopback checked,
+# started and filled a server the bubble does not talk to: on a machine pointed
+# at a remote brain this script would have reported "not running", enabled the
+# LOCAL service, pulled gigabytes into it, and judged its tool support.
+#
+# Sets two globals rather than printing one: a subshell would lose the second.
+#   OLLAMA_HOST_URL — the endpoint this install should use
+#   OLLAMA_REMOTE   — 1 when that endpoint is NOT on this machine
+# A non-loopback brain is only usable when the app's opt-in is on — the
+# SETTINGS value strictly (`is True`, so a hand-edited string is not one), then
+# the same environment tokens the send guard accepts. Without it the bubble
+# REFUSES every request, so checking that server would say nothing about a
+# working install; loopback is what this script can honestly provision, said
+# out loud.
+_resolve_ollama_endpoint() {
+    local url optin
+    url="${HANDSOFF_OLLAMA_HOST:-$(_read_setting ollama_host)}"
+    [ -n "$url" ] || url="$OLLAMA_DEFAULT"
+    case "$url" in
+        *://*) ;;
+        *) url="http://$url" ;;   # the app does the same to a bare host:port
+    esac
+    url="${url%/}"
+    OLLAMA_REMOTE=0
+    case "$url" in
+        http://127.0.0.1:*|http://localhost:*|http://\[::1\]:*) ;;
+        *) OLLAMA_REMOTE=1 ;;
+    esac
+    if [ "$OLLAMA_REMOTE" = "1" ]; then
+        optin="$(_read_bool_setting allow_remote_ollama)"
+        case "$optin" in
+            true) ;;
+            *) optin="$(printf '%s' "${HANDSOFF_ALLOW_REMOTE_OLLAMA:-}" \
+                           | tr 'A-Z' 'a-z')"
+               case "$optin" in
+                   1|true|yes|on) ;;
+                   *) echo "    WARN: settings.json sets ollama_host=$url (not loopback) while"
+                      echo "      allow_remote_ollama is off — the bubble refuses a remote brain"
+                      echo "      in that state, so this install checks $OLLAMA_DEFAULT instead."
+                      url="$OLLAMA_DEFAULT"
+                      OLLAMA_REMOTE=0 ;;
+               esac ;;
+        esac
+    fi
+    OLLAMA_HOST_URL="$url"
+}
+
+
+_resolve_ollama_endpoint
+echo "==> [8/8] Checking ollama ($OLLAMA_HOST_URL)"
 if [ "$REHEARSAL" = "1" ]; then
     echo "    skipping ollama checks (rehearsal)"
-elif ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then
+elif ! curl -s --max-time 2 "$OLLAMA_HOST_URL/api/tags" >/dev/null; then
+    if [ "$OLLAMA_REMOTE" = "1" ]; then
+        # A remote brain is NOT this machine's service to start — enabling the
+        # local unit here would answer nothing and mislead the user.
+        echo "    $OLLAMA_HOST_URL (settings.json ollama_host) is not answering, and it is not"
+        echo "    on this machine — the local ollama service is left alone. Start ollama"
+        echo "    on that host, or point ollama_host back at $OLLAMA_DEFAULT."
     # ponytail: never touch the system service when pkgs are skipped or opted out.
-    if [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ] || [ "${HANDSOFF_NO_OLLAMA_SERVICE:-0}" = "1" ]; then
+    elif [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ] || [ "${HANDSOFF_NO_OLLAMA_SERVICE:-0}" = "1" ]; then
         echo "    ollama not running — leaving the service alone (skip/opt-out)"
     else
         echo "    starting the ollama service ..."
@@ -865,6 +1042,12 @@ elif ! curl -s --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null; then
         sleep 2
     fi
 fi
+# The `ollama` CLI resolves its own endpoint (OLLAMA_HOST), so it is pointed at
+# the SAME server the app is configured with. Otherwise this script would pull a
+# model into one server and judge it on another, and the bubble would talk to a
+# third answer.
+OLLAMA_HOST="${OLLAMA_HOST_URL#*://}"
+export OLLAMA_HOST
 if [ "$REHEARSAL" != "1" ] && ! ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$OLLAMA_MODEL"; then
     echo "    pulling $OLLAMA_MODEL (a few GB, one time) ..."
     ollama pull "$OLLAMA_MODEL" || echo "    WARN: pull failed — run 'ollama pull $OLLAMA_MODEL' later"
@@ -875,10 +1058,14 @@ if [ "$REHEARSAL" != "1" ] && ! ollama show "$OLLAMA_MODEL" 2>/dev/null | grep -
     echo "    handsoff will still chat, but set HANDSOFF_MODEL to enable tools."
 fi
 
-atomic_write "$CONF_DIR/niri-window-rule.kdl" 644 <<'NIRI_EOF'
+# The app-id is SUBSTITUTED rather than interpolated in the heredoc: the rule
+# anchors on `^...$`, and `$"` inside an unquoted heredoc is a bash locale
+# expansion, so the placeholder is swapped after the text is written.
+niri_rule() {
+    cat <<'NIRI_EOF'
 // handsoff voice-assistant bubble — merge into ~/.config/niri/config.kdl
 window-rule {
-    match app-id=r#"^handsoff$"#
+    match app-id=r#"^@APP_ID@$"#
     open-floating true
     default-floating-position x=16 y=16 relative-to="bottom-right"
     focus-ring { off; }
@@ -886,6 +1073,9 @@ window-rule {
     shadow { off; }
 }
 NIRI_EOF
+}
+niri_rule | sed "s/@APP_ID@/$APP_ID/" \
+    | atomic_write "$CONF_DIR/niri-window-rule.kdl" 644
 # ONE autostart owner: systemd (if the user unit is actually enabled) OR
 # niri spawn-at-startup — never both. SYSTEMD_EDITOR says nothing about
 # whether systemd manages the app; check the real unit state instead.

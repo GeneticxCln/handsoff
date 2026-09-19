@@ -34,6 +34,28 @@ Sources: `install.sh`, `handsoff.py` (`main`, `_deployment_snapshot`,
    dropped only when empty-or-bytecode — never `rm -rf` a shared dir),
    `--uninstall --purge` (backs up config/state first).
 
+**One source per provisioned value.** A step that provisions something the app
+has already decided reads the app rather than repeating the decision:
+
+| step | read from | how |
+|---|---|---|
+| 4 whisper model | `settings.json` → `whisper_size` | `_resolve_whisper_size`; a size outside `settings_schema.WHISPER_SIZES` is refused with the list named |
+| 4 whisper revision | `HANDSOFF_WHISPER_REVISION` | env only — nothing in the app decides it |
+| 6 speech repo | `core/audio.py` → `TTS_REPO_ID` | `_app_constant` (`ast`, never an import: `handsoff.py` builds a QApplication) |
+| 7 app-id in the niri rule | `handsoff.py` → `APP_NAME` | same reader; the rule text takes `@APP_ID@` and `sed` substitutes it (an unquoted heredoc would treat `$"` as a locale expansion) |
+| 8 model | `settings.json` → `model` | `_read_setting` |
+| 8 server | `settings.json` → `ollama_host` | `_resolve_ollama_endpoint`, which mirrors the app's own remote rule: a non-loopback host is used only when `allow_remote_ollama` is **strictly** `true` in settings (or the send guard's env tokens), otherwise the script says so and checks loopback, because the bubble refuses that endpoint anyway |
+
+The reader is failure-tolerant by construction (missing file, missing key, an
+interpreter that will not answer): it prints nothing and the named `DEFAULT_*`
+fallback stands, so no state of the user's config can stop an install. Step 8
+points the `ollama` CLI at the same endpoint the app uses (`OLLAMA_HOST`) and
+never starts the local service for a remote host. Three literals that were
+provisioned twice are gone with it: a configured `whisper_size: small` used to
+have `tiny` downloaded and recorded in the manifest; a hardcoded loopback was
+probed, started and filled while the bubble talked to another server; and the
+speech repo name was a second copy of the one the app reads.
+
 ## 2. Deployment truth
 
 `_deployment_snapshot()` (`handsoff.py:758`) hashes running vs repo vs

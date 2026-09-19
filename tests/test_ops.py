@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -1222,6 +1223,73 @@ class TestInstallerPurgeBackup:
         assert not list(home.glob("handsoff-backup-*.tar.gz"))
 
 
+# ------------------------------- what install.sh provisions, and from where
+# install.sh decides five things the app has already decided: the whisper size
+# step 5 DOWNLOADS (the bubble loads `settings["whisper_size"]`), the model step
+# 8 pulls and judges, the server step 8 probes and fills, the speech repo step 6
+# primes, and the app-id the niri rule it writes has to match. Each of those was
+# a literal, and the literals drifted — `qwen3:8b` judged while the bubble ran
+# `gemma4:12b`, and piper → chatterbox renamed the repo a second copy of the
+# name would have kept priming. These helpers RUN the shipped resolvers against
+# fixture settings files instead of reading them out of the script, so a guard
+# cannot be satisfied by a comment that says the right thing.
+_INSTALLER_RESOLVERS = ("_read_setting", "_read_bool_setting", "_app_constant",
+                        "_resolve_whisper_size", "_resolve_ollama_endpoint")
+
+
+def _installer_source() -> str:
+    return (HERE / "install.sh").read_text(encoding="utf-8")
+
+
+def _installer_function(name: str) -> str:
+    """The shell function exactly as shipped, sliced by its own closing brace."""
+    lines = _installer_source().splitlines(keepends=True)
+    start = next(i for i, line in enumerate(lines)
+                 if line.startswith(f"{name}() {{"))
+    end = next(i for i in range(start + 1, len(lines))
+               if lines[i].startswith("}"))
+    return "".join(lines[start:end + 1])
+
+
+def _installer_assignment(name: str) -> str:
+    """The literal value of a top-level `NAME="..."` assignment."""
+    found = re.search(rf'^{re.escape(name)}="([^"]*)"', _installer_source(), re.M)
+    assert found, f"install.sh does not assign {name}"
+    return found.group(1)
+
+
+def _run_resolvers(body: str, home, settings=None, env=None, here=None) -> str:
+    """Run `body` with the shipped resolvers sourced and CONF_DIR in a scratch home.
+
+    `set -eu` on purpose: every resolver here is written to answer with a
+    default instead of failing, so a non-zero exit or an unset variable is a bug
+    in them rather than in the caller. HANDSOFF_ALLOW_REMOTE_OLLAMA is cleared
+    unless the test sets it, so the machine running the suite cannot decide what
+    these cases assert.
+    """
+    conf = Path(home) / ".config" / "handsoff"
+    conf.mkdir(parents=True, exist_ok=True)
+    if settings is not None:
+        (conf / "settings.json").write_text(json.dumps(settings),
+                                            encoding="utf-8")
+    lines = ["set -eu",
+             f'CONF_DIR="{conf}"',
+             f'PYBIN="{sys.executable}"',
+             f'HERE="{here or HERE}"']
+    for name in ("OLLAMA_DEFAULT", "DEFAULT_MODEL", "DEFAULT_WHISPER_SIZE",
+                 "DEFAULT_TTS_REPO", "DEFAULT_APP_ID"):
+        lines.append(f'{name}="{_installer_assignment(name)}"')
+    lines += [_installer_function(name) for name in _INSTALLER_RESOLVERS]
+    lines.append(body)
+    child = dict(os.environ)
+    child.pop("HANDSOFF_ALLOW_REMOTE_OLLAMA", None)
+    child.update(env or {})
+    out = subprocess.run(["bash", "-c", "\n".join(lines)], capture_output=True,
+                         text=True, env=child, cwd=str(home))
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
 class TestInstallerRehearsal:
     """The installer can exercise deployment without touching the host."""
 
@@ -1273,28 +1341,56 @@ class TestInstallerRehearsal:
         step 8 skips the ollama checks there, so the shipped resolver is
         extracted and RUN against a settings file instead of being read.
         """
-        source = (HERE / "install.sh").read_text(encoding="utf-8")
-        body = source[source.index("_configured_model() {"):]
-        body = body[:body.index("\n}\n") + 3]
-        conf = tmp_path / ".config" / "handsoff"
-        conf.mkdir(parents=True)
-        script = (f'CONF_DIR={conf!s}\nPYBIN="{sys.executable}"\n{body}\n'
-                  'printf "%s" "$(_configured_model)"\n')
-        (conf / "settings.json").write_text(json.dumps({"model": "gemma4:12b"}),
-                                            encoding="utf-8")
-        out = subprocess.run(["bash", "-c", script], capture_output=True,
-                             text=True)
-        assert out.returncode == 0, out.stderr
-        assert out.stdout == "gemma4:12b", out.stdout
+        body = 'printf "%s" "$(_read_setting model)"'
+        assert _run_resolvers(body, tmp_path,
+                              {"model": "gemma4:12b"}) == "gemma4:12b"
 
-        (conf / "settings.json").unlink()
-        out = subprocess.run(["bash", "-c", script], capture_output=True,
-                             text=True)
-        assert out.returncode == 0 and out.stdout == "", (
-            f"a missing settings file must leave the default in force: {out}")
-        assert "${HANDSOFF_MODEL:-$(_configured_model)}" in source, (
+        # No settings file, a corrupt one, and a key that is not a string all
+        # leave the shipped default in force, and that default is the app's.
+        for home, settings in ((tmp_path / "bare", None),
+                               (tmp_path / "corrupt", "{ not json"),
+                               (tmp_path / "num", {"model": None})):
+            if isinstance(settings, str):
+                conf = home / ".config" / "handsoff"
+                conf.mkdir(parents=True)
+                (conf / "settings.json").write_text(settings, encoding="utf-8")
+                assert _run_resolvers(body, home) == ""
+            else:
+                assert _run_resolvers(body, home, settings) == ""
+
+        source = _installer_source()
+        assert "${HANDSOFF_MODEL:-$(_read_setting model)}" in source, (
             "the configured model must be the primary source and the named "
             "default only the fallback")
+
+    def test_rehearsal_downloads_the_size_the_app_loads_and_records_it(
+            self, tmp_path):
+        """The end-to-end half: step 5 says 'small' and the manifest records it.
+
+        Rehearsal skips the ollama checks but not the whisper step, so a
+        settings file seeded before the run is the whole experiment: with the
+        old literal this line said 'tiny' for a bubble configured to load
+        'small', and the manifest then claimed a model the app never asked for.
+        """
+        conf = tmp_path / "rehearsal" / ".config" / "handsoff"
+        conf.mkdir(parents=True)
+        (conf / "settings.json").write_text(
+            json.dumps({"whisper_size": "small",
+                        "ollama_host": "http://box.lan:11434",
+                        "allow_remote_ollama": True}), encoding="utf-8")
+        result, root, sentinel = self._run(tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "Downloading whisper 'small' model" in result.stdout, result.stdout
+        assert "[8/8] Checking ollama (http://box.lan:11434)" in result.stdout, (
+            "step 8 must name the server the app is configured with")
+        assert not any(sentinel.iterdir())
+        manifest = json.loads(
+            (root / ".config" / "handsoff" / "deployment.json").read_text())
+        assert manifest["whisper_model"] == "small", (
+            "the manifest must record the model that was actually downloaded")
+        snippet = (root / ".config" / "handsoff" / "niri-window-rule.kdl").read_text()
+        assert "@APP_ID@" not in snippet, (
+            "the app-id placeholder must be substituted, not shipped raw")
 
     def _expected_shipped(self):
         """The set the installer must deliver, derived the way IT derives it.
@@ -1639,3 +1735,130 @@ class TestBoundedJobBuffer:
             time.sleep(0.05)
         assert jid not in tb._jobs, "job was never reaped"
         assert calls == [jid], calls
+
+
+class TestInstallerProvisionsWhatTheAppDecided:
+    """install.sh must not decide again what settings.json already decided.
+
+    One shape, five values: the whisper size step 5 downloads, the model step 8
+    pulls and judges, the server step 8 probes and fills, the speech repo step 6
+    primes, and the app-id the niri rule matches. Each was a literal here and
+    the app's own value elsewhere, and the literals had already drifted. The
+    fallbacks stay — a bare machine has no settings.json to read — so one test
+    below holds every one of them against the app's own default.
+    """
+
+    def test_the_whisper_size_it_downloads_is_the_size_the_app_loads(
+            self, tmp_path):
+        body = 'printf "%s" "$(_resolve_whisper_size)"'
+        assert _run_resolvers(body, tmp_path,
+                              {"whisper_size": "small"}) == "small"
+        # The knob still wins, for a machine being provisioned for a size its
+        # settings file does not carry yet.
+        assert _run_resolvers(body, tmp_path, {"whisper_size": "small"},
+                              env={"HANDSOFF_WHISPER": "base"}) == "base"
+        # A size the app would refuse is refused HERE, with the list named,
+        # instead of reaching faster-whisper as a repo that does not exist.
+        out = _run_resolvers(body, tmp_path / "junk", {"whisper_size": "huge"})
+        assert out.splitlines()[-1] == _installer_assignment("DEFAULT_WHISPER_SIZE")
+        assert "not a size this app accepts" in out, out
+        assert "WHISPER_SIZES" in out, out
+        # No settings at all: the default, which is the app's own default.
+        bare = _run_resolvers(body, tmp_path / "bare")
+        assert bare == _installer_assignment("DEFAULT_WHISPER_SIZE"), bare
+        # ...and the download step and the manifest both use that resolved
+        # value: a manifest naming a model nobody downloaded is the drift the
+        # doctor's deployment check then reports forever.
+        source = _installer_source()
+        assert "WHISPER_SIZE=\"$(_resolve_whisper_size)\"" in source
+        assert "Downloading whisper '$WHISPER_SIZE' model" in source
+        assert '"whisper_model": "$WHISPER_SIZE"' in source
+
+    def test_step_8_talks_to_the_server_the_app_is_configured_with(self, tmp_path):
+        body = ('_resolve_ollama_endpoint' + chr(10)
+                + 'printf "%s|%s" "$OLLAMA_HOST_URL" "$OLLAMA_REMOTE"')
+        default = _installer_assignment("OLLAMA_DEFAULT")
+        # A loopback server on a non-default port is used as written.
+        assert _run_resolvers(body, tmp_path,
+                              {"ollama_host": "http://127.0.0.1:11500"}) \
+            == "http://127.0.0.1:11500|0"
+        # A bare host:port gets the same scheme the app adds.
+        assert _run_resolvers(body, tmp_path / "bare",
+                              {"ollama_host": "box.lan:11434",
+                               "allow_remote_ollama": True}) == "http://box.lan:11434|1"
+        # A remote brain needs the app's opt-in, and the SETTINGS side of it is
+        # strict exactly as the app reads it (`is True`): a hand-edited string
+        # is not an opt-in, so provisioning that server would describe a bubble
+        # that refuses every request.
+        out = _run_resolvers(body, tmp_path / "string",
+                             {"ollama_host": "http://box.lan:11434",
+                              "allow_remote_ollama": "true"})
+        assert out.splitlines()[-1] == f"{default}|0", out
+        assert "allow_remote_ollama is off" in out, out
+        # ...and the environment token the send guard accepts is the fallback.
+        assert _run_resolvers(body, tmp_path / "env",
+                              {"ollama_host": "http://box.lan:11434"},
+                              env={"HANDSOFF_ALLOW_REMOTE_OLLAMA": "Yes"}) \
+            == "http://box.lan:11434|1"
+        # The failing case a user without either opt-in is in: the bubble
+        # refuses the remote host, so this script checks loopback instead.
+        assert _run_resolvers(body, tmp_path / "off",
+                              {"ollama_host": "http://box.lan:11434"}) \
+            .splitlines()[-1] == f"{default}|0"
+        # Wiring: step 8 uses the resolved endpoint, points the CLI at the same
+        # server (or `pull` fills one and `show` judges another), and reaches
+        # for the LOCAL service only when the endpoint IS local.
+        source = _installer_source()
+        assert 'curl -s --max-time 2 "$OLLAMA_HOST_URL/api/tags"' in source
+        assert 'OLLAMA_HOST="${OLLAMA_HOST_URL#*://}"' in source
+        assert 'export OLLAMA_HOST' in source
+        step8 = source[source.index("_resolve_ollama_endpoint" + chr(10)
+                                    + 'echo "==> [8/8]'):]
+        assert step8.index('"$OLLAMA_REMOTE" = "1"') \
+            < step8.index("HANDSOFF_NO_OLLAMA_SERVICE") \
+            < step8.index("sudo systemctl enable --now ollama"), (
+            "the remote branch must come before the branch that starts the "
+            "local service")
+
+    def test_the_speech_repo_it_primes_is_the_one_the_app_reads(self, tmp_path):
+        from conftest import core_module
+        audio = core_module("audio")
+        body = 'printf "%s" "$(_app_constant core/audio.py TTS_REPO_ID)"'
+        assert _run_resolvers(body, tmp_path) == audio.TTS_REPO_ID
+        # The proof that this READS the app rather than carrying a second copy:
+        # rename the constant in a copy of the module and the answer follows.
+        root = tmp_path / "app"
+        (root / "core").mkdir(parents=True)
+        original = (HERE / "core" / "audio.py").read_text(encoding="utf-8")
+        declared = f'TTS_REPO_ID = "{audio.TTS_REPO_ID}"'
+        assert declared in original, "the fixture does not contain the constant"
+        (root / "core" / "audio.py").write_text(
+            original.replace(declared, 'TTS_REPO_ID = "someone-else/renamed"'),
+            encoding="utf-8")
+        assert _run_resolvers(body, tmp_path / "mut", here=root) \
+            == "someone-else/renamed"
+        assert "$(_app_constant core/audio.py TTS_REPO_ID)" in _installer_source()
+
+    def test_the_window_rule_names_the_app_id_the_bubble_sets(self, tmp_path, H):
+        body = 'printf "%s" "$(_app_constant handsoff.py APP_NAME)"'
+        assert _run_resolvers(body, tmp_path) == H.APP_NAME
+        source = _installer_source()
+        assert 'match app-id=r#"^@APP_ID@$"#' in source, (
+            "the rule is written from the app-id the bubble sets")
+        assert "s/@APP_ID@/$APP_ID/" in source
+        assert 'match app-id=r#"^handsoff$"#' not in source, (
+            "the rule must not carry its own copy of the app-id")
+
+    def test_every_fallback_is_the_apps_own_default(self, H):
+        """A fallback that drifts is a machine provisioned for nobody's config."""
+        from settings_schema import DEFAULT_SETTINGS, WHISPER_SIZES
+        from conftest import core_module
+        assert _installer_assignment("DEFAULT_MODEL") == DEFAULT_SETTINGS["model"]
+        assert _installer_assignment("DEFAULT_WHISPER_SIZE") \
+            == DEFAULT_SETTINGS["whisper_size"]
+        assert _installer_assignment("DEFAULT_WHISPER_SIZE") in WHISPER_SIZES
+        assert _installer_assignment("OLLAMA_DEFAULT") \
+            == DEFAULT_SETTINGS["ollama_host"]
+        assert _installer_assignment("DEFAULT_TTS_REPO") \
+            == core_module("audio").TTS_REPO_ID
+        assert _installer_assignment("DEFAULT_APP_ID") == H.APP_NAME
