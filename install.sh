@@ -164,7 +164,17 @@ case "${1:-}" in
 esac
 
 WHISPER_SIZE="${HANDSOFF_WHISPER:-tiny}"
-OLLAMA_MODEL="${HANDSOFF_MODEL:-qwen3:8b}"
+# Which model step 8 judges and pulls. Resolved just below, once the interpreter
+# is known: the app reads its model from settings.json (`model` — see
+# `OLLAMA_MODEL = str(SETTINGS["model"])`), and the deployment default is only
+# the last resort. The monolith has no `HANDSOFF_MODEL` in its unit either, so a
+# machine that has been running a while has the user's choice on disk and the
+# hardcoded name is a model NOTHING loads: this machine's settings.json said
+# `gemma4:12b` while step 8 warned about `qwen3:8b`, and on a host that did not
+# already have that model the installer would have PULLED it (several GB) and
+# then judged its tool support — work about the wrong model, reported to a user
+# who never chose it.
+OLLAMA_MODEL=""
 # Speech engine weights. chatterbox-turbo replaced Piper, so this is a
 # Hugging Face repo (a directory of safetensors) rather than a single .onnx
 # voice file. huggingface_hub fetches content-addressed blobs and verifies
@@ -173,6 +183,25 @@ TTS_REPO="${HANDSOFF_TTS_REPO:-ResembleAI/chatterbox-turbo}"
 # ponytail: resolve once; venv's python3 shadows system when activated.
 PYBIN="${HANDSOFF_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
 WHISPER_REVISION="${HANDSOFF_WHISPER_REVISION:-main}"
+
+# The model the app is actually configured with, read from the same file the app
+# reads. Every failure (no file yet, no key, an interpreter that will not answer)
+# prints nothing and leaves the default below in force, so a first install on a
+# bare machine still has a model to pull and nothing here can stop the install.
+_configured_model() {
+    "$PYBIN" - "$CONF_DIR/settings.json" <<'PY_EOF' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        value = json.load(fh).get("model")
+except Exception:
+    value = None
+if isinstance(value, str) and value.strip():
+    sys.stdout.write(value.strip())
+PY_EOF
+}
+OLLAMA_MODEL="${HANDSOFF_MODEL:-$(_configured_model)}"
+[ -n "$OLLAMA_MODEL" ] || OLLAMA_MODEL="qwen3:8b"
 
 if [ "${1:-}" = "--uninstall" ]; then
     echo "==> Uninstalling handsoff"

@@ -1261,6 +1261,41 @@ class TestInstallerRehearsal:
         snippet = root / ".config" / "handsoff" / "niri-window-rule.kdl"
         assert "window-rule" in snippet.read_text()
 
+    def test_the_model_the_installer_judges_is_the_one_the_app_uses(
+            self, tmp_path):
+        """Step 8 must judge the CONFIGURED model, not the deployment default.
+
+        The app reads `SETTINGS["model"]` out of settings.json and its unit sets
+        no HANDSOFF_MODEL, so on a machine that has been running, the hardcoded
+        default names a model NOTHING loads — the installer warned about
+        `qwen3:8b` (and would have pulled its several GB on a host without it)
+        while the bubble ran `gemma4:12b`. Rehearsal cannot show this, because
+        step 8 skips the ollama checks there, so the shipped resolver is
+        extracted and RUN against a settings file instead of being read.
+        """
+        source = (HERE / "install.sh").read_text(encoding="utf-8")
+        body = source[source.index("_configured_model() {"):]
+        body = body[:body.index("\n}\n") + 3]
+        conf = tmp_path / ".config" / "handsoff"
+        conf.mkdir(parents=True)
+        script = (f'CONF_DIR={conf!s}\nPYBIN="{sys.executable}"\n{body}\n'
+                  'printf "%s" "$(_configured_model)"\n')
+        (conf / "settings.json").write_text(json.dumps({"model": "gemma4:12b"}),
+                                            encoding="utf-8")
+        out = subprocess.run(["bash", "-c", script], capture_output=True,
+                             text=True)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout == "gemma4:12b", out.stdout
+
+        (conf / "settings.json").unlink()
+        out = subprocess.run(["bash", "-c", script], capture_output=True,
+                             text=True)
+        assert out.returncode == 0 and out.stdout == "", (
+            f"a missing settings file must leave the default in force: {out}")
+        assert "${HANDSOFF_MODEL:-$(_configured_model)}" in source, (
+            "the configured model must be the primary source and the named "
+            "default only the fallback")
+
     def _expected_shipped(self):
         """The set the installer must deliver, derived the way IT derives it.
 
