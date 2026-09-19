@@ -2709,6 +2709,76 @@ class TestTheScansShapesAreCheckedProperties:
                  if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
         return reads - local, bound
 
+    @staticmethod
+    def _target_into(target, out) -> None:
+        """`for a, (b, c) in …`, starred targets and comprehensions, one walker."""
+        if isinstance(target, ast.Name):
+            out.add(target.id)
+        elif isinstance(target, ast.Starred):
+            TestTheScansShapesAreCheckedProperties._target_into(target.value, out)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for el in target.elts:
+                TestTheScansShapesAreCheckedProperties._target_into(el, out)
+
+    @classmethod
+    def _loop_targets(cls, loop) -> set:
+        """Names the loop binds through its OWN target: `for action, x in …`.
+
+        Not an assignment inside the body, and missing it was a real hole in
+        the first version of this rule: every closure reading the ITEM variable
+        — the most ordinary thing a loop closure does — looked bound-and-safe.
+        """
+        out: set = set()
+        if isinstance(loop, (ast.For, ast.AsyncFor)):
+            cls._target_into(loop.target, out)
+        return out
+
+    @classmethod
+    def _closure_offenders(cls, tree, label) -> tuple:
+        """(closures seen, offenders) — the rule, so every caller judges alike.
+
+        Two scopes, because they are the same mistake: a loop that rebinds a
+        name a nested `def`/`lambda` reads (through its target or in its body),
+        and a COMPREHENSION whose variable a closure inside it reads —
+        `[lambda: i for i in …]`, where `i` is rebound per element.
+        """
+        scanned, offenders = 0, []
+        closures = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+        for scope in ast.walk(tree):
+            if isinstance(scope, (ast.For, ast.AsyncFor, ast.While)):
+                rebound = cls._assigned_in(scope) | cls._loop_targets(scope)
+            elif isinstance(scope, (ast.ListComp, ast.SetComp, ast.DictComp,
+                                    ast.GeneratorExp)):
+                rebound = set()
+                for gen in scope.generators:
+                    cls._target_into(gen.target, rebound)
+            else:
+                continue
+            if not rebound:
+                continue
+            for fn in [n for n in ast.walk(scope) if isinstance(n, closures)]:
+                scanned += 1
+                reads, bound = cls._reads_and_defaults(fn)
+                leaked = sorted((reads & rebound) - bound)
+                if leaked:
+                    offenders.append(
+                        (fn.lineno,
+                         f"{label}:{fn.lineno} "
+                         f"{getattr(fn, 'name', '<lambda>')}() reads {leaked}"))
+        return scanned, offenders
+
+    #: A sample the rule MUST refuse: one shape per scope it claims to cover.
+    #: Asserted below, because a rule that has gone blind reports a clean tree
+    #: — which is indistinguishable from a clean tree.
+    CLOSURE_SAMPLE = (
+        "for item, extra in CASES:\n"          # through the loop's TARGET
+        "    lambda: item\n"
+        "    stored = lambda: extra\n"
+        "for _ in range(3):\n"                 # bound in the BODY
+        "    box = {}\n"
+        "    lambda: box\n"
+        "[lambda: i for i in range(3)]\n")     # through a COMPREHENSION
+
     def test_a_worker_defined_in_a_loop_binds_what_it_reads(self):
         """A nested def in a loop must bind the loop's names at DEFINITION time.
 
@@ -2720,25 +2790,23 @@ class TestTheScansShapesAreCheckedProperties:
         writing `def _work(_rec=rec, _gen=gen, …)`. Binding is a one-line fix
         and an invisible one, which is exactly why it is checked here.
         """
+        seen, planted = self._closure_offenders(
+            ast.parse(self.CLOSURE_SAMPLE), "<sample>")
+        # The exact LINES, not a count: a count of 3 is satisfied by the two
+        # body shapes alone, which is how the first version of this assertion
+        # let a rule go blind to comprehensions and still pass (measured
+        # 2026-09-19 — the mutation that disabled that branch stayed green).
+        assert seen == 4 and [ln for ln, _ in planted] == [2, 3, 6, 7], (
+            "the rule no longer sees every shape it claims to cover — a blind "
+            "sweep reports a clean tree, which is indistinguishable from one: "
+            f"seen={seen} offenders={planted}")
+
         scanned, offenders = 0, []
         for path in self._shipped():
             tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
-            for loop in ast.walk(tree):
-                if not isinstance(loop, (ast.For, ast.AsyncFor, ast.While)):
-                    continue
-                rebound = self._assigned_in(loop)
-                if not rebound:
-                    continue
-                for fn in [n for n in ast.walk(loop)
-                           if isinstance(n, (ast.FunctionDef,
-                                             ast.AsyncFunctionDef))]:
-                    scanned += 1
-                    reads, bound = self._reads_and_defaults(fn)
-                    leaked = sorted((reads & rebound) - bound)
-                    if leaked:
-                        offenders.append(
-                            f"{path.relative_to(HERE)}:{fn.lineno} "
-                            f"{fn.name}() reads {leaked} from the loop")
+            found, bad = self._closure_offenders(tree, str(path.relative_to(HERE)))
+            scanned += found
+            offenders += [msg for _ln, msg in bad]
         assert scanned >= 3, (
             f"only {scanned} nested def(s) inside a loop found — the subjects "
             "are the PTT worker and the two brain workers, so a sweep that "
@@ -2747,3 +2815,30 @@ class TestTheScansShapesAreCheckedProperties:
             "a function defined inside a loop reads a name the loop rebinds, "
             "unbound: it will see whichever object the next pass put there — "
             "bind it as a default (def f(x=x)):\n" + "\n".join(offenders))
+
+    def test_the_suite_holds_itself_to_the_worker_binding_rule(self):
+        """The tests get the same rule. A fixture or a lambda handed to a
+        thread reads the name too, and a suite that leaks state across its own
+        cases is how an ORDER dependency gets born — this repository has fixed
+        two of those already (the announce worker, the queued command).
+
+        Swept today: 0 offenders in 9 closures inside loops, and the nine are
+        safe for reasons that are checkable rather than assumed — a lambda
+        reading nothing from the loop, a lambda with the name already bound as
+        a default, and one reading `idle`/`queue`, which the loop does not
+        rebind. That is the point of pinning it: the next one is one line.
+        """
+        scanned, offenders = 0, []
+        for path in sorted((HERE / "tests").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            found, bad = self._closure_offenders(tree, f"tests/{path.name}")
+            scanned += found
+            offenders += [msg for _ln, msg in bad]
+        assert scanned >= 9, (
+            f"only {scanned} closure(s) inside a loop found in the suite — "
+            "there are 9 today, so a sweep that finds fewer has lost its "
+            "subject and must not report a pass")
+        assert not offenders, (
+            "a closure defined inside a loop in the SUITE reads a name the "
+            "loop rebinds, unbound — a leak or an order dependency waiting for "
+            "a shuffle to expose it:\n" + "\n".join(offenders))

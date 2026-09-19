@@ -1233,3 +1233,52 @@ mutation behind them because nothing at runtime can observe a type hint; and the
 journal evidence is from this machine's session on 2026-09-18, so the "slow to
 finish" window it documents is the shape that was fixed, not a reproduction of a
 lost turn.
+
+## The closure rule turned inward: the suite, and the two shapes the rule could not see (2026-09-19)
+
+The rule written in the previous round swept the SHIPPED source. The obvious
+next question is whether it holds for the thing that runs it, and answering that
+found more wrong with the RULE than with the suite.
+
+**The suite is clean, and that is a measured statement rather than an
+assumption.** 33 test files, 548 loops, and 9 closures defined inside a loop. All
+nine read nothing the loop rebinds, or have it bound already: three
+`slot.commit(lambda key: None)` lambdas that read nothing at all, two
+`_idle_release` lambdas reading `idle`/`queue` (rebound nowhere — the loop binds
+`call`), a `_confirm_handsfree` lambda whose `seen` is now bound at definition
+(this round's predecessor), `hook=lambda reason, a=answer: a`, and a
+`lambda enabled: None` reading only its own parameter. The rule reports 0
+offenders, and the sweep's own subject count is pinned (`scanned >= 9`) so a rule
+that quietly stops finding the nine cannot pass as a clean suite.
+
+**But two shapes were invisible to it, and both are the shape it exists for.**
+
+1. **A loop's own TARGET was never counted as a rebinding.** `rebound` came from
+   `_assigned_in(loop)` — assignments in the BODY — so `for action, expected in
+   CASES:` bound nothing the rule knew about, and a closure reading the ITEM
+   variable, the most ordinary thing a loop closure does, looked safe. Every
+   `for x in …` in the tree was exempt. This is exactly the shape my own
+   throwaway sweep had, and the reason the first `0 hits` it printed was not
+   trustworthy until a planted sample proved it could see anything at all.
+2. **Comprehension scopes were not scopes.** `[lambda: i for i in range(3)]` is
+   the classic late-binding error — `i` is rebound per element — and the rule
+   walked past it because a comprehension is not a `for` statement.
+
+Both are fixed, and the fix is pinned by a **planted sample**, one shape per
+scope, whose exact offender LINES are asserted rather than their count: a count
+would have been satisfied by the two body shapes while the comprehension branch
+sat disabled. That was not hypothetical either — the first version of this very
+assertion let a mutation disabling the comprehension branch stay GREEN (measured
+2026-09-19), which is the same class of mistake the rule is about: a check that
+cannot fail is not a check.
+
+**Teeth: 4/4 mutations caught, 0 missed, every restore verified green** — the
+shipped brain worker unbound again; a SUITE lambda reading the loop's `seen`
+unbound again (the case that motivated the sweep); the rule reverted to body-only
+rebinding; and the comprehension branch disabled.
+
+**Stated limits:** the rule is lexical, so it judges a closure by the names in
+its source, not by whether it actually outlives its iteration — a `def` called
+immediately inside the loop is flagged too, which is the safe direction and is
+why the shipped tree's three subjects are bound rather than exempted; and the
+suite sweep covers `tests/*.py` only, not the two harness modules in `ci/`.

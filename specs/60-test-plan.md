@@ -16,7 +16,7 @@ nothing — a missing row does.
 | File | `test_*` fns | Area |
 |---|---|---|
 | `test_audio.py` | 200 | Recorder, resample, whisper/TTS seams, levels, playback cancel |
-| `test_regression.py` | 152 | cross-cutting pins: prompt text, tool census, marker, restart internals, source-shape properties (loader rollbacks, leased slots, loop-bound workers) — was a rotted 144 against a real 147 |
+| `test_regression.py` | 153 | cross-cutting pins: prompt text, tool census, marker, restart internals, source-shape properties (loader rollbacks, leased slots, loop-bound workers — the rule applied to the shipped source AND to this suite, with a planted sample so a rule that goes blind cannot report a clean tree) — was a rotted 144 against a real 147 |
 | `test_desktop.py` | 119 | niri/typing/windows/clipboard/screens, guards |
 | `test_policy.py` | 100 | DecisionPolicy, gates, confirm flow, whitelist/blocked |
 | `test_design_packs.py` | 99 | packs, image design, palettes, ink guard, and the animation bounds a non-finite fps cannot pass |
