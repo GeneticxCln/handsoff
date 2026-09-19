@@ -282,3 +282,23 @@ class TestSelfMuteIsWholeWord:
         assert self._muted("slack", "", "prehandsoff work") is False
         assert self._muted("slack", "assistant manager update",
                            app_name="assist") is False
+
+    def test_an_unreadable_mute_list_stays_muted(self):
+        """A check that cannot run must not read the notification aloud.
+
+        The outer `except Exception` returned False — "not muted" — so a mute
+        list that could not be evaluated was indistinguishable from no mute
+        list, and the notification the user had silenced got spoken. Failing
+        toward silence is the only direction consistent with the list's purpose.
+        """
+        class Exploding:
+            def __bool__(self):
+                return True
+
+            def __str__(self):
+                raise RuntimeError("unrepresentable entry")
+
+        from core import assistant as assist_mod
+        assert assist_mod.notification_muted(
+            "Slack", "build failed", "",
+            mute_apps=[Exploding()], app_name="handsoff") is True

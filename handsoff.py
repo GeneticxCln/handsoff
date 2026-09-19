@@ -1051,8 +1051,16 @@ def _speech_yield_state(free_mb) -> dict:
         return state
     # Read from the CACHE only: doctor must not start an HTTP call (a wedged
     # Ollama would add seconds to it) and the turn path is what fills this in.
-    claim = (_llm_footprint["mb"]
-             if _llm_footprint["model"] == OLLAMA_MODEL else None)
+    # `need_mb` when a turn has recorded one, because that is what the turn will
+    # actually ask the card for — a resident model's unmet remainder, not its
+    # whole blob — and a doctor that weighed the blob would disagree with the
+    # decision it is describing. `mb` is the fallback: a size read but no
+    # residency yet means the fresh-load footprint is the best available claim.
+    claim = None
+    if _llm_footprint.get("model") == OLLAMA_MODEL:
+        claim = _llm_footprint.get("need_mb")
+        if claim is None:
+            claim = _llm_footprint.get("mb")
     state["claim_mb"] = claim
     if claim is None:
         state["note"] = ("the LLM's size has not been read yet — a turn reads "
@@ -1063,6 +1071,46 @@ def _speech_yield_state(free_mb) -> dict:
     state["would_yield"] = bool(verdict["yield"])
     state["note"] = verdict["note"]
     return state
+
+
+def _brain_fit_note(total_mb) -> str:
+    """One line: can the configured model ever be ON this card?
+
+    The question nothing else in the diagnostics asks, and the one that decides
+    whether a turn takes seconds or minutes. `brain:` says reachable, `llm
+    memory:` describes the release policy, and `gpu headroom:` counts the
+    card's free bytes — a model too large for all of them simply runs on CPU,
+    and the only symptom is latency. Measured 2026-09-18: `qwen3.8:27b` at
+    17.7 GB on a 16.0 GB card, 7 min 49 s from key release to spoken reply, and
+    10 s for the same turn after the model was changed to a 7.6 GB one.
+
+    "" when either number is unknown: nothing measured, nothing claimed — the
+    same rule the release verdict follows.
+    """
+    try:
+        claim = _llm_footprint_mb()
+    except Exception:
+        log.debug("llm footprint unreadable for the fit line", exc_info=True)
+        claim = None
+    try:
+        total = int(total_mb or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if not claim or not total:
+        return ""
+    gb, card = claim / 1024.0, total / 1024.0
+    if claim <= total * 0.75:
+        return (f"brain fit: {OLLAMA_MODEL} needs {gb:.1f} GB of the card's "
+                f"{card:.1f} GB, leaving room for the speech models — turns "
+                f"stay on the GPU")
+    if claim <= total * 0.95:
+        return (f"brain fit: {OLLAMA_MODEL} needs {gb:.1f} GB of the card's "
+                f"{card:.1f} GB — the model fits, but little is left for "
+                f"speech and whisper, so a turn may have to wait for them")
+    return (f"brain fit: {OLLAMA_MODEL} needs {gb:.1f} GB but the card has "
+            f"{card:.1f} GB — it can NEVER be fully offloaded, so turns run "
+            f"partly on the CPU and take MINUTES, not seconds: choose a "
+            f"smaller model (Settings → Brain)")
 
 
 def _gpu_headroom_lines() -> list:
@@ -1134,7 +1182,10 @@ def _gpu_headroom_lines() -> list:
         else:
             line += (f"; the speech model keeps its {held_gb:.1f} GB — "
                      f"{ask['note']}")
-    return [line]
+    # ...and the one question the rest of the diagnostics never ask: whether
+    # the configured model fits this card at all.
+    fit = _brain_fit_note(total)
+    return [line, fit] if fit else [line]
 
 
 def _deployment_snapshot() -> dict:
@@ -2514,7 +2565,10 @@ def _resident_llm() -> "dict | None":
 # does not change between two questions; a failed read is cached too, so a
 # wedged Ollama is asked once per window rather than once per turn.
 _LLM_FOOTPRINT_SECONDS = 600.0
-_llm_footprint = {"model": "", "mb": None, "at": 0.0}
+# `mb` is the model's whole blob (the fresh-load footprint the doctor's fit line
+# asks about); `need_mb` is what a TURN still has to find room for, which counts
+# the part Ollama already has resident. Both belong to `model`.
+_llm_footprint = {"model": "", "mb": None, "need_mb": None, "at": 0.0}
 
 
 def _llm_footprint_mb() -> "int | None":
@@ -2541,8 +2595,42 @@ def _llm_footprint_mb() -> "int | None":
         except Exception:
             log.debug("ollama model size probe failed", exc_info=True)
             mb = None
-    _llm_footprint.update({"model": OLLAMA_MODEL, "mb": mb, "at": now})
+    # A fresh-load read cannot see the split, so the need starts as the whole
+    # footprint; `_llm_need_mb` narrows it the moment residency is consulted.
+    _llm_footprint.update({"model": OLLAMA_MODEL, "mb": mb, "need_mb": mb,
+                           "at": now})
     return mb
+
+
+def _llm_need_mb(resident) -> "int | None":
+    """What a turn still has to find room for, counting what is already loaded.
+
+    `/api/tags` prices the model as if a turn loaded it from nothing. That is
+    the right number for "can this model EVER be on this card" (the doctor's
+    fit line) and the WRONG one for a turn, because Ollama keeps the model
+    resident between questions: the memory it already holds is inside the
+    driver's free reading, so asking for the whole footprint again weighs a
+    turn for memory that is already there. Measured 2026-09-18: gemma4:12b
+    fully resident on the card (8.0 GB of it) while every turn logged a
+    `7207 MB claim` that could not fit, and the verdict then claimed the turn
+    "needed the card" when nothing needed to be loaded at all.
+
+    `size - size_vram` is exactly the part of the model that is NOT on the card:
+    zero when it is entirely resident (the turn loads nothing), the offloaded
+    remainder when Ollama has split it. Unknown residency (None, or a reading
+    that carries no sizes) falls back to the fresh-load footprint, so a bundle
+    that cannot ask /api/ps keeps the old behaviour rather than claiming zero.
+    """
+    if isinstance(resident, dict) and resident.get("loaded"):
+        size, vram = resident.get("size"), resident.get("size_vram")
+        if size is None or vram is None:
+            return _llm_footprint_mb()
+        missing_gib = max(0.0, float(size) - float(vram))
+        need = int(math.ceil(missing_gib * 1024.0))
+        if _llm_footprint["model"] == OLLAMA_MODEL:
+            _llm_footprint["need_mb"] = need
+        return need
+    return _llm_footprint_mb()
 
 
 def _llm_release_verdict() -> dict:
@@ -2703,7 +2791,21 @@ def _free_the_card_for_the_llm(reason: str = "") -> dict:
     # the same number is then the baseline the gain is measured against, so the
     # journal's "what came back" belongs to the arithmetic that asked.
     free = _free_vram_now()
-    verdict = _audio.yield_to_llm_verdict(free, _llm_footprint_mb(), held_mb=held)
+    # What is ALREADY loaded decides what this turn is asking for. Asked of
+    # Ollama once, here, so the arithmetic and the residency fact come from the
+    # same reading: a model entirely on the card needs no room, and weighing the
+    # whole blob instead made a resident model look like a claim the card had to
+    # find from scratch (measured 2026-09-18: 7207 MB "claim" refused on every
+    # turn while the model sat resident, and a turn that loaded nothing was
+    # reported as one the card refused).
+    resident = _resident_llm()
+    need = _llm_need_mb(resident)
+    if isinstance(resident, dict) and resident.get("loaded") and need == 0:
+        detail = ("the LLM is already on the card in full, so this turn loads "
+                  "nothing and the voice was left alone")
+        log.debug("turn card check: %s", detail)
+        return {"gave_way": False, "freed_mb": None, "detail": detail}
+    verdict = _audio.yield_to_llm_verdict(free, need, held_mb=held)
     if not verdict["yield"]:
         if verdict.get("tight"):
             log.info("the turn needed the card and the models stayed — %s",
@@ -2711,14 +2813,6 @@ def _free_the_card_for_the_llm(reason: str = "") -> dict:
         else:
             log.debug("turn card check: %s", verdict["note"])
         return {"gave_way": False, "freed_mb": None, "detail": verdict["note"]}
-    # Only now is it worth asking Ollama what is loaded: a model that is already
-    # resident means this turn loads nothing and the voice must not be spent.
-    resident = _resident_llm()
-    if resident is not None and resident.get("loaded"):
-        detail = (f"the LLM is already on the card, so the turn will not load "
-                  f"it ({verdict['note']})")
-        log.info("the turn needed the card and the models stayed — %s", detail)
-        return {"gave_way": False, "freed_mb": None, "detail": detail}
     if not _ANNOUNCE_LOCK.acquire(blocking=False):
         detail = ("something is speaking, so the speech model was left alone "
                   "(the next turn can ask)")
@@ -3240,12 +3334,43 @@ class _SentenceQueue(queue.Queue):
     Everything after it is generation the user is already hearing, which is why
     the probe listens here instead of timing the whole call — a long answer must
     not be mistaken for a slow reload and talk the policy into keeping memory.
+
+    `producer_alive` is the streaming thread's liveness, set by the turn that
+    starts it. The consumer (`_speak`) waits for a terminator that only the
+    producer can send, so "is the producer still there?" belongs with the queue
+    that travels between them rather than as a second parameter on `_speak` —
+    the queue already carries this call's identity, and a plain `queue.Queue`
+    from any other caller simply answers None (no watchdog).
     """
+
+    producer_alive: "callable | None" = None
 
     def put(self, item, *args, **kwargs):
         if item is not None:            # None is the end-of-stream terminator
             _finish_llm_reload_probe()
         return super().put(item, *args, **kwargs)
+
+
+def _producer_still_here(producer_alive) -> bool:
+    """The streaming producer's own liveness, with "unknown" as "still here".
+
+    The consumer side of `_SentenceQueue`: `_speak` waits for a terminator only
+    the producer can send, and this is how it learns that nobody is going to.
+
+    A probe that raises answers "still here": the terminator is guaranteed by
+    core.brain, so this guard is the second, independent net — and a net that
+    fired on an unreadable answer would cut a reply short, which is exactly the
+    failure it exists to prevent. Callable-less queues (any plain queue.Queue
+    from another caller) also answer "still here": no watchdog was offered, so
+    none is applied.
+    """
+    if not callable(producer_alive):
+        return True
+    try:
+        return bool(producer_alive())
+    except Exception:
+        log.debug("producer liveness probe failed", exc_info=True)
+        return True
 
 
 # ------------------------------------------------------------------------ audio in
@@ -6379,6 +6504,25 @@ class Assistant(QObject):
         SETTINGS.clear()
         SETTINGS.update(new)
         reload_derived_settings()
+        # The tool belt holds its OWN permissions dict (a private copy made at
+        # construction), and `SETTINGS.update(new)` above REPLACES
+        # SETTINGS["permissions"] with a new object — so without this re-point
+        # the belt went on gating every call with the permissions this process
+        # started with. Both directions were wrong: disabling a tool mid-session
+        # left its gate open, and enabling one kept answering "REFUSED: the 'x'
+        # tool is disabled in handsoff settings" until a restart. The reload is
+        # the one channel a permission change arrives through (the settings app
+        # writes settings.json and asks for reload-settings), so this is the one
+        # place it has to be applied. The tool LIST was already filtered from
+        # the live dict, which is exactly how the two came to disagree.
+        # `getattr` twice on purpose: a partially-built Assistant (a test, an
+        # embedder) has no belt, and a settings reload that raised here would
+        # leave SETTINGS already replaced and everything after it unapplied —
+        # a half-applied reload is worse than a reload that skips one step.
+        belt = getattr(self, "_tools", None)
+        refresh_perms = getattr(belt, "set_permissions", None)
+        if callable(refresh_perms):
+            refresh_perms(SETTINGS.get("permissions"))
         # Both copies go under `_model_cache_lock`, the same lock the mirror
         # uses: dropping one side while a transcribe/get_tts call is between
         # its push and its load is how a dropped model came back and stayed.
@@ -6747,6 +6891,20 @@ class Assistant(QObject):
         today = datetime.date.today().isoformat()
         if self._briefing_done_date == today:
             return ""
+        # The in-memory stamp is not enough on its own: `--ptt reload-settings`
+        # (and the Settings app's live apply) builds a fresh Assistant, which
+        # re-armed the greeting — measured 2026-09-18, delivered at 21:17,
+        # 21:24 and 21:35, each one a reload apart. The stamp that survives a
+        # reload is the one `_mark_briefing_delivered()` already writes into
+        # the mic-events file.
+        stamp = _load_mic_events().get("last_briefing")
+        if isinstance(stamp, (int, float)):
+            try:
+                if datetime.date.fromtimestamp(stamp).isoformat() == today:
+                    self._briefing_done_date = today   # remember it too
+                    return ""
+            except (OverflowError, OSError, ValueError):
+                pass
         low = text.strip().lower()
         if low.startswith(self._BRIEFING_SKIP_PREFIXES):
             return ""   # a command, not a greeting — don't hijack it
@@ -6833,6 +6991,11 @@ class Assistant(QObject):
         if set_turn is not None:
             set_turn(gen)
         conversation = self._conversation_for(text)
+        # Where this turn's OWN messages begin in `conversation`: everything
+        # after the history it was built from. Publishing is by append (below),
+        # so this is what keeps a late turn from rewriting history it does not
+        # own.
+        hist_at_entry = len(getattr(self, "_history", None) or [])
         self._turn_spoke = False
         for _round in range(MAX_TOOL_ROUNDS):
             if cancel.is_set():
@@ -6849,13 +7012,21 @@ class Assistant(QObject):
                     try:
                         turn.result = ollama_chat_stream(
                             conversation, turn.sentence_q, turn.cancel, tools)
-                    except RuntimeError as e:
-                        turn.result = {"tool_calls": [], "content": "", "error": str(e)}
+                    except Exception as e:
+                        # NOT just RuntimeError: an IncompleteRead, a socket
+                        # timeout or an OOM-killed Ollama raised something else
+                        # and escaped with `turn.result` still None, so the
+                        # turn ended as a silent empty answer instead of the
+                        # apology the RuntimeError path speaks.
+                        log.exception("streaming brain call failed")
+                        turn.result = {"tool_calls": [], "content": "",
+                                       "error": f"{type(e).__name__}: {e}"}
                     finally:
                         turn.done.set()
 
                 streamer = threading.Thread(target=_run_stream, daemon=True)
                 streamer.start()
+                turn.sentence_q.producer_alive = streamer.is_alive
                 self._speak(None, gen, cancel, sentence_q=turn.sentence_q)
                 streamer.join(timeout=2.0)
                 if streamer.is_alive():
@@ -6891,7 +7062,12 @@ class Assistant(QObject):
                 def _run_call() -> None:
                     try:
                         box["msg"] = ollama_chat(conversation, tools)
-                    except RuntimeError as e:
+                    except Exception as e:
+                        # Same asymmetry the streaming path had: only
+                        # RuntimeError was caught, so anything else escaped the
+                        # daemon thread, left `box` empty and made a dead turn
+                        # look like an empty reply.
+                        log.exception("brain call failed")
                         box["err"] = e
 
                 _t = threading.Thread(target=_run_call, name="brain-call",
@@ -6949,29 +7125,41 @@ class Assistant(QObject):
                     break
             if stop_tool_loop:
                 break
-        # only THIS turn may publish history: a newer utterance owns the
-        # assistant's memory once it has started (its own pipeline will write)
-        if gen == self._gen:
-            msgs = [m for m in conversation[1:] if m.get("role") != "system"]
-            # ^ drop the main system prompt [1:]; the facts/hardware block is
-            # injected fresh by _conversation_for on every turn — persisting it
-            # would accumulate one stale copy per turn (token bloat, broken
-            # KV-cache prefix, and a superseded fact could win), so the turn's
-            # user message is stored without it.
-            injected = getattr(self, "_turn_injected", "")
-            if injected:
-                for index, message in enumerate(msgs):
-                    content = str(message.get("content") or "")
-                    if (message.get("role") == "user"
-                            and content.startswith(injected)):
-                        msgs[index] = {**message,
-                                       "content": content[len(injected):].lstrip("\n")}
-                        break
-            self._history = _trim_history(msgs)
-            _strip_images(self._history)   # screenshots: this turn's model call only
+        # A COMPLETED turn is published, even when a newer utterance has since
+        # started. The old rule — "only the current generation may write" —
+        # handed ownership to an utterance that may never write at all: an
+        # ignored hands-free capture or a clipped PTT press bumps the
+        # generation and then produces nothing, so every answered turn before
+        # it was thrown away. Measured 2026-09-18: `history.json` froze at
+        # 2026-09-17T13:28 across three answered turns while hands-free
+        # captures climbed gen 9 → 30, the bubble forgot each exchange, and the
+        # daily briefing re-greeted because the file it reads never changed.
+        # Publishing ONLY this turn's own messages is what makes a late write
+        # safe: the whole-history rewrite a current-generation turn used to do
+        # would clobber whatever a superseded turn had just appended.
+        # The facts/hardware block is injected fresh by _conversation_for on
+        # every turn — persisting it would accumulate one stale copy per turn
+        # (token bloat, broken KV-cache prefix, a superseded fact could win),
+        # so the turn's user message is stored without it.
+        fresh = [m for m in conversation[1 + hist_at_entry:]
+                 if m.get("role") != "system"]
+        injected = getattr(self, "_turn_injected", "")
+        if injected:
+            for index, message in enumerate(fresh):
+                content = str(message.get("content") or "")
+                if (message.get("role") == "user"
+                        and content.startswith(injected)):
+                    fresh[index] = {**message,
+                                    "content": content[len(injected):].lstrip("\n")}
+                    break
+        if fresh:
+            _strip_images(fresh)   # screenshots: this turn's model call only
+            _seal_tool_calls(fresh)  # no unanswered call may enter the prefix
+            self._history = _trim_history(self._history + fresh)
             self._save_history()
-        else:
-            log.info("turn superseded at history-write; discarding")
+            if gen != self._gen:
+                log.info("turn superseded at history-write; kept its %d "
+                         "message(s)", len(fresh))
 
     # -- speaking -----------------------------------------------------------------
 
@@ -6979,6 +7167,12 @@ class Assistant(QObject):
                sentence_q: "queue.Queue[str | None] | None" = None) -> None:
         """Speak `text` now. With a sentence queue: speak each sentence as it
         arrives (streaming TTS — playback starts while the model still writes).
+
+        This loop is a consumer waiting for a terminator the PRODUCER owes it,
+        so it also watches the producer: an empty queue whose owner is gone ends
+        the loop with what already arrived. (The terminator itself is now
+        guaranteed — see core.brain.ollama_chat_stream — so this is the second,
+        independent guard rather than the only one.)
 
         ONE speech serializer: every playback (brain streaming/non-streaming,
         timers, snooze, say_now, crash/missed) funnels through _ANNOUNCE_LOCK
@@ -7027,13 +7221,33 @@ class Assistant(QObject):
                 log.info("follow-up window open for %ss", window)
             return
         said: list[str] = []
+        # The streaming queue carries its producer's liveness (see
+        # _SentenceQueue): the consumer holds no other way to learn that no
+        # terminator is coming, and blocking on that is how a turn used to hang
+        # — the doctor showed `thinking`, nothing was ever spoken, and only a
+        # manual barge-in ended it.
+        producer_alive = getattr(sentence_q, "producer_alive", None)
         while True:
             try:
                 sentence = sentence_q.get(timeout=0.5)
             except queue.Empty:
                 if cancel.is_set():
                     return
-                continue
+                if _producer_still_here(producer_alive):
+                    continue
+                # The producer is gone, so no terminator is coming. Take one
+                # last look for anything it queued just before it ended (the
+                # timeout can expire in that window), and if there is nothing,
+                # finish with what was already spoken rather than blocking on a
+                # terminator nobody owes this loop.
+                try:
+                    sentence = sentence_q.get_nowait()
+                except queue.Empty:
+                    log.warning(
+                        "reply stream ended without its terminator — speaking "
+                        "what arrived (%d sentence(s)) and ending the turn",
+                        len(said))
+                    break
             if sentence is None:
                 break
             self._set(gen, SPEAKING)
@@ -7406,6 +7620,11 @@ PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                "preview-pack", "preview-clear"}
 
 
+# Reported when the platform HAS SO_PEERCRED and the call still failed: the
+# caller's `peer != os.getuid()` then refuses, which is the safe direction.
+_PEER_UID_UNKNOWN = -1
+
+
 def _peer_uid(conn: "socket.socket") -> "int | None":
     """uid of the process at the far end of a unix socket, or None if unknown.
 
@@ -7419,13 +7638,23 @@ def _peer_uid(conn: "socket.socket") -> "int | None":
     that case. What it adds is an explicit check that still holds if the
     directory mode is ever loosened, and a log line saying who tried.
     """
+    if not hasattr(socket, "SO_PEERCRED"):
+        return None                  # non-Linux: the platform cannot be asked
     try:
         raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
                               struct.calcsize("3i"))
         _pid, uid, _gid = struct.unpack("3i", raw)
         return int(uid)
-    except (OSError, AttributeError, struct.error):
-        return None                  # non-Linux or no credentials: allow
+    except (OSError, struct.error):
+        # ASKED, AND LEARNED NOTHING — which is not the same as being unable to
+        # ask, and the old code treated the two alike (`except …: return
+        # None` = "allow"). On a kernel that has SO_PEERCRED, a failed
+        # getsockopt now reports the sentinel below, and the caller refuses it
+        # like any other uid that is not ours: a check that answers "unknown"
+        # must not answer "yes".
+        log.warning("control socket: cannot read peer credentials (%s)",
+                    "SO_PEERCRED failed")
+        return _PEER_UID_UNKNOWN
 
 
 class ControlServer:
@@ -8050,6 +8279,52 @@ def _strip_images(history: list) -> None:
     for m in history:
         if isinstance(m, dict):
             m.pop("images", None)
+
+
+def _seal_tool_calls(history: list) -> None:
+    """Drop `tool_calls` from any assistant message whose calls went unanswered.
+
+    A turn that stops for a confirmation offer breaks out of the tool loop with
+    calls still queued, so the assistant message it just appended carries
+    `tool_calls` while only SOME of them have role:tool replies. Publishing that
+    message put an unanswered call into history — and history is the prefix of
+    every later request, where a tool call with no matching result is exactly
+    the shape Ollama rejects or mis-conditions on, on EVERY future turn.
+
+    The text stays; only the unanswered plumbing is removed, so the transcript
+    still reads as the conversation the user heard.
+    """
+    index = 0
+    while index < len(history):
+        message = history[index]
+        index += 1
+        if not isinstance(message, dict):
+            continue
+        calls = message.get("tool_calls")
+        if not calls:
+            continue
+        # Matched by POSITION, because that is how this bubble replies: its
+        # tool entries are `{"role": "tool", "tool_name": …, "content": …}`
+        # with no `tool_call_id`, one per call in order. Counting the run of
+        # consecutive replies after the assistant message is therefore the
+        # answer available here — an id-based match would call every answered
+        # call orphaned and strip the plumbing from every turn.
+        look = index
+        while look < len(history):
+            nxt = history[look]
+            if not isinstance(nxt, dict) or nxt.get("role") != "tool":
+                break
+            look += 1
+        if (look - index) >= len(calls):
+            continue                      # every call has its reply: keep it
+        log.info("dropping %d unanswered tool call(s) from history",
+                 len(calls) - (look - index))
+        message.pop("tool_calls", None)
+        if not (message.get("content") or "").strip():
+            # An assistant turn that was ONLY a tool call, with the call now
+            # removed, is an empty message — worse than no message.
+            history.pop(index - 1)
+            index -= 1
 
 
 def acquire_lock():

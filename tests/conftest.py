@@ -8,6 +8,7 @@ import copy
 import functools
 import gc
 import importlib.util
+import json
 import os
 import random
 import re
@@ -248,7 +249,23 @@ GIT_PLUMBING = ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_PREFIX",
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG_PARAMETERS",
                 "GIT_CONFIG_COUNT", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
                 "GIT_AUTHOR_DATE", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
-                "GIT_COMMITTER_DATE", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR")
+                "GIT_COMMITTER_DATE", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR",
+                # WHAT GIT RUNS FOR YOU, AND WHERE IT READS CONFIG FROM. A
+                # leaked GIT_ASKPASS is a credential helper the child's own git
+                # will invoke, and GIT_PAGER / GIT_EXTERNAL_DIFF are programs
+                # run over that child's output — the same class as the identity
+                # above: something from the developer's environment reaching a
+                # scratch repository. GIT_CONFIG* redirects where git finds its
+                # configuration, which the harness supplies itself.
+                #
+                # These two were found by a real failure in an environment that
+                # exported them (2026-09-18) while the suite passed here, which
+                # is why the probe guard that reads a real hook now PLANTS the
+                # whole family: the list cannot lose one just because the
+                # machine running the tests does not happen to set it.
+                "GIT_ASKPASS", "GIT_PAGER", "GIT_SSH", "GIT_SSH_COMMAND",
+                "GIT_TERMINAL_PROMPT", "GIT_EXTERNAL_DIFF", "GIT_NAMESPACE",
+                "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
 
 
 def sandbox_env(home=None) -> dict:
@@ -727,6 +744,35 @@ def _module_state_is_restored(H):
     snap = _snapshot_state(H)
     yield
     _restore_state(H, snap)
+
+
+@pytest.fixture(autouse=True)
+def _the_daily_briefing_stamp_does_not_cross_tests(H):
+    """A durable stamp cannot start a test already set by the test before it.
+
+    `_maybe_briefing_prefix` now reads `last_briefing` out of the mic-health
+    file, because the stamp has to survive a live settings reload or the bubble
+    re-greets you (measured 2026-09-18: delivered at 21:17, 21:24 and 21:35,
+    each one a reload apart). Durable means it also survives the test that
+    wrote it, and the suite shares one STATE_DIR for the whole session, so the
+    next test that wanted a morning briefing found one already delivered:
+    three `test_world_events` briefing tests went red in collection order only.
+
+    Clears the stamp, not the file: mic HISTORY is deliberately left as the
+    test found it, since a test that wants a degraded history sets one up.
+    """
+    path = H.MIC_EVENTS_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        doc = None
+    if isinstance(doc, dict) and "last_briefing" in doc:
+        doc.pop("last_briefing", None)
+        try:
+            path.write_text(json.dumps(doc), encoding="utf-8")
+        except OSError:
+            pass
+    yield
 
 
 #: Every thread a bubble or its listener starts. Named here so the teardown

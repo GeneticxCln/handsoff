@@ -718,6 +718,45 @@ class TestICSDailyOldEvent:
         ev = _core_calendar.ics_events_from_text(text, win_s, win_e)
         assert ev and ev[0]["summary"] == "Old weekly", ev
 
+    def test_a_weekly_count_that_ended_years_ago_is_not_re_emitted(self, H):
+        """COUNT is spent from DTSTART, not from wherever the week jump landed.
+
+        The WEEKLY branch jumps `w` to the first week that can overlap the
+        window, and the instance counter `k` still began at 0 — so a
+        WEEKLY;COUNT=3 meeting that ENDED years ago was re-emitted as if it
+        were just starting (verified 2026-09-18). The DAILY branch derives an
+        absolute index and never had this shape; the two disagreeing is what
+        made the phantom instances possible.
+        """
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        start = today - H.datetime.timedelta(days=3 * 365)
+        ev = self._events(H, start.strftime("%Y%m%dT090000"),
+                          "FREQ=WEEKLY;COUNT=3",
+                          (today.year, today.month, today.day),
+                          (today + H.datetime.timedelta(days=14)).timetuple()[:3])
+        assert ev == [], ev
+
+    def test_a_weekly_count_emits_only_its_remaining_instances(self, H):
+        """A COUNT=10 weekly rule four weeks in has SIX instances left.
+
+        The window is eight weeks long, so the difference between counting
+        absolute instances and counting from the jump is visible in one array:
+        the rule ends at instance #10 (five weeks from today) and nothing may
+        appear after it.
+        """
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        start = today - H.datetime.timedelta(days=28)
+        ev = self._events(H, start.strftime("%Y%m%dT090000"),
+                          "FREQ=WEEKLY;COUNT=10",
+                          (today.year, today.month, today.day),
+                          (today + H.datetime.timedelta(days=56)).timetuple()[:3])
+        got = [e["start"].date() for e in ev]
+        want = [(today + H.datetime.timedelta(weeks=i)).date()
+                for i in range(6)]
+        assert got == want, (got, want)
+
 
 class TestCalendarSourceSafety:
     """A Google-style "secret iCal address" is a bearer credential: whoever

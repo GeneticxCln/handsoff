@@ -23,6 +23,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -510,6 +511,42 @@ _SECRET_GLOBS = (
 )
 
 
+def _flag_names(tok: str) -> tuple[str, ...]:
+    """The flag NAMES an argument declares, a short cluster split into letters.
+
+    `--delete` and `-D` are obvious. `-rd` is the shape that matters:
+    `a.lstrip('-')` reads it as the single name `'rd'`, which matches no delete
+    flag, so `git branch -rd x` deleted a ref through a guard written to refuse
+    exactly that (verified 2026-09-18). A `--`-prefixed flag keeps its name
+    whole, a one-letter flag is itself, and anything longer without `--` is a
+    cluster of letters.
+    """
+    if not tok.startswith('-'):
+        return ()
+    body = tok.lstrip('-')
+    name = body.split('=', 1)[0]
+    if tok.startswith('--') or len(name) == 1:
+        return (name,)
+    return tuple(name)
+
+
+def _flag_values(tok: str) -> tuple[str, ...]:
+    """What an argument carries BEHIND its leading dash that could name a path.
+
+    A flag is not automatically harmless. `--output=<path>` is how a
+    whitelisted read-only verb writes a file, and skipping every token that
+    starts with `-` skipped the path inside it as well: measured 2026-09-18,
+    `git diff --output=$HOME/.config/handsoff/settings.json` was ACCEPTED — a
+    diff written over the settings file resets every permission switch to its
+    default — and the same flag reaches `~/.ssh/*`. The `=`-attached value is
+    returned so the caller's secret-path check sees it; a SEPARATED value
+    (`--output <path>`) is its own argument and is checked anyway.
+    """
+    if not tok.startswith('-') or '=' not in tok:
+        return ()
+    return (tok.split('=', 1)[1],)
+
+
 def denied_secret_path(path) -> str | None:
     """Why `path` must not be read into the conversation, or None if it may be.
 
@@ -738,8 +775,20 @@ class ToolBelt:
     ALLOWED = {'pactl', 'playerctl', 'brightnessctl', 'niri', 'spawn', 'echo', 'cat', 'ls', 'pwd', 'notify-send', 'ps', 'free', 'uptime', 'df', 'ss', 'nvidia-smi'}
     _CARGO_OK = {'build', 'check', 'test', 'clippy'}
     _GIT_READ = {'status', 'diff', 'log', 'show', 'branch', 'remote'}
+    # Flags, not verbs: a read verb plus one of these is a WRITE.
     _GIT_DELETE_FLAGS = {'d', 'D', 'delete'}
+    _GIT_WRITE_FLAGS = {'output'}
     BLOCKED = ('sudo', 'rm', 'pacman', 'yay', 'paru', 'shutdown', 'poweroff', 'reboot', 'halt', 'mkfs', 'dd', 'kill', 'chmod', 'chown', 'mount', 'umount', 'curl', 'wget', 'bash', 'sh', 'zsh', 'fish', 'python', 'python3', 'pip', 'mv', 'cp', 'tar', 'zip', '7z', 'make', 'gcc', 'systemctl', 'journalctl', 'tee', 'xargs', 'env', 'eval', 'exec')
+    # The bubble's own runtime stores. They are not source and not the user's
+    # notes: `history.json` and `memory.json` are injected into EVERY future
+    # prompt (so one unconfirmed edit installs a standing instruction that
+    # outlives the session), `reminders.json` fires alarms, and
+    # `pending-restart.json` carries the restart note. Refused by name for the
+    # same reason settings.json is: the file speaks for the user, and the model
+    # editing it is the model editing its own orders.
+    _RUNTIME_STORES = ('history.json', 'memory.json', 'reminders.json',
+                       'pending-restart.json', 'mic-health.json',
+                       'cap-refusals.json')
     MAX_READ = 160000
     MAX_WRITE = 2000000
     MAX_SELF_EDIT = 500000  # self/split whole-file replace cap (handsoff.py ~270KB)
@@ -783,7 +832,24 @@ class ToolBelt:
         # "no limit" to anyone who tried one. The memory is already bounded by
         # the window: only calls the limit admitted are ever appended.
         self._tool_times: deque[float] = deque()
-        self._perm = {'run_command': True, 'read_file': True, 'edit_file': True, 'self_restart': True, **(permissions or {})}
+        self.set_permissions(permissions)
+
+    def set_permissions(self, permissions: dict | None) -> None:
+        """Adopt a permissions dict, keeping the belt's own defaults.
+
+        This exists because a LIVE settings reload REPLACES
+        `SETTINGS['permissions']` with a new dict (the reload clears and refills
+        SETTINGS), while the belt kept a reference to the dict it was built
+        with. The gate below then read a snapshot no reload could reach, so a
+        permission the user had just saved was ignored until the next restart —
+        and it failed in the unsafe direction too, since disabling a tool
+        mid-session left its gate open, and enabling one kept answering
+        "REFUSED: disabled". The host calls this from the reload path; the
+        belt's own dict stays authoritative for a caller that builds one with
+        explicit permissions (tests, embedders).
+        """
+        self._perm = {'run_command': True, 'read_file': True, 'edit_file': True,
+                      'self_restart': True, **(permissions or {})}
 
     def _rate_limit(self) -> int:
         """The configured calls/60s, read defensively.
@@ -854,6 +920,121 @@ class ToolBelt:
             return False
         return True
 
+    # An edit that COMPILES can still fail to LOAD: a name error inside a
+    # decorator argument, a `from x import y` that no longer exists, an
+    # exception in the module body. That is the difference between a bad edit
+    # and a bricked assistant — the unit is `Restart=always`, so a module that
+    # raises on import never reaches main(), and it crash-loops with no voice
+    # and no doctor until somebody runs install.sh by hand.
+    IMPORT_SMOKE_TIMEOUT = 60.0
+
+    def _import_smoke(self, path: Path, kind: str) -> str:
+        """Load the just-written file in a subprocess. "" when it loads.
+
+        Runs the SAME import the app itself will run — under the file's real
+        module name, from its real directory — rather than a syntax check, so
+        the things that only happen at import time are covered: `core.tools`
+        under `core.tools`, `handsoff.py` under `handsoff` (its own claim on
+        the canonical name is satisfied, because the import machinery registers
+        it before the body runs).
+
+        A subprocess, not `importlib` in-process: this runs inside the LIVE
+        bubble, and importing a broken copy into the running interpreter is the
+        very failure the check exists to prevent.
+
+        Returns "" on success and a one-line reason on failure; the caller
+        decides what to do with it (see `edit_file`).
+        """
+        target = path.resolve()
+        if target.name == "__init__.py" and target.parent.name == "core":
+            name, root = "core", target.parent.parent
+        elif target.parent.name == "core":
+            name, root = f"core.{target.stem}", target.parent.parent
+        else:
+            name, root = target.stem, target.parent
+        code = (
+            "import importlib.util, sys\n"
+            f"sys.path.insert(0, {str(root)!r})\n"
+            f"spec = importlib.util.spec_from_file_location({name!r}, {str(target)!r})\n"
+            "if spec is None or spec.loader is None:\n"
+            "    raise SystemExit(4)\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            f"sys.modules[{name!r}] = mod\n"
+            "spec.loader.exec_module(mod)\n"
+        )
+        try:
+            proc = subprocess.run([sys.executable, "-c", code],
+                                  capture_output=True, text=True,
+                                  timeout=self.IMPORT_SMOKE_TIMEOUT,
+                                  cwd=str(root))
+        except subprocess.TimeoutExpired:
+            return (f"loading it did not finish within "
+                    f"{self.IMPORT_SMOKE_TIMEOUT:.0f}s")
+        except OSError as e:
+            return f"the load check could not run ({type(e).__name__}: {e})"
+        if proc.returncode == 0:
+            return ""
+        # A traceback's caret/ruler lines (`~~~~~~^^^^^`) carry no words, and a
+        # message the model has to act on is worth more as the failing line and
+        # the exception than as the decoration around them.
+        lines = [ln.strip() for ln in (proc.stderr or proc.stdout).splitlines()
+                 if ln.strip() and re.search(r"[A-Za-z0-9]", ln)]
+        tail = " | ".join(lines[-5:]) or f"exit code {proc.returncode}"
+        return f"importing it raises ({tail[:600]})"
+
+    @staticmethod
+    def _restore_previous(path: Path) -> str:
+        """Put the file back the way `edit_file` found it. Returns what happened.
+
+        `edit_file` copies to `.bak` before it writes, so the previous bytes are
+        already on disk; a file that did not exist is removed again rather than
+        left half-installed. Rollback is the point of the smoke test: the unit
+        restarts on its own, so leaving a module that cannot load on disk is the
+        same as refusing to start.
+        """
+        bak = Path(str(path) + ".bak")
+        try:
+            if bak.exists():
+                shutil.copy2(bak, path)
+                os.chmod(path, 0o600)
+                return f"{path.name} was put back as it was before this edit"
+            path.unlink(missing_ok=True)
+            return f"{path.name} (new) was removed again"
+        except OSError as e:
+            return (f"{path.name} could NOT be rolled back ({e}) — the file "
+                    f"on disk does not load, restore it before restarting")
+
+    @staticmethod
+    def _clip_preview(out: str, limit: int) -> str:
+        """Fit a diff to `limit` WITHOUT hiding what is being left out.
+
+        The plain `out[:limit]` cut this replaces could hide a whole second
+        hunk behind "… (diff truncated, N more chars)", so the confirmation the
+        user HEARS described a smaller change than the one being offered — a
+        prompt-injected backdoor in the tail of a self-edit was inside the
+        change and outside the description. Naming what remains (how many
+        hunks, how many lines in each direction) keeps the summary true even
+        when the text is clipped: the count IS the claim the user is approving.
+        """
+        if len(out) <= limit:
+            return out
+        head = out[:limit]
+        if '\n' in head:
+            head = head.rsplit('\n', 1)[0]      # never cut mid-line
+        rest = out[len(head):]
+        hunks = len(re.findall(r'^@@', rest, re.M))
+        added = sum(1 for line in rest.splitlines()
+                    if line.startswith('+') and not line.startswith('+++'))
+        removed = sum(1 for line in rest.splitlines()
+                      if line.startswith('-') and not line.startswith('---'))
+        left = []
+        if hunks:
+            left.append(f'{hunks} more hunk(s)')
+        if added or removed:
+            left.append(f'{added} more line(s) added, {removed} removed')
+        return head + (f'\n… (diff truncated at {limit} of {len(out)} chars — '
+                       + (', '.join(left) or 'more text') + ')')
+
     @staticmethod
     def _self_edit_preview(args: dict, limit: int=800) -> str:
         """Unified diff of the proposed self-edit against the live source,
@@ -867,9 +1048,7 @@ class ToolBelt:
         out = ''.join(difflib.unified_diff(old.splitlines(True), new.splitlines(True), fromfile='handsoff.py (running)', tofile='handsoff.py (proposed)'))
         if not out:
             return '(proposed content is identical to the running source)'
-        if len(out) > limit:
-            out = out[:limit] + f'\n… (diff truncated, {len(out) - limit} more chars)'
-        return out
+        return ToolBelt._clip_preview(out, limit)
 
     @staticmethod
     def _split_edit_preview(args: dict, limit: int=800) -> str:
@@ -887,9 +1066,7 @@ class ToolBelt:
         out = ''.join(difflib.unified_diff(old.splitlines(True), new.splitlines(True), fromfile=f'{target.name} (running)', tofile=f'{target.name} (proposed)'))
         if not out:
             return '(proposed content is identical to the running file)'
-        if len(out) > limit:
-            out = out[:limit] + f'\n… (diff truncated, {len(out) - limit} more chars)'
-        return out
+        return ToolBelt._clip_preview(out, limit)
 
     def _announce_job(self, text: str) -> None:
         """Speak a job completion through the assistant's announcement path
@@ -1049,12 +1226,15 @@ class ToolBelt:
         # leave run_command a way to read exactly what read_file refuses.
         # Every argument is checked against the same secret-path predicate.
         for tok in argv[1:]:
-            if not tok or tok.startswith('-'):
-                continue
-            denied = denied_secret_path(tok)
-            if denied:
-                return (None, '', f"REFUSED: '{tok}' — {denied}. run_command "
-                        f"cannot read credential stores into the conversation", False)
+            # A FLAG IS NOT EXEMPT. `--flag=value` carries a path, and one
+            # whitelisted verb writes a file with it (_flag_values).
+            for part in (tok, *_flag_values(tok)):
+                if not part:
+                    continue
+                denied = denied_secret_path(part)
+                if denied:
+                    return (None, '', f"REFUSED: '{part}' — {denied}. run_command "
+                            f"cannot read credential stores into the conversation", False)
         low = cmd.lower()
         exe_base = Path(argv[0]).name
         _unblocked = ''
@@ -1064,8 +1244,21 @@ class ToolBelt:
                 _unblocked = exe_base
             else:
                 return (None, '', f"REFUSED: '{exe_base} {verb or '(no verb)'}' is not allowed — git is read-only (status/diff/log/show/branch/remote), cargo only builds/tests", False)
-            if _unblocked == 'git' and any((a.lstrip('-') in self._GIT_DELETE_FLAGS for a in argv[2:] if a.startswith('-'))):
+            if _unblocked == 'git' and any(
+                    name in self._GIT_DELETE_FLAGS
+                    for a in argv[2:] if a.startswith('-')
+                    for name in _flag_names(a)):
                 return (None, '', 'REFUSED: deleting branches (git branch -d/-D) is not allowed', False)
+            # git is allowed READ-ONLY, and `--output` is the one flag that
+            # turns a read verb into a write: it writes the diff/log wherever it
+            # is pointed, permission checks and confirmation included. Refusing
+            # the flag closes the channel for every verb at once.
+            if _unblocked == 'git' and any(
+                    name in self._GIT_WRITE_FLAGS
+                    for a in argv[2:] if a.startswith('-')
+                    for name in _flag_names(a)):
+                return (None, '', 'REFUSED: git is read-only here, and --output '
+                        'writes a file wherever it is pointed', False)
         for bad in self.BLOCKED:
             if bad == _unblocked:
                 continue
@@ -1153,6 +1346,18 @@ class ToolBelt:
         if err:
             return err
         exe = argv[0]
+        if is_restart:
+            # BEFORE the command, not after it. The restart script terminates
+            # this process, so `subprocess.run` may never return and the note
+            # was written by a process that had usually already been killed —
+            # "I'm back, with my changes applied" never fired once (verified in
+            # source, 2026-09-18). Validation has already happened here, so a
+            # REFUSED command still arms nothing — and that is where "the script
+            # exists" is established too (`_validate_command` checks the
+            # configured RESTART_SCRIPT, absolute), so a second existence test
+            # on `argv[0]` would only be wrong for the bare-name invocation:
+            # `handsoff-restart` resolves on PATH, not in the working directory.
+            self._on_restart_pending()
         try:
             timeout = 240.0 if exe_base == 'cargo' else self.TIMEOUT
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
@@ -1160,8 +1365,6 @@ class ToolBelt:
             return f'ERROR: program not found: {exe}'
         except subprocess.TimeoutExpired:
             return f'ERROR: command timed out after {timeout:.0f}s'
-        if is_restart:
-            self._on_restart_pending()
         out = f'exit code {proc.returncode}\nstdout:\n{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}'
         return out[:2000]
     YDOTOOL_SOCKET = '/tmp/.ydotool_socket'
@@ -2929,6 +3132,15 @@ class ToolBelt:
             argv, _exe, err, is_restart = self._validate_command(command)
             if err:
                 return err
+            if is_restart:
+                # Same reason as run_command: the job is DETACHED from the
+                # start, so it can kill this process before the code after
+                # Popen runs — and the existence of the restart script is
+                # `_validate_command`'s check, not this line's. The slot above
+                # is already admitted, so a job refused at the cap cannot reach
+                # this line (the reservation happens first, and `reserve()`
+                # returning None returns early).
+                self._on_restart_pending()
             _dep().log.info('start_command: %s', _dep()._log_metadata(command, 'command'))
             try:
                 proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
@@ -2938,10 +3150,6 @@ class ToolBelt:
             # jobs can never be handed the same id.
             job_id, _displaced = slot.commit(
                 lambda key: BoundedJob(key, command.strip(), proc))
-        if is_restart:
-            # AFTER admission: a job refused at the cap never ran, so it must
-            # not leave the bubble believing a restart is in flight.
-            self._on_restart_pending()
         return f'started {job_id}: {command.strip()} — it runs in the background; call job_status to check it. I will announce when it finishes.'
 
     @tool(description='State/output of start_command jobs; finished announced', gates='run_command', aliases={'job_id': ('id', 'job')})
@@ -3307,6 +3515,11 @@ class ToolBelt:
         is_self = kind == 'self'
         if p in (_dep().SETTINGS_FILE, _dep().SETTINGS_FILE.with_suffix('.json')) or p.name.startswith('settings.json'):
             return 'REFUSED: settings.json controls your own permissions — the user manages it via the settings app'
+        if p.name.lower() in self._RUNTIME_STORES:
+            return (f'REFUSED: {p.name} is a runtime store the bubble keeps — '
+                    'changing it by hand would change what every future turn is '
+                    'told or which alarms fire. The user changes it through the '
+                    'app (or clears history), not through a file edit.')
         if is_self:
             if _dep().SELF_MARKER not in content:
                 return f"REFUSED: self-edit must keep the marker line '{_dep().SELF_MARKER}'"
@@ -3341,6 +3554,17 @@ class ToolBelt:
         except OSError as e:
             return f'ERROR: cannot write {p}: {e}'
         _dep().log.info('edit_file wrote %d bytes to %s', len(content), _dep()._log_metadata(p, 'path'))
+        if is_self or (kind == 'split' and p.suffix == '.py'):
+            problem = self._import_smoke(p, kind)
+            if problem:
+                _dep().log.error(
+                    'edit_file: %s compiles but does not load — rolling back (%s)',
+                    _dep()._log_metadata(p, 'path'), problem)
+                return (f'ERROR: {p.name} compiles but does not load — '
+                        f'{problem}. {self._restore_previous(p)}. Nothing was '
+                        f'restarted: a module that cannot be imported would '
+                        f'crash-loop the bubble on the next restart. Fix the '
+                        f'import error and edit again.')
         note = f'wrote {len(content)} bytes to {p}'
         if is_self:
             note += f" — verify first: python -m py_compile {p} && python -m pytest tests/test_policy.py -q, then run_command '{_dep().RESTART_SCRIPT}' to restart into the new version"

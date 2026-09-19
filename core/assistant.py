@@ -185,7 +185,13 @@ def notification_muted(app: str, summary: str, body: str, *,
                     return True
         return False
     except Exception:
-        return False
+        # MUTE, do not announce. The old `return False` made a mute list that
+        # could not be evaluated indistinguishable from no mute list at all,
+        # so a failure on this path read the notification aloud — the one
+        # direction the list exists to prevent. A bug in the check is a reason
+        # to say less, not more.
+        log.exception("cannot evaluate the notification mute list")
+        return True
 
 
 class _MonitorRun:

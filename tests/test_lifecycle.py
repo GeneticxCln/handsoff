@@ -704,6 +704,32 @@ class TestControlSocket:
         H, _delivered, _app = server
         assert self._roundtrip(H.CONTROL_SOCK, "status").startswith("state=")
 
+    def test_an_unreadable_peer_uid_is_refused_not_allowed(self, server,
+                                                           monkeypatch):
+        """ASKED and learned nothing is not the same as being unable to ask.
+
+        `_peer_uid` returned None for both "this platform has no SO_PEERCRED"
+        and "the kernel refused the call", and the caller read None as allow —
+        so one failed getsockopt opened every verb. The sentinel separates them.
+        """
+        H, delivered, _app = server
+        assert H._PEER_UID_UNKNOWN != os.getuid()
+        monkeypatch.setattr(H, "_peer_uid", lambda conn: H._PEER_UID_UNKNOWN)
+        assert self._roundtrip(H.CONTROL_SOCK, "interrupt") == "error: not permitted\n"
+        assert "interrupt" not in delivered
+
+    def test_the_sentinel_comes_from_a_failed_call_only(self, H, monkeypatch):
+        """A platform that cannot answer still passes; a call that failed
+        does not."""
+        class Conn:
+            def getsockopt(self, *args):
+                raise OSError("nope")
+
+        assert hasattr(H.socket, "SO_PEERCRED"), "Linux is assumed here"
+        assert H._peer_uid(Conn()) == H._PEER_UID_UNKNOWN
+        monkeypatch.delattr(H.socket, "SO_PEERCRED", raising=False)
+        assert H._peer_uid(Conn()) is None
+
     @staticmethod
     def _bare_roundtrip(sock_path: Path, action: str) -> str:
         """A request with NO capability token: an old client, or a process
@@ -1158,6 +1184,205 @@ def _bare_assistant(H):
     return a
 
 
+def _speaker(H, monkeypatch):
+    """An Assistant that can actually run the streaming branch of _speak.
+
+    Synthesis and playback are the only slow parts, so they are replaced and
+    what they were handed is collected: the test is about WHEN the loop ends,
+    not about whether a WAV reached the speakers.
+    """
+    H.STATE_DIR.mkdir(parents=True, exist_ok=True)   # TTS scratch lives here
+    a = H.Assistant.__new__(H.Assistant)
+    a._models_ready = threading.Event()
+    a._models_ready.set()
+    a._recently_spoken = []
+    a._turn_spoke = False
+    a._last_spoken = ""
+    a._followup_until = 0.0
+    a._handsfree = False
+    a._set = lambda *args, **kwargs: None
+    said: list = []
+    monkeypatch.setattr(H, "tts_to_wav",
+                        lambda text, wav: said.append(text) or wav.write_bytes(b""))
+    monkeypatch.setattr(H._audio, "play_wav", lambda wav, cancel: None)
+    return a, said
+
+
+class TestTheSpeakerWatchesItsProducer:
+    """A consumer must not wait forever for a terminator nobody owes it.
+
+    `_speak`'s streaming half is a consumer: it reads sentences until it sees
+    the None terminator its producer puts there. A producer that died without
+    sending one left this loop blocked — the doctor showed `thinking`, nothing
+    was ever spoken, and only a manual barge-in ended it (verified in source,
+    2026-09-18). core.brain now guarantees the terminator; the queue also
+    carries its producer's liveness, so the wait cannot outlive the producer
+    even if a future caller forgets.
+    """
+
+    def test_a_dead_producer_ends_the_wait(self, H, monkeypatch):
+        a, said = _speaker(H, monkeypatch)
+        q = H._SentenceQueue()
+        q.put("First sentence.")
+        q.producer_alive = lambda: False          # died before the terminator
+        start = time.monotonic()
+        H.Assistant._speak(a, None, 0, threading.Event(), sentence_q=q)
+        assert said == ["First sentence."], said
+        assert time.monotonic() - start < 5.0, (
+            "the speaker blocked on a queue whose producer was already gone")
+
+    def test_a_live_producer_is_still_waited_for(self, H, monkeypatch):
+        """The watchdog must not fire on a model that is simply thinking."""
+        a, _said = _speaker(H, monkeypatch)
+        q = H._SentenceQueue()
+        q.producer_alive = lambda: True
+        finished: list = []
+        worker = threading.Thread(
+            target=lambda: (H.Assistant._speak(a, None, 0, threading.Event(),
+                                               sentence_q=q),
+                            finished.append(1)))
+        worker.start()
+        worker.join(1.0)
+        assert not finished, "the speaker gave up on a live producer"
+        q.put(None)                               # now the terminator lands
+        worker.join(5.0)
+        assert finished, "the speaker never finished after the terminator"
+
+
+class TestAFailedStreamIsSpokenNotSwallowed:
+    """A stream that fails must say so, whatever it raised.
+
+    `_run_stream` caught RuntimeError only, so anything else (an
+    IncompleteRead, a socket timeout, an OOM-killed Ollama) escaped the worker
+    thread with `turn.result` still None and the turn ended as a silent empty
+    answer. The non-streaming helper had the same asymmetry. Both now record
+    every failure as the spoken outage the RuntimeError path already was.
+    """
+
+    def _turn(self, H, monkeypatch, boom):
+        said: list = []
+        a = H.Assistant.__new__(H.Assistant)
+        a._tools = types.SimpleNamespace(_set_user_turn=lambda *_: None)
+        a._conversation_for = lambda text: [{"role": "user", "content": text}]
+        a._gen = 1
+        a._history = []
+        a._turn_spoke = False
+        a._save_history = lambda: None
+        a._speak = lambda text, gen, cancel, sentence_q=None: (
+            said.append(text) if text else None)
+        monkeypatch.setattr(H, "ollama_chat_stream", boom)
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", True)
+        monkeypatch.setitem(H._BRAIN_STATE, "tools_supported", False)
+        H.Assistant._brain_turn(a, "hello", 1, threading.Event())
+        return said
+
+    def test_a_value_error_is_reported_as_an_outage(self, H, monkeypatch):
+        def boom(*_args, **_kwargs):
+            raise ValueError("connection reset by peer")
+        said = self._turn(H, monkeypatch, boom)
+        assert said, "a failed stream left the user with silence"
+        assert "offline" in said[0] and "connection reset by peer" in said[0], said
+
+    def test_a_missing_terminator_does_not_hang_the_turn(self, H, monkeypatch):
+        """No terminator, no sentences, producer gone: the turn must END.
+
+        The watchdog on the queue is what makes this pass; without it the
+        speaker waits for a None that will never arrive.
+        """
+        def silent(*_args, **_kwargs):
+            return {"tool_calls": [], "content": "", "error": ""}
+        said = self._turn(H, monkeypatch, silent)
+        assert said == [], said           # an empty reply is not spoken
+
+
+class TestATurnStoppedForConfirmation:
+    """The message it publishes must not carry a call nobody answered.
+
+    A confirmation offer breaks out of the tool loop with calls still queued,
+    so the assistant message has `tool_calls` while only some have replies. That
+    message goes into history, which is the prefix of every later request — and
+    an unanswered call is exactly the shape a model rejects or mis-conditions
+    on, on every future turn.
+    """
+
+    def test_no_unanswered_call_reaches_history(self, H, monkeypatch):
+        calls: list = []
+
+        class Belt:
+            _last_images: list = []
+            _last_confirmation_offer = False
+
+            @staticmethod
+            def _set_user_turn(_gen):
+                return None
+
+            def execute(self, name, args):
+                calls.append(name)
+                if len(calls) == 1:
+                    type(self)._last_confirmation_offer = True
+                return f"ran {name}", False
+
+        a = H.Assistant.__new__(H.Assistant)
+        a._tools = Belt()
+        a._gen = 1
+        a._history = []
+        a._turn_spoke = False
+        a._save_history = lambda: None
+        a._set = lambda *_a, **_k: None
+        a._speak = lambda text, gen, cancel, sentence_q=None: None
+        a._conversation_for = lambda text: [
+            {"role": "user", "content": text}]
+
+        def stream(*_args, **_kwargs):
+            return {"tool_calls": [
+                        {"function": {"name": "one", "arguments": {}}},
+                        {"function": {"name": "two", "arguments": {}}}],
+                    "content": "On it.", "error": ""}
+
+        monkeypatch.setattr(H, "ollama_chat_stream", stream)
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", True)
+        monkeypatch.setitem(H._BRAIN_STATE, "tools_supported", True)
+
+        H.Assistant._brain_turn(a, "do two things", 1, threading.Event())
+
+        assert calls == ["one"], calls      # the second waited for the answer
+        assert not any(m.get("tool_calls") for m in a._history), a._history
+
+
+class TestLiveReloadReachesTheGates:
+    """A permission saved in the settings app must gate the very next call.
+
+    The belt holds its OWN permissions dict (a private copy made at
+    construction) and a live reload REPLACES `SETTINGS["permissions"]` with a
+    new object — so without a re-point the belt went on gating with the
+    permissions this process started with. Both directions were wrong: turning
+    a tool OFF left its gate open (the unsafe one), and turning one ON kept
+    answering "REFUSED: … disabled" until a restart.
+    """
+
+    def test_the_reload_repoints_the_belt(self, H, monkeypatch):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        assert belt._perm["edit_file"] is True
+        new = dict(H.SETTINGS)
+        new["permissions"] = {**H.SETTINGS["permissions"], "edit_file": False}
+        a = H.Assistant.__new__(H.Assistant)
+        a._tools = belt
+        a._handsfree = bool(new.get("handsfree", False))
+        monkeypatch.setattr(H, "_load_settings", lambda: dict(new))
+        monkeypatch.setattr(H, "reload_derived_settings", lambda: None)
+        original = dict(H.SETTINGS)
+        try:
+            H.Assistant._reload_settings_live(a)
+        finally:
+            H.SETTINGS.clear()
+            H.SETTINGS.update(original)
+        assert belt._perm["edit_file"] is False, (
+            "the reload did not reach the belt's gates")
+        out, _err = belt.execute(
+            "edit_file", {"path": str(H.SELF_PATH), "content": "'x'\n"})
+        assert "REFUSED" in out and "disabled" in out, out
+
+
 class TestSharedVoiceLevel:
     """The one level signal the bubble's designs and the Settings meter share."""
 
@@ -1590,6 +1815,68 @@ class TestStreamingChat:
                            for m in asst._history)
         finally:
             H.OLLAMA_BASE = old_base
+
+    def test_a_superseded_turn_still_lands_in_memory(self, H, monkeypatch):
+        """A completed exchange is remembered even after a newer utterance has
+        started — and that is what makes the daily briefing work.
+
+        The old rule let only the CURRENT generation write, which handed the
+        memory to an utterance that may never write anything at all: an ignored
+        hands-free capture or a clipped PTT press bumps the generation and
+        produces no turn. Measured 2026-09-18: `history.json` froze at
+        2026-09-17T13:28 across three answered turns while hands-free captures
+        climbed gen 9 → 30 — the bubble answered out loud and forgot, and the
+        once-a-day briefing re-greeted because the file it reads never changed.
+        """
+        asst = H.Assistant.__new__(H.Assistant)
+        asst._tools = types.SimpleNamespace()
+        asst._gen = 1
+        asst._history = [{"role": "user", "content": "older question"},
+                         {"role": "assistant", "content": "older answer"}]
+        asst._turn_spoke = False
+        asst._maybe_briefing_prefix = lambda text: ""
+        asst._conversation_for = lambda text: list(asst._history) + [
+            {"role": "system", "content": "injected facts"},
+            {"role": "user", "content": text}]
+        saved: list = []
+        said: list = []
+        asst._save_history = lambda: saved.append(list(asst._history))
+        asst._set = lambda *_a, **_k: None
+
+        def fake_stream(conv, q, cancel, tools):
+            q.put("Turn two answered.")
+            q.put(None)
+            return {"tool_calls": [], "content": "Turn two answered.",
+                    "error": ""}
+
+        def fake_speak(text, gen, cancel, sentence_q=None):
+            if sentence_q is None:
+                if text:
+                    said.append(text)
+                return
+            while True:
+                item = sentence_q.get(timeout=2)
+                if item is None:
+                    return
+                said.append(item)
+
+        def speak_then_supersede(text, gen, cancel, sentence_q=None):
+            """A newer utterance arrives while this turn is still speaking."""
+            fake_speak(text, gen, cancel, sentence_q)
+            asst._gen += 1
+
+        asst._speak = speak_then_supersede
+        monkeypatch.setattr(H, "ollama_chat_stream", fake_stream)
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", True)
+        monkeypatch.setitem(H._BRAIN_STATE, "tools_supported", False)
+
+        H.Assistant._brain_turn(asst, "what time is it", 1, threading.Event())
+
+        assert said == ["Turn two answered."], said
+        assert [m["content"] for m in asst._history][-2:] == [
+            "what time is it", "Turn two answered."], asst._history
+        assert saved, ("a completed turn was not published to disk — a newer "
+                       "utterance that never answered took the memory with it")
 
     def test_old_stream_cannot_overwrite_new_turn_result(self, H, monkeypatch):
         """A late canceled stream owns its result and cannot replace turn B's."""

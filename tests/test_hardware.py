@@ -351,6 +351,19 @@ class TestFastfetch:
         assert "timeout" not in json.dumps(ff)  # invoker Shell never trusted
         assert "shell" not in {k.lower() for k in ff}
 
+    def test_empty_output_is_degraded_not_a_silent_success(self, HW, tmp_path):
+        """`fastfetch -j` that failed is not "a machine with no facts".
+
+        The exit status was ignored and `.stdout` returned whatever happened, so
+        an empty result parsed as an empty machine and the section reported
+        ok: True with every field blank — which is worse than a missing binary,
+        because a missing binary says so and this said nothing.
+        """
+        snap = HW.snapshot(_ctx(tmp_path),
+                           self._probers(fastfetch_json=lambda: ""), {})
+        ff = snap["fastfetch"]
+        assert ff["ok"] is False and "no output" in ff["error"], ff
+
     def test_timeout_keeps_last_good(self, HW, tmp_path):
         cache: dict = {}
         HW.snapshot(_ctx(tmp_path), self._probers(), cache)
@@ -516,3 +529,54 @@ class TestTtlCacheIsSharedSafely:
         out, cached = HW._probe("gpu", _boom, cache, True)
         assert out["ok"] is True and out["degraded"] is True
         assert "nvidia-smi wedged" in out["error"]
+
+
+class TestModelCacheProbe:
+    """The two `iterdir` reads that could take the whole section down.
+
+    `is_dir()` is its own stat, so it answers a different question than "may I
+    enumerate this": a cache directory that exists and cannot be READ raised
+    straight out of the probe, and the whisper one was outside the guard that
+    the TTS side had.
+    """
+
+    def test_an_unreadable_snapshots_directory_is_not_cached(self, HW, tmp_path,
+                                                             monkeypatch):
+        root = tmp_path / "hub"
+        rev = root / "snapshots" / "rev"
+        rev.mkdir(parents=True)
+        (rev / "blob.bin").write_bytes(b"x")
+        actual = Path.iterdir
+
+        def deny(self):
+            if self.name == "snapshots":
+                raise PermissionError("denied")
+            return actual(self)
+
+        monkeypatch.setattr(Path, "iterdir", deny)
+        assert HW._snapshot_cached(root) is False
+
+    def test_an_unreadable_whisper_directory_degrades_the_section(
+            self, HW, tmp_path, monkeypatch):
+        whisper = tmp_path / "whisper"
+        whisper.mkdir()
+        actual = Path.iterdir
+
+        def deny(self):
+            if self.name == "whisper":
+                raise PermissionError("denied")
+            return actual(self)
+
+        monkeypatch.setattr(Path, "iterdir", deny)
+        out = HW._stt_tts({"tts_weights_dir": str(tmp_path / "none"),
+                           "whisper_model_dir": str(whisper),
+                           "whisper_size": "small"})
+        assert out["ok"] is False and out.get("error"), out
+
+    def test_a_populated_snapshot_reads_as_cached(self, HW, tmp_path):
+        root = tmp_path / "hub"
+        rev = root / "snapshots" / "rev"
+        rev.mkdir(parents=True)
+        (rev / "blob.bin").write_bytes(b"x")
+        assert HW._snapshot_cached(root) is True
+        assert HW._snapshot_cached(tmp_path / "absent") is False

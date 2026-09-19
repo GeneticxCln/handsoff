@@ -270,6 +270,20 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
         if win_start - dur > week0 + datetime.timedelta(weeks=interval):
             ahead = (win_start - dur) - week0
             w = max(0, ahead // datetime.timedelta(weeks=interval) - 1)
+        # COUNT IS COUNTED FROM DTSTART, INCLUDING THE WEEKS THE JUMP SKIPPED.
+        # The jump above moves `w` to the first week that can overlap the
+        # window, but `k` — the counter the COUNT bound is compared against —
+        # still began at 0, so a WEEKLY;COUNT=3 meeting that ENDED years ago was
+        # re-emitted as if it were just beginning (verified 2026-09-18). DAILY
+        # derives an absolute index and never had this shape, which is what made
+        # the two branches disagree. Instances in weeks [0, w): the days on or
+        # after DTSTART's own weekday in week 0 (an earlier weekday in that week
+        # is still before DTSTART and does not exist), then every matching day
+        # in each later week. With no COUNT the counter is only compared against
+        # the unbounded stand-in, so this changes nothing there.
+        if w > 0:
+            k = (sum(1 for d in days if d >= dtstart.weekday())
+                 + (w - 1) * len(days))
         # 200 weeks CAPS THE DISTANCE FROM DTSTART, not the work done: with
         # the jump above the loop now starts near the window, so bound it by
         # the distance to the window instead (a fortnight past win_end is

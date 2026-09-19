@@ -70,7 +70,7 @@ def idle(H, monkeypatch):
     # The LLM's size, once read, is cached for ten minutes on the turn path; a
     # fresh record per test keeps one test's model out of the next one's ask.
     monkeypatch.setattr(H, "_llm_footprint",
-                        {"model": "", "mb": None, "at": 0.0})
+                        {"model": "", "mb": None, "need_mb": None, "at": 0.0})
     return H
 
 
@@ -1070,8 +1070,56 @@ class TestTheTurnAsksTheSpeechModel:
 
         assert out["gave_way"] is False and "fits already" in out["detail"]
         assert drops == [], "the voice is not spent on room the card already has"
-        assert srv.urls("/api/ps") == [], (
-            "residency is only worth asking about when the claim does not fit")
+        # Residency IS asked even here, and deliberately: the claim itself is
+        # "what is still missing", so a turn cannot be weighed without it. The
+        # cost is one localhost GET; the alternative (weigh the whole blob and
+        # ask residency only once it fails) is what reported a fully resident
+        # model as memory the card refused.
+        assert srv.urls("/api/ps"), "the claim counts what is already loaded"
+
+    def test_a_resident_model_is_not_weighed_by_its_whole_blob(
+            self, idle, monkeypatch):
+        """The live defect, as a test: a resident model needs no room.
+
+        Measured 2026-09-18, deployed bubble: `gemma4:12b` resident in full
+        (8.0 GB of it on the card) with 1.7 GB free. Every turn logged
+        `7207 MB claim refused: 8231 MB needed (1024 MB reserve) but only 5083
+        MB is free` and reported that it "needed the card" — while the turn had
+        nothing to load, and the number it weighed included the memory the
+        model already held.
+        """
+        self._speech_on_card(idle, monkeypatch)
+        _server(idle, monkeypatch, size_gb=7.8, vram_gb=7.8, tags_gb=7.04)
+        drops = self._drops(idle, monkeypatch)
+        self._pool(idle, monkeypatch, 1_683)
+
+        out = idle._free_the_card_for_the_llm("a turn that needs the LLM")
+
+        assert out["gave_way"] is False and drops == []
+        assert "already on the card in full" in out["detail"], out["detail"]
+        assert "claim refused" not in out["detail"], (
+            "a resident model is not a claim the card has to find room for")
+
+    def test_a_split_model_is_weighed_by_its_unmet_remainder(
+            self, idle, monkeypatch):
+        """The other half: a split model asks only for the missing part.
+
+        Ollama had `size_vram` of a 8.0 GB model at 7.5 GB, so the turn needs
+        512 MB more — not the 8.0 GB blob. That difference is the decision:
+        the card cannot hold the blob, and the voice therefore stays, even
+        though 512 MB is room the release really would make.
+        """
+        self._speech_on_card(idle, monkeypatch)
+        _server(idle, monkeypatch, size_gb=8.0, vram_gb=7.5, tags_gb=8.0)
+        drops = self._drops(idle, monkeypatch)
+        self._pool(idle, monkeypatch, 500, 3_900)
+
+        out = idle._free_the_card_for_the_llm()
+
+        assert out["gave_way"] is True, out
+        assert drops == [True]
+        assert "512 MB claim" in out["detail"], (
+            f"the unmet remainder is the claim, not the whole model: {out}")
 
     def test_a_model_already_loaded_is_not_a_model_to_make_room_for(
             self, idle, monkeypatch):
@@ -1275,6 +1323,41 @@ class TestTheTurnAsksTheSpeechModel:
         line = idle._gpu_headroom_lines()[0]
         assert "never asks the speech model for the card " \
                "(speech_yields_to_llm off)" in line, line
+
+    def test_the_fit_line_names_a_model_that_can_never_be_resident(
+            self, idle, monkeypatch):
+        """The question nothing else in the diagnostics asks, and the one that
+        decides whether a turn takes seconds or minutes.
+
+        Measured live on 2026-09-18: `qwen3.8:27b` at 17.7 GB on a 16.0 GB
+        card, 7 min 49 s from key release to spoken reply — while `brain:`
+        said "reachable" and `gpu headroom:` counted free bytes. The same turn
+        took 10 s after the model was changed to a 7.6 GB one.
+        """
+        monkeypatch.setattr(idle, "_llm_footprint_mb", lambda: 18_124)   # 17.7 GB
+        out = idle._brain_fit_note(16_380)
+        assert "can NEVER be fully offloaded" in out, out
+        assert "MINUTES" in out and "Settings" in out, out
+
+        # A model that fits with room for the voice, and one that just fits.
+        monkeypatch.setattr(idle, "_llm_footprint_mb", lambda: 7_782)    # 7.6 GB
+        assert "stay on the GPU" in idle._brain_fit_note(16_380)
+        monkeypatch.setattr(idle, "_llm_footprint_mb", lambda: 14_500)
+        assert "little is left for speech" in idle._brain_fit_note(16_380)
+
+        # Nothing measured, nothing claimed — the same rule the release
+        # verdict follows, so an unreadable card or model cannot invent advice.
+        monkeypatch.setattr(idle, "_llm_footprint_mb", lambda: None)
+        assert idle._brain_fit_note(16_380) == ""
+        monkeypatch.setattr(idle, "_llm_footprint_mb", lambda: 7_782)
+        assert idle._brain_fit_note(None) == ""
+        assert idle._brain_fit_note("junk") == ""
+
+        # ...and it rides the doctor's own line list, so `--ptt doctor` says it.
+        _nvidia(idle, monkeypatch, pool="10000, 16380",
+                procs=f"{os.getpid()}, 3400")
+        lines = idle._gpu_headroom_lines()
+        assert any("brain fit:" in ln for ln in lines), lines
 
 
 class TestReloadMeasurement:

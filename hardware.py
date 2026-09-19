@@ -77,10 +77,25 @@ def _default_probers() -> dict:
         "ydotool_which": lambda: shutil.which("ydotool"),
         "socket_connectable": _sock_ok,
         "fastfetch_which": lambda: shutil.which("fastfetch"),
-        "fastfetch_json": lambda: subprocess.run(
-            ["fastfetch", "-j"], capture_output=True, text=True,
-            timeout=3).stdout,
+        "fastfetch_json": _fastfetch_json,
     }
+
+
+def _fastfetch_json() -> str:
+    """`fastfetch -j` output, or "" when the command did not succeed.
+
+    The exit status was ignored and `.stdout` was returned whatever happened, so
+    a fastfetch that failed (or was killed before it printed) handed the section
+    an empty string that parsed as an empty machine — reported `ok: True` with
+    no facts at all, which is worse than a missing binary because nothing says
+    anything is wrong.
+    """
+    try:
+        proc = subprocess.run(["fastfetch", "-j"], capture_output=True,
+                              text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
 
 _LEGACY_YDOTOOL_SOCKET = "/tmp/.ydotool_socket"
 
@@ -312,7 +327,14 @@ def _snapshot_cached(root: Path) -> bool:
     snapshots = root / "snapshots"
     if not snapshots.is_dir():
         return False
-    for snap in snapshots.iterdir():
+    try:
+        entries = list(snapshots.iterdir())
+    except OSError:
+        # A directory that exists and cannot be READ raised straight out of
+        # here: `is_dir()` is its own stat, so it answers a different question
+        # than "may I enumerate this".
+        return False
+    for snap in entries:
         if not snap.is_dir():
             continue
         try:
@@ -328,9 +350,12 @@ def _stt_tts(ctx: dict) -> dict:
         tdir = Path(str(ctx.get("tts_weights_dir") or ""))
         wdir = Path(str(ctx.get("whisper_model_dir") or ""))
         tts_cached = _snapshot_cached(tdir)
+        # The whisper side shares the guard for the same reason: this was the
+        # one `iterdir` outside it, so an unreadable whisper directory took the
+        # whole section down instead of degrading it.
+        cached = any(wdir.iterdir()) if wdir.is_dir() else False
     except OSError as e:
         return _deg(e)
-    cached = any(wdir.iterdir()) if wdir.is_dir() else False
     # `ok` means "both speech directions are ready", not "the TTS weights
     # exist". It mirrored `tts_cached` alone, so a bubble with working speech
     # and NO whisper model reported `ok: True` — a deaf assistant described as
@@ -416,8 +441,13 @@ def _fastfetch(probers: dict) -> dict:
         return {"ok": False, "installed": False,
                 "note": "fastfetch not installed"}
     raw = probers["fastfetch_json"]()
+    if not str(raw or "").strip():
+        # Empty output is not "a machine with no facts": it is a probe that
+        # produced nothing. Reported as a success it was the one shape of
+        # failure the section could not describe.
+        return _deg("fastfetch produced no output")
     try:
-        mods = json.loads(raw or "[]")
+        mods = json.loads(raw)
         by_type = {m.get("type"): m.get("result") for m in mods
                    if isinstance(m, dict) and m.get("result") is not None}
     except Exception as e:

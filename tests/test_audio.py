@@ -2038,7 +2038,8 @@ class TestHandsfreeConfirm:
         deadline, ready = time.time() + 5, False
         while time.time() < deadline:
             try:
-                from test_lifecycle import TestControlSocket  # noqa: import here (the original fixture body did this too)
+                # imported here, as the original fixture body did
+                from test_lifecycle import TestControlSocket
                 if TestControlSocket._roundtrip(sock_path, "status").startswith("state="):
                     ready = True
                     break
@@ -2368,10 +2369,60 @@ class TestMicHistory:
         assert "open-failing" in prefix
         # same day: no second briefing
         assert a._maybe_briefing_prefix("hello again") == ""
-        # new day, no new problems since the stamp -> no mic section
+        # new day, no new problems since the stamp -> no mic section.
+        # The once-a-day stamp that survives a reload is the one on disk, so a
+        # simulated new day has to move that whole file back: the stamp AND the
+        # events. Moving only the in-memory copy still reads as "already
+        # greeted today", and moving only the stamp would make today's problem
+        # look like a new one since yesterday's briefing.
+        shift = 26 * 3600
+        doc = json.loads(_micfile.read_text())
+        doc["last_briefing"] = doc["last_briefing"] - shift
+        for event in doc.get("events", []):
+            if isinstance(event.get("t"), (int, float)):
+                event["t"] -= shift
+        _micfile.write_text(json.dumps(doc), encoding="utf-8")
         a._briefing_done_date = ""
         prefix2 = a._maybe_briefing_prefix("good morning")
         assert "Sunny" in prefix2 and "Microphone problems" not in prefix2
+
+    def test_a_live_reload_does_not_re_arm_the_briefing(self, H, _micfile,
+                                                        monkeypatch):
+        """The once-a-day stamp cannot live only in the object's memory.
+
+        `--ptt reload-settings` (and the Settings app's live apply) builds a
+        FRESH Assistant, and the greeting then read as due again: measured
+        2026-09-18, `morning briefing delivered` at 21:17, 21:24 and 21:35,
+        each one a reload apart. The stamp that survives is the one the mic
+        state file already carries.
+        """
+        monkeypatch.setitem(H.SETTINGS, "briefing", True)
+        monkeypatch.setitem(H.SETTINGS, "home_place", "Berlin")
+        monkeypatch.setattr(H, "_world_events", lambda *a, **k: ([], False))
+
+        class _Tools:
+            @staticmethod
+            def execute(name, args):
+                return _core_tools.ToolResult("Sunny, 21 degrees in Berlin.")
+
+        def fresh():
+            """A new Assistant, exactly as a live reload leaves one."""
+            a = H.Assistant.__new__(H.Assistant)
+            a._tools = _Tools()
+            a._briefing_done_date = ""
+            return a
+
+        H._mark_briefing_delivered()          # today's stamp, on disk
+        assert fresh()._maybe_briefing_prefix("good morning") == "", (
+            "a reload re-armed the daily greeting")
+
+        # ...and yesterday's stamp must NOT silence today's briefing: the line
+        # is a date, not a boolean.
+        doc = json.loads(_micfile.read_text())
+        doc["last_briefing"] = time.time() - 26 * 3600
+        _micfile.write_text(json.dumps(doc), encoding="utf-8")
+        prefix = fresh()._maybe_briefing_prefix("good morning")
+        assert "Sunny" in prefix, prefix
 
     def test_briefing_skipped_without_problems_or_disabled(self, H, _micfile,
                                                            monkeypatch):

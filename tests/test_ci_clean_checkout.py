@@ -239,12 +239,19 @@ class TestTheHarnessEnvironment:
     HARMLESS = ("GIT_EXEC_PATH",)
 
     def test_the_dropped_list_covers_what_a_hook_is_really_handed(self):
-        """Read from a real hook rather than from this file's opinion.
-
-        The list above is only right if it covers what git really passes, and the
-        only authority on that is git: a probe hook dumps its own environment, and
-        `GIT_INDEX_FILE` — the one that broke the fixture — has to be in it and in
+        """Read from a real hook rather than from this file's opinion.        The list above is only right if it covers what git really passes, and the
+        only authority on that is git: a probe hook dumps its own environment,
+        and `GIT_INDEX_FILE` — the one that broke the fixture — has to be in it and in
         the list.
+
+        The HELPER family is PLANTED rather than waited for. Reading only what
+        git exports made this guard as good as the machine it ran on: the two
+        names it was missing (`GIT_ASKPASS`, `GIT_PAGER`) were found by a run in
+        an environment that exported them, while the same suite passed here
+        (2026-09-18), because git does not invent those itself. So the probe
+        commit now runs with the family in its environment, and the assertion
+        below fails when the list stops covering a name — whichever machine
+        runs it.
         """
         hooks = Path(tempfile.mkdtemp(prefix="handsoff-hookprobe-"))
         dump = hooks / "exported.txt"
@@ -254,6 +261,16 @@ class TestTheHarnessEnvironment:
         hook.chmod(0o755)
         repo = Path(tempfile.mkdtemp(prefix="handsoff-hookprobe-repo-"))
         env = sandbox_env()
+        # Planted, not inherited: a leaked helper is a program the child's git
+        # would run, and no test may depend on the developer's shell exporting
+        # one for that to be true.
+        env.update({
+            "GIT_ASKPASS": "/bin/false",
+            "GIT_PAGER": "cat",
+            "GIT_SSH_COMMAND": "ssh -o IdentitiesOnly=yes",
+            "GIT_EXTERNAL_DIFF": "/bin/false",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+        })
         _git(repo, "init", "-q", env=env)
         subprocess.run(
             ["git", "-C", str(repo), "-c", f"core.hooksPath={hooks}",
@@ -268,6 +285,9 @@ class TestTheHarnessEnvironment:
             f"the probe hook was handed {sorted(exported)} — if the index is not "
             f"among them, git has stopped exporting what broke the fixture and "
             f"this guard needs re-reading, not deleting")
+        assert "GIT_ASKPASS" in exported, (
+            f"the planted helper never reached the hook ({sorted(exported)}), so "
+            f"this guard is only as strong as the machine's environment again")
         missed = sorted(name for name in exported
                         if name not in GIT_PLUMBING + self.HARMLESS)
         assert not missed, (

@@ -424,6 +424,44 @@ class TestAuditFixes:
         H._strip_images(history)
         assert all("images" not in m for m in history)
 
+    def test_an_unanswered_tool_call_is_stripped_before_it_is_stored(self, H):
+        """A turn that stops for a confirmation offer publishes a message whose
+        calls were only PARTLY answered. History is the prefix of every later
+        request, and a tool call with no matching result is the shape a model
+        rejects or mis-conditions on — on every future turn."""
+        history = [
+            {"role": "user", "content": "do two things"},
+            {"role": "assistant", "content": "On it.",
+             "tool_calls": [{"id": "a", "function": {"name": "one"}},
+                            {"id": "b", "function": {"name": "two"}}]},
+            {"role": "tool", "tool_name": "one", "content": "done"},
+        ]
+        H._seal_tool_calls(history)
+        assert "tool_calls" not in history[1]
+        assert history[1]["content"] == "On it.", "the words must stay"
+
+    def test_a_fully_answered_batch_keeps_its_plumbing(self, H):
+        """Matched by position: the bubble's tool entries carry no id, so an
+        id-based match would call every answered call orphaned."""
+        history = [
+            {"role": "assistant", "content": "On it.",
+             "tool_calls": [{"function": {"name": "one"}}]},
+            {"role": "tool", "tool_name": "one", "content": "done"},
+        ]
+        H._seal_tool_calls(history)
+        assert history[0]["tool_calls"], (
+            "an answered call lost its plumbing — history no longer matches "
+            "the conversation the model produced")
+
+    def test_a_call_only_message_disappears_rather_than_emptying(self, H):
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"function": {"name": "one"}}]},
+        ]
+        H._seal_tool_calls(history)
+        assert [m["role"] for m in history] == ["user"], history
+
     def test_urllib_parse_imported_explicitly(self, H):
         import ast, pathlib
         tree = ast.parse(pathlib.Path(H.__file__).read_text())

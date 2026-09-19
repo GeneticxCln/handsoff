@@ -411,19 +411,28 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                        state: MutableMapping[str, bool] | None = None,
                        urlopen: Callable = urllib.request.urlopen,
                        keep_alive: str | None = None) -> dict:
-    """Stream chat content into q, ending it with exactly one terminator."""
-    guard()
-    payload = _defaults(base, model, num_ctx, tools, True, keep_alive)
-    messages = _messages_system_first(messages, logger)
-    payload["messages"] = messages
-    req = urllib.request.Request(
-        base + "/api/chat", data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"})
+    """Stream chat content into q, ending it with exactly one terminator.
+
+    EVERY step that can raise lives inside the `try`, `guard()` and the request
+    build included. The `finally` is what puts the terminator on the queue, and
+    the speaker blocks on that queue until it sees one — so a raise from before
+    the `try` did not fail the turn, it HUNG the voice loop with no apology and
+    no recovery, freeable only by a manual barge-in. The docstring promised
+    "exactly one terminator"; this makes the promise unconditional rather than
+    a claim that held only for the failures the author had in mind.
+    """
     buf = ""
     full = ""
     tool_calls: list[dict] = []
     fallback = False
     try:
+        guard()
+        payload = _defaults(base, model, num_ctx, tools, True, keep_alive)
+        messages = _messages_system_first(messages, logger)
+        payload["messages"] = messages
+        req = urllib.request.Request(
+            base + "/api/chat", data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
         with urlopen(req, timeout=300) as response:
             for raw in response:
                 if cancel is not None and cancel.is_set():

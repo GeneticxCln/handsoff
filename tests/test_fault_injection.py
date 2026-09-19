@@ -138,6 +138,31 @@ class TestOllamaRefuses:
                 urlopen=lambda req, timeout=None: (_ for _ in ()).throw(refused()))
         assert list(q.queue) == [None]
 
+    def test_a_failure_before_the_fetch_still_ends_the_queue(self, H):
+        """The terminator is owed even when the raise is UPSTREAM of the fetch.
+
+        `guard()` and the request build sat before the `try`, and the `finally`
+        is what puts the terminator on the queue — so a raise there skipped it
+        and the speaker blocked on a queue that would never be ended. The turn
+        hung with no apology and no recovery, freeable only by a manual
+        barge-in; the docstring's "exactly one terminator" held only for the
+        failures the author had in mind (verified in source, 2026-09-18).
+        """
+        q: queue.Queue = queue.Queue()
+
+        def refuse() -> None:
+            raise RuntimeError("the guard refused this turn")
+
+        with pytest.raises(RuntimeError):
+            H._brain.ollama_chat_stream(
+                [{"role": "user", "content": "hi"}], q, threading.Event(), None,
+                base=BASE, model="m", num_ctx=4096, guard=refuse,
+                logger=logging.getLogger("handsoff.fault"),
+                urlopen=lambda req, timeout=None: None)
+        assert list(q.queue) == [None], (
+            "a failure before the fetch left the sentence queue unended — the "
+            "speaker waits on that queue forever")
+
     def test_refusal_reaches_the_user_as_offline_not_empty(self, H, caplog, monkeypatch):
         """End to end, through the streaming path the bubble actually uses."""
         spoken: list[str] = []

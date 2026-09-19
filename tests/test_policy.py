@@ -132,6 +132,70 @@ class TestToolBelt:
         assert "restart" in yes
         assert (tmp_path / "handsoff.py.bak").exists()  # backup written
 
+    def test_an_edit_that_compiles_but_cannot_load_is_rolled_back(
+            self, tb, H, tmp_path, monkeypatch):
+        """The crash-loop guard: syntax is not the same as a loadable module.
+
+        The unit is `Restart=always`, so a module that raises while being
+        imported never reaches main() — the bubble crash-loops with no voice
+        and no doctor, and only a hand-run install.sh recovers it. Compiling is
+        therefore not enough, and the check has to be a real import: `raise`
+        here is valid syntax, valid bytecode, and fatal at load.
+        """
+        belt, _ = tb
+        fake_self = tmp_path / "handsoff.py"
+        original = H.SELF_MARKER + "\nprint('v1')\n"
+        fake_self.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(H, "SELF_PATH", fake_self)
+        belt._set_user_turn(1)
+        belt.execute("edit_file", {
+            "path": str(fake_self),
+            "content": H.SELF_MARKER + "\nraise RuntimeError('boom at import')\n"})
+        belt._set_user_turn(2)
+
+        out, err = belt.execute("confirm_action", {"answer": "yes"})
+
+        assert err and out.startswith("ERROR"), out
+        assert "does not load" in out and "boom at import" in out, out
+        assert fake_self.read_text(encoding="utf-8") == original, (
+            "a module that cannot be imported must not be left on disk")
+        assert "put back" in out, out
+
+    def test_an_edit_that_loads_is_kept(self, tb, H, tmp_path, monkeypatch):
+        """The smoke test must not refuse a normal edit."""
+        belt, _ = tb
+        fake_self = tmp_path / "handsoff.py"
+        fake_self.write_text(H.SELF_MARKER + "\nprint('v1')\n", encoding="utf-8")
+        monkeypatch.setattr(H, "SELF_PATH", fake_self)
+        new_src = H.SELF_MARKER + "\nVALUE = 2\n"
+        belt._set_user_turn(1)
+        belt.execute("edit_file", {"path": str(fake_self), "content": new_src})
+        belt._set_user_turn(2)
+
+        out, err = belt.execute("confirm_action", {"answer": "yes"})
+
+        assert not err and out.startswith("wrote"), out
+        assert fake_self.read_text(encoding="utf-8") == new_src
+
+    def test_a_new_file_that_cannot_load_is_removed_again(
+            self, tb, H, tmp_path, monkeypatch):
+        """No `.bak` to restore: the half-installed module goes away."""
+        belt, _ = tb
+        fake_self = tmp_path / "handsoff.py"
+        monkeypatch.setattr(H, "SELF_PATH", fake_self)
+        belt._set_user_turn(1)
+        belt.execute("edit_file", {
+            "path": str(fake_self),
+            "content": H.SELF_MARKER + "\nimport no_such_module_anywhere\n"})
+        belt._set_user_turn(2)
+
+        out, err = belt.execute("confirm_action", {"answer": "yes"})
+
+        assert err and "does not load" in out, out
+        assert "no_such_module_anywhere" in out, out
+        assert not fake_self.exists(), "a file that cannot load must not survive"
+        assert "removed again" in out, out
+
     def test_self_edit_confirm_is_forced_even_when_policy_allows(self, tb, H,
                                                                  tmp_path, monkeypatch):
         """Prompt-injection hardening: command_policy ALLOW must NOT downgrade
@@ -186,6 +250,30 @@ class TestToolBelt:
         belt._perm["self_restart"] = False
         out, err = belt.execute("run_command", {"command": str(fake_restart)})
         assert err and "self-restart is disabled" in out
+
+    def test_the_restart_note_is_armed_before_the_command_runs(
+            self, tb, H, tmp_path, monkeypatch):
+        """The restart script KILLS this process, so the note has to be written
+        before the command: anything after `subprocess.run` usually never ran,
+        which is why "I'm back, with my changes applied" never fired."""
+        belt, notes = tb
+        order: list = []
+        monkeypatch.setattr(belt, "_on_restart_pending",
+                            lambda: (order.append("note"),
+                                     notes.append("pending")))
+        fake_restart = tmp_path / "handsoff-restart"
+        fake_restart.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake_restart.chmod(0o755)
+        monkeypatch.setattr(H, "RESTART_SCRIPT", fake_restart)
+
+        def killed(*_args, **_kwargs):
+            order.append("command")
+            raise OSError("this process was killed by the restart")
+
+        monkeypatch.setattr(H.subprocess, "run", killed)
+        with pytest.raises(OSError):
+            belt.run_command(str(fake_restart))
+        assert order == ["note", "command"], order
 
     def test_unknown_tool(self, tb):
         belt, _ = tb
@@ -1353,6 +1441,18 @@ class TestSplitConfirm:
             {"path": str(target), "content": "x\n" * 100}, limit=20)
         assert "diff truncated" in preview
 
+    def test_a_clipped_diff_still_says_what_it_left_out(self, H):
+        """The confirmation the user HEARS must not describe a smaller change
+        than the one being offered: a plain cut can hide a whole hunk behind
+        "… (diff truncated)", which is where a backdoor in the tail of a
+        self-edit would sit — inside the change, outside the description."""
+        dump = "".join(f"-old line {i}\n+new line {i}\n" for i in range(200))
+        clip = H.ToolBelt._clip_preview(dump, 200)
+        assert clip.startswith(dump[:150])
+        assert "diff truncated at 200 of" in clip
+        assert "more line(s) added" in clip
+        assert "+new line 0" in clip      # what it shows is a real prefix
+
 
 class TestSecretPathGuard:
     """read_file, watch_file and run_command share ONE credential predicate.
@@ -1429,6 +1529,72 @@ class TestSecretPathGuard:
         assert err and out.startswith("REFUSED"), out
         dotdot = f"{tmp_path}/.ssh/../.ssh/id_rsa"
         assert belt._validate_command(f"cat {dotdot}")[2] is not None
+
+    def test_a_runtime_store_is_refused_like_settings(self, tb, tmp_path):
+        """history.json and memory.json are injected into EVERY future prompt.
+
+        Only settings.json was name-refused, so one unconfirmed edit_file
+        installed a standing instruction that outlived the session — the model
+        editing its own orders. The stores that speak for the user are refused
+        by name, through the same door settings.json already had.
+        """
+        belt, _ = tb
+        for name in ("history.json", "memory.json", "reminders.json"):
+            out, _err = belt.execute(
+                "edit_file", {"path": str(belt._deps.CONFIG_DIR / name),
+                              "content": "[]"})
+            assert "REFUSED" in out and "runtime store" in out, out
+
+    def test_a_flag_value_cannot_carry_a_credential_path(self, tb, tmp_path):
+        """`--flag=<path>` used to be skipped whole, because it starts with `-`.
+
+        The secret-path loop `continue`d on every token beginning with a dash,
+        so the path on the far side of the `=` was never tested — and one
+        whitelisted read-only verb WRITES a file with that flag. Verified
+        2026-09-18: `git diff --output=$HOME/.config/handsoff/settings.json` was
+        ACCEPTED.
+        """
+        belt, _ = tb
+        argv, _, err, _ = belt._validate_command("git diff --output=~/.ssh/id_rsa")
+        assert argv is None and "REFUSED" in err and ".ssh" in err, err
+
+    def test_git_output_is_refused_because_it_writes_a_file(self, tb):
+        """git is allowed READ-ONLY, and `--output` is its write channel.
+
+        A diff written over `settings.json` silently resets every permission
+        switch to its default, and the same flag reaches any other file the
+        bubble can write, with no confirmation step in between — which is why
+        the refusal is about the FLAG and not about the target: paths that are
+        ordinary files (and allowed to be read) are exactly what it must not
+        accept here.
+        """
+        belt, _ = tb
+        for command in ("git diff --output=~/.config/handsoff/settings.json",
+                        "git log --output=/tmp/anywhere.txt",
+                        "git show --output ~/notes.md"):
+            argv, _, err, _ = belt._validate_command(command)
+            assert argv is None and "REFUSED" in err, (command, err)
+            assert "--output" in err, (command, err)
+
+    def test_a_short_flag_cluster_cannot_hide_a_branch_delete(self, tb):
+        """`a.lstrip('-')` read `-rd` as one name, which matched no delete flag.
+
+        `git branch -rd x` removes a remote-tracking ref (and `-ad` deletes
+        every merged branch), so both slipped through a guard written to refuse
+        exactly that (verified 2026-09-18). The letters are now tested
+        individually, which is what makes this a bug fix rather than a longer
+        list of spellings.
+        """
+        belt, _ = tb
+        for command in ("git branch -rd origin/x", "git branch -ad x",
+                        "git branch -D x", "git branch --delete x"):
+            argv, _, err, _ = belt._validate_command(command)
+            assert argv is None and "REFUSED" in err, (command, err)
+        # ...and the reading verbs a cluster can legitimately look like stay.
+        for command in ("git branch -a", "git branch -avv", "git log -p",
+                        "git diff", "git status"):
+            argv, _, err, _ = belt._validate_command(command)
+            assert err is None and argv, (command, err)
 
 
 class TestStrictArgumentCoercion:
