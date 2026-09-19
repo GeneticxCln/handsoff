@@ -44,6 +44,7 @@ import base64
 import faulthandler
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import json
 import logging
@@ -3409,14 +3410,103 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect())
 
 
-def _http_get_hop(url: str, timeout: float = 10.0) -> tuple:
+def _dial_pinned(pins, timeout=None, source_address=None):
+    """Connect to the CHECKED addresses, in order: no name is resolved here.
+
+    `socket.create_connection` takes a (host, port) and looks it up itself, so
+    the pin is applied by handing it the address LITERALS `core.web` approved —
+    a literal needs no lookup, which is the point. The list is tried in the
+    order the policy checked it, so a dual-stack name keeps its fallback address
+    instead of losing the family this machine cannot reach.
+    """
+    last = None
+    for index, pin in enumerate(pins):
+        ip, port = pin[0], pin[1]
+        try:
+            return socket.create_connection((str(ip), int(port)), timeout,
+                                            source_address)
+        except OSError as exc:
+            last = exc
+            if index == len(pins) - 1:
+                raise
+    raise last           # unreachable: the loop returns or raises
+
+
+def _pinned_connection(base, pins):
+    """An `http.client` connection that dials `pins` but keeps the NAME.
+
+    `HTTPConnection.connect` builds its socket through `self._create_connection`
+    (the class attribute `socket.create_connection`), and `HTTPSConnection` then
+    wraps that socket with `server_hostname=self.host`. Replacing that one
+    callable therefore pins the address while the Host header, the SNI and the
+    certificate check all stay about the name the user asked for — which is what
+    makes this a pin and not a rewrite to an IP. `http.client` does not follow
+    redirects, which is this seam's contract too.
+    """
+    def _create(address, timeout=None, source_address=None):
+        return _dial_pinned(pins, timeout, source_address)
+
+    class _Pinned(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # An INSTANCE attribute, not a class one: a plain function on the
+            # class would be bound and receive `self` as its first argument.
+            self._create_connection = _create
+
+    return _Pinned
+
+
+def _pinned_get(url: str, timeout: float, pins) -> tuple:
+    """One GET to the checked address: `(body, Location or "")`."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = (parts.scheme or "http").strip().lower()
+    host = parts.hostname or ""
+    port = parts.port or (443 if scheme == "https" else 80)
+    base = (http.client.HTTPSConnection if scheme == "https"
+            else http.client.HTTPConnection)
+    conn = _pinned_connection(base, pins)(host, port, timeout=timeout)
+    try:
+        path = urllib.parse.urlunsplit(("", "", parts.path or "/",
+                                        parts.query, ""))
+        # identity: http.client does not decompress, and this path sends no
+        # Accept-Encoding through urllib's opener.
+        conn.request("GET", path, headers={"User-Agent": _HTTP_UA,
+                                          "Accept-Encoding": "identity"})
+        resp = conn.getresponse()
+        if resp.status in (301, 302, 303, 307, 308):
+            return b"", str(resp.headers.get("Location") or "")
+        if resp.status >= 400:
+            raise urllib.error.HTTPError(url, resp.status, resp.reason,
+                                         resp.headers, None)
+        return resp.read(2_000_000), ""
+    finally:
+        conn.close()
+
+
+def _http_get_hop(url: str, timeout: float = 10.0, connect_to=None) -> tuple:
     """ONE request, WITHOUT following redirects: `(body, Location or "")`.
 
     `core.web.read_page` walks the chain itself so that the address it
     validated is the address it fetches from. A redirect target is a new
     address, and a model-supplied URL that passes every rule can still answer
     `302 Location: http://169.254.169.254/…`.
+
+    `connect_to` is the address list `core.web` approved for this exact URL
+    (`(ip, port)` pairs). With it, the request goes over a connection pinned to
+    those addresses, which closes the DNS-rebinding window — the name is
+    validated once and resolved AGAIN at connect time, and a name server is free
+    to answer the second lookup with 127.0.0.1 or a metadata address. Without
+    it (an older caller) the name is resolved here, as before.
+
+    Deliberately not urllib's opener in the pinned case: that opener owns the
+    hostname resolution this exists to bypass. Two stated limits of the choice:
+    an HTTP proxy configured in the environment is not used for a pinned fetch
+    (a proxy is another party that would resolve the name itself), and the
+    pinned path sends `Accept-Encoding: identity` because `http.client` does no
+    decompression.
     """
+    if connect_to:
+        return _pinned_get(url, timeout, connect_to)
     req = urllib.request.Request(url, headers={"User-Agent": _HTTP_UA})
     try:
         with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as r:
@@ -3438,7 +3528,8 @@ _web.configure(
     http_get=lambda url, timeout=10.0: _http_get(url, timeout),
     # The reader's second seam: one request, redirects NOT followed, so the URL
     # policy in `core.web` applies to every hop rather than to the first one.
-    http_get_hop=lambda url, timeout=10.0: _http_get_hop(url, timeout),
+    http_get_hop=lambda url, timeout=10.0, connect_to=None: _http_get_hop(
+        url, timeout, connect_to=connect_to),
     searxng_url=lambda: str(SETTINGS.get("searxng_url") or ""),
     logger=log,
 )

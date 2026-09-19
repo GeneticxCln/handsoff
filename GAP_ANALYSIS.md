@@ -3790,11 +3790,26 @@ value (`int(...)` on a setting) is not a guard, it is the sound of the bug
 arriving; the fix is at the writer. A cap the data structure cannot represent
 (`maxlen=60` vs a limit of 600) is not a cap; the fix is at the structure.
 
-The unresolved residue, stated rather than implied: the DNS-rebinding window in
-`core/web.py` (the URL is validated, then re-resolved at fetch) and the watcher's
-`(a|aa)+` alternation ReDoS remain, both documented at their site and both
-bounded to one daemon thread. Neither was in this pass; neither should be read as
-fixed because these were.
+The unresolved residue, stated rather than implied at the time: the
+DNS-rebinding window in `core/web.py` (the URL is validated, then re-resolved at
+fetch) and the watcher's `(a|aa)+` alternation ReDoS, both documented at their
+site and both bounded to one daemon thread. **The rebinding window is CLOSED
+(2026-09-19)**, and the shape of the fix is the same rule one layer down: the
+reader no longer leaves the checked address behind. `_public_target` returns the
+addresses it approved and `_read_fetch` hands them to the fetch (`connect_to`),
+so the transport dials the literal that was checked while the Host header, the
+SNI and the certificate check stay about the name — the name is not resolved a
+second time, so there is no second answer for a name server to diverge on. Every
+redirect hop carries its OWN pin (a chain that carried the first hop's address
+forward would fetch the last hop from the first hop's host), a seam that cannot
+take a pin is used but WARNED about rather than silently unpinned, and the
+lookup itself is bounded by `_DNS_TIMEOUT_S` because `getaddrinfo` has no timeout
+of its own. What remains, stated rather than implied: a pinned fetch does not use
+an HTTP proxy from the environment (a proxy is another party that would resolve
+the name itself) and sends `Accept-Encoding: identity`; the DNS bound is a
+daemon thread the reader walks away from, not a cancellation, so a truly stuck
+resolver leaves one thread behind per attempt; and the watcher's ReDoS still
+stands, documented at its site.
 
 ## The same rule, seen from the other side
 

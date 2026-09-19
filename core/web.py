@@ -164,8 +164,30 @@ def _http(url: str, timeout: float = SEARCH_TIMEOUT) -> bytes:
 MAX_REDIRECTS = 5           # a chain longer than this is refused, not followed
 
 
-def _hop(url: str, timeout: float) -> tuple:
-    """ONE request, redirects NOT followed: (body, Location or "")."""
+def _accepts_connect_to(fn) -> bool:
+    """True when the injected hop fetch can be handed the checked addresses.
+
+    A seam that takes `connect_to` (or `**kwargs`) can dial the address the
+    policy approved; one that cannot resolves the name a second time, which is
+    the rebinding window left open. Detected rather than required, so a partial
+    install or a test double still fetches — and is TOLD what it is giving up.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return True
+    return "connect_to" in params
+
+
+def _hop(url: str, timeout: float, connect_to=None) -> tuple:
+    """ONE request, redirects NOT followed: (body, Location or "").
+
+    `connect_to` is the address LIST the policy approved for THIS url (`(ip,
+    port)` pairs), passed straight through so the transport can dial exactly
+    what was checked instead of resolving the name again.
+    """
     target = _HTTP_HOP
     if target is None:
         return None, ""
@@ -173,11 +195,17 @@ def _hop(url: str, timeout: float) -> tuple:
         target = _resolve(target)
     if target is None:
         return None, ""
+    if connect_to and _accepts_connect_to(target):
+        return target(url, timeout, connect_to=connect_to)
+    if connect_to:
+        _warn("the injected hop fetch cannot be pinned to the checked address "
+              "for %s: it resolves the name a second time, and a rebinding "
+              "name can answer differently than it did for the check", url)
     body, location = target(url, timeout)
     return body, str(location or "")
 
 
-def _read_fetch(url: str, timeout: float) -> tuple:
+def _read_fetch(url: str, timeout: float, connect_to=None) -> tuple:
     """(body, final_url, problem): the reader's fetch, redirects walked HERE.
 
     `_public_url` checks the address ONCE, and a redirect is a NEW address that
@@ -192,18 +220,30 @@ def _read_fetch(url: str, timeout: float) -> tuple:
     untrusted address. Relative Locations are resolved against the URL that
     sent them, which is what a browser does and what a server means.
 
+    The second hole is the one no check on the NAME can close: the checked
+    address and the fetched address used to be two separate resolutions of the
+    same name, and a name server is free to answer them differently (DNS
+    rebinding — public for the policy, 127.0.0.1 for the socket). So every hop
+    carries the addresses `_public_target` approved for it into the fetch.
+
     A host without the hop seam (a partial install, or a test that patched only
     the plain fetch) gets the one-shot fetch and a warning, because the honest
     alternative — reading nothing — would take the feature away from every
-    caller rather than one.
+    caller rather than one. `connect_to` is the address list the caller already
+    checked for the FIRST hop; every later hop is checked here, as before.
     """
     if _HTTP_HOP is None:
-        _warn("no redirect-checking fetch injected: reading %s in one shot", url)
+        _warn("no redirect-checking fetch injected: reading %s in one shot "
+              "— redirects are followed unchecked AND the checked address "
+              "cannot be pinned, so the name is resolved a second time", url)
         return _http(url, timeout), url, ""
-    current = url
+    current, pins = url, connect_to
     for _ in range(MAX_REDIRECTS + 1):
-        body, location = _hop(current, timeout)
+        body, location = _hop(current, timeout, connect_to=pins)
         if body is None:                     # seam disappeared mid-walk
+            _warn("the hop fetch vanished mid-walk for %s: reading %s in one "
+                  "shot — unchecked redirects, and the name is resolved "
+                  "again rather than pinned", url, current)
             return _http(current, timeout), current, ""
         if not location:
             return body, current, ""
@@ -212,7 +252,7 @@ def _read_fetch(url: str, timeout: float) -> tuple:
         except ValueError:
             return b"", current, (f"{current} redirected to {location!r}, which "
                                   f"is not a usable address")
-        clean, problem = _public_url(target)
+        clean, pins, problem = _public_target(target)
         if problem:
             return b"", current, (f"{current} redirected to {target}, which is "
                                   f"not fetched: {problem}")
@@ -734,44 +774,115 @@ def _is_private_ip(host: str) -> bool:
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
-def _public_url(url: str) -> tuple:
-    """(url, problem): `url` only when it is a public http(s) address.
+#: How long a name may take to resolve before the reader gives up on it.
+#: `socket.getaddrinfo` has no timeout of its own, and this runs inside a turn
+#: the user is waiting on, so a name server that never answers must not hold the
+#: reply hostage.
+_DNS_TIMEOUT_S = 5.0
+
+
+def _resolve_host(host: str, port) -> tuple:
+    """(getaddrinfo result, problem): a name's addresses, BOUNDED in time.
+
+    Nothing here judges the addresses — `_public_target` does — because the
+    result is also what gets PINNED for the fetch, and a judgement made on a
+    different reading than the connection would be the very race this pair
+    exists to remove.
+
+    The wait is bounded by a worker thread the C call owns and cannot cancel,
+    so a wedged resolver leaves one daemon thread behind per attempt; the
+    timeout is reported rather than hidden, because "this name never answered"
+    is a different fact from "this name has no address".
+    """
+    box: dict = {}
+
+    def _call() -> None:
+        try:
+            box["infos"] = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        except Exception as exc:
+            box["error"] = exc
+
+    th = threading.Thread(target=_call, name="dns-resolve", daemon=True)
+    th.start()
+    th.join(_DNS_TIMEOUT_S)
+    if th.is_alive():
+        return [], f"{host} could not be resolved within {_DNS_TIMEOUT_S:.0f}s"
+    if "error" in box:
+        return [], f"{host} cannot be resolved ({type(box['error']).__name__})"
+    return list(box.get("infos") or []), ""
+
+
+def _public_target(url: str) -> tuple:
+    """(url, pinned addresses, problem): a public http(s) address, and WHICH.
 
     The reader is asked for addresses by a language model, so the address is
     untrusted input: this machine's own services, the LAN, link-local metadata
     endpoints and mDNS names are refused rather than fetched into a transcript.
     A name that RESOLVES to such an address is refused too, which is what makes
     this a check on the destination and not on the spelling.
+
+    The addresses come back WITH the verdict because checking a name and then
+    fetching it by name is a race a name server can win: the same name can
+    answer with a public address for this check and with 127.0.0.1 (or
+    169.254.169.254) a moment later, when the transport resolves it again — DNS
+    rebinding, and the transport is the only place that can close it. So the
+    caller hands these exact addresses to the fetch (`connect_to` in the hop
+    seam), which connects to them while still validating the certificate against
+    the NAME: the checked address and the connected address are then the same
+    one by construction rather than by timing.
     """
     raw = str(url or "").strip()
     if not raw:
-        return "", "no address given"
+        return "", [], "no address given"
     if not re.match(r"^https?://", raw, re.I):
-        return "", f"{raw!r} is not an http(s) address"
+        return "", [], f"{raw!r} is not an http(s) address"
     try:
         parts = urllib.parse.urlsplit(raw)
     except ValueError:
-        return "", f"{raw!r} is not a usable address"
+        return "", [], f"{raw!r} is not a usable address"
     host = (parts.hostname or "").strip()
     if not host:
-        return "", "the address has no host"
+        return "", [], "the address has no host"
     if parts.username or parts.password:
-        return "", "addresses with credentials are not fetched"
+        return "", [], "addresses with credentials are not fetched"
     if _is_private_ip(host):
-        return "", f"{host} is on this machine or a private network"
+        return "", [], f"{host} is on this machine or a private network"
     if (host.casefold() == "localhost" or host.casefold().endswith(".local")
             or host.casefold().endswith(".internal")
             or host.casefold().endswith(".home.arpa") or "." not in host):
-        return "", f"{host} is not a public host"
+        return "", [], f"{host} is not a public host"
+    # `urlsplit` defers the port check to the `.port` property, which RAISES on
+    # anything outside 0-65535 or non-numeric — and this is a model-supplied
+    # address, so a bad port has to be a refusal with a sentence like every
+    # other bad address, not an exception out of `read_page` (which the tool
+    # wrapper could only turn into a generic "could not read that page").
     try:
-        infos = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80),
-                                   proto=socket.IPPROTO_TCP)
-    except Exception as exc:
-        return "", f"{host} cannot be resolved ({type(exc).__name__})"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return "", [], (f"{raw!r} has a port that is not a number between 0 "
+                         f"and 65535")
+    infos, problem = _resolve_host(host, port)
+    if problem:
+        return "", [], problem
+    if not infos:
+        return "", [], f"{host} has no address"
     for info in infos:
         if _is_private_ip(str(info[4][0])):
-            return "", f"{host} resolves to a private address ({info[4][0]})"
-    return urllib.parse.urlunsplit(parts), ""
+            return "", [], (f"{host} resolves to a private address "
+                            f"({info[4][0]})")
+    pins = [(str(info[4][0]), info[4][1]) for info in infos]
+    return urllib.parse.urlunsplit(parts), pins, ""
+
+
+def _public_url(url: str) -> tuple:
+    """(url, problem) — `_public_target` without the pinned addresses.
+
+    For callers that only need the verdict: sending the user's address to a
+    third-party reader, say, which fetches it from elsewhere and so has no
+    socket here to pin.
+    """
+    clean, _pins, problem = _public_target(url)
+    return clean, problem
 
 
 def read_page(url: str, max_chars: int = READ_MAX_CHARS) -> tuple:
@@ -782,7 +893,7 @@ def read_page(url: str, max_chars: int = READ_MAX_CHARS) -> tuple:
     backend that served it, so a third-party fetch is never invisible. `text` is
     "" on failure and `problem` says why, in one sentence a caller can speak.
     """
-    clean, problem = _public_url(url)
+    clean, pins, problem = _public_target(url)
     if problem:
         return "", "", problem
     try:
@@ -794,7 +905,8 @@ def read_page(url: str, max_chars: int = READ_MAX_CHARS) -> tuple:
     try:
         # The redirect-checking fetch, not `_http`: the address was validated,
         # and so must every hop the server sends us to (see `_read_fetch`).
-        raw, _final, hop_problem = _read_fetch(clean, READ_TIMEOUT)
+        raw, _final, hop_problem = _read_fetch(clean, READ_TIMEOUT,
+                                               connect_to=pins)
         if hop_problem:
             _record(_READER_SEEN, "local", False, hop_problem)
             return "", "", hop_problem

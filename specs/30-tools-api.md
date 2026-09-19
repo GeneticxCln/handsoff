@@ -128,7 +128,13 @@ fallback walk with per-backend failure record (`failure_reasons()`),
 one in-flight request per backend via `BoundedRegistry`, TTL cache 300 s,
 per-backend timeout 6 s, reader 8 s / 40 000 chars / 6000 into context.
 `read_page`: local fetch first, Jina Reader fallback — and the text says
-which served it. SSRF: loopback/link-local/private/`.local` refused.
+which served it. SSRF: loopback/link-local/private/`.local` refused, the
+redirect chain walked one hop at a time with EVERY hop put back through the
+same destination check, and the addresses each hop was checked at handed to
+the fetch (`connect_to`) so the address dialled is the address checked — the
+name is never resolved a second time behind the check. A hop seam that cannot
+be pinned is used, and warned about; the resolver is bounded by
+`_DNS_TIMEOUT_S` because `getaddrinfo` has no timeout of its own.
 `get_weather`: open-meteo, `home_place` default; severe signals (WMO set,
 75 km/h wind) feed briefings, never auto-model-judged.
 

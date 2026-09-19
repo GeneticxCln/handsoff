@@ -14,6 +14,8 @@ at the bottom, which skips itself when the machine is offline.
 """
 from __future__ import annotations
 
+import http.client
+import http.server
 import json
 import socket
 import threading
@@ -482,6 +484,11 @@ class TestReader:
         ("javascript:alert(1)", "not an http(s) address"),
         ("https://user:pw@example.com/x", "credentials"),
         ("", "no address given"),
+        # `urlsplit` defers the port check to `.port`, which RAISES — and this
+        # address comes from a model, so a bad port is a refusal like any other.
+        ("http://example.com:99999/x", "port that is not a number"),
+        ("http://example.com:abc/x", "port that is not a number"),
+        ("http://example.com:-1/x", "port that is not a number"),
     ])
     def test_the_reader_refuses_this_machine_and_the_lan(self, web, url, expected):
         f = serve(web, Fetch())
@@ -666,6 +673,152 @@ class TestDoctor:
         assert "local fetch FAILED" in note and "Jina fallback refused" in note
 
 
+class TestTheCheckedAddressIsTheOneFetched:
+    """The pin: the name is checked ONCE, and the socket goes where it pointed.
+
+    `_public_target` validated a NAME and the transport resolved that name
+    again, so a name server was free to answer the policy with a public address
+    and the socket with 127.0.0.1 — DNS rebinding, and no check on the name can
+    close it. The reader now hands each hop's checked addresses to the fetch
+    (`connect_to`), and the host's fetch dials them while keeping the name for
+    the Host header and the TLS identity.
+    """
+
+    def _pinning_hop(self, hops, seen):
+        def hop(url, timeout=10.0, connect_to=None):
+            seen.append((url, connect_to))
+            return hops.get(url, (b"", ""))
+        return hop
+
+    def test_the_policy_hands_back_the_addresses_it_checked(self, web):
+        clean, pins, problem = web._public_target("https://example.com/x")
+        assert not problem and clean == "https://example.com/x", (clean, problem)
+        assert pins == [(PUBLIC_IP, 443)], pins
+        _clean, pins, _problem = web._public_target("http://example.com/x")
+        assert pins == [(PUBLIC_IP, 80)], pins
+
+    def test_the_first_hop_is_handed_the_checked_address(self, web):
+        seen = []
+        web.configure(http_get_hop=self._pinning_hop({}, seen))
+        web.read_page("https://example.com/start")
+        assert seen and seen[0][0] == "https://example.com/start", seen
+        assert seen[0][1] == [(PUBLIC_IP, 443)], (
+            f"the fetch was not told which address was checked: {seen[0][1]!r}")
+
+    def test_every_redirect_hop_is_handed_its_own_checked_address(
+            self, web, monkeypatch):
+        """A chain is a new address each time, so it is a new pin each time.
+
+        A walk that carried the FIRST hop's address forward would fetch the final
+        hop at the first hop's host — the same class of mistake as not checking
+        the redirect at all.
+        """
+        first, second = PUBLIC_IP, "1.1.1.1"
+
+        def dns(host, port, *a, **k):
+            ip = first if host == "example.com" else second
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+        monkeypatch.setattr(web.socket, "getaddrinfo", dns)
+        seen = []
+        web.configure(http_get_hop=self._pinning_hop({
+            "https://example.com/a": (b"", "https://cdn.example.net/b"),
+            "https://cdn.example.net/b": (b"", ""),
+        }, seen))
+        web.read_page("https://example.com/a")
+        assert seen[0][1] == [(first, 443)], seen
+        landed = [c for u, c in seen if u.startswith("https://cdn.example.net/b")]
+        assert landed and landed[0] == [(second, 443)], (
+            f"a redirect hop was not pinned to its own checked address: {seen}")
+
+    def test_a_hop_that_cannot_pin_is_told_what_it_gives_up(self, web,
+                                                            monkeypatch):
+        """The seam is detected, not required, so a partial install still reads
+        — but it is TOLD, in the journal, that the window it cannot close stays
+        open. Silence here would look like a closed hole."""
+        warnings = []
+
+        class _Log:
+            @staticmethod
+            def warning(msg, *args):
+                warnings.append(msg % args if args else msg)
+            debug = exception = warning
+
+        monkeypatch.setattr(web, "_LOG", _Log)
+        fetched = []
+
+        def hop(url, timeout=10.0):        # an older caller's seam: no pin
+            fetched.append(url)
+            return b"", ""
+
+        web.configure(http_get_hop=hop)
+        web.read_page("https://example.com/x")
+        assert fetched, "a seam that cannot pin must still fetch"
+        assert any("cannot be pinned" in w for w in warnings), warnings
+        assert any("rebinding" in w for w in warnings), warnings
+
+    def test_a_reader_with_no_hop_seam_says_both_things_it_gives_up(
+            self, web, monkeypatch):
+        """A partial install still reads, but the journal must not report a
+        closed hole: the one-shot path follows redirects unchecked AND
+        resolves the name a second time."""
+        warnings = []
+
+        class _Log:
+            @staticmethod
+            def warning(msg, *args):
+                warnings.append(msg % args if args else msg)
+            debug = exception = warning
+
+        monkeypatch.setattr(web, "_LOG", _Log)
+        monkeypatch.setattr(web, "_HTTP_HOP", None)
+        monkeypatch.setattr(web, "_HTTP_GET",
+                            lambda url, timeout=10.0: b"<html>x</html>")
+        web.read_page("https://example.com/x")
+        said = " ".join(warnings)
+        assert "redirects are followed unchecked" in said, warnings
+        assert "resolved a second time" in said, warnings
+
+    def test_a_seam_that_vanishes_mid_walk_is_not_a_silent_unpin(
+            self, web, monkeypatch):
+        """`_hop` returning None means the seam went away while the chain was
+        being walked. Falling back is right; falling back SILENTLY would look
+        like a pinned read in the journal, which is the whole accounting."""
+        warnings = []
+
+        class _Log:
+            @staticmethod
+            def warning(msg, *args):
+                warnings.append(msg % args if args else msg)
+            debug = exception = warning
+
+        monkeypatch.setattr(web, "_LOG", _Log)
+        monkeypatch.setattr(web, "_HTTP_HOP_IS_FN", False)
+        monkeypatch.setattr(web, "_HTTP_HOP", lambda: None)     # resolver
+        monkeypatch.setattr(web, "_HTTP_GET",
+                            lambda url, timeout=10.0: b"<html>x</html>")
+        web.read_page("https://example.com/x")
+        said = " ".join(warnings)
+        assert "vanished mid-walk" in said, warnings
+        assert "resolved" in said, warnings
+
+    def test_a_name_that_never_answers_does_not_hold_the_turn(self, web,
+                                                             monkeypatch):
+        """`getaddrinfo` has no timeout, and this runs inside a spoken turn."""
+        monkeypatch.setattr(web, "_DNS_TIMEOUT_S", 0.2)
+
+        def stuck(host, port, *a, **k):
+            time.sleep(2.0)
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, port))]
+
+        monkeypatch.setattr(web.socket, "getaddrinfo", stuck)
+        start = time.monotonic()
+        text, _via, problem = web.read_page("https://slow.example/x")
+        elapsed = time.monotonic() - start
+        assert text == "" and "could not be resolved within" in problem, problem
+        assert elapsed < 1.5, f"the resolver held the turn for {elapsed:.1f}s"
+
+
 class TestHandsoffWiring:
     """The app's side: the tools, the gate, the doctor, the delegations."""
 
@@ -683,6 +836,120 @@ class TestHandsoffWiring:
             None, None, 302, "Found", {}, "http://169.254.169.254/") is None, (
             "the host's hop fetch follows redirects — the reader cannot check "
             "an address it never sees")
+        # ...and it must be able to accept the addresses the reader checked:
+        # a seam that cannot take them resolves the name a SECOND time, which
+        # is the rebinding window the pin exists to close. The reader degrades
+        # to a warning, so nothing else would fail if this regressed.
+        assert H._web._accepts_connect_to(H._http_get_hop), (
+            "the host's hop fetch cannot be handed the checked addresses, so "
+            "the reader resolves every name twice")
+
+    def test_the_pinned_fetch_dials_the_checked_address_and_keeps_the_name(
+            self, H):
+        """End to end and offline: the socket goes to the pin, the name stays.
+
+        `example.invalid` is reserved (RFC 2606) and cannot resolve, so the
+        ONLY way this request can reach the local server is through the pin —
+        which is what makes this a proof rather than a rehearsal. What the
+        server sees is the other half: a Host header of the NAME, because a pin
+        that rewrote the request to an IP would break virtual hosts and the TLS
+        identity (`_pinned_connection` keeps `self.host`).
+        """
+        seen = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen["host"] = self.headers.get("Host")
+                seen["path"] = self.path
+                body = b"<html><body>pinned</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):        # keep the suite's output clean
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        port = srv.server_address[1]
+        try:
+            body, location = H._http_get_hop(
+                f"http://example.invalid:{port}/x?q=1", 5.0,
+                connect_to=[("127.0.0.1", port)])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        assert not location and b"pinned" in body, (body, location)
+        assert seen.get("host", "").startswith("example.invalid"), seen
+        assert seen.get("path") == "/x?q=1", seen
+
+    def test_the_pin_replaces_the_dial_and_nothing_else(self, H, monkeypatch):
+        """`http.client` dials through `self._create_connection`, and the pin
+        replaces exactly that callable — so the address dialled is the checked
+        one while `host` (Host header, TLS SNI, certificate check) stays the
+        name. Pinned here rather than described in the docstring."""
+        dialled = []
+
+        def fake(address, timeout=None, source_address=None):
+            dialled.append((address, timeout))
+            raise OSError("refused by the test")
+
+        monkeypatch.setattr(H.socket, "create_connection", fake)
+        conn_class = H._pinned_connection(http.client.HTTPSConnection,
+                                          [("93.184.216.34", 443)])
+        conn = conn_class("example.com", 443, timeout=3)
+        assert conn.host == "example.com", (
+            "the Host header and the TLS SNI must stay the name")
+        assert conn.port == 443, conn.port
+        with pytest.raises(OSError):
+            conn.connect()
+        assert dialled == [( ("93.184.216.34", 443), 3 )], dialled
+
+    def test_a_second_checked_address_is_still_tried(self, H, monkeypatch):
+        """A dual-stack name keeps its fallback: the pins are tried in the
+        order the policy checked them, so a family this machine cannot reach
+        costs a connection attempt and not the fetch."""
+        dialled = []
+
+        def fake(address, timeout=None, source_address=None):
+            dialled.append(address)
+            if len(dialled) == 1:
+                raise OSError("no route to host")
+            return socket.socket()          # a real socket; never connected
+
+        monkeypatch.setattr(H.socket, "create_connection", fake)
+        conn_class = H._pinned_connection(
+            http.client.HTTPConnection,
+            [("93.184.216.34", 80), ("1.1.1.1", 80)])
+        conn = conn_class("example.com", 80, timeout=3)
+        conn.connect()
+        assert dialled == [("93.184.216.34", 80), ("1.1.1.1", 80)], dialled
+
+    def test_the_pinned_fetch_never_resolves_the_NAME(self, H, monkeypatch):
+        """The rebinding window is the transport's second resolution of a NAME,
+        and this is the property that closes it: the only string the pinned dial
+        hands the resolver is the address the policy checked. `getaddrinfo` is
+        still called on that LITERAL (a numeric address is returned as-is, no
+        server consulted); the URL's host name never reaches it."""
+        asked = []
+        real = H.socket.getaddrinfo
+
+        def watching(host, port, *args, **kwargs):
+            asked.append((str(host), port))
+            return real(host, port, *args, **kwargs)
+
+        monkeypatch.setattr(H.socket, "getaddrinfo", watching)
+        probe = socket.socket()                     # a port nothing is on
+        probe.bind(("127.0.0.1", 0))
+        closed = probe.getsockname()[1]
+        probe.close()
+        with pytest.raises(OSError):
+            H._http_get_hop("http://rebinding.example/x", 2.0,
+                            connect_to=[("127.0.0.1", closed)])
+        assert asked == [("127.0.0.1", closed)], (
+            "the pinned fetch resolved something other than the checked "
+            f"address: {asked}")
 
 
     def test_the_news_tool_names_the_recorded_reason(self, H, monkeypatch):

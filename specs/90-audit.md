@@ -719,3 +719,112 @@ writes (fontconfig, Qt) that no test controls. And the rule protects PATHS, not
 owning tests: a write that reaches the real home through a child spawned with a
 hand-built environment is still out of reach, which is the same seam, stated the
 same way.
+**What was asked.** Close the DNS-rebinding TOCTOU in the web reader: pin the
+address that was validated for the actual fetch and bound the resolver, or state
+precisely why pinning cannot work there.
+
+**The hole, in one sentence.** `_public_target` validated a NAME and the
+transport resolved that name AGAIN, so a name server was free to answer the
+policy with a public address and the socket with `127.0.0.1` (or
+`169.254.169.254`) a moment later — and no check on the name can close that,
+because the two answers are the whole mechanism. The check and the fetch have to
+be about the same value.
+
+**Pinning works here, and the shape is what makes it a pin.** The policy now
+returns the addresses it approved (`_public_target`), `_read_fetch` carries them
+into the fetch (`connect_to`), and the host dials them: `_http_get_hop` routes a
+pinned hop to `_pinned_get`, which builds an `http.client` connection through
+`_pinned_connection`. That subclass replaces ONE callable — the instance's
+`_create_connection`, which is the single place `http.client` builds its socket —
+with `_dial_pinned`, which connects to the address literals in the order the
+policy checked them. `self.host` is untouched, so the Host header, the SNI and
+the certificate check stay about the name the user asked for: this is a pin, not
+a rewrite to an IP. It is safe to hand the transport literals precisely because
+the pin is what removed the name from that last step.
+
+**Every hop carries its OWN pin, and that is a second bug avoided.** The walk
+rechecks each Location through `_public_target` (so a redirect is just another
+untrusted address) and passes the NEW hop's addresses; carrying the first hop's
+pin forward would have fetched the last hop at the first hop's host — the same
+class of mistake as not checking the redirect at all.
+
+**Why a proxy had to be bypassed rather than used.** An `HTTP_PROXY` in the
+environment is another party that resolves the name itself, which is exactly the
+resolution this exists to delete, and `urllib`'s opener owns both that and the
+hostname lookup. The pinned path is therefore `http.client` directly, and the two
+things that costs are stated at the site rather than discovered: no proxy on a
+pinned fetch, and `Accept-Encoding: identity` because that path does no
+decompression.
+
+**The seam is DETECTED, and degradation is loud.** `_accepts_connect_to` reads
+the injected function's signature, so a partial install (or a test double) still
+reads in one shot instead of losing the feature — but it is WARNED about, and the
+warning names BOTH losses (unchecked redirects, and the name resolved a second
+time). Writing the tests found the second silent path: `_hop` returning None
+(seam gone mid-walk) fell back to the one-shot fetch with NO warning at all,
+which would have read as a pinned fetch in the journal. It says so now.
+
+**The resolver is bounded, because `getaddrinfo` has no timeout.** `_DNS_TIMEOUT_S
+= 5.0` runs the lookup on a daemon thread and joins it: the reader walks away
+rather than holding a spoken turn open on a name server that never answers. That
+is a bound, not a cancellation — the thread is not interruptible, and a truly
+stuck resolver leaves one behind (stated in the spec).
+
+**Measured while designing, then guarded offline.** The mechanism was prototyped
+against a real host before it was written: dialling `example.com`'s address while
+`server_hostname` stayed `example.com` negotiated that certificate, and a foreign
+name on the same connection was refused — so the pin reaches the socket without
+changing what TLS checks. Every guard since is offline: the host test drives a
+real `ThreadingHTTPServer` on loopback through `_http_get_hop` with a pin, using
+`http://example.invalid:PORT/…` — a name reserved by RFC 2606 that cannot
+resolve, so reaching the server at all IS the proof — and asserts the server saw
+`Host: example.invalid` and the path intact. A second test records what the
+dial hands the resolver and asserts it was the checked literal and never the URL's
+name.
+
+**A defect the pin's own path exposed, fixed here.** Checking the policy function
+the pin depends on turned up an address shape that RAISED out of `read_page`:
+`urlsplit` defers the port check to its `.port` property, which raises
+`ValueError` for `:99999` or `:abc`, and nothing caught it — so a model-supplied
+address reached the tool wrapper's broad `except`, which could only say
+`ERROR: could not read that page (ValueError)` and log a warning. Every other bad
+address gets a refusal with a sentence naming what was wrong, and an untrusted
+address is not a special case, so the port is read under `try` and the answer is
+`… has a port that is not a number between 0 and 65535`, still with nothing
+fetched. Three refusal cases pin it (out of range, non-numeric, negative).
+
+**Teeth: 11 tests in `tests/test_web.py` (64 → 75 test functions, 86 → 89
+collected).**
+`TestTheCheckedAddressIsTheOneFetched` (the policy returns the addresses it
+checked; the first hop is handed the pin; every redirect hop gets its own new
+pin; an unpinnable seam is warned about and still reads; the no-seam fallback and
+the vanished seam both state what they give up; a stuck name fails inside the
+bound) plus four in `TestHandsoffWiring` (the injected hop seam advertises
+`connect_to`; the pinned fetch dials the checked address and keeps the name; the
+pin replaces the dial and nothing else — `conn.host`/`conn.port` untouched; a
+second checked address is still tried; the name is never resolved). **11/11
+mutations caught, 0 missed, every restore sha256-verified**: the seam never
+handed the pin, the walk forgetting the first hop's pin, the policy returning no
+addresses, an unpinnable seam used silently, the resolver left unbounded, the
+pinned connection dialling by name again, the hop fetch ignoring `connect_to`,
+only the first checked address dialled, the seam dropping the parameter, the two
+warnings silenced, and the malformed port raising again.
+
+**Measured on the final bytes.** `tests` **PASS — 1 860 passed in 266 s**;
+`coverage` **PASS, 84.75%** (2 595 missing of 17 017) ≥ 70; `compile`, `shell`,
+`smoke` and `clean-checkout` PASS; specs freshness **19 passed** after the
+generated module table was rewritten from the code. The tree is **checkout only**
+as of this section: `doctor` reads `deployment: installed-drift`, because
+`core/web.py` (and `handsoff.py`, whose earlier round was also never deployed)
+differ from `~/.local/bin/…`.
+
+## The installer stopped deciding what the app already decided (2026-09-19)
+
+**Stated limits (the earlier section).** The pin covers the READER's hop seam. The plain `http_get`
+seam still resolves names, and deliberately so: its URLs are the module's own
+backend constants, and the one place a model-supplied address rides through it is
+the Jina fallback, whose HOST is a fixed reader and whose own hops are walked and
+pinned like any other. A pinned fetch bypasses an environment proxy and asks for
+identity encoding (both above). A host that injects no hop seam reads unpinned and
+is warned. The bound on DNS is a thread the reader abandons, not a cancel. And the
+watcher's `(a|aa)+` ReDoS remains open, as stated in the section before this one.

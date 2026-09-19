@@ -24,7 +24,7 @@ nothing — a missing row does.
 | `test_settings_contract.py` | 24 | the field table: coercion, controls, cards, companion rows, the window |
 | `test_lifecycle.py` | 90 | generations, staleness, PTT epoch, cancel/done, installer membership + rehearsal (each on a fixture it builds) |
 | `test_ops.py` | 67 | deploy snapshot, restart, control socket, health/doctor |
-| `test_web.py` | 64 | router, backends, cache, reader, SSRF refusals |
+| `test_web.py` | 75 | router, backends, cache, reader, SSRF refusals, the redirect walk, and the DNS pin (`connect_to` at the reader and at the host's dial, the seam that cannot pin, the bounded resolver) |
 | `test_fault_injection.py` | 52 | boundary breakage, loud-degradation contract |
 | `test_sandbox.py` | 78 | secret paths, edit boundaries, command validation, and the write guard's own teeth (the refusal, its decision table, the exemptions, the event rules, the CHILD half — a spawned child is refused, the same child with the variable removed is not, and the shim it runs is the pointer rather than a second copy of the rules — and the DEVELOPER'S USER DIRS, the second rule: `~/.config` and `~/.local/state` refused before the write lands, the message naming the directory and the fix, the roots captured before any sandbox (so they do not follow a load's throw-away HOME), the checkout keeping precedence over the home it sits inside, and one variable per rule) |
 | `test_calendar.py` | 45 | ICS parse/RRULE/format, scheme + label guards |
