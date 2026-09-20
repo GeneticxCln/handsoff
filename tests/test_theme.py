@@ -146,6 +146,18 @@ class TestWallpaperDetection:
         assert lum == pytest.approx(theme.relative_luminance("#1a1a1a"))
         assert run.calls and run.calls[0][0] == "magick"
 
+    def test_sample_luminance_accepts_a_hash_prefixed_hex(self):
+        """ImageMagick's %[hex:p{0,0}] is read with or without the '#'.
+
+        The six-char slice happened BEFORE the strip, so a prefixed output
+        left '#1a1a1' — a shape refusal that read as "no luminance", i.e.
+        every wallpaper-tuned look silently stopped tuning (verified
+        2026-09-20).
+        """
+        run = _runner(0, "#1A1A1A\n")
+        lum = theme.sample_image_luminance("/w/a.png", runner=run)
+        assert lum == pytest.approx(theme.relative_luminance("#1a1a1a"))
+
     def test_sample_luminance_degrades_without_raising(self):
         assert theme.sample_image_luminance("/w/a.png", runner=_runner(1, "")) is None
         assert theme.sample_image_luminance("/w/a.png", runner=_runner(0, "zzz")) is None

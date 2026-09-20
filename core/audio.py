@@ -157,8 +157,15 @@ class Recorder:
         stream, self._stream = self._stream, None
         if stream is None:
             return
+        # Separate guards: stop() can fail on a stream the device already
+        # dropped, and the close() that releases it used to sit in the SAME
+        # try — skipped when stop() raised, leaking the PortAudio stream the
+        # reference had already been dropped for.
         try:
             stream.stop()
+        except Exception:
+            log.exception("failed to stop input stream")
+        try:
             stream.close()
         except Exception:
             log.exception("failed to close input stream")
@@ -278,7 +285,6 @@ _TTS_RUN_LOCK = threading.Lock()
 # number, because the smaller one is what the model occupies at rest rather
 # than what asking it to speak takes.
 _TTS_VRAM_MB = 3_400
-_TTS_FLOAT32_PATCHED = False
 _WHISPER_VRAM_MB = {
     "tiny": 600, "base": 800, "small": 1400, "medium": 2600,
     "large": 3600, "large-v1": 3600, "large-v2": 3600, "large-v3": 3600,
@@ -833,7 +839,6 @@ def _patch_float32_norm(model) -> None:
     fails, not merely an odd one. Casting at this single seam repairs the whole
     path (verified: as-is raises, cast returns tokens (1, 250)).
     """
-    global _TTS_FLOAT32_PATCHED
     original = getattr(model, "norm_loudness", None)
     if original is None or not callable(original):
         return
@@ -845,7 +850,6 @@ def _patch_float32_norm(model) -> None:
         model.norm_loudness = norm_loudness_float32
     except (AttributeError, TypeError):   # slots/proxy: leave the model alone
         return
-    _TTS_FLOAT32_PATCHED = True
 
 
 # NOTE on xformers (measured, so nobody re-opens this): xformers 0.0.35 is the

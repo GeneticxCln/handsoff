@@ -169,7 +169,11 @@ def ollama_unload(*, base: str, model: str, guard: Callable[[], None],
             response.read()
         return True
     except Exception as exc:
-        logger.debug("ollama unload of %s skipped (%s): %s",
+        # "failed", not "skipped": this branch is reached only when the unload
+        # was ATTEMPTED and did not happen (the docstring above says the same),
+        # and a journal that calls a failure a skip sends the reader looking
+        # for a policy that declined rather than a host that refused.
+        logger.debug("ollama unload of %s failed (%s): %s",
                      model, type(exc).__name__, exc)
         return False
 
@@ -422,7 +426,7 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
     a claim that held only for the failures the author had in mind.
     """
     buf = ""
-    full = ""
+    full_parts: list[str] = []
     tool_calls: list[dict] = []
     fallback = False
     try:
@@ -451,7 +455,7 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                 if not piece:
                     continue
                 buf += piece
-                full += piece
+                full_parts.append(piece)
                 while True:
                     match = re.search(r"[.!?…](\s|$)", buf)
                     if not match:
@@ -500,4 +504,5 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
             q.put(None)
     if tools and state is not None:
         state["tools_supported"] = True
-    return {"tool_calls": tool_calls, "content": strip_thinking(full).strip()}
+    return {"tool_calls": tool_calls,
+            "content": strip_thinking("".join(full_parts)).strip()}

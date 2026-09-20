@@ -70,7 +70,8 @@ def relative_luminance(value: str) -> float | None:
     return 0.2126 * r + 0.7152 * g + 0.0722 * b
 
 
-def _retune(rgb: tuple[int, int, int], shift: float, sat: float) -> tuple[int, int, int]:
+def _retune(rgb: tuple[int, int, int], shift: float,
+            sat: float) -> tuple[float, float, float]:
     """Push a colour away from grey by `sat` then lift/sink it by `shift`."""
     r, g, b = rgb
     mean = (r + g + b) / 3.0
@@ -194,7 +195,10 @@ def sample_image_luminance(path: str, *, runner=subprocess.run) -> float | None:
     if result is None or getattr(result, "returncode", 1) != 0:
         return None
     raw = (getattr(result, "stdout", "") or "").strip()
-    hexcol = raw[:6]
+    # The '#' is dropped BEFORE the slice: a prefixed "#rrggbb" used to leave
+    # '#rrggb', fail the shape check, and read as "no luminance" — a silent
+    # false negative for every look that tunes against the wallpaper.
+    hexcol = raw.lstrip("#")[:6]
     if not re.fullmatch(r"[0-9a-fA-F]{6}", hexcol):
         return None
     return relative_luminance("#" + hexcol)

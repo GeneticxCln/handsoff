@@ -424,12 +424,20 @@ def _lines(deps: DoctorDeps) -> list[str]:
 
         if deps.shutil.which("ydotool"):
             sock = deps.ydotool_socket()
-            if deps.socket_connectable(sock):
-                lines.append(f"ydotool: ok (daemon reachable at {sock})")
+            try:
+                reachable = deps.socket_connectable(sock)
+            except Exception as e:
+                # A probe that raises is a LINE, never a dead doctor: this is
+                # the tool somebody runs precisely when something is wrong,
+                # and the niri probe beside it was already held to this rule.
+                lines.append(f"ydotool: probe failed ({e})")
             else:
-                lines.append(
-                    f"ydotool: daemon UNREACHABLE (no socket at {sock}) — "
-                    "start it: systemctl --user enable --now ydotool.service")
+                if reachable:
+                    lines.append(f"ydotool: ok (daemon reachable at {sock})")
+                else:
+                    lines.append(
+                        f"ydotool: daemon UNREACHABLE (no socket at {sock}) — "
+                        "start it: systemctl --user enable --now ydotool.service")
         else:
             lines.append("ydotool: NOT INSTALLED (typing tools will fail)")
 

@@ -345,15 +345,32 @@ def _snapshot_cached(root: Path) -> bool:
     return False
 
 
+def _has_nonempty_file(root: Path) -> bool:
+    """True when `root` holds at least one non-empty regular file.
+
+    `any(root.iterdir())` counted a directory holding only zero-byte or
+    half-downloaded files as cached: a partial fetch then read as a usable
+    model, and the bubble "could hear" in every status line while its first
+    spoken turn failed. The same question `_snapshot_cached` asks of a Hugging
+    Face snapshot, asked of a flat directory — and `iterdir` stays OUTSIDE the
+    per-entry swallow, so an unreadable directory still degrades the section
+    rather than reading as "not cached".
+    """
+    for entry in root.iterdir():
+        try:
+            if entry.is_file() and entry.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _stt_tts(ctx: dict) -> dict:
     try:
         tdir = Path(str(ctx.get("tts_weights_dir") or ""))
         wdir = Path(str(ctx.get("whisper_model_dir") or ""))
         tts_cached = _snapshot_cached(tdir)
-        # The whisper side shares the guard for the same reason: this was the
-        # one `iterdir` outside it, so an unreadable whisper directory took the
-        # whole section down instead of degrading it.
-        cached = any(wdir.iterdir()) if wdir.is_dir() else False
+        cached = _has_nonempty_file(wdir) if wdir.is_dir() else False
     except OSError as e:
         return _deg(e)
     # `ok` means "both speech directions are ready", not "the TTS weights

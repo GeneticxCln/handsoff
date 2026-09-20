@@ -547,16 +547,8 @@ def _flag_values(tok: str) -> tuple[str, ...]:
     return (tok.split('=', 1)[1],)
 
 
-def denied_secret_path(path) -> str | None:
-    """Why `path` must not be read into the conversation, or None if it may be.
-
-    Returns a short reason for the REFUSED message. Matching happens on the
-    RESOLVED path, so `~/.ssh/../.ssh/id_rsa` and symlinks cannot slip past.
-    """
-    try:
-        p = Path(path).expanduser().resolve()
-    except (OSError, RuntimeError, ValueError):
-        return None                       # unreadable path: the caller reports it
+def _secret_reason(p: Path) -> str | None:
+    """Why THIS path is one of the denied stores, judged by name and place."""
     for anc in p.parents:
         if anc.name.lower() in _SECRET_DIRS:
             return f"{anc.name}/ holds credentials or key material"
@@ -573,6 +565,28 @@ def denied_secret_path(path) -> str | None:
     for pat in _SECRET_GLOBS:
         if fnmatch.fnmatch(name, pat):
             return f"{p.name} matches the credential pattern {pat!r}"
+    return None
+
+
+def denied_secret_path(path) -> str | None:
+    """Why `path` must not be read into the conversation, or None if it may be.
+
+    Returns a short reason for the REFUSED message. Matching happens on the
+    RESOLVED path, so `~/.ssh/../.ssh/id_rsa` cannot slip past — and on the
+    expanded path as well, because resolving is exactly what a symlink
+    defeats: `~/.ssh/id_rsa` pointing at `/tmp/key` resolved to a name the
+    rules do not know, so READING it was allowed (verified 2026-09-20). The
+    name the user asked for is judged, whichever file it turns out to be.
+    """
+    try:
+        expanded = Path(path).expanduser()
+        p = expanded.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None                       # unreadable path: the caller reports it
+    for candidate in (p, expanded):
+        reason = _secret_reason(candidate)
+        if reason:
+            return reason
     return None
 
 
@@ -793,6 +807,14 @@ class ToolBelt:
     MAX_WRITE = 2000000
     MAX_SELF_EDIT = 500000  # self/split whole-file replace cap (handsoff.py ~270KB)
     TIMEOUT = 15
+
+    # The rate-limit window is a read-modify-write, and two turns CAN execute
+    # tools at once (a barge-in starts a new turn while the old worker
+    # finishes), so an unlocked check-then-append let both pass the same last
+    # slot. CLASS-level on purpose: the suite builds belts with `__new__` and a
+    # bare `_tool_times`, and an instance attribute made every one of those
+    # fixtures fail on a missing lock rather than on what it tests.
+    _rate_lock = threading.Lock()
 
     def __init__(self, on_restart_pending: 'callable', permissions: dict | None=None, on_timer: 'callable | None'=None, on_notification: 'callable | None'=None, on_announce: 'callable | None'=None, on_pomodoro: 'callable | None'=None, on_cap_refusal: 'callable | None'=None, dependencies=None) -> None:
         self._dependencies = dependencies or _DEFAULT_DEPS
@@ -1103,13 +1125,14 @@ class ToolBelt:
         self._last_confirmation_offer = False
         limit = self._rate_limit()
         now = time.monotonic()
-        while self._tool_times and now - self._tool_times[0] > 60:
-            self._tool_times.popleft()
-        if limit > 0:
-            if len(self._tool_times) >= limit:
-                log_decision(name, _log_target(args, 120), 'RATE-LIMITED', 'refused: rate limit')
-                return ToolResult(f'REFUSED: tool-call rate limit reached ({limit} calls/60s) — stop calling tools, answer from what you have, or wait', 'refused')
-            self._tool_times.append(now)
+        with self._rate_lock:
+            while self._tool_times and now - self._tool_times[0] > 60:
+                self._tool_times.popleft()
+            if limit > 0:
+                if len(self._tool_times) >= limit:
+                    log_decision(name, _log_target(args, 120), 'RATE-LIMITED', 'refused: rate limit')
+                    return ToolResult(f'REFUSED: tool-call rate limit reached ({limit} calls/60s) — stop calling tools, answer from what you have, or wait', 'refused')
+                self._tool_times.append(now)
         fn = self._tool_methods().get(name)
         if fn is None:
             return ToolResult(f'unknown tool: {name}', 'error')
@@ -3050,7 +3073,6 @@ class ToolBelt:
             self._confirm_running = None
         _dep().log_decision(tool, _log_target(args, 120), 'EXECUTED', 'refused/errored' if err else 'ok')
         return out
-    JOB_ANNOUNCE_S = 20.0
 
     def _refused_at_cap(self, registry, detail: str) -> None:
         """Shout about — and record — a cap turning real work away.

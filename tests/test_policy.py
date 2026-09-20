@@ -411,6 +411,48 @@ class TestToolRateLimit:
         out, err = belt.execute("get_datetime", {})
         assert err and "rate limit" in out, out
 
+    def test_two_callers_meeting_at_the_last_slot_admit_one(self, H,
+                                                            monkeypatch):
+        """The window is a read-modify-write, and `execute` runs on MORE than
+        one thread: a barge-in starts the next turn while the previous worker
+        is still finishing its call. Two callers meeting inside the check both
+        passed the same last slot, so the limit admitted twice its number.
+
+        The interleaving is STRETCHED rather than raced — the stamp itself
+        sleeps, so a second caller has 200 ms to reach its check. That is
+        exactly the overlap a lock removes; without one this test fails on
+        every run rather than some.
+        """
+        monkeypatch.setitem(H.SETTINGS, "max_tool_calls", 1)
+        belt = self._belt(H)
+
+        class _SlowStamp(deque):
+            """A window queue whose stamp takes 200 ms, as a busy call would."""
+
+            def append(self, item):
+                time.sleep(0.2)
+                super().append(item)
+
+        belt._tool_times = _SlowStamp()
+        started = threading.Barrier(2)
+        admitted = []
+        lock = threading.Lock()
+
+        def call():
+            started.wait(5)
+            out, err = belt.execute("get_datetime", {})
+            with lock:
+                admitted.append(not err)
+
+        threads = [threading.Thread(target=call) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert len(admitted) == 2, "a caller never came back"
+        assert admitted.count(True) == 1, (
+            f"a limit of 1 admitted {admitted.count(True)} of 2 calls: {admitted}")
+
     def test_a_junk_limit_does_not_kill_every_tool_call(self, H, monkeypatch):
         """`int("junk")` raised straight out of `_execute`, so ONE corrupted
         value took out every tool call for the rest of the process — the same
@@ -1492,6 +1534,31 @@ class TestSecretPathGuard:
                      "~/.config/handsoff/settings.json",
                      "~/.sshx/notes.txt"):            # prefix, not the dir
             assert denied_secret_path(Path(path).expanduser()) is None, path
+
+    def test_predicate_denies_a_secret_symlinked_away(self, tmp_path):
+        """Resolving must not erase the name the user asked to READ.
+
+        `~/.ssh/id_rsa -> /tmp/key` resolved to a name no rule knows, so the
+        one path a credential guard exists for read as an ordinary file — the
+        docstring said "symlinks cannot slip past" and the code let exactly
+        that through (verified 2026-09-20).
+        """
+        from core.tools import denied_secret_path
+        target = tmp_path / "key"
+        target.write_text("PRIVATE-KEY-BODY-MUST-NOT-ESCAPE", encoding="utf-8")
+        link = tmp_path / "id_rsa"
+        link.symlink_to(target)
+        assert denied_secret_path(link), \
+            "an id_rsa symlinked out of the tree must still be refused"
+        # ...and the reverse direction is pinned too: a NON-secret name that
+        # RESOLVES into a secret store stays refused.
+        store = tmp_path / ".ssh"
+        store.mkdir()
+        (store / "config").write_text("", encoding="utf-8")
+        through = tmp_path / "innocent"
+        through.symlink_to(store / "config")
+        assert denied_secret_path(through), \
+            "a plain name resolving INTO .ssh must still be refused"
 
     def test_read_file_refuses_and_never_returns_the_body(self, tb, tmp_path):
         belt, _ = tb

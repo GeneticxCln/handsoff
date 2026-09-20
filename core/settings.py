@@ -457,9 +457,12 @@ def _coerce_spotter_models(s: dict, field, log) -> None:
 
 def _coerce_tool_call_times(s: dict, field, log) -> None:
     """The per-belt call-time deque is runtime state, never a user value: a
-    hand-edited list is discarded rather than trusted as call history."""
-    if not isinstance(s.get(field.key), (list, type(None))):
-        s[field.key] = None
+    hand-edited list is discarded rather than trusted as call history.
+
+    The code used to KEEP any list it found — the one shape this docstring
+    names as discarded — and nothing in the app ever writes the key, so every
+    list on disk is hand-edited by definition (verified 2026-09-20)."""
+    s[field.key] = None
 
 
 def _coerce_workspace_aliases(s: dict, field, log) -> None:
@@ -856,8 +859,14 @@ class Settings:
         return self._data[key]
 
     def __setitem__(self, key: str, value) -> None:
-        """Persist one setting; use :meth:`as_dict` for an in-memory view."""
-        self.persist(key, value)
+        """Persist one setting; use :meth:`as_dict` for an in-memory view.
+
+        Raising on a failed write is the dict protocol's rule — the silent
+        no-op this used to be is how `obj[k] = v` reads as done while the disk
+        still holds the old value. The bool-returning writer is :meth:`persist`.
+        """
+        if not self.persist(key, value):
+            raise OSError(f"could not persist setting {key!r}")
 
     def __contains__(self, key: str) -> bool:
         return key in self._data

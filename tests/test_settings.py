@@ -680,6 +680,16 @@ class TestSettingsSplit:
         assert conflict is None
         assert merged == current
 
+    def test_tool_call_times_is_runtime_state_never_a_user_list(self, H):
+        """The coercer's docstring says a hand-edited list is discarded; the
+        code kept any list it found — the one shape the rule names was the one
+        shape that survived a load (verified 2026-09-20). Nothing in the app
+        ever writes this key, so every list on disk is hand-edited by
+        definition."""
+        s = {**H.DEFAULT_SETTINGS, "tool_call_times": [1, 2]}
+        out = H._core_settings.coerce_settings(s)
+        assert out["tool_call_times"] is None
+
     def test_settings_object_loads_and_persists(self, H, tmp_path, monkeypatch):
         obj = H._core_settings.settings_object(
             tmp_path / "settings.json", tmp_path)
@@ -835,6 +845,11 @@ class TestSettingsSplit:
         assert obj["mic_threshold"] == 555, "memory changed although the write failed"
         assert json.loads((tmp_path / "settings.json").read_text(
             encoding="utf-8"))["mic_threshold"] != 777
+        # ...and the dict protocol fails the same way: `obj[k] = v` used to
+        # swallow the False and read as done (verified 2026-09-20).
+        with pytest.raises(OSError):
+            obj["mic_threshold"] = 777
+        assert obj["mic_threshold"] == 555
 
     def test_persist_reports_success(self, H, tmp_path):
         obj = H._core_settings.settings_object(tmp_path / "settings.json", tmp_path)

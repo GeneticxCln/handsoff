@@ -757,6 +757,55 @@ class TestICSDailyOldEvent:
                 for i in range(6)]
         assert got == want, (got, want)
 
+    def test_a_weekly_count_stops_mid_week(self, H):
+        """COUNT bounds INSTANCES, and a week can hold several matching days.
+
+        The `k < count` check lived only on the outer week loop, so a cap
+        reached on Wednesday kept emitting Friday and then the next week's
+        days — COUNT=4 over MO,WE,FR produced SIX instances (verified
+        2026-09-20). The window is two weeks wide on purpose: the overrun is
+        only visible when the cap lands inside a week.
+        """
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        monday = today - H.datetime.timedelta(days=today.weekday())
+        ev = self._events(H, monday.strftime("%Y%m%dT090000"),
+                          "FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=4",
+                          (monday.year, monday.month, monday.day),
+                          (monday + H.datetime.timedelta(days=15)).timetuple()[:3])
+        got = [e["start"].date() for e in ev]
+        want = [(monday + H.datetime.timedelta(days=d)).date()
+                for d in (0, 2, 4, 7)]
+        assert got == want, (got, want)
+
+    def test_a_monthly_count_stops_mid_month(self, H):
+        """The same mid-batch cap, in the BYMONTHDAY candidate loop."""
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        first = today.replace(day=1)
+        ev = self._events(H, first.strftime("%Y%m%dT090000"),
+                          "FREQ=MONTHLY;BYMONTHDAY=1,15;COUNT=3",
+                          (first.year, first.month, 1),
+                          (first + H.datetime.timedelta(days=60)).timetuple()[:3])
+        got = [e["start"].date() for e in ev]
+        second = (first + H.datetime.timedelta(days=32)).replace(day=1)
+        want = [first.date(), first.replace(day=15).date(), second.date()]
+        assert got == want, (got, want)
+
+    def test_a_yearly_count_stops_mid_year(self, H):
+        """The same mid-batch cap, in the YEARLY candidate loop."""
+        today = H.datetime.datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        first = today.replace(month=1, day=1)
+        ev = self._events(H, first.strftime("%Y%m%dT090000"),
+                          "FREQ=YEARLY;BYMONTH=1,6;BYMONTHDAY=1;COUNT=3",
+                          (first.year, 1, 1),
+                          (first + H.datetime.timedelta(days=400)).timetuple()[:3])
+        got = [e["start"].date() for e in ev]
+        want = [first.date(), first.replace(month=6).date(),
+                first.replace(year=first.year + 1).date()]
+        assert got == want, (got, want)
+
 
 class TestCalendarSourceSafety:
     """A Google-style "secret iCal address" is a bearer credential: whoever

@@ -604,3 +604,28 @@ class TestModelCacheProbe:
         (rev / "blob.bin").write_bytes(b"x")
         assert HW._snapshot_cached(root) is True
         assert HW._snapshot_cached(tmp_path / "absent") is False
+
+    def test_a_zero_byte_whisper_file_is_not_cached(self, HW, tmp_path):
+        """`any(iterdir())` counted a half-downloaded model as cached.
+
+        The whisper directory is flat (no snapshots/ nesting), so it skipped
+        `_snapshot_cached`'s non-empty-file rule: a directory holding only
+        zero-byte or partial files read as a usable model — "cached" in every
+        status line while the first spoken turn failed (verified 2026-09-20).
+        """
+        whisper = tmp_path / "whisper"
+        whisper.mkdir()
+        (whisper / "model.bin").write_bytes(b"")
+        out = HW._stt_tts({"tts_weights_dir": str(tmp_path / "none"),
+                           "whisper_model_dir": str(whisper),
+                           "whisper_size": "small"})
+        assert out["ok"] is False and out["whisper_cached"] is False, out
+
+    def test_a_nonempty_whisper_file_reads_as_cached(self, HW, tmp_path):
+        whisper = tmp_path / "whisper"
+        whisper.mkdir()
+        (whisper / "model.bin").write_bytes(b"x")
+        out = HW._stt_tts({"tts_weights_dir": str(tmp_path / "none"),
+                           "whisper_model_dir": str(whisper),
+                           "whisper_size": "small"})
+        assert out["whisper_cached"] is True, out

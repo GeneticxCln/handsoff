@@ -294,6 +294,13 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
             if base > win_end:
                 break
             for d in days:
+                # COUNT bounds INSTANCES, and a week can hold several
+                # (BYDAY=MO,WE,FR): the check lived only on the `while` above,
+                # so a cap reached mid-week kept emitting the rest of that
+                # week's days — phantoms past the rule's own end (verified
+                # 2026-09-20: COUNT=4 over MO,WE,FR emitted SIX).
+                if k >= count:
+                    break
                 t = base + datetime.timedelta(days=d)
                 t = t.replace(hour=clock[0], minute=clock[1], second=clock[2],
                               microsecond=clock[3])
@@ -349,6 +356,8 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                 if t:
                     cands.append(t)
             for t in sorted(cands):
+                if k >= count:      # same mid-batch cap as WEEKLY's days
+                    break
                 k += 1
                 if want(t):
                     out.append(t)
@@ -387,6 +396,8 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                     except ValueError:
                         pass   # Feb 29 in a non-leap year: no occurrence
             for t in sorted(cands):
+                if k >= count:      # same mid-batch cap as WEEKLY's days
+                    break
                 k += 1
                 if want(t):
                     out.append(t)

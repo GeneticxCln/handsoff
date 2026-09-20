@@ -1382,3 +1382,30 @@ class TestASparseHardwareSnapshot:
         doctor, deps = self._deps()
         deps.hardware_snapshot = lambda _ttl: {}
         assert doctor._lines(deps)
+
+    def test_a_raising_probe_is_a_line_not_a_dead_doctor(self):
+        """`socket_connectable` is the HOST's function, and it was called
+        outside any guard: a stand-in that raised (no `/proc/self/fd`, a
+        socket API the platform lacks) took the whole doctor down — in the one
+        tool somebody runs precisely BECAUSE something is wrong. The niri
+        probe beside it was already held to this rule, which is the asymmetry
+        the fix removed.
+        """
+        doctor, deps = self._deps()
+        # The LEGACY probe path: a host that supplies no `hardware_snapshot`
+        # (the doctor reads `getattr(H, "_doctor_snapshot", None)`, so a
+        # partial host really lands here) is the one where the doctor calls
+        # the host's own probes directly.
+        deps.hardware_snapshot = lambda _ttl: None
+        deps.shutil = types.SimpleNamespace(which=lambda name: f"/usr/bin/{name}")
+        deps.ydotool_socket = lambda: "/run/user/1000/.ydotool_socket"
+
+        def boom(_sock):
+            raise OSError("no /proc/self/fd on this platform")
+
+        deps.socket_connectable = boom
+        lines = doctor._lines(deps)
+        assert any(line.startswith("ydotool: probe failed") for line in lines), lines
+        # …and the rest of the report still happened: a dead probe is one line,
+        # not a truncated doctor.
+        assert any(line.startswith("niri IPC:") for line in lines), lines
