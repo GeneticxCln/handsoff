@@ -106,6 +106,12 @@ _ROOT_PREFIX = ""
 #: suite that had nothing to refuse.
 _PROTECTED: tuple = ()
 
+#: Whether the audit hook has been added in this process. An audit hook cannot
+#: be removed once added, so a second AGREEING `install()` (a fixture re-arming
+#: after a reload) must not register a second hook — the checks above all pass,
+#: which is exactly when the duplicate used to land.
+_INSTALLED = False
+
 
 def install(root, protected=()) -> None:
     """Arm the guard for `root` and the developer's `protected` dirs, here.
@@ -121,7 +127,7 @@ def install(root, protected=()) -> None:
     developer's real paths can name them, and `tests/conftest.py` captures them
     at import time, before any sandbox runs.
     """
-    global _ROOT, _ROOT_PREFIX, _PROTECTED
+    global _ROOT, _ROOT_PREFIX, _PROTECTED, _INSTALLED
     root = os.path.normpath(str(root))
     if _ROOT and _ROOT != root:
         raise RuntimeError(
@@ -143,7 +149,9 @@ def install(root, protected=()) -> None:
     _ROOT = root
     _ROOT_PREFIX = root + os.sep
     _PROTECTED = tuple(directories)
-    sys.addaudithook(_hook)
+    if not _INSTALLED:
+        sys.addaudithook(_hook)
+        _INSTALLED = True
 
 
 def root() -> str:

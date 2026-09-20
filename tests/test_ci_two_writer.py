@@ -1778,3 +1778,53 @@ class TestTheGateWiring:
         assert "'/sh'*" in shell_case and "python" not in shell_case, (
             "the shell gate discovers scripts by shebang; a pattern that matched "
             "python would run `bash -n` over the stamp script")
+
+
+class TestTheStampRefusesToGuess:
+    """A git failure is not an empty tree, and half a snapshot is not a pass.
+
+    Both were live holes in the same false pass this gate exists to refuse:
+    `snapshot()` mapped every non-zero `git diff`/`ls-files` in a tree that HAS
+    a HEAD to "empty", and `_moves()` validated only the BEFORE snapshot's
+    fields, so a truncated `after` read as every tracked file vanished (or as
+    nothing moved at all, depending on which side was missing them). Fixed
+    2026-09-20; free-standing here so the CLI end-to-end tests stay about the
+    run mechanism.
+    """
+
+    def test_a_git_failure_in_a_headed_tree_is_unjudgeable(
+            self, W, repo, monkeypatch):
+        good = W.snapshot(repo)
+        real = W._git
+
+        def failing(root, *args):
+            if args and args[0] == "diff":
+                return 128, ""
+            return real(root, *args)
+
+        monkeypatch.setattr(W, "_git", failing)
+        failed = W.snapshot(repo)
+        assert failed.get("why"), (
+            "a repo whose git commands failed must SAY it could not be read; "
+            "an empty diff would read as a clean tree")
+        assert "head" not in failed and "tracked" not in failed
+        assert W._moves(good, failed) is None
+        assert W._moves(failed, good) is None
+
+    def test_a_truncated_after_snapshot_is_not_a_pass(self, W, repo):
+        good = W.snapshot(repo)
+        assert W._moves(good, {"vcs": "git", "at": good["at"]}) is None, (
+            "half a snapshot is 'cannot judge', never 'nothing moved'")
+
+    def test_a_backwards_clock_gets_no_timing_lines(self, W, tmp_path):
+        target = tmp_path / "moved.py"
+        target.write_text("x\n", encoding="utf-8")
+        base = {"vcs": "git", "root": str(tmp_path), "at": 2000.0,
+                "head": "h", "tracked": {}, "tracked_diff": "",
+                "tracked_paths": [], "untracked": {"moved.py": "hash"}}
+        after = {**base, "at": 1000.0, "untracked": {"moved.py": "other"}}
+        assert W._moves(base, after)     # the row exists to time
+        assert W.when_notes(tmp_path, base, after,
+                            window="the tests gate's window") == [], (
+            "a clock that went backwards cannot place a write; a negative "
+            "fraction is worse than no line")

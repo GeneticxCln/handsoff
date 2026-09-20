@@ -467,6 +467,26 @@ class TestCompileAll:
         assert C.main(["compile_all.py", str(tmp_path)]) == 1
         assert "refusing to report success" in capsys.readouterr().err
 
+    def test_a_missing_root_is_named_as_the_root(self, C, tmp_path, capsys):
+        """A mistyped root used to read as "a tree with no Python in it".
+
+        Both are failures, so the run still refused — but the message pointed
+        at the wrong problem, and a gate whose diagnosis can be wrong is one
+        somebody works around instead of fixing.
+        """
+        missing = tmp_path / "not-there"
+        assert C.main(["compile_all.py", str(missing)]) == 1
+        err = capsys.readouterr().err
+        assert "does not exist" in err and "not-there" in err
+
+    def test_a_root_that_is_a_file_is_named_as_such(self, C, tmp_path, capsys):
+        """`rglob` on a file raises NotADirectoryError — caught, not traced."""
+        a_file = tmp_path / "a_module.py"
+        a_file.write_text("x = 1\n")
+        assert C.main(["compile_all.py", str(a_file)]) == 1
+        err = capsys.readouterr().err
+        assert "not a directory" in err and "a_module.py" in err
+
     def test_the_real_tree_passes(self, C, capsys):
         assert C.main(["compile_all.py", str(HERE)]) == 0
         assert "byte-compiled" in capsys.readouterr().out

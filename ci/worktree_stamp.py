@@ -182,14 +182,23 @@ def snapshot(root: Path) -> dict:
     head_code, head_out = _git(root, "rev-parse", "HEAD")
     head = head_out.strip() if head_code == 0 else ""
     diff_code, diff = _git(root, "diff", "HEAD", "--no-color", "--binary")
-    # An unborn HEAD (a fresh `git init`) has nothing to diff: empty, not an
-    # error. Everything in it is untracked and gets hashed below.
-    diff_text = diff if diff_code == 0 else ""
     names_code, names_out = _git(root, "diff", "HEAD", "--name-only", "-z")
+    listed_code, listed = _git(root, "ls-files", "--others",
+                               "--exclude-standard", "-z")
+    known_code, known = _git(root, "ls-files", "-z")
+    # An unborn HEAD (a fresh `git init`) has nothing to diff: empty, not an
+    # error. But a tree that HAS a HEAD and whose git commands still failed is
+    # a tree this gate could not READ, and calling that an empty diff is the
+    # false pass the gate exists to refuse — so it is spelled unjudgeable (no
+    # REQUIRED_FIELDS, so `_moves` answers None) rather than "nothing moved".
+    if head_code == 0 and (diff_code != 0 or names_code != 0
+                           or listed_code != 0 or known_code != 0):
+        return {"vcs": "git", "root": str(root), "at": time.time(),
+                "why": "git could not read this worktree (cannot judge)"}
+    diff_text = diff if diff_code == 0 else ""
     paths = sorted(part for part in names_out.split("\0") if part) \
         if names_code == 0 else []
     tracked = {rel: _content(root / rel) for rel in paths}
-    listed = _git(root, "ls-files", "--others", "--exclude-standard", "-z")[1]
     untracked = {}
     for rel in sorted(part for part in listed.split("\0") if part):
         untracked[rel] = _content(root / rel)
@@ -199,7 +208,6 @@ def snapshot(root: Path) -> dict:
     # file. IGNORED paths are not here on purpose — the gates rewrite
     # `.coverage`, `tests/report*.xml` and `__pycache__` every run, and a rule
     # that fired on those would refuse the run that wrote them.
-    known = _git(root, "ls-files", "-z")[1]
     written = {}
     for rel in sorted(part for part in known.split("\0") if part):
         stamp = _write_time(root / rel)
@@ -262,8 +270,10 @@ def _moves(before: dict, after: dict):
     # Key PRESENCE, not truthiness: an unborn HEAD with nothing untracked is a
     # legitimate (empty) snapshot, while one missing its own fields is a file
     # somebody truncated — and reading that as "nothing moved" is exactly the
-    # false pass this gate exists to refuse.
-    if not set(REQUIRED_FIELDS) <= set(before):
+    # false pass this gate exists to refuse. Judged on BOTH sides: a truncated
+    # `after` used to sail through as "nothing moved" too.
+    if not set(REQUIRED_FIELDS) <= set(before) \
+            or not set(REQUIRED_FIELDS) <= set(after):
         return None
     rows = []
     for kind in ("tracked", "untracked"):
@@ -457,6 +467,10 @@ def when_notes(root: Path, before: dict, after: dict, *, window: str,
     if not isinstance(opened, (int, float)) or not isinstance(closed, (int, float)):
         return []
     opened, width = float(opened), float(closed) - float(opened)
+    if width <= 0:
+        # A clock that went backwards (NTP, a manual change) makes every offset
+        # and fraction below a lie; "no opinion" beats a negative one.
+        return []
     notes = []
     if before.get("head") != after.get("head"):
         committed = _commit_time(root)

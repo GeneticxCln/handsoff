@@ -37,10 +37,20 @@ TODO = "TODO"
 
 
 def _install_var(name: str) -> list:
-    """The words of `NAME="a b c"` in install.sh — the installer's own list."""
+    """The words of `NAME="a b c"` in install.sh — the installer's own list.
+
+    A declaration this parser can no longer find is a REFUSAL, not an empty
+    list: the module table is generated from these names, so a renamed or
+    requoted variable would silently shrink it — and a freshly written spec
+    would then agree with itself while missing modules.
+    """
     match = re.search(rf'^{name}="([^"]*)"', INSTALL.read_text(encoding="utf-8"),
                       re.M)
-    return match.group(1).split() if match else []
+    if match is None:
+        raise SystemExit(
+            f"install.sh does not declare {name}=\"…\" in the form this "
+            f"generator reads — fix the declaration and the generator together")
+    return match.group(1).split()
 
 
 def modules() -> list:
@@ -153,8 +163,13 @@ def render_tools(text: str) -> str:
     rows = tool_rows()
     body = [[f"`{name}`", f"`{gate}`" if gate else "—", str(line)]
             for name, gate, line in rows]
-    text = re.sub(r"\*\*\d+ `@tool` methods\*\*",
-                  f"**{len(rows)} `@tool` methods**", text, count=1)
+    text, n = re.subn(r"\*\*\d+ `@tool` methods\*\*",
+                      f"**{len(rows)} `@tool` methods**", text, count=1)
+    if not n:
+        raise SystemExit(
+            "the tool-count prose is gone from specs/30-tools-api.md (this "
+            "generator rewrites it) — reword both together, or the count it "
+            "states goes stale with nothing failing")
     return _render_table(text, TOOLS_HEADER, body)
 
 

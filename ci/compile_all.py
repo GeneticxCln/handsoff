@@ -44,6 +44,16 @@ def discover(root: pathlib.Path) -> list[pathlib.Path]:
 
 def main(argv: list[str]) -> int:
     root = pathlib.Path(argv[1] if len(argv) > 1 else ".")
+    # A missing or non-directory root used to fall through to discovery and
+    # report "no Python sources" — the same message a genuinely empty tree
+    # gives, which sends the reader looking for the wrong problem.
+    if not root.exists():
+        print(f"compile_all: root path does not exist: {root}", file=sys.stderr)
+        return 1
+    if not root.is_dir():
+        print(f"compile_all: root path is not a directory: {root}",
+              file=sys.stderr)
+        return 1
     files = discover(root)
     if not files:
         # A gate that finds nothing is a broken gate, not a passing one.
