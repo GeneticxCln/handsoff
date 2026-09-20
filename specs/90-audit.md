@@ -1447,3 +1447,110 @@ an object's method reached through an attribute is resolved by name only, so a
 `commit` defined once in a file with 30 classes is followed — correct here, and
 worth knowing if a name like `run` ever becomes unique by accident.
 
+## The closure rule follows the helper into its own module — the root bound is enforced where the file is read (2026-09-19)
+
+**The limit this closes was stated by the section above in so many words:** the
+follow read the callee's body only when the def was in the SAME file, so `from
+harness import take_it` — a helper that calls its closure in place — was
+indistinguishable from `threading.Thread`, and a loop was told to bind a name it
+can never read again. The rule now resolves across the files of this checkout.
+
+**How the follow crosses a file.** One parsed-module object (`_Source`) carries a
+tree, its OWN parent map and its path — and the parent map is not decoration:
+`parents[node]` is only meaningful for the tree the node was parsed out of, so
+the walk into a callee in another file must use that module's map, and a mutation
+that uses the scanned file's map instead is caught (the argument's use resolves
+to nothing there, and the callee is read as a keeper). `_module(path, root)` is
+the ONE place a file is read and the ONE place the root bound is enforced: a path
+outside the checkout — or a name that only exists in an installed library —
+returns nothing and the call is not followed. A single expression, deliberately:
+a second copy of the bound further out could never be falsified on its own, and a
+check nobody can fail is not a check. `_module_path` tries two homes, because
+both are how this repository imports itself — the importing file's own directory
+(`tests/` do `from conftest import …`; a package does `from .theme import …`)
+and the checkout root (`core/assistant.py` does `from core.registry import …`) —
+and a RELATIVE import counts its levels up from the importing file's directory
+(`from ..harness import take_it` in `pkg/sub/deep.py` names `pkg/harness.py`).
+`_imports` builds `{name in this module: (file, attribute or None)}` from every
+`Import`/`ImportFrom`: `import core.brain` binds both `core.brain` and `core`,
+`import harness as h` binds `h`, `from twice import tap` binds `tap` →
+`(twice.py, "tap")`, and a star import or a name that is no file here is simply
+absent — which the caller reads as "assumed to keep what it is given". A dotted
+CALL name is tried longest first (`h.take_it` → the module itself, then `h`), so
+the most specific module wins.
+
+**That a name is imported is not yet an answer** — which is what `_imported_def`
+exists for: `from core.registry import BoundedRegistry` binds a CLASS, and
+looking for a def of that name finds none, so a class, a constant or an imported
+lambda declines to be followed exactly as it should. An attribute binding is
+followed only when the imported module defines that name **exactly once**; defined
+twice leaves the call ambiguous and it is not followed at all, because guessing
+the wrong body is how this rule would start missing escapes.
+
+**And one hole was found while writing it.** The import table is built from every
+`Import` node in the module, so a name imported and then REBOUND at module level
+(`from harness import take_it` … `take_it = keep_it`) was still resolved to the
+imported body — a verdict about a function nobody calls, and in the unsafe
+direction: the imported `take_it` consumes its closure, so a call that actually
+runs a KEEPER would have been left alone as consumed. Names rebound at module
+level (assignment, annotation, or a module-level `def`/`class` of the same name)
+are now dropped from the table, and the call falls back to "assumed to keep" —
+the direction whose cost is a needless `x=x` default. Lexical like the rest of
+the rule, and stated: only module level is checked, so a rebinding inside a
+function is not seen.
+
+**The sample is now real files parsed from real paths.**
+`test_an_imported_helper_is_read_instead_of_assumed` writes a package under
+`tmp_path` — `harness.py` (`take_it` calls its closure, `keep_it` stores it),
+`twice.py` (a `tap` defined twice) — and four consumers judged through the same
+helper the shipped sweep calls, so the machinery under test is the machinery that
+runs. Each part fails a different way if the follow is wrong: the consumer of
+`take_it` must be left alone while the consumer of `keep_it` must be flagged
+(`(2, [5])`); the ALIASED module (`import harness as h`, then `h.take_it(…)`)
+resolves; a name defined twice in the imported module is ambiguous and not
+followed; a name rebound at module level is not the import any more and the call
+is judged as kept; the RELATIVE import two levels up resolves; and the SAME
+consumer file judged with a root that does not contain the helper resolves
+nothing — both closures assumed kept — so the follow never leaves the root it was
+handed.
+
+**Measured reach in this tree: no such chain exists yet.** The shipped sweep
+judges **12** closures inside loops and resolves **0** call sites across a file
+boundary, so this half is pinned by the sample today and is what the next
+imported consumer inherits. What IS pinned in the shipped and suite sweeps is
+that the import table still reads this repository: the suite half requires **≥ 5**
+`from … import …` names to resolve to a file in the checkout — measured, **151
+of 185** bindings across 33 test files (the shipped tree: 6 of 23 across 21
+files) — a floor rather than a count, so a rename can starve it visibly instead
+of silently.
+
+**Teeth: 13/13 mutations caught, 0 missed, every restore verified green** —
+eleven on the cross-module half (the root bound dropped so a file outside the
+checkout is followed too; a relative import resolved against the root only;
+`import x as y` no longer binding `y`; an ambiguous name followed anyway;
+imported names never resolved at all; the follow dropping the root so no callee
+outside the file resolves; the cross-module walk using the SCANNED file's parent
+map; a name rebound at module level followed anyway; a wrapper that only passes
+the closure ON read as a keeper; the cycle guard removed, which fails loudly as
+`RecursionError`; and a callee that calls its closure in place read as a KEEPER)
+plus two controls proving the refactor did not blunt the earlier verdicts (a
+shipped brain worker unbound again; comprehension scopes not scopes again).
+
+**Stated limits:** the import table is lexical — a name imported and rebound
+inside a FUNCTION is still resolved to the import; a star import is not read at
+all; a name defined twice in the imported module is refused rather than guessed;
+the same-named file in the importing file's own directory wins over the checkout
+root (the order this repository's two import styles require); and everything
+outside the checkout is assumed to keep what it is given. All of them are
+conservative in the same direction — a needless `x=x` default, never a missed
+escape — except the function-level rebinding, which is stated as a hole rather
+than dressed up.
+
+**Measured on the final bytes:** the `tests` gate **PASS — 1 921 passed in
+257 s** (1 920 before: this round adds the imported-consumer test); `order`
+**PASS**, seed shuffle **1 921 in 261 s** and file-order shuffle **1 921 in
+260 s**; `coverage` **PASS, 85.29%** (2 542 missing of 17 275) ≥ 70; `compile`,
+`shell` and `smoke` PASS; `clean-checkout` **PASS** (freshness **19 passed in
+3.2 s**); `two-writer` **PASS**, the worktree unchanged through the run. And the
+`specs/60-test-plan.md` row for `test_regression.py` moved 153 → 154, because
+this round does add a test rather than sharpen one.

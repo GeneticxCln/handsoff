@@ -2383,6 +2383,25 @@ class TestWatcherPatternSafety:
         assert [int(s.split()[-1]) for s in seen] == list(range(total))
 
 
+class _Source:
+    """One parsed module for the closure rule: tree, parent map, and path.
+
+    Threaded through the follow because a callee read in ANOTHER module needs
+    the parent map of the tree it actually came from — `parents[node]` is only
+    meaningful for the tree the node was parsed out of — and because the module
+    that file imports from is the one that file names, not the one being
+    scanned. `path` is None for a tree with no file (a string in a test), which
+    is what keeps such a tree to same-file resolution.
+    """
+
+    __slots__ = ("tree", "parents", "path")
+
+    def __init__(self, tree, parents, path=None):
+        self.tree = tree
+        self.parents = parents
+        self.path = path
+
+
 class TestTheScansShapesAreCheckedProperties:
     """Two shapes a full-tree scan found, as PROPERTIES rather than instances.
 
@@ -2809,6 +2828,12 @@ class TestTheScansShapesAreCheckedProperties:
                 return f"bound to `{name}` and {why}"
         return ""
 
+    #: path -> the parsed `_Source`, or None for a file that is not there.
+    #: A module is asked for once per call site and never changes mid-run, so
+    #: the parse happens once; keying by path keeps a re-run from re-reading
+    #: `core/tools.py` for each of its call sites.
+    _MODULE_CACHE: dict = {}
+
     @staticmethod
     def _defs_named(tree, name) -> list:
         return [n for n in ast.walk(tree)
@@ -2816,15 +2841,183 @@ class TestTheScansShapesAreCheckedProperties:
                 and n.name == name]
 
     @classmethod
-    def _definition_of(cls, func, tree):
-        """(the def this call names, its `self` offset), or None.
+    def _module(cls, path, root):
+        """The parsed module at `path`, for a file INSIDE `root`, else None.
 
-        Same file only, by UNIQUE name — two defs called `take` leave the call
+        The root bound is the whole safety of crossing a file: `from
+        PySide6.QtCore import QTimer` resolves to no file here, and even if a
+        name did collide with an installed library, following it would make a
+        verdict depend on somebody else's implementation rather than on this
+        checkout's code. This is the ONE place the bound is enforced — a
+        second copy further out could never be falsified on its own, and a
+        guard nobody can fail is not a guard.
+        """
+        try:
+            key = path.resolve()
+            key.relative_to(root.resolve())
+        except (OSError, ValueError):
+            return None
+        if key not in cls._MODULE_CACHE:
+            source = None
+            try:
+                tree = ast.parse(key.read_text(encoding="utf-8"), str(key))
+            except (OSError, SyntaxError, UnicodeDecodeError):
+                tree = None
+            if tree is not None:
+                source = _Source(tree, cls._parents(tree), key)
+            cls._MODULE_CACHE[key] = source
+        return cls._MODULE_CACHE[key]
+
+    @classmethod
+    def _module_path(cls, dotted, source, root, home=None):
+        """The file a dotted module name names inside `root`, else None.
+
+        Two homes are tried, because both are how this repository imports
+        itself: the importing file's OWN directory (tests do `from conftest
+        import …`; `core/bubble.py` does `from .theme import …`, whose home is
+        the package it sits in) and the checkout root (`core/assistant.py` does
+        `from core.registry import …`). Whether the file found is inside `root`
+        is `_module`'s question: it is asked once, where the file is read, so
+        the bound has exactly one expression and one way to fail.
+        """
+        if root is None or source is None or source.path is None or not dotted:
+            return None
+        homes = [home if home is not None else source.path.parent, root]
+        for base in homes:
+            for cand in (base.joinpath(*dotted.split(".")).with_suffix(".py"),
+                         base.joinpath(*dotted.split("."), "__init__.py")):
+                if cand.is_file():
+                    return cand
+        return None
+
+    @classmethod
+    def _imports(cls, source, root) -> dict:
+        """{name in this module: (the file it names, the attribute or None)}.
+
+        `import core.brain` binds `core` and the dotted `core.brain` (both to
+        core/brain.py, the package's own `__init__` being a different question);
+        `import core.brain as b` binds `b`; `from core.brain import take_it`
+        binds `take_it` → (core/brain.py, "take_it"), and `from core import
+        registry` binds `registry` → the MODULE itself (attribute None). A
+        relative import resolves against the package it sits in.        A star import,
+        or any name that is no file here, is simply absent — which the caller
+        reads as "assumed to keep what it is given".
+
+        A name imported and then REBOUND at module level (`from harness import
+        take_it` … `take_it = keep_it`) is not the import any more, so it is
+        dropped from the table rather than followed to a body nobody calls.
+        Lexical like the rest of the rule, and stated: only module level is
+        checked, so a rebinding inside a function is not seen — and dropping a
+        name is the safe direction (it costs a needless `x=x` default, where
+        following the wrong body can miss an escape).
+        """
+        out: dict = {}
+        for node in ast.walk(source.tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    path = cls._module_path(alias.name, source, root)
+                    if path is None:
+                        continue
+                    out[alias.name] = (path, None)
+                    out.setdefault(alias.name.split(".")[0], (path, None))
+                    if alias.asname:
+                        out[alias.asname] = (path, None)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level and source.path is None:
+                    continue                # relative to what? a string tree
+                home = None
+                if node.level:
+                    home = source.path.parent
+                    for _ in range(node.level - 1):
+                        home = home.parent
+                base = node.module or ""
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    sub = f"{base}.{alias.name}" if base else alias.name
+                    path = cls._module_path(sub, source, root, home)
+                    attr = None
+                    if path is None and base:
+                        path = cls._module_path(base, source, root, home)
+                        attr = alias.name
+                    if path is not None:
+                        out[alias.asname or alias.name] = (path, attr)
+        rebound: set = set()
+        for node in source.tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    cls._target_into(target, rebound)
+            elif isinstance(node, ast.AnnAssign):
+                cls._target_into(node.target, rebound)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef)):
+                rebound.add(node.name)
+        for name in rebound & set(out):
+            del out[name]
+        return out
+
+    @staticmethod
+    def _dotted_candidates(func) -> list:
+        """`a.b.c` → ["a.b.c", "a.b", "a"] — longest first, so the most
+        specific module wins. A call on an expression (`Holder().commit`,
+        `sink.append`) yields none: its value is not an import.
+        """
+        parts: list = []
+        node = func
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return []
+        parts.append(node.id)
+        parts.reverse()
+        return [".".join(parts[:i]) for i in range(len(parts), 0, -1)]
+
+    @classmethod
+    def _imported_def(cls, dotted, source, root):
+        """The def a dotted name names through THIS module's imports, or None.
+
+        That a name is imported is not yet an answer: `from core.registry
+        import BoundedRegistry` binds a CLASS, and looking for a def of that
+        name finds none, which is precisely how a class, a constant or an
+        imported lambda declines to be followed.
+        """
+        binding = cls._imports(source, root).get(dotted)
+        if binding is not None and binding[1] is not None:
+            target = cls._module(binding[0], root)
+            defs = [] if target is None else cls._defs_named(target.tree,
+                                                            binding[1])
+            if len(defs) == 1:
+                return defs[0], 0, target
+        parts = dotted.split(".")
+        for cut in range(len(parts) - 1, 0, -1):
+            head, tail = ".".join(parts[:cut]), parts[cut:]
+            if len(tail) != 1:
+                continue
+            bound = cls._imports(source, root).get(head)
+            path = bound[0] if bound is not None and bound[1] is None else None
+            if path is None:
+                path = cls._module_path(head, source, root)
+            target = None if path is None else cls._module(path, root)
+            if target is None:
+                continue
+            defs = cls._defs_named(target.tree, tail[0])
+            if len(defs) == 1:
+                return defs[0], 0, target
+        return None
+
+    @classmethod
+    def _definition_of(cls, func, source, root=None):
+        """(the def this call names, its `self` offset, the module), or None.
+
+        Same file FIRST, by UNIQUE name — two defs called `take` leave the call
         ambiguous, and following the wrong body is how this rule would start
-        missing escapes. An attribute call on a MODULE (`hardware._probe`,
-        `core.brain.take_it`) is a function, so no `self` is skipped; one on
-        anything else (`self._run(fn)`, `slot.commit(fn)`) is a METHOD, and its
-        first parameter is the instance.
+        missing escapes. Then, when the name came from an import, the module it
+        names in this checkout: an imported consumer is read, not assumed. An
+        attribute call on a MODULE (`hardware._probe`, `core.brain.take_it`) is
+        a function, so no `self` is skipped; one on anything else
+        (`self._run(fn)`, `slot.commit(fn)`) is a METHOD, and its first
+        parameter is the instance.
         """
         if isinstance(func, ast.Name):
             wanted, offset = func.id, 0
@@ -2832,9 +3025,13 @@ class TestTheScansShapesAreCheckedProperties:
             wanted, offset = func.attr, 1
         else:
             return None
-        same = cls._defs_named(tree, wanted)
+        same = cls._defs_named(source.tree, wanted)
         if len(same) == 1:
-            return same[0], offset
+            return same[0], offset, source
+        for dotted in cls._dotted_candidates(func):
+            hit = cls._imported_def(dotted, source, root)
+            if hit is not None:
+                return hit
         return None
 
     @staticmethod
@@ -2875,7 +3072,7 @@ class TestTheScansShapesAreCheckedProperties:
         return False
 
     @classmethod
-    def _consumes(cls, call, arg, tree, parents, chain=frozenset()) -> bool:
+    def _consumes(cls, call, arg, source, root=None, chain=frozenset()) -> bool:
         """Does the callee USE this closure during the call, or KEEP it?
 
         The reason `threading.Thread` is not simply on the CONSUMING list:
@@ -2892,16 +3089,20 @@ class TestTheScansShapesAreCheckedProperties:
         `chain` of (callee, parameter) pairs already walked makes a cycle of
         such wrappers a refusal instead of a loop.
 
+        The callee may live in ANOTHER module of this checkout (`from harness
+        import take_it`) — `root` is the checkout the follow is allowed inside,
+        and the walk uses that module's own parent map, not the scanned file's.
+
         A store, a `return`, a hand-off from a NESTED scope (a thread, a timer)
         or a call the target does not consume means it can outlive. Anything
         unreadable — an external callee, a `*args` binding, an ambiguous name —
         falls back to "keeps it", which is the safe direction: the cost is a
         needless default, never a missed escape.
         """
-        found = cls._definition_of(call.func, tree)
+        found = cls._definition_of(call.func, source, root)
         if found is None:
             return False
-        callee, offset = found
+        callee, offset, here = found
         param = cls._parameter_for(call, arg, callee, offset)
         if param is None:
             return False
@@ -2916,18 +3117,18 @@ class TestTheScansShapesAreCheckedProperties:
             if not (isinstance(node, ast.Name) and node.id == param
                     and isinstance(node.ctx, ast.Load)):
                 continue
-            up = parents.get(node)
+            up = here.parents.get(node)
             if not isinstance(up, ast.Call):
                 return False                 # kept, whatever the verb
-            if not cls._directly_in(up, callee, parents):
+            if not cls._directly_in(up, callee, here.parents):
                 return False                 # called or passed on by a worker
-            if up.func is not node and not cls._consumes(up, node, tree,
-                                                         parents, chain):
+            if up.func is not node and not cls._consumes(up, node, here, root,
+                                                         chain):
                 return False                 # handed ON to a callee that keeps
         return True
 
     @classmethod
-    def _escapes(cls, fn, scope, tree, parents, enclosing) -> str:
+    def _escapes(cls, fn, scope, source, enclosing, root=None) -> str:
         """How this closure leaves the iteration that defined it, or "".
 
         "" means CALLED IN THE ITERATION, which is the only case left alone:
@@ -2935,6 +3136,7 @@ class TestTheScansShapesAreCheckedProperties:
         shape is named, so a failure says which way the worker got out —
         stored, threaded, connected, returned, collected.
         """
+        parents = source.parents
         if isinstance(scope, (ast.ListComp, ast.SetComp, ast.DictComp,
                               ast.GeneratorExp)):
             up = parents.get(fn)
@@ -2955,7 +3157,7 @@ class TestTheScansShapesAreCheckedProperties:
                     or getattr(up.func, "id", None) or ast.unparse(up.func)[:40]
                 if callee in cls.CONSUMING:
                     return ""                   # sorted(…, key=lambda: x)
-                if cls._consumes(up, node, tree, parents):
+                if cls._consumes(up, node, source, root):
                     return ""                   # a readable def CALLS what it gets
                 return f"handed to {callee}()"
             if isinstance(up, ast.Assign):
@@ -2970,7 +3172,7 @@ class TestTheScansShapesAreCheckedProperties:
         return ""
 
     @classmethod
-    def _closure_offenders(cls, tree, label) -> tuple:
+    def _closure_offenders(cls, tree, label, module=None, root=None) -> tuple:
         """(the closures it saw, by name, offenders) — the rule, one home.
 
         Two scopes, because they are the same mistake — a loop that rebinds a
@@ -2986,10 +3188,15 @@ class TestTheScansShapesAreCheckedProperties:
         was 12 unrelated closures and a PTT worker that is not in a loop at
         all — a count here is a floor a refactor can quietly walk off).
 
+        `module` and `root` are what let the follow cross a FILE: with them, a
+        callee imported from another module of this checkout is read instead of
+        assumed, and a callee that resolves outside `root` is not followed. A
+        tree with no `module` (a sample parsed from a string) stays same-file.
         """
         seen, offenders = [], []
         closures = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-        parents = cls._parents(tree)
+        source = _Source(tree, cls._parents(tree), module)
+        parents = source.parents
         for scope in ast.walk(tree):
             if isinstance(scope, (ast.For, ast.AsyncFor, ast.While)):
                 rebound = cls._assigned_in(scope) | cls._loop_targets(scope)
@@ -3009,7 +3216,7 @@ class TestTheScansShapesAreCheckedProperties:
                 leaked = sorted((reads & rebound) - bound)
                 if not leaked:
                     continue
-                why = cls._escapes(fn, scope, tree, parents, enclosing)
+                why = cls._escapes(fn, scope, source, enclosing, root)
                 if why:
                     offenders.append(
                         (fn.lineno,
@@ -3178,7 +3385,7 @@ class TestTheScansShapesAreCheckedProperties:
         for path in self._shipped():
             tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
             found, bad = self._closure_offenders(
-                tree, str(path.relative_to(HERE)))
+                tree, str(path.relative_to(HERE)), module=path, root=HERE)
             seen += found
             offenders += [msg for _ln, msg in bad]
         for worker in ("_run_stream", "_run_call"):
@@ -3197,6 +3404,113 @@ class TestTheScansShapesAreCheckedProperties:
             "a function defined inside a loop reads a name the loop rebinds, "
             "unbound: it will see whichever object the next pass put there — "
             "bind it as a default (def f(x=x)):\n" + "\n".join(offenders))
+
+    def test_an_imported_helper_is_read_instead_of_assumed(self, tmp_path):
+        """A callee in ANOTHER module of the same checkout is followed too.
+
+        `from harness import take_it` used to be indistinguishable from
+        `threading.Thread`, so a helper that calls its closure in place was
+        assumed to KEEP it and a loop was told to bind a name it can never read
+        again. The consumers here are real files, parsed from real paths, with
+        real import statements — the same machinery the shipped sweep uses, not
+        a fixture standing in for it — and each part fails a different way if
+        the follow is wrong:
+
+          * a helper that CALLS the closure is left alone, one that KEEPS it
+            is not, and the one that is left alone must be left alone BECAUSE
+            the imported body was read (not because its lambda reads nothing);
+          * an ALIASED module (`import harness as h`) resolves too;
+          * a name defined twice in the imported module is ambiguous, so it is
+            not followed at all;
+          * a name imported and then REBOUND at module level is not the import
+            any more, so the call is judged on the rebound name (assumed kept)
+            rather than on the body of a function nobody calls;
+          * a RELATIVE import two levels up (`from ..harness import take_it`)
+            resolves against the package it sits in;
+          * and the same consumer analysed with a root that does NOT contain
+            the helper resolves nothing — the follow never leaves the root.
+        """
+        pkg = tmp_path / "pkg"
+        (pkg / "sub").mkdir(parents=True)
+        (pkg / "harness.py").write_text(
+            "def take_it(fn):\n"
+            "    fn()\n"
+            "def keep_it(fn):\n"
+            "    hold.append(fn)\n", encoding="utf-8")
+        (pkg / "twice.py").write_text(
+            "def tap(fn):\n"
+            "    fn()\n"
+            "def tap(fn):\n"          # the same NAME twice: not followed
+            "    hold.append(fn)\n", encoding="utf-8")
+        cases = {
+            "consumer_direct.py": (
+                "from harness import take_it, keep_it\n"
+                "for item in CASES:\n"
+                "    take_it(lambda: item)\n"
+                "for item2 in CASES:\n"
+                "    keep_it(lambda: item2)\n"),
+            "consumer_alias.py": (
+                "import harness as h\n"
+                "for item in CASES:\n"
+                "    h.take_it(lambda: item)\n"),
+            "consumer_twice.py": (
+                "from twice import tap\n"
+                "for item in CASES:\n"
+                "    tap(lambda: item)\n"),
+            "consumer_rebound.py": (
+                "from harness import take_it, keep_it\n"
+                "take_it = keep_it\n"          # rebound: not the import any more
+                "for item in CASES:\n"
+                "    take_it(lambda: item)\n"),
+            "sub/deep.py": (
+                "from ..harness import take_it\n"
+                "for item in CASES:\n"
+                "    take_it(lambda: item)\n"),
+        }
+        for name, text in cases.items():
+            (pkg / name).write_text(text, encoding="utf-8")
+
+        def judge(name, root):
+            path = pkg / name
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            return self._closure_offenders(tree, name, module=path, root=root)
+
+        seen, off = judge("consumer_direct.py", tmp_path)
+        assert (len(seen), [ln for ln, _ in off]) == (2, [5]), (
+            "the imported helper that CALLS the closure must be left alone and "
+            f"the one that KEEPS it must not: seen={seen} offenders={off}")
+        assert "handed to keep_it()" in off[0][1], off
+
+        seen, off = judge("consumer_alias.py", tmp_path)
+        assert (len(seen), [ln for ln, _ in off]) == (1, []), (
+            f"`import harness as h` then `h.take_it(…)` is the same helper: "
+            f"seen={seen} offenders={off}")
+
+        seen, off = judge("consumer_twice.py", tmp_path)
+        assert [ln for ln, _ in off] == [3], (
+            "`tap` is defined TWICE in the imported module, so which body runs "
+            f"is not knowable and the call is not followed: {off}")
+        assert "handed to tap()" in off[0][1], off
+
+        seen, off = judge("consumer_rebound.py", tmp_path)
+        assert (len(seen), [ln for ln, _ in off]) == (1, [4]), (
+            "`take_it = keep_it` at module level means the name is NOT the "
+            "imported helper, so the call is not followed to a consuming body "
+            f"and the closure is assumed kept: seen={seen} offenders={off}")
+        assert "handed to take_it()" in off[0][1], off
+
+        seen, off = judge("sub/deep.py", tmp_path)
+        assert (len(seen), [ln for ln, _ in off]) == (1, []), (
+            "`from ..harness import take_it`, two levels up in the package, "
+            f"names the same helper: seen={seen} offenders={off}")
+
+        other = tmp_path / "other"
+        other.mkdir()
+        seen, off = judge("consumer_direct.py", other)
+        assert [ln for ln, _ in off] == [3, 5], (
+            "with a root that does not contain the helper, nothing resolves and "
+            "both closures are assumed to be kept — the follow never leaves "
+            f"the root it was handed: {off}")
 
     def test_the_suite_holds_itself_to_the_worker_binding_rule(self):
         """The tests get the same rule. A fixture or a lambda handed to a
@@ -3217,13 +3531,24 @@ class TestTheScansShapesAreCheckedProperties:
         for path in sorted((HERE / "tests").glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
             found, bad = self._closure_offenders(
-                tree, f"tests/{path.name}")
+                tree, f"tests/{path.name}", module=path, root=HERE)
             seen += found
             offenders += [msg for _ln, msg in bad]
         assert len(seen) >= 10, (
             f"only {len(seen)} closure(s) inside a loop found in the suite — "
             "there are 10 today, so a sweep that finds fewer has lost its "
             "subject and must not report a pass")
+        resolved = 0
+        for path in sorted((HERE / "tests").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+            source = _Source(tree, self._parents(tree), path)
+            resolved += sum(1 for _p, attr in self._imports(source, HERE).values()
+                            if attr is not None)
+        assert resolved >= 5, (
+            f"only {resolved} `from … import …` name(s) in the suite resolved to "
+            "a file in this checkout — the import table has stopped reading "
+            "this repository's own imports, so no callee can be followed "
+            "across a module boundary any more")
         assert not offenders, (
             "a closure defined inside a loop in the SUITE reads a name the "
             "loop rebinds, unbound — a leak or an order dependency waiting for "
