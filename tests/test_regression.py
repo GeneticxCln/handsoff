@@ -2733,17 +2733,263 @@ class TestTheScansShapesAreCheckedProperties:
             cls._target_into(loop.target, out)
         return out
 
+    #: Calls that CONSUME a closure inside the iteration that made it, so a
+    #: closure handed to one cannot outlive the names it reads. Everything NOT
+    #: in here is ASSUMED to keep what it is given unless `_consumes` can read
+    #: the callee's own body and watch it call the closure in place — the safe
+    #: direction either way: the cost of the assumption is an `x=x` default, and
+    #: the cost of the other is a worker writing into the next round's object.
+    #: `map`/`filter` are deliberately absent — they return a lazy iterator that
+    #: outlives the call, which is the opposite of consuming.
+    CONSUMING = ("sorted", "min", "max", "any", "all", "sum", "list", "tuple",
+                 "set", "frozenset", "dict", "len", "next", "print",
+                 "reversed", "id", "repr", "format", "isinstance", "callable")
+
+    @staticmethod
+    def _parents(tree) -> dict:
+        return {child: parent for parent in ast.walk(tree)
+                for child in ast.iter_child_nodes(parent)}
+
+    @staticmethod
+    def _enclosing_of(node, tree, parents):
+        """The innermost function (or the module) that CONTAINS `node`.
+
+        The whole point of the escape test: a closure is safe as long as every
+        use of it is a call inside the iteration, and "every use" has to be
+        looked for one level up — in the function that holds the loop.
+        """
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.Module)):
+                return node
+        return tree
+
+    @staticmethod
+    def _within(node, scope, parents) -> bool:
+        while node in parents:
+            if node is scope:
+                return True
+            node = parents[node]
+        return False
+
+    @classmethod
+    def _handed_on(cls, name, enclosing, scope, parents) -> str:
+        """Why `name` is not just a local this iteration calls, or "".
+
+        Two ways out, and both are how a per-iteration worker becomes
+        reachable after its iteration: the name is READ as a value somewhere
+        (`hold.append(f)`, `return f`), or it is CALLED from outside the loop
+        (`f = lambda: x` … then `f()` after the loop — that call sees the last
+        pass's `x`). A read that is the callee of a call inside the loop is the
+        one case that stays local.
+        """
+        for node in ast.walk(enclosing):
+            if not (isinstance(node, ast.Name) and node.id == name
+                    and isinstance(node.ctx, ast.Load)):
+                continue
+            up = parents.get(node)
+            if not (isinstance(up, ast.Call) and up.func is node):
+                return f"`{name}` is read as a value"
+            if not cls._within(node, scope, parents):
+                return f"`{name}` is called from outside the loop"
+        return ""
+
+    @classmethod
+    def _stored_on(cls, targets, scope, parents, enclosing) -> str:
+        """Where an assigned closure goes: an attribute, or a name that leaks."""
+        names: set = set()
+        for t in targets:
+            if isinstance(t, (ast.Attribute, ast.Subscript)):
+                return f"stored on {ast.unparse(t)[:40]}"
+            cls._target_into(t, names)
+        for name in sorted(names):
+            why = cls._handed_on(name, enclosing, scope, parents)
+            if why:
+                return f"bound to `{name}` and {why}"
+        return ""
+
+    @staticmethod
+    def _defs_named(tree, name) -> list:
+        return [n for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == name]
+
+    @classmethod
+    def _definition_of(cls, func, tree):
+        """(the def this call names, its `self` offset), or None.
+
+        Same file only, by UNIQUE name — two defs called `take` leave the call
+        ambiguous, and following the wrong body is how this rule would start
+        missing escapes. An attribute call on a MODULE (`hardware._probe`,
+        `core.brain.take_it`) is a function, so no `self` is skipped; one on
+        anything else (`self._run(fn)`, `slot.commit(fn)`) is a METHOD, and its
+        first parameter is the instance.
+        """
+        if isinstance(func, ast.Name):
+            wanted, offset = func.id, 0
+        elif isinstance(func, ast.Attribute):
+            wanted, offset = func.attr, 1
+        else:
+            return None
+        same = cls._defs_named(tree, wanted)
+        if len(same) == 1:
+            return same[0], offset
+        return None
+
+    @staticmethod
+    def _parameter_for(call, arg, callee, offset):
+        """The parameter this argument binds to, or None when it is unknowable.
+
+        A `*args` splat shifts the positions, a `**kwargs` splat hides the
+        keyword, and a `*fns` parameter collects a tuple the callee can index
+        later — none of those can be read, so none of them are guessed at.
+        """
+        if any(isinstance(a, ast.Starred) for a in call.args):
+            return None
+        params = list(callee.args.posonlyargs) + list(callee.args.args)
+        for i, node in enumerate(call.args):
+            if node is arg:
+                i += offset
+                return params[i].arg if i < len(params) else None
+        for kw in call.keywords:
+            if kw.value is arg and kw.arg:
+                return kw.arg
+        return None
+
+    @staticmethod
+    def _directly_in(node, func, parents) -> bool:
+        """True when `node` runs in `func`'s own body, not a nested scope.
+
+        The distinction the follow turns on: `def take(fn): fn()` uses the
+        closure DURING the call, while `def later(fn): Thread(target=lambda:
+        fn()).start()` calls it from a worker that outlives the call.
+        """
+        while node in parents:
+            node = parents[node]
+            if node is func:
+                return True
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.Lambda)):
+                return False
+        return False
+
+    @classmethod
+    def _consumes(cls, call, arg, tree, parents, chain=frozenset()) -> bool:
+        """Does the callee USE this closure during the call, or KEEP it?
+
+        The reason `threading.Thread` is not simply on the CONSUMING list:
+        follow the callee instead of assuming. When its definition is in THIS
+        tree under a unique name, bind the argument to its parameter and read
+        what the body does with it — every use being a call in the callee's OWN
+        body means the closure cannot outlive the call, which is exactly the
+        case the blunt version demanded an `x=x` default for.
+
+        A use that hands the parameter ON (`def through(fn): take_it(fn)`) is
+        followed one level further rather than read as a store, because a
+        wrapper that only passes the closure along consumes it exactly as far
+        as its target does — and that target is read by the same code. The
+        `chain` of (callee, parameter) pairs already walked makes a cycle of
+        such wrappers a refusal instead of a loop.
+
+        A store, a `return`, a hand-off from a NESTED scope (a thread, a timer)
+        or a call the target does not consume means it can outlive. Anything
+        unreadable — an external callee, a `*args` binding, an ambiguous name —
+        falls back to "keeps it", which is the safe direction: the cost is a
+        needless default, never a missed escape.
+        """
+        found = cls._definition_of(call.func, tree)
+        if found is None:
+            return False
+        callee, offset = found
+        param = cls._parameter_for(call, arg, callee, offset)
+        if param is None:
+            return False
+        declared = {a.arg for a in (callee.args.posonlyargs + callee.args.args
+                                    + callee.args.kwonlyargs)}
+        if param not in declared:
+            return False
+        if (id(callee), param) in chain:
+            return False                     # a cycle of wrappers: not chased
+        chain = chain | {(id(callee), param)}
+        for node in ast.walk(callee):
+            if not (isinstance(node, ast.Name) and node.id == param
+                    and isinstance(node.ctx, ast.Load)):
+                continue
+            up = parents.get(node)
+            if not isinstance(up, ast.Call):
+                return False                 # kept, whatever the verb
+            if not cls._directly_in(up, callee, parents):
+                return False                 # called or passed on by a worker
+            if up.func is not node and not cls._consumes(up, node, tree,
+                                                         parents, chain):
+                return False                 # handed ON to a callee that keeps
+        return True
+
+    @classmethod
+    def _escapes(cls, fn, scope, tree, parents, enclosing) -> str:
+        """How this closure leaves the iteration that defined it, or "".
+
+        "" means CALLED IN THE ITERATION, which is the only case left alone:
+        the names it closed over are still the ones the loop had. Every other
+        shape is named, so a failure says which way the worker got out —
+        stored, threaded, connected, returned, collected.
+        """
+        if isinstance(scope, (ast.ListComp, ast.SetComp, ast.DictComp,
+                              ast.GeneratorExp)):
+            up = parents.get(fn)
+            if isinstance(up, ast.Call) and up.func is fn:
+                return ""                    # (lambda: i)() inside the scope
+            return "the comprehension's result, one closure per element"
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # A named def is a STATEMENT, not an expression: the question is
+            # what happens to its NAME, not what contains it.
+            return cls._handed_on(fn.name, enclosing, scope, parents)
+        node = fn
+        while node is not scope and node in parents:
+            up = parents[node]
+            if isinstance(up, ast.Call):
+                if up.func is node:
+                    return ""                   # (lambda: x)()
+                callee = getattr(up.func, "attr", None) \
+                    or getattr(up.func, "id", None) or ast.unparse(up.func)[:40]
+                if callee in cls.CONSUMING:
+                    return ""                   # sorted(…, key=lambda: x)
+                if cls._consumes(up, node, tree, parents):
+                    return ""                   # a readable def CALLS what it gets
+                return f"handed to {callee}()"
+            if isinstance(up, ast.Assign):
+                return cls._stored_on(up.targets, scope, parents, enclosing)
+            if isinstance(up, ast.AnnAssign):
+                return cls._stored_on([up.target], scope, parents, enclosing)
+            if isinstance(up, (ast.Return, ast.Yield)):
+                return "returned"
+            if isinstance(up, (ast.Dict, ast.List, ast.Set, ast.Tuple)):
+                return "put in a container literal"
+            node = up
+        return ""
+
     @classmethod
     def _closure_offenders(cls, tree, label) -> tuple:
-        """(closures seen, offenders) — the rule, so every caller judges alike.
+        """(the closures it saw, by name, offenders) — the rule, one home.
 
-        Two scopes, because they are the same mistake: a loop that rebinds a
+        Two scopes, because they are the same mistake — a loop that rebinds a
         name a nested `def`/`lambda` reads (through its target or in its body),
-        and a COMPREHENSION whose variable a closure inside it reads —
-        `[lambda: i for i in …]`, where `i` is rebound per element.
+        and a COMPREHENSION whose variable a closure inside it reads. And one
+        condition, which is what this rule is FOR: the closure must be able to
+        outlive its iteration. A closure invoked in the iteration it was
+        defined in reads the names the loop has at that moment, correctly.
+
+        The names are RETURNED rather than counted because the callers pin
+        WHICH closures they expect to be judged (measured 2026-09-19: the
+        shipped half called `>= 3` the "three subjects" while the real answer
+        was 12 unrelated closures and a PTT worker that is not in a loop at
+        all — a count here is a floor a refactor can quietly walk off).
+
         """
-        scanned, offenders = 0, []
+        seen, offenders = [], []
         closures = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+        parents = cls._parents(tree)
         for scope in ast.walk(tree):
             if isinstance(scope, (ast.For, ast.AsyncFor, ast.While)):
                 rebound = cls._assigned_in(scope) | cls._loop_targets(scope)
@@ -2756,31 +3002,126 @@ class TestTheScansShapesAreCheckedProperties:
                 continue
             if not rebound:
                 continue
+            enclosing = cls._enclosing_of(scope, tree, parents)
             for fn in [n for n in ast.walk(scope) if isinstance(n, closures)]:
-                scanned += 1
+                seen.append(getattr(fn, "name", "<lambda>"))
                 reads, bound = cls._reads_and_defaults(fn)
                 leaked = sorted((reads & rebound) - bound)
-                if leaked:
+                if not leaked:
+                    continue
+                why = cls._escapes(fn, scope, tree, parents, enclosing)
+                if why:
                     offenders.append(
                         (fn.lineno,
                          f"{label}:{fn.lineno} "
-                         f"{getattr(fn, 'name', '<lambda>')}() reads {leaked}"))
-        return scanned, offenders
+                         f"{getattr(fn, 'name', '<lambda>')}() reads {leaked} "
+                         f"and escapes the iteration — {why}"))
+        return seen, offenders
 
-    #: A sample the rule MUST refuse: one shape per scope it claims to cover.
-    #: Asserted below, because a rule that has gone blind reports a clean tree
-    #: — which is indistinguishable from a clean tree.
-    CLOSURE_SAMPLE = (
-        "for item, extra in CASES:\n"          # through the loop's TARGET
-        "    lambda: item\n"
-        "    stored = lambda: extra\n"
-        "for _ in range(3):\n"                 # bound in the BODY
-        "    box = {}\n"
-        "    lambda: box\n"
-        "[lambda: i for i in range(3)]\n")     # through a COMPREHENSION
+    #: A sample the rule MUST refuse — and, just as important, must LEAVE
+    #: ALONE. The verdict travels WITH each line instead of being parsed back
+    #: out of the text or counted: the first version of this sample used
+    #: trailing comments as markers, which are Python comments and therefore
+    #: not part of the string at all, so its expectation was silently EMPTY
+    #: while the rule was working perfectly (measured 2026-09-19).
+    #:   verdict = the substring the offender's REASON must name (or None)
+    #:
+    #: The second half carries the FOLLOW: `take_it(lambda: item2)` and
+    #: `Holder().commit(lambda: item6)` are left alone because the callee's own
+    #: body is read and it CALLS the closure during the call, while `keep_it`
+    #: stores it, `later` calls it from a nested worker, `anyhow` takes `*fns`
+    #: where no binding can be read, and `pick` is defined twice so the name is
+    #: ambiguous and not followed at all. Each of those is one mutation away
+    #: from passing, which is why they are in the sample rather than argued in
+    #: a comment.
+    CLOSURE_SAMPLE_LINES = (
+        ("for item, extra in CASES:", None),
+        ("    (lambda: item)()", None),                    # called in place
+        ("    sorted(CASES, key=lambda k: item)", None),   # consumed here
+        ("    obj.cb = lambda: extra", "stored on obj.cb"),
+        ("    sink.append(lambda: item)", "handed to append()"),
+        ("    th = threading.Thread(target=lambda: item)", "handed to Thread()"),
+        ("def make():", None),
+        ("    for _ in range(3):", None),
+        ("        box = {}", None),
+        ("        def worker():", "read as a value"),      # returned by its name
+        ("            return box", None),
+        ("        return worker", None),
+        ("    return worker", None),
+        ("[lambda: i for i in range(3)]", "one closure per element"),
+        ("for extra2 in CASES:", None),
+        ("    f = lambda: extra2", "bound to `f`"),        # then handed on
+        ("    hold.append(f)", None),
+        ("    f()", None),
+        # -- the callee is FOLLOWED when its body is right here -------------
+        ("def take_it(fn):", None),
+        ("    fn()", None),
+        ("for item2 in CASES:", None),
+        ("    take_it(lambda: item2)", None),              # read: CALLED in place
+        ("def keep_it(fn):", None),
+        ("    hold.append(fn)", None),
+        ("for item3 in CASES:", None),
+        ("    keep_it(lambda: item3)", "handed to keep_it()"),
+        ("def later(fn):", None),
+        ("    threading.Timer(1, lambda: fn()).start()", None),
+        ("for item4 in CASES:", None),
+        ("    later(lambda: item4)", "handed to later()"),  # called from a worker
+        ("def anyhow(*fns):", None),
+        ("    fns[0]()", None),
+        ("for item5 in CASES:", None),
+        ("    anyhow(lambda: item5)", "handed to anyhow()"),   # unknowable binding
+        ("class Holder:", None),
+        ("    def commit(self, fn):", None),
+        ("        self.n = 1", None),                   # the arg binds PAST self
+        ("        fn()", None),
+        ("for item6 in CASES:", None),
+        ("    Holder().commit(lambda: item6)", None),      # read: a method call
+        ("def pick(fn):", None),
+        ("    fn()", None),
+        ("def pick(fn):", None),                        # same name twice: not
+        ("    hold.append(fn)", None),                  # followed at all
+        ("for item7 in CASES:", None),
+        ("    pick(lambda: item7)", "handed to pick()"),
+        ("def both(fn):", None),
+        ("    fn()", None),                                 # called in place...
+        ("    hold.append(fn)", None),                     # ...and KEPT: unsafe
+        ("for item8 in CASES:", None),
+        ("    both(lambda: item8)", "handed to both()"),
+        # -- a wrapper that only hands it ON is followed one level further --
+        ("def through(fn):", None),
+        ("    take_it(fn)", None),                         # passed to a consumer
+        ("for item9 in CASES:", None),
+        ("    through(lambda: item9)", None),              # read: consumed downstream
+        ("def relay(fn):", None),
+        ("    keep_it(fn)", None),                         # passed to a keeper
+        ("for item10 in CASES:", None),
+        ("    relay(lambda: item10)", "handed to relay()"),
+        ("def handoff(fn):", None),
+        ("    threading.Timer(1, lambda: take_it(fn)).start()", None),
+        ("for item11 in CASES:", None),
+        ("    handoff(lambda: item11)", "handed to handoff()"),   # from a worker
+        ("def ping(fn):", None),
+        ("    pong(fn)", None),                            # two wrappers that
+        ("def pong(fn):", None),                          # hand it back and
+        ("    ping(fn)", None),                            # forth: REFUSED
+        ("for item12 in CASES:", None),
+        ("    ping(lambda: item12)", "handed to ping()"),
+        ("def stash(fn):", None),
+        ("    parked = fn", None),                        # kept by an ASSIGNMENT,
+        ("for item13 in CASES:", None),                 # not by a call
+        ("    stash(lambda: item13)", "handed to stash()"),
+    )
+
+    CLOSURE_SAMPLE = "\n".join(line for line, _v in CLOSURE_SAMPLE_LINES) + "\n"
+
+    #: line number -> the substring its reason must contain, for the escapes.
+    CLOSURE_SAMPLE_FLAGS = {n: verdict
+                            for n, (_line, verdict)
+                            in enumerate(CLOSURE_SAMPLE_LINES, 1)
+                            if verdict}
 
     def test_a_worker_defined_in_a_loop_binds_what_it_reads(self):
-        """A nested def in a loop must bind the loop's names at DEFINITION time.
+        """A closure that can OUTLIVE its iteration must bind those names.
 
         A closure reads the NAME, not the value: `turn` assigned once per pass
         of `for _round in range(MAX_TOOL_ROUNDS)` means a worker that outlives
@@ -2789,28 +3130,69 @@ class TestTheScansShapesAreCheckedProperties:
         the window, and it is the same shape the PTT worker already avoids by
         writing `def _work(_rec=rec, _gen=gen, …)`. Binding is a one-line fix
         and an invisible one, which is exactly why it is checked here.
+
+        WHICH closures get judged is pinned by name, not by a count. The PTT
+        worker is the idiom this rule came from but not one of its subjects —
+        it is defined in `finish_listening()`, not in a loop — so a `>= 3`
+        floor was satisfied by twelve unrelated lambdas while naming nothing
+        (measured 2026-09-19). Both brain workers are required by name instead.
+
+        And the rule is about LIFETIME, not about the text: a closure called in
+        the iteration that defined it reads the right names and is left alone,
+        which the sample pins with its own unmarked lines. The expectation is
+        carried line by line (the line, and the word its reason must name) and
+        the flagged LINES are compared — a count was satisfied by the wrong
+        lines once, and the branch that went blind stayed green because of it
+        (2026-09-19).
         """
         seen, planted = self._closure_offenders(
             ast.parse(self.CLOSURE_SAMPLE), "<sample>")
-        # The exact LINES, not a count: a count of 3 is satisfied by the two
-        # body shapes alone, which is how the first version of this assertion
-        # let a rule go blind to comprehensions and still pass (measured
-        # 2026-09-19 — the mutation that disabled that branch stayed green).
-        assert seen == 4 and [ln for ln, _ in planted] == [2, 3, 6, 7], (
-            "the rule no longer sees every shape it claims to cover — a blind "
-            "sweep reports a clean tree, which is indistinguishable from one: "
-            f"seen={seen} offenders={planted}")
+        reasons = dict(planted)
+        assert sorted(reasons) == sorted(self.CLOSURE_SAMPLE_FLAGS), (
+            "the rule no longer flags exactly what the sample marks as an "
+            "escape — a blind sweep reports a clean tree, which is "
+            f"indistinguishable from one: flagged={sorted(reasons)} "
+            f"expected={sorted(self.CLOSURE_SAMPLE_FLAGS)}")
+        for line, want in sorted(self.CLOSURE_SAMPLE_FLAGS.items()):
+            assert want in reasons.get(line, ""), (
+                f"line {line} of the sample is an escape by a DIFFERENT route "
+                f"than the one it names: its reason reads "
+                f"{reasons.get(line)!r}, which does not say {want!r} — each "
+                "way out (stored, threaded, connected, returned) is diagnosed "
+                "by its own branch, and one branch covering for another means "
+                "one of them is dead")
+            assert self.CLOSURE_SAMPLE_LINES[line - 1][1] == want
+        left_alone = [n for n, (_l, verdict) in
+                      enumerate(self.CLOSURE_SAMPLE_LINES, 1) if not verdict]
+        assert not set(left_alone) & set(reasons), (
+            "the rule flagged a closure CALLED IN ITS OWN ITERATION (or a "
+            "plain line), where the names it closed over are still the "
+            "loop's — the sample carries no verdict there, which is the "
+            f"promise that this is a lifetime rule: {planted}")
+        assert len(seen) == 20, (
+            f"the sample holds 20 closures inside a loop or comprehension, the "
+            f"rule saw {len(seen)}: {seen} — a rule that stops finding them "
+            "is blind, not clean")
 
-        scanned, offenders = 0, []
+        seen, offenders = [], []
         for path in self._shipped():
             tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
-            found, bad = self._closure_offenders(tree, str(path.relative_to(HERE)))
-            scanned += found
+            found, bad = self._closure_offenders(
+                tree, str(path.relative_to(HERE)))
+            seen += found
             offenders += [msg for _ln, msg in bad]
-        assert scanned >= 3, (
-            f"only {scanned} nested def(s) inside a loop found — the subjects "
-            "are the PTT worker and the two brain workers, so a sweep that "
-            "finds fewer is a broken sweep, not a passing one")
+        for worker in ("_run_stream", "_run_call"):
+            assert worker in seen, (
+                f"{worker} — a worker handed to a thread from inside "
+                "`for _round in range(MAX_TOOL_ROUNDS)` — is not among the "
+                f"{len(seen)} closures this sweep judged ({seen}), so the "
+                "binding it carries is no longer being checked: it reads "
+                "`turn`/`tools`/`box`, which the next pass rebinds, and an "
+                "unbound worker writes its result into the NEXT round's turn")
+        assert len(seen) >= 3, (
+            f"only {len(seen)} closures inside a loop found in the shipped "
+            "tree — the sweep has lost its subjects and must not report a "
+            "pass")
         assert not offenders, (
             "a function defined inside a loop reads a name the loop rebinds, "
             "unbound: it will see whichever object the next pass put there — "
@@ -2822,21 +3204,25 @@ class TestTheScansShapesAreCheckedProperties:
         cases is how an ORDER dependency gets born — this repository has fixed
         two of those already (the announce worker, the queued command).
 
-        Swept today: 0 offenders in 9 closures inside loops, and the nine are
-        safe for reasons that are checkable rather than assumed — a lambda
-        reading nothing from the loop, a lambda with the name already bound as
-        a default, and one reading `idle`/`queue`, which the loop does not
-        rebind. That is the point of pinning it: the next one is one line.
+        Swept today: 0 offenders in 10 closures inside a loop — nine in
+        `for`/`while` bodies and one inside a comprehension, which became a
+        subject of its own when comprehension scopes were added to the rule
+        (that is why this count is 10 and the round before it measured 9). The
+        ten are safe for reasons that are checkable rather than assumed — a
+        lambda reading nothing from the loop, a lambda with the name already
+        bound as a default, and one reading `idle`/`queue`, which the loop does
+        not rebind. That is the point of pinning it: the next one is one line.
         """
-        scanned, offenders = 0, []
+        seen, offenders = [], []
         for path in sorted((HERE / "tests").glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
-            found, bad = self._closure_offenders(tree, f"tests/{path.name}")
-            scanned += found
+            found, bad = self._closure_offenders(
+                tree, f"tests/{path.name}")
+            seen += found
             offenders += [msg for _ln, msg in bad]
-        assert scanned >= 9, (
-            f"only {scanned} closure(s) inside a loop found in the suite — "
-            "there are 9 today, so a sweep that finds fewer has lost its "
+        assert len(seen) >= 10, (
+            f"only {len(seen)} closure(s) inside a loop found in the suite — "
+            "there are 10 today, so a sweep that finds fewer has lost its "
             "subject and must not report a pass")
         assert not offenders, (
             "a closure defined inside a loop in the SUITE reads a name the "

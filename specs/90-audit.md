@@ -1277,8 +1277,173 @@ shipped brain worker unbound again; a SUITE lambda reading the loop's `seen`
 unbound again (the case that motivated the sweep); the rule reverted to body-only
 rebinding; and the comprehension branch disabled.
 
-**Stated limits:** the rule is lexical, so it judges a closure by the names in
+**Stated limits:** the rule was lexical, so it judged a closure by the names in
 its source, not by whether it actually outlives its iteration — a `def` called
-immediately inside the loop is flagged too, which is the safe direction and is
-why the shipped tree's three subjects are bound rather than exempted; and the
-suite sweep covers `tests/*.py` only, not the two harness modules in `ci/`.
+immediately inside the loop was flagged too, which is the safe direction. Two
+details in this paragraph did not survive the next round's measurement and are
+corrected by the section below (2026-09-19): the sweep's floor `scanned >= 9` is
+now 10, and the shipped tree does not have "three subjects" — it has twelve
+closures inside loops, and the PTT worker is not among them (it is defined in
+`finish_listening()`, not in a loop), so the two brain workers are pinned by name
+instead. The suite sweep still covers `tests/*.py` only, not the two harness
+modules in `ci/`.
+
+## The closure rule judges lifetime now: an escape is not a mention (2026-09-19)
+
+Last round's rule answered a proxy question — *does this closure SIT inside a
+loop* — so it refused a `def` invoked in the iteration that defined it just as
+readily as a worker handed to a thread. Here is the sharper rule. It asks the
+question the docstring already claimed: **can this closure outlive its
+iteration?** Five ways out are recognised, and each is diagnosed in its own
+words, because "one branch covering for another" would mean one of them is dead:
+
+- **stored** — `obj.cb = lambda: extra` is `stored on obj.cb`;
+- **handed to a callee that keeps it** — `sink.append(lambda: item)` is `handed
+  to append()`, `threading.Thread(target=lambda: item)` is `handed to Thread()`;
+- **bound to a name that leaks** — `f = lambda: extra2` … `hold.append(f)` is
+  ``bound to `f` and `f` is read as a value``, a named `def` returned by its name
+  is `` `worker` is read as a value ``;
+- **collected** — a container literal holding it;
+- **a comprehension's element** — `[lambda: i for i in range(3)]`, one closure
+  per element, because `i` is rebound as the comprehension runs.
+
+And the one shape left ALONE: a closure **called in the place it was written** —
+`(lambda: item)()`, `sorted(…, key=lambda k: item)` — because the names it closed
+over are still the loop's at that moment. The callees that consume what they are
+given are listed (`CONSUMING`); everything else is assumed to KEEP it, which is
+the safe direction: the cost of the assumption is an `x=x` default, and the cost
+of the other is a worker writing into the next round's object.
+
+**The sample was lying, and the rule was fine.** The planted sample marked its
+escapes with trailing `# FLAG` comments — which are *Python comments*, not part
+of the string being parsed — so `CLOSURE_SAMPLE_FLAGS`, read back out of the
+text, was **EMPTY** while the rule was working perfectly. A sample with an empty
+expectation accepts any rule at all. The verdict now travels WITH each line: a
+tuple of (source line, the word its reason must name). The assertion compares the
+flagged LINES, then asserts each line's REASON contains that word, then asserts
+every unmarked line was left alone — so a branch answering in another branch's
+wording fails, and a rule that flags an in-place call fails.
+
+**A count floor was standing in for a subject.** The shipped half asserted
+`scanned >= 3` and its message called the subjects "the PTT worker and the two
+brain workers". Neither half of that survived measurement: the sweep judges
+**12** closures inside loops across the shipped files, and the PTT worker is not
+one of them — `_work` is defined in `finish_listening()`, not in a loop, so the
+rule has never seen it. The idiom this rule came from was never one of its
+subjects. `_closure_offenders` now returns the closures it judged **by name**,
+the shipped half requires `_run_stream` and `_run_call` by name, and the suite
+half's floor moved 9 → 10 because one of its subjects lives in a comprehension —
+a scope the rule could not see two rounds ago.
+
+**Teeth: 8/8 mutations caught, 0 missed, every restore verified green** — every
+closure called in place (rule blind to escaping); an in-place call treated as an
+escape; the stored-on branch answering with the handed-to word; the name-following
+branch killed; the sample's own verdict moved onto a line its reason no longer
+matches; a shape dropped from the sample; the shipped brain worker renamed out of
+the pinned subjects; and the shipped brain worker unbound again (which the rule
+now reports as `` `_run_stream` is read as a value ''`, naming the route out
+instead of merely objecting).
+
+**Measured on the final bytes:** `tests` **1 920 passed in 252.8 s**; `coverage`
+**85.29%** (2 542 missing of 17 275) ≥ 70; freshness **19 passed**. The count
+stays 1 920 because this round sharpened existing checks rather than adding a
+test. **No deploy and no gate run:** no shipped file changed — the whole round is
+`tests/test_regression.py` plus the two spec surfaces — so `--ptt doctor` still
+reads `deployment: in-sync` on running `134c3c8661cc…`, and the full gate set is
+the next step's work rather than this one's.
+
+**Stated limits:** the rule still judges lifetime from the TEXT — a closure
+handed to an unknown callee that happens to consume it synchronously is refused
+(conservative, and the reason `CONSUMING` exists as an explicit list); an escape
+through an unbound name that the loop does not rebind is out of scope, because
+the rule only asks about names the loop rebinds; and the suite half still covers
+`tests/*.py` only, not the two harness modules in `ci/`.
+
+### The callee is read now, not assumed (2026-09-19)
+
+The follow-up to that rule: it knew a closure handed to `sorted` is consumed
+(because `sorted` is on a list of builtins) and assumed **every other callee
+keeps what it is given**. That assumption is safe but expensive — it demands an
+`x=x` default from a helper that calls its closure and forgets it.
+
+So the rule now *reads* the callee when it can. `_definition_of` resolves the
+call target by **unique name** in the same file — a `Name` (`take_it(...)`) or an
+`Attribute` (`Holder().commit(...)`, which is a METHOD, so its positional
+arguments are bound past `self`). `_parameter_for` binds the closure argument to
+the parameter it lands in, and refuses to guess through a `*args` splat or a
+`*fns` parameter, where no binding can be read. `_consumes` then walks the
+callee's body: **every use of that parameter must be a call in the callee's own
+body**, and `_directly_in` is what distinguishes `def take_it(fn): fn()` — used
+during the call — from `def later(fn): Timer(1, lambda: fn()).start()`, called
+from a worker that outlives it. Anything unreadable (an external callee, a
+splat, an ambiguous name) keeps the old answer: assume it keeps it.
+
+**What the follow finds in this tree, measured:** 73 closures are passed as an
+argument to a call whose target is a unique def in the same file; **7 of them are
+called in place** — every one of them a `hardware._probe("section", lambda: …)`
+prober, and `_probe` does call `fn()` in its own body (line 156) — and 66 are
+kept or handed on. 149 def names in the tree appear more than once in their file,
+so they are never followed. **None of the seven is currently a subject of the
+rule**, because they sit in `snapshot()`'s `try`, not in a loop: the follow is
+what the *next* call site gets, and the sample is where it is pinned today.
+
+**The sample grew the other half**, seven shapes that each fail a different way
+if the follow is wrong: `take_it` (called in place → left alone), `Holder().commit`
+(a method, so the argument binds past `self` → left alone), `keep_it` (stores the
+parameter), `later` (calls it from a nested worker), `anyhow(*fns)` (a binding
+that cannot be read), `pick` (defined **twice**, so the name is ambiguous and not
+followed at all) and `both` (calls it *and* keeps it — the case that must not be
+read as consent from the happy half). Every one of those is one mutation away
+from passing, which is why they are lines in the sample rather than arguments in
+a comment.
+
+### A wrapper that only passes the closure ON is followed too (2026-09-19)
+
+One level of indirection was still a false escape: `def through(fn): take_it(fn)`
+was read as a store, because the parameter's use is an argument of another call
+rather than a call of it. It is a *pass-through*, and the honest answer is the
+one its target gives: the wrapper consumes the closure exactly as far as
+`take_it` does. So a use that hands the parameter on is now followed with the
+same code, from the callee's own body only — from a nested scope (`threading.
+Timer(1, lambda: take_it(fn))`) the call outlives the wrapper and the refusal
+stands. The `chain` of (callee, parameter) pairs already walked makes a cycle of
+wrappers (`ping` → `pong` → `ping`) a refusal instead of an infinite descent,
+and a wrapper whose target KEEPS the closure is refused just as it was.
+
+**Measured in this tree: no such chain exists yet.** Of the closures handed to a
+readable callee, 7 are called in place, 66 are kept or handed on, and **0 arrive
+through a pass-through** — so, like the follow itself, this half is pinned by the
+sample today and is what the next wrapper inherits. The sample grew four shapes
+that each fail a different way: `through` (passed to a consumer → left alone),
+`relay` (passed to a *keeper* → refused), `handoff` (passed on from a nested
+worker → refused) and `ping`/`pong` (a cycle → refused), plus `stash`, whose
+parameter is kept by an **assignment** rather than a call.
+
+**Teeth: 10/10 mutations on this half caught, 0 missed, restoring green** — the
+follow removed (back to assuming every callee keeps it); every readable callee
+assumed to consume; a call from a nested worker read as an in-place call; an
+ambiguous name followed anyway (first definition wins); a method's argument bound
+WITHOUT skipping `self`; the first in-place call taken as consent with a later
+store ignored; a parameter kept by an assignment read as an in-place use; a
+wrapper that only passes the closure ON refused as a keeper; the cycle guard
+removed; and the `chain` not threaded into the recursion. The last two fail
+loudly (`RecursionError`) rather than quietly, which is the guard doing its job.
+One of the ten was **unfalsifiable before `stash` existed** — no sample shape kept
+a parameter without a call, so the mutation stayed green for the right reason (it
+had nothing to break), which is why the shape was added rather than the mutation
+dropped. Together with the 8/8 on the lifetime rule: **18/18, 0 missed**.
+
+**Stated limits of the follow:** resolution is by unique name only, so a helper
+whose name is defined twice in its file is never followed (conservative: a
+needless default, never a missed escape); it reads the callee in the SAME file,
+so a helper imported from another module is assumed to keep its closure; a
+`*args`/`*fns` binding is refused rather than guessed; a cycle of wrappers is
+refused rather than resolved (there is no fixed point to find, and refusing is
+the direction that cannot miss an escape); and — **corrected here, the point of
+the section above** — a parameter that is only ever *passed on* is no longer read
+as kept: it is followed through, so the limit this section used to state as
+"the rule reads one level, deliberately" is closed; and
+an object's method reached through an attribute is resolved by name only, so a
+`commit` defined once in a file with 30 classes is followed — correct here, and
+worth knowing if a name like `run` ever becomes unique by accident.
+
