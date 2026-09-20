@@ -1554,3 +1554,294 @@ than dressed up.
 3.2 s**); `two-writer` **PASS**, the worktree unchanged through the run. And the
 `specs/60-test-plan.md` row for `test_regression.py` moved 153 → 154, because
 this round does add a test rather than sharpen one.
+
+## The OCR scan triaged against the source: twenty-one fixes with guards, and every other finding written down with the reason it is not work (2026-09-20)
+
+**The scan** is the offline reviewer's pass of 2026-09-20 — 231 comments across
+32 files, every file it read handed a verdict whether or not it found anything.
+This round read each finding against THIS tree, and where a finding was about a
+Python API rather than about this code, against CPython itself: the
+checkout-write guard's event→arguments map was checked by installing an audit
+hook and reading what CPython really passes to it (`os.mkdir(path, mode,
+dir_fd)`, `os.remove(path, dir_fd)`, `os.symlink(src, dst, dir_fd)`, and a
+`tempfile.mkstemp` whose sole argument IS the created path). Twenty-one findings
+had teeth and are fixed, each with the guard that now holds it. **The rest are
+dismissed here, one line each with the reason** — a dismissal is a claim about
+the scanner's model of this code, and it is worth exactly as much as the reason
+somebody wrote down for it.
+
+### What had teeth, and what holds each one now
+
+| where | what was wrong | held by |
+|---|---|---|
+| `core/calendar.py:296` | `COUNT` was checked only on the WEEK loop, so a rule whose cap lands mid-week kept emitting the rest of that week: `FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=4` produced **six** instances, materialising meetings the rule itself says do not exist (verified) | `tests/test_calendar.py` `test_a_weekly_count_stops_mid_week` |
+| `core/calendar.py:359/399` | the same mid-batch cap missing from the MONTHLY and YEARLY candidate loops | `test_a_monthly_count_stops_mid_month`, `test_a_yearly_count_stops_mid_year` |
+| `core/tools.py:547` | `denied_secret_path` judged only the RESOLVED path, which is the one thing a symlink defeats: `id_rsa -> /tmp/key` resolved to a name no rule knows, so reading a private key was ALLOWED — the docstring promised "symlinks cannot slip past" and the code let exactly that through. Both directions are now judged (the name asked for, and what it resolves to) | `tests/test_policy.py` `test_predicate_denies_a_secret_symlinked_away` (a secret symlinked OUT, and a plain name resolving INTO `.ssh`) |
+| `core/tools.py:1126` | the 60 s rate window is a read-modify-write, and `execute` really does run on two threads at once (a barge-in starts the next turn while the old worker finishes), so two callers meeting inside the check both passed the same last slot | `TestToolRateLimit::test_two_callers_meeting_at_the_last_slot_admit_one` (the interleaving STRETCHED — the stamp sleeps 200 ms — so it fails on every run without the lock, not sometimes) |
+| `core/settings.py:858` | `Settings.__setitem__` was `self.persist(...)` and dropped the False on the floor: `obj[k] = v` read as done while the disk still held the old value | `tests/test_settings.py` (the failed-write test gained the dict-protocol half) |
+| `core/settings.py:458` | `_coerce_tool_call_times` KEPT any list it found — the one shape its own docstring names as discarded. Nothing in the app ever writes the key, so every list on disk is hand-edited by definition | `test_tool_call_times_is_runtime_state_never_a_user_list` |
+| `core/audio.py:156` | `stream.close()` sat in the same `try` as `stream.stop()`, so a `stop()` that raised skipped the close — leaking the PortAudio stream whose reference had already been dropped, on a device that had just disappeared | structural; no separate test (below) |
+| `core/brain.py:453` | `full += piece` per spoken sentence — quadratic in response length, and `sentence`-sized chunks make that a real O(n²) on a long answer | the streaming tests (behaviour unchanged: one `join`) |
+| `core/theme.py:198` | `raw[:6]` sliced BEFORE stripping the `#`, so a prefixed `#rrggbb` became `#rrggb`, failed the shape check, and read as "no luminance" — every wallpaper-tuned look silently stopped tuning | `tests/test_theme.py` `test_sample_luminance_accepts_a_hash_prefixed_hex` |
+| `core/theme.py:73` | `_retune` was annotated `-> tuple[int, int, int]` while returning floats | (annotation only) |
+| `hardware.py:348` | `any(wdir.iterdir())` counted a directory holding only zero-byte or half-downloaded files as a CACHED whisper model — "cached" in every status line while the first spoken turn failed. The flat whisper dir skipped `_snapshot_cached`'s non-empty-file rule, and the same `iterdir` sat outside the per-entry swallow | `tests/test_hardware.py` `test_a_zero_byte_whisper_file_is_not_cached` (+ the non-empty control) |
+| `core/doctor.py:425` | the ydotool probe called the HOST's `socket_connectable` outside any guard: a probe that raised took the whole doctor down — in the tool somebody runs precisely BECAUSE something is wrong. The niri probe beside it was already held to the rule | `tests/test_fault_injection.py` `test_a_raising_probe_is_a_line_not_a_dead_doctor` (which also asserts the rest of the report still happened) |
+| `ci/compile_all.py:45` | a missing root (and a root that is a file) fell through to discovery and reported the same "no Python sources" a genuinely empty tree gives — a refusal that named the wrong problem | `tests/test_ci_summary.py` `test_a_missing_root_is_named_as_the_root`, `test_a_root_that_is_a_file_is_named_as_such` |
+| `ci/spec_tables.py:39` | `_install_var` returned `[]` for a declaration it could no longer find, so a renamed or requoted variable would silently shrink the architecture table — and a freshly `--write`n spec would agree with itself while missing modules | the freshness gate: the generator's output is compared with the specs, and a shrunken table is STALE |
+| `ci/spec_tables.py:153` | `render_tools` rewrote the `**N `@tool` methods**` prose with `sub` and never checked the sentence still existed — reword it and the count goes stale with nothing failing | `subn` + refusal (its mutation cannot be falsified today: the sentence IS there — stated, not dressed up) |
+| `ci/worktree_stamp.py:184` | a `git diff`/`ls-files` that FAILED in a tree that HAS a HEAD was read as an empty diff and an empty untracked list — the false "nothing moved" this gate exists to refuse | `tests/test_ci_two_writer.py` `test_a_git_failure_in_a_headed_tree_is_unjudgeable` |
+| `ci/worktree_stamp.py:262` | `_moves` validated only the BEFORE snapshot's fields, so a truncated `after` read as every tracked file vanishing — or as "nothing moved", depending on which side lost them | `test_a_truncated_after_snapshot_is_not_a_pass` |
+| `ci/worktree_stamp.py:466` | a clock that went backwards (NTP, a manual change) made every offset and fraction in the WHEN lines a lie | `test_a_backwards_clock_gets_no_timing_lines` |
+| `tests/checkout_guard.py:120` | a second AGREEING `install()` added a SECOND audit hook (hooks cannot be removed, and every guard above it passes — which is exactly the case the duplicate landed in) | the flag, exercised by the suite's own install path; no separate test (below) |
+| `core/tools.py:3053`, `core/audio.py:281` | two names written and never read again — `JOB_ANNOUNCE_S` (superseded) and `_TTS_FLOAT32_PATCHED` (which an early return on it would have made WRONG: a reloaded model needs the patch again) | removed; no test (a dead name has no behaviour to pin) |
+| `core/brain.py:172` | the unload-failure journal line called a failure a SKIP — the docstring beside it says the call was made and failed, and the wording sends the reader looking for a policy that declined instead of a host that refused | (wording; the exception type was already logged) |
+
+**Two fixes have no new test, stated rather than implied:** the audio stream
+`stop`/`close` split (a leak on a device that vanished — the shape is the fix)
+and the guard's `_INSTALLED` flag (an audit hook cannot be listed back, so the
+only observable is "no second hook", and the suite installs once per process).
+Both were verified by reading the code path, not by a red test.
+
+**One mutation cannot be falsified at all:** removing the `subn`-vs-`sub`
+check in `render_tools` changes nothing while the sentence it guards is still
+in `specs/30-tools-api.md`. That is the honest state of a guard whose subject is
+a FUTURE edit; it is here so the next person who rewords that sentence knows the
+guard was deliberate.
+
+**The generated tables had to move, and the freshness gate is what said so.**
+Every fix above shifts line numbers in `core/tools.py`, `core/audio.py`,
+`core/settings.py`, `core/calendar.py`, `core/brain.py`, `core/theme.py`,
+`hardware.py` and `core/doctor.py`, and `specs/20-architecture.md` states each
+module's size while `specs/30-tools-api.md` states every tool's line — so the
+suite went red on `test_the_tables_are_what_the_generator_produces` before a
+human noticed, and `ci/spec_tables.py --write` rewrote both. That is the gate
+working, and it is why the ledger row below carries hashes for two files this
+round never meant to touch.
+
+### Dismissed, and why
+
+**Pytest configuration.** `testpaths = tests` is the only test tree (the plan's
+own rows enumerate `tests/*.py`, and a new directory would be a plan change
+before it was a discovery change). The `PytestUnhandledThreadExceptionWarning`
+filter needs pytest ≥ 7 and this environment runs 9.1.1, pinned in
+`requirements-lock.txt`. The coverage-floor comment: `70` is stated in
+`.coveragerc` AND in the CI job, and the coverage gate is what reads it.
+
+**`ci/pytest_summary.py`, `ci/spec_tables.py`.** The digest's totals come from
+junit's own suite attributes — pytest wrote them, and a recount from the cases
+would be a DIFFERENT number, not a better one. `_short_classname`'s inputs are
+dotted module paths (pinned by `tests/test_ci_summary.py:217`), never a path.
+The `PRIVATE-TOKEN` header cannot surface in `HTTPError.__str__` (`HTTP Error
+NNN: …`), and the note is posted as a HEADER, not a body. `_case_msg`'s `elif`
+is unreachable — same `find`, same result. `module[:1] == ["tests"]` is the
+list-slice idiom for a possibly-empty list. `ENV_HINTS` substring matching is a
+HINT table whose two PortAudio entries are ordered by measured need (the
+comment says which pipeline this came from). The `SystemExit` in `_table_body`
+is this tool's failure idiom (it has no broader error contract), and the
+whitespace/`strip('`')` findings describe tables this generator itself writes.
+`tool_rows` walking the whole AST instead of `tree.body`: every `@tool` is a
+METHOD of `ToolBelt` — a top-level-only walk would find ZERO and the census test
+would fail immediately.
+
+**`core/__init__.py`.** The loaders' singleton is enforced by
+`sys.modules.setdefault` BEFORE the module executes, which the docstring calls
+out as the mechanism (a second racer receives the winner's module); a lock would
+serialise an import without adding a guarantee. `load_module`'s path candidates
+all contain the file the literal name asks for, and every caller passes a
+literal. The `_allowed_dirs` swallow is deliberate, and the fallback import's
+`TypeError` catch is the refusal path (narrowing it turns a broken module into a
+traceback instead of the named `ImportError`).
+
+**`attic/patch_wakeword.py` (every finding).** `attic/` is a provenance
+archive: excluded from the compile gate, from `.coverage`, and imported by
+nothing in the tree (checked). Its defects are history, not surface.
+
+**`core/audio.py`.** The cited f-string logging line already uses lazy
+`%`-formatting (the scan's own text says so). The level-callback swallow runs
+inside the PortAudio callback — a persistently failing UI metronome must not
+flood the journal, and the meter is cosmetic. No lock-order violation exists:
+`get_whisper` takes only `_whisper_lock`, and a reload under it serialises the
+transcribers that were already queued behind it. The RMS allocation is a
+1024-sample block per block. `wav_path` is built by `synthesize()` under
+`STATE_DIR` and no model input reaches it. A corrupt reference clip is reported
+by the engine at load, so the duration read is best-effort by design.
+
+**`core/lifecycle.py`.** `next_turn` is called once per turn, not in a loop;
+no caller passes a list (grep: none — the list branch exists for external
+callers, and `counter[0]` is its documented shape); the value setter has one
+documented test-only caller.
+
+**`core/doctor.py`.** The text-vs-JSON cache asymmetry is deliberate and
+commented ("Fresh cache: doctor must see live state" — the text path must read
+the card NOW; the JSON/control path uses the TTL). The `Restart=` substring
+match in the text path is tolerant ON PURPOSE (a commented or spaced
+`Restart=` still means auto-restart is configured) while the JSON path keeps the
+strict regex as the machine contract. `sys_version_info or sys.version_info`:
+an empty tuple is FALSY, so the fallback already happens — the premise is
+inverted. An empty `ollama_model` in a failure line is cosmetic; the setting is
+validated at load.
+
+**`core/brain.py`.** The once-per-process warning flag's worst case is one
+duplicated log line, and the flag write is atomic under the GIL. The broad
+`except` in the stream guard logs and RE-RAISES with the traceback intact. The
+Korean characters in `strip_thinking` are the scan's own admitted display
+corruption — the source has plain `think` tags. `state=None` is the documented
+contract for a caller without a state dict (the host always passes one).
+
+**`ci/worktree_stamp.py`.** A timeout and a failure now BOTH become the
+cannot-judge shape, so conflating them no longer produces a verdict. The
+checkpoint/rebase locking findings: `gates.sh` is serial by construction (one
+run per worktree, per-run `mktemp -d` state), and a `FileExistsError` lock would
+wedge the gate after a crashed run behind a stale lock — atomic writes alone do
+not fix a read-modify-write, and inventing a lock here is how the gate starts
+refusing runs for reasons that have nothing to do with the tree. The WHEN
+lines' clock is the file's OWN mtime by design (the timing tests place writes
+with `os.utime` against a chosen window); the snapshot's recorded nanoseconds
+answer the different question (reverted-write evidence) and are already used
+there.
+
+**`core/assistant.py`.** The notification reader already backs off and spends
+an attempt on the pass-raise path (that was the earlier full-CPU spin fix); an
+explicit `kill` is a preference, not a property. The pomodoro announce callback
+is injected by the host and does not re-enter the controller (the lock is an
+RLock for the tests' command paths). `take_missed`'s swallow is deliberate and
+commented ("hand back nothing and let the next tick fire them normally") —
+re-raising would take the missed-reminder path down on a transient write error.
+`ATTEMPT_BUDGET` is a documented ceiling on total restarts while enabled, not a
+failure counter, and the health surface reports it. dbus-monitor prints only
+string arguments, and `Notify`'s string order is app/icon/summary/body — exactly
+the slice used (replaces-id is uint32). The mute check's fail-open is deliberate
+and commented ("a bug in the check is a reason to say less, not more"). The
+`dbus-monitor` argv is a list (no shell) and its quotes are match-rule syntax.
+`update()`'s `None` sentinel is documented with a test speaking to it —
+changing it is an interface break. Hour-scale repeats at sub-second tolerance
+make the `//` exactness question moot, and the pomodoro snapshot dict is
+replaced wholesale under the lock.
+
+**`core/registry.py`.** The "corpse reservation" branch is unreachable given the
+invariant the code enforces (entries + reservations ≤ cap, so a reclaimable
+entry implies a free slot) — and the comment says exactly that. `_cancel`'s
+`None` branch is never taken by its only caller, so no double decrement exists.
+The read locks are absent because registries hold a handful of entries by design
+(caps 4-8). `Offer.__len__` defines TRUTHINESS for an armed offer, which is what
+the mapping reads; "number of fields" is not what the class means. Expiry on
+read is the documented contract. A released-never-settled slot is the
+documented state after a raising build.
+
+**`core/settings.py`.** The JSON round-trip doubles as the serializability
+check the typed contract relies on. The `loaded` shape check has no
+undefined-name path (exceptions return first) — the outer check is the
+quarantine path for valid-JSON-wrong-shape. The `BaseException` catch is
+REQUIRED, not sloppy: cleanup must also run for `KeyboardInterrupt`, and the
+repo has a checked property that loader rollbacks catch `BaseException`. The
+cross-process lock is not reentrant because its two users (`write_settings`,
+`persist_setting`) do not nest; making it reentrant would hide a real nesting
+bug. `_three_way_merge` only ever stores values it has checked are not
+`_MISSING`, and the tests assert no sentinel survives (disk data is JSON and
+cannot contain one anyway). `calendar_ics.split` is correct (the scan says so).
+`persist_setting`'s deep copy is deliberate and commented.
+
+**`settings_schema.py`.** `load_settings` deep-copies the defaults on every load
+and nothing mutates the module-level dict, so the "mutable default" surface does
+not exist. A typo'd catalogue label fails `tests/test_settings_contract.py` — a
+stronger guard than a runtime warning. `fields_by_key` is a dict comprehension
+over ~90 rows on a tab redraw. `"str": "line"` IS in `KIND_CONTROLS` (the scan
+misread). The catalogue's colours are all valid hex. `tts_reference` names its
+control through `render=`, which is what the GUI dispatches on (and the settings
+GUI suite passes). `RETIRED_SETTINGS` is applied on load AND write. The
+`spotter_models` cap lives in its coercer, which is where the tip says it is.
+
+**`hardware.py`.** The probe-failure race is bounded by `FAILURE_TTL` (≤ 5 s)
+between two probes of the SAME section, and a CAS would buy machinery for a
+self-healing case. The per-probe swallows are the design (sections are
+independent, and a probe returns its own error string). `fastfetch`'s "produced
+no output" is the diagnosis the caller can act on. The ydotool socket probe only
+CONNECTS (sends nothing), so a false "reachable" is cosmetic, and
+`XDG_RUNTIME_DIR` is already preferred over the compiled-in path.
+
+**`core/web.py`.** The resolver-thread leak is a documented trade-off ("a
+wedged resolver leaves one daemon thread behind per attempt; the timeout is
+reported rather than hidden"), and the proposed `socket.setdefaulttimeout` is
+process-global while not bounding `getaddrinfo` everywhere. The cache key cannot
+collide: one component is normalised to a fixed backend name and the other is an
+int, so no `|` can appear in either. The SearXNG probe is a 0.3 s connect on
+localhost, on the doctor path. `html_to_text`'s broad catch is documented ("a
+malformed page is not an error, just a short one"). The hop-seam fallback WARNS
+(not silent) and the shipped host always injects the seam
+(`handsoff.py:3914/3959`); the comment weighs reading nothing against one-shot
+for a partial install, and that is the decision. The duplicated `traceback`
+alternative in `_TECH` is harmless. `clean` comes from `_public_url` validation,
+so the Jina URL cannot be steered. `read_results`' per-backend caps and
+politeness are the contract. `_purge_locked` pops the oldest in a loop (no
+recursion) and `or ""` already handles `None`.
+
+**`core/tools.py`.** `_FLAG_WARNED`'s worst case is a duplicated once-per-process
+warning. `_import_smoke`'s two proposed prescriptions contradict each other and
+the current narrow catch is deliberate: only the failures this check can
+diagnose become a reason string, and an import that raises on the module's own
+terms is reported by its traceback, not by the smoke test.
+
+**`tests/checkout_guard.py`, `tests/conftest.py`.** The guard is Linux-only
+because the whole app is (niri, PortAudio, systemd) — the `/proc/self/fd`
+resolution is the platform, not an assumption to abstract. The fail-open for an
+unreadable event shape is deliberate and documented (a shape the guard does not
+understand is one it does not judge); the mapped shapes are the ones verified
+against CPython. The `os.environ` mutation is single-process by construction
+(no xdist plugin is installed and `pytest.ini` adds none) and `os.environ` is
+process-global by nature. The deepcopy fallback is documented, and the objects
+that fail it are models and locks where identity IS the intent. The gc fold-up
+is what finds unregistered listeners, and its cost is bounded by the listeners
+that exist.
+
+**`core/theme.py`, `core/calendar.py`, `tests/fake_ollama.py`.** An escaped
+quote inside a niri wallpaper path does not appear in this config and the
+parser's simple tokenisation is the config's actual grammar. `genexp` style. The
+calendar's MONTHLY `k` IS initialised — `k = 0` sits once before the branch at
+line 214 and is shared by every frequency (the scan's "UnboundLocalError" is a
+misfire). `first_index` is only set under `if gap > timedelta(0)`. All-day
+events materialising at local midnight is the design, and overlap uses the
+event's duration. Reading the user's own `.ics` path from settings is the
+feature, and the parser ignores non-ICS content. Negative durations are refused
+on purpose (commented). A malformed `Content-Length` in the fake Ollama server
+is not a supported input for a test double, and the crash is loud and inside a
+test.
+
+**Teeth measured, not asserted: 13/13 mutations caught, 0 missed, every
+restore byte-exact.** Each fix was reverted in turn — the weekly `COUNT` cap
+removed; the monthly/yearly mid-batch cap removed; `hexcol = raw[:6]` restored;
+`any(wdir.iterdir())` restored; the secret guard resolving only; the rate
+window unlocked; `_coerce_tool_call_times` keeping a list again; `__setitem__`
+silent again; the doctor's probe unguarded (`raise` in its except); the root
+check removed from `compile_all`; the worktree's git failure read as an empty
+diff; `_moves` validating only BEFORE; and the backwards-clock guard disabled —
+and each one turned exactly the new guard red. **A caveat worth keeping:** the
+first attempt at this sweep was killed by the harness mid-case, and a SIGKILL
+cannot run a `finally`, so `core/tools.py` was left holding the unfixed
+`return _secret_reason(p)`. It was put back from the byte-exact backup, the diff
+was read to confirm it, and that case was re-run (caught, restored, verified).
+The restore discipline only works while the process can run its handlers; the
+backup is what saves the run after a hard kill — which is exactly the shape that
+bit the earlier round.
+
+**Measured on the final bytes:** the `tests` gate **PASS — 1 936 passed in
+252 s** (1 921 before: fifteen new guards); `order` **PASS** — seed shuffle
+**1 936 in 261 s**, file-order shuffle **1 936 in 257 s**; `coverage` **PASS,
+85.33%** (2 541 missing of 17 316) ≥ 70; `compile` **PASS** (54 files
+byte-compiled); `shell` and `smoke` PASS; `clean-checkout` **PASS** (the
+freshness guard **19 passed in 3.6 s** in a scratch worktree of HEAD);
+`two-writer` **PASS**, "worktree unchanged since the run started". The plan's
+per-file rows for the touched suites were brought to their measured counts
+(they are not pinned, and two were already quietly stale before this round).
+
+**This tree is now the running bubble.** Eight SHIPPED files changed —
+`core/audio.py`, `core/brain.py`, `core/calendar.py`, `core/doctor.py`,
+`core/settings.py`, `core/theme.py`, `core/tools.py` and `hardware.py` — so
+the deploy this section originally recorded as owed was made on 2026-09-20:
+`HANDSOFF_SKIP_SYSTEM_PKGS=1 ./install.sh` at 09:04, both stage gates passed
+(byte-compile + schema import), the service restarted to PID 160114, and
+`--ptt doctor` reads `deployment: in-sync — installed copy matches the
+checkout`. All 18 manifest entries verify against both their source hash and
+their installed hash; the eight changed modules are byte-identical between
+the checkout and `~/.local/bin`; and the journal from the restart shows
+whisper loaded, chatterbox-turbo warmed on CUDA and `ollama ok`, with no
+import error anywhere.
