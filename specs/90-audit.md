@@ -2239,18 +2239,57 @@ What it is **not**, each eliminated by measurement rather than argument:
   `--shot` screenshot mode, and the only `process.exit(0)` is the tail of the
   quit handler.
 
-It is **not only the dev build either**, which is the last thing measured here:
-the user's own *installed* AppImage, up and serving for 1 h 39 min, exited the
-same way at 11:05:38 — systemd logged its scope's consumption at that second
+It is **not only the dev build either**, and the same event explains the user's own
+copy: their *installed* AppImage, up and serving for 1 h 39 min, exited at 11:05:38
+— systemd logged its scope's consumption at that second
 (`app-niri-nautilus-22894.scope: Consumed 4min 20.716s CPU time over 1h 39min
-47.291s`), and an *Install current AppImage from folder* window is on the desktop
-afterwards. The update **poller is not the trigger** — it is notify-only, it never
-runs in development, and `installNow` is reachable only from a click
-(`auto.autoInstallOnAppQuit = true` installs at quit, it does not cause one) — but
-a clean status-0 exit with the window closed and an AppImage install dialog on
-screen is exactly what an install flow looks like from outside, and it is the
-strongest lead there is. The trigger is inside that process, and pinning it means
-instrumenting the sibling tree — their work, not handsoff's. What matters for
+47.291s`). The *Install current AppImage from folder* window on the desktop
+afterwards belongs to an install they began; the update **poller is not the
+trigger** — it is notify-only, it never runs in development, `installNow` is
+reachable only from a click, and `auto.autoInstallOnAppQuit = true` installs at
+quit rather than causing one.
+
+### What the exit actually is: a `Mod+Q` chord, and the app's own answer to it
+
+Pinned by instrumenting the sibling's **packaged build**, not their source tree —
+their tree is on `fix/ci-tests` with uncommitted work, so the copy lives at
+`/tmp/qs-implant` (`asar extract`, ONE added line `require('./quit-trace.js')`,
+repack). The tracer logs every `app` event, every window event and every `close`
+**with a stack**, plus a 10 s heartbeat, and the renderer speaks through console
+markers (`ELECTRON_ENABLE_LOGGING=1`).
+
+The trigger is the user's own niri binding, `Mod+Q { close-window; }`
+(`~/.config/niri/cfg/keybinds.kdl:37`), acting on whichever window held focus:
+
+* the spontaneous close (11:41:42, 174.81 s into the run) arrived with a stack
+  holding **only the tracer and Node's own `emit`** — *no application frame* — and
+  the renderer **never called `window.close()`**, so no code in Quant Space closed
+  it;
+* the renderer recorded the chord's own signature **177 ms before** the main-side
+  close: `[RIMPLANT] keydown key=Meta ctrl=false meta=false alt=false`, then
+  `beforeunload` → `pagehide` → `visibilitychange -> hidden` → `unload`. A bare
+  `Meta` is exactly what `Mod+Q` leaves behind — niri consumes the `Q`;
+* the app's answer to losing its last window is Electron's default path:
+  `window 1 event: closed` → `app event: window-all-closed []` → `app.quit()`
+  called from **`main.js:593:76`** → `before-quit` → `will-quit` → `process 'exit'
+  event, code=0`. Nothing else had happened inside the app first: the last IPC
+  channel before the close was at **+0.47 s**, 174 seconds earlier;
+* **positive control**: `ydotool key 125:1 16:1 16:0 125:0` (Meta+Q) against the
+  focused window reproduced the chain byte-for-byte at **+0.92 s** — the same
+  `keydown key=Meta`, the same frameless `close`, then `window-all-closed`,
+  `app.quit()` from `main.js:593:76` and exit 0;
+* **elimination**: the same instrumented bytes under a nested headless weston
+  (`--backend=headless-backend.so --socket=qs-weston`) — a compositor niri cannot
+  send a close request into — ran **+120 s** with `visible=true focused=false
+  destroyed=false` and RSS flat at 215 MB. Nothing in the app closes its own
+  window on any timer.
+
+So the lifetimes (17.0 s … 285.6 s … 1 h 39 m 47 s) are not a schedule: they are
+*when a chord landed on a window that had focus*. Under niri these windows get
+focus within half a second of opening (`event: focus` at +0.54 s in the traced
+run) and `close-window` acts on the focused window, so a `Meta+Q` meant for
+anything else closes the desk instead — while a blurred desk is immune (the
+weston window, `focused=false` throughout, was never touched). What matters for
 this feature is that the desk's exit is *audible* rather than mysterious: their
 `before-quit` removes the discovery file, so the client's answer is the true one
 ("Quantum Space isn't running."), not "connection refused" about a port nobody
