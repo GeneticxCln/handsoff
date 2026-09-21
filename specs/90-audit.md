@@ -2287,9 +2287,16 @@ The trigger is the user's own niri binding, `Mod+Q { close-window; }`
 So the lifetimes (17.0 s … 285.6 s … 1 h 39 m 47 s) are not a schedule: they are
 *when a chord landed on a window that had focus*. Under niri these windows get
 focus within half a second of opening (`event: focus` at +0.54 s in the traced
-run) and `close-window` acts on the focused window, so a `Meta+Q` meant for
-anything else closes the desk instead — while a blurred desk is immune (the
-weston window, `focused=false` throughout, was never touched). What matters for
+run). **And the immunity of a blurred desk was then measured rather than argued:**
+two instrumented clones launched seconds apart on their own profiles, the second
+holding focus, and one chord closed only it — the blurred clone recorded **0 `close`
+events**, logged no `keydown` at all, and was still running when the chord had
+passed (niri gave it focus 8 ms after the other's exit). What a trace cannot recover
+is *intent*: the spontaneous run shows the desk re-focused 0.96 s before its close
+(`event: focus` at +173.85 s), which is what being selected and then closed looks
+like and equally what a chord aimed at the frontmost window looks like. The measured
+statement is the narrow one — `close-window` closes the focused window, and the desk
+was the focused window. What matters for
 this feature is that the desk's exit is *audible* rather than mysterious: their
 `before-quit` removes the discovery file, so the client's answer is the true one
 ("Quantum Space isn't running."), not "connection refused" about a port nobody
