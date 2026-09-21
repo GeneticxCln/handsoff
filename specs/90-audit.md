@@ -1947,3 +1947,96 @@ serialisation **trades wall time for a verdict** (~22 min of machine time per
 push instead of ~15), which is the honest price of a green that is about the
 commit rather than about its neighbours. The desk machine time is not billed,
 but it is not free either.
+
+## A System-1 decision engine measured before it is trusted — and the desk work is on no remote (2026-09-21)
+
+**Two questions, one round: is a typed-decision model worth wiring into the turn,
+and what does a fresh look at the tree see that the ledger does not?** The first
+was answered with a harness rather than an opinion; the second turned up a
+feature that only exists on this machine.
+
+### The prize, measured
+
+The turn offers **all 48 tool schemas on every round** — `json.dumps(H.TOOLS)` is
+16 680 characters, **~4 165 tokens** — and the system prompt another 2 172, so
+`_fixed_prompt_tokens()` is **6 342 of a 32 768-token window**: the tool list
+alone is **12.7%**, paid again on every tool round (`_brain_turn`, and the list
+is rebuilt per round from the live permission map). Nothing anywhere decides
+what KIND of request this is before the 12B model is asked: the only pre-model
+predicates in the tree are `core/web.py`'s search-backend `_route` and
+`_classify_edit_path`'s edit-risk read.
+
+### The engine, measured on this machine
+
+Laya **0.3.4** is installed (pipx venv, python 3.14, torch 2.14.0+cu130) with
+**2 369 MB** of checkpoints cached and **no console script** — `command -v laya`
+finds nothing, because it is a library. Measured here, offline: **load 13.8–15.7 s
+per checkpoint**, **1 607 MiB resident** on the card, **p50 28–34 ms** warm on GPU
+(54 ms on a longer option set), **p50 538 ms / max 1.09 s on CPU**, and its
+`detect_script` helper 0.004–0.039 ms in pure Python.
+
+### The bake-off, and its verdict
+
+`ci/laya_bakeoff.py` — new, and deliberately **not a gate**: it needs torch and a
+GPU, neither of which is a dependency of this project (the suite asserts torch is
+never imported), so it is run by hand under the interpreter that has Laya. It
+scores two corpora and never merges them: **63 authored cases** (every family,
+several phrasings, including the recogniser's own damage — *"hey seifer tell me
+the way they're outside"*, *"something in the chat"*, *"it's time for play
+music"*) and the **real pairs mined from the app's own history files**, labelled
+by the tool the 12B model actually chose. Private utterances are read and never
+written back into this repository.
+
+| corpus | top-1 | recall@2 | recall@3 | recall@5 |
+|---|---|---|---|---|
+| authored, plain wording (63) | **39/63 — 62%** | 73% | 83% | 94% |
+| authored, strict wording | 35/63 — 56% | 78% | 83% | 89% |
+| real pairs (7) | 3/7 | 43% | 43% | 71% |
+
+**Three things kill it as a gate, and the second is the interesting one.**
+(1) 62% top-1 is not a routing decision anyone should ship. (2) **Its
+confidence is saturated and wrong**: p50 and max are both **1.00**, so the
+README's "act automatically above 0.85" rule is meaningless on this schema —
+measured on the same cases where the choice itself was wrong. (3) The error is
+*systematic*, not noise: `none` absorbs imperative requests — `web -> none` ×5,
+`windows -> none` ×2, `system -> none` ×2, `timers -> none` ×2 — and the strict
+rewording, written to forbid exactly that, moved top-1 **down** (56%) while
+lifting recall@2 to 78%. The option set is what the model is failing on, and it
+fails confidently.
+
+### What it CAN do, and why the cheaper fix is elsewhere
+
+As an *advisory* widener (offer the top-k families, keep the full belt as
+fallback) recall@3 is **83%** — a real number, and the honest reading of it is
+"three families in four". The token arithmetic says that is not where the fat is:
+`windows` (11 tools) and `system` (9) carry **1 915 of the 4 165 tokens** — 46%
+of the whole schema — so a learned router that narrows to three families saves
+~1 800 tokens while risking the right family 17% of the time, whereas splitting
+or trimming two oversized families saves the same tokens with **no** accuracy
+risk. Laya's own README is explicit that the base checkpoints are near chance on
+its typed-decisions benchmark and that fine-tuning is where the value is; that is
+what the harness now exists to grade, against a corpus that grows with use.
+
+### Found while measuring: the desk work is on no remote
+
+Mining the corpus meant reading the app's own `history.json`, and a turn in it
+calls **`quant_space_read`** — a tool that does not exist in this checkout.
+`grep -c quant_space` over `handsoff.py` and `core/tools.py` on `main` is **0**.
+The work lives on **`feat/quant-space-desk`**, which is **local-only** (`origin`
+has one head, `main`), carries `core/qs_desk.py` plus the four desk tools and
+their tests, and is **diverged, not behind**: 3 commits only on the branch, 4
+only on `main`, so it cannot fast-forward. The running bubble is that branch's
+bytes. So the deployed assistant has a capability that exists on exactly one
+machine, in a working copy, with no remote copy and no merge request.
+
+### Stated limits
+
+The authored corpus is **my writing**, not ground truth about what this user
+says; the real corpus is **7 cases** (the app's history is 6 entries plus a
+handful of backups — that is the whole of it), so it is reported separately and
+is a signal, not a verdict. Only the `typed-decisions` checkpoint was measured
+(not `multilingual`, not the `Router`), and only on this card. The harness scores
+families, so its accuracy bounds the *narrowing* idea and says nothing about
+choosing a single tool. And the unmerged-branch finding is a fact about this
+working copy as it stands today: it says nothing about intent, only that no
+remote can restore it if this disk does not.
