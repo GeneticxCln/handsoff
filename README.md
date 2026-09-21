@@ -30,6 +30,11 @@ voice clip you pick. Everything runs on your machine.
 - **Ambient automation** — opt-in desktop notification reading, Pomodoro work /
   break cycles, threshold alerts for RAM/GPU memory, and bounded file/process
   watchers that announce matching failures or exits.
+- **Your Quantum Space desk** — "what is Claude doing?" answers from the desk
+  itself: which sessions are open in the Quantum Space workbench, and the tail
+  of what each one printed. Read-only, over the local channel Quantum Space
+  opens for this (its Settings → Control), and only once that desk allows this
+  assistant by name.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
@@ -449,6 +454,7 @@ the bubble → Settings…) has a permission switch for every dangerous tool:
 | **Screen access** | screenshots + OCR |
 | **Notifications** | future desktop notification reader; off by default |
 | **Pomodoro / Watchers** | work-break timer and bounded file/process monitoring |
+| **Quantum Space desk** | read the sessions open in Quantum Space and the tail of what they said — one switch for all four `quant_space_*` tools. Quantum Space keeps its own Control setting and its own allow-list on top of this, and refuses in its own words until you allow the assistant there |
 
 Safety boundaries enforced in code (not just the prompt):
 

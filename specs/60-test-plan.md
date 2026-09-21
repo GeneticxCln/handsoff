@@ -1,6 +1,6 @@
 # handsoff — test plan
 
-Sources: `tests/` (30 files + `conftest.py` + `checkout_guard.py` + `fake_ollama.py`),
+Sources: `tests/` (31 files + `conftest.py` + `checkout_guard.py` + `fake_ollama.py`),
 `install.sh` (what it provisions from),
 `pytest.ini`,
 `.coveragerc`, `.github/workflows/ci.yml`, `.gitlab-ci.yml`,
@@ -45,6 +45,7 @@ nothing — a missing row does.
 | `test_p0_fixes.py` | 6 | named P0 regressions |
 | `test_specs_freshness.py` | 19 | the specs' counts and cells vs the code, the generated tables, and the file/module/spec lists |
 | `test_settings_gui.py` | 1 (+ offscreen subprocess drivers) | Qt GUI incl. 10-design ink guard |
+| `test_qs_desk.py` | 73 | the Quantum Space desk client against a REAL `http.server` on an ephemeral port (never a recorded double): the wire (POST to `/`, bearer, no Origin, the lines clamp, and the token re-read on EVERY request — the file is rewritten between two calls and the second must carry the new one), the file that is not ours to trust (stale pid, mode 0644, non-JSON, protocol 2, a live foreign pid — each refused with NO request made), the desk's own sentences relayed verbatim (including its two different `not-granted` ones), the four failure states kept as four sentences, and the family's one gate (off ⇒ nothing reaches the desk, DENY policy wins). The fake answers in the shapes a LIVE desk was measured answering on 2026-09-21 — `control` as `{enabled, clients}` rather than a bare bool, `desk` in `hello` as the whole status object, `lines` on every read, an EMPTY body on 401/403/405/400, session rows whose `kind` is the tile's own (`claude`, `agent` null for a shell), and ids in the app's window-prefixed panel form (`w1_p_1`) — because a fake that is tidier than the desk tests the wrong desk (see `specs/90-audit.md`, "The desk client's first live turn"). Two more guards come from the second live turn: a session NAME is bounded to 40 characters before it is spoken (the desk names a `run` tile with its whole 171-character command line), and a read with no line breaks is called out as ONE line — while a real line-oriented stream gets no such note, so the note keeps meaning something. Five more (73 now) come from the third live round, where the client's OWN constructor was the defect: `Desk("handsoff")` — a client name where a path belongs — used to become one relative path and answer "Quantum Space isn't running." about a desk with a 0600 file on disk and a live pid in it, so a path that cannot be one is refused (relative path, empty list, non-path), an omitted list searches the profile directories, and a single absolute path is still a path list |
 | `conftest.py` / `fake_ollama.py` | 0 | module loader (`handsoff_core` + alias), order-shuffle, the user-dir sandbox, the checkout-write audit hook installed for this process, the `sitecustomize` shim that carries it into every python child the suite spawns, fake brain |
 | `checkout_guard.py` | 0 | the write property's ONE home: the audit hook, the event table and its per-event rules, the two rules it applies (the checkout, and the developer's real user dirs — the checkout first, because it has exemptions), the exemptions, and the `install()` that both this process and every child call |
 
@@ -193,7 +194,7 @@ nothing — a missing row does.
   guard pins every clamp (remove one → red); pixel-OCR avoided where
   multi-output screenshots proved unreliable (ACCEPTANCE §1: verified at the
   data layer through `_fmt_health` instead).
-- Suite pins what humans forget: system-prompt text, 48-tool census,
+- Suite pins what humans forget: system-prompt text, 52-tool census,
   `SELF_MARKER`, restart-script internals, `BUBBLE_DESIGNS`↔schema agreement,
   looks catalogue vs loader bounds, `_DEPLOY_FILES` floor vs manifest.
 

@@ -15,7 +15,7 @@ Sources: `install.sh`, `handsoff.py` (`main`, `_deployment_snapshot`,
    `TOP_REQUIRED` (`handsoff.py settings_schema.py hardware.py`) +
    `handsoff-settings.py` + `handsoff-restart` + `core/` set
    (`CORE_REQUIRED`: `__init__ registry settings audio brain tools doctor
-   lifecycle calendar assistant bubble web theme`) + any further
+   lifecycle calendar assistant bubble web theme qs_desk`) + any further
    `git ls-files '*.py'`; tarball (no git) fallback = declared set only.
    `CORE_REQUIRED` missing → stage fails loudly. `py_compile` gate on stage.
 4. Whisper model SHA256-verified atomic download (`HANDSOFF_WHISPER`,

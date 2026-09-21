@@ -312,6 +312,12 @@ DEFAULT_SETTINGS: dict = {
         "notifications": False,  # desktop notifications are private by default
         "pomodoro": True,
         "watchers": True,
+        "quant_space": True,  # read the Quantum Space desk (which sessions are
+                               # open, and the tail of what they said). ON, but
+                               # it is the SECOND switch: the desk keeps its own
+                               # Control setting and its own allow-list, and
+                               # refuses with a sentence naming Settings →
+                               # Control until the user consents THERE.
     },
     "extra_allowed_commands": [],
     "tool_call_times": None,          # filled per-ToolBelt: deque of monotonic times

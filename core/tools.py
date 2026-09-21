@@ -33,6 +33,7 @@ from collections import deque
 from pathlib import Path
 from contextvars import ContextVar
 
+from core import qs_desk as _qs_desk
 from core import registry as _registry
 
 
@@ -2014,6 +2015,139 @@ class ToolBelt:
             items = self._file_watchers.clear() + self._process_watchers.clear()
         for stop, _thread in items:
             stop.set()
+
+    # -- Quantum Space desk ---------------------------------------------------
+    # A read-only window on another app's own report of itself: which sessions
+    # are open, and the tail of what each said. FOUR tools on ONE gate
+    # (`quant_space`), the way press_keys, focus_window and watchers each cover a
+    # family, because the question the user actually has is one question — may
+    # the assistant read my Quantum Space desk? — and `command_policy` still
+    # gives per-tool ALLOW/DENY/CONFIRM control on top of it.
+    #
+    # Everything the desk says is RELAYED, never interpreted. It writes its own
+    # refusals as sentences for a person ("... Open Quant Space → Settings →
+    # Control and allow it."), so rewording one here would be a second, worse
+    # account of the same event — and the desk is the side that knows which of
+    # its two `not-granted` situations this is.
+    #
+    # A refusal a model might swallow is never only in its reply: `_qs_refused`
+    # puts it in the journal, in decisions.jsonl (rendered by the settings app's
+    # Decision log pane) and on the desktop through the same notify path every
+    # other event the user must know about uses.
+
+    def _qs_client(self):
+        """A Desk for this machine's Quantum Space profile(s).
+
+        Built per call, because building one is what re-reads the discovery
+        file — and the token in it is rotated by the app's own process, which
+        can restart between two tool calls.
+        """
+        return _qs_desk.connect()
+
+    def _qs_refused(self, tool: str, error, diagnostic: bool = False) -> str:
+        """Record and announce a desk that turned a call away, and word it.
+
+        `diagnostic` chooses between two true sentences: the plain one (the
+        desk's own words) for a tool that was asked to DO something, or the
+        named state for the diagnostic, whose whole job is to say WHICH state
+        the link is in. The record and the announcement are identical either
+        way — that is the point.
+        """
+        refused = error.state == "not-granted"
+        _dep().log.warning("the Quantum Space desk refused %s (%s): %s",
+                           tool, error.state, error.message)
+        log_decision(tool, error.state, "REFUSED" if refused else "ERROR",
+                     f"desk: {error.reason or error.state}")
+        teller = getattr(self._deps, "notify", None)
+        if teller is not None:
+            try:
+                teller(f"Quantum Space: {error.message}")
+            except Exception:
+                _dep().log.debug("a desk refusal could not be announced",
+                                 exc_info=True)
+        prefix = "REFUSED" if refused else "ERROR"
+        if diagnostic:
+            return f"{prefix}: {_qs_desk.describe_state(error)}"
+        return f"{prefix}: {error.message}"
+
+    @tool(gates='quant_space', description='Whether Quantum Space is running and what its desk has open right now: the app version, the open folder, and every session in it. Use for "is Quantum Space running?", "what is open in Quantum Space?". For one session\'s screen output use quant_space_read.')
+    def quant_space_status(self) -> str:
+        """Ask the Quantum Space desk what is open right now."""
+        desk = self._qs_client()
+        try:
+            desk.hello()
+            status = desk.status()
+            sessions = desk.sessions()
+        except _qs_desk.DeskError as e:
+            return self._qs_refused("quant_space_status", e)
+        return _qs_desk.describe_status(status, sessions)
+
+    @tool(gates='quant_space', description='List the sessions open in Quantum Space — each one\'s agent or kind and the folder it is in — together with the session id quant_space_read takes. Use it before reading when the session is not precisely known.')
+    def quant_space_sessions(self) -> str:
+        """What the desk has open, as one spoken sentence and an id list."""
+        desk = self._qs_client()
+        try:
+            sessions = desk.sessions()
+        except _qs_desk.DeskError as e:
+            return self._qs_refused("quant_space_sessions", e)
+        index = _qs_desk.session_index(sessions)
+        return _qs_desk.describe_sessions(sessions) + (f"\n{index}" if index else "")
+
+    @tool(gates='quant_space', description="Read the recent screen output of ONE Quantum Space session, by its id or name from quant_space_sessions. Use for 'what is Claude doing?', 'what did it just say?', 'read me the last thing it printed'.", aliases={'session': ('id', 'name', 'session_id', 'target', 'which'), 'lines': ('tail', 'last', 'n')})
+    def quant_space_read(self, session: str, lines: int=0) -> str:
+        """The tail of ONE session's screen, resolved against the desk's list.
+
+        session: an id or name from quant_space_sessions
+        lines: how many lines back to read (0 = the desk's own useful tail)
+        """
+        desk = self._qs_client()
+        try:
+            sessions = desk.sessions()
+            chosen = _qs_desk.resolve_session(sessions, session)
+        except _qs_desk.DeskError as e:
+            return self._qs_refused("quant_space_read", e)
+        try:
+            result = desk.read(chosen.get("id") or session, lines)
+        except _qs_desk.DeskError as e:
+            if e.state == "no-output":
+                # The session IS there and simply has nothing on screen yet:
+                # that is an answer, not a failure, and it is said the same way
+                # an empty read is.
+                return _qs_desk.describe_read({**chosen, "text": ""})
+            return self._qs_refused("quant_space_read", e)
+        # The id in the arguments is whatever the model typed; the entry that
+        # makes 'why did it read THAT tile' answerable names the session it
+        # actually resolved to.
+        log_decision("quant_space_read",
+                     f"{chosen.get('id')} ({chosen.get('name') or chosen.get('kind') or '?'})",
+                     "ALLOW", "read the desk")
+        # `chosen` first: `session.read` answers with `{id, name, kind, agent,
+        # text, truncated}` and no folder, and reading a tile whose folder is
+        # left out is how "the api one" becomes two identical-looking answers.
+        return _qs_desk.describe_read({**chosen, **result})
+
+    @tool(gates='quant_space', description="Diagnose the Quantum Space control link and say which state it is in: not running, the desk refusing on its own Control rules (its own sentence), or — when a session is named — that the session is gone. Use after any quantum_space_* call failed, and when the user asks why the assistant cannot see their desk.", aliases={'session': ('id', 'name', 'session_id')})
+    def quant_space_check(self, session: str='') -> str:
+        """Which state the desk link is in, in one line.
+
+        session: an id or name to check is still open (optional)
+        """
+        desk = self._qs_client()
+        try:
+            desk.hello()
+            status = desk.status()
+            sessions = desk.sessions()
+        except _qs_desk.DeskError as e:
+            return self._qs_refused("quant_space_check", e, diagnostic=True)
+        line = (f"Quantum Space desk: fine — "
+                f"{_qs_desk.describe_status(status, sessions)}")
+        if session:
+            try:
+                _qs_desk.resolve_session(sessions, session)
+            except _qs_desk.DeskError as e:
+                line += "\n" + self._qs_refused("quant_space_check", e,
+                                                 diagnostic=True)
+        return line
 
     @tool(description="Control niri workspaces: 'go' (switch), 'move' (send window), 'next'/'prev' (one workspace), 'list' (overview).", gates='run_command', aliases={'action': ('cmd', 'command', 'op'), 'target': ('arg', 'value', 'ref')})
     def workspace(self, action: str, target: str='') -> str:
