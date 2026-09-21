@@ -6,62 +6,73 @@ do not hand-edit it, and do not copy a number out of it into prose.
 `gates=None` (decorator omits `gates=`) means "own name"; `gates=''` means
 ungated. Descriptions are the pinned model-facing strings in the decorator.
 
+**The effective gate also decides whether a tool is OFFERED.** Every schema here
+is JSON'd into every round, and `SETTINGS["permissions"]` is keyed by the gate —
+one dropdown per family in the settings app — so a family switched off stops its
+schemas being sent at all (`permitted_tools`, applied per round from live
+settings): a tool the user cannot call is a tool the prompt should not pay for.
+The belt refuses such a call anyway, so nothing is lost by not listing it — and
+the names of the switched-off families travel in the system prompt, because the
+"disabled in handsoff settings" sentence was the one that named the switch.
+Ungated tools always ship, and a gate the filter has never heard of fails OPEN,
+matching the belt's own check at call time.
+
 ## Census (name | effective gate | line)
 
 | Tool | Gate | L |
 |---|---|---|
-| `run_command` | `run_command` | 1364 |
-| `type_text` | `type_text` | 1593 |
-| `press_keys` | `press_keys` | 1656 |
-| `press_hotkey` | `press_keys` | 1759 |
-| `notification_reader` | `notifications` | 1818 |
-| `pomodoro` | `pomodoro` | 1856 |
-| `watch_file` | `watchers` | 1932 |
-| `watch_process` | `watchers` | 1981 |
-| `quant_space_status` | `quant_space` | 2074 |
-| `quant_space_sessions` | `quant_space` | 2086 |
-| `quant_space_read` | `quant_space` | 2097 |
-| `quant_space_check` | `quant_space` | 2130 |
-| `workspace` | `run_command` | 2153 |
-| `focus_window` | `focus_window` | 2271 |
-| `wait_for_window` | `focus_window` | 2317 |
-| `wait` | — | 2339 |
-| `niri_capabilities` | — | 2440 |
-| `close_window` | `run_command` | 2470 |
-| `copy_text` | `copy_text` | 2530 |
-| `paste_text` | `paste_text` | 2542 |
-| `set_reminder` | `reminders` | 2557 |
-| `list_reminders` | `reminders` | 2610 |
-| `cancel_reminder` | `reminders` | 2626 |
-| `snooze_reminder` | `reminders` | 2645 |
-| `media_play` | `media` | 2683 |
-| `media_control` | `media` | 2719 |
-| `media_volume` | `media` | 2738 |
-| `now_playing` | `media` | 2750 |
-| `search_library` | `media` | 2767 |
-| `calendar_month` | `calendar` | 2786 |
-| `read_calendar` | `calendar` | 2816 |
-| `get_weather` | `web_access` | 2860 |
-| `web_search` | `web_access` | 2889 |
-| `read_page` | `web_access` | 2915 |
-| `world_events` | `web_access` | 2928 |
-| `lookup_fact` | `web_access` | 2952 |
-| `get_datetime` | `get_datetime` | 2969 |
-| `see_screen` | `screen_access` | 3012 |
-| `read_screen_text` | `screen_access` | 3030 |
-| `kill_process` | `run_command` | 3117 |
-| `confirm_kill` | `run_command` | 3145 |
-| `confirm_action` | — | 3175 |
-| `start_command` | `run_command` | 3263 |
-| `job_status` | `run_command` | 3312 |
-| `handsoff_doctor` | — | 3360 |
-| `screen_elements` | `screen_access` | 3460 |
-| `click_element` | `operator` | 3482 |
-| `click_at` | `operator` | 3499 |
-| `scroll` | `operator` | 3504 |
-| `open_app` | `run_command` | 3537 |
-| `read_file` | `read_file` | 3627 |
-| `edit_file` | `edit_file` | 3657 |
+| `run_command` | `run_command` | 1410 |
+| `type_text` | `type_text` | 1639 |
+| `press_keys` | `press_keys` | 1702 |
+| `press_hotkey` | `press_keys` | 1805 |
+| `notification_reader` | `notifications` | 1864 |
+| `pomodoro` | `pomodoro` | 1902 |
+| `watch_file` | `watchers` | 1978 |
+| `watch_process` | `watchers` | 2027 |
+| `quant_space_status` | `quant_space` | 2120 |
+| `quant_space_sessions` | `quant_space` | 2132 |
+| `quant_space_read` | `quant_space` | 2143 |
+| `quant_space_check` | `quant_space` | 2176 |
+| `workspace` | `run_command` | 2199 |
+| `focus_window` | `focus_window` | 2317 |
+| `wait_for_window` | `focus_window` | 2363 |
+| `wait` | — | 2385 |
+| `niri_capabilities` | — | 2486 |
+| `close_window` | `run_command` | 2516 |
+| `copy_text` | `copy_text` | 2576 |
+| `paste_text` | `paste_text` | 2588 |
+| `set_reminder` | `reminders` | 2603 |
+| `list_reminders` | `reminders` | 2656 |
+| `cancel_reminder` | `reminders` | 2672 |
+| `snooze_reminder` | `reminders` | 2691 |
+| `media_play` | `media` | 2729 |
+| `media_control` | `media` | 2765 |
+| `media_volume` | `media` | 2784 |
+| `now_playing` | `media` | 2796 |
+| `search_library` | `media` | 2813 |
+| `calendar_month` | `calendar` | 2832 |
+| `read_calendar` | `calendar` | 2862 |
+| `get_weather` | `web_access` | 2906 |
+| `web_search` | `web_access` | 2935 |
+| `read_page` | `web_access` | 2961 |
+| `world_events` | `web_access` | 2974 |
+| `lookup_fact` | `web_access` | 2998 |
+| `get_datetime` | `get_datetime` | 3015 |
+| `see_screen` | `screen_access` | 3058 |
+| `read_screen_text` | `screen_access` | 3076 |
+| `kill_process` | `run_command` | 3163 |
+| `confirm_kill` | `run_command` | 3191 |
+| `confirm_action` | — | 3221 |
+| `start_command` | `run_command` | 3309 |
+| `job_status` | `run_command` | 3358 |
+| `handsoff_doctor` | — | 3406 |
+| `screen_elements` | `screen_access` | 3506 |
+| `click_element` | `operator` | 3528 |
+| `click_at` | `operator` | 3545 |
+| `scroll` | `operator` | 3550 |
+| `open_app` | `run_command` | 3583 |
+| `read_file` | `read_file` | 3673 |
+| `edit_file` | `edit_file` | 3703 |
 
 ## Result contract
 

@@ -2620,3 +2620,97 @@ reopen, zero frames, `stalled`), and the Yeti is absent from `sounddevice`'s
 INPUT list entirely — it appears only as an output. The capture was moved to the
 StreamCam, which opens at 16 kHz and delivers frames, set through the same
 setting the Voice pane writes and applied without a restart.
+
+## The oversized tool families: what a trim is worth, and the filter that never filtered (2026-09-21)
+
+The Laya round's arithmetic put the cheap half of its prize here — `windows`
+(11 tools) and `system` (9) carrying **1 915 of the 4 165 schema tokens**, 46% of
+the belt, so that trimming them bought the same prefill a three-family router
+would, with no accuracy risk. This round went after it, and priced the ceiling
+first.
+
+**Re-measured on the merged belt (52 tools).** The whole thing `json.dumps` to
+**18 512 chars ≈ 4 628 tokens**, and the two families are **7 299 chars ≈ 1 825
+tokens — 39%** (the share is below the audit's 46% because the desk merge added a
+family of its own). Within them the cost splits three ways: descriptions
+**3 008**, parameter docs **1 506**, and JSON scaffolding **~141 chars per tool**
+over 19 tools ≈ **2 679** — and that last number is the ceiling of any prose trim:
+`{"type": "function", "function": …}` is not prose, and only FEWER tools remove
+it.
+
+**What the trim bought: 748 chars ≈ 187 tokens.** Descriptions 3 008 → 2 278, the
+two families' parameter docs 1 506 → 1 479, the whole belt 18 512 → 17 764. The
+rule held to is that a capability the model must DISCOVER keeps its words: the
+whitelist's trivial members (`echo`, `cat`, `ls`, `pwd`) stay, because that is how
+a model learns it may list a directory; what went was restatement and mechanism —
+"needed to turn screenshot pixels into pointer coordinates" became "for
+pixel-to-pointer conversion", "Run screen_elements first" went because the scan
+tool's own description already says it, and the same parameter sentence shipped
+twice ("optional 'x y width height' in pixels") became one shorter line.
+
+**The real lever was a filter that never filtered.** The round loop shipped
+`[t for t in TOOLS if SETTINGS["permissions"].get(t["function"]["name"], True)]`
+— and the permissions dict is keyed by FAMILY (one dropdown per family in the
+settings app: `run_command`, `screen_access`, `operator`…), never by a tool's own
+name. That lookup missed every time, defaulted to `True`, and so **nothing was
+ever dropped at all**: a default config shipped **4 schemas belonging to families
+that are OFF by default** (`operator` ×3, `notifications` ×1) — **1 449 chars
+≈ 362 tokens in every round** — for tools the belt answers with `REFUSED: the
+'operator' tool is disabled in handsoff settings`. A capability the user cannot
+call is a capability the prompt should not pay for, and this one was being paid
+for twice: once in prefill, once in the round the model spent calling it.
+
+**Fixed at the predicate, not the call site.** `permitted_tools` filters on the
+tool's own GATE, from live settings, rebuilt every round, so a family switched on
+mid-session is offered on the very next round; ungated tools always ship; a gate
+the filter has never heard of fails OPEN, matching the belt's own check at call
+time. `tool_gates()` and the schema builder now share ONE walk of the belt,
+because a second copy of that loop is exactly how a tool ends up in the prompt but
+not in the gate map. **On a default config the schema sent every round goes
+18 512 → 16 315 chars (52 → 48 tools): 2 197 chars ≈ 549 tokens — 12% of the
+belt** — and the four schemas removed are exactly the four that could only ever
+refuse.
+
+**The refusal keeps its fix path.** Dropping a schema also drops the tool whose
+refusal NAMED the switch, so the family names travel in the system prompt instead
+(one line, written only when something is off — about 150 chars against the 1 449
+saved), and the spoken answer can still point at the settings app rather than
+guess at a result.
+
+**What each family is worth, since that dial is now real** (chars per round; a
+quarter of that in tokens): `run_command` 2 811, `quant_space` 1 905,
+`web_access` 1 834, `media` 1 423, `reminders` 1 136, `operator` 1 073,
+`screen_access` 1 048, `focus_window` 768, `watchers` 738, `press_keys` 736,
+`calendar` 566, `edit_file` 484, `notifications` 376, `pomodoro` 369,
+`read_file` 335, `type_text` 319, `paste_text` 246, `copy_text` 211,
+`get_datetime` 184.
+
+**Teeth: 8 guards.** A switched-off family leaves the prompt, and the saving is
+asserted to be more than a rounding error; with every family ON the shipped list
+IS the belt, so the filter cannot lose a tool; an unknown gate fails OPEN and with
+every family off only the gateless tools remain; the turn site filters on the
+family, with the name-keyed lookup asserted GONE from the source; a switched-off
+family can still name its switch. Then the two that keep prose and interface
+apart: the tool interface is pinned as a sha256 over {name, params, required,
+types} for all 52 tools, so a description may shrink but something callable
+cannot silently disappear; the whole belt has a ceiling, and the two oversized
+families' descriptions have one too (2 400, against 3 008 before).
+
+**One thing deliberately NOT changed, recorded as an open item:** the startup
+warm-up still sends the FULL belt, and the suite pins that by name ("warmup must
+pass the full tool schemas"). Its rationale is that the warm-up should hold the
+exact prefix a turn will use — which is no longer strictly true once a family is
+off, so the first question after a restart can re-prefill the tools block. That is
+a design call about what the cache is for, not a trim, so it is stated rather than
+taken.
+
+**Stated limits.** The reconstruction of "saves ~1 800 tokens" is arithmetic on
+today's 52-tool belt, not a measurement of the audit's 11+9 plan. The scaffolding
+price (~141 chars per tool) is measured, and it is the part no prose can reach.
+The trim is deliberately partial: every enumeration that names a discoverable
+capability survived. The venue is a DEFAULT config — a user with every family on
+gets the 748-char trim and none of the 1 449, which is the point, because that
+dial belongs to the user. And the interface digest is a SHAPE check: it proves
+nothing about behaviour, so the behavioural evidence is the other thing measured
+here — that the four schemas removed were the four the belt refused at call time,
+and that the belt's own gate check is untouched.

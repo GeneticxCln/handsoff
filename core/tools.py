@@ -179,8 +179,13 @@ _DEFAULT_DEPS.SELF_MARKER = SELF_MARKER
 # Host replacements (notably H.subprocess in tests) remain visible through DI.
 import subprocess as _subprocess
 subprocess = _InjectedProxy(_subprocess)
-def build_tools():
-    out = []
+def _belt_tools():
+    """Every decorated tool on the belt, once each — the ONE walk.
+
+    `build_tools` and `tool_gates` must agree on which functions are tools and
+    what name each ships under: a second copy of this loop is exactly how a tool
+    ends up in the prompt but not in the gate map.
+    """
     seen = set()
     for name in dir(ToolBelt):
         fn = getattr(ToolBelt, name)
@@ -189,6 +194,12 @@ def build_tools():
         if id(fn) in seen:
             continue
         seen.add(id(fn))
+        yield fn
+
+
+def build_tools():
+    out = []
+    for fn in _belt_tools():
         params = _param_schema(fn)
         required = fn._tool_required
         if required is None:
@@ -203,6 +214,41 @@ def build_tools():
                            "required": required},
         }})
     return out
+
+
+def tool_gates() -> dict:
+    """{tool name: gate} for the belt — the family each tool answers to.
+
+    Deliberately uncached: the host publishes its `ToolBelt` subclass back into
+    this module, so a cache built before that would describe a different class
+    — the stale-map shape this file has been bitten by before. The walk is
+    ~50µs over 52 tools.
+    """
+    return {fn._tool_name: (fn._tool_gates or "") for fn in _belt_tools()}
+
+
+def permitted_tools(tools, permissions) -> list:
+    """The schemas a turn may be offered: one per tool whose FAMILY is on.
+
+    The gate is the unit `SETTINGS["permissions"]` is keyed by — one dropdown
+    per family in the settings app, `run_command` / `screen_access` / `operator`
+    and so on. A filter that looks a tool's own NAME up in that dict therefore
+    filters nothing: the name is never a key, the lookup defaults to True, and
+    every schema ships whatever the user switched off. Measured on a default
+    config that shipped 1462 chars (~366 tokens) of `operator` and
+    `notifications` schemas in EVERY round, for tools the belt then refused —
+    a family the user cannot use is a family that should not be in the prompt.
+
+    Gate `""` means the tool belongs to no family and always ships. An unknown
+    gate fails open, matching the belt's own check (`self._perm.get(gate,
+    True)`), so a missing key can never withdraw a capability — and a family the
+    user just switched ON is present in the very next round, because the caller
+    rebuilds this list per round from live SETTINGS.
+    """
+    gates = tool_gates()
+    perms = permissions or {}
+    return [t for t in tools
+            if perms.get(gates.get(t["function"]["name"], ""), True)]
 
 
 _JSON_TYPE = {str: "string", int: "integer", float: "number", bool: "boolean"}
@@ -1360,7 +1406,7 @@ class ToolBelt:
             return 'REFUSED: passing script/code flags to spawned programs is not allowed'
         return None
 
-    @tool(description='Run one safe whitelisted command (pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, system probes like ps/free/uptime/df/ss/nvidia-smi, read-only git (status/diff/log/show/branch/remote), cargo build/check/test/clippy, restart script). Single command only — pipes/; /&& are refused.')
+    @tool(description='Run one safe whitelisted command (pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, system probes like ps/free/df/ss/nvidia-smi, read-only git (status/diff/log/show/branch), cargo build/check/test/clippy, restart script). One command only — pipes, ; and && are refused.')
     def run_command(self, command: str) -> str:
         """Run a whitelisted shell command.
 
@@ -2149,7 +2195,7 @@ class ToolBelt:
                                                  diagnostic=True)
         return line
 
-    @tool(description="Control niri workspaces: 'go' (switch), 'move' (send window), 'next'/'prev' (one workspace), 'list' (overview).", gates='run_command', aliases={'action': ('cmd', 'command', 'op'), 'target': ('arg', 'value', 'ref')})
+    @tool(description='Control niri workspaces: switch to one, move a window onto one, step one at a time, or list them.', gates='run_command', aliases={'action': ('cmd', 'command', 'op'), 'target': ('arg', 'value', 'ref')})
     def workspace(self, action: str, target: str='') -> str:
         """Control workspaces.
 
@@ -2267,7 +2313,7 @@ class ToolBelt:
                 return None
             time.sleep(self._WIN_POLL_S)
 
-    @tool(description="Focus a desktop window by app name or title substring ('firefox', 'slack', 'alacritty'). Confirms the window really got focus before returning.", aliases={'app': ('window',)})
+    @tool(description='Focus a desktop window by app name or title substring; confirms it really got focus.', aliases={'app': ('window',)})
     def focus_window(self, app: str) -> str:
         """Focus a window by name.
 
@@ -2313,12 +2359,12 @@ class ToolBelt:
                 return False
             time.sleep(self._WIN_POLL_S)
 
-    @tool(description='Wait until a window matching the name exists (apps take a moment to appear after launch). Returns the window and whether it is focused. Use after open_app, or when a window is slow to appear.', gates='focus_window', aliases={'app': ('window', 'name')})
+    @tool(description='Wait until a window matching the name exists. Use after open_app or when a window is slow; reports it and whether it is focused.', gates='focus_window', aliases={'app': ('window', 'name')})
     def wait_for_window(self, app: str, timeout: float=10.0) -> str:
         """Wait for a window to exist.
 
         app: app-id or title substring to wait for
-        timeout: seconds to wait before giving up (max 30)
+        timeout: seconds before giving up (max 30)
         """
         q = app.strip().lower()
         if not q:
@@ -2335,11 +2381,11 @@ class ToolBelt:
         _dep().log.info('wait_for_window: %s %s', self._win_label(w), focus)
         return f'window ready: {self._win_label(w)} ({focus})'
 
-    @tool(description='Sleep for `seconds` (0.5-30, default 1) before the next action: lets an app finish drawing, an animation settle, or a dialog appear. Prefer wait_for_window when waiting for an app window.', gates='', aliases={'seconds': ('secs', 'delay', 'duration')})
+    @tool(description='Pause before the next action so an app can finish drawing or a dialog can appear. Prefer wait_for_window for a window.', gates='', aliases={'seconds': ('secs', 'delay', 'duration')})
     def wait(self, seconds: float=1.0) -> str:
         """Wait a moment.
 
-        seconds: how long to sleep (0.5 to 30)
+        seconds: how long to sleep (0.5-30)
         """
         try:
             s = float(seconds)
@@ -2436,7 +2482,7 @@ class ToolBelt:
             m['actions'] = acts
         return m
 
-    @tool(description='Live capability manifest of the niri compositor: version, open windows, workspaces, outputs (name and scale — needed to convert screenshot pixels to pointer coordinates), keyboard layouts, and every supported action on THIS version. Cached ~30s; refresh=true forces a fresh poll.', gates='', aliases={'refresh': ('force',)})
+    @tool(description='Live niri manifest: version, windows, workspaces, outputs (name + scale, for pixel-to-pointer conversion), keymaps, and every action THIS version supports. Cached ~30s.', gates='', aliases={'refresh': ('force',)})
     def niri_capabilities(self, refresh: bool=False) -> str:
         """Report what the running compositor supports right now.
 
@@ -2466,7 +2512,7 @@ class ToolBelt:
             out.append(f'actions ({len(acts)}): {shown}{more}')
         return '\n'.join(out) or 'niri capability manifest unavailable'
 
-    @tool(description="Close an app's windows by name ('firefox', 'spotify') or 'this' for the focused one. Polite close (like Alt+F4): unsaved work prompts the user. Never force-kills.", gates='run_command', aliases={'app': ('window', 'name')})
+    @tool(description="Close an app's windows politely by name, or 'this' for the focused one — unsaved work prompts, and it never force-kills.", gates='run_command', aliases={'app': ('window', 'name')})
     def close_window(self, app: str) -> str:
         """Close window(s) politely.
 
@@ -2856,7 +2902,7 @@ class ToolBelt:
             out += f"  [unreadable: {'; '.join(bad)}]"
         return f'{label}: {out}'
 
-    @tool(description="Current weather + today/tomorrow forecast for a place, e.g. 'Berlin', 'New York', 'Tokyo'. Omit the place to use the user's home place.", gates='web_access', aliases={'place': ('city',)})
+    @tool(description="Current weather and today/tomorrow forecast for a place; omit it to use the user's home place.", gates='web_access', aliases={'place': ('city',)})
     def get_weather(self, place: str='') -> str:
         place = (place or str(_dep().SETTINGS.get('home_place', ''))).strip()
         if not place:
@@ -3012,8 +3058,8 @@ class ToolBelt:
     def see_screen(self, question: str='', region: str='') -> str:
         """Look at the screen with vision.
 
-        question: what you want to find out from the screen
-        region: optional 'x y width height' in pixels
+        question: what to find out from the screen
+        region: optional 'x y width height' pixels
         """
         err = self._take_screenshot(region)
         if err:
@@ -3026,11 +3072,11 @@ class ToolBelt:
         hint = f' (user asks: {question[:200]})' if question else ''
         return f'Screenshot captured and attached as an image{hint}.'
 
-    @tool(description='Read all visible text on screen via OCR (fast, no vision model). Best for reading articles, chats, code or error messages on screen.', gates='screen_access')
+    @tool(description='Read all visible text on screen via OCR (no vision model). Best for articles, chats, code or errors on screen.', gates='screen_access')
     def read_screen_text(self, region: str='') -> str:
         """Read screen text via OCR.
 
-        region: optional 'x y width height' in pixels
+        region: optional 'x y width height' pixels
         """
         err = self._take_screenshot(region, scale_down=False)
         if err:
@@ -3113,7 +3159,7 @@ class ToolBelt:
                 continue
         return pids
 
-    @tool(gates='run_command', description="Stop (SIGTERM) one of the user's own processes by EXACT name or by the port it listens on. Two steps: kill_process first shows the match and asks to confirm; then confirm_kill('yes') actually stops it.")
+    @tool(gates='run_command', description="Stop (SIGTERM) one of your own processes by EXACT name or listening port. Two steps: this shows the match, then confirm_kill('yes') stops it.")
     def kill_process(self, target: str) -> str:
         target = str(target or '').strip()
         if not target:
@@ -3141,7 +3187,7 @@ class ToolBelt:
         _dep().log.info('kill_process: offered pid %d (%s), awaiting confirm', pid, name)
         return f"About to stop {name} (pid {pid}). Nothing happened yet — call confirm_kill('yes') to stop it, or confirm_kill('no') to cancel."
 
-    @tool(gates='run_command', description="Second step of kill_process: confirm_kill('yes') stops the offered process; confirm_kill('no') cancels the offer.")
+    @tool(gates='run_command', description="Second step of kill_process: 'yes' stops the offered process, 'no' cancels.")
     def confirm_kill(self, answer: str='yes') -> str:
         # The offer owns its own lock. Arming is ONE assignment, so no reader
         # can see it half-armed; `consume()` is the claim, so two racing
@@ -3456,7 +3502,7 @@ class ToolBelt:
             return f' (element scan is {age:.0f}s old — the screen may have changed; run screen_elements again)'
         return ''
 
-    @tool(gates='screen_access', description='List clickable text elements on screen with numbers and positions. Run this before click_element; re-run after anything changes — clicks, typing, scrolling and launches all make the last scan stale, and click_element will warn when it is.')
+    @tool(gates='screen_access', description='List clickable text elements on screen with numbers and positions. Re-run after anything changes; a stale scan is warned about on click.')
     def screen_elements(self) -> str:
         if not hasattr(self, '_elements'):
             self._elements = []
@@ -3478,7 +3524,7 @@ class ToolBelt:
         _dep().log.info('screen_elements: %d lines (pointer scale %.2f)', len(self._elements), self._pointer_scale)
         return f'{len(self._elements)} clickable text elements (coordinates are screen pixels; pointer scale {self._pointer_scale:g}):\n' + self._screen_elements_fmt()
 
-    @tool(gates='operator', description='Click a text element from the last screen_elements scan by its number or (part of) its text. Run screen_elements first.', aliases={'ref': ('element', 'name', 'label', 'target')})
+    @tool(gates='operator', description='Click a text element from the last screen_elements scan, by its number or (part of) its text.', aliases={'ref': ('element', 'name', 'label', 'target')})
     def click_element(self, ref: str) -> str:
         els = getattr(self, '_elements', [])
         if not els:
@@ -3500,7 +3546,7 @@ class ToolBelt:
         return self._operator_click(x, y, 'target')
     _SCROLL_SIGNS = {'up': 1, 'down': -1, 'right': 1, 'left': -1}
 
-    @tool(gates='operator', description='Scroll the mouse wheel by `amount` notches (default 3): direction up / down / left / right. Affects whatever window is under the pointer — click_element or click_at first to aim it. Content moves, so re-run screen_elements before clicking anything after.', aliases={'direction': ('dir', 'way'), 'amount': ('notches', 'clicks', 'lines')})
+    @tool(gates='operator', description='Scroll the mouse wheel by `amount` notches in `direction`. Affects whatever window is under the pointer — click_element or click_at first to aim it. Re-run screen_elements before clicking afterwards: the content moves.', aliases={'direction': ('dir', 'way'), 'amount': ('notches', 'clicks', 'lines')})
     def scroll(self, direction: str='down', amount: int=3) -> str:
         """Scroll the mouse wheel.
 
@@ -3533,7 +3579,7 @@ class ToolBelt:
     OPEN_APP_WAIT_S = 12.0
     _WIN_GRACE_S = 3.0
 
-    @tool(description="Launch a desktop app by name ('firefox', 'spotify', 'files'…), wait for its window to appear and report which window it is. Then focus_window to aim typing at it.", gates='run_command', aliases={'app': ('name',)})
+    @tool(description='Launch a desktop app by name and wait for its window; then focus_window to aim typing at it.', gates='run_command', aliases={'app': ('name',)})
     def open_app(self, app: str) -> str:
         a = app.strip().lower()
         if not a:
@@ -3658,7 +3704,7 @@ class ToolBelt:
         """Overwrite a text file.
 
         path: File path, ~ expanded.
-        content: The complete new file content.
+        content: the complete new file content
         """
         p = Path(path).expanduser().resolve()
         if len(content) > self.MAX_WRITE:

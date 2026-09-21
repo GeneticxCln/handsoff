@@ -2243,6 +2243,20 @@ def _fixed_prompt_tokens() -> int:
     return _FIXED_PROMPT_TOKENS
 
 
+def _switched_off_families() -> list:
+    """Families the user has switched off — the schemas a turn does NOT carry.
+
+    `permitted_tools` drops these from the tool list, so the model no longer
+    sees the tool that used to answer "REFUSED: disabled in handsoff settings"
+    *and* name the switch in the same breath. One line in the system prompt
+    keeps that fix path: the family names, not the whole schema, are what made
+    the refusal useful.
+    """
+    perms = SETTINGS.get("permissions") or {}
+    return sorted({g for g in _core_tools.tool_gates().values()
+                   if g and not perms.get(g, True)})
+
+
 def _history_budget() -> int:
     """History token budget: explicit setting wins; otherwise num_ctx minus
     the fixed prompt cost minus a 1024-token reply reserve (floor 1024)."""
@@ -7533,9 +7547,14 @@ class Assistant(QObject):
         now = (f"{_core_calendar.DAY_NAMES[_now.weekday()]}, {_now.day:02d} "
                f"{_core_calendar.MONTH_NAMES[_now.month - 1]} {_now.year}, "
                f"{_now.hour:02d}:{_now.minute:02d}")
+        off_families = _switched_off_families()
         system = (f"{SYSTEM_PROMPT}\n\nCurrent local date and time: {now}. "
                   "If the user asks about anything that depends on the current "
-                  "date (weather today, 'tomorrow', news), use your tools.")
+                  "date (weather today, 'tomorrow', news), use your tools."
+                  + (f" Switched off in settings, so not offered: "
+                     f"{', '.join(off_families)} — if asked for one of these, "
+                     "name the settings switch instead of guessing."
+                     if off_families else ""))
         briefing = self._maybe_briefing_prefix(text)
         user_content = (briefing + "\n\nThe user just said: " + text) if briefing else text
         tail: list[str] = []
@@ -7571,7 +7590,7 @@ class Assistant(QObject):
             if cancel.is_set():
                 return
             tools = ([] if not _BRAIN_STATE["tools_supported"] else
-                     [t for t in TOOLS if SETTINGS["permissions"].get(t["function"]["name"], True)])
+                     _core_tools.permitted_tools(TOOLS, SETTINGS["permissions"]))
             stream_enabled = _setting_flag("streaming_tts", True)
             if stream_enabled:
                 # speak sentences while the model is still generating; tool

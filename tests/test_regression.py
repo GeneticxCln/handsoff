@@ -679,6 +679,139 @@ class TestHistoryTokenTrim:
         assert a._spotter_wake is False   # normal VAD path, not the spotter
 
 
+class TestTheShippedSchemaIsWhatTheUserSwitchedOn:
+    """The belt is JSON'd into EVERY round, so what ships is a budget the user
+    already controls: `permissions` is keyed by FAMILY (one dropdown per family
+    in the settings app, `run_command` / `screen_access` / `operator` …), and a
+    tool whose family is off can only ever answer "REFUSED: disabled in handsoff
+    settings".
+
+    Measured 2026-09-21, before this round: the host filtered on the tool's own
+    NAME, which is never a key in that dict — the lookup defaulted to True and
+    so NOTHING was ever filtered. A default config shipped 4 schemas (operator
+    x3, notifications x1) for tools the belt then refused: 1449 chars, ~362
+    tokens, every single round.
+    """
+
+    def _default_families(self):
+        import settings_schema as _ss
+        return dict(_ss.DEFAULT_SETTINGS["permissions"])
+
+    def test_a_family_switched_off_leaves_the_prompt(self, H):
+        tools = _core_tools.build_tools()
+        perms = self._default_families()
+        off = sorted(k for k, v in perms.items() if not v)
+        assert off, "this guard is meaningless without a default-off family"
+        gates = _core_tools.tool_gates()
+        shipped = _core_tools.permitted_tools(tools, perms)
+        assert [t for t in shipped
+                if gates[t["function"]["name"]] in off] == [], \
+            "a switched-off family's schemas are still being paid for"
+        saved = len(json.dumps(tools)) - len(json.dumps(shipped))
+        assert saved > 1000, f"the saving is meant to be real, got {saved} chars"
+
+    def test_nothing_usable_is_dropped(self, H):
+        """The direction that must never regress: with every family on, the
+        shipped list IS the belt. A filter that loses a tool loses a capability.
+        """
+        tools = _core_tools.build_tools()
+        assert _core_tools.permitted_tools(tools, {k: True for k in self._default_families()}) \
+            == tools
+
+    def test_a_family_the_filter_has_never_heard_of_fails_open(self, H):
+        """An empty (or hand-edited, or older-than-this-release) permissions
+        dict must not withdraw anything — the belt's own check is
+        `self._perm.get(gate, True)`, so the filter must match it. And with
+        EVERY family off, only the gateless tools may remain.
+        """
+        tools = _core_tools.build_tools()
+        assert _core_tools.permitted_tools(tools, {}) == tools
+        gates = _core_tools.tool_gates()
+        shipped = {t["function"]["name"] for t in _core_tools.permitted_tools(
+            tools, {k: False for k in self._default_families()})}
+        assert shipped == {t["function"]["name"] for t in tools
+                           if not gates.get(t["function"]["name"])}
+
+    def test_the_turn_site_filters_on_the_family(self, H):
+        """The predicate is only as good as its call site: the round loop must
+        call it with live SETTINGS, so a family switched on mid-session is
+        offered on the very next round rather than at the next restart."""
+        src = Path(ROOT, "handsoff.py").read_text(encoding="utf-8")
+        assert 'permitted_tools(TOOLS, SETTINGS["permissions"])' in src
+        assert 'SETTINGS["permissions"].get(t["function"]["name"]' not in src, \
+            "the name-keyed lookup filtered nothing — permissions is keyed by family"
+
+    def test_a_switched_off_family_can_still_name_its_switch(self, H, monkeypatch):
+        """Dropping the schema also drops the tool that used to say "disabled in
+        handsoff settings", so the family names travel in the system prompt
+        instead and the refusal keeps its fix path."""
+        monkeypatch.setitem(H.SETTINGS, "permissions",
+                            {"operator": False, "notifications": False,
+                             "web_access": True})
+        off = H._switched_off_families()
+        assert "operator" in off and "notifications" in off
+        assert "web_access" not in off, "an enabled family must not be announced as off"
+
+
+class TestTrimmingTheSchemaCostsNoCapability:
+    """Trimming PROSE is free; changing the INTERFACE is a capability change and
+    must never happen by accident. These two pin the difference.
+
+    Measured 2026-09-21: the whole belt `json.dumps`s to 17764 chars (~4441
+    tokens) and rides in every round — down from 18512 (~4628 tokens) before the
+    windows and system families were trimmed (their descriptions went
+    1734+1274 -> 1225+1053, and their parameter docs shrank by ~180 more).
+    """
+
+    #: sha256 of {name: {params, required, types}} for every tool — the part of
+    #: a schema the model can actually call. Update this (and the spec tables)
+    #: when the interface deliberately changes; if you only meant to shorten a
+    #: description, a failure here means you shortened a capability instead.
+    INTERFACE = "0da48bf03a7ba098ae06d0852a1468a59ca4644d9b51108ca0cc33e4396835cd"
+
+    #: The whole belt, as requests sends it (ensure_ascii).
+    SCHEMA_CEILING = 18_000
+    #: Descriptions of the windows + system families — the two the audit named
+    #: as 46% of the schema. Measured 2278 today, 3008 before the trim.
+    BIG_FAMILY_PROSE_CEILING = 2_400
+
+    def test_the_interface_is_the_shape_this_round_pinned(self, H):
+        import hashlib
+        by = {t["function"]["name"]: t["function"] for t in H.TOOLS}
+        iface = {n: {"params": sorted(by[n]["parameters"]["properties"]),
+                     "required": by[n]["parameters"]["required"],
+                     "types": {p: s.get("type") for p, s
+                               in by[n]["parameters"]["properties"].items()}}
+                 for n in sorted(by)}
+        blob = json.dumps(iface, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(blob.encode()).hexdigest()
+        assert digest == self.INTERFACE, (
+            f"the tool interface changed ({len(by)} tools)\n"
+            "If that was deliberate — a new tool, a new parameter — update "
+            "INTERFACE here and the spec census. If you were only trimming "
+            "prose, you have just removed something callable.")
+
+    def test_the_prompt_budget_does_not_drift_back_up(self, H):
+        total = len(json.dumps(H.TOOLS))
+        assert total <= self.SCHEMA_CEILING, (
+            f"the tool schemas are {total} chars (ceiling {self.SCHEMA_CEILING}) "
+            "— this is paid in EVERY round, so trim it or raise the ceiling on "
+            "purpose")
+
+    def test_the_oversized_families_keep_their_prose_trimmed(self, H):
+        by = {t["function"]["name"]: t["function"] for t in H.TOOLS}
+        big = ["wait_for_window", "workspace", "niri_capabilities", "see_screen",
+               "close_window", "read_screen_text", "focus_window",
+               "screen_elements", "click_element", "open_app", "click_at",
+               "run_command", "edit_file", "wait", "kill_process", "read_file",
+               "get_weather", "confirm_kill", "get_datetime"]
+        prose = sum(len(by[n]["description"]) for n in big if n in by)
+        assert prose <= self.BIG_FAMILY_PROSE_CEILING, (
+            f"the windows+system descriptions are back up to {prose} chars "
+            f"(ceiling {self.BIG_FAMILY_PROSE_CEILING}; 3008 before the trim) — "
+            "say it in the refusal or the docstring, not in the prompt")
+
+
 class TestMedia:
     """MPD media tools: honest errors, real parsing, permission gate."""
 
