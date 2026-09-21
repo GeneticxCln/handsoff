@@ -3,9 +3,10 @@
 
 WHY THIS EXISTS, AND WHY IT IS NOT WIRED INTO ANYTHING YET.
 
-`handsoff` offers all 48 tool schemas to the model on every round — measured at
-16 680 characters, ~4 170 tokens, 12.7% of a 32 768-token window — and lets a
-12B model sort the request out from there. A typed-decision model (Laya) answers
+`handsoff` offers its whole tool belt to the model on every round — measured
+2026-09-21 at 52 tools, 17 764 characters, ~4 441 tokens of a 32 768-token window
+(48 tools and ~4 079 tokens on a config with the default-off families switched
+off) — and lets a 12B model sort the request out from there. A typed-decision model (Laya) answers
 a *choice* question over a fixed option set in one forward pass, ~50 ms on this
 machine, which would let the turn narrow 48 schemas to a handful before the
 prompt is built.
@@ -112,6 +113,12 @@ FAMILIES: dict[str, tuple[str, tuple[str, ...]]] = {
         "what notifications or messages arrived on this machine",
         ("notification_reader",),
     ),
+    "desk": (
+        "what an AI coding agent is doing in the Quantum Space desk, what its"
+        " sessions are, or the tail of what one said",
+        ("quant_space_status", "quant_space_sessions", "quant_space_read",
+         "quant_space_check"),
+    ),
     "none": ("just answer, or chat; no tool is needed", ()),
 }
 
@@ -197,6 +204,16 @@ AUTHORED: list[tuple[str, str]] = [
     ("tell me a joke", "none"),
     ("who are you", "none"),
     ("that sounds right", "none"),
+
+    # desk (the Quantum Space sessions — a family that was in the belt and in
+    # no option at all until 2026-09-21: the token arithmetic was silently
+    # pricing four tools as unroutable)
+    ("what is claude doing", "desk"),
+    ("what is the agent doing in the terminal", "desk"),
+    ("read me the tail of what claude said", "desk"),
+    ("which sessions are open in quantum space", "desk"),
+    ("is quantum space running", "desk"),
+    ("what did the coding agent just say", "desk"),
 ]
 
 
@@ -379,6 +396,16 @@ def main(argv: list[str]) -> int:
                         help="a checkout, for the tool-schema token arithmetic")
     parser.add_argument("--out", type=pathlib.Path, default=None,
                         help="write the per-case log here (default: don't)")
+    parser.add_argument("--checkpoint", type=pathlib.Path, default=None,
+                        help="grade a LOCAL checkpoint directory (e.g. one this "
+                             "repo's ci/laya_finetune.py wrote) instead of the "
+                             "zero-shot model")
+    parser.add_argument("--grown", type=pathlib.Path, default=None,
+                        help="extra rows mined into a corpus JSONL "
+                             "(ci/laya_corpus.py --grow), scored as their own set")
+    parser.add_argument("--ignore-temperature", action="store_true",
+                        help="drop the checkpoint's own temperature table, so "
+                             "the ranking and the confidence can be told apart")
     args = parser.parse_args(argv[1:])
 
     try:
@@ -399,10 +426,25 @@ def main(argv: list[str]) -> int:
           f"families {len(FAMILIES)} | tools covered {len(TOOL_FAMILY)}")
 
     t0 = time.perf_counter()
-    agent = laya.load("convaiinnovations/laya", subfolder="typed-decisions",
-                      device=device)
+    if args.checkpoint:
+        agent = laya.load(str(args.checkpoint.resolve()), device=device)
+        which = str(args.checkpoint)
+    else:
+        agent = laya.load("convaiinnovations/laya", subfolder="typed-decisions",
+                          device=device)
+        which = "convaiinnovations/laya (typed-decisions, zero-shot)"
     print(f"checkpoint loaded in {time.perf_counter() - t0:.1f}s"
-          f"{' / %.0f MiB vram' % (torch.cuda.memory_allocated() / 2**20) if device == 'cuda' else ''}")
+          f"{' / %.0f MiB vram' % (torch.cuda.memory_allocated() / 2**20) if device == 'cuda' else ''}"
+          f"\n  model: {which}")
+    if args.ignore_temperature:
+        # The checkpoint calibrates by OPTION COUNT (`temperature_by_options`),
+        # and this task's option set lands in its widest bucket. Ranking is
+        # unaffected by a positive scale, so this isolates what the table does
+        # to the CONFIDENCE rather than to the decision.
+        table = dict(getattr(agent, "temperature_by_options", {}) or {})
+        agent.temperature_by_options = {k: 1.0 for k in table}
+        print(f"  temperature table pinned to 1.0 (was: "
+              f"{', '.join(f'{k}={v:.3g}' for k, v in table.items())})")
 
     variants = (["plain", "strict"] if args.variant == "both"
                 else [args.variant])
@@ -415,6 +457,21 @@ def main(argv: list[str]) -> int:
         real = run(agent, mine_real(args.real) if args.real else [],
                    (f"real set ({args.real}, {variant})" if args.real
                     else "real set (none given)"), log, strict) or real
+        if args.grown:
+            grown: list[tuple[str, str, str]] = []
+            for line in args.grown.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                text, fam = row.get("text"), row.get("family")
+                if text and fam in FAMILIES:
+                    grown.append((text, fam, str(row.get("source") or "grown")))
+            run(agent, grown, f"grown corpus ({args.grown}, {variant} wording)",
+                log, strict)
 
     if args.checkout:
         print(f"\n=== tool-schema arithmetic ({args.checkout}) ===")

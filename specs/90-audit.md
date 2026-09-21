@@ -2714,3 +2714,117 @@ dial belongs to the user. And the interface digest is a SHAPE check: it proves
 nothing about behaviour, so the behavioural evidence is the other thing measured
 here — that the four schemas removed were the four the belt refused at call time,
 and that the belt's own gate check is untouched.
+
+## The Laya fine-tune: measured, and the answer is "not yet, but the calibration is" (2026-09-21)
+
+The bake-off said fine-tuning was the honest path, so this pass took it: a
+fine-tune on THIS project's own tool-family decision, graded by that same
+harness, against a corpus that grows as the machine is used.
+
+### A family the belt had and no option could offer
+
+`--report` compares the harness's family table against the shipped belt, and it
+found the gap the table itself could not: **four desk tools belonged to no
+option** — the family that shipped 1 905 characters of schema in the previous
+round was invisible to the router, so the token arithmetic was pricing four
+tools as unroutable and a `quant_space_*` request could only ever be answered by
+whichever family looked closest. A `desk` family now exists (with its speech), and
+the check reports **0 missing and 0 unmapped over 52 tool names**. Labels are
+read from the harness's own table, never restated here, because two copies of a
+label set drift silently and the fine-tune would then be trained toward options
+the harness no longer scores.
+
+### The corpus, and how it grows
+
+The authored set is the harness's (69 rows, hand-labelled speech — including a
+recogniser's own damage). Real rows are MINED from the app's own history files:
+utterance plus the tool the real 12B model called, mapped to a family through the
+belt's own gate map. They live in `laya-corpus.jsonl` in the app's state
+directory — never in this checkout — deduped by normalised text with `first_seen`,
+`last_seen` and `count`, and a second disagreement about the same sentence is
+reported as a CONFLICT rather than silently relabelled. Eight real rows exist
+today; re-mining is idempotent (+0 new, 8 re-seen, 0 conflicts, 0 unknown labels),
+and **six of those eight sentences were already in the authored set** — the
+written corpus predicts what this user actually says. The corpus a fine-tune saw
+was therefore **71 rows** (69 authored + 2 mined and not already covered), in 12
+families; its content hash `83e4c83f16736100…` is recorded inside the checkpoint
+it produced, so a later run can tell whether the corpus moved under it.
+
+### What was trained, and on what evidence
+
+The task is the harness's own `choice` question over its own option table,
+converted with the runtime's own `_to_internal`, sequenced with the runtime's own
+`build_sequence`, scored by the library's own strictly proper scoring rule
+(`proper_reward`) plus a small action loss toward "answer directly". Every number
+is **stratified 5-fold cross-validation with the zero-shot model scored on the
+SAME folds**, seeded (an unseeded run printed 57% and then 66% on identical folds
+— which is how the noise floor got measured), and every metric is taken on RAW
+logits because a positive scale cannot move a ranking.
+
+| stage | what learns | zero-shot -> fine-tuned, top-1 | ECE (raw) |
+| --- | --- | --- | --- |
+| `head` | 26.5 M params, encoder frozen | 64→66, 61→63, 63→62 (+1 ± 2) | 0.40 → 0.29 |
+| `last` | 75.5 M (head + 4 of 28 encoder layers) | 64→76, 61→73, 63→78 (**+12, +12, +15**) | 0.40 → 0.18 |
+| `full` | all 421 M | **did not fit**: OOM beside a bubble holding 3.69 GiB on a 16 GB card | — |
+
+So the frozen encoder WAS the limit: adapting four of twenty-eight encoder layers
+is worth about **+13 points of top-1** and halves the calibration error, while
+training only the head is worth nothing that survives the seed spread. A held-out
+checkpoint (trained on 50 rows, its fold-1 rows never seen) was then graded
+end-to-end through the library's own loader: **zero-shot 14/21 (67%) → fine-tuned
+16/21 (76%)**, recall@3 86% → 90%, and with the checkpoint's temperature table
+pinned to 1.0 the accuracy is IDENTICAL — the ranking/calibration split proves
+itself at runtime. On the rows it trained on the same checkpoint scores 93%, and
+that number is memorisation, not evidence.
+
+### The finding that is ready to use: the confidence table is wrong for this task
+
+The checkpoint calibrates by OPTION COUNT, and this task's 12-option question
+lands in its widest bucket, `choice:11+`, where the table says **0.1006**. That is
+why the bake-off saw confidence pinned at 1.00 while the model was wrong: the
+scale, not the model, is what saturates. Measured on raw logits, a turn's own
+confidence is unusable as a gate:
+
+* log-score: raw **−0.96 / −1.05 / −1.00** (three seeds) vs **AS SHIPPED −1.98 /
+  −2.30 / −2.07** vs fitted −0.82 / −0.92 / −0.86. The shipped table costs about
+  **a full nat per decision**.
+* ECE: raw 0.38–0.40, as shipped 0.34–0.38, with a temperature fitted on our own
+  corpus 0.29 — and 0.16–0.19 for the encoder-adapted model. The fitted value is
+  **0.51–0.91 across folds** (median 0.62 zero-shot, 0.56 fine-tuned), i.e. the
+  shipped number is roughly **seven times too sharp** for an eleven-plus-option
+  choice.
+
+The saved checkpoint therefore writes the fitted value into that bucket, which is
+a calibration fix that cannot change a single decision.
+
+### Verdict
+
+* **Do not wire the fine-tune as an accuracy play yet.** +13 points measured on
+  71 rows of in-house speech, held-out n = 21, folds of 10–21 rows: the direction
+  is clear and the size is not. The corpus has to grow about tenfold first, and
+  the store now does that by itself every time the harness is run with `--grow`.
+* **Do use the calibration number** the moment any confidence is treated as a
+  gate to act on: as shipped, the checkpoint's own "act above 0.85" rule would
+  fire on almost every request.
+* `full` fine-tuning is a card question, not a modelling one, and it is the
+  stage most likely to overfit 71 rows; it should be re-tried with the bubble's
+  models released before it is read as a capability limit.
+
+### Stated limits
+
+A MINED label is what the 12B model DID, not intent — one of the eight real rows
+is "It's time for play music" labelled `system` because that is the tool the app
+reached for, where a person would say media. That is why the mined set is
+reported separately and never merged into the authored number. The authored rows
+are my writing, not a sample of this user's speech. Folds of 10–21 rows make the
+per-fold spread the error bar, so the min/max is printed beside every mean.
+The state an utterance is rendered into is the harness's own `{"utterance": …}`
+JSON, in training and grading alike: parity, but a plainer encoding might lift
+both sides and would invalidate the earlier baseline, so it was not changed
+mid-flight. `--stage last` was tried at four layers only (not swept), one
+checkpoint was saved, and the encoder-adapted model's held-out grade rests on a
+single 21-row fold.
+
+The corpus store also counts MINING PASSES, not user turns (`count` 5 today
+because this pass ran the miner repeatedly) — it is a re-seen counter, and
+nothing should read it as usage.
