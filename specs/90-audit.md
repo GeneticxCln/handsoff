@@ -2573,3 +2573,50 @@ families, so its accuracy bounds the *narrowing* idea and says nothing about
 choosing a single tool. And the unmerged-branch finding is a fact about this
 working copy as it stands today: it says nothing about intent, only that no
 remote can restore it if this disk does not.
+
+## The section-4 TTS walk: what the machine half closed, and three things it could not (2026-09-21)
+
+Section 4's first two items were walked at the machine. The ledger records the
+hand's verdict and the measurement separately, because these items exist to be
+judged by a person: a sink monitor proves sound left the app and cannot prove it
+reached an ear, and that gap is the whole reason the items are marked `[human]`.
+
+**Replies audible — heard, in the configured voice.** Before the test the output
+path was checked (sink unmuted and active, `tts_volume` at unity), because a muted
+sink looks identical to a working one from inside the process. On the machine
+side, `history.json` stayed BYTE-IDENTICAL across 34 s of OPEN MICROPHONE while
+the bubble spoke a 161-character sentence containing its own wake word, and again
+across a 262-character one: the transcript holds nothing the bubble said.
+
+Three findings are recorded rather than rounded off:
+
+* **The rule that refused the captures was the wake word, not the echo guard.**
+  Both were stopped by `ignored (no wake word)` while the echo check answered
+  "not my own speech" (`False`) on both. So "the bubble does not transcribe
+  itself" is established by the wake-word rule here; the echo detector's own
+  branch was never the one that fired on these two captures.
+* **An utterance inside the follow-up window was still refused for want of a wake
+  word.** It arrived after the window opened (18:13:06.136) and was decided
+  inside it (18:13:11.937), yet took the wake-word path. Either the edge is
+  sub-second or the window is not honoured; a single sample cannot tell the two
+  apart. Open question, not counted as a pass.
+* **Barge-in truncates decisively, but not literally instantly, and the click
+  half is unsettled.** With speech detected from the sink and the interrupt sent
+  only once it had been audible for 3 s, a 300-character announcement whose
+  natural length is 20 s (control) stopped after 4.3 s of speech, and
+  `state=idle` followed. With Chrome and speech-dispatcher muted so only the
+  bubble was on the sink, about a second of speech-level audio followed the
+  interrupt — longer than `play_wav`'s own cancel granularity (`_PLAY_BLOCK` of
+  1024 frames), so it is recorded as an open finding. The click half cannot be
+  settled by machine: the bubble interrupts on PRESS, before the hold-to-record
+  timer — the right verb in the right order — but it also sets
+  `Qt.WindowDoesNotAcceptFocus`, so a click cannot be confirmed by a focus
+  change, and neither niri's reported tile position nor the window rule's anchor
+  produced a PTT capture when pressed. Supervising the tap remains the test.
+
+**Found while setting the item up, and it answers section 3:** the configured
+default input opens and then never returns a frame (a `RuntimeError` on every
+reopen, zero frames, `stalled`), and the Yeti is absent from `sounddevice`'s
+INPUT list entirely — it appears only as an output. The capture was moved to the
+StreamCam, which opens at 16 kHz and delivers frames, set through the same
+setting the Voice pane writes and applied without a restart.

@@ -137,8 +137,8 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
 
 ## 4. TTS (P0/P1)
 
-- ☐ [human, synthesis verified] Replies spoken with the configured voice; no
-  echo into the transcript. Engine verified 2026-09-12 on chatterbox-turbo:
+- ✅ [human+auto, synthesis verified] Replies spoken with the configured voice;
+  no echo into the transcript. Engine verified 2026-09-12 on chatterbox-turbo:
   `tts_to_wav` writes 24 kHz 16-bit PCM, and with a reference clip set the
   conditionals provably change the audio (same sentence, clone vs built-in:
   waveform correlation +0.015, f0 138 Hz vs 218 Hz against the clip's 110 Hz).
@@ -150,6 +150,35 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   spoke, so the bubble's own voice never entered the conversation.
   Listen for: the reply in the configured voice, and then check Settings →
   History holds nothing attributed to you that you did not say.
+  Verified 2026-09-21 18:16 at the machine: the reply was HEARD, clearly, in the
+  cloned voice — the one clause no monitor can judge, since a muted or
+  unplugged sink looks identical to a working one from the app's side (the
+  sink was checked first: unmuted, 35%, active port analog-output, and
+  `tts_volume` 1.0, so the path to the ears was clear). On the machine side,
+  `history.json` stayed BYTE-IDENTICAL (6 entries, sha `c8e711419b42fa1d`)
+  across 34s of OPEN MICROPHONE while the bubble spoke a 161-character sentence
+  containing its own wake word ("Hey Jarvis…"), and again across a
+  262-character one — so the transcript holds nothing the bubble said.
+  Two limits on that echo evidence, stated rather than rounded off: the
+  captures that were refused were stopped by the WAKE-WORD rule (`ignored (no
+  wake word)`), not by the echo guard — the guard answered "not my own speech"
+  (False) on both — and a third utterance that arrived INSIDE the 6s follow-up
+  window (opened 18:13:06.136, decided 18:13:11.937) was also refused for want
+  of a wake word. That is either a sub-second window edge or the window not
+  being honoured; one sample cannot tell them apart, so it is recorded as an
+  open question in `specs/90-audit.md` rather than counted as a pass.
+  This item was only testable after a capture-device change: the default source
+  (Blue Microphones / Yeti) opens and then NEVER returns a frame
+  (`opens_failed` 0→5, `RuntimeError` on every reopen, `frames=0`,
+  `stalled=true`), while the StreamCam opens at 16 kHz and delivers audio
+  (32 000 frames, peak 0.2975, `utterances=1`). `mic_device` is now
+  `Logitech StreamCam: USB Audio (hw:3,0)`, set the way Settings → Voice sets
+  it (same key, same plain-device-name value, applied by `reload-settings` with
+  no restart); the previous value (`""`) is kept at
+  `/tmp/settings.json.before-4x`. This is also the §3 finding: the Yeti is
+  absent from `sounddevice`'s device list entirely (it appears only as an
+  OUTPUT, `Blue Microphones: USB Audio (hw:4,0)`, `in=0`), so "the Yeti appears
+  in *Input device*" is not merely untested — on this tree it cannot appear.
 - ☐ [human] Barge-in: click the bubble while it speaks → playback stops
   instantly (needs the bubble audibly speaking; supervised test)
   Auto half verified 2026-09-18 except the click itself: `--ptt interrupt`
@@ -157,6 +186,28 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   of a far longer reply, then `state=idle`), against a control with no
   interrupt where the whole reply was spoken. The click sends the same verb.
   Look at: click the bubble mid-sentence — the sound should stop immediately.
+  Machine half re-measured 2026-09-21 on these bytes, closed loop and clean:
+  the monitor was read live and the interrupt was sent only once speech had
+  been audible for 3.0s, so no wall-clock or model-load guess entered the
+  number. A 300-character announcement whose natural length is 20s (control,
+  unbroken, 18:27) and 17s (a click aimed 340 px wide of the bubble — a sham
+  control) stopped after 4.3s of speech: the interrupt truncates, and
+  `state=idle` follows.
+  NOT literally instant, and the item's wording is therefore not met to the
+  letter: with Chrome and speech-dispatcher muted so only the bubble was on
+  the sink, ~1.0–1.2s of speech-level audio followed the interrupt (chunks at
+  0.06–0.12 rms, with a dip and a partial resume before silence). `play_wav`
+  checks its cancel event every `_PLAY_BLOCK` = 1024 frames (~43ms at 24 kHz),
+  so a one-second tail is longer than the player's own granularity — recorded
+  as an open finding, not rounded off.
+  The CLICK half could not be settled by machine and is left to the hand:
+  `core/bubble.py:3924` calls `interrupt()` on PRESS, before the 140ms
+  hold-to-record timer — the right verb, in the right order — but the bubble
+  sets `Qt.WindowDoesNotAcceptFocus` (core/bubble.py:1978), so a click cannot
+  be confirmed by a focus change, and on this desktop neither niri's
+  `tile_pos_in_workspace_view` (2963,1310) nor the window rule's bottom-right
+  anchor (2995,1651) produced a PTT capture when pressed — a programmatic
+  click cannot be aimed at the bubble here. Supervising it remains the test.
 - ☐ [human] Volume/rate sliders in Settings take effect after Apply
   Auto half measured 2026-09-18 through the same path Apply uses
   (`reload-settings`): `tts_volume` 0.25 vs 1.0 moved the monitor's speech
