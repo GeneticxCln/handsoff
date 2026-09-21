@@ -16,8 +16,11 @@
 # same order seed, same coverage floor, same junit report and same failure digest
 # — while the runner underneath is the desk's instead of a frozen Debian image.
 # `suite:hosted` is the frozen-image reference for when the question is whether
-# the desk and the image agree: manual, because it spends minutes, and allowed to
-# fail, because it never gates a merge. Supply-chain parity is unchanged where
+# the desk and the image agree: manual, because it spends minutes; allowed to
+# fail, because it never gates a merge; and defined ONLY for pipelines started
+# from the web UI or the API, because GitLab refuses every job of a pipeline at
+# creation once the namespace's minutes are spent — manual jobs included, which
+# is measured, not assumed (see the job's own comment). Supply-chain parity is unchanged where
 # images are used: every one is pinned by *digest* (tag in a trailing comment),
 # and the `shell` job fails CI if a mutable tag-only image ref sneaks back in —
 # same policy as the SHA-pinned GH actions.
@@ -232,7 +235,18 @@ coverage:
 suite:hosted:
   stage: test
   image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
-  when: manual
+  # Absent from a push pipeline, and that is MEASURED rather than cautious: once
+  # the namespace's compute minutes are spent, GitLab refuses every job of a
+  # pipeline at creation — this one included, `when: manual` or not. Job
+  # 16625849832 was created and finished 7 ms apart, never queued, with
+  # `failure_reason: ci_quota_exceeded`, so leaving it in put a red mark on every
+  # pipeline that said nothing about the commit. It exists in pipelines started
+  # from the web UI or the API — which is where a human asking for the
+  # frozen-image reference starts one.
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"
+      when: manual
+    - when: never
   allow_failure: true
   variables:
     QT_QPA_PLATFORM: offscreen

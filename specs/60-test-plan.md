@@ -148,9 +148,13 @@ nothing — a missing row does.
   Debian and verifies the same two tests — the files by name, and the
   `ctypes.util.find_library('portaudio')` lookup sounddevice performs at import
   — wherever apt does not exist). `suite:hosted` keeps the digest-pinned image
-  reachable as a MANUAL, `allow_failure` reference, so the frozen-image leg runs
-  when the question is whether the desk and the image agree (or when the desk is
-  offline) and never as a gate. Plus pip cache on the lock file, junit report,
+  reachable as a MANUAL, `allow_failure` reference — defined ONLY in pipelines
+  started from the web UI or the API, because GitLab refuses every job of a
+  pipeline at creation once the minutes are spent, manual jobs included (job
+  16625849832: created and finished 7 ms apart, never queued), so a reference
+  left in every push pipeline is a red mark that says nothing about the commit.
+  The frozen-image leg therefore runs when the question is whether the desk and
+  the image agree (or when the desk is offline) and never as a gate. Plus pip cache on the lock file, junit report,
   and the `after_script` digest (`ci/pytest_summary.py --post`) that prints
   failing names + env-fix hints even when the job dies.
 
