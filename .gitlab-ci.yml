@@ -3,20 +3,36 @@
 # workflow stays the authoritative definition: when a gate changes there,
 # change it here too.
 #
-# Supply-chain parity with the GH pins: every image below is pinned by
-# *digest* (tag kept in a trailing comment), and the `shell` job fails CI if
-# a mutable tag-only image ref ever sneaks back in — same policy as the
-# SHA-pinned GH actions.
+# It no longer mirrors the IMAGES, and that is the one deliberate difference.
+# GitLab-hosted (instance) runners are billed to the namespace's 400 free compute
+# minutes a month, all three projects under this account draw on that one pool,
+# and this repo's five suite jobs spent it by 13 September — after which every job
+# on an instance runner died with `ci_quota_exceeded` before running a single
+# test (364 of them), and a merge request's pipeline said nothing at all about the
+# merge request. The gates now run on the desk runner: a project runner on the
+# developer's machine, tagged `desk`, where a job is not billed.
 #
-# Debian slim + PySide6 + sounddevice: the PySide6 wheels bundle Qt but
-# offscreen rendering still needs runtime libraries (glib/GL/EGL/xkbcommon/
-# dbus/fontconfig), and sounddevice needs the PortAudio library itself
-# (libportaudio2) plus the ALSA runtime that PortAudio links against
-# (libasound2t64) — see the `.qt_deps` note below, where getting that pair
-# wrong is what failed the tests jobs. The GitHub runners get all of these
-# from the shared ubuntu image; Debian slim needs them explicitly. Digests are
-# frozen, so the Debian base (trixie, hence the t64 package names) cannot
-# drift under us.
+# What is mirrored is what the gates CHECK — same suites, same python versions,
+# same order seed, same coverage floor, same junit report and same failure digest
+# — while the runner underneath is the desk's instead of a frozen Debian image.
+# `suite:hosted` is the frozen-image reference for when the question is whether
+# the desk and the image agree: manual, because it spends minutes, and allowed to
+# fail, because it never gates a merge. Supply-chain parity is unchanged where
+# images are used: every one is pinned by *digest* (tag in a trailing comment),
+# and the `shell` job fails CI if a mutable tag-only image ref sneaks back in —
+# same policy as the SHA-pinned GH actions.
+#
+# Two things the desk needs that an image would have provided, both checked
+# rather than assumed: the CPython each job asked for (ci/desk_python.sh, via uv)
+# and the runtime libraries (ci/apt_deps.sh, which installs on Debian and
+# verifies elsewhere). A desk node/python that does not match fails the job
+# rather than quietly standing in for the image it replaces.
+#
+# PySide6 + sounddevice: the wheels bundle Qt but offscreen rendering still needs
+# runtime libraries (glib/GL/EGL/xkbcommon/dbus/fontconfig), and sounddevice
+# needs the PortAudio library itself (libportaudio2) plus the ALSA runtime that
+# PortAudio links against (libasound2t64) — see the `.qt_deps` note below, where
+# getting that pair wrong is what failed the tests jobs.
 #
 # When a suite job fails, read the summary before the log: the junit report
 # gives GitLab's Test-summary tab, and `after_script` prints a short digest of
@@ -26,6 +42,21 @@ stages: [test, static, smoke]
 
 default:
   interruptible: true
+
+# One pipeline per ref: a superseded push cancels the older one rather than
+# racing it for a desk that runs two jobs at a time, and a branch carrying an
+# open merge request is judged by that MR's pipeline instead of by it AND a
+# second branch pipeline saying the same thing — which is how a quota gets spent
+# twice on one commit.
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
 
 # Per-job plumbing shared by every job that runs the suite: the pip download
 # cache (keyed on the constraints file), the junit report that feeds GitLab's
@@ -52,30 +83,50 @@ default:
     - python "$CI_PROJECT_DIR/ci/pytest_summary.py"
       "$CI_PROJECT_DIR/tests/report.xml" --post
 
-# The apt layer every suite job inherits. It is a SCRIPT, not a one-liner:
+# The runtime layer every suite job inherits. It is a SCRIPT, not a one-liner:
 # a single unknown package name fails the whole `apt-get install`, the `&&`
 # chain then installs nothing, and the job runs the entire suite against a
 # container with no audio or Qt runtime — hundreds of `import handsoff` errors
 # whose cause is one line at the top of the log. That is not hypothetical:
 # `libdbus-1-3t64` does not exist in this image, so nothing was ever installed,
 # no matter what the list said. ci/apt_deps.sh installs each package on its
-# own, tries the t64 and plain names, and then verifies the SONAMEs by file —
-# including the `ctypes.util.find_library('portaudio')` lookup sounddevice
-# performs at import — so a gap fails there, by name.
+# own, tries the t64 and plain names, verifies the SONAMEs by file — including
+# the `ctypes.util.find_library('portaudio')` lookup sounddevice performs at
+# import — so a gap fails there, by name. On the desk (no apt) the same script
+# verifies instead of installing, by the same two tests.
 .qt_deps: &qt_deps
   "bash ci/apt_deps.sh"
 
+# The CPython a desk job runs: the version its image would have given it, from
+# ci/desk_python.sh (a uv-managed venv per version, reused warm). It exports
+# PATH so the lines below are the same lines the hosted job runs, and points
+# bytecode at /tmp because the desk interpreter lives under $HOME while the
+# suite's own write guard refuses any test write into the developer's real user
+# dirs — a rule with no artifact exemption, deliberately. Measured: without the
+# redirect that guard refuses the run at the first stdlib import.
+.desk_python: &desk_python
+  |
+  export PATH="$(bash ci/desk_python.sh):$PATH"
+  export PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/handsoff-ci-pycache/py$PY_VERSION"
+  python -V
+
 # --- The full test suite (GH: `tests` matrix job) ---------------------------
 # Single source of truth: requirements.txt (pinned floors) installed with the
-# checked-in constraints file for reproducibility — same as GH.
+# checked-in constraints file for reproducibility — same as GH, same command.
 .tests_base:
   stage: test
+  tags:
+    - desk
   variables:
     # The offscreen-launch test spawns the real bubble without a display.
     QT_QPA_PLATFORM: offscreen
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+    # Which leg of the GH matrix this job stands in for; ci/desk_python.sh
+    # refuses any interpreter that does not answer with it.
+    PY_VERSION: "3.12"
   <<: *shared
   script:
+    - *desk_python
     - *qt_deps
     - python -m pip install --upgrade pip
     - pip install -r requirements.txt -c requirements-lock.txt
@@ -84,11 +135,13 @@ default:
 
 tests:3.12:
   extends: .tests_base
-  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
 
 tests:3.13:
   extends: .tests_base
-  image: "python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285" # 3.13-slim
+  variables:
+    QT_QPA_PLATFORM: offscreen
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+    PY_VERSION: "3.13"
 
 # --- Ordering-dependence probe (GH: `order` job) ---------------------------
 # The suite must pass whatever order it runs in; the default collection order
@@ -99,10 +152,14 @@ tests:3.13:
 # before the second overwrites it.
 order:
   stage: test
-  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  tags:
+    - desk
   variables:
     QT_QPA_PLATFORM: offscreen
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+    # The shuffle is interpreter-blind, so this leg is 3.12 alone — the same
+    # choice the GH job makes with its single setup-python step.
+    PY_VERSION: "3.12"
   <<: *shared
   # Restated rather than inherited: a job that declares `artifacts` REPLACES the
   # shared block's, so the `when`/`expire_in` have to be here too or the upload
@@ -124,6 +181,7 @@ order:
     - python "$CI_PROJECT_DIR/ci/pytest_summary.py"
       "$CI_PROJECT_DIR/tests/report-order-files.xml"
   script:
+    - *desk_python
     - *qt_deps
     - python -m pip install --upgrade pip
     - pip install -r requirements.txt -c requirements-lock.txt
@@ -143,10 +201,12 @@ order:
 # --- Coverage floor (GH: `coverage` job) ------------------------------------
 coverage:
   stage: test
-  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  tags:
+    - desk
   variables:
     QT_QPA_PLATFORM: offscreen
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+    PY_VERSION: "3.12"
     # Subprocess coverage: the offscreen-GUI drivers engage measurement when
     # COVERAGE_PROCESS_START is set, and the absolute COVERAGE_FILE keeps
     # their parallel data files in the workspace for the combine.
@@ -154,6 +214,7 @@ coverage:
     COVERAGE_FILE: "$CI_PROJECT_DIR/.coverage"
   <<: *shared
   script:
+    - *desk_python
     - *qt_deps
     - python -m pip install --upgrade pip
     - pip install -r requirements.txt -c requirements-lock.txt
@@ -162,12 +223,40 @@ coverage:
       --cov-report=term-missing --cov-fail-under=70
       --junitxml="$CI_PROJECT_DIR/tests/report.xml"
 
+# --- The frozen-image reference (manual) ------------------------------------
+# The one job that still runs where this file used to: the digest-pinned Debian
+# image, with the apt layer doing what it was written for. It is MANUAL because
+# it spends the namespace's compute minutes, and `allow_failure` because a
+# reference is not a gate — it never blocks a merge. Ask for it when the question
+# is whether the desk runner and the image agree, or when the desk is offline.
+suite:hosted:
+  stage: test
+  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  when: manual
+  allow_failure: true
+  variables:
+    QT_QPA_PLATFORM: offscreen
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  <<: *shared
+  script:
+    - *qt_deps
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt -c requirements-lock.txt
+    - python -m pytest tests/ -q
+      --junitxml="$CI_PROJECT_DIR/tests/report.xml"
+
 # --- Byte-compile every shipped source (GH: `compile` job) ------------------
-# py_compile never imports: no Qt libs or dependencies needed at all.
+# py_compile never imports: no Qt libs or dependencies needed at all. It runs on
+# the OLDEST version in the matrix, because that is what catches syntax the
+# newest interpreter accepts and the shipped floor does not.
 compile:
   stage: static
-  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  tags:
+    - desk
+  variables:
+    PY_VERSION: "3.12"
   script:
+    - *desk_python
     # Discovered, not listed: an enumerated compile set silently skips a newly
     # added module — exactly how core/theme.py escaped the installer. attic/
     # (provenance archive) stays out, matching .coveragerc's omit list.
@@ -176,7 +265,8 @@ compile:
 # --- Shell checks + pin guards (GH: `shell` job) ----------------------------
 shell:
   stage: static
-  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  tags:
+    - desk
   script:
     # GitHub side: action refs must stay immutable SHAs.
     - |
@@ -221,7 +311,8 @@ shell:
 # --help must parse and print usage without touching the system.
 smoke:
   stage: smoke
-  image: "python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea" # 3.12-slim
+  tags:
+    - desk
   script:
     - out=$(bash install.sh --help)
     - echo "$out" | grep -q "Options:"

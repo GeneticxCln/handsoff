@@ -134,9 +134,25 @@ nothing — a missing row does.
   installer's no-git fallback) now bring the repository and the checkout they
   need, so the staged tree and the developer's tree run the same suite — same
   tests, same verdict. Bypass only via `--no-verify`, deliberately.
-- GitLab: same gates + pip cache on the lock file, junit report, and
-  `after_script` digest (`ci/pytest_summary.py --post`) that prints failing
-  names + env-fix hints even when the job dies.
+- GitLab: the same gates, on the DESK RUNNER rather than on a GitLab-hosted
+  (instance) runner — a project runner on the developer's own machine (tag
+  `desk`), where a job is not billed against the namespace's 400-a-month
+  compute-minutes quota. The quota is why: it is one pool for every project
+  under the account, this repo's five suite jobs spent it on 13 September, and
+  the 364 jobs that followed died with `ci_quota_exceeded` before running a
+  single test — so a merge request's pipeline said nothing about the merge
+  request. Two things an image would have provided are CHECKED instead of
+  assumed: the CPython each job stands in for (`ci/desk_python.sh`, a uv venv
+  per matrix version, refusing an interpreter that answers with another
+  version) and the runtime libraries (`ci/apt_deps.sh`, which installs on
+  Debian and verifies the same two tests — the files by name, and the
+  `ctypes.util.find_library('portaudio')` lookup sounddevice performs at import
+  — wherever apt does not exist). `suite:hosted` keeps the digest-pinned image
+  reachable as a MANUAL, `allow_failure` reference, so the frozen-image leg runs
+  when the question is whether the desk and the image agree (or when the desk is
+  offline) and never as a gate. Plus pip cache on the lock file, junit report,
+  and the `after_script` digest (`ci/pytest_summary.py --post`) that prints
+  failing names + env-fix hints even when the job dies.
 
 ## 3. Conventions that keep the suite honest
 
