@@ -1845,3 +1845,105 @@ their installed hash; the eight changed modules are byte-identical between
 the checkout and `~/.local/bin`; and the journal from the restart shows
 whisper loaded, chatterbox-turbo warmed on CUDA and `ollama ok`, with no
 import error anywhere.
+
+## The gates stop drawing on a spent quota — the desk runner, and the two couplings that five suites on one machine made visible (2026-09-21)
+
+**The symptom was a pipeline that said nothing about the commit it judged.**
+Isolate them one at a time and the picture is arithmetic, not mystery: this
+namespace's 400 free compute minutes a month are **one pool** for every project
+under the account, and this repo's five suite jobs had spent ~235 of them by
+mid-September (measured per job from the API: `coverage` 86 min, `tests:3.13`
+61, `tests:3.12` 60, `order` 26). The last job that actually executed was
+`tests:3.12` at **08:47 UTC on 13 September**; the first refusal was `smoke` at
+09:31; and **365 jobs in the last 60 pipelines** never started at all, each one
+created and finished milliseconds apart with `failure_reason:
+ci_quota_exceeded`. The last pipeline that ran to a verdict is **#2844293191
+(13 Sep 07:18, 14.7 minutes, all 7 jobs on instance runners)** — that is what one
+push cost, and it is why the burn is worth fixing at the runner and not by
+quietly running fewer gates.
+
+**The fix is a runner, not a smaller suite.** A project runner on the
+developer's machine — id **56559829**, tag `desk`, shell executor,
+`gitlab-runner` **19.4.0** with its binary checked against the release's own
+`aeebda64…`, running as the user service `gitlab-runner-desk.service`, config in
+`~/.gitlab-runner/config.toml` at mode 0600, scoped to this project and
+`quant-space`, untagged jobs refused — where a job is **not billed**. Every job
+in `.gitlab-ci.yml` carries `tags: [desk]` except the frozen-image reference.
+The one assumption worth testing was tested, in the useful direction: GitLab.com
+**does** schedule jobs on a private runner while the namespace's quota is spent
+(the first desk pipeline was created and picked up in three seconds), and only
+*instance* runners are blocked — which is exactly why GitLab's own docs list
+private runners as the mitigation.
+
+**Two things the image used to provide have to be provided another way, and
+both are CHECKED rather than assumed.** `ci/desk_python.sh` fetches the CPython
+each job stands in for into a per-version `uv` venv and **refuses an interpreter
+that answers with another version** — the desk's system python is 3.14, newer
+than both matrix legs, and a green about a python nobody ships would be a
+different kind of red. `ci/apt_deps.sh` still installs on Debian and now
+**ensures** where apt does not exist (the same two tests on the desk: the files
+by name, and the `ctypes.util.find_library('portaudio')` lookup sounddevice
+performs at import), which is what keeps every pytest job inheriting the runtime
+layer instead of the anchor quietly becoming decorative.
+
+**The measurement that decided the shape.** The first green pipeline on the desk
+is **#2867642545**, and every number below is read out of its job traces:
+
+| job | what it ran | desk time |
+|---|---|---|
+| `coverage` | suite + `--cov-fail-under=70` | 328 s — **1 938 passed**, TOTAL **82%** (3 966 missing of 21 717) |
+| `order` | shuffled, then file-order shuffled | 498 s — **1 938 passed** each (244 s + 245 s, seed `b73a955…`) |
+| `tests:3.12` | suite | 246 s — **1 938 passed** |
+| `tests:3.13` | suite | 253 s — **1 938 passed** |
+| `compile` / `shell` / `smoke` | byte-compile, pins, `--help` | 3.6 s / 3.5 s / 3.4 s |
+
+**22.3 minutes of machine time, 0 billed minutes, 7 of 7 green.** The coverage
+figure being *lower* than the desk's own ~85% is not a regression: CI exports
+`COVERAGE_PROCESS_START`, so the offscreen-GUI children are measured too, and
+more measured statements with the same untested edges read as a smaller
+percentage — the documented difference, now stated where the number is.
+
+**The suite jobs hold a `resource_group`, and that is measured rather than
+cautious.** On a hosted runner every job owns a fresh container; on a desk they
+would own the same GPU, audio server and `/tmp`. The first desk pipeline carrying
+a change collided **twice in one run**, and both were real couplings rather than
+noise: `test_precommit_staged`'s scratch-tree check compared the machine's whole
+`/tmp/handsoff-staged-*` set before and after, so the OTHER job's in-flight tree
+read as its own leak (both legs, same seconds), and the offscreen live-probe
+scenario's whisper worker was still answering when its wall-clock deadline
+expired. Both are fixed where they live: the scratch check now hands the hook a
+`TMPDIR` and judges only that directory (the hook's own `mktemp -d -t
+handsoff-staged-XXXXXX` honours it, which is why the fix works), and the GUI
+scenario **joins** its worker instead of running out a deadline.
+
+**A new guard holds the shape that made a neighbour look like a leak**
+(`tests/test_sandbox.py`): a test that enumerates the machine's temp root — or
+anything else shared — to judge its own work fails, and the message says so.
+Mutation-checked: a planted leak in `githooks/pre-commit` is caught, and a test
+that forgets its own `TMPDIR` is caught, each restore sha256-verified.
+
+**The frozen-image reference was moved out of push pipelines, and that needed
+measuring rather than reasoning.** Once the namespace's minutes are spent GitLab
+refuses **every** job of a pipeline at creation — manual jobs included. Job
+16625849832 was created and finished **7 ms** apart, never queued, with
+`failure_reason: ci_quota_exceeded`, so leaving `when: manual` in place put a red
+mark on every push that said nothing about the commit. It is now defined only in
+pipelines started from the web UI or the API, where a human asking the question
+"do the desk and the image agree?" actually starts one.
+
+**Stated limits.** The desk job runs a uv-managed 3.12 or 3.13, but the kernel,
+libc and Qt are the desk's rather than the digest-pinned Debian image's — that
+question is what `suite:hosted` remains for, and it has **not** been run since
+moving (it spends minutes, which is the point of it being manual), so parity
+between desk and image is asserted by construction here, not by a fresh
+measurement. A job **waits** for the desk runner rather than failing over to an
+instance runner, so a machine that is off means a pipeline that hangs, not a
+pipeline that bills. Bytecode is pointed at `/tmp`
+(`PYTHONPYCACHEPREFIX`), because the desk interpreter lives under `$HOME` and
+the suite's own checkout-write guard refuses a test write into the developer's
+real user dirs — with no artifact exemption, deliberately; measured: without the
+redirect the guard refuses the run at the first stdlib import. And the
+serialisation **trades wall time for a verdict** (~22 min of machine time per
+push instead of ~15), which is the honest price of a green that is about the
+commit rather than about its neighbours. The desk machine time is not billed,
+but it is not free either.
