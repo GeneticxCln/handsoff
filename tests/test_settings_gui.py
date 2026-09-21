@@ -3900,10 +3900,17 @@ def the_live_probe_gate_captures_and_transcribes_a_utterance():
         probe._on_frames(quiet, object(), 234)
     assert "speech captured" in probe._last_event, probe._last_event
 
-    # the whisper worker: success, then failure, then supersession
-    deadline = time.time() + 5.0
-    while time.time() < deadline and probe._last_transcript != "heard 1":
-        time.sleep(0.02)
+    # the whisper worker: success, then failure, then supersession. Each wait
+    # JOINS the worker instead of polling a wall clock: a 5-second deadline
+    # measures the machine's load, not the code. Measured on the desk runner,
+    # with three suites on one host, the fake transcribe's answer arrived after
+    # the deadline expired and this scenario failed as `transcribed` on a strip
+    # of code that was behaving exactly as it should. `_transcribe_worker` sets
+    # its state BEFORE returning, so a join is the whole synchronisation, and a
+    # generous bound keeps a genuine wedge a failure rather than a hung job.
+    worker = probe._transcribe_thread
+    worker.join(30)
+    assert not worker.is_alive(), "the whisper worker never finished"
     assert probe._last_transcript == "heard 1"
     assert probe._last_event == "transcribed"
 
@@ -3912,9 +3919,9 @@ def the_live_probe_gate_captures_and_transcribes_a_utterance():
 
     settings_app.H.transcribe = boom
     probe._start_transcribe(quiet.reshape(-1))
-    deadline = time.time() + 5.0
-    while time.time() < deadline and "transcribe failed" not in probe._last_event:
-        time.sleep(0.02)
+    worker = probe._transcribe_thread
+    worker.join(30)
+    assert not worker.is_alive(), "the failing worker never finished"
     assert "whisper weights vanished" in probe._last_event
 
     # a superseded worker's late answer must NOT overwrite the newer one
@@ -3924,11 +3931,12 @@ def the_live_probe_gate_captures_and_transcribes_a_utterance():
     old_thread = probe._transcribe_thread
     settings_app.H.transcribe = lambda a: "fast answer"
     probe._start_transcribe(quiet.reshape(-1))
-    deadline = time.time() + 5.0
-    while time.time() < deadline and probe._last_transcript != "fast answer":
-        time.sleep(0.02)
+    fast_thread = probe._transcribe_thread
+    fast_thread.join(30)
+    assert not fast_thread.is_alive(), "the fast worker never finished"
     gate_ev.set()
-    old_thread.join(5)
+    old_thread.join(30)
+    assert not old_thread.is_alive(), "the superseded worker never finished"
     assert probe._last_transcript == "fast answer", \
         "the stale worker's result must be discarded"
     assert probe.snapshot()["transcript"] == "fast answer"

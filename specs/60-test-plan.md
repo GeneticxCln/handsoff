@@ -154,7 +154,27 @@ nothing — a missing row does.
   16625849832: created and finished 7 ms apart, never queued), so a reference
   left in every push pipeline is a red mark that says nothing about the commit.
   The frozen-image leg therefore runs when the question is whether the desk and
-  the image agree (or when the desk is offline) and never as a gate. Plus pip cache on the lock file, junit report,
+  the image agree (or when the desk is offline) and never as a gate.
+- Two couplings the desk made visible, fixed where they live rather than hidden
+  by serialising around them. On a hosted runner every job owns a container, so
+  a test may assume it is alone on the machine; on the desk it is not, and the
+  first desk pipeline carrying a change failed BOTH suite legs on
+  `test_precommit_staged`'s scratch-tree check, each reporting the other job's
+  in-flight `/tmp/handsoff-staged-*` tree as its own leak — its verdict was
+  about whoever else was running, which is also true of a developer committing
+  while the suite runs. That test now hands the hook a TMPDIR of its own (the
+  hook's `mktemp -d -t` reads it) and proves the child honours it before
+  asserting nothing was left, so the check can no longer pass vacuously; and
+  `TestNoTestJudgesTheSharedTempNamespace` in `test_sandbox.py` fails any test
+  that ENUMERATES the machine's temp root (`glob`/`rglob`/`iterdir`/`scandir`/
+  `listdir`/`walk` over `tempfile.gettempdir()`), with the shipped line as its
+  planted sample. The second collision was a wall clock: the offscreen
+  live-probe scenario polled for up to five seconds for the whisper worker, so
+  under load the answer arrived after the deadline and a correct strip of code
+  failed as `transcribed` — it now JOINS the worker (30 s bound) and asserts the
+  state, which is synchronisation rather than patience. The suite jobs also hold
+  a `resource_group` (`handsoff-suite`) because the suite genuinely owns real
+  devices — GPU speech models, offscreen Qt, the audio server — for its duration. Plus pip cache on the lock file, junit report,
   and the `after_script` digest (`ci/pytest_summary.py --post`) that prints
   failing names + env-fix hints even when the job dies.
 

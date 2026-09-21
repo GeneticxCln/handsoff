@@ -998,6 +998,89 @@ class TestNoLoaderBypassesTheSandbox:
         assert "isolated_user_dirs()" in body, body
 
 
+class TestNoTestJudgesTheSharedTempNamespace:
+    """Reading the machine's temp root means reading everybody else's work.
+
+    `tempfile.gettempdir()` is not a fixture: on a developer's machine it holds
+    whatever they are doing, and on the desk runner it holds whatever the OTHER
+    job is doing. Measured, and the reason this rule exists:
+    `test_precommit_staged` counted `/tmp/handsoff-staged-*` before and after its
+    own runs, so when two suites ran on one host each leg reported the other's
+    in-flight scratch tree as its own leak — a red that said nothing about
+    either commit. A developer committing while the suite runs had been tripping
+    the same wire without anyone seeing it.
+
+    The rule is about ENUMERATING that root, not about naming it: a test may
+    still assert where something landed (a path under $TMPDIR is a fact about
+    the code, not about the machine). What it may not do is list the directory —
+    `glob`/`rglob`/`iterdir`/`scandir`/`listdir`/`walk` — and call the result
+    its own. Create the directory first (`tmp_path`, `tempfile.mkdtemp`) and
+    enumerate that.
+    """
+
+    ENUMERATORS = ("glob", "rglob", "iterdir", "scandir", "listdir", "walk")
+
+    def _offenders(self):
+        offenders = []
+        for path in sorted((HERE / "tests").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (isinstance(func, ast.Attribute)
+                        and func.attr in self.ENUMERATORS):
+                    continue
+                if any(isinstance(inner, ast.Call)
+                       and isinstance(inner.func, ast.Attribute)
+                       and inner.func.attr == "gettempdir"
+                       for inner in ast.walk(node)):
+                    offenders.append(f"{path.name}:{node.lineno}")
+        return offenders
+
+    def test_nothing_enumerates_the_machines_temp_root(self):
+        offenders = self._offenders()
+        assert offenders == [], (
+            "these list the machine's temp directory instead of a directory "
+            "they made, so their verdict is about whatever else is running "
+            f"(use tmp_path or tempfile.mkdtemp): {offenders}")
+
+    def test_the_rule_sees_the_shape_it_was_written_for(self):
+        """A rule that cannot fail is not a rule: the planted sample is the
+        exact line this suite shipped, in a copy of a test module."""
+        planted = (
+            "import tempfile\n"
+            "from pathlib import Path\n"
+            "def test_planted():\n"
+            "    before = set(Path(tempfile.gettempdir())"
+            ".glob('handsoff-staged-*'))\n"
+            "    assert before == before\n")
+        tree = ast.parse(planted)
+        seen = [n.lineno for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr in self.ENUMERATORS
+                and any(isinstance(i, ast.Call)
+                        and isinstance(i.func, ast.Attribute)
+                        and i.func.attr == "gettempdir"
+                        for i in ast.walk(n))]
+        assert seen == [4], seen
+        # ...and the fix the suite now uses is NOT flagged, so the rule cannot
+        # be satisfied only by removing the check altogether.
+        fixed = ("import tempfile\n"
+                 "def test_fixed(tmp_path):\n"
+                 "    scratch = tmp_path / 'hooktmp'\n"
+                 "    assert not list(scratch.glob('handsoff-staged-*'))\n")
+        assert not [n.lineno for n in ast.walk(ast.parse(fixed))
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr in self.ENUMERATORS
+                    and any(isinstance(i, ast.Call)
+                            and isinstance(i.func, ast.Attribute)
+                            and i.func.attr == "gettempdir"
+                            for i in ast.walk(n))]
+
+
 class TestOneAppPerProcess:
     """The app registers ITSELF under one name, and every loader reuses it.
 

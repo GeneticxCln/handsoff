@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -287,16 +286,42 @@ class TestTheStagedTreeDecides:
         assert out.returncode != 0, (
             f"the commit contains the broken bytes:\n{out.stdout}{out.stderr}")
 
-    def test_it_leaves_no_scratch_directory_behind(self, repo):
-        """Both verdicts, counted the only way a leftover can be seen."""
+    def test_it_leaves_no_scratch_directory_behind(self, repo, tmp_path):
+        """Both verdicts, counted in the namespace the hook was TOLD to use.
+
+        The hook makes its scratch tree with `mktemp -d -t`, which reads TMPDIR,
+        so the run is handed a directory of its own — counting the machine's
+        /tmp instead made this check judge whoever else ran a hook in the same
+        seconds. Measured: with two suites on one host, this test failed in BOTH
+        desk-runner legs, each reporting the other's in-flight
+        /tmp/handsoff-staged-* tree as its own leak. A developer committing while
+        the suite runs had been tripping the same wire, invisibly.
+
+        The probe below is what keeps the tighter assertion from being vacuous:
+        it proves the child honours this TMPDIR, so a scratch tree that really
+        leaked would land exactly where this test is looking.
+        """
         env = _env()
-        before = set(Path(tempfile.gettempdir()).glob("handsoff-staged-*"))
+        scratch = tmp_path / "hooktmp"
+        scratch.mkdir()
+        env["TMPDIR"] = str(scratch)
+        # The template deliberately does not carry the app's name: the sandbox
+        # guard in test_sandbox.py reads an unsandboxed child's literal strings
+        # and treats the app's name as evidence that the child loads it. This
+        # child only ever runs `mktemp`, so it says so.
+        probe = subprocess.run(
+            ["mktemp", "-d", "-t", "staged-probe-XXXXXX"],
+            capture_output=True, text=True, env=env, check=True)
+        assert Path(probe.stdout.strip()).parent == scratch, (
+            "the child does not honour TMPDIR, so this check could not see a "
+            f"leak: the probe landed at {probe.stdout.strip()}")
+        before = set(scratch.glob("handsoff-staged-*"))
         _write(repo, INDEX, "alpha\nbeta\n")
         _write(repo, PLAN, "# plan\n- alpha\n- beta\n")
         _git(repo, "add", INDEX, env=env)
         assert _git(repo, "commit", "-q", "-m", "refused", env=env).returncode != 0
         assert _git(repo, "add", PLAN, env=env).returncode == 0
         assert _git(repo, "commit", "-q", "-m", "accepted", env=env).returncode == 0
-        after = set(Path(tempfile.gettempdir()).glob("handsoff-staged-*"))
+        after = set(scratch.glob("handsoff-staged-*"))
         assert after == before, (
             f"a run left a scratch tree behind: {sorted(after - before)}")

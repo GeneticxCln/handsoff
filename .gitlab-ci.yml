@@ -31,6 +31,13 @@
 # verifies elsewhere). A desk node/python that does not match fails the job
 # rather than quietly standing in for the image it replaces.
 #
+# The suite jobs hold a resource_group (`handsoff-suite`), so the desk runs one
+# suite at a time: on a hosted runner each job owns a fresh container, and on a
+# desk they would own the same GPU, audio server and /tmp — measured, twice, in
+# one pipeline (see .tests_base). Serialising costs wall time (about 23 minutes
+# of machine time per push instead of 10) and buys a signal that is about the
+# commit rather than about its neighbours.
+#
 # PySide6 + sounddevice: the wheels bundle Qt but offscreen rendering still needs
 # runtime libraries (glib/GL/EGL/xkbcommon/dbus/fontconfig), and sounddevice
 # needs the PortAudio library itself (libportaudio2) plus the ALSA runtime that
@@ -120,6 +127,18 @@ workflow:
   stage: test
   tags:
     - desk
+  # ONE suite at a time on this machine, and that is measured rather than
+  # cautious. With two full suites running together the first desk pipeline that
+  # carried a change collided twice: `test_precommit_staged`'s scratch-tree
+  # check reported the OTHER job's in-flight /tmp/handsoff-staged-* tree as its
+  # own leak (both legs, same seconds), and the offscreen live-probe scenario's
+  # whisper worker was still answering when its wall-clock deadline expired.
+  # The suite exercises real devices — GPU speech models, offscreen Qt, the audio
+  # server — and owns them for its duration, so a green is a verdict about the
+  # commit only when nothing else is running one. Both tests were fixed at the
+  # same time (own scratch namespace, joins instead of deadlines); this is the
+  # belt, not the only braces.
+  resource_group: handsoff-suite
   variables:
     # The offscreen-launch test spawns the real bubble without a display.
     QT_QPA_PLATFORM: offscreen
@@ -157,6 +176,7 @@ order:
   stage: test
   tags:
     - desk
+  resource_group: handsoff-suite   # see .tests_base: never beside another suite
   variables:
     QT_QPA_PLATFORM: offscreen
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
@@ -206,6 +226,7 @@ coverage:
   stage: test
   tags:
     - desk
+  resource_group: handsoff-suite   # see .tests_base: never beside another suite
   variables:
     QT_QPA_PLATFORM: offscreen
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
