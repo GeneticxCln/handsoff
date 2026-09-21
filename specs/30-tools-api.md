@@ -1,6 +1,6 @@
 # handsoff — tools API
 
-Source: `core/tools.py` — **48 `@tool` methods**, counted from the decorators that
+Source: `core/tools.py` — **52 `@tool` methods**, counted from the decorators that
 define them. The census below is GENERATED (`python3 ci/spec_tables.py --write`);
 do not hand-edit it, and do not copy a number out of it into prose.
 `gates=None` (decorator omits `gates=`) means "own name"; `gates=''` means
@@ -10,54 +10,58 @@ ungated. Descriptions are the pinned model-facing strings in the decorator.
 
 | Tool | Gate | L |
 |---|---|---|
-| `run_command` | `run_command` | 1363 |
-| `type_text` | `type_text` | 1592 |
-| `press_keys` | `press_keys` | 1655 |
-| `press_hotkey` | `press_keys` | 1758 |
-| `notification_reader` | `notifications` | 1817 |
-| `pomodoro` | `pomodoro` | 1855 |
-| `watch_file` | `watchers` | 1931 |
-| `watch_process` | `watchers` | 1980 |
-| `workspace` | `run_command` | 2019 |
-| `focus_window` | `focus_window` | 2137 |
-| `wait_for_window` | `focus_window` | 2183 |
-| `wait` | — | 2205 |
-| `niri_capabilities` | — | 2306 |
-| `close_window` | `run_command` | 2336 |
-| `copy_text` | `copy_text` | 2396 |
-| `paste_text` | `paste_text` | 2408 |
-| `set_reminder` | `reminders` | 2423 |
-| `list_reminders` | `reminders` | 2476 |
-| `cancel_reminder` | `reminders` | 2492 |
-| `snooze_reminder` | `reminders` | 2511 |
-| `media_play` | `media` | 2549 |
-| `media_control` | `media` | 2585 |
-| `media_volume` | `media` | 2604 |
-| `now_playing` | `media` | 2616 |
-| `search_library` | `media` | 2633 |
-| `calendar_month` | `calendar` | 2652 |
-| `read_calendar` | `calendar` | 2682 |
-| `get_weather` | `web_access` | 2726 |
-| `web_search` | `web_access` | 2755 |
-| `read_page` | `web_access` | 2781 |
-| `world_events` | `web_access` | 2794 |
-| `lookup_fact` | `web_access` | 2818 |
-| `get_datetime` | `get_datetime` | 2835 |
-| `see_screen` | `screen_access` | 2878 |
-| `read_screen_text` | `screen_access` | 2896 |
-| `kill_process` | `run_command` | 2983 |
-| `confirm_kill` | `run_command` | 3011 |
-| `confirm_action` | — | 3041 |
-| `start_command` | `run_command` | 3129 |
-| `job_status` | `run_command` | 3178 |
-| `handsoff_doctor` | — | 3226 |
-| `screen_elements` | `screen_access` | 3326 |
-| `click_element` | `operator` | 3348 |
-| `click_at` | `operator` | 3365 |
-| `scroll` | `operator` | 3370 |
-| `open_app` | `run_command` | 3403 |
-| `read_file` | `read_file` | 3493 |
-| `edit_file` | `edit_file` | 3523 |
+| `run_command` | `run_command` | 1364 |
+| `type_text` | `type_text` | 1593 |
+| `press_keys` | `press_keys` | 1656 |
+| `press_hotkey` | `press_keys` | 1759 |
+| `notification_reader` | `notifications` | 1818 |
+| `pomodoro` | `pomodoro` | 1856 |
+| `watch_file` | `watchers` | 1932 |
+| `watch_process` | `watchers` | 1981 |
+| `quant_space_status` | `quant_space` | 2074 |
+| `quant_space_sessions` | `quant_space` | 2086 |
+| `quant_space_read` | `quant_space` | 2097 |
+| `quant_space_check` | `quant_space` | 2130 |
+| `workspace` | `run_command` | 2153 |
+| `focus_window` | `focus_window` | 2271 |
+| `wait_for_window` | `focus_window` | 2317 |
+| `wait` | — | 2339 |
+| `niri_capabilities` | — | 2440 |
+| `close_window` | `run_command` | 2470 |
+| `copy_text` | `copy_text` | 2530 |
+| `paste_text` | `paste_text` | 2542 |
+| `set_reminder` | `reminders` | 2557 |
+| `list_reminders` | `reminders` | 2610 |
+| `cancel_reminder` | `reminders` | 2626 |
+| `snooze_reminder` | `reminders` | 2645 |
+| `media_play` | `media` | 2683 |
+| `media_control` | `media` | 2719 |
+| `media_volume` | `media` | 2738 |
+| `now_playing` | `media` | 2750 |
+| `search_library` | `media` | 2767 |
+| `calendar_month` | `calendar` | 2786 |
+| `read_calendar` | `calendar` | 2816 |
+| `get_weather` | `web_access` | 2860 |
+| `web_search` | `web_access` | 2889 |
+| `read_page` | `web_access` | 2915 |
+| `world_events` | `web_access` | 2928 |
+| `lookup_fact` | `web_access` | 2952 |
+| `get_datetime` | `get_datetime` | 2969 |
+| `see_screen` | `screen_access` | 3012 |
+| `read_screen_text` | `screen_access` | 3030 |
+| `kill_process` | `run_command` | 3117 |
+| `confirm_kill` | `run_command` | 3145 |
+| `confirm_action` | — | 3175 |
+| `start_command` | `run_command` | 3263 |
+| `job_status` | `run_command` | 3312 |
+| `handsoff_doctor` | — | 3360 |
+| `screen_elements` | `screen_access` | 3460 |
+| `click_element` | `operator` | 3482 |
+| `click_at` | `operator` | 3499 |
+| `scroll` | `operator` | 3504 |
+| `open_app` | `run_command` | 3537 |
+| `read_file` | `read_file` | 3627 |
+| `edit_file` | `edit_file` | 3657 |
 
 ## Result contract
 

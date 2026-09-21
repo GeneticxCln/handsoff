@@ -28,7 +28,7 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
 
 1. **`_DEPLOY_FILES` drift — CLOSED (2026-09-16).** `handsoff.py:644` is still a
    top-level floor (the shipped top-level files plus three core modules), while
-   install.sh `CORE_REQUIRED` ships 13 core modules. A manifest-driven
+   install.sh `CORE_REQUIRED` ships 14 core modules. A manifest-driven
    install was already safe — the manifest glob is unioned over the tuple — so
    the exposure was the manifest-less or hand-rolled install, which compared
    only the floor and reported `in-sync` while modules differed.
@@ -85,9 +85,10 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
   origin-checked loader. No `pickle`, no `os.system`, no `shell=True`.
 - Subprocess is argv-list only (`subprocess.run([...])`), never a shell
   string; shell operators are refused before `shlex.split`.
-- `my_tool` (line 441) is a docstring example inside `tool()` — NOT the
-  49th tool. AST census = 48.
-- `stop_watchers` is a plain method, not a 49th `@tool`.
+- `my_tool` (line 441) is a docstring example inside `tool()` — a docstring
+  defines no tool. AST census = 52.
+- `stop_watchers` is a plain method, not an `@tool` (it is what the two
+  watchers need to be stopped together).
 - `paste_text`/`get_datetime`/`read_file` etc. with no explicit `gates=`
   default to their OWN name — gated, not ungated. Only `gates=''` is ungated
   (`wait`, `niri_capabilities`, `confirm_action`, `handsoff_doctor`).
@@ -102,8 +103,8 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
    `core/*.py` plus the manifest.
 2. DONE (2026-09-16) — `tests/test_specs_freshness.py`, its own file rather
    than a class in `test_regression.py` (and listed in `60-test-plan.md`): each
-   count is read from the source of truth the spec names for itself — 48 tools,
-   64 settings keys, 22 PTT verbs, 13 core modules, plus 19 permission keys —
+   count is read from the source of truth the spec names for itself — 52 tools,
+   64 settings keys, 22 PTT verbs, 14 core modules, plus 20 permission keys —
    and every place a spec states one is read back and compared. It also pins
    STRUCTURE, which a count cannot see: every core module in the architecture
    map, every test file in the test plan, every spec in this index. Size claims
@@ -1846,6 +1847,492 @@ the checkout and `~/.local/bin`; and the journal from the restart shows
 whisper loaded, chatterbox-turbo warmed on CUDA and `ollama ok`, with no
 import error anywhere.
 
+## Another app's desk, over its own channel: one leaf module, one gate, four sentences a user can tell apart (2026-09-20)
+
+**What this is.** Quantum Space — the sibling workbench on this machine —
+publishes a local, opt-in, consent-gated control channel for a trusted program:
+a discovery file beside its own settings, and five READ-ONLY JSON-RPC methods on
+loopback. `core/qs_desk.py` is the client half of that contract, and
+`core/tools.py` gains four tools on it: `quant_space_status` (`hello`, then
+`desk.status` — "is it there, what is open"), `quant_space_sessions`,
+`quant_space_read` (one session's tail, its id resolved against the desk's own
+list rather than guessed), and `quant_space_check`, the diagnostic that names
+WHICH state the link is in. Nothing was added to the other side: this round is a
+client, and the contract it speaks was frozen before it started.
+
+**Not built on `core/web.py`, deliberately.** That module's whole job is the
+opposite of this one: its `_public_target` refuses loopback and private
+addresses, and `read_page` walks a public redirect chain. On a loopback channel
+that refusal is the hazard, not the protection, so the transport is stdlib
+`http.client` — which also ignores the proxy environment variables `urllib`
+honours, one more way a request meant for this machine could leave it.
+
+**Four rules, each with its reason and its own test.** The discovery file is a
+CLAIM by whatever wrote it, not evidence about the app: a mode that is not
+private, a protocol number this client does not speak, and a live pid that is not
+ours are each a REFUSAL that stops the search, and the test asserts the fake
+bridge saw no request at all. The token is read PER REQUEST and never cached — the
+same rule handsoff's own control token follows, and for the same reason, so the
+file is rewritten with a second token between two calls and the second request
+must carry the new one. A client that cannot read the credential still SENDS the
+request, mirroring `_control_payload`: nothing here decides on the user's behalf
+that "control is off", because the refusal belongs to the server that owns the
+rule and it has its own wording for it. And the desk's sentence IS the answer —
+its refusals are already written for a person, so they are surfaced verbatim,
+with a test pinning that the message is character-for-character the desk's.
+
+**Four states, four sentences, and one of them is the desk's.** A user hears
+"Quantum Space isn't running" (no file, or a pid that is gone — a STALE file, not
+"connection refused"), the desk's own sentence when it refuses on its own rules,
+and "that session isn't on the desk any more". One wire reason covers two
+situations — Control switched off, and this client not yet on the desk's
+allow-list — and the body that knows which is the desk, so both sentences are
+ITS; a client that composed its own would collapse two problems with two
+different fixes into one line. Pinned by test as distinct strings, including that
+the two `not-granted` refusals stay two different sentences.
+
+**A refusal is never only in the model's reply.** A call the desk turns away goes
+to the journal at WARNING, to `decisions.jsonl` (which the settings app renders
+in its own Decision log pane), and onto the desktop through the same notification
+path every other event the user has to know about uses — with the SAME wording
+every time, so the host's coalescing folds a model looping on the call into one
+popup instead of a swarm. Deliberately no second cooldown here: that would be a
+worse second answer to a question the host already answers.
+
+**One gate for the family, and a consent that is not ours to give.** All four
+tools carry `gates='quant_space'`, the way `press_keys` covers two tools and
+`watchers` two more, because the user's question is one question; the per-tool
+`command_policy` still gives ALLOW / DENY / CONFIRM underneath. The key defaults
+ON, like `watchers` and `screen_access`, and it is the SECOND switch: the desk
+keeps its own Control setting and its own allow-list, and refuses in its own
+words until the user consents THERE. So the assistant cannot talk its way onto
+somebody else's desk by being allowed to read one.
+
+**The census moved:** four more tools, one more permission key, one more core
+module. Every place a spec states one of those counts was updated — the index's
+two, the requirements' tool line and permission section, the architecture map
+(its new row, its `@tool` sentence and its `CORE_REQUIRED` count), the two
+generated tables (`ci/spec_tables.py --write`), the data spec's policy line, the
+ops spec's quoted list, the test plan's row for the new file, and this spec's own
+three. `install.sh`'s `CORE_REQUIRED` gained `qs_desk`: a tarball install stages
+that floor, so a module missing from it compiles here and is absent on the
+deployed machine, which `tests/test_sandbox.py` is what catches. `README.md`
+gained the feature line and the permission row a user reads before flipping it.
+
+**The tests drive a REAL socket.** `tests/test_qs_desk.py` starts an
+`http.server` on an ephemeral port in a thread and scripts the desk's own
+behaviour behind it, rather than recording calls against a mock — because half of
+what this client must get right IS the wire: a POST to the root path, a bearer
+header, NO `Origin` (which the desk refuses outright, so a web page cannot reach
+it), and the HTTP status checked before the body is worth parsing. Pinned there:
+a stale pid, a world-readable file, a body that is not JSON, a protocol number
+that is not this one, and a live foreign pid — each refused with ZERO requests
+made; the status codes for a bad Origin or Host, a wrong verb, a bad token, an
+over-size body and a notification answer; the desk's own `not-granted`,
+`session-not-found` and `no-output` reasons; the line clamp at both ends (and
+that zero sends no count at all, so the desk's own useful tail applies); the
+token absent from every repr, every error message and every decision-log line;
+and the family's one gate — off means nothing reaches the desk, and a `DENY`
+policy wins over it. The suite needs no Quantum Space installed, no port open
+and nothing in the developer's own `~/.config`: each test builds its own profile
+under a throw-away root and points the environment at it, which is also what
+proves the module reads the environment rather than this machine.
+
+**Measured on the final bytes, all seven gates green:** `tests` **PASS —
+1 997 passed in 287 s** (1 936 before: 61 new tests); `order` **PASS** in BOTH
+orderings (seed d985fc7, **1 997** each, 578 s); `coverage` **PASS, 85.42%**
+(2 583 missing of 17 716) ≥ 70; `compile` **PASS** (56 files byte-compiled);
+`shell` and `smoke` **PASS**; `clean-checkout` **PASS** (the freshness guard,
+19 passed in 3.5 s, in a scratch worktree of HEAD); `two-writer` **PASS** —
+"worktree unchanged since the run started". The two new files were STAGED before
+that run, because two guards ask the index rather than the checkout: one refuses
+an untracked module in a directory the installer ships by glob, and the other
+compares the deployed set against what git owns.
+
+**Stated limits.** The status line speaks `control` and `windows` only when they
+are a plain bool or int — a client that guesses at another app's nested shapes
+invents facts the user then hears as fact — so a nested control object is
+reported as nothing rather than as prose. A read is trimmed to its tail
+(the desk's own `truncated` flag is stated as well), because a coding agent's
+scrollback is not a document and "what is it doing" is a question about now. The
+folder in a read's label comes from the session list, since the read answer does
+not carry one. There is no cap on how many desk reads one turn may make:
+`command_policy` and the existing tool-call limit are the two controls this tree
+already has, and a third would be a second answer to a question already
+answered. And **nothing was deployed**: three SHIPPED files changed
+(`core/tools.py`, `settings_schema.py`, `install.sh`), so the running bubble is
+still the previous bytes and `--ptt doctor` will read out-of-sync against this
+checkout until `install.sh` runs — deliberately not done from an unmerged
+branch, because a branch is not a release.
+
+---
+
+## The desk client's first live turn: what a real Quant Space actually says, and the four places the fake bridge was flattering us (2026-09-21)
+
+**What was run.** One real push-to-talk turn — *"what is Claude doing?"* — against
+a real Quantum Space desk, on this machine, with the client from this checkout
+deployed (`--ptt doctor` → `in-sync`; 19 manifest files hash-matched). The desk
+was a real build of the app (the bridge-bearing one, `release/linux-unpacked`)
+run against its own dev profile, holding a real Claude tile in
+`/tmp/qs-desk-demo`, with Control switched on and `handsoff` on its allow-list —
+the state Settings → Control produces.
+
+**What the turn did, from the journal.** `ptt timing: frames=71680 rate=16000`
+(4.5 s of audio captured) → whisper transcribed it → `tool call:
+quant_space_status (argument names=[])` at 09:44:17 → and it spoke, from the real
+desk: *"Claude is currently active in a session within the qs-desk-demo
+folder."* The tool result the model was given, verbatim out of `history.json`:
+
+> Quantum Space is running (v0.5.1) with the qs-desk-demo folder open. one
+> session: claude in the qs-desk-demo folder. Control is on for handsoff and 1
+> window.
+
+`decisions.jsonl` carries the app's own entry for it (`quant_space_status`,
+ALLOW, dispatched), which is the Decision-log pane doing its job.
+
+**The finding that mattered, and it was one syllable.** The prompt that specified
+this feature froze the profile directory as `Quantum Space` — with the syllable
+the app does not have. The app's own product name is **Quant Space**; its built
+`app.asar` carries that string 272 times and "Quantum Space" zero times, and a
+dev run appends `-dev` to the *same* basename (`review-profile.js`:
+`normalPath + (packaged ? '' : '-dev')`). So the first live call was:
+
+```
+paths: ~/.config/Quantum Space/control.json      — absent
+       ~/.config/Quantum Space-dev/control.json  — absent
+refused state='not-running' — "Quantum Space isn't running."
+```
+
+…against a desk that was **listening, granted, and holding a live Claude
+session** at `~/.config/Quant Space-dev/control.json`. The frozen contract's
+spelling made a running desk invisible, and no test could have caught it: the
+fake writes the file wherever the test tells it to, so the fake agreed with the
+contract and both were wrong about the machine. `APP_DIRS` now probes the app's
+own name first and keeps the handoff's spelling as a tolerated fallback (a file
+that exists and is not ours still stops the search, so this is not a guess about
+which desk answered), pinned by a test that names the measurement.
+
+**Four more places the fake was flattering, all now aligned to what the desk
+answers.** (1) `desk.status.control` is the desk's own object,
+`{"enabled": true, "clients": ["handsoff"]}`, not the bare bool the fake used —
+and `describe_status` only spoke a bool, so against every REAL desk the client
+said nothing about the consent the whole feature rests on. Caught live: the
+status line read "…1 window." with `control` silently dropped. It now speaks
+"Control is on for handsoff", and the shape we *don't* know is still not guessed
+at (a `control` whose `enabled` is not a bool still says nothing). (2) `hello`'s
+`desk` is the whole status object, not a word for "live". (3) `session.read`
+also returns **`lines`** — how many it actually returned (45 of 2000 asked for),
+which the contract's table does not list. (4) A non-POST, a bad token, an Origin
+header and bad JSON come back with **empty bodies** — 405/401/403/400 and
+nothing else — so the client keys off the code because there is nothing else to
+key off; the fake used to send a JSON body and could have hidden a client that
+read the body.
+
+**The contract's most optimistic sentence.** It promises the read's `text` has
+"already had ANSI/OSC stripped on the desk's side, so what you get is
+speakable". For a Claude TUI that is false, and the fake — whose read text is
+`"running the tests\n12 passed"` — could never show it. What the desk really hands
+back from a live agent is prose with the **spaces eaten**, box-drawing rules, and
+the same repaint twice:
+
+```
+Quicksafetycheck:Isthis
+a projectyoucreatedor
+❯No,exit
+────────────────────────
+```
+
+The cause is the desk's own stripping (cursor-positioned repaints are not
+sequence-free prose), and the fix is NOT ours to make: rewriting that here would
+be this client inventing the agent's words. So the read is relayed exactly as the
+desk stripped it, and a guard now pins that relaying — including the honest
+consequence: a spoken `quant_space_read` of a TUI can be hard to listen to, and
+making it pretty belongs on the desk's side, where the raw stream is.
+
+**Three things found in the sibling project, which are not mine to fix from
+here.** (1) The app the user is actually running — the AppImage in
+`release/`, built 17:46 — **predates `control-bridge.js` entirely** (17:46 vs the
+source written 18:43): `desk.sessions`, `control.json` and `[control] control
+bridge listening` appear ZERO times in it, while the `linux-unpacked` build from
+20:46 contains all three. So "built and live-verified" was true of the newer
+build; a normal install of that AppImage would leave this client saying "isn't
+running" forever, with the app visibly open. (2) In the sibling's current working
+tree `wireAcpLive` is **imported and never called** (`main.js:13`; the only other
+references are its definition and export), so `acp:start`/`acp:send`/`acp:kill`
+are never registered and a chat/agent tile cannot start — live, the renderer's
+`acp:start` came back `No handler registered`. The built bundle has the same shape
+(three hits: definition, export, require — no call site), which is why the live
+turn used a `kind: 'claude'` tile, the legacy spawn path that still works.
+(3) `desk.status.folder` was `null` on the first call and `/tmp/qs-desk-demo` a
+minute later: the window's folder registers after the bridge starts, so a client
+must not read `folder: null` as "no folder open". This client's read labels come
+from the session list for exactly that reason, and now have a live example behind
+them.
+
+**How the utterance got in, stated because it was not a held microphone.** The
+acoustic route was tried first and failed twice: `--ptt stop` reported
+`frames=0`, and a direct 4-second `parecord` of the same room wrote a **0-byte**
+file, so the room path is currently dead on this machine (speaker output at 0.33,
+the Yeti's ALSA profile named differently from the 2026-09-18 note:
+`…-00.analog-stereo`, not `….2`). The turn that worked injected the phrase
+digitally: a `module-null-sink` named `qsptt`, the default source pointed at its
+monitor for the length of one press, `paplay --device=qsptt`, then the original
+default source restored and the module unloaded (verified restored afterwards).
+That is a real capture through the app's own `system default` path, and it is
+**not** the same as a human pressing the button — §3's microphone items still need
+a person, and the room path being dead is itself worth a look.
+
+**Evidence.** `tests/test_qs_desk.py` **65 passed** (4 new tests and one
+rewritten: the real product name is probed first, the desk's own `control` object
+is spoken with its grant, an unknown shape is still silent, a real `w1_p_1` id is
+handed straight back, and the mangled tail is relayed unchanged). The real wire
+was captured method by method — all five methods, the line clamp at 1 and at
+99999, and nine failure shapes — with the status codes matching the contract's
+table exactly (403 Origin, 405 verb, 401 token, 400 JSON, 200 + `error` object
+with the desk's own `reason` and sentence). `tests/test_specs_freshness.py` 19
+passed after `ci/spec_tables.py --write` regenerated the module table (`core/qs_desk.py`
+687 → **722** lines); `ruff` clean on both changed files.
+
+**Stated limits.** The live desk was the app's **dev profile**, not the installed
+one — a second instance had to be used because the user's own running copy holds
+the single-instance lock, and the config directory was chosen by `--user-data`
+rather than by the app's own default. So the *product name* fact is measured from
+the app's source and its built bundle, while the end-to-end run used a profile
+the app would also accept. The read path is proven against a Claude tile's trust
+prompt, not against an agent mid-task: a session with a full transcript of
+generated output has more repaints and more box rules, and nothing here proves
+that reads stay useful at that size.
+
+---
+
+## The second ask, and the size question answered with numbers: the read is fine for a stream and theatre for a TUI (2026-09-21)
+
+**The follow-up question was "ask again, against a session with a real
+transcript of generated output, and say whether the read stays useful at that
+size". The first honest answer is that no agent on this machine can generate
+output today.** Claude Code's configured model is
+`nvidia/nemotron-3-ultra-550b-a55b:free`, which its own catalog rejects
+(`There's an issue with the selected model … It may not exist or you may not have
+access to it`), and `codex exec` answers `You've hit your usage limit … try again
+at Oct 6th, 2026`. The user's own Claude transcripts are thin for the same
+reason (their biggest real one is 84 events whose last assistant block is a
+`402 Token Harbor balance is at $0`). So the desk was given two REAL sessions
+that could exist anyway: a `run` tile streaming `ollama run gemma4:12b` through a
+"write a 120-line markdown report" prompt, and the Claude TUI itself, owned by a
+shell tile (a `kind: 'claude'` tile **disappears from the desk when the CLI
+exits**, which is how the first Claude session was lost mid-round — worth knowing
+for anyone asking about a tile that has quit).
+
+**Measured, both at once, one `session.read` each (asked 200 lines, then 2 000 —
+identical answers, so nothing was being cut):**
+
+| session | returned `lines` | `truncated` | chars | newlines | box glyphs | word-like |
+| --- | --- | --- | --- | --- | --- | --- |
+| `ollama run` report (`w1_p_1`, kind `run`) | **174** | false | 6 586 | 173 | 0 | 80 % |
+| Claude TUI (`w1_p_1`, kind `claude`) | **1** | false | 2 173 | **0** | **362** | 66 % |
+
+**So the usefulness has nothing to do with size.** The 174-line stream reads
+fine: the tail is coherent markdown — `### 3.2 ANSI Escape Sequences`, prose with
+its spaces intact — and its only noise is a 429-character Braille spinner frame
+and the shell's own echoed command line at the head. The TUI is not useful at
+*any* size: a cursor-positioned screen has **no line breaks at all**, so 2 173
+characters arrive as one line, two thirds of whose "words" are glued
+(`Claude Codev2.1.278`, `Keptmodelasth-orchestra`, `YourToken Harbor`), wrapped in
+362 box-drawing characters, and the content is chrome — version banner, model
+name, a billing line, the 402 error, timing, effort level, mode — with the one
+surviving conversation fragment mangled (`the  is a test reply if      you see my 
+ test`).
+
+**And the desk's own flag is wrong in exactly that case, which is theirs to
+fix.** It answered `lines: 1, truncated: false` about a whole screen, because
+`read()` counts newlines (`text.split('\n')`): a screen with none is "one line,
+not truncated" no matter how much of the 64 KB buffer it filled. A caller asking
+for 200 lines is told nothing was cut when a screen was handed over. Called out
+here with the numbers rather than worked around, because the fix belongs where
+the raw stream is (`truncated` should be judged against the buffer, not against
+the newline count).
+
+**The most consequential finding of the round was not in the client at all: the
+same question asked twice was answered from memory, and the memory was stale.**
+Turn 1 (09:44) called the tool — `history.json` holds `[assistant]
+tool_calls=1`, then the `[tool]` result off the real desk, then the spoken
+answer. Turn 2 (10:06), the identical phrase, produced `[assistant] len=71
+tool_calls=0` and said "Claude is currently active in a session within the
+qs-desk-demo folder" — while the desk's real state at that moment was a `claude`
+session in the **Quantum Shell** folder plus an ollama session in qs-desk-demo.
+The model read the previous turn's tool result out of its own history and
+repeated it. Nothing in the client can prevent that; `--ptt clear-history` is the
+lever that already exists for it (its stated purpose is that a new model cannot
+parrot the old transcript), and this is the measured case for pulling it when the
+thing being asked about moves.
+
+**Two defects this measurement found in the client, both fixed with guards.**
+(1) A session's `name` is spoken, and the desk names a `run` tile with its WHOLE
+command line — measured at 171 characters — so "what is open" used to read a
+prompt aloud. Names are now bounded to 40 characters with the cut shown
+(`ollama run gemma4:12b "Write a long tec…`), in the spoken line and in the
+model's index alike, while `resolve_session` still matches on the full name.
+(2) A read with no line breaks is now called out as ONE line, so a screen cannot
+pass as a one-line session; a real line-oriented stream gets no such note
+(pinned by its own test, because a note that fires on everything says nothing).
+`tests/test_qs_desk.py` is **68 passed** (3 new).
+
+**Stated limits, and one unresolved.** The "at size" stream was an Ollama report
+rather than a working coding agent's scrollback — there is no working coding
+agent on this machine today, so the *writer* is not the one the feature exists
+for, though the stream shape is. The desk instance **exited on its own twice**
+during this half (no OOM entry in the user journal; the log simply stops), and the
+second capture produced no audio at all (`no audio from the recorder`) on the
+same injected-audio path that had just worked, so the repeat ask could not be
+re-run after `clear-history`. Both are recorded rather than smoothed.
+
+All three of those limits were taken to the bottom the same day — the desk's
+exit, the silent capture, and the missing coding agent — and the constructor
+mistake that paid for the search is written up in "The second live turn's three
+limits, measured to the bottom" below. The paragraphs above are left as they
+were written, because each sentence in them was true at the time.
+
+
+## The second live turn's three limits, measured to the bottom — and the client's own constructor was the defect (2026-09-21)
+
+The section above ends with three things left open: the desk that "exited on its
+own twice", the capture that produced no audio on a path that had just worked,
+and the read never having been proven against a working coding agent. All three
+are closed here, and one of them was the client's own fault.
+
+### Why the desk kept going away: it quits by itself, cleanly, in minutes — and the trace was dying with it
+
+The instrumentation was the first defect, and it was mine. The launch wrapper was
+`bash -c '"$BIN" …'`, so the wrapper's own `/proc/self/cmdline` contained the
+binary path — and `pkill -f <binary>`, the very command used to stop the app,
+killed the wrapper too. The wrapper therefore never wrote its exit line, which is
+exactly why the earlier account reads "the log simply stops". A watcher whose
+argv holds no part of that pattern (the binary path comes from a file) recorded
+the truth on the first try:
+
+```
+launch 2026-09-21T10:32:41 pid=198420 …
+EXIT status=0 at 2026-09-21T10:37:27 after 285.6 s
+```
+
+**It exits by itself, cleanly, and not on a fixed clock.** Measured lifetimes on
+this machine: 17.0 s, 22.7 s, 35.1 s, 44.1 s, 47.3 s, 285.6 s, ~243 s, ~244 s.
+Every one was `status=0` or a systemd `Result=success`/`ExecMainStatus=0`, with
+no Crashpad dump, no OOM line in the kernel journal, and 22 GB of RAM free. The
+compositor's own event stream shows the window arrive and then leave
+(`WindowOpenedOrChanged {id:40, pid:317613}` … `WindowClosed {id:40}`), and once
+it is gone niri has no `Quant Space` window left at all — so the sentence a user
+hears and the screen they see agree.
+
+What it is **not**, each eliminated by measurement rather than argument:
+
+* **not my shell's lifecycle** — the same deaths happen under `systemd-run
+  --scope` and as a `systemd-run --user` *service*, i.e. outside the cgroup my
+  commands run in (my shell lives in `app-niri-noctalia-1435.scope`);
+* **not content** — an *empty* desk, no tiles, no agent, died in 44.1 s;
+* **not the GPU path** — `--ozone-platform=x11` and the Wayland default died
+  within a second of each other (4 min 3 s and 4 min 4 s), so the "Vulkan is not
+  compatible with wayland" error it logs is noise, not the trigger;
+* **not the updater** — `build.publish` is null and `installNow` is reachable
+  only from a click;
+* **not app-level window code** — there is no `window.close()` outside the
+  `--shot` screenshot mode, and the only `process.exit(0)` is the tail of the
+  quit handler.
+
+It is **not only the dev build either**, which is the last thing measured here:
+the user's own *installed* AppImage, up and serving for 1 h 39 min, exited the
+same way at 11:05:38 — systemd logged its scope's consumption at that second
+(`app-niri-nautilus-22894.scope: Consumed 4min 20.716s CPU time over 1h 39min
+47.291s`), and an *Install current AppImage from folder* window is on the desktop
+afterwards. The update **poller is not the trigger** — it is notify-only, it never
+runs in development, and `installNow` is reachable only from a click
+(`auto.autoInstallOnAppQuit = true` installs at quit, it does not cause one) — but
+a clean status-0 exit with the window closed and an AppImage install dialog on
+screen is exactly what an install flow looks like from outside, and it is the
+strongest lead there is. The trigger is inside that process, and pinning it means
+instrumenting the sibling tree — their work, not handsoff's. What matters for
+this feature is that the desk's exit is *audible* rather than mysterious: their
+`before-quit` removes the discovery file, so the client's answer is the true one
+("Quantum Space isn't running."), not "connection refused" about a port nobody
+owns.
+
+### The silent capture: an assignment to an audio source that does not exist yet is swallowed
+
+`pactl set-default-source qsmic`, issued in the same breath as
+`module-remap-source` creates that source, is **dropped silently**: pactl exits
+0, prints nothing, and `pactl get-default-source` still names the Yeti. The
+bubble then opened the real microphone, which heard the room and nothing else —
+which is what "no audio from the recorder" was.
+
+The harness fix is the assertion, and it is now in front of every turn rather
+than behind it: play the phrase into the null sink *while* recording the default
+source, and require signal before spending a turn. Measured on the check itself —
+peak 32767, rms 3777, 32 301 samples above −36 dBFS — and then on both turns that
+followed it: `ptt timing: frames=97280 rate=16000` and `frames=93184 rate=16000`,
+against the zero of the failed capture.
+
+### A real coding agent on the local model: what a coding agent's scrollback actually is
+
+Every *installed* agent still cannot generate on this machine: Claude Code's
+configured model is rejected by its own catalog, `codex exec` is out of quota
+until 6 October, `opencode` does not start at all (`SQLiteError: no such column:
+replacement_seq`), goose's configured provider is a hosted one, and the user's
+own stored transcripts end at `402 Token Harbor balance is at $0`.
+
+But goose speaks Ollama — `GOOSE_PROVIDER=ollama GOOSE_MODEL=qwen3:8b` — which
+makes a **real coding agent** work a **real folder** locally. Measured: it read
+the files, ran `python3 -m pytest -q .` for real, and its tile holds the literal
+`1 passed in 0.01s` under goose's own `▸ shell` block. So the writer the feature
+exists for now has a live example, and the read was measured on three shapes
+through the same client:
+
+| session on the desk | `lines` | chars | box glyphs | word-like | `truncated` |
+| --- | --- | --- | --- | --- | --- |
+| goose agent report (its own 73 lines) | 77 | 4 734 | 0 | 90 % | false |
+| Ollama markdown stream (previous turn) | 174 | 6 586 | 0 | 80 % | false |
+| Claude Code TUI screen | 1 | 2 173 | 362 | 66 % | false |
+
+**Usefulness tracks orientation, not size.** An agent's own prose arrives
+line-perfect (longest line 260 characters, and `truncated: false` because 4 734
+is inside the 8 000-character cap). A cursor-positioned screen has no line breaks
+at all, so two thousand characters of chrome arrive as one line. And the local 8B
+model is a weak tool user: asked to survey the module it emitted `shell` with a
+missing `command` and goose printed `Error: Failed to parse arguments: missing
+field command`; asked for a 60-line report with the module embedded in the prompt
+it produced *no* assistant text at all (two sessions of 37 kB prompt); asked for
+a report with no tools it answered in 73 lines. A coding agent on a local model
+is real, and it fails like one.
+
+### The failure path, tested by accident
+
+The third live turn ("Read me what the agent on my desk has been doing.",
+`clear-history` first, so the model could not parrot) captured `frames=93184`,
+transcribed, and called `quant_space_read` — and by then the desk had gone. The
+tool results were `ERROR: Quantum Space isn't running.` twice, and the spoken
+answer was *"Quantum Space is not currently running, so I cannot see what the
+agent is doing."* That is the designed behaviour under the hardest condition
+there is — the desk dying mid-turn in another app's short life — and it is the
+opposite of the two failure modes this feature was built to avoid: no hang, and
+no invented answer. Nine minutes earlier, on the same injection path, the same
+turn made **four** tool calls and relayed the desk's own `session-gone` sentence
+for a name the model had guessed (`That session isn't on the desk any more. Open
+now: shell, /tmp/qs-agent-task2.sh.`).
+
+### And the defect that cost the hour: `Desk("handsoff")`
+
+The client's constructor takes `paths` first. The natural mistake — the CLIENT
+name where a path was wanted — became one relative path, matched no file, and
+answered **"Quantum Space isn't running."** about a desk that was running, with a
+0600 discovery file on disk and a live pid inside it. A wrong state is worse than
+a crash here: it is indistinguishable from the truth, and it sent this exercise
+looking for an app that had not gone anywhere.
+
+Fixed in `_as_paths`: a relative path, an empty list and a non-path are refused
+as the programming errors they are (naming the shape wanted and the `client=`
+that would have been right), an omitted list searches the profile directories —
+the same list `connect()` uses — and one absolute path is still a path list. Five
+new guards hold it, including the one that says a *correct* construction still
+reaches the desk that is running. `tests/test_qs_desk.py` is **73 passed**.
 ## The gates stop drawing on a spent quota — the desk runner, and the two couplings that five suites on one machine made visible (2026-09-21)
 
 **The symptom was a pipeline that said nothing about the commit it judged.**

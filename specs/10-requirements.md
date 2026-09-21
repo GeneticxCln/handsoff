@@ -34,7 +34,7 @@ Sources: `settings_schema.py` (64 keys, `DEFAULT_SETTINGS`, `BUBBLE_DESIGNS`,
   stripped before TTS (`core/brain.py:20`), sentences starting `<3`/`<5 min`
   MUST survive.
 
-## 3. Tools (48, full census in `30-tools-api.md`)
+## 3. Tools (52, full census in `30-tools-api.md`)
 
 Desktop (gated `run_command` unless noted): `run_command`, `workspace`,
 `close_window`, `kill_process`+`confirm_kill`, `start_command`+`job_status`,
@@ -51,7 +51,11 @@ Knowledge (gate `web_access`): `get_weather`, `web_search`, `read_page`,
 (gate `calendar`): `calendar_month`, `read_calendar`. Personal (gate
 `reminders`): `set_reminder`, `list_reminders`, `cancel_reminder`,
 `snooze_reminder`. Ambient (own gates): `notification_reader`,
-`pomodoro`, `watch_file`, `watch_process`.
+`pomodoro`, `watch_file`, `watch_process`. Another app (gate
+`quant_space`): `quant_space_status`, `quant_space_sessions`,
+`quant_space_read`, `quant_space_check` — read-only, and the desk on the
+other side keeps its own Control switch and allow-list, so these relay what
+it says rather than deciding for it (`core/qs_desk.py`).
 
 ## 4. Bubble + settings GUI
 
@@ -114,15 +118,17 @@ Knowledge (gate `web_access`): `get_weather`, `web_search`, `read_page`,
 - N6 Platform: Arch/CachyOS + niri, NVIDIA strongly recommended (26B ≈
   14 GB VRAM), mic + speakers, Ollama, MPD for music, ydotoold for typing.
 
-## 8. Permission model (19 keys, `settings_schema.py:296`)
+## 8. Permission model (20 keys, `settings_schema.py:296`)
 
 Defaults ON: run/read/edit/self_restart/type/press_keys/web/media/screen/
-paste/copy/reminders/calendar/focus/get_datetime/pomodoro/watchers.
-Defaults OFF: `operator` (real pointer), `notifications` (private).
+paste/copy/reminders/calendar/focus/get_datetime/pomodoro/watchers/
+quant_space. Defaults OFF: `operator` (real pointer), `notifications`
+(private).
 `dry_run` False, `confirm_seconds` 90.0, `command_policy` per-tool
 ALLOW/DENY/CONFIRM, `extra_allowed_commands` extends the shell whitelist.
 `press_hotkey` rides the `press_keys` gate; `workspace`, `close_window`,
 `kill_process`, `start_command`, `job_status`, `open_app` ride `run_command`;
-`wait_for_window` rides `focus_window`. `wait`, `niri_capabilities`,
-`confirm_action`, `handsoff_doctor`, `get_datetime` are ungated by design
-(read-only or second-step).
+`wait_for_window` rides `focus_window`; the four `quant_space_*` tools ride
+the ONE gate `quant_space`. `wait`, `niri_capabilities`, `confirm_action`,
+`handsoff_doctor`, `get_datetime` are ungated by design (read-only or
+second-step).
