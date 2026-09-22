@@ -43,6 +43,14 @@ class PomodoroController:
         # the phase flip announces while holding it, and an announce is a
         # callback into the rest of the app.
         self._lock = threading.RLock()
+        # Self-watch probe: bumped at every phase boundary. A pomodoro whose
+        # thread is alive but whose phase clock never advances is wedged.
+        self._beat = 0
+
+    def beat(self) -> int:
+        """Progress signal for core.selfwatch; None-safe (see assistant probe)."""
+        with self._lock:
+            return self._beat
 
     def command(self, action: str, work: float, break_minutes: float) -> str:
         """Own the bounded pomodoro worker and announce work/break transitions."""
@@ -79,6 +87,8 @@ class PomodoroController:
                 return
             if stop.wait(max(0.05, state["until"] - time.monotonic())):
                 return
+            with self._lock:
+                self._beat = getattr(self, "_beat", 0) + 1
             phase = "break" if phase == "work" else "work"
             minutes = state["break"] if phase == "break" else state["work"]
             with self._lock:
@@ -278,6 +288,16 @@ class NotificationReader:
         # see half a pair: a failure with no attempt spent, or the reverse.
         self._health_lock = threading.Lock()
         self._health = self._blank_health()
+        # Self-watch probe: bumped once per dbus-monitor line the worker reads.
+        # A reader whose process is alive but wedged stops incrementing, which
+        # is exactly what the sampler wants to see.
+        self._beat_lock = threading.Lock()
+        self._beat = 0
+
+    def beat(self) -> int:
+        """Progress signal for core.selfwatch: monotonic, changes on traffic."""
+        with self._beat_lock:
+            return self._beat
 
     # -- the live run, as views onto the registered slot -----------------------
     # Kept as attributes' names because the assistant, the doctor and the tests
@@ -489,6 +509,10 @@ class NotificationReader:
             for line in proc.stdout or ():
                 if stop.is_set():
                     return
+                # Self-watch probe: one bump per dbus-monitor line read — a
+                # monitor that stopped emitting (wedged pipe) freezes this.
+                with self._beat_lock:
+                    self._beat += 1
                 if "member=Notify" in line and (
                         line.startswith("signal ") or line.startswith("method call ")):
                     values = []

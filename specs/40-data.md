@@ -3,7 +3,7 @@
 Sources: `settings_schema.py`, `core/settings.py`,
 `handsoff.py` paths/caps, `core/calendar.py`, `core/web.py`, `hardware.py`.
 
-## 1. settings.json (64 keys, `SETTINGS_VERSION = 2`)
+## 1. settings.json (65 keys, `SETTINGS_VERSION = 2`)
 
 Precedence: built-in defaults ← environment ← `settings.json`.
 Stamped `version` on every write. v0→v2 migration stepwise
@@ -78,7 +78,7 @@ atomic + 0600 (`atomic_private_write`, mkstemp in-dir, no predictable
 
 | Path | Format | Cap / note |
 |---|---|---|
-| `CONFIG_DIR/settings.json` | JSON + `version` | the 64 keys above |
+| `CONFIG_DIR/settings.json` | JSON + `version` | the 65 keys above |
 | `CONFIG_DIR/deployment.json` | `{files: {rel: {source_sha256, installed_sha256}}, …}` | written by install.sh; read by `_deployment_snapshot` |
 | `CONFIG_DIR/history.json` | [{role, content, images?}] | token-budget trimmed, images stripped on save |
 | `CONFIG_DIR/memory.json` | [{key, fact}] | ≤24, oldest dropped |
@@ -92,6 +92,7 @@ atomic + 0600 (`atomic_private_write`, mkstemp in-dir, no predictable
 | `STATE_DIR/reminders.json` | [{name, due, repeat}] | ≤64, `REMINDERS_LOCK` + sidecar flock |
 | `STATE_DIR/mic-health.json` | {events:[…], briefing} | ≤200 transitions |
 | `STATE_DIR/cap-refusals.json` | {totals, last} | ≤50; storm-proof |
+| `STATE_DIR/self-watch.jsonl` | one line per sampler tick with findings: `{t, findings:[{prefix, kind, since_s}], state}` | ≤200 lines, 0600; written whether or not the speaking switch is on — the file is the diagnosis, the announcement the convenience |
 | `STATE_DIR/decisions.jsonl` | JSON lines | ≤500 (`_DECISIONS_MAX`) |
 | `STATE_DIR/laya-turns.jsonl` | one line per completed turn: `{ts, text, tools}` | append-only; folded by `ci/laya_corpus.py` on every read, 0600 |
 | `STATE_DIR/laya-turns.cursor` | `{lines, hash, at}` | how much of the queue was folded; the hash catches a replaced queue |

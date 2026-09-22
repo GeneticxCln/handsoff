@@ -183,6 +183,11 @@ PTT_READ_ONLY = frozenset({"status", "health", "level", "doctor",
 MIC_EVENTS_FILE = STATE_DIR / "mic-health.json"   # mic transitions + last briefing
 MIC_EVENTS_MAX = 200                              # hard cap on recorded transitions
 _MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
+# Self-watch findings: what the sampler saw and when, so a death or wedge is
+# still diagnosable after the process that saw it is gone (the same reasoning
+# as the cap-refusals file).
+SELF_WATCH_FILE = STATE_DIR / "self-watch.jsonl"
+SELF_WATCH_MAX = 200                               # hard cap on recorded findings
 # Cap refusals: the bubble turning real work away because a bounded registry
 # was full. Kept on disk as well as in the journal, so `--ptt doctor` can still
 # report it once the process that refused it is gone — the point is that a
@@ -4373,6 +4378,7 @@ class WakeSpotter:
 # `_core_assistant.NotificationReader` where the app uses them, and the app's
 # namespace stops being a second copy of core.assistant's public names.
 _core_assistant = _load_module("assistant")
+_selfwatch_mod = _load_module("selfwatch")
 
 # The reminder queue's storage logic (parsing, serialized transactions,
 # startup catch-up, due-split arithmetic) lives in core.assistant.ReminderStore;
@@ -4484,6 +4490,32 @@ def _record_mic_event(from_state: str, to_state: str) -> None:
             _core_settings.atomic_private_write(MIC_EVENTS_FILE, json.dumps(doc))
     except Exception:
         log.exception("cannot record mic event")
+
+
+def _append_self_watch_record(findings: list, snap: dict) -> None:
+    """Append the sampler's findings to the self-watch state file (best
+    effort, one JSON line per tick that has something to say, capped). The
+    record lands even when the speaking switch is off — the file is the
+    diagnosis, the announcement is only the convenience."""
+    try:
+        line = json.dumps({
+            "t": time.time(),
+            "findings": findings,
+            "state": getattr(snap, "get", lambda *_a: None)("assistant"),
+        }, ensure_ascii=False)
+        with _MIC_EVENTS_LOCK:
+            lines = []
+            try:
+                lines = SELF_WATCH_FILE.read_text(encoding="utf-8")\
+                    .splitlines()
+            except (OSError, ValueError):
+                lines = []
+            lines.append(line)
+            lines = lines[-SELF_WATCH_MAX:]
+            _core_settings.atomic_private_write(SELF_WATCH_FILE,
+                                                "\n".join(lines) + "\n")
+    except Exception:
+        log.exception("cannot record self-watch finding")
 
 
 def _load_mic_events() -> dict:
@@ -5714,6 +5746,13 @@ class Assistant(QObject):
         }
         snap["deployment"] = _deployment_snapshot()
         snap["laya_corpus"] = _laya_corpus_counts()
+        try:
+            sw = self._selfwatch
+        except AttributeError:
+            sw = None
+        snap["self_watch"] = (
+            sw.snapshot_health(self._state, None) if sw is not None
+            else {"error": "self-watch not started"})
         return snap
 
     # -- mic self-heal -------------------------------------------------------
@@ -6406,6 +6445,77 @@ class Assistant(QObject):
                                name="missed-reminders")
         self._start_worker(self._reminder_worker, name="reminders")
         self._start_worker(self._settings_watch_worker, name="settings-watch")
+        # -- self-watch: the agent watching itself (the push half of health)
+        # Spawned ONCE at startup, like the reminder worker: a per-turn thread
+        # would both flap the baseline and outlive its purpose. The sampler
+        # never raises; a probe that raises is a None, not a crash.
+        self._selfwatch = _selfwatch_mod.SelfWatch(
+            sync_fns={
+                # A probe whose VALUE changes while the component works; a
+                # frozen value for WEDGED_AFTER_S is the wedge signal.
+                "reminders": "_selfwatch_probe_reminders",
+                "notification-reader": "_selfwatch_probe_reader",
+                "settings-watch": "_selfwatch_probe_settings_watch",
+                "pomodoro": "_selfwatch_probe_pomodoro",
+            })
+        self._start_worker(self._selfwatch_loop, name="self-watch")
+
+    # -- self-watch (the agent watching itself) ------------------------------
+
+    def _selfwatch_loop(self) -> None:
+        """The sampler's cadence, on the same shutdown Event as the other
+        workers: `_shutdown_event` is what `shutdown()` sets, so the watcher
+        dies with the process instead of lingering half-alive."""
+        while not self._shutdown_event.wait(_selfwatch_mod.WEDGED_AFTER_S / 4):
+            self._selfwatch_tick()
+
+    def _selfwatch_tick(self) -> dict:
+        """One sample: record, journal, speak what's due. Never raises.
+
+        The sampler itself always runs — `--ptt health` must show the truth
+        even when the switch is off — but the switch gates the SPEAKING: a
+        user who has not asked for self-announcements does not get them.
+        """
+        snap = self._selfwatch.tick(self)
+        if snap.get("error"):
+            log.warning("self-watch: sampler error %s", snap["error"])
+        pending = self._selfwatch.pending_announcements()
+        if pending:
+            _append_self_watch_record(pending, snap)
+        if not _setting_flag("self_watch", False):
+            return snap
+        for f in pending:
+            text = _selfwatch_mod.announcement_text(f)
+            log.warning("self-watch: %s", text)
+            try:
+                notify(text)
+            except Exception:                       # notify must not wedge us
+                log.exception("self-watch: notify failed")
+            self._announce_now(text)
+        return snap
+
+    # probes: a value that CHANGES while the component is healthy ----------
+
+    def _selfwatch_probe_reminders(self):
+        """The reminder worker's poll counter — set every 2 s pass."""
+        return getattr(self, "_reminder_beats", None)
+
+    def _selfwatch_probe_settings_watch(self):
+        """The settings watcher's poll counter — set every 3 s pass."""
+        return getattr(self, "_settings_watch_beats", None)
+
+    def _selfwatch_probe_reader(self):
+        """The reader's own monotonically increasing read counter."""
+        return getattr(self._notifications, "beat", lambda: None)()
+
+    def _selfwatch_probe_pomodoro(self):
+        """Pomodoro's poll counter, or None when the timer is not running
+        (a stopped timer is not a wedged one — no probe, no finding)."""
+        ctrl = getattr(self._pomodoro, "_thread", None)
+        if ctrl is None or not ctrl.is_alive():
+            return None
+        return getattr(self._pomodoro, "beat", lambda: None)()
+
     def shutdown(self) -> None:
         self._lifecycle_ensure()
         if self._closed:

@@ -1,6 +1,6 @@
 # handsoff — requirements
 
-Sources: `settings_schema.py` (64 keys, `DEFAULT_SETTINGS`, `BUBBLE_DESIGNS`,
+Sources: `settings_schema.py` (65 keys, `DEFAULT_SETTINGS`, `BUBBLE_DESIGNS`,
 `APPEARANCE_LOOKS`), `core/tools.py` (`@tool`, `DecisionPolicy`, `ALLOWED`,
 `BLOCKED`), `handsoff.py` (`PTT_ACTIONS`, `PTT_READ_ONLY`, assistant states).
 

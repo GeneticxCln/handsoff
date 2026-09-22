@@ -361,6 +361,9 @@ DEFAULT_SETTINGS: dict = {
                                    # the speech model to give the card back
                                    # (it reloads in seconds)
     "notification_reader": False,  # desktop notifications are private by default
+    "self_watch": False,           # the agent watching itself (announcements off
+                                   # by default; --ptt health carries the section
+                                   # either way)
     "notification_mute_apps": [],
 }
 
@@ -883,6 +886,12 @@ SETTINGS_FIELDS: tuple = (
        title="Read desktop notifications aloud (opt-in)",
        tip="Private by default. When enabled, future notifications are spoken; "
            "nothing already on screen is read, and no text is stored.", group="hands-free"),
+    _f("self_watch", "bool", tab="voice",
+       title="Watch my own worker threads and speak up when one dies or wedges",
+       tip="The agent watching itself: the sampler inventories its own long-lived "
+           "threads and their progress signals, and announces a dead or stuck "
+           "component instead of failing quietly. Findings are also visible in "
+           "--ptt health under self_watch.", group="hands-free"),
     _f("notification_mute_apps", "str_list", cap=32, lower=True, tab="voice",
        title="Apps never read aloud", ctrl="commas",
        tip="App names, comma separated, matched case-insensitively.", group="hands-free"),
