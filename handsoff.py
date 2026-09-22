@@ -1733,6 +1733,7 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         crash_log=CRASH_LOG,
         appearance_look=_appearance_note,
         web_lines=_web_lines,
+        stop_attribution_health=_stop_attribution_health,
         # ONE story for the card: the tenants, the speech models, the LLM and
         # what the next turn asks for are one host collector behind one doctor
         # section, so no two lines can describe the same memory differently.
@@ -4476,6 +4477,69 @@ def _laya_corpus_counts() -> dict:
             "grown_rows": _rows(LAYA_CORPUS_FILE)}
 
 
+# The stop-probe's ledger: the unit's ExecStop appends one JSON line per stop
+# job, naming whoever invoked it. Reported through health and doctor so a stop
+# with a named caller is visible without reading the raw file.
+STOP_ATTRIBUTION_FILE = STATE_DIR / "stop-attribution.jsonl"
+_STOP_ATTRIBUTION_TAIL = 3          # lines health reports at most
+_STOP_ATTRIBUTION_CMD_CHARS = 120   # per-caller cmdline chars health carries
+
+
+def _stop_attribution_health() -> dict:
+    """The tail of the stop-attribution ledger, shaped for health/doctor.
+
+    The ledger is written by `handsoff-stop-probe` (the unit's ExecStop=), one
+    JSON line per stop job. Health reports the LAST few entries with the
+    caller's exe, cmdline head and ancestry chain — enough to answer "who
+    stopped it?" without opening the file. Read-only, best effort: a missing
+    ledger means "no stop observed since the probe shipped", and a corrupt
+    line is skipped, never raised (diagnostics must not break health).
+    """
+    try:
+        with STOP_ATTRIBUTION_FILE.open("r", encoding="utf-8") as fh:
+            lines = [ln for ln in fh if ln.strip()]
+    except OSError:
+        return {"present": False, "total": 0, "last": None}
+
+    def _one(ln: str) -> dict:
+        rec = json.loads(ln)
+        callers = rec.get("callers") or []
+        shaped = []
+        for c in callers:
+            if not isinstance(c, dict):
+                continue
+            shaped.append({
+                "pid": c.get("pid"),
+                "exe": c.get("exe") or "",
+                "cmd": (c.get("cmd") or "")[:_STOP_ATTRIBUTION_CMD_CHARS],
+                "chain": [
+                    {"exe": (h.get("exe") or ""),
+                     "cmd": (h.get("cmd") or "")[:_STOP_ATTRIBUTION_CMD_CHARS]}
+                    for h in (c.get("chain") or []) if isinstance(h, dict)
+                ],
+            })
+        return {"ts": rec.get("ts") or "",
+                "callers": shaped,
+                "note": rec.get("note") or "",
+                "unattributed": not shaped}
+
+    last: dict | None = None
+    total = 0
+    tail: list[dict] = []
+    for ln in lines:
+        try:
+            rec = _one(ln)
+        except (ValueError, TypeError):
+            continue          # a torn or hand-edited line is skipped, not fatal
+        total += 1
+        tail.append(rec)
+        if len(tail) > _STOP_ATTRIBUTION_TAIL:
+            tail.pop(0)
+    if tail:
+        last = tail[-1]
+    return {"present": True, "total": total, "last": last, "tail": tail}
+
+
 def _record_mic_event(from_state: str, to_state: str) -> None:
     """Append one mic-state transition to the mic-health state file (best
     effort: diagnostics must never break the audio path)."""
@@ -5763,6 +5827,7 @@ class Assistant(QObject):
         }
         snap["deployment"] = _deployment_snapshot()
         snap["laya_corpus"] = _laya_corpus_counts()
+        snap["stop_attribution"] = _stop_attribution_health()
         try:
             sw = self._selfwatch
         except AttributeError:

@@ -85,7 +85,7 @@ class DoctorDeps:
         "control_sock", "crash_log", "remote_ollama_allowed",
         "remote_ollama_optin_source",
         "cap_refusal_note", "cap_refusals",
-        "appearance_look", "web_lines",
+        "appearance_look", "web_lines", "stop_attribution_health",
         "gpu_lines", "gpu_headroom",
         "shutil", "sounddevice", "log",
     )
@@ -118,6 +118,7 @@ class DoctorDeps:
         self.crash_log: Path = Path("/nonexistent/crash.log")
         self.remote_ollama_allowed: Callable[[], bool] | None = None
         self.remote_ollama_optin_source: Callable[[], str] | None = None
+        self.stop_attribution_health: Callable[[], dict] | None = None
         # Cap refusals: how often a bounded registry has turned real work away.
         # A host that does not record them reports none, which is also the
         # truthful answer for a host that has no registries to bound.
@@ -461,6 +462,39 @@ def _lines(deps: DoctorDeps) -> list[str]:
     else:
         lines.append("systemd unit: not installed (autostart falls back to niri spawn)")
 
+    # Stop attribution: the unit's ExecStop probe records WHO stops this unit.
+    # A stop with a named caller is the one evidence the restart killer leaves,
+    # so doctor reports the last one here — reported even when empty, so "none"
+    # is a finding (no stop observed / probe not shipped) rather than silence.
+    sa = getattr(deps, "stop_attribution_health", None)
+    if sa is not None:
+        try:
+            h = sa() or {}
+        except Exception:
+            h = {"present": False}
+        last = h.get("last")
+        if last:
+            callers = last.get("callers") or []
+            if callers:
+                c = callers[0]
+                chain = " <- ".join(
+                    (hc.get("exe") or "?") for hc in (c.get("chain") or [])[:3])
+                when = str(last.get("ts") or "")[:19]
+                lines.append(
+                    f"stop attribution: last stop {when} by "
+                    f"{c.get('exe') or '?'} ({chain})"
+                    + (f" +{len(callers) - 1} more caller(s)" if len(callers) > 1 else ""))
+            else:
+                lines.append(
+                    f"stop attribution: last stop {str(last.get('ts') or '')[:19]} "
+                    "had NO visible caller (session shutdown or direct D-Bus call)")
+        elif h.get("present"):
+            lines.append("stop attribution: ledger present, no stop recorded yet")
+        else:
+            lines.append(
+                "stop attribution: no ledger — probe not shipped or no stop "
+                "since it landed (install.sh wires it as ExecStop=)")
+
     if deps.crash_log.exists():
         try:
             age = time.time() - deps.crash_log.stat().st_mtime
@@ -549,6 +583,15 @@ def doctor_json() -> dict:
                 re.search(r"^Restart=(always|on-failure|on-abnormal)$", txt, re.M))
         except OSError:
             pass
+    try:
+        sa = deps.stop_attribution_health() or {}
+    except Exception:
+        sa = {}
+    out["stop_attribution"] = {
+        "present": bool(sa.get("present")),
+        "total": int(sa.get("total") or 0),
+        "last": sa.get("last"),
+    }
     # Only when the host measured or estimated something: a host without the
     # dep leaves the JSON exactly as it was, the same way its text report is
     # unchanged. The dict is passed through as the host built it — this module

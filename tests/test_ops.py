@@ -682,6 +682,82 @@ class TestDoctor:
         assert "whisper: revision unknown; sha256 unknown" in text
         assert "python: " in text
 
+    # ---- stop-attribution ledger in doctor + health -----------------------
+
+    def test_doctor_reports_a_named_stopper(self, H, monkeypatch, tmp_path):
+        """The whole point: "who stopped the unit?" is answerable from doctor,
+        without reading the raw ledger file."""
+        ledger = tmp_path / "stop-attribution.jsonl"
+        ledger.write_text(json.dumps({
+            "ts": "2026-09-22T18:41:43+02:00", "unit": "handsoff.service",
+            "callers": [{"pid": 7, "exe": "systemctl",
+                         "cmd": "systemctl --user stop handsoff.service",
+                         "chain": [{"pid": 6, "exe": "bash",
+                                    "cmd": "bash -c systemctl ..."}]}],
+            "note": ""}) + "\n", encoding="utf-8")
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        text = H.run_doctor()
+        assert "stop attribution: last stop 2026-09-22T18:41:43 by systemctl (bash)" in text, text
+        out = H.doctor_json()["stop_attribution"]
+        assert out["present"] and out["total"] == 1
+        assert out["last"]["callers"][0]["exe"] == "systemctl"
+        assert out["last"]["callers"][0]["chain"][0]["exe"] == "bash"
+
+    def test_doctor_reports_an_unattributed_stop(self, H, monkeypatch, tmp_path):
+        """callers:[] is a finding, not a failure: it is what a session
+        shutdown or a direct D-Bus call looks like — doctor must say so."""
+        ledger = tmp_path / "stop-attribution.jsonl"
+        ledger.write_text(json.dumps({
+            "ts": "2026-09-22T19:00:00+02:00", "unit": "handsoff.service",
+            "callers": [], "note": "no invoking process visible"}) + "\n",
+            encoding="utf-8")
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        text = H.run_doctor()
+        assert "stop attribution: last stop 2026-09-22T19:00:00 had NO visible caller" in text
+        assert H.doctor_json()["stop_attribution"]["last"]["unattributed"] is True
+
+    def test_doctor_says_when_the_ledger_is_absent(self, H, monkeypatch, tmp_path):
+        """No ledger is a positive finding with a reason ("probe not shipped or
+        no stop since"), never a missing line — the cap-refusal rule."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", tmp_path / "none.jsonl")
+        text = H.run_doctor()
+        assert "stop attribution: no ledger" in text
+        assert H.doctor_json()["stop_attribution"] == {
+            "present": False, "total": 0, "last": None}
+
+    def test_health_snapshot_carries_the_attribution_tail(self, H, monkeypatch,
+                                                          tmp_path):
+        """--ptt health carries the same tail: exe, cmdline head and the chain,
+        capped, so a wedged stop shows without reading the file."""
+        ledger = tmp_path / "stop-attribution.jsonl"
+        rows = [
+            {"ts": f"2026-09-22T19:0{i}:00+02:00", "unit": "handsoff.service",
+             "callers": [{"pid": i, "exe": "systemctl",
+                          "cmd": "x" * 400, "chain": []}], "note": ""}
+            for i in range(5)
+        ]
+        ledger.write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        health = H._stop_attribution_health()
+        assert health["present"] and health["total"] == 5
+        assert len(health["tail"]) == 3          # capped at the last three
+        assert health["last"]["ts"].startswith("2026-09-22T19:04")
+        assert len(health["last"]["callers"][0]["cmd"]) == 120   # cmdline head
+
+    def test_a_torn_ledger_line_is_skipped_not_fatal(self, H, monkeypatch,
+                                                     tmp_path):
+        """Diagnostics must not break on a half-written line: the probe appends
+        under systemd, so a torn tail is possible; skip it, count the rest."""
+        ledger = tmp_path / "stop-attribution.jsonl"
+        good = json.dumps({"ts": "t1", "unit": "handsoff.service",
+                           "callers": [], "note": ""})
+        ledger.write_text(good + "\n{" + "\n", encoding="utf-8")  # + torn line
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        health = H._stop_attribution_health()
+        assert health["total"] == 1 and health["last"]["ts"] == "t1"
+        assert "stop attribution: no ledger" not in H.run_doctor()
+
     def test_doctor_json_shape(self, H, monkeypatch, tmp_path):
         monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "none.json")
         d = H.doctor_json()
