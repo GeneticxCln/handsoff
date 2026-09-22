@@ -222,6 +222,97 @@ class TestCrossings:
         assert "Ollama" in a._hardware_note
 
 
+class TestMicDead:
+    """The mic-dead rule: the device OPENS but yields nothing — the two
+    shapes the listener already classifies (`silent`, or `stalled` while
+    listening, the EIO wedge) — announced once per episode with the way out
+    named, never on a healthy or stopped capture."""
+
+    def _silent(self, H, monkeypatch, device="Blue Yeti"):
+        a, said, popped = _assistant(H, monkeypatch)
+        monkeypatch.setattr(H._hardware, "disk_free",
+                            lambda path="/": {"ok": True, "total": 10 ** 12,
+                                               "free": 100 * 2 ** 30})
+        a._listener = types.SimpleNamespace(
+            mic_snapshot=lambda: {"state": "silent", "device": device})
+        H._DOCTOR_TTL.clear()
+        H._DOCTOR_TTL["data"] = {"audio": {"ok": True, "count": 2, "inputs": [
+            "Blue Yeti", "Logitech StreamCam: USB Audio (hw:3,0)"]}}
+        H._DOCTOR_TTL["at"] = {"audio": time.monotonic()}
+        return a, said, popped
+
+    def test_two_strike_silent_announces_once_with_backup(self, H,
+                                                          watch_settings,
+                                                          monkeypatch):
+        a, said, popped = self._silent(H, monkeypatch)
+        a._hardware_tick()                       # strike 1: a blip stays silent
+        assert said == [] and popped == []
+        a._hardware_tick()                       # strike 2: urgent, once
+        assert len(said) == 1 and len(popped) == 1
+        assert "Blue Yeti" in said[0] and "silence" in said[0]
+        assert "StreamCam" in said[0]            # the way out is named
+        a._hardware_tick()                       # still dead: no repeat
+        assert len(said) == 1 and len(popped) == 1
+
+    def test_stalled_listening_reads_the_same(self, H, watch_settings,
+                                              monkeypatch):
+        a, said, popped = self._silent(H, monkeypatch)
+        a._listener = types.SimpleNamespace(
+            mic_snapshot=lambda: {"state": "listening", "stalled": True,
+                                  "device": "Blue Yeti"})
+        a._hardware_tick()
+        a._hardware_tick()
+        assert len(said) == 1 and len(popped) == 1
+        assert "stopped streaming" in said[0]
+
+    def test_recovery_rearms_with_a_note(self, H, watch_settings,
+                                         monkeypatch):
+        a, said, popped = self._silent(H, monkeypatch)
+        a._hardware_tick()
+        a._hardware_tick()
+        assert len(said) == 1
+        a._listener = types.SimpleNamespace(
+            mic_snapshot=lambda: {"state": "listening", "device": "Blue Yeti",
+                                  "stalled": False})
+        a._hardware_tick()                       # healthy: re-arm + note
+        assert len(said) == 1 and len(popped) == 1
+        assert a._hardware_last["mic_dead"] is False
+        a._hardware_note = ""
+        a._listener = types.SimpleNamespace(
+            mic_snapshot=lambda: {"state": "silent", "device": "Blue Yeti"})
+        a._hardware_tick()
+        a._hardware_last_urgent = 0.0          # cooldown expired, as in TestCrossings
+        a._hardware_tick()                       # second episode: announces again
+        assert len(said) == 2 and len(popped) == 2
+
+    def test_stopped_listener_is_not_a_dead_mic(self, H, watch_settings,
+                                                monkeypatch):
+        a, said, popped = self._silent(H, monkeypatch)
+        a._listener = types.SimpleNamespace(
+            mic_snapshot=lambda: {"state": "stopped", "device": "Blue Yeti"})
+        a._hardware_tick()
+        a._hardware_tick()
+        assert said == [] and popped == []
+
+    def test_no_backup_visible_says_so(self, H, watch_settings, monkeypatch):
+        a, said, popped = self._silent(H, monkeypatch)
+        H._DOCTOR_TTL["data"] = {"audio": {"ok": True, "count": 1,
+                                           "inputs": ["Blue Yeti"]}}
+        H._DOCTOR_TTL["at"] = {"audio": time.monotonic()}
+        a._hardware_tick()
+        a._hardware_tick()
+        assert len(said) == 1 and len(popped) == 1
+        assert "No other input device" in said[0]
+
+    def test_exploding_snapshot_never_raises(self, H, watch_settings,
+                                             monkeypatch):
+        a, said, popped = _assistant(H, monkeypatch)
+        a._listener = types.SimpleNamespace(
+            mic_snapshot=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        a._hardware_tick()
+        assert said == [] and popped == []
+
+
 class TestRobustness:
     def test_exploding_probers_never_raise(self, H, watch_settings, monkeypatch):
         def boom(*a, **k):

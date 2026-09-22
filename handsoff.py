@@ -6262,6 +6262,45 @@ class Assistant(QObject):
                 urgent = urgent or "Microphone unplugged: no input devices"
             if isinstance(audio, dict) and audio.get("count") is not None:
                 last["audio_count"] = audio.get("count")
+            # -- mic dead: the device OPENS but yields nothing. Two shapes
+            # the listener already classifies: `silent` (reads succeed, every
+            # frame is zero — a dead element or muted hardware) and `stalled`
+            # while listening (reads stop arriving — the EIO wedge). Two
+            # consecutive ticks, like the Ollama rule (one blip stays
+            # silent), then urgent ONCE per episode with the way out named:
+            # another visible input as the backup. A stopped listener is not
+            # a dead mic — the rule watches a live capture only.
+            mic_dead = (((mic or {}).get("state") == "silent")
+                        or ((mic or {}).get("stalled")
+                            and (mic or {}).get("state") == "listening"))
+            if mic_dead:
+                last["micdead_miss"] = last.get("micdead_miss", 0) + 1
+                if last["micdead_miss"] >= 2 and not last.get("mic_dead"):
+                    last["mic_dead"] = True
+                    dev = str((mic or {}).get("device") or "?")
+                    why = ("returns only silence"
+                           if (mic or {}).get("state") == "silent"
+                           else "has stopped streaming")
+                    backup = None
+                    if isinstance(audio, dict):
+                        for name in (audio.get("inputs") or []):
+                            name = str(name or "")
+                            if (name
+                                    and name.lower() not in dev.lower()
+                                    and dev.lower() not in name.lower()):
+                                backup = name
+                                break
+                    tail = (f"Switch me to {backup} in settings."
+                            if backup else
+                            "No other input device is visible.")
+                    urgent = urgent or (
+                        f"My microphone ({dev}) {why} — I cannot hear "
+                        f"you. {tail}")
+            else:
+                if last.get("mic_dead"):
+                    notes.append("Microphone is producing audio again")
+                last["mic_dead"] = False
+                last["micdead_miss"] = 0
             # -- channels: note for the next turn, urgent via popup + speech
             if notes:
                 self._hardware_note = "\n".join(notes[:2])[:200]
