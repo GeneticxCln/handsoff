@@ -681,6 +681,7 @@ _DEPLOY_FILES = (
     "core/settings.py",
     "core/doctor.py",
     "handsoff-restart",
+    "handsoff-stop-probe",
 )
 
 

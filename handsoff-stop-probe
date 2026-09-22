@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# handsoff-stop-probe — attribute a handsoff.service stop to whoever asked for it.
+#
+# Why this exists: three fault-injection turns in a row lost their answer to a
+# systemd stop that arrived seconds after the answer was submitted, with no
+# caller the user journal could name ("Stopping handsoff voice assistant
+# bubble…" is a stop JOB, so the invoker was unit management — but WHO invoked
+# it never reached the journal). A probe wired as ExecStop= runs at exactly the
+# one instant the invoker is still visible: a stop job blocks its caller, so
+# whoever ran `systemctl --user stop/restart handsoff.service` (or the settings
+# GUI's "stop the unit instead") is still sitting in /proc when this starts.
+# After the job completes the caller is gone, which is why a post-hoc journal
+# or /proc sweep could never answer the question.
+#
+# Semantics that matter:
+#   * ExecStop runs ONLY on a stop job — explicit stop, restart, or session
+#     teardown (PartOf=graphical-session.target). A crash respawn under
+#     Restart=always does NOT run it: "it died" and "someone stopped it" are
+#     different events, and the journal already covers the first.
+#   * The probe is read-only over /proc and appends one JSONL line to
+#     $XDG_STATE_HOME/handsoff/stop-attribution.jsonl (0600). It spawns
+#     nothing, touches nothing else, and ALWAYS exits 0: a failing ExecStop
+#     would mark the unit itself failed, which is a worse outcome than a
+#     missed attribution.
+#   * Read the ledger with:
+#       tail ~/.local/state/handsoff/stop-attribution.jsonl
+#     callers:[] (no invoking process visible) is itself information: it is
+#     what a session shutdown or a direct D-Bus API call looks like.
+#   * Budget: ≤ 6 hops of ancestry, newest first, so the chain reads
+#     "systemctl ← bash -c … ← node" without drowning the line.
+#
+# Two env seams exist for the suite only; production never sets either:
+#   HANDSOFF_PROC_ROOT  — the /proc tree to scan (default /proc)
+#   HANDSOFF_STOP_LOG   — the ledger path override (default under the state dir)
+set -u
+
+# systemd user units always have HOME; if some exotic manager does not, there
+# is nowhere meaningful to log — leave silently rather than fail the stop job.
+[ -n "${HOME:-}" ] || exit 0
+
+PROC_ROOT="${HANDSOFF_PROC_ROOT:-/proc}"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
+OUT="${HANDSOFF_STOP_LOG:-$STATE/stop-attribution.jsonl}"
+UNIT="handsoff.service"
+
+# JSON string body: backslash and quote escaped; control characters are
+# stripped by the callers before reaching here, so nothing can split the line.
+json_str() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+hop_json() {  # $1 = pid → {"pid","exe","cmd"} for one process, or nothing
+    local p="$1" c exe
+    c="$(tr '\0' ' ' <"$PROC_ROOT/$p/cmdline" 2>/dev/null)" || return 1
+    c="$(printf '%s' "$c" | tr -d '\000-\037\177')"
+    [ -n "$c" ] || return 1
+    exe="$(readlink "$PROC_ROOT/$p/exe" 2>/dev/null)" || exe=""
+    printf '{"pid":%s,"exe":"%s","cmd":"%s"}' \
+        "$p" "$(json_str "${exe##*/}")" "$(json_str "${c:0:200}")"
+}
+
+# newest → oldest via each process's ppid (stat field 4, after the greedy
+# strip of "pid (comm) " — comm itself may contain spaces and parentheses).
+hop_ppid() {
+    sed -n 's/.*) \(.\) \([0-9]*\) .*/\2/p' "$PROC_ROOT/$1/stat" 2>/dev/null
+}
+
+ancestry_chain() {  # $1 = pid → the caller's chain EXCLUDING itself
+    # A hop whose /proc reads fail mid-chain (a defunct parent has an empty
+    # cmdline) is SKIPPED, not emitted empty: an entry that never materialises
+    # must not leave a dangling comma behind, which would make the whole line
+    # unparseable JSON — a ledger you cannot `jq` is a ledger you will not read.
+    # The failed hop still CONSUMES budget, and this loop runs inside a stop
+    # job: a self-parented or corrupt stat must cost iterations, never hang the
+    # stop (TimeoutStopSec is the only backstop, and it is minutes).
+    local p="$1" hops=0 acc="" entry
+    while [ "$hops" -lt 6 ]; do
+        p="$(hop_ppid "$p")"
+        case "$p" in ''|*[!0-9]*) break ;; esac
+        [ "$p" -gt 1 ] || break                # stop before systemd itself
+        hops=$((hops + 1))
+        entry="$(hop_json "$p")" || continue
+        if [ -n "$acc" ]; then acc="$acc,$entry"; else acc="$entry"; fi
+    done
+    printf '%s' "$acc"
+}
+
+# --- the scan: who, right now, is a process that mentions handsoff AND is a
+# unit-management client. Everything else that merely mentions "handsoff" (the
+# bubble itself, an editor with the file open, a journalctl tail) is not a
+# caller, and a python exe is excluded as a second net: the bubble's own
+# cmdline names handsoff.py, and the probe must never attribute a stop to the
+# thing being stopped.
+callers=""
+ncallers=0
+for d in "$PROC_ROOT"/[0-9]*; do
+    p="${d##*/}"
+    [ "$p" = "$$" ] && continue
+    cmd="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" || continue
+    case "$cmd" in *handsoff*) ;; *) continue ;; esac
+    case "$cmd" in
+        *systemctl*|*busctl*|*dbus-send*|*gdbus*) ;;
+        *) continue ;;
+    esac
+    exe="$(readlink "$d/exe" 2>/dev/null)" || exe=""
+    case "${exe##*/}" in
+        python*|systemd*) continue ;;
+    esac
+    h="$(hop_json "$p")" || continue
+    chain="$(ancestry_chain "$p")"
+    entry="$h"
+    if [ -n "$chain" ]; then
+        # Splice "chain" INSIDE the caller object: hop_json always ends its
+        # object with one brace, so drop exactly that char and graft the key
+        # in its place (a sibling "chain" makes the whole line unparseable —
+        # the ledger must be jq-able to be readable).
+        entry="${h::-1},\"chain\":[$chain]}"
+    fi
+    if [ "$ncallers" -eq 0 ]; then
+        callers="$entry"
+    else
+        callers="$callers,$entry"
+    fi
+    ncallers=$((ncallers + 1))
+done
+
+ts="$(date -Is 2>/dev/null || date)"
+if [ "$ncallers" -eq 0 ]; then
+    note="no invoking process visible in /proc — a session shutdown, a direct D-Bus API call, or a caller that already exited"
+else
+    note=""
+fi
+# (the note is spelled into $note above and used once below; a placeholder
+# name here would die under set -u and a FAILED ExecStop marks the whole
+# unit failed — a worse outcome than any missed attribution)
+
+mkdir -p "$STATE" 2>/dev/null || true
+if [ ! -e "$OUT" ]; then
+    : >"$OUT" 2>/dev/null && chmod 600 "$OUT" 2>/dev/null || exit 0
+fi
+
+printf '{"ts":"%s","unit":"%s","callers":[%s],"note":"%s"}\n' \
+    "$(json_str "$ts")" "$UNIT" "$callers" "$(json_str "$note")" \
+    >>"$OUT" 2>/dev/null || exit 0

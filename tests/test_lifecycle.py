@@ -2219,6 +2219,148 @@ class TestRestartScriptSystemdAware:
             "a pid was announced for a process that never started")
 
 
+class TestStopProbe:
+    """handsoff-stop-probe: the unit's ExecStop journal-tripwire.
+
+    Three injection turns lost their answer to a systemd stop whose invoker the
+    journal never named — a stop JOB's caller is gone by the time anything
+    post-hoc looks. ExecStop= is the one seam that runs while the caller is
+    still visible (it blocks on the job), so the probe runs there. These
+    guards prove the probe's BEHAVIOUR by execution against a fake /proc and
+    pin the installer wiring that keeps it live.
+    """
+
+    @staticmethod
+    def _run_probe(tmp_path, proc_root, *, env_extra=None):
+        env = sandbox_env(tmp_path / "home")
+        env.update({
+            "XDG_STATE_HOME": str(tmp_path / "state"),
+            "HANDSOFF_PROC_ROOT": str(proc_root),
+        })
+        env.update(env_extra or {})
+        return subprocess.run(
+            ["bash", str(HERE / "handsoff-stop-probe")],
+            env=env, capture_output=True, text=True, timeout=30)
+
+    @staticmethod
+    def _proc_entry(proc, pid, ppid, exe_name, cmdline):
+        d = proc / str(pid)
+        d.mkdir(parents=True)
+        (d / "cmdline").write_bytes(
+            cmdline.replace("\x00", "\x00").encode("utf-8") + b"\x00")
+        if exe_name:
+            # readlink reads a SYMLINK, not a regular file: the fake /proc exe
+            # is a link to a target whose basename the probe then reports.
+            (d / "exe").symlink_to("/usr/bin/" + exe_name)
+        (d / "stat").write_text(
+            f"{pid} ({exe_name or 'unknown'}) R {ppid} 0 0 0 0 0 0 0 0\n")
+
+    def test_a_visible_systemctl_caller_is_attributed_with_its_chain(
+            self, tmp_path):
+        """The shape this exists for: `bash -c 'systemctl --user stop …'`.
+
+        The invoker itself plus its ancestry chain are recorded — the chain is
+        what names the AGENT behind a `bash -c` wrapper, the thing the
+        post-hoc journal could never answer.
+        """
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        self._proc_entry(proc, 400, 300, "bash", "bash\x00-c\x00systemctl --user stop handsoff.service")
+        self._proc_entry(proc, 300, 1, "node", "node\x00agent.mjs\x00--do-things")
+        result = self._run_probe(tmp_path, proc)
+        assert result.returncode == 0, result.stderr
+        line = (tmp_path / "state" / "handsoff"
+                / "stop-attribution.jsonl").read_text().strip().splitlines()[-1]
+        rec = json.loads(line)
+        assert rec["unit"] == "handsoff.service"
+        assert len(rec["callers"]) == 1
+        caller = rec["callers"][0]
+        assert caller["pid"] == 400
+        assert caller["exe"] == "bash"
+        assert "systemctl --user stop handsoff.service" in caller["cmd"]
+        assert len(caller["chain"]) == 1
+        # hop_json renders argv space-joined with one trailing space — the
+        # test pins the parseable shape, not bash's argv spacing.
+        assert caller["chain"][0]["cmd"].strip() == "node agent.mjs --do-things"
+        assert rec["note"] == "", "a caller was found; the note must stay empty"
+
+    def test_the_bubble_itself_is_never_a_caller(self, tmp_path):
+        """The bubble's cmdline names handsoff.py — a python exe is excluded
+        as a second net, so the probe can never attribute the stop to the
+        thing being stopped."""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        self._proc_entry(proc, 500, 1, "python3.13",
+                         "python3\x00/home/u/.local/bin/handsoff.py")
+        result = self._run_probe(tmp_path, proc)
+        rec = json.loads((tmp_path / "state" / "handsoff"
+                          / "stop-attribution.jsonl").read_text().strip())
+        assert rec["callers"] == []
+        assert "no invoking process visible" in rec["note"]
+
+    def test_editors_and_journal_tails_are_not_callers(self, tmp_path):
+        """Mentioning handsoff without being a unit-management client is not a
+        caller: an editor with the file open or a journalctl tail must not be
+        mistaken for whoever stopped the unit."""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        self._proc_entry(proc, 600, 1, "vi", "vi\x00/home/u/Projects/handsoff/handsoff.py")
+        self._proc_entry(proc, 601, 1, "journalctl",
+                         "journalctl\x00--user\x00-u\x00handsoff\x00-f")
+        r = self._run_probe(tmp_path, proc)
+        assert r.returncode == 0, r.stderr
+        rec = json.loads((tmp_path / "state" / "handsoff"
+                          / "stop-attribution.jsonl").read_text().strip())
+        assert rec["callers"] == []
+
+    def test_no_caller_yields_the_empty_note_and_still_exits_zero(
+            self, tmp_path):
+        """An empty callers list is itself information (a session shutdown or a
+        direct D-Bus call), and a probe with nothing to report must still exit
+        0 — a failing ExecStop marks the whole unit failed, which is a worse
+        outcome than any missed attribution."""
+        proc = tmp_path / "proc"
+        proc.mkdir()   # empty /proc: no processes at all
+        result = self._run_probe(tmp_path, proc)
+        assert result.returncode == 0, result.stderr
+        rec = json.loads((tmp_path / "state" / "handsoff"
+                          / "stop-attribution.jsonl").read_text().strip())
+        assert rec["callers"] == [] and rec["note"]
+
+    def test_ledger_is_private_and_appends(self, tmp_path):
+        """The ledger holds stop provenance — 0600, appended, never truncated
+        by a second probe run."""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        self._proc_entry(proc, 700, 1, "systemctl", "systemctl --user stop handsoff.service")
+        self._run_probe(tmp_path, proc)
+        self._run_probe(tmp_path, proc)
+        ledger = tmp_path / "state" / "handsoff" / "stop-attribution.jsonl"
+        lines = ledger.read_text().strip().splitlines()
+        assert len(lines) == 2, "each probe run appends exactly one line"
+        assert ledger.stat().st_mode & 0o777 == 0o600, oct(ledger.stat().st_mode)
+        assert all(json.loads(l)["ts"] for l in lines)
+
+    def test_installer_wiring_keeps_the_probe_live(self):
+        """The probe is only as real as its wiring: ExecStop= must name it,
+        and every shipped-set step must carry it beside handsoff-restart."""
+        src = (HERE / "install.sh").read_text()
+        assert "ExecStop=%h/.local/bin/handsoff-stop-probe" in src, (
+            "the unit must wire the probe as its stop attribution hook")
+        assert 'install -m 755 "$HERE/handsoff-stop-probe"' in src
+        assert "SWITCH_FILES_755=\"handsoff-restart handsoff-stop-probe\"" in src
+        assert "$PREV/\"handsoff-stop-probe" not in src  # no mangled glob
+        assert '$PREV"/handsoff-stop-probe' in src, "rollback must restore it"
+        assert "handsoff-settings.py handsoff-restart handsoff-stop-probe" in src, (
+            "the manifest-less uninstall fallback must remove it")
+        # The probe is shipped code: the hook and the gates check it by
+        # shebang, but the shipped-set floors must name it.
+        deploy = (HERE / "handsoff.py").read_text()
+        assert '"handsoff-stop-probe",' in deploy, (
+            "_DEPLOY_FILES is the floor; a probe missing from it escapes "
+            "the manifest-less drift comparison")
+
+
 class TestToolSchemaFromCode:
     """@tool decorator: Python functions ARE the Ollama tool schema."""
 
@@ -2755,6 +2897,7 @@ class TestStagedRelease:
     # the one artifact installed by name, and the requirement pair whose
     # consistency is validated ahead of the rehearsal's pip skip.
     SHIPPED_FROM_CHECKOUT = ("install.sh", "handsoff-restart",
+                             "handsoff-stop-probe",
                              "requirements.txt", "requirements-lock.txt")
 
     def _fake_home(self, tmp_path, bin_py="# deployed handsoff\n"):

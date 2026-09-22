@@ -1071,7 +1071,7 @@ class TestInstalledCopySmoke:
         # single-source defaults, hardware = lazy-imported watch, core/ = the
         # settings package from split step (a))
         for name in ("handsoff.py", "handsoff-settings.py", "handsoff-restart",
-                     "settings_schema.py", "hardware.py"):
+                     "handsoff-stop-probe", "settings_schema.py", "hardware.py"):
             src = HERE / name
             if src.exists():
                 (bin_dir / name).write_bytes(src.read_bytes())
@@ -1543,7 +1543,8 @@ class TestInstallerRehearsal:
         hashed = sorted(k for k in manifest["files"] if k.startswith("core/"))
         assert hashed == [f"core/{name}" for name in sorted(expected_core)]
         hashed_top = sorted(k for k in manifest["files"] if "/" not in k)
-        assert hashed_top == sorted(expected_top | {"handsoff-restart"})
+        assert hashed_top == sorted(
+            expected_top | {"handsoff-restart", "handsoff-stop-probe"})
         for rel in manifest["files"]:
             entry = manifest["files"][rel]
             assert entry["source_sha256"] == entry["installed_sha256"], rel

@@ -144,7 +144,7 @@ case "${1:-}" in
         # prev/ only ever holds files this installer put there, so restoring
         # the whole tree is safe — and globbing it means a module added since
         # prev was saved still comes back.
-        for f in "$PREV"/*.py "$PREV"/handsoff-restart; do
+        for f in "$PREV"/*.py "$PREV"/handsoff-restart "$PREV"/handsoff-stop-probe; do
             [ -f "$f" ] || continue
             base="$(basename "$f")"
             if is_exec "$base"; then m=755; else m=644; fi
@@ -381,7 +381,7 @@ PY_EOF
     if [ "$_deployed" = "0" ]; then
         # No manifest (an older install, or it was removed): fall back to the
         # hard-imported floor plus the two optional/non-Python artifacts.
-        for rel in $TOP_REQUIRED handsoff-settings.py handsoff-restart; do
+        for rel in $TOP_REQUIRED handsoff-settings.py handsoff-restart handsoff-stop-probe; do
             rm -f "$BIN_DIR/$rel"
         done
         for m in $CORE_REQUIRED; do
@@ -635,6 +635,11 @@ for src in "$HERE"/core/*.py; do
 done
 install -m 755 "$HERE/handsoff-restart" "$STAGE_DIR/handsoff-restart" \
     || stage_fail "could not stage handsoff-restart"
+# The stop-probe ships beside handsoff-restart: the unit's ExecStop= names it,
+# so a deployment without it would leave a unit whose stop job fails to find
+# its probe (a failed ExecStop marks the whole unit failed).
+install -m 755 "$HERE/handsoff-stop-probe" "$STAGE_DIR/handsoff-stop-probe" \
+    || stage_fail "could not stage handsoff-stop-probe"
 # --- gate 1: every staged Python file must byte-compile before it can ship
 STAGED_PY=("$STAGE_DIR"/*.py)
 STAGED_PY+=("$STAGE_DIR"/core/*.py)
@@ -651,7 +656,8 @@ if [ -f "$BIN_DIR/handsoff.py" ]; then
     # Save the deployed copy of every file we ship — taken from the stage's own
     # list, so an unrelated .py a user keeps in ~/.local/bin is never swept into
     # prev and then restored over something later.
-    for f in "$STAGE_DIR"/*.py "$STAGE_DIR/handsoff-restart"; do
+    for f in "$STAGE_DIR"/*.py "$STAGE_DIR/handsoff-restart" \
+             "$STAGE_DIR/handsoff-stop-probe"; do
         base="$(basename "$f")"
         [ -f "$BIN_DIR/$base" ] && cp -p "$BIN_DIR/$base" "$PREV_DIR.staging/$base"
     done
@@ -671,7 +677,7 @@ fi
 # --- the switch: install staged files; any failure restores the previous set
 # Built from the staged tree rather than listed: whatever was staged -- and
 # therefore byte-compiled by the gate above -- is exactly what switches in.
-SWITCH_FILES_755="handsoff-restart"
+SWITCH_FILES_755="handsoff-restart handsoff-stop-probe"
 SWITCH_FILES_644=""
 for f in "$STAGE_DIR"/*.py; do
     base="$(basename "$f")"
@@ -829,7 +835,8 @@ $manifest_whisper_sha256
   "files": {
 $manifest_top_files
 $manifest_core_files
-    "handsoff-restart": {"source_sha256": "$(sha_of "$HERE/handsoff-restart")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"}
+    "handsoff-restart": {"source_sha256": "$(sha_of "$HERE/handsoff-restart")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-restart")"},
+    "handsoff-stop-probe": {"source_sha256": "$(sha_of "$HERE/handsoff-stop-probe")", "installed_sha256": "$(sha_of "$BIN_DIR/handsoff-stop-probe")"}
   }
 }
 MANIFEST_EOF
@@ -927,6 +934,13 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=$PYBIN %h/.local/bin/handsoff.py
+# Stop attribution: at the instant a stop job begins, whoever invoked it is
+# still blocked on the job and visible in /proc — the only moment a stop can
+# be attributed to its caller (afterwards they are gone, which is why three
+# injection turns were lost to an unattributed stop). Read-only, always exits
+# 0 (a failing ExecStop marks the unit failed), and it does NOT run on a
+# crash respawn (Restart=always), which is a different event.
+ExecStop=%h/.local/bin/handsoff-stop-probe
 # Restart=always: recover from clean exits too (stray SIGTERM, Quit menu click,
 # app.quit()) — the only quiet exit we honour is a real desktop shutdown (PartOf).
 Restart=always
@@ -1100,7 +1114,7 @@ assert manifest["files"]
 PY_EOF
     # The floor derives from the same one definition as everything else, so it
     # cannot drift; the non-Python artifacts are named explicitly.
-    for required in $TOP_REQUIRED handsoff-restart; do
+    for required in $TOP_REQUIRED handsoff-restart handsoff-stop-probe; do
         [ -f "$BIN_DIR/$required" ] \
             || { echo "FATAL: rehearsal missing $BIN_DIR/$required" >&2; exit 1; }
     done
