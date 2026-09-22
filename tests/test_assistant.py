@@ -690,6 +690,112 @@ def test_reader_health_names_the_last_failure_and_what_it_cost():
     assert saved and saved[-1] == ("notification_reader", False), saved
 
 
+def test_reader_gave_up_asks_for_the_live_reload_after_persisting():
+    """The gave-up persist is a settings change made OUTSIDE the settings
+    app, so it must go through the one channel a change is applied through:
+    the reload request the settings app's own Save asks for. Ordered AFTER
+    the persist (the reload re-reads the file; asking first would re-apply
+    the stale value), and best-effort — a channel that raises must not
+    turn the reader's own stop into a failure.
+    """
+    reloaded: list[int] = []
+    saved: list[tuple] = []
+
+    class AliveProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    class InstantStop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            pass
+
+        def wait(self, timeout):
+            return False
+
+    reader = _reader([], popen_factory=lambda *a, **k: AliveProc(),
+                     persist=lambda k, v: saved.append((k, v)),
+                     request_reload=lambda: reloaded.append(1))
+    reader.loop = lambda proc, stop: (_ for _ in ()).throw(
+        OSError("monitor said no"))
+    reader.run(InstantStop(), run=types.SimpleNamespace(proc=AliveProc()))
+    assert saved[-1] == ("notification_reader", False), saved
+    assert reloaded == [1], reloaded
+
+
+def test_reader_gave_up_survives_a_raising_reload_channel():
+    """The stop must land even if the reload channel is broken: the persist
+    is the truth, the reload is a courtesy — and a courtesy that raises
+    must not escalate the reader's own shutdown into an error state."""
+    saved: list[tuple] = []
+
+    class AliveProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    class InstantStop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            pass
+
+        def wait(self, timeout):
+            return False
+
+    def broken():
+        raise RuntimeError("channel down")
+
+    reader = _reader([], popen_factory=lambda *a, **k: AliveProc(),
+                     persist=lambda k, v: saved.append((k, v)),
+                     request_reload=broken)
+    reader.loop = lambda proc, stop: (_ for _ in ()).throw(
+        OSError("monitor said no"))
+    reader.run(InstantStop(), run=types.SimpleNamespace(proc=AliveProc()))
+    assert saved[-1] == ("notification_reader", False), \
+        "the stop persisted before the channel was asked"
+    h = reader.health(enabled=False)
+    assert h["gave_up"] is True, h
+
+
+def test_reader_gave_up_without_a_channel_still_stops_cleanly():
+    """The channel is optional (an embedder, a test host): None means no
+    reload request is made and nothing else about the stop changes."""
+    saved: list[tuple] = []
+
+    class AliveProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    class InstantStop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            pass
+
+        def wait(self, timeout):
+            return False
+
+    reader = _reader([], popen_factory=lambda *a, **k: AliveProc(),
+                     persist=lambda k, v: saved.append((k, v)))
+    reader.loop = lambda proc, stop: (_ for _ in ()).throw(
+        OSError("monitor said no"))
+    reader.run(InstantStop(), run=types.SimpleNamespace(proc=AliveProc()))
+    assert saved[-1] == ("notification_reader", False), saved
+
+
 def test_re_enabling_the_reader_starts_the_counters_over():
     """`health` describes the reader that is live NOW: carrying the previous
     run's failures forward would report a healthy reader as a failing one.

@@ -5532,7 +5532,18 @@ class Assistant(QObject):
             spawn=self._start_worker, is_closed=self._is_closed,
             announce=self._announce_now, muted=self._notification_muted,
             popen_factory=lambda *a, **k: subprocess.Popen(*a, **k),
-            persist=set_setting)
+            persist=set_setting,
+            # The gave-up path asks for the same live reload the settings app's
+            # Save asks for: one apply channel, so the bubble re-reads the
+            # persisted flag on the Qt thread instead of trusting its in-memory
+            # copy. The signal emit is thread-safe; the apply runs where widget
+            # work is legal. Honest scope: an OPEN settings window whose form is
+            # dirty still holds `True` (its disk poll stands down while dirty,
+            # by design — that is what protects a mid-edit form), and a Save
+            # there writes the toggle back — but that is a USER pressing Save,
+            # the bubble re-reads it through the settings watcher, and a reader
+            # whose monitor is still broken gives up again and persists off.
+            request_reload=lambda: self.sigCommand.emit("reload-settings"))
         self._pomodoro = _core_assistant.PomodoroController(
             announce=self._announce_now, spawn=self._start_worker,
             is_closed=self._is_closed)

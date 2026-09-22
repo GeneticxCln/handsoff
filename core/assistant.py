@@ -286,15 +286,19 @@ class NotificationReader:
     ATTEMPT_BUDGET = 5    # monitor respawns/retries before the reader gives up
     BACKOFF_START = 1.0   # seconds before the first retry; doubles to…
     BACKOFF_MAX = 30.0    # …this ceiling
-
     def __init__(self, *, spawn, is_closed, announce, muted, popen_factory,
-                 persist) -> None:
+                 persist, request_reload=None) -> None:
         self._spawn = spawn
         self._is_closed = is_closed
         self._announce = announce
         self._muted = muted
         self._popen_factory = popen_factory
         self._persist = persist
+        # The one channel a settings change is applied through (the settings
+        # app's own Save uses it): asked after the gave-up persist, so the
+        # running bubble re-reads the flag live instead of trusting its
+        # in-memory copy, and every open settings window hears the change too.
+        self._request_reload = request_reload
         self._runs = BoundedRegistry("notification-reader", 1)
         self._cooldown_lock = threading.Lock()
         self._app_last: dict[str, float] = {}
@@ -670,6 +674,19 @@ class NotificationReader:
                 self._persist("notification_reader", False)
             except Exception:
                 log.exception("notification reader could not persist its stop")
+            # Ask for the live reload AFTER the persist (the reload re-reads
+            # the file; asking first would re-apply the stale value). The GUI's
+            # disk poll stands down while its form is dirty, so without this
+            # an open window can hold `True` and a later Save would write it
+            # back — silently re-arming a reader whose monitor just failed
+            # five times to stay up. Best-effort: the stop itself must not
+            # depend on the channel answering.
+            reload = self._request_reload
+            if callable(reload):
+                try:
+                    reload()
+                except Exception:
+                    log.exception("notification reader: reload request failed")
 
 
 def split_due_reminders(items: list[dict], now: float
