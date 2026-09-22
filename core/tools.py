@@ -894,6 +894,11 @@ class ToolBelt:
         self._pending_confirm = _registry.Offer("confirm")
         self._user_turn_marker = 0
         self._last_confirmation_offer = False
+        # The ONE refusal the tool loop may answer in the same turn: a re-arm
+        # gate refusal while the offer is still live. Set at the refusal,
+        # read-and-consumed by the loop's single in-turn retry, so it can
+        # never cycle; reset here at entry like its sibling above.
+        self._last_rearm_retry = False
         self._confirm_running: str | None = None
         self._last_images: list[str] = []
         self._elements_ts: float = 0.0
@@ -1179,6 +1184,7 @@ class ToolBelt:
     def _execute(self, name: str, args: dict) -> ToolResult:
         self._last_images = []
         self._last_confirmation_offer = False
+        self._last_rearm_retry = False
         limit = self._rate_limit()
         now = time.monotonic()
         with self._rate_lock:
@@ -1910,6 +1916,15 @@ class ToolBelt:
                 if ans not in ('yes', 'y', 'no', 'n'):
                     # NOT consumed: an unusable answer leaves the offer open,
                     # exactly as confirm_kill leaves it.
+                    # Marked for the tool loop's one in-turn retry: attempt 1
+                    # of the live injection (ledger 2026-09-22) had the model
+                    # stop at this refusal and relay it while the user had
+                    # already said yes — the 120 s offer expired with the
+                    # consent never spent. This is the ONLY refusal so
+                    # marked: the offer is still live, so one nudge can
+                    # convert it, and the marker is read-and-consumed by the
+                    # loop so it cannot cycle.
+                    self._last_rearm_retry = True
                     return ('ERROR: re-enabling needs the user\'s spoken yes '
                             "while the offer is live — call again with "
                             "confirm='yes' (or confirm='no' to leave it off).")

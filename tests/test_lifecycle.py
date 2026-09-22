@@ -2010,6 +2010,162 @@ class TestConfirmationLoop:
         assert asst._tools.calls == ["wait"]
 
 
+class TestRearmInTurnRetry:
+    """The one in-turn retry the tool loop spends: the model stopped at the
+    re-arm gate refusal while the offer is still live, and attempt 1 of the
+    live injection (ledger 2026-09-22) showed the 120 s offer expiring with
+    the user's yes never spent because the model relayed the refusal and
+    stopped. One system nudge — SYSTEM role, so the publish filter drops it
+    and stored history never reads as the user having said it again — keyed
+    on the belt's read-and-consumed marker, once per turn.
+    """
+
+    def _asst(self, H, belt):
+        asst = H.Assistant.__new__(H.Assistant)
+        asst._tools = belt
+        asst._gen = 1
+        asst._history = []
+        asst._turn_spoke = False
+        asst._conversation_for = lambda text: [{"role": "system"},
+                                                {"role": "user", "content": text}]
+        asst._save_history = lambda: None
+        asst._speak = lambda *args, **kwargs: None
+        return asst
+
+    def test_refusal_then_nudge_then_yes_completes_in_one_turn(self, H, monkeypatch):
+        """Refusal -> nudge -> the model calls again with confirm='yes' ->
+        the reader re-enables, all inside the 120 s window, instead of the
+        turn ending on the refusal and the offer expiring.
+        """
+        class Belt:
+            _last_confirmation_offer = False
+
+            def __init__(self):
+                self.calls = []
+                self._last_images = []
+                self._last_rearm_retry = False
+
+            def execute(self, name, args):
+                self.calls.append((name, dict(args)))
+                self._last_rearm_retry = (name == "notification_reader"
+                                          and "confirm" not in args)
+                if "confirm" not in args:
+                    return _core_tools.ToolResult(
+                        "ERROR: re-enabling needs the user's spoken yes "
+                        "while the offer is live — call again with "
+                        "confirm='yes' (or confirm='no' to leave it off).",
+                        "refused")
+                return _core_tools.ToolResult(
+                    "notification reader is on (started). Muted apps: none",
+                    "ok")
+
+        belt = Belt()
+        asst = self._asst(H, belt)
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", False)
+        def model(conversation, tools):
+            # A model reacting to the LATEST tool result, like a real one:
+            results = [str(m.get("content") or "") for m in conversation
+                       if m.get("role") == "tool"]
+            if not results:                      # round 1: the bare start
+                return {"content": "", "tool_calls": [
+                    {"function": {"name": "notification_reader",
+                                  "arguments": {"action": "start"}}}]}
+            if "spoken yes" in results[-1]:      # round 2: nudge heard
+                return {"content": "", "tool_calls": [
+                    {"function": {"name": "notification_reader",
+                                  "arguments": {"action": "start",
+                                                "confirm": "yes"}}}]}
+            return {"content": "Done — the reader is back on.",
+                    "tool_calls": []}            # round 3: the final answer
+        monkeypatch.setattr(H, "ollama_chat", model)
+
+        H.Assistant._brain_turn(asst, "re-enable the reader", 1,
+                                threading.Event())
+
+        assert belt.calls == [
+            ("notification_reader", {"action": "start"}),
+            ("notification_reader", {"action": "start", "confirm": "yes"}),
+        ], belt.calls
+        # The nudge is a SYSTEM message: the publish filter drops it, so
+        # stored history never reads as the user having said it again.
+        assert not any(m.get("role") == "user"
+                       and "system retry" in str(m.get("content") or "")
+                       for m in asst._history), asst._history
+        assert any(m.get("role") == "assistant"
+                   and "reader is back on" in str(m.get("content") or "")
+                   for m in asst._history), asst._history
+
+    def test_retry_happens_once_per_turn_even_if_the_model_refuses_again(self, H, monkeypatch):
+        """The model ignored the nudge and refused again: the loop falls
+        through to the normal exit rather than nudging against
+        MAX_TOOL_ROUNDS — the retry is once per TURN.
+        """
+        class Belt:
+            _last_confirmation_offer = False
+
+            def __init__(self):
+                self.calls = []
+                self._last_images = []
+                self._last_rearm_retry = False
+
+            def execute(self, name, args):
+                self.calls.append((name, dict(args)))
+                self._last_rearm_retry = (name == "notification_reader"
+                                          and "confirm" not in args)
+                return _core_tools.ToolResult(
+                    "ERROR: re-enabling needs the user's spoken yes", "refused")
+
+        belt = Belt()
+        asst = self._asst(H, belt)
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", False)
+        monkeypatch.setattr(H, "ollama_chat", lambda conversation, tools: {
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "notification_reader",
+                              "arguments": {"action": "start"}}}]})
+
+        H.Assistant._brain_turn(asst, "re-enable the reader", 1,
+                                threading.Event())
+
+        # Round 1 refused and nudged; round 2 refused again with the retry
+        # spent — the turn ends there instead of spinning the rounds out.
+        assert belt.calls == [
+            ("notification_reader", {"action": "start"}),
+            ("notification_reader", {"action": "start"}),
+        ], belt.calls
+        # The turn still published (sealed, answered calls only) and carried
+        # no system nudge into history.
+        assert not any(m.get("role") == "user"
+                       and "system retry" in str(m.get("content") or "")
+                       for m in asst._history), asst._history
+
+    def test_a_stale_marker_from_an_earlier_turn_is_drained_not_nudged(self, H, monkeypatch):
+        """Belts persist across turns. A marker left set by a turn that ended
+        through a path with no drain (barge-in's `return`) must not speak for
+        the NEXT turn's conversation: the no-tool-calls append drains it.
+        """
+        class Belt:
+            _last_confirmation_offer = False
+
+            def __init__(self):
+                self._last_images = []
+                self._last_rearm_retry = True   # stale, from an earlier turn
+
+        asst = self._asst(H, Belt())
+        monkeypatch.setitem(H.SETTINGS, "streaming_tts", False)
+        monkeypatch.setattr(H, "ollama_chat", lambda conversation, tools: {
+            "content": "The reader is off; the offer has expired.",
+            "tool_calls": []})
+
+        H.Assistant._brain_turn(asst, "status?", 1, threading.Event())
+
+        assert asst._tools._last_rearm_retry is False, (
+            "the stale marker must be drained by the next append")
+        assert any(m.get("role") == "assistant"
+                   and "expired" in str(m.get("content") or "")
+                   for m in asst._history), asst._history
+
+
 # -------------------------------------------------------------------- audit fixes
 
 

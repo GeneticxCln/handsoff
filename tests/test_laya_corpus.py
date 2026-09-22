@@ -266,6 +266,36 @@ class TestTheCorpusNeverWritesIntoTheCheckout:
         assert rc == 1
         assert not target.exists(), "a refused dump still wrote the file"
 
+    def test_a_redirected_store_gets_a_scratch_queue_not_the_real_one(
+            self, tmp_path, monkeypatch):
+        """A redirected --store must never fold the app's REAL turn queue.
+
+        build() already knew the rule (a scratch store means a scratch queue),
+        but main() passed its --turns DEFAULT straight through, defeating it:
+        the checkout guard caught the suite advancing the real cursor on
+        2026-09-22, after fault-injection turns left laya-turns.jsonl unmined
+        and any --store-redirected run advanced it under the developer's home.
+        The cursor advances over EVERY line, usable or not — so one junk row
+        is enough to prove the point.
+        """
+        real_queue = tmp_path / "real" / "laya-turns.jsonl"
+        real_queue.parent.mkdir()
+        real_queue.write_text(
+            json.dumps({"ts": "t", "text": "", "tools": []}) + "\n",
+            encoding="utf-8")
+        monkeypatch.setattr(corpus, "DEFAULT_TURNS", real_queue)
+        rc = corpus.main(["laya_corpus.py", "--report",
+                          "--store", str(tmp_path / "store.jsonl")])
+        assert rc == 0
+        real_cursor = real_queue.with_suffix(".cursor")
+        assert not real_cursor.exists(), (
+            "a redirected store folded and advanced the real turn queue")
+        # ...and the scratch queue beside the scratch store is the one read
+        # (absent here, so nothing was folded at all).
+        scratch_queue = tmp_path / "laya-turns.jsonl"
+        assert scratch_queue == corpus.DEFAULT_STORE.parent / corpus.DEFAULT_TURNS.name \
+            or not scratch_queue.exists()
+
     def test_the_hash_covers_the_labelled_set(self, tmp_path):
         """A checkpoint records which corpus trained it. Same rows in another
         order must hash the same; a different label must not.

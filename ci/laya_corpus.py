@@ -465,9 +465,20 @@ def main(argv: list[str]) -> int:
                         help="grown rows only (the authored set is the training default)")
     args = parser.parse_args(argv[1:])
 
+    # The one-directory rule build() enforces for a None log, honoured at the
+    # CLI layer too: a redirected --store gets its queue beside it, not the
+    # app's real one. Passing the DEFAULT_TURNS default through verbatim used
+    # to defeat the rule — a test or CI run redirecting the store still folded
+    # the REAL turn queue and advanced the REAL cursor (the checkout guard
+    # caught exactly that on 2026-09-22, after fault-injection turns left the
+    # queue unmined and the test run advanced it).
+    turns = args.turns
+    if turns == DEFAULT_TURNS and args.store != DEFAULT_STORE:
+        turns = args.store.parent / DEFAULT_TURNS.name
+
     corpus = build(authored_set=not args.no_authored, real_dir=args.real,
                    store_path=args.store, grow=args.grow,
-                   turn_log=args.turns, fold=not args.no_fold)
+                   turn_log=turns, fold=not args.no_fold)
     counts = corpus["counts"]
     print(f"families           : {len(families())}")
     if args.grow:

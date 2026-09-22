@@ -1719,6 +1719,79 @@ class TestAmbientCapabilities:
         assert out.startswith("ERROR: the re-enable offer was just claimed"), out
         assert "notification reader is on" not in out, out
 
+    def test_reader_rearm_gate_refusal_marks_the_one_retryable_refusal(self, H, monkeypatch):
+        """The in-turn retry marker lives ONLY on the refusal a retry can fix:
+        an unusable confirm while the offer is still live. Nothing else about
+        this tool may nudge the model — not a declined offer (that is the
+        user's answer), not an expired one (no retry can help), not a healthy
+        start, not a race loss. This is the only seam the tool loop reads.
+        """
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        tb._on_rearm_offer = lambda: (True, True)
+        tb._consume_rearm_offer = lambda: {"ok": True}
+        tb._last_rearm_retry = False
+        # The refusal itself: marked, offer NOT consumed, sentence named.
+        out = tb.notification_reader("start")
+        assert tb._last_rearm_retry is True, "the retryable refusal must be marked"
+        assert "confirm='yes'" in out, out
+        # A declined offer consumes-and-declines: the user answered, there is
+        # nothing to retry, and the marker must not be set.
+        tb._last_rearm_retry = False
+        out = tb.notification_reader("start", confirm="no")
+        assert tb._last_rearm_retry is False
+        assert "Left off" in out, out
+        # The yes path: consumed and enabled, no marker.
+        tb._last_rearm_retry = False
+        out = tb.notification_reader("start", confirm="yes")
+        assert tb._last_rearm_retry is False
+        assert "started" in out, out
+
+    def test_reader_rearm_gate_marker_resets_on_every_execute(self, H, monkeypatch):
+        """The marker is per-CALL state like its sibling _last_confirmation_offer:
+        the next execute() on the same belt must not inherit a stale retry
+        signal from the previous call — a healthy start must never be nudged
+        because an earlier call was refused. Driven through execute() (not the
+        method directly) because the reset lives in _execute().
+        """
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        tb._on_rearm_offer = lambda: (True, True)
+        tb._consume_rearm_offer = lambda: {"ok": True}
+        # Seed the pieces _execute needs that __new__ skips.
+        tb._policy = type("P", (), {"classify": staticmethod(lambda name: "ALLOW"),
+                                    "confirm_seconds": staticmethod(lambda: 120)})()
+        tb._confirm_running = None
+        tb._rate_lock = threading.Lock()
+        tb._tool_times = __import__("collections").deque()
+        tb._rate_limit = lambda: 0
+        monkeypatch.setattr(_core_tools, "log_decision",
+                            lambda *a, **k: None)
+        out, _err = tb.execute("notification_reader", {"action": "start"})
+        assert out.startswith("ERROR: re-enabling needs the user's spoken yes"), out
+        assert tb._last_rearm_retry is True
+        # The very next execute — a full yes — must find the marker cleared.
+        out2, _err2 = tb.execute("notification_reader",
+                                 {"action": "start", "confirm": "yes"})
+        assert tb._last_rearm_retry is False
+        assert "started" in out2, out2
+
+    def test_reader_rearm_gate_marker_absent_on_stub_belts(self, H, monkeypatch):
+        """Belts built with __new__ and never through __init__ have no marker
+        attribute; the gate must still refuse correctly, and the tool loop's
+        getattr reads stay None — 'no marker' is 'no retry', never a crash.
+        """
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: None)
+        assert not hasattr(tb, "_last_rearm_retry")
+        tb._on_rearm_offer = lambda: (True, True)
+        out = tb.notification_reader("start")
+        assert out.startswith("ERROR: re-enabling needs the user's spoken yes"), out
+        assert getattr(tb, "_last_rearm_retry", None) is True
+
     def test_notification_reader_is_private_by_default(self, H, monkeypatch):
         monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
                                              "notification_reader": False})

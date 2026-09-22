@@ -7809,6 +7809,29 @@ class Assistant(QObject):
         # own.
         hist_at_entry = len(getattr(self, "_history", None) or [])
         self._turn_spoke = False
+
+        def _rearm_nudge() -> dict:
+            # The one in-turn retry: the model stopped at a re-arm gate
+            # refusal while the offer is still live — attempt 1 of the live
+            # injection (ledger 2026-09-22) let the 120 s offer expire with
+            # the user's yes never spent, because the model relayed the
+            # refusal and stopped. One system nudge, keyed on the belt's
+            # read-and-consumed marker, so it can never cycle. A SYSTEM role,
+            # not user: the publish filter drops system messages, so the
+            # nudge stays out of stored history and cannot read as the user
+            # having said it again.
+            return {"role": "system", "content": (
+                "system retry: the tool result you just stopped at is a "
+                "re-arm gate refusal, not a final answer — the user already "
+                "answered yes aloud. Call notification_reader again with "
+                "confirm='yes' now (or confirm='no' to leave it off). This "
+                "retry happens once.")}
+
+        # Once per TURN, not once per marker sighting: a model that refuses
+        # again after the nudge must fall through to the normal exit, not be
+        # nudged into a loop against MAX_TOOL_ROUNDS.
+        rearm_retried = False
+
         for _round in range(MAX_TOOL_ROUNDS):
             if cancel.is_set():
                 return
@@ -7918,6 +7941,13 @@ class Assistant(QObject):
                 if not (content or "").strip():
                     log.warning("empty model reply with no tool calls; not appending")
                     break
+                # Drain-only: the marker is consumed at the round exit where
+                # it was set (below), so it can only be seen here stale — a
+                # turn that ended on a confirmation offer or barge-in — and
+                # a stale marker must never speak for THIS conversation.
+                # getattr throughout: stub belts in tests never run __init__.
+                if getattr(self._tools, "_last_rearm_retry", False):
+                    self._tools._last_rearm_retry = False
                 conversation.append({"role": "assistant", "content": content})
                 break
             conversation.append(
@@ -7946,6 +7976,29 @@ class Assistant(QObject):
                     stop_tool_loop = True
                     break
             if stop_tool_loop:
+                # A confirmation offer ends the turn for the user to answer;
+                # any retry marker set earlier in this batch must not leak
+                # into the next turn's conversation.
+                if getattr(self._tools, "_last_rearm_retry", False):
+                    self._tools._last_rearm_retry = False
+                break
+            # The retry, from the round exit where the refusal actually
+            # happened: the model called the tool, got the gate refusal, and
+            # stopped. Once per turn (rearm_retried), consumed-on-read, so it
+            # can never cycle no matter how the model answers the nudge.
+            if getattr(self._tools, "_last_rearm_retry", False):
+                self._tools._last_rearm_retry = False
+                if not rearm_retried:
+                    rearm_retried = True
+                    log.info("re-arm retry: the model stopped at the gate "
+                             "refusal with the offer still live — nudging once")
+                    conversation.append(_rearm_nudge())
+                    continue
+                # The retry is already spent and the model refused again:
+                # end the turn on the refusal rather than spin the remaining
+                # rounds against a gate that will keep saying no.
+                log.info("re-arm retry already spent — ending the turn on "
+                         "the refusal")
                 break
         # A COMPLETED turn is published, even when a newer utterance has since
         # started. The old rule — "only the current generation may write" —
