@@ -17,7 +17,7 @@ import time
 # origin-checked loader, which exec's a bare spec (`__package__ == ""`), so a
 # relative import cannot resolve. `core.tools` already imports its siblings this
 # way, and a plain `import core.assistant` resolves to the same module object.
-from core.registry import BoundedRegistry
+from core.registry import BoundedRegistry, Offer
 
 
 class PomodoroController:
@@ -286,6 +286,11 @@ class NotificationReader:
     ATTEMPT_BUDGET = 5    # monitor respawns/retries before the reader gives up
     BACKOFF_START = 1.0   # seconds before the first retry; doubles to…
     BACKOFF_MAX = 30.0    # …this ceiling
+    # How long the spoken re-arm offer stays claimable. Long enough to finish
+    # a sentence and answer "re-enable notifications"; short enough that a
+    # stale yes does not re-enable a reader the user has given up on.
+    REARM_OFFER_WINDOW_S = 120.0
+
     def __init__(self, *, spawn, is_closed, announce, muted, popen_factory,
                  persist, request_reload=None) -> None:
         self._spawn = spawn
@@ -315,6 +320,66 @@ class NotificationReader:
         # is exactly what the sampler wants to see.
         self._beat_lock = threading.Lock()
         self._beat = 0
+        # The re-arm offer. When the retry budget is spent, the reader does not
+        # silently auto-retry — five monitor deaths is a diagnosis, not a flake
+        # — but recovery must not require a restart either. Following the
+        # snooze precedent: a background event arms an expiring offer, speaks
+        # it, and the user's answer reaches it through a tool the model calls.
+        # `arm_unless` is the anti-loop guard: a repeated gave-up (an operator
+        # flipping the flag back on while dbus-monitor is still broken) must
+        # not extend its own window.
+        self._rearm_offer = Offer("reader-rearm")
+
+    # -- the re-arm offer ------------------------------------------------------
+    # Arm/read/consume as three accessors so the belt (and its tests) need no
+    # knowledge of the offer's internals; the deadline logic stays in Offer.
+
+    def arm_rearm_offer(self) -> bool:
+        """Offer to re-enable after a gave-up; speak it once.
+
+        Returns True when a NEW offer was armed and announced. ``arm_unless``
+        refuses when one is already live, so a repeat gave-up inside the
+        window neither extends the deadline nor repeats the announce — the
+        same anti-loop rule the model's own confirmations follow. The belt's
+        gate reads the result via ``rearm_gate()``. The offer exists ONLY
+        because of a gave-up: arming one for a healthy reader would let a
+        stale "yes" look like consent to gate nothing, so a reader that has
+        not given up refuses here.
+        """
+        with self._health_lock:
+            gave_up = self._health["gave_up"]
+        if not gave_up:
+            return False
+        armed = self._rearm_offer.arm_unless(lambda live: True,
+                                             self.REARM_OFFER_WINDOW_S)
+        if armed:
+            try:
+                self._announce(
+                    "my notification reader has stopped after repeated "
+                    "failures. Say re-enable notifications if you want it "
+                    "back on.")
+            except Exception:
+                # The finding must survive a broken speaker: the offer is
+                # armed and queryable either way.
+                log.exception("notification reader: re-arm announce failed")
+        return armed
+
+    def rearm_gate(self) -> tuple:
+        """``(needed, live)`` for the belt's start gate.
+
+        ``needed`` is the reader's OWN diagnosis — it gave up and turned itself
+        off — because "no offer armed" alone cannot distinguish a healthy
+        reader from an expired offer, and only the first of those must leave a
+        bare ``start`` ungated. ``live`` says an offer is claimable right now.
+        """
+        with self._health_lock:
+            gave_up = self._health["gave_up"]
+        live, _expired = self._rearm_offer.state()
+        return (bool(gave_up), live is not None)
+
+    def consume_rearm_offer(self):
+        """The claim: the second of two racing re-enables gets ``None``."""
+        return self._rearm_offer.consume()
 
     def beat(self) -> int:
         """Progress signal for core.selfwatch: monotonic, changes on traffic."""
@@ -382,8 +447,15 @@ class NotificationReader:
         self._health_update(attempts_used=attempts, backoff_seconds=backoff)
 
     @classmethod
-    def _snapshot(cls, counters: dict, *, enabled, running: bool) -> dict:
-        """The JSON-ready snapshot: counters + liveness -> one shape."""
+    def _snapshot(cls, counters: dict, *, enabled, running: bool,
+                  rearm_offer: bool = False) -> dict:
+        """The JSON-ready snapshot: counters + liveness -> one shape.
+
+        ``rearm_offer`` rides beside ``enabled``/``running`` rather than in the
+        counters: it is the state of the OFFER, not of the reader's work, and
+        ``absent_health`` must report the same key as False without an offer
+        to ask.
+        """
         now = time.monotonic()
         last = counters["last_failure"]
         started = counters["pass_started_at"]
@@ -406,6 +478,7 @@ class NotificationReader:
             "enabled": enabled,
             "state": state,
             "running": running,
+            "rearm_offer": bool(rearm_offer),
             "passes": counters["passes"],
             "notifications": counters["notifications"],
             "failures": counters["failures"],
@@ -436,7 +509,8 @@ class NotificationReader:
             counters = dict(self._health)
         run = self._runs.get(self.SLOT)
         return self._snapshot(counters, enabled=enabled,
-                              running=run is not None and run.alive())
+                              running=run is not None and run.alive(),
+                              rearm_offer=self._rearm_offer.state()[0] is not None)
 
     @classmethod
     def absent_health(cls, *, enabled: bool | None = None) -> dict:
@@ -459,6 +533,11 @@ class NotificationReader:
             # resetting after it would wipe its first pass. `health` describes
             # the reader that is live now, not the one before the last toggle.
             self._health_update(**self._blank_health())
+            # A live reader owns no re-arm offer — a stale "yes" from an old
+            # conversation must not look like consent to a LATER gave-up.
+            # Cleared before the slot is granted, so the reader that starts
+            # can never inherit one.
+            self._rearm_offer.clear()
             slot = self._runs.reserve(
                 self.SLOT, reclaim=lambda run: not run.alive())
             if slot is None:
@@ -687,6 +766,15 @@ class NotificationReader:
                     reload()
                 except Exception:
                     log.exception("notification reader: reload request failed")
+            # Last, because every earlier step must land first: the settings
+            # file says off, the GUI heard it, the journal has it — only now
+            # is the user offered a way back that does not need a restart.
+            # A broken speaker or a broken reload channel must not cost the
+            # user the offer.
+            try:
+                self.arm_rearm_offer()
+            except Exception:
+                log.exception("notification reader: re-arm offer failed")
 
 
 def split_due_reminders(items: list[dict], now: float

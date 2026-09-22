@@ -575,7 +575,7 @@ def test_a_pass_that_raises_spends_the_budget_instead_of_spinning():
 _HEALTH_KEYS = {
     "enabled", "state", "running", "passes", "notifications", "failures",
     "attempts_used", "attempts_budget", "backoff_seconds", "pass_seconds",
-    "gave_up", "last_failure",
+    "gave_up", "last_failure", "rearm_offer",
 }
 
 
@@ -688,6 +688,118 @@ def test_reader_health_names_the_last_failure_and_what_it_cost():
     assert h["attempts_used"] >= h["attempts_budget"], (
         "a reader that gave up must show the budget spent, not a retry left")
     assert saved and saved[-1] == ("notification_reader", False), saved
+
+
+def test_reader_gave_up_arms_and_speaks_the_rearm_offer():
+    """The third channel the gave-up path opens, after the journal and the
+    reload request: the user is OFFERED a way back that does not need a
+    restart. A finding is never only in the journal — and an offer the user
+    never hears is not an offer."""
+    spoken: list = []
+    saved: list = []
+
+    class AliveProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    class InstantStop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            pass
+
+        def wait(self, timeout):
+            return False
+
+    reader = _reader(spoken, popen_factory=lambda *a, **k: AliveProc(),
+                     persist=lambda k, v: saved.append((k, v)))
+    reader.loop = lambda proc, stop: (_ for _ in ()).throw(
+        OSError("monitor said no"))
+    reader.run(InstantStop(), run=types.SimpleNamespace(proc=AliveProc()))
+    assert any("re-enable notifications" in s for s in spoken), spoken
+    needed, live = reader.rearm_gate()
+    assert (needed, live) == (True, True), (needed, live)
+    h = reader.health(enabled=False)
+    assert h["rearm_offer"] is True, h
+    # The offer claims exactly once.
+    assert reader.consume_rearm_offer() is not None
+    assert reader.rearm_gate() == (True, False), (
+        "after the claim the gate reads live=False: the next bare start is "
+        "refused with the expired path")
+
+
+def test_reader_rearm_offer_is_not_extended_by_a_repeat_gave_up():
+    """``arm_unless``'s rule, applied here: a second gave-up inside the window
+    neither extends the deadline nor repeats the announce. A broken
+    dbus-monitor plus a monitor-killing operator must not produce a chorus.
+    """
+    spoken: list = []
+    reader = _reader(spoken)
+    reader._health_update(gave_up=True)
+    assert reader.arm_rearm_offer() is True
+    first = reader._rearm_offer.snapshot_state()
+    assert reader.arm_rearm_offer() is False, "the offer must not re-arm"
+    assert reader._rearm_offer.snapshot_state() == first, (
+        "the deadline must not move")
+    assert sum("re-enable" in s for s in spoken) == 1, spoken
+
+
+def test_reader_rearm_announce_survives_a_broken_speaker():
+    """A broken speaker must not cost the user the offer: the offer is armed
+    and queryable either way, and the finding is in the journal regardless.
+    """
+    def boom(_text):
+        raise RuntimeError("no audio device")
+
+    reader = _reader([boom])
+    reader._health_update(gave_up=True)   # the diagnosis the offer answers
+    assert reader.arm_rearm_offer() is True
+    assert reader.rearm_gate() == (True, True)
+
+
+def test_reader_rearm_gate_tracks_its_own_gave_up_diagnosis():
+    """`needed` is the reader's own fact, not "an offer exists" — a fresh
+    reader with no offer must read (False, False), which is what keeps a
+    healthy reader's bare start ungated. And the arm itself refuses on a
+    healthy reader: the offer exists only because of a gave-up.
+    """
+    spoken: list = []
+    reader = _reader(spoken)
+    assert reader.rearm_gate() == (False, False)
+    assert reader.arm_rearm_offer() is False, (
+        "a healthy reader must not arm a re-arm offer")
+    assert spoken == [], "nothing was spoken for a healthy reader"
+
+
+def test_reader_enable_clears_a_stale_rearm_offer():
+    """A live reader owns no re-arm offer: a stale "yes" from an old
+    conversation must not look like consent to a LATER gave-up. Cleared
+    before the slot is granted, so the reader that starts can never inherit
+    one.
+    """
+    spoken: list = []
+    procs: list = []
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    reader = _reader(
+        spoken,
+        spawn=lambda *a, **k: types.SimpleNamespace(is_alive=lambda: True),
+        popen_factory=lambda *a, **k: procs.append(FakeProc()) or procs[-1])
+    reader._rearm_offer.arm(999.0, reason="stale")
+    assert reader.set_enabled(True) == "notification reader enabled"
+    assert reader.rearm_gate() == (False, False), (
+        "an enabled reader must not carry a claimable offer")
+    reader.shutdown()
 
 
 def test_reader_gave_up_asks_for_the_live_reload_after_persisting():

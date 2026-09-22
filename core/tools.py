@@ -863,13 +863,22 @@ class ToolBelt:
     # fixtures fail on a missing lock rather than on what it tests.
     _rate_lock = threading.Lock()
 
-    def __init__(self, on_restart_pending: 'callable', permissions: dict | None=None, on_timer: 'callable | None'=None, on_notification: 'callable | None'=None, on_announce: 'callable | None'=None, on_pomodoro: 'callable | None'=None, on_cap_refusal: 'callable | None'=None, dependencies=None) -> None:
+    def __init__(self, on_restart_pending: 'callable', permissions: dict | None=None, on_timer: 'callable | None'=None, on_notification: 'callable | None'=None, on_rearm_offer=None, consume_rearm_offer=None, on_announce: 'callable | None'=None, on_pomodoro: 'callable | None'=None, on_cap_refusal: 'callable | None'=None, dependencies=None) -> None:
         self._dependencies = dependencies or _DEFAULT_DEPS
         self._deps = self._dependencies
         _CURRENT.set(self._dependencies)
         self._on_restart_pending = on_restart_pending
         self._on_timer = on_timer
         self._on_notification = on_notification
+        # The reader's re-arm gate, injected so this module never imports the
+        # assistant: `_on_rearm_offer()` reads `(needed, live)` — the reader
+        # gave up (so a bare start must be gated) and an offer is claimable
+        # right now — and `_consume_rearm_offer()` claims it (the second of
+        # two racing re-enables gets None). Absent (older hosts, some tests)
+        # = no gate: bare `start` behaves as it always did, because a host
+        # that cannot supply the gate cannot have armed an offer either.
+        self._on_rearm_offer = on_rearm_offer
+        self._consume_rearm_offer = consume_rearm_offer
         self._on_announce = on_announce
         # The host decides whether a refusal is worth SAYING out loud (and how
         # often); this belt only knows that a cap turned work away.
@@ -1860,9 +1869,63 @@ class ToolBelt:
             _dep().log.info('press_hotkey: %s', c)
         return r
 
-    @tool(gates='notifications', description='Read future desktop notifications aloud. Actions: start, stop, toggle, status, or mute (mute_apps is comma-separated app names). Private and disabled by default.')
-    def notification_reader(self, action: str='status', mute_apps: str='') -> str:
+    @tool(gates='notifications', description='Read future desktop notifications aloud. Actions: start, stop, toggle, status, or mute (mute_apps is comma-separated app names). Private and disabled by default. After the reader stopped on its own (repeated monitor failures), starting it needs the spoken re-enable offer: confirm=\'yes\' while the offer is live.')
+    def notification_reader(self, action: str='status', mute_apps: str='',
+                            confirm: str='') -> str:
+        # Re-arm gate, keyed on the reader's OWN diagnosis (rearm_gate's
+        # `needed` = it gave up and turned itself off), because "no offer
+        # armed" alone cannot tell a healthy reader from an expired offer and
+        # only the first must leave a bare start ungated. A gave-up reader
+        # must not come back at the model's bare word: the failure was real
+        # (five monitor deaths), the setting was flipped OFF by the app
+        # itself, and an unattended retry loop here would fight the reader's
+        # own decision forever. Following kill_process -> confirm_kill: the
+        # offer is armed by the SPEECH ("say re-enable notifications"), lives
+        # REARM_OFFER_WINDOW_S, and confirm='no' consumes-and-declines like
+        # confirm_kill's. stop, status, mute and toggling toward OFF stay
+        # ungated — the gate protects re-enabling, not stopping.
         action = str(action or 'status').strip().lower()
+        current = setting_flag('notification_reader')
+        wants_enable = (action == 'start'
+                        or (action == 'toggle' and not current))
+        # getattr, not attributes: belts are also built with `__new__` by the
+        # suite and by embedders that never ran __init__ — a missing seam is
+        # "no gate", not a crash.
+        rearm = getattr(self, "_on_rearm_offer", None)
+        consume = getattr(self, "_consume_rearm_offer", None)
+        if wants_enable and rearm is not None:
+            needed, live = rearm()
+            if needed and not live:
+                # The spoken window is THE window: the reader is dead and
+                # will not give up again until something enables it, so a new
+                # offer needs the settings app (or a restart). Say so.
+                return ('ERROR: the notification reader stopped on its own '
+                        'after repeated failures and the re-enable offer has '
+                        'expired. Starting it needs a fresh spoken offer — '
+                        "tell the user to re-enable it from the settings "
+                        "app; a new offer is spoken only the next time the "
+                        'reader gives up.')
+            if needed and live:
+                ans = str(confirm or '').strip().lower()
+                if ans not in ('yes', 'y', 'no', 'n'):
+                    # NOT consumed: an unusable answer leaves the offer open,
+                    # exactly as confirm_kill leaves it.
+                    return ('ERROR: re-enabling needs the user\'s spoken yes '
+                            "while the offer is live — call again with "
+                            "confirm='yes' (or confirm='no' to leave it off).")
+                # consume() is the claim: the second of two racing re-enables
+                # gets None and refuses, instead of both flipping the flag.
+                if consume() is None:
+                    return ('ERROR: the re-enable offer was just claimed '
+                            'elsewhere — check the reader\'s status before '
+                            'doing anything else.')
+                if ans in ('no', 'n'):
+                    _dep().log_decision('notification_reader', '', 'CONFIRM',
+                                        're-arm offer declined')
+                    return ('Left off — the reader stays off. It can be '
+                            're-enabled later from the settings app.')
+                _dep().log_decision('notification_reader', '', 'CONFIRM',
+                                    're-arm offer consumed; re-enabling')
         # `is False` (not `not ...`): set_setting returns an exact bool, but a
         # stubbed seam in tests returns None, which means "not checked" rather
         # than "the write failed" — report only a real failure.

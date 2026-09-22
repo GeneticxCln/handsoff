@@ -5547,10 +5547,15 @@ class Assistant(QObject):
         self._pomodoro = _core_assistant.PomodoroController(
             announce=self._announce_now, spawn=self._start_worker,
             is_closed=self._is_closed)
+        # The belt's re-arm gate reads the reader's own diagnosis and claims
+        # its offer — the same injected-callable seam every other assistant
+        # collaborator uses, so core/tools never imports core/assistant.
         self._tools = ToolBelt(
             on_restart_pending=self._prepare_restart,
             permissions=SETTINGS["permissions"],
             on_notification=self._set_notification_reader,
+            on_rearm_offer=self._notifications.rearm_gate,
+            consume_rearm_offer=self._notifications.consume_rearm_offer,
             on_announce=self._announce_now,
             on_pomodoro=self._set_pomodoro,
             on_cap_refusal=self.announce_cap_refusal,

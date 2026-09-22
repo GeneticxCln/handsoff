@@ -767,7 +767,7 @@ class TestTrimmingTheSchemaCostsNoCapability:
     #: a schema the model can actually call. Update this (and the spec tables)
     #: when the interface deliberately changes; if you only meant to shorten a
     #: description, a failure here means you shortened a capability instead.
-    INTERFACE = "0da48bf03a7ba098ae06d0852a1468a59ca4644d9b51108ca0cc33e4396835cd"
+    INTERFACE = "7c2229e56c87b1198bef146f9834cb9ee630303dc502c45d958cbd50126ae958"
 
     #: The whole belt, as requests sends it (ensure_ascii).
     SCHEMA_CEILING = 18_000
@@ -1611,6 +1611,113 @@ class TestAmbientCapabilities:
         tb._on_announce = kwargs.get("on_announce")
         tb._on_pomodoro = kwargs.get("on_pomodoro")
         return tb
+
+    def test_reader_rearm_gate_bare_start_refused_while_offer_live(self, H, monkeypatch):
+        """The whole point of the re-arm path: after the reader stopped on its
+        own (five monitor deaths), the model cannot bring it back at its bare
+        word. The offer exists, the flag is off — and 'start' without the
+        user's yes is refused with the path back named. The offer is NOT
+        consumed by a refusal.
+        """
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        offers = [(True, True)]          # (needed, live)
+        consumed: list = []
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        tb._on_rearm_offer = lambda: offers[-1]
+        tb._consume_rearm_offer = lambda: consumed.append(1) or {"ok": True}
+        out = tb.notification_reader("start")
+        assert out.startswith("ERROR: re-enabling needs the user's spoken yes"), out
+        assert consumed == [], "a refusal must not consume the offer"
+        # ...and the refusal names the sentence the user was told to say.
+        assert "spoken yes" in out
+
+    def test_reader_rearm_gate_confirm_yes_consumes_and_enables(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        offers = [(True, True)]
+        consumed: list = []
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        tb._on_rearm_offer = lambda: offers[-1]
+        tb._consume_rearm_offer = lambda: consumed.append(1) or {"ok": True}
+        out = tb.notification_reader("start", confirm="yes")
+        assert consumed == [1], "yes claims the offer"
+        assert "started" in out, out
+
+    def test_reader_rearm_gate_confirm_no_declines_and_consumes(self, H, monkeypatch):
+        """'no' must CONSUME the offer, not leave it claimable by a later
+        call — matching confirm_kill's semantics, where a declined offer is
+        spent either way."""
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        offers = [(True, True)]
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        tb._on_rearm_offer = lambda: offers[-1]
+        tb._consume_rearm_offer = lambda: {"ok": True}
+        out = tb.notification_reader("start", confirm="no")
+        assert out.startswith("Left off"), out
+        # ...and the second yes cannot resurrect a declined offer.
+        tb._on_rearm_offer = lambda: (True, False)
+        out2 = tb.notification_reader("start", confirm="yes")
+        assert "expired" in out2, out2
+
+    def test_reader_rearm_gate_expired_offer_refused_with_the_path_back(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: None)
+        tb._on_rearm_offer = lambda: (True, False)   # needed, NOT live
+        out = tb.notification_reader("start", confirm="yes")
+        assert out.startswith("ERROR: the notification reader stopped on its own"), out
+        assert "expired" in out and "settings app" in out, out
+
+    def test_healthy_reader_start_is_ungated(self, H, monkeypatch):
+        """The gate keys on the reader's own gave_up diagnosis — NOT on "an
+        offer exists". A reader that never gave up starts at the model's bare
+        word exactly as before; this is the anti-false-positive rule the
+        self-watch round taught.
+        """
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        tb._on_rearm_offer = lambda: (False, False)  # not needed, no offer
+        out = tb.notification_reader("start")
+        assert "started" in out, out
+
+    def test_absent_rearm_seam_leaves_start_ungated(self, H, monkeypatch):
+        """Belts built with __new__ and no rearm seam at all: the gate is
+        absent, so start behaves exactly as before. A host that cannot supply
+        the gate cannot have armed an offer either.
+        """
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        out = tb.notification_reader("start")
+        assert "started" in out, out
+
+    def test_reader_rearm_gate_toggle_to_off_is_ungated(self, H, monkeypatch):
+        """The gate protects re-enabling, not stopping: with the reader ON,
+        a toggle (which turns it OFF) passes through the gate untouched — and
+        with the gate's seam present but the reader healthy.
+        """
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": True})
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        tb._on_rearm_offer = lambda: (True, True)    # even a live offer...
+        calls: list = []
+        tb._consume_rearm_offer = lambda: calls.append(1) or {"ok": True}
+        out = tb.notification_reader("toggle")
+        assert "stopped" in out, out
+        assert calls == [], "stopping must not consume a re-arm offer"
+
+    def test_reader_rearm_gate_racing_second_yes_refused(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        tb._on_rearm_offer = lambda: (True, True)
+        tb._consume_rearm_offer = lambda: None   # the loser of a race
+        out = tb.notification_reader("start", confirm="yes")
+        assert out.startswith("ERROR: the re-enable offer was just claimed"), out
+        assert "notification reader is on" not in out, out
 
     def test_notification_reader_is_private_by_default(self, H, monkeypatch):
         monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
