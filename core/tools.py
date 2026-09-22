@@ -272,9 +272,10 @@ def _log_target(args: dict, limit: int = 200) -> str:
 def log_decision(tool: str, target: str, decision: str, result: str='dispatched') -> None:
     """Append one JSON line to ~/.local/state/handsoff/decisions.jsonl.
 
-    Every tool decision — ALLOW, DENY, CONFIRM, DRY-RUN — lands here with an
-    action id, so 'why did it do that' always has an answer. Best-effort:
-    a failed log write must never break the tool call itself."""
+    Every tool decision — ALLOW, DENY, CONFIRM, DRY-RUN, RATE-LIMITED,
+    REFUSE — lands here with an action id, so 'why did it do that' always
+    has an answer. Best-effort: a failed log write must never break the
+    tool call itself."""
     entry = {'id': f'{int(time.time() * 1000):x}-{random.randrange(1 << 16):04x}', 'ts': datetime.datetime.now().astimezone().isoformat(timespec='seconds'), 'tool': tool, 'target': _dep()._log_metadata(target), 'decision': decision, 'result': result}
     try:
         with _DECISIONS_LOCK:
@@ -1905,6 +1906,9 @@ class ToolBelt:
                 # The spoken window is THE window: the reader is dead and
                 # will not give up again until something enables it, so a new
                 # offer needs the settings app (or a restart). Say so.
+                log_decision('notification_reader', '', 'REFUSE',
+                             're-enable refused: the re-arm offer has expired '
+                             '— a fresh offer needs the settings app')
                 return ('ERROR: the notification reader stopped on its own '
                         'after repeated failures and the re-enable offer has '
                         'expired. Starting it needs a fresh spoken offer — '
@@ -1925,12 +1929,22 @@ class ToolBelt:
                     # convert it, and the marker is read-and-consumed by the
                     # loop so it cannot cycle.
                     self._last_rearm_retry = True
+                    # Durable before the nudge can consume it: a refusal is
+                    # never only in the model's reply (the injection ledger
+                    # showed this refusal living nowhere but the tool result).
+                    log_decision('notification_reader', '', 'REFUSE',
+                                 're-enable refused: bare start while the '
+                                 "re-arm offer is live — needs confirm='yes' "
+                                 "or 'no'")
                     return ('ERROR: re-enabling needs the user\'s spoken yes '
                             "while the offer is live — call again with "
                             "confirm='yes' (or confirm='no' to leave it off).")
                 # consume() is the claim: the second of two racing re-enables
                 # gets None and refuses, instead of both flipping the flag.
                 if consume() is None:
+                    log_decision('notification_reader', '', 'REFUSE',
+                                 're-enable refused: the re-arm offer was '
+                                 'just claimed elsewhere')
                     return ('ERROR: the re-enable offer was just claimed '
                             'elsewhere — check the reader\'s status before '
                             'doing anything else.')

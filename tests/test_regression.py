@@ -1792,6 +1792,53 @@ class TestAmbientCapabilities:
         assert out.startswith("ERROR: re-enabling needs the user's spoken yes"), out
         assert getattr(tb, "_last_rearm_retry", None) is True
 
+    def test_reader_rearm_gate_refusals_are_durable_in_the_decision_log(
+            self, H, monkeypatch):
+        """A refusal is never only in the model's reply — the house rule the
+        injection ledger made concrete: the gate's three refusals lived
+        nowhere but the tool result, and decisions.jsonl recorded only the
+        policy's ALLOW. Each branch now logs REFUSE with its reason named:
+        a bare start while the offer is live, an expired offer, a lost race.
+        Consent keeps logging CONFIRM; a healthy start logs nothing at all.
+        """
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
+                                             "notification_reader": False})
+        tb = self._tb(H, on_notification=lambda enabled: "started" if enabled else "stopped")
+        seen: list = []
+        monkeypatch.setattr(_core_tools, "log_decision",
+                            lambda *a, **k: seen.append(a))
+        tb._on_rearm_offer = lambda: (True, True)
+        tb._consume_rearm_offer = lambda: {"ok": True}
+        # Bare start: REFUSE, naming the branch.
+        tb.notification_reader("start")
+        assert seen[-1][:3] == ("notification_reader", "", "REFUSE"), seen
+        assert "bare start" in seen[-1][3], seen
+        # A declined offer is an ANSWER: CONFIRM, not REFUSE.
+        tb.notification_reader("start", confirm="no")
+        assert seen[-1][2] == "CONFIRM" and "declined" in seen[-1][3], seen
+        # The yes path: CONFIRM consumed.
+        tb.notification_reader("start", confirm="yes")
+        assert seen[-1][2] == "CONFIRM" and "consumed" in seen[-1][3], seen
+        # Expired offer: REFUSE, pointing at the settings app.
+        tb._on_rearm_offer = lambda: (True, False)
+        seen.clear()
+        tb.notification_reader("start", confirm="yes")
+        assert len(seen) == 1 and seen[0][2] == "REFUSE", seen
+        assert "expired" in seen[0][3], seen
+        # Lost race: REFUSE, naming the claim.
+        tb._on_rearm_offer = lambda: (True, True)
+        tb._consume_rearm_offer = lambda: None
+        seen.clear()
+        tb.notification_reader("start", confirm="yes")
+        assert len(seen) == 1 and seen[0][2] == "REFUSE", seen
+        assert "claimed elsewhere" in seen[0][3], seen
+        # A healthy start is not a refusal: nothing logged.
+        tb._on_rearm_offer = lambda: (False, False)
+        seen.clear()
+        out = tb.notification_reader("start")
+        assert "started" in out, out
+        assert seen == [], seen
+
     def test_notification_reader_is_private_by_default(self, H, monkeypatch):
         monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS,
                                              "notification_reader": False})
