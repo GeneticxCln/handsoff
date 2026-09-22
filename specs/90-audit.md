@@ -2828,3 +2828,85 @@ single 21-row fold.
 The corpus store also counts MINING PASSES, not user turns (`count` 5 today
 because this pass ran the miner repeatedly) — it is a re-seen counter, and
 nothing should read it as usage.
+
+## The corpus grows without a command: the app records the turn, the queue is folded on read (2026-09-21)
+
+The fine-tune round ended with "the corpus has to grow about tenfold first", and
+the store it grows into was fed by a hand-run `--grow` pass over old
+`history.json` files. That has two defects a measurement cannot fix: the pass is
+a command somebody has to remember, and history is TRIMMED — the turns most
+worth learning from are exactly the ones that age out of it. This round moved the
+recording to the moment a turn completes.
+
+**What the app records, and what it deliberately does not.** Every completed turn
+is appended to a queue in the app's state directory (`laya-turns.jsonl`, 0600):
+the utterance, capped at 400 characters, and the TOOL NAMES the turn called.
+No family. The family table is the harness's (`FAMILIES`), and it is not the
+belt's gate map — `run_command` alone spans the `system` and `windows` families —
+so an app-side label would be a second, drifting copy of a vocabulary it cannot
+derive. The queue therefore holds facts the app owns, and
+`ci/laya_corpus.py` derives the label where the table lives.
+
+**The fold is a side effect of reading, not a command.** `build()` — what
+`--report`, `--dump` and the fine-tune all call — folds whatever the queue holds,
+merges it into the store (dedupe, `count`, conflicts), and advances a cursor.
+`--grow` remains as the history BACKFILL, which the queue cannot replace: those
+old turns are only in `history.json`.
+
+**The label rule is one function, used by both paths.** `mine_real` (history) and
+the queue fold both ask the harness's `label_of`, and the fold reports what it
+could not use through the harness's `why_unlabelled` — so the accounting cannot
+disagree with the rule that produced it. What that rule refuses is worth naming,
+because it is not new: a turn that called NOTHING (it answered directly, which
+the authored set already covers, and admitting chat would swamp the routing
+task), a turn that called a tool no family owns, and a turn spanning TWO families
+(not one routing decision but two). All three are recorded and COUNTED, not
+dropped, and the report names the reason rather than a total: across the first two
+probe queues on this machine, **4 of 7 recorded turns were unusable — three
+because they called nothing and one because it spanned two families** — which is
+the corpus saying its option set is narrower than the app's behaviour, not a bug
+in the fold.
+
+**Two findings from building it, both worth more than the feature.**
+
+* A line-count cursor has a SILENT failure mode. Round one tracked "lines
+  already folded" as a number, and a hand-replaced queue with the same line count
+  — or a longer one — leaves the cursor ahead of the new file, so every later
+  turn is skipped forever while health reports a healthy queue. Found by trying
+  the case rather than reasoning about it. The cursor now carries a fingerprint
+  of the lines it consumed; a queue that does not match it is treated as a
+  replaced one and refolded from the start, which the store's dedupe absorbs.
+  That is also what makes deleting the queue by hand SAFE instead of silently
+  fatal.
+* The suite's checkout-write guard caught a real leak in the same cut: `build()`
+  with a scratch store still wrote the DEFAULT cursor into the developer's real
+  state directory, because the queue and the cursor defaulted independently of
+  the store. They now come from ONE directory — a scratch store means a scratch
+  queue — and a missing queue writes no cursor at all.
+
+**What `--ptt health` says now** (`laya_corpus` in the snapshot): `turns_recorded`
+— the running count of completed turns the app has queued — `turns_pending`, what
+the next corpus read folds in, and `grown_rows`, what the store holds after
+dedupe. None of the three is computed by running the corpus: the app reads two
+JSON-lines files and a cursor.
+
+**Stated limits.** The queue is append-only and unbounded by design — it is the
+record that a fold has NOT happened yet, so trimming it is what would lose a turn
+whose fold raced the app's write; at ~150 bytes a turn it is the smallest file in
+the state directory, and deleting it by hand is safe (see above). A turn that
+aborted, was cancelled or produced nothing is not recorded: "completed" is the
+gate, and an aborted turn has no choice to learn from. The store's `count` now
+means "times the user really said this" for queue rows, while a history-mined row
+still bumps once per `--grow` pass — the old re-seen caveat, now confined to the
+backfill path. And the recording is per TURN, so a turn that called one tool four
+times contributes one row: the decision being learned is the family choice, not
+the call volume.
+
+**A third finding, from running the gates rather than the feature: the control
+socket's own request bound could overshoot by one `recv`.** The read loop checked
+`_CONTROL_REQUEST_MAX` BEFORE reading and then asked for a fixed 64 KiB, so a
+request delivered in pieces could land one chunk past the ceiling. It surfaced as
+a single red test under a loaded full-suite run (101996 bytes buffered for a
+65536-byte bound) while passing in isolation — the shape of a flake, and it was
+not one: the test was right about the bound. The loop now asks for what is LEFT
+of the ceiling, which makes the bound exact and that test deterministic.

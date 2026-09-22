@@ -65,6 +65,136 @@ class TestTheCorpusKeepsItsLabelsHonest:
         assert live <= covered, f"the report lost sight of {sorted(live - covered)}"
 
 
+class TestTheTurnQueue:
+    """The app records a completed turn; this module folds it. That is where
+    "the corpus grows without a command" actually lives, so it is what the
+    guards here hold down: one label rule, a fold nobody has to remember, and a
+    cursor that cannot go stale in silence."""
+
+    def _queue(self, tmp_path: Path, rows: list) -> Path:
+        path = tmp_path / "laya-turns.jsonl"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows),
+                        encoding="utf-8")
+        return path
+
+    def test_one_label_rule_labels_both_ways_a_row_is_mined(self):
+        """The history pass and the turn queue must not be labelled by two
+        different rules: the same tool set has to get the same answer, and the
+        reason it is refused has to name the case the fold reports.
+        """
+        assert bakeoff.label_of(["set_reminder"]) == "timers"
+        assert bakeoff.label_of(["set_reminder", "list_reminders"]) == "timers", \
+            "one family, several tools, is one routing case"
+        assert bakeoff.label_of([]) is None, "answering directly is not a tool choice"
+        assert bakeoff.label_of(["set_reminder", "media_play"]) is None, \
+            "a turn spanning two families is two decisions, not one"
+        assert bakeoff.label_of(["no_such_tool"]) is None
+        assert bakeoff.why_unlabelled(["set_reminder"]) == ""
+        assert bakeoff.why_unlabelled([]) == "answered without a tool"
+        assert "spans families" in bakeoff.why_unlabelled(
+            ["set_reminder", "media_play"])
+        assert "no family owns" in bakeoff.why_unlabelled(["no_such_tool"])
+
+    def test_the_fold_happens_without_a_command(self, tmp_path):
+        """`build()` is what --report, --dump and the fine-tune all call, and
+        the queue is folded there — not behind --grow, which is only the
+        history backfill. Nothing has to be remembered or run.
+        """
+        turns = self._queue(tmp_path, [
+            {"ts": "t1", "text": "what is claude doing",
+             "tools": ["quant_space_read"]},
+            {"ts": "t2", "text": "hello there", "tools": []},
+        ])
+        built = corpus.build(authored_set=False, store_path=tmp_path / "s.jsonl",
+                             turn_log=turns)
+        assert built["counts"]["turns"]["recorded"] == 2
+        assert built["counts"]["turns"]["folded_lines"] == 2
+        assert built["counts"]["turns"]["unusable"] == 1
+        assert built["counts"]["by_source"] == {"grown": 1}
+        assert [r["family"] for r in built["rows"]] == ["desk"]
+        assert built["rows"][0]["source"] == "turn:t1", built["rows"][0]
+
+    def test_a_fold_is_idempotent_and_saying_it_again_counts(self, tmp_path):
+        """Re-reading the corpus is the normal case. With the cursor advanced,
+        a row counted twice means the user SAID it twice — which is why the
+        cursor, not a re-seen counter, is what makes this honest.
+        """
+        turns = self._queue(tmp_path, [{"ts": "t1", "text": "play some music",
+                                        "tools": ["media_play"]}])
+        store = tmp_path / "s.jsonl"
+        corpus.build(authored_set=False, store_path=store, turn_log=turns)
+        assert json.loads(store.read_text(encoding="utf-8"))["count"] == 1
+        again = corpus.build(authored_set=False, store_path=store, turn_log=turns)
+        assert again["counts"]["turns"]["folded_lines"] == 0, "the cursor did not advance"
+        assert json.loads(store.read_text(encoding="utf-8"))["count"] == 1
+        turns.write_text(turns.read_text(encoding="utf-8")
+                         + json.dumps({"ts": "t2", "text": "Play some music!",
+                                       "tools": ["media_play"]}) + "\n",
+                         encoding="utf-8")
+        third = corpus.build(authored_set=False, store_path=store, turn_log=turns)
+        assert third["counts"]["turns"]["folded"] == 1
+        assert json.loads(store.read_text(encoding="utf-8"))["count"] == 2
+
+    def test_a_hand_replaced_queue_is_refolded_not_skipped(self, tmp_path):
+        """A line COUNT cannot tell "the same queue, more lines" from "another
+        queue with the same count": a replaced file would leave the cursor
+        ahead of it and every later turn would be skipped FOREVER — the one
+        silent failure this design can have. The cursor therefore carries a
+        fingerprint of the lines it consumed, and a queue that does not match
+        it is folded from the start.
+        """
+        turns = self._queue(tmp_path, [{"ts": "t1", "text": "play some music",
+                                        "tools": ["media_play"]}])
+        store = tmp_path / "s.jsonl"
+        corpus.build(authored_set=False, store_path=store, turn_log=turns)
+        self._queue(tmp_path, [
+            {"ts": "x1", "text": "what is the weather", "tools": ["get_weather"]},
+            {"ts": "x2", "text": "pause the music", "tools": ["media_control"]},
+        ])
+        after = corpus.build(authored_set=False, store_path=store, turn_log=turns)
+        assert after["counts"]["turns"]["replaced"] is True
+        assert sorted(r["text"] for r in after["rows"]) == [
+            "pause the music", "play some music", "what is the weather"], \
+            "the refold kept the row it had already folded and took the two new ones"
+        assert sorted(r["family"] for r in after["rows"]) == ["media", "media", "weather"]
+
+    def test_a_turn_the_option_set_cannot_use_is_counted_not_dropped(self, tmp_path):
+        turns = self._queue(tmp_path, [
+            {"ts": "t1", "text": "open the window and play music",
+             "tools": ["focus_window", "media_play"]},
+            {"ts": "t2", "text": "hello there", "tools": []},
+            {"ts": "t3", "text": "", "tools": ["set_reminder"]},
+        ])
+        built = corpus.build(authored_set=False, store_path=tmp_path / "s.jsonl",
+                             turn_log=turns)
+        turns_info = built["counts"]["turns"]
+        assert turns_info["recorded"] == 3
+        assert turns_info["folded"] == 0 and turns_info["unusable"] == 3
+        assert built["counts"]["total"] == 0, "an unusable turn was trained on"
+
+    def test_the_queue_the_cursor_and_the_store_are_private(self, tmp_path):
+        turns = self._queue(tmp_path, [{"ts": "t", "text": "play some music",
+                                        "tools": ["media_play"]}])
+        store = tmp_path / "s.jsonl"
+        corpus.build(authored_set=False, store_path=store, turn_log=turns)
+        for path in (store, turns.with_suffix(".cursor")):
+            assert path.stat().st_mode & 0o777 == 0o600, path
+
+    def test_the_default_paths_follow_the_app_s_own_state_directory(self, monkeypatch,
+                                                                    tmp_path):
+        """A store anywhere else than the app's state directory is a corpus
+        that silently trains on nothing: `handsoff.py` builds STATE_DIR as
+        $XDG_STATE_HOME/handsoff, and these paths are derived the same way.
+        """
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        assert corpus.state_dir() == tmp_path / "handsoff"
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+        assert corpus.state_dir() == Path.home() / ".local" / "state" / "handsoff"
+        assert corpus.DEFAULT_STORE.name == "laya-corpus.jsonl"
+        assert corpus.DEFAULT_TURNS.name == "laya-turns.jsonl"
+        assert corpus.DEFAULT_CURSOR.name == "laya-turns.cursor"
+
+
 class TestTheGrowthStore:
     def test_a_row_is_added_once_and_re_seen_in_place(self, tmp_path):
         """Re-mining the same history is the normal case (the harness is run by

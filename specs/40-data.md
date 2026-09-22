@@ -93,6 +93,9 @@ atomic + 0600 (`atomic_private_write`, mkstemp in-dir, no predictable
 | `STATE_DIR/mic-health.json` | {events:[…], briefing} | ≤200 transitions |
 | `STATE_DIR/cap-refusals.json` | {totals, last} | ≤50; storm-proof |
 | `STATE_DIR/decisions.jsonl` | JSON lines | ≤500 (`_DECISIONS_MAX`) |
+| `STATE_DIR/laya-turns.jsonl` | one line per completed turn: `{ts, text, tools}` | append-only; folded by `ci/laya_corpus.py` on every read, 0600 |
+| `STATE_DIR/laya-turns.cursor` | `{lines, hash, at}` | how much of the queue was folded; the hash catches a replaced queue |
+| `STATE_DIR/laya-corpus.jsonl` | grown corpus rows `{text, family, source, first_seen, last_seen, count}` | written by `ci/laya_corpus.py`, never into the checkout, 0600 |
 | `STATE_DIR/world-events-seen.json` | {norm_key: epoch} | dedupes briefings + proactive only |
 | `STATE_DIR/pending-restart.json` | {reason, at} | self-edit restart handshake |
 | `STATE_DIR/screen.png` | screenshot | overwritten per capture |

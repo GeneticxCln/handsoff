@@ -202,6 +202,21 @@ _CAP_EVENT_FIELDS = ("registry", "cap", "held", "reserved", "occupants",
 _CAP_LABELS = {"job": "background-job", "watch-file": "file-watcher",
                "watch-process": "process-watcher",
                "diagnostic": "diagnostic-worker"}
+# The Laya corpus grows from the app's own completed turns. This file is the
+# QUEUE: facts the app owns — the utterance, and the tool names the turn called
+# — written the moment a turn completes. The FAMILY is derived where the family
+# table lives (`ci/laya_corpus.py`, from `ci/laya_bakeoff.py`), because a copy
+# of a label set inside the app is a copy that drifts, and the queue is folded
+# in on every read of the corpus — so the corpus grows with no command.
+# Append-only by design: the queue is the record that a fold has NOT happened
+# yet, so the app never deletes from it, and it can be deleted by hand safely
+# (the store keeps what was folded; the cursor notices a replaced queue and
+# refolds the whole thing).
+LAYA_TURNS_FILE = STATE_DIR / "laya-turns.jsonl"
+LAYA_CORPUS_FILE = STATE_DIR / "laya-corpus.jsonl"   # written by ci/laya_corpus.py
+LAYA_TURNS_CURSOR = STATE_DIR / "laya-turns.cursor"  # how much of it was folded
+LAYA_UTTERANCE_MAX = 400              # one spoken turn; anything longer is not one
+_LAYA_TURNS_LOCK = threading.Lock()   # append is read-modify-write for the cursor
 SELF_MARKER = "# handsoff-self-marker: this line must be preserved across self-edits"
 
 # Support-module loading: ONE shared order (beside-this-file -> ~/.local/bin
@@ -4379,6 +4394,81 @@ _REMINDER_STORE = _core_assistant.ReminderStore(
 _core_calendar = _load_module("calendar")
 
 
+def _turn_tool_names(messages: list) -> list[str]:
+    """Every tool name THIS turn's messages called, in order, deduped.
+
+    Read from the turn's own messages rather than from `decisions.jsonl`: a call
+    that was DENIED or deferred is still what the model chose, and the decision
+    log is capped and trimmed at 500 lines while this is the routing record.
+    """
+    names: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            name = (fn or {}).get("name") if isinstance(fn, dict) else None
+            if isinstance(name, str) and name and name not in names:
+                names.append(name)
+    return names
+
+
+def _record_turn_for_corpus(text: str, messages: list) -> None:
+    """Append one completed turn to the Laya corpus queue (best effort).
+
+    Called with the turn's own messages BEFORE history is sealed: a turn that
+    stopped for a confirmation offer carries tool calls whose `role:tool` replies
+    never happened, and those calls are exactly the model's choice — which the
+    sealed history drops. The utterance is capped at LAYA_UTTERANCE_MAX, and the
+    line is written 0600 beside `decisions.jsonl`, because these are the user's
+    own sentences; the corpus module's refusal to write them into the checkout is
+    the other half of that rule.
+    """
+    text = (text or "").strip()[:LAYA_UTTERANCE_MAX]
+    if not text:
+        return
+    entry = json.dumps(
+        {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+         "text": text, "tools": _turn_tool_names(messages)}, ensure_ascii=False)
+    try:
+        with _LAYA_TURNS_LOCK:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with LAYA_TURNS_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(entry + "\n")
+                fh.flush()
+            os.chmod(LAYA_TURNS_FILE, 0o600)
+    except Exception:
+        log.debug("laya turns write failed", exc_info=True)
+
+
+def _laya_corpus_counts() -> dict:
+    """What `--ptt health` says about the corpus: what is queued, what is in.
+
+    `turns_recorded` is the RUNNING COUNT — completed turns the app has written
+    to the queue — and it is the number that grows as the machine is used.
+    `turns_pending` is what the next read of the corpus (a `--report`, a dump or
+    a fine-tune) folds in; `grown_rows` is what the store holds after dedupe.
+    Read-only and cheap: both files are JSON lines.
+    """
+    def _rows(path: Path) -> int:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return sum(1 for line in fh if line.strip())
+        except OSError:
+            return 0
+
+    folded = 0
+    try:
+        folded = max(0, int(json.loads(LAYA_TURNS_CURSOR.read_text(
+            encoding="utf-8")).get("lines")))
+    except (OSError, TypeError, ValueError):
+        pass
+    recorded = _rows(LAYA_TURNS_FILE)
+    return {"turns_recorded": recorded,
+            "turns_pending": max(0, recorded - folded),
+            "grown_rows": _rows(LAYA_CORPUS_FILE)}
+
+
 def _record_mic_event(from_state: str, to_state: str) -> None:
     """Append one mic-state transition to the mic-health state file (best
     effort: diagnostics must never break the audio path)."""
@@ -5623,6 +5713,7 @@ class Assistant(QObject):
             "size": SETTINGS.get("bubble_size", _core_bubble.WINDOW_PX),
         }
         snap["deployment"] = _deployment_snapshot()
+        snap["laya_corpus"] = _laya_corpus_counts()
         return snap
 
     # -- mic self-heal -------------------------------------------------------
@@ -6176,12 +6267,14 @@ class Assistant(QObject):
     # -- reminders --------------------------------------------------------------
 
     def _reminder_worker(self) -> None:
+        self._reminder_beats = 0
         while not self._shutdown_event.wait(2.0):
             try:
                 # drain_due() owns the whole read-modify-write (never nest two
                 # flock sidecars: the non-reentrant LOCK_EX would block forever;
                 # the store's in-process lock serializes threads instead)
                 fired = _reminder_store().drain_due()
+                self._reminder_beats = getattr(self, "_reminder_beats", 0) + 1
                 if not fired:
                     continue
                 for r in fired:
@@ -6210,11 +6303,14 @@ class Assistant(QObject):
             last = SETTINGS_FILE.stat().st_mtime
         except OSError:
             pass
+        self._settings_watch_beats = 0
         while not self._shutdown_event.wait(3.0):
             try:
                 mtime = SETTINGS_FILE.stat().st_mtime
             except OSError:
                 continue
+            self._settings_watch_beats = \
+                getattr(self, "_settings_watch_beats", 0) + 1
             if mtime != last:
                 last = mtime
                 self.sigCommand.emit("reload-settings")
@@ -6310,7 +6406,6 @@ class Assistant(QObject):
                                name="missed-reminders")
         self._start_worker(self._reminder_worker, name="reminders")
         self._start_worker(self._settings_watch_worker, name="settings-watch")
-
     def shutdown(self) -> None:
         self._lifecycle_ensure()
         if self._closed:
@@ -7752,6 +7847,9 @@ class Assistant(QObject):
                                     "content": content[len(injected):].lstrip("\n")}
                     break
         if fresh:
+            # The corpus grows from this turn — before history is sealed, and
+            # best-effort: a corpus write must never be the reason a turn fails.
+            _record_turn_for_corpus(text, fresh)
             _strip_images(fresh)   # screenshots: this turn's model call only
             _seal_tool_calls(fresh)  # no unanswered call may enter the prefix
             self._history = _trim_history(self._history + fresh)
@@ -8517,7 +8615,17 @@ class ControlServer:
                                 _peer_uid(conn), _CONTROL_READ_BUDGET)
                             break
                         try:
-                            part = conn.recv(65536)
+                            # Ask for what is LEFT of the ceiling, not a fixed
+                            # chunk: the loop checks BEFORE reading, so a fixed
+                            # 64 KiB asked for one more chunk than the bound
+                            # allowed and the request could reach the ceiling
+                            # plus a full recv. Measured under a loaded full-suite
+                            # run, where the kernel delivers a 100 KB request in
+                            # pieces: the dispatched argument was 101996 bytes for
+                            # a 65536-byte bound, and the test that holds the bound
+                            # was right about it.
+                            part = conn.recv(min(65536,
+                                                 _CONTROL_REQUEST_MAX - total))
                         except (TimeoutError, OSError):
                             break
                         if not part:

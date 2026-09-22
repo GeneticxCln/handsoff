@@ -287,6 +287,36 @@ def tool_token_costs(checkout: pathlib.Path) -> dict | None:
     return out
 
 
+def why_unlabelled(tools: list[str]) -> str:
+    """Why a turn's tool calls select no family — '' when they select exactly one.
+
+    A routing case is ONE family, so this is the rule both ways rows are mined
+    are labelled by, written ONCE: a turn that spans two families is not one
+    routing decision, it is two; a call to a tool the belt no longer has is
+    unusable because the option set this corpus trains toward is this table's
+    own; and a turn that called nothing answered directly, which the authored
+    set already covers — keeping chat out of the MINED rows is what stops it
+    swamping the routing task. The corpus reports its skips through this same
+    function, so its accounting cannot disagree with the label rule.
+    """
+    if not tools:
+        return "answered without a tool"
+    unknown = sorted({t for t in tools if t not in TOOL_FAMILY})
+    if unknown:
+        return f"called a tool no family owns ({', '.join(unknown)})"
+    fams = sorted({TOOL_FAMILY[t] for t in tools})
+    if len(fams) > 1:
+        return f"spans families ({', '.join(fams)})"
+    return ""
+
+
+def label_of(tools: list[str]) -> str | None:
+    """The ONE family a turn's tool calls select, or None when they select none."""
+    if why_unlabelled(tools):
+        return None
+    return TOOL_FAMILY[tools[0]]
+
+
 def mine_real(dirpath: pathlib.Path) -> list[tuple[str, str, str]]:
     """(utterance, family, source) from the app's own history files.
 
@@ -314,15 +344,10 @@ def mine_real(dirpath: pathlib.Path) -> list[tuple[str, str, str]]:
                     name = (call.get("function") or {}).get("name")
                     if name:
                         tools.append(name)
-            fams = {TOOL_FAMILY[t] for t in tools if t in TOOL_FAMILY}
-            # One family, and it must own every tool the turn called: a turn
-            # that spans two families is not a routing case, it is two.
-            if text and len(fams) == 1 and len(tools) == len([t for t in tools
-                                                             if t in TOOL_FAMILY]):
-                fam = fams.pop()
-                if (text, fam) not in seen:
-                    seen.add((text, fam))
-                    rows.append((text, fam, path.name))
+            fam = label_of(tools)
+            if text and fam and (text, fam) not in seen:
+                seen.add((text, fam))
+                rows.append((text, fam, path.name))
     return rows
 
 
