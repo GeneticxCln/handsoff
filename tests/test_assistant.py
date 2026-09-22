@@ -706,3 +706,37 @@ def test_re_enabling_the_reader_starts_the_counters_over():
     assert (h["failures"], h["gave_up"], h["attempts_used"],
             h["backoff_seconds"], h["last_failure"]) == (0, False, 0, 0.0, None)
     assert h["state"] == "running"
+
+
+def test_pomodoro_beating_wait_keeps_the_exact_wait_contract():
+    """The chunked wait exists so a 25-minute phase is not indistinguishable
+    from a wedged loop to the self-watch sampler. The contract it must keep:
+    a set stop wins IMMEDIATELY (never a full chunk), the total sleep is the
+    requested amount (phase timing untouched), and the beat advances between
+    chunks — which is the only reason the chunking exists.
+    """
+    from core.assistant import PomodoroController
+
+    spoken: list = []
+
+    def spawn(*a, **k):
+        return types.SimpleNamespace(is_alive=lambda: True, join=lambda *a: None)
+
+    ctrl = PomodoroController(announce=spoken.append, spawn=spawn,
+                              is_closed=lambda: False)
+    stop = threading.Event()
+    ctrl._beat = 0
+
+    # Stop already set: wins immediately, zero chunks consumed.
+    stop.set()
+    assert ctrl._wait_beating(stop, 300.0) is True
+    assert ctrl._beat == 0
+
+    # Unset stop, long wait: the wait consumes exactly `seconds` of chunk
+    # sleeps (an Event.wait returns False after each full chunk) and beats
+    # between chunks — 300 s in 30 s chunks is 10 beats.
+    stop.clear()
+    start = time.monotonic()
+    assert ctrl._wait_beating(stop, 0.05) is False
+    assert ctrl._beat == 1
+    assert time.monotonic() - start < 1.0, "a 0.05 s wait must stay 0.05 s"

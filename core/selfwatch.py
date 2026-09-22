@@ -43,13 +43,17 @@ __all__ = [
 LONG_LIVED_PREFIXES = (
     "mic-health",            # the mic reporter (spawned once per listener)
     "pipeline",              # the audio -> transcription worker
-    "loader",                # the model loader
     "reminders",             # the reminder worker
     "settings-watch",        # the settings file watcher
     "control",               # the control socket server
     "notification-reader",   # the dbus notification reader
     "pomodoro",              # the pomodoro timer
 )
+# "loader" was watched here first and the live bubble proved why it must
+# not be: model loads are TRANSIENT work (load, hand over the model, exit),
+# so the thread is absent most of the time and the sampler read its normal
+# rest state as a death. A prefix earns its place here only if the process
+# is broken when that thread is not running.
 
 # Wedge threshold: a watched component whose probe value has not changed for
 # this long is reported wedged. Generous on purpose — a false "wedged" that

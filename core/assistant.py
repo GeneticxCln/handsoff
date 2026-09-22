@@ -52,6 +52,24 @@ class PomodoroController:
         with self._lock:
             return self._beat
 
+    def _wait_beating(self, stop: threading.Event, seconds: float) -> bool:
+        """Wait `seconds` for `stop` in chunks of at most 30 s, bumping the
+        self-watch beat between chunks. True means STOP — the exact contract
+        of the plain `stop.wait` it replaces, with the same total sleep, so
+        phase timing is untouched; the chunks exist because a 25-minute
+        single wait is indistinguishable from a wedged loop to a sampler
+        that watches progress signals.
+        """
+        waited = 0.0
+        while waited < seconds:
+            chunk = min(30.0, seconds - waited)
+            if stop.wait(chunk):
+                return True
+            waited += chunk
+            with self._lock:
+                self._beat = getattr(self, "_beat", 0) + 1
+        return False
+
     def command(self, action: str, work: float, break_minutes: float) -> str:
         """Own the bounded pomodoro worker and announce work/break transitions."""
         if action == "status":
@@ -85,7 +103,7 @@ class PomodoroController:
                 state = self._state
             if not state:
                 return
-            if stop.wait(max(0.05, state["until"] - time.monotonic())):
+            if self._wait_beating(stop, max(0.05, state["until"] - time.monotonic())):
                 return
             with self._lock:
                 self._beat = getattr(self, "_beat", 0) + 1

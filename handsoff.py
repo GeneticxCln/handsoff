@@ -6452,9 +6452,15 @@ class Assistant(QObject):
         self._selfwatch = _selfwatch_mod.SelfWatch(
             sync_fns={
                 # A probe whose VALUE changes while the component works; a
-                # frozen value for WEDGED_AFTER_S is the wedge signal.
+                # frozen value for WEDGED_AFTER_S is the wedge signal. Only
+                # components whose healthy loop CHANGES a value get one: the
+                # reader's traffic beat was here first and the live bubble
+                # proved it wrong — a quiet desktop is the reader's HEALTHY
+                # state, so its beat freezes on silence and read 'wedged'
+                # forever. It is watched liveness-only (its real failure,
+                # retry-budget exhaustion, ends in thread exit, which the
+                # liveness half catches).
                 "reminders": "_selfwatch_probe_reminders",
-                "notification-reader": "_selfwatch_probe_reader",
                 "settings-watch": "_selfwatch_probe_settings_watch",
                 "pomodoro": "_selfwatch_probe_pomodoro",
             })
@@ -6503,10 +6509,6 @@ class Assistant(QObject):
     def _selfwatch_probe_settings_watch(self):
         """The settings watcher's poll counter — set every 3 s pass."""
         return getattr(self, "_settings_watch_beats", None)
-
-    def _selfwatch_probe_reader(self):
-        """The reader's own monotonically increasing read counter."""
-        return getattr(self._notifications, "beat", lambda: None)()
 
     def _selfwatch_probe_pomodoro(self):
         """Pomodoro's poll counter, or None when the timer is not running
