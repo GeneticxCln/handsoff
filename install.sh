@@ -57,7 +57,7 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/handsoff"
 # TOP_REQUIRED is the floor: what handsoff.py hard-imports. Losing one of those
 # must fail the stage loudly rather than deploy an app that dies on import.
 TOP_REQUIRED="handsoff.py settings_schema.py hardware.py"
-TOP_EXECUTABLE="handsoff.py handsoff-settings.py handsoff-restart"
+TOP_EXECUTABLE="handsoff.py handsoff-settings.py handsoff-restart handsoff-stop-probe"
 # core/ ships as a SET. CORE_REQUIRED is the floor — the modules handsoff.py
 # hard-imports — and it fails the stage loudly if one of them disappears; the
 # glob over core/*.py is the ceiling. It used to be a hand-maintained copy list,
@@ -335,8 +335,14 @@ if [ "${1:-}" = "--uninstall" ]; then
             echo "FATAL: could not create the handsoff backup archive; nothing removed" >&2
             exit 1
         fi
+        # Back up the SAME tree purge is about to delete: STATE_DIR is
+        # XDG-resolved (line 45) and the `rm -rf` below deletes exactly it,
+        # so the archive must name the same relative path — a hardcoded
+        # .local/state/handsoff would restore a wrong-or-absent tree while
+        # the real state (an XDG-redirected one) was destroyed.
+        _purge_state_rel="${STATE_DIR#"$HOME"/}"          # e.g. .local/state/handsoff
         if ! tar czf "$backup" -C "$HOME" \
-                .config/handsoff .local/state/handsoff; then
+                ".config/handsoff" "$_purge_state_rel"; then
             rm -f -- "$backup"
             echo "FATAL: handsoff backup archive failed; nothing removed" >&2
             exit 1

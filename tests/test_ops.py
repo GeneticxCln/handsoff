@@ -1965,6 +1965,51 @@ class TestInstallerPurgeBackup:
         assert conf.exists() and state.exists()
         assert not list(home.glob("handsoff-backup-*.tar.gz"))
 
+    def test_purge_backs_up_the_xdg_redirected_state_it_deletes(self, tmp_path):
+        """--purge deletes the XDG-RESOLVED $STATE_DIR (line 45), so the
+        backup archive must name the same tree — the audit found the tar
+        hardcoding .local/state/handsoff, which under an XDG-redirected
+        HOME archives a wrong-or-absent directory while rm -rf destroys
+        the real one. Both spellings must agree, and the archive must
+        actually contain the redirected state's files."""
+        home = tmp_path / "home"
+        xdg_state = home / "xdg-state"            # NOT .local/state
+        conf = home / ".config" / "handsoff"
+        state = xdg_state / "handsoff"
+        conf.mkdir(parents=True)
+        state.mkdir(parents=True)
+        (conf / "settings.json").write_text("config")
+        (state / "history.json").write_text("redirected state")
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "systemctl").write_text("#!/bin/sh\nexit 0\n")
+        (fake_bin / "systemctl").chmod(0o755)
+        env = dict(os.environ)
+        env.update({
+            "HOME": str(home),
+            "XDG_STATE_HOME": str(xdg_state),
+            "PATH": str(fake_bin) + os.pathsep + env["PATH"],
+        })
+        result = subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--uninstall", "--purge"],
+            env=env, capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not conf.exists() and not state.exists(), (
+            "the redirected state itself must be purged")
+        archives = sorted(home.glob("handsoff-backup-*.tar.gz"))
+        assert len(archives) == 1, result.stderr
+        listing = subprocess.run(
+            ["tar", "tzf", str(archives[0])], capture_output=True,
+            text=True, check=True,
+        ).stdout
+        # The archive holds the state purge ACTUALLY deleted — the redirected
+        # tree — not the hardcoded default path it never touched.
+        assert "xdg-state/handsoff/history.json" in listing, listing
+        assert ".local/state/handsoff" not in listing, listing
+        assert ".config/handsoff/settings.json" in listing
+
 
 # ------------------------------- what install.sh provisions, and from where
 # install.sh decides five things the app has already decided: the whisper size

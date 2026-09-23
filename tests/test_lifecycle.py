@@ -3153,6 +3153,34 @@ class TestStagedRelease:
         assert (home / ".local" / "bin" / "core" / "theme.py").read_text() \
             == SENTINEL_CORE_BYTES
 
+    def test_rollback_and_switch_keep_the_probe_executable(self, tmp_path):
+        """The unit's ExecStop= executes handsoff-stop-probe DIRECTLY, so a
+        rollback or switch that restores it 0644 leaves a unit whose stop job
+        dies on Permission denied — discovered by the 2026-09-23 audit (the
+        fresh-install path chmods 755, but the restore case listed only three
+        executables and the rollback loop trusted is_exec()). Modes are
+        asserted here, not just bytes."""
+        home, _conf = self._fake_home(tmp_path, bin_py="# OLD deployed bytes\n")
+        r = self._run_rehearsal(home)
+        assert r.returncode == 0, r.stderr[-3000:]
+        bin_dir = home / ".local" / "bin"
+        # The rehearsal install itself must have made the probe executable.
+        assert bin_dir / "handsoff-stop-probe"
+        mode = (bin_dir / "handsoff-stop-probe").stat().st_mode & 0o777
+        assert mode == 0o755, oct(mode)
+        # ...and after a rollback, the restored probe is STILL executable.
+        rb = subprocess.run(
+            ["bash", str(HERE / "install.sh"), "--rollback"],
+            env={**os.environ, "HOME": str(home),
+                 "XDG_STATE_HOME": str(home / ".local" / "state")},
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert rb.returncode == 0, rb.stderr
+        mode = (bin_dir / "handsoff-stop-probe").stat().st_mode & 0o777
+        assert mode == 0o755, (
+            "a rollback restored the stop-probe non-executable — the unit's "
+            f"ExecStop would fail on every stop: {oct(mode)}")
+
     def test_rollback_without_previous_release_fails_cleanly(self, tmp_path):
         home, conf = self._fake_home(tmp_path, bin_py=None)
         env = dict(os.environ)
