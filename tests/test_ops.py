@@ -1100,6 +1100,103 @@ class TestDoctor:
         assert not any(ln.strip().startswith("[PASS] PASS")
                        for ln in text.splitlines())
 
+    # ---- fault-injection guards: the three injected failure modes ----------
+
+    def test_a_reader_that_lost_its_shutdown_skip_fails_the_audit(self, H,
+                                                                  monkeypatch,
+                                                                  tmp_path):
+        """Fault 3a, now a guard: a reader whose shutdown skip is gone counts
+        an annotated sweep as a pattern pair — the false positive this whole
+        arc exists to prevent. The independent oracle (expected pairs
+        recomputed from the raw rows) must catch it, since the stripped-flags
+        delta cannot: the breakage survives re-parsing and lies identically
+        both ways."""
+        rows = [self._attr_row("2026-09-23T09:00:00+02:00"),
+                {"ts": "2026-09-23T09:03:00+02:00",
+                 "unit": "handsoff.service", "callers": [],
+                 "shutdown": 1, "note": "session-shutdown sweep"}]
+        ledger = tmp_path / "stop-attribution.jsonl"
+        ledger.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
+                          encoding="utf-8")
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+
+        def broken_reader(records):
+            stripped = [{**r, "shutdown": False} for r in records]
+            return H._expected_ghost_pairs(stripped) and {
+                "seen": True, "pairs": H._expected_ghost_pairs(stripped),
+                "window_min": 60, "last_ghost_ts": ""}
+
+        monkeypatch.setattr(H, "_ghost_stop_pattern", broken_reader)
+        text, rc = H._stop_audit_report()
+        # The broken reader is self-consistent (its own stripped-flags delta
+        # matches), so `pattern reader` passes and the ORACLE catches it.
+        assert rc == 1 and "[FAIL] exemption" in text
+        assert "independent count 0" in text
+
+    def test_a_reader_that_overcounts_fails_the_exemption_check(self, H,
+                                                                monkeypatch,
+                                                                tmp_path):
+        """Fault 3b, now a guard: the old check bounded pairs from one side
+        only (`gained >= 0`), so a reader that lies identically with and
+        without flags passed its own delta. Equality with the independent
+        count is the contract now — both in the sweep-ghost branch and in
+        the no-sweep-ghost branch."""
+        rows = [self._attr_row("2026-09-23T09:00:00+02:00"),
+                self._ghost_row("2026-09-23T09:03:00+02:00")]
+        ledger = tmp_path / "stop-attribution.jsonl"
+        ledger.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
+                          encoding="utf-8")
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+        real = H._ghost_stop_pattern
+
+        def gainy_reader(records):
+            out = real(records)
+            return {**out, "pairs": out["pairs"] + 1, "seen": True}
+
+        monkeypatch.setattr(H, "_ghost_stop_pattern", gainy_reader)
+        text, rc = H._stop_audit_report()
+        assert rc == 1 and "[FAIL] exemption" in text
+        assert "the raw rows support 1" in text
+
+    def test_the_oracle_agrees_with_the_reader_on_the_documented_rule(self, H,
+                                                                      monkeypatch,
+                                                                      tmp_path):
+        """The oracle is deliberate duplication — this guard is the price of
+        that choice: the two implementations must agree on the documented
+        rule across the shapes that matter (anchor then ghost, sweep ghost
+        exempt, negative gap never counts, unparseable ts never accuses)."""
+        shapes = [
+            [("attr", "09:00"), ("ghost", "09:03")],        # 1 pair
+            [("attr", "09:00"), ("sweep", "09:03")],        # exempt: 0
+            [("attr", "09:00"), ("ghost", "08:00")],        # negative gap: 0
+            [("ghost", "09:03")],                            # no anchor: 0
+            [("attr", "09:00"), ("ghost", "11:03")],        # outside window: 0
+        ]
+
+        def row(kind, hm):
+            ts = f"2026-09-23T{hm}:00+02:00"
+            if kind == "attr":
+                return self._attr_row(ts)
+            r = self._ghost_row(ts)
+            if kind == "sweep":
+                r["shutdown"] = 1
+                r["note"] = "sweep"
+            return r
+
+        for shape in shapes:
+            rows = [row(k, hm) for k, hm in shape]
+            ledger = tmp_path / "stop-attribution.jsonl"
+            ledger.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
+                              encoding="utf-8")
+            monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+            monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+            fresh = H._ghost_stop_pattern(rows)
+            assert fresh["pairs"] == H._expected_ghost_pairs(rows), shape
+            text, rc = H._stop_audit_report()
+            assert rc == 0 and "[FAIL]" not in text, shape
+
     def test_a_shutdown_ghost_does_not_start_supersession(self, H,
                                                           monkeypatch,
                                                           tmp_path):

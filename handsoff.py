@@ -4662,6 +4662,39 @@ def _unexplained_stops_health() -> dict:
     return {"open": items, "superseded_by": superseded_by}
 
 
+def _expected_ghost_pairs(rows: list) -> int:
+    """The audit's independent oracle for the ghost-pattern reader.
+
+    Reimplements the reader's documented pairing rule straight from the
+    raw rows — attributed anchor, then unattributed non-shutdown ghost
+    with 0 <= gap <= window — so the audit can judge the reader against
+    the LEDGER rather than against itself. Deliberate duplication: an
+    oracle that shared the reader's code would share its bugs, which is
+    exactly the blind spot fault injection demonstrated (a reader whose
+    breakage survives re-parsing passes its own stripped-flags delta).
+    """
+    def _t(rec: dict):
+        try:
+            return datetime.datetime.fromisoformat(str(rec.get("ts") or ""))
+        except ValueError:
+            return None
+
+    pairs = 0
+    after_attr: datetime.datetime | None = None
+    for rec in rows:
+        t = _t(rec)
+        if rec.get("callers"):
+            if t is not None:
+                after_attr = t
+            continue
+        if rec.get("shutdown") or t is None or after_attr is None:
+            continue
+        gap = (t - after_attr).total_seconds()
+        if 0 <= gap <= _STOP_ATTRIBUTION_GHOST_WINDOW_S:
+            pairs += 1
+    return pairs
+
+
 def _stop_audit_report() -> tuple[str, int]:
     """`--ptt stop-audit`: the post-boot verification as one built-in verb.
 
@@ -4714,20 +4747,32 @@ def _stop_audit_report() -> tuple[str, int]:
         check("pattern reader", reported == fresh,
               f"reported {reported} vs fresh {fresh}")
 
-        # --- the exemption actually exempts: with every shutdown flag
-        # stripped the pattern may only GAIN pairs, never lose them, and a
-        # sweep-only ghost must vanish entirely
+        # --- the exemption actually exempts — judged two ways. The DELTA
+        # (flags stripped may only gain pairs) catches an exemption that
+        # over-reaches, but fault injection proved a reader whose breakage
+        # survives re-parsing passes its own delta: it lies identically
+        # both ways. So the audit also holds an INDEPENDENT oracle — the
+        # expected pair count recomputed from the raw rows — and requires
+        # equality, not merely a one-sided bound.
+        expected = _expected_ghost_pairs(rows)
         stripped = [{**r, "shutdown": False} for r in rows]
         off = _ghost_stop_pattern(stripped)
         sweep_ghosts = [r for r in rows
                         if r.get("shutdown") and not r.get("callers")]
         if sweep_ghosts:
             gained = off["pairs"] - fresh["pairs"]
-            check("exemption", gained >= 0 and fresh["pairs"] <= off["pairs"],
+            ok = gained >= 0 and fresh["pairs"] == expected
+            check("exemption", ok,
                   f"{len(sweep_ghosts)} sweep ghost(s) in window; pairs "
-                  f"with exemption {fresh['pairs']} vs without {off['pairs']}")
+                  f"with exemption {fresh['pairs']} vs without {off['pairs']}"
+                  f" (independent count {expected})")
         else:
-            check("exemption", True, "no sweep ghosts in the audited window")
+            check("exemption", fresh["pairs"] == expected,
+                  "no sweep ghosts in the audited window; independent "
+                  f"count {expected}"
+                  if fresh["pairs"] == expected else
+                  f"reader reports {fresh['pairs']} pair(s) but the raw "
+                  f"rows support {expected}")
 
         # --- the probe's writer contract on annotated rows
         bad = [r for r in rows
