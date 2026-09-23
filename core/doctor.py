@@ -485,9 +485,15 @@ def _lines(deps: DoctorDeps) -> list[str]:
                     f"{c.get('exe') or '?'} ({chain})"
                     + (f" +{len(callers) - 1} more caller(s)" if len(callers) > 1 else ""))
             else:
-                lines.append(
-                    f"stop attribution: last stop {str(last.get('ts') or '')[:19]} "
-                    "had NO visible caller (session shutdown or direct D-Bus call)")
+                if last.get("shutdown"):
+                    lines.append(
+                        f"stop attribution: last stop {str(last.get('ts') or '')[:19]} "
+                        "ran inside the session-shutdown sweep (exit.target) — "
+                        "expected, not an anomaly")
+                else:
+                    lines.append(
+                        f"stop attribution: last stop {str(last.get('ts') or '')[:19]} "
+                        "had NO visible caller (session shutdown or direct D-Bus call)")
         elif h.get("present"):
             lines.append("stop attribution: ledger present, no stop recorded yet")
         else:

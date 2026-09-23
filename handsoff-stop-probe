@@ -125,8 +125,30 @@ for d in "$PROC_ROOT"/[0-9]*; do
 done
 
 ts="$(date -Is 2>/dev/null || date)"
+
+# --- is the SESSION itself exiting right now? (poweroff, logout, session
+# exit) A stop arriving inside the shutdown sweep is the session's, not some
+# hidden caller's: exit.target is the special unit a user manager activates
+# for exactly that. Primary signal is the invocation symlink systemd keeps
+# under $XDG_RUNTIME_DIR for every active unit — bus-free to read, and the
+# bus itself may already be dead mid-sweep (systemctl is only the belt).
+# Annotated as "shutdown" so ledger consumers can EXEMPT these stops instead
+# of accusing a poweroff — the 21:34:06 ghost was precisely this: a night
+# poweroff 105 s after a deploy restart, read as the killer shape until the
+# system journal said "poweroff requested".
+shutdown=0
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u 2>/dev/null || echo 1000)}"
+if [ -e "$RUNTIME_DIR/systemd/units/invocation:exit.target" ] \
+   || systemctl --user is-active --quiet exit.target 2>/dev/null; then
+    shutdown=1
+fi
+
 if [ "$ncallers" -eq 0 ]; then
-    note="no invoking process visible in /proc — a session shutdown, a direct D-Bus API call, or a caller that already exited"
+    if [ "$shutdown" -eq 1 ]; then
+        note="no invoking process visible — the stop ran inside the session-shutdown sweep (exit.target active): the session's, not a hidden caller's"
+    else
+        note="no invoking process visible in /proc — a session shutdown, a direct D-Bus API call, or a caller that already exited"
+    fi
 else
     note=""
 fi
@@ -139,6 +161,6 @@ if [ ! -e "$OUT" ]; then
     : >"$OUT" 2>/dev/null && chmod 600 "$OUT" 2>/dev/null || exit 0
 fi
 
-printf '{"ts":"%s","unit":"%s","callers":[%s],"note":"%s"}\n' \
-    "$(json_str "$ts")" "$UNIT" "$callers" "$(json_str "$note")" \
+printf '{"ts":"%s","unit":"%s","callers":[%s],"shutdown":%d,"note":"%s"}\n' \
+    "$(json_str "$ts")" "$UNIT" "$callers" "$shutdown" "$(json_str "$note")" \
     >>"$OUT" 2>/dev/null || exit 0

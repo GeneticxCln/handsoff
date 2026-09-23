@@ -4498,6 +4498,12 @@ def _ghost_stop_pattern(records: list) -> dict:
     stopped the unit twice and hid the second time. The reader adjudicates
     (doctor formats, it does not adjudicate); timestamps are compared as
     parsed datetimes and an unparseable ts can never accuse anyone.
+
+    Exemption: stops the probe annotated "shutdown" (ExecStop ran while
+    exit.target was active — poweroff, logout, session exit) are the
+    session's own sweep, invisible by design, and can never form the
+    pattern. A night poweroff 105 s after a deploy restart is exactly the
+    benign pair that must not cry wolf.
     """
     def _t(rec: dict):
         try:
@@ -4514,6 +4520,8 @@ def _ghost_stop_pattern(records: list) -> dict:
             if t is not None:
                 after_attr = t
             continue
+        if rec.get("shutdown"):
+            continue        # the session's own sweep — exempt, never a pattern
         if t is None or after_attr is None:
             continue
         gap = (t - after_attr).total_seconds()
@@ -4561,6 +4569,7 @@ def _stop_attribution_health() -> dict:
         return {"ts": rec.get("ts") or "",
                 "callers": shaped,
                 "note": rec.get("note") or "",
+                "shutdown": bool(rec.get("shutdown")),
                 "unattributed": not shaped}
 
     last: dict | None = None

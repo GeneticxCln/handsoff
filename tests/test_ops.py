@@ -859,6 +859,39 @@ class TestDoctor:
         assert health == {"present": False, "total": 0, "last": None}
         assert "PATTERN" not in H.run_doctor()
 
+    # ---- shutdown exemption: the session's own sweep is never the pattern
+
+    def test_shutdown_annotated_ghost_is_exempt_from_the_pattern(self, H,
+                                                                 monkeypatch,
+                                                                 tmp_path):
+        """The real 21:34:06 shape: deploy restart 21:32, poweroff 21:34.
+        The ghost carries shutdown:1 (the probe saw exit.target), so the pair
+        must NOT read as the killer pattern."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00"),
+                       {"ts": "2026-09-23T09:03:00+02:00",
+                        "unit": "handsoff.service", "callers": [],
+                        "shutdown": 1, "note": "session-shutdown sweep"}]))
+        text = H.run_doctor()
+        assert "PATTERN" not in text
+        assert "session-shutdown sweep (exit.target) — expected, not an " \
+               "anomaly" in text
+        g = H.doctor_json()["stop_attribution"]["ghost_pattern"]
+        assert g["seen"] is False and g["pairs"] == 0
+
+    def test_shutdown_flag_defaults_false_for_pre_annotation_rows(self, H,
+                                                                  monkeypatch,
+                                                                  tmp_path):
+        """Rows the old probe wrote (no shutdown key) must behave exactly as
+        before — the exemption can never resurrect an old ghost as benign
+        without evidence."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00"),
+                       self._ghost_row("2026-09-23T09:03:00+02:00")]))
+        assert "PATTERN" in H.run_doctor()        # the d34ebb5 behavior holds
+        h = H._stop_attribution_health()
+        assert h["last"]["shutdown"] is False     # shape carried either way
+
     def test_doctor_json_shape(self, H, monkeypatch, tmp_path):
         monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "none.json")
         d = H.doctor_json()

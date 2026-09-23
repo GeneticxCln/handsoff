@@ -2360,6 +2360,67 @@ class TestStopProbe:
             "_DEPLOY_FILES is the floor; a probe missing from it escapes "
             "the manifest-less drift comparison")
 
+    # ---- shutdown annotation: stops inside the session-exit sweep
+
+    @staticmethod
+    def _exit_target(runtime):
+        d = runtime / "systemd" / "units"
+        d.mkdir(parents=True)
+        (d / "invocation:exit.target").touch()
+
+    def test_stop_inside_the_shutdown_sweep_is_annotated(self, tmp_path):
+        """exit.target active → shutdown:1 and the sweep note: the ledger must
+        be able to say "the session's own" instead of hinting at a killer.
+        The 21:34:06 ghost — a night poweroff 105 s after a deploy restart —
+        is precisely the benign shape this annotation exists to name."""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        self._exit_target(tmp_path / "runtime")
+        result = self._run_probe(
+            tmp_path, proc,
+            env_extra={"XDG_RUNTIME_DIR": str(tmp_path / "runtime")})
+        assert result.returncode == 0, result.stderr
+        line = (tmp_path / "state" / "handsoff"
+                / "stop-attribution.jsonl").read_text().strip()
+        rec = json.loads(line)
+        assert rec["shutdown"] == 1
+        assert rec["callers"] == []
+        assert "session-shutdown sweep" in rec["note"]
+
+    def test_a_plain_stop_is_not_annotated_shutdown(self, tmp_path):
+        """No exit.target (runtime dir points nowhere) → shutdown:0 and the
+        honest generic note — annotation must not dilute real anomalies."""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        result = self._run_probe(
+            tmp_path, proc,
+            env_extra={"XDG_RUNTIME_DIR": str(tmp_path / "runtime-empty")})
+        assert result.returncode == 0, result.stderr
+        rec = json.loads((tmp_path / "state" / "handsoff"
+                          / "stop-attribution.jsonl").read_text().strip())
+        assert rec["shutdown"] == 0
+        assert "no invoking process visible in /proc" in rec["note"]
+
+    def test_a_named_caller_during_shutdown_is_still_named(self, tmp_path):
+        """A shutdown sweep does not erase whoever is blocking on the stop
+        job: annotation is metadata, never a substitute for attribution.
+        (The caller filter needs handsoff in the cmdline by design — a plain
+        `systemctl --user poweroff` names no unit and is nobody's caller.)"""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        self._proc_entry(proc, 800, 1, "systemctl",
+                         "systemctl --user stop handsoff.service")
+        self._exit_target(tmp_path / "runtime")
+        result = self._run_probe(
+            tmp_path, proc,
+            env_extra={"XDG_RUNTIME_DIR": str(tmp_path / "runtime")})
+        assert result.returncode == 0, result.stderr
+        rec = json.loads((tmp_path / "state" / "handsoff"
+                          / "stop-attribution.jsonl").read_text().strip())
+        assert rec["shutdown"] == 1
+        assert len(rec["callers"]) == 1 and rec["callers"][0]["exe"] == "systemctl"
+        assert rec["note"] == ""
+
 
 class TestToolSchemaFromCode:
     """@tool decorator: Python functions ARE the Ollama tool schema."""
