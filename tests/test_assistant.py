@@ -198,6 +198,42 @@ def test_load_tolerates_missing_or_bad_json(tmp_path):
     assert store.load() == []
 
 
+def test_an_unparseable_file_is_quarantined_not_emptied(tmp_path):
+    """An unreadable or unparseable file is EVIDENCE, not an empty queue:
+    load() must quarantine it (the settings.json rule) and mark the load
+    failed, so the corruption stays on disk and no caller mistakes it for
+    "the user cancelled everything" (audit 2026-09-23)."""
+    moved = []
+    store, _saved, _ = _store(
+        tmp_path, quarantine=lambda p: (moved.append(p)))
+    store.path.write_text("{ CORRUPT !!!")
+    assert store.load() == []
+    assert moved == [store.path]
+    assert store.load_failed
+    # A missing file is NOT a failure: first run, a real empty.
+    store.path.unlink()
+    assert store.load() == [] and not store.load_failed
+
+
+def test_update_never_saves_over_a_load_that_failed(tmp_path):
+    """The data-loss reproduction: live queue + a corrupt file + one update()
+    used to write a fresh queue over the corrupt file AND _backup()-first
+    then copied the CORRUPT bytes over the good .bak — queue and recovery
+    copy destroyed together, silently. Now the transaction aborts: the
+    corrupt file stays on disk un-replaced, and nothing is written."""
+    store, saved, _ = _store(tmp_path)
+    store.update(lambda items: items + [{"name": "water plants", "due": 5.0}])
+    good = store.path.read_text()
+    store.path.write_text("{ CORRUPT !!!")       # disk corrupts between turns
+    result = store.update(
+        lambda items: items + [{"name": "new", "due": 9.0}])
+    assert result == [], "the aborted transaction returns what it could read"
+    assert store.path.read_text() == "{ CORRUPT !!!", (
+        "update() must not overwrite a file it could not read")
+    assert saved[-1] == good, (
+        "no new save may run: the corrupt file must not become the .bak")
+
+
 def test_update_is_one_read_modify_write(tmp_path):
     store, saved, _ = _store(tmp_path)
     store.update(lambda items: items + [{"name": "a", "due": 5.0}])

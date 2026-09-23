@@ -799,6 +799,15 @@ def split_due_reminders(items: list[dict], now: float
     return fired, kept
 
 
+def _quarantine_noop(path) -> None:
+    """Default quarantine when the host injects none: leave the file alone.
+
+    The real quarantine (core.settings.quarantine_file) moves the corrupt
+    file aside, and that is what the host binds — but the store must stay
+    loadable in tests and tools with no config dir to move files in.
+    """
+
+
 class ReminderStore:
     """The persisted reminder queue: reminders.json behind one writer.
 
@@ -814,7 +823,7 @@ class ReminderStore:
     """
 
     def __init__(self, path, *, lock, file_lock, backup, write,
-                 logger=None, clock=time.time) -> None:
+                 logger=None, clock=time.time, quarantine=None) -> None:
         # `path` and `lock` stay public: the host application rebinds its
         # REMINDERS_FILE/REMINDERS_LOCK globals (tests redirect them) and
         # refreshes both here before each use, so the store must never be
@@ -826,26 +835,56 @@ class ReminderStore:
         self._write = write
         self._log = logger or logging.getLogger("handsoff")
         self._clock = clock
+        # Dependency-injected so the store stays testable without a real
+        # config dir; the host binds core.settings.quarantine_file.
+        self._quarantine = quarantine or _quarantine_noop
+        # Set by load(): True when the file exists but could not be read or
+        # parsed. update() refuses to save over a load that failed.
+        self.load_failed = False
 
     def load(self) -> list[dict]:
-        """Read reminders.json, dropping entries that are malformed."""
+        """Read reminders.json, dropping entries that are malformed.
+
+        A file that cannot be READ or PARSED at all (OSError, invalid JSON,
+        a non-list body) is not an empty queue — it is evidence. Returning
+        [] here made the next update() overwrite the corrupt file with a
+        fresh queue AND overwrite the good .bak with the corrupt bytes
+        (save() backs up before writing): data loss with no log line. So
+        the corrupt file is QUARANTINED (moved aside, core.settings' rule)
+        and the failure logged; `load_failed` says what happened so a
+        caller can refuse to save over it.
+        """
+        self.load_failed = False
         try:
-            data = json.loads(self.path.read_text())
-            if not isinstance(data, list):
-                return []
-            out = []
-            for r in data:
-                if not isinstance(r, dict) or not isinstance(r.get("name"), str) \
-                        or not isinstance(r.get("due"), (int, float)):
-                    continue
-                try:
-                    r["repeat_hours"] = float(r.get("repeat_hours") or 0)
-                except (TypeError, ValueError):
-                    r["repeat_hours"] = 0.0
-                out.append(r)
-            return out
-        except (OSError, ValueError):
+            raw = self.path.read_text()
+        except FileNotFoundError:
+            return []              # first run: an absent queue is a real empty
+        except OSError:
+            self.load_failed = True
+            self._log.warning("reminders file %s could not be read", self.path,
+                              exc_info=True)
             return []
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            self.load_failed = True
+            self._quarantine(self.path)
+            return []
+        if not isinstance(data, list):
+            self.load_failed = True
+            self._quarantine(self.path)
+            return []
+        out = []
+        for r in data:
+            if not isinstance(r, dict) or not isinstance(r.get("name"), str) \
+                    or not isinstance(r.get("due"), (int, float)):
+                continue
+            try:
+                r["repeat_hours"] = float(r.get("repeat_hours") or 0)
+            except (TypeError, ValueError):
+                r["repeat_hours"] = 0.0
+            out.append(r)
+        return out
 
     def save(self, items: list[dict]) -> None:
         """Caller MUST hold `lock` + the sidecar flock: two concurrent
@@ -861,9 +900,20 @@ class ReminderStore:
         Only None preserves the loaded list: an empty list is a real result
         (cancelling the last reminder), and `mutate(items) or items` used to
         resurrect it, silently no-opping cancel-all.
+
+        A load that FAILED (unreadable or unparseable file) aborts the
+        transaction: saving the mutated empty list would destroy the queue,
+        and the .bak would then hold the corrupt bytes — the exact loss
+        this guard exists to prevent. The file stays on disk (quarantined
+        if unparseable) for recovery.
         """
         with self.lock, self._file_lock(self.path.parent, "reminders.json.lock"):
             items = self.load()
+            if self.load_failed:
+                self._log.error(
+                    "reminders update aborted: %s is unreadable/unparseable "
+                    "— not overwriting a queue we could not read", self.path)
+                return items
             result = mutate(items)
             if result is not None:
                 items = result

@@ -4433,6 +4433,11 @@ _REMINDER_STORE = _core_assistant.ReminderStore(
     write=_core_settings.atomic_private_write,
     logger=log,
     clock=time.time,
+    # A corrupt reminders.json is EVIDENCE, not an empty queue: quarantine
+    # it (the same rule settings.json follows) so update() cannot save a
+    # fresh queue over unreadable data and _backup() cannot then copy the
+    # corrupt bytes over the good .bak (the audit's data-loss finding).
+    quarantine=_core_settings.quarantine_file,
 )
 # Calendar parsing lives in core.calendar (stdlib-only, no Qt/Assistant). One
 # handle again: the briefing, the ToolBelt's host-dependency fallback and the
