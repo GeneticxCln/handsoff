@@ -121,6 +121,31 @@ names the crash log (truncated-not-unlinked, same inode, 0600). Crash-loop
 `reset-failed + start` recovers. Session end → clean exit via
 `PartOf=graphical-session.target`.
 
+The stop-attribution ledger (`handsoff-stop-probe`, wired as the unit's
+`ExecStop=`): a stop job's invoker is visible in /proc only while the job
+blocks it, so the probe runs at exactly that instant and appends one JSON
+line per stop to `stop-attribution.jsonl` (0600) — the callers (pid, exe,
+120-char cmdline head, ≤6-hop ancestry newest-first), a `shutdown` flag and
+a note. ExecStop runs ONLY on stop jobs (explicit stop/restart/session
+teardown); a crash respawn under `Restart=always` does not run it — "it
+died" and "someone stopped it" are different events, and the journal covers
+the first. `callers:[]` is itself information: a session shutdown, a direct
+D-Bus call, or a caller already gone when the probe looked. The `shutdown`
+flag marks stops that ran inside the session-exit sweep, detected bus-free
+via the `invocation:exit.target` symlink under `$XDG_RUNTIME_DIR` (the bus
+may already be dead mid-poweroff; `systemctl is-active exit.target` is the
+belt) — a night poweroff 105 s after a deploy restart is the benign pair
+that used to read as the killer shape. The ghost-pattern rule
+(`_ghost_stop_pattern`, health `stop_attribution.ghost_pattern`): an
+unattributed NON-shutdown stop that FOLLOWS an attributed one within 60 min
+(last 50 rows, parsed datetimes, negative gaps never count) is the
+invisible-killer shape and doctor renders a PATTERN line — even when the
+latest stop was attributed, because a killer that alternates must not slip
+between two clean lines; `seen: false` is reported whenever the ledger
+exists (the cap-refusals idiom: "none" must be distinguishable from
+"never checked"), and a shutdown-annotated ghost renders `expected, not an
+anomaly`. The reader adjudicates; doctor formats.
+
 ## 7. Environment + deps
 
 Needs: niri, Ollama (`OLLAMA_HOST`, default loopback; remote requires
