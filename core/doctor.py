@@ -86,6 +86,7 @@ class DoctorDeps:
         "remote_ollama_optin_source",
         "cap_refusal_note", "cap_refusals",
         "appearance_look", "web_lines", "stop_attribution_health",
+        "unexplained_stops",
         "gpu_lines", "gpu_headroom",
         "shutil", "sounddevice", "log",
     )
@@ -119,6 +120,9 @@ class DoctorDeps:
         self.remote_ollama_allowed: Callable[[], bool] | None = None
         self.remote_ollama_optin_source: Callable[[], str] | None = None
         self.stop_attribution_health: Callable[[], dict] | None = None
+        # Stops the tripwire shipped too late to see: listed until an
+        # autopsy explains one or the ledger supersedes the whole item.
+        self.unexplained_stops: Callable[[], dict] | None = None
         # Cap refusals: how often a bounded registry has turned real work away.
         # A host that does not record them reports none, which is also the
         # truthful answer for a host that has no registries to bound.
@@ -513,6 +517,29 @@ def _lines(deps: DoctorDeps) -> list[str]:
                 f"{str(ghost.get('last_ghost_ts') or '')[:19]}) — the "
                 "invisible-killer shape, not a session shutdown")
 
+    # The stops the tripwire shipped too late to see. An open item with no
+    # home is how a mystery quietly disappears; this line keeps them visible
+    # until an autopsy explains an entry or a later attributed catch
+    # supersedes the list.
+    us = getattr(deps, "unexplained_stops", None)
+    if us is not None:
+        try:
+            u = us() or {}
+        except Exception:
+            u = {}
+        open_items = u.get("open") or []
+        if open_items:
+            newest = max((str(i.get("ts"))[:16] for i in open_items
+                          if i.get("ts")), default="?")
+            lines.append(
+                f"stop attribution: {len(open_items)} stop(s) remain "
+                f"UNEXPLAINED (newest {newest}) — predates the tripwire; "
+                "listed until explained or superseded")
+        elif u.get("superseded_by"):
+            lines.append(
+                f"stop attribution: no unexplained stops — superseded by the "
+                f"attributed catch at {str(u.get('superseded_by'))[:19]}")
+
     if deps.crash_log.exists():
         try:
             age = time.time() - deps.crash_log.stat().st_mtime
@@ -612,11 +639,20 @@ def doctor_json() -> dict:
     }
     if sa.get("present"):
         # Mirrors cap_refusals: when the ledger exists the pattern is ALWAYS
-        # reported, and `seen: false` is itself a finding ("no pattern" must
+        # reported, and `unexplained` is itself a finding ("no pattern" must
         # be distinguishable from "never checked").
         ghost = sa.get("ghost_pattern")
         if isinstance(ghost, dict):
             out["stop_attribution"]["ghost_pattern"] = dict(ghost)
+    us_dep = getattr(deps, "unexplained_stops", None)
+    try:
+        us = (us_dep() if us_dep is not None else {}) or {}
+    except Exception:
+        us = {}
+    out["unexplained_stops"] = {
+        "open": list(us.get("open") or []),
+        "superseded_by": us.get("superseded_by") or "",
+    }
     # Only when the host measured or estimated something: a host without the
     # dep leaves the JSON exactly as it was, the same way its text report is
     # unchanged. The dict is passed through as the host built it — this module

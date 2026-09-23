@@ -1734,6 +1734,7 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         appearance_look=_appearance_note,
         web_lines=_web_lines,
         stop_attribution_health=_stop_attribution_health,
+        unexplained_stops=_unexplained_stops_health,
         # ONE story for the card: the tenants, the speech models, the LLM and
         # what the next turn asks for are one host collector behind one doctor
         # section, so no two lines can describe the same memory differently.
@@ -4488,6 +4489,23 @@ _STOP_ATTRIBUTION_GHOST_WINDOW_S = 3600  # ghost must FOLLOW an attributed
 # stop within this window to count as the pattern (a lone unattributed stop
 # is a legal session shutdown; the pair is the invisible-killer shape)
 
+# The stops the tripwire never saw: it shipped 21:09, and these three hit
+# 18:26–18:43 the same evening — mid-session, machine up, no caller the
+# journal could name. Listed by doctor until an autopsy explains an entry
+#    or the ledger supersedes them (the recurrence must RETURN first: an
+# unattributed ghost after the newest incident, then an attributed catch
+# after that ghost — any earlier catch would close the item on day one).
+_OPEN_UNEXPLAINED_STOPS: tuple = (
+    {"ts": "2026-09-22T18:26:00+02:00", "detail": "mid-session stop, boot -1"},
+    {"ts": "2026-09-22T18:30:02+02:00", "detail": "mid-session stop, boot -1"},
+    {"ts": "2026-09-22T18:41:43+02:00",
+     "detail": "mid-session stop, boot -1 — ate a fault-injection answer"},
+)
+# The anchor OUTLIVES the list: when an autopsy empties the entries above,
+# the date the mystery began must stay — supersession ("the tripwire caught
+# the recurrence") is measured from here, not from whatever entries remain.
+_OPEN_UNEXPLAINED_STOPS_LATEST = "2026-09-22T18:41:43+02:00"
+
 
 def _ghost_stop_pattern(records: list) -> dict:
     """Judge whether invisible stops form a PATTERN, not an accident.
@@ -4592,6 +4610,57 @@ def _stop_attribution_health() -> dict:
         last = tail[-1]
     return {"present": True, "total": total, "last": last, "tail": tail,
             "ghost_pattern": _ghost_stop_pattern(scan)}
+
+
+def _unexplained_stops_health() -> dict:
+    """The standing OPEN list: stops with no surviving evidence.
+
+    The probe shipped AFTER these, so no ledger row exists to re-read — the
+    item is memory, not measurement, kept as data so doctor can list it and
+    the day an autopsy resolves an entry, clearing it is a one-line data
+    edit. "Superseded" is derived, not stored: any attributed non-shutdown
+    catch later than the newest incident means the tripwire is answering
+    the very question these incidents left open.
+    """
+    items = [dict(it) for it in _OPEN_UNEXPLAINED_STOPS]
+
+    def _t(ts: str):
+        try:
+            return datetime.datetime.fromisoformat(ts)
+        except ValueError:
+            return None
+
+    last_incident = max((_t(i["ts"]) for i in items
+                         if _t(i["ts"]) is not None), default=None)
+    anchor = last_incident or _t(_OPEN_UNEXPLAINED_STOPS_LATEST)
+    # Supersession is DERIVED and deliberately strict: not "any attributed
+    # catch after the incidents" (the installer's own restart would close
+    # the item on day one) — the recurrence must return first. An
+    # unattributed non-shutdown ghost after the newest incident, then an
+    # attributed non-shutdown catch after THAT ghost, is the tripwire
+    # catching the killer red-handed; only then is the item answered.
+    ghost_seen = False
+    superseded_by = ""
+    try:
+        with STOP_ATTRIBUTION_FILE.open("r", encoding="utf-8") as fh:
+            for ln in fh:
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue          # torn line, same rule as health
+                t = _t(str(rec.get("ts") or ""))
+                if t is None or anchor is None or t <= anchor:
+                    continue
+                if rec.get("shutdown"):
+                    continue
+                if not rec.get("callers"):
+                    ghost_seen = True
+                elif ghost_seen:
+                    superseded_by = str(rec.get("ts"))
+                    break
+    except OSError:
+        pass
+    return {"open": items, "superseded_by": superseded_by}
 
 
 def _record_mic_event(from_state: str, to_state: str) -> None:

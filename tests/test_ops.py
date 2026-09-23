@@ -892,6 +892,61 @@ class TestDoctor:
         h = H._stop_attribution_health()
         assert h["last"]["shutdown"] is False     # shape carried either way
 
+    # ---- the OPEN list: stops the tripwire shipped too late to see
+
+    def test_open_unexplained_stops_are_listed(self, H, monkeypatch, tmp_path):
+        """The standing item renders while entries remain: an open mystery
+        with no home is how it quietly disappears from doctor."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", tmp_path / "none")
+        text = H.run_doctor()
+        assert "stop attribution: 3 stop(s) remain UNEXPLAINED (newest " \
+               "2026-09-22T18:41) — predates the tripwire; listed until " \
+               "explained or superseded" in text
+        u = H.doctor_json()["unexplained_stops"]
+        assert len(u["open"]) == 3 and u["superseded_by"] == ""
+
+    def test_a_recurrence_caught_red_handed_supersedes(self, H, monkeypatch,
+                                                       tmp_path):
+        """Supersession is strict: the recurrence must RETURN (an
+        unattributed ghost after the incidents) AND be caught (an attributed
+        catch after that ghost) — then the list is answered by evidence."""
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00"),
+                       self._ghost_row("2026-09-23T09:10:00+02:00"),
+                       self._attr_row("2026-09-23T09:30:00+02:00")]))
+        text = H.run_doctor()
+        assert "UNEXPLAINED" not in text
+        assert "no unexplained stops — superseded by the attributed catch " \
+               "at 2026-09-23T09:30:00" in text
+        u = H.doctor_json()["unexplained_stops"]
+        assert u["open"] == [] and u["superseded_by"] == "2026-09-23T09:30:00+02:00"
+
+    def test_an_attributed_catch_alone_does_not_supersede(self, H, monkeypatch,
+                                                          tmp_path):
+        """The naive rule would close the item on day one — the installer's
+        own restart is an attributed catch. Only a caught RECURRENCE counts."""
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00")]))
+        text = H.run_doctor()
+        assert "UNEXPLAINED" not in text          # list is empty (data edit)
+        assert "superseded by" not in text        # but nothing superseded it
+        assert H.doctor_json()["unexplained_stops"]["superseded_by"] == ""
+
+    def test_a_shutdown_ghost_does_not_start_supersession(self, H,
+                                                          monkeypatch,
+                                                          tmp_path):
+        """An annotated sweep ghost is explained by its flag — it is not the
+        mystery returning, so it must not arm the supersession sequence."""
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [{"ts": "2026-09-23T09:10:00+02:00",
+                        "unit": "handsoff.service", "callers": [],
+                        "shutdown": 1, "note": "sweep"},
+                       self._attr_row("2026-09-23T09:30:00+02:00")]))
+        assert H.doctor_json()["unexplained_stops"]["superseded_by"] == ""
+
     def test_doctor_json_shape(self, H, monkeypatch, tmp_path):
         monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "none.json")
         d = H.doctor_json()
