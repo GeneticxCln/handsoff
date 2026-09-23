@@ -2910,3 +2910,22 @@ a single red test under a loaded full-suite run (101996 bytes buffered for a
 65536-byte bound) while passing in isolation — the shape of a flake, and it was
 not one: the test was right about the bound. The loop now asks for what is LEFT
 of the ceiling, which makes the bound exact and that test deterministic.
+
+## The unit learned to say who stopped it: a tripwire, a pattern, a false positive, an autopsy (2026-09-23)
+
+Three fault-injection turns lost their answers to systemd stops whose invoker
+the journal never named — after a stop job completes, its caller is gone, and
+no post-hoc sweep can recover it. The fix is `handsoff-stop-probe` as the
+unit's `ExecStop=`: the one instant a stop job's invoker is still visible in
+/proc. The arc that followed is written up as a point design,
+`docs/superpowers/specs/2026-09-23-stop-attribution-design.md` — the
+attribution mechanics, the ghost-pattern rule (invisible stop following an
+attributed one within the hour), the rule's own false positive (a night
+poweroff misread as the killer shape, fixed by annotating exit.target sweeps
+in the ledger), and the autopsy that closed the founding mystery: the four
+18:xx stops of boot -1 were the injection battle's OWN step-boundary
+restarts, fingerprinted by the handsfree flag states in their startup
+banners — the experiment chasing itself, caught only because the journal
+kept the receipts. Pinned by `tests/test_lifecycle.py::TestStopProbe` and
+`tests/test_ops.py::TestDoctor`; the on-disk format and rule prose live in
+`specs/50-ops.md` §6.
