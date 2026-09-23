@@ -4483,6 +4483,46 @@ def _laya_corpus_counts() -> dict:
 STOP_ATTRIBUTION_FILE = STATE_DIR / "stop-attribution.jsonl"
 _STOP_ATTRIBUTION_TAIL = 3          # lines health reports at most
 _STOP_ATTRIBUTION_CMD_CHARS = 120   # per-caller cmdline chars health carries
+_STOP_ATTRIBUTION_GHOST_SCAN = 50   # ledger rows the ghost pattern reads back
+_STOP_ATTRIBUTION_GHOST_WINDOW_S = 3600  # ghost must FOLLOW an attributed
+# stop within this window to count as the pattern (a lone unattributed stop
+# is a legal session shutdown; the pair is the invisible-killer shape)
+
+
+def _ghost_stop_pattern(records: list) -> dict:
+    """Judge whether invisible stops form a PATTERN, not an accident.
+
+    A single unattributed stop is legal — a session shutdown or a direct
+    D-Bus call leaves no /proc trace. But an unattributed stop that follows
+    an ATTRIBUTED one within the window is the restart-killer shape: someone
+    stopped the unit twice and hid the second time. The reader adjudicates
+    (doctor formats, it does not adjudicate); timestamps are compared as
+    parsed datetimes and an unparseable ts can never accuse anyone.
+    """
+    def _t(rec: dict):
+        try:
+            return datetime.datetime.fromisoformat(str(rec.get("ts") or ""))
+        except ValueError:
+            return None
+
+    pairs = 0
+    after_attr: datetime.datetime | None = None
+    last_ghost: dict | None = None
+    for rec in records:
+        t = _t(rec)
+        if rec.get("callers"):
+            if t is not None:
+                after_attr = t
+            continue
+        if t is None or after_attr is None:
+            continue
+        gap = (t - after_attr).total_seconds()
+        if 0 <= gap <= _STOP_ATTRIBUTION_GHOST_WINDOW_S:
+            pairs += 1
+            last_ghost = rec
+    return {"seen": pairs > 0, "pairs": pairs,
+            "window_min": _STOP_ATTRIBUTION_GHOST_WINDOW_S // 60,
+            "last_ghost_ts": (last_ghost or {}).get("ts") or ""}
 
 
 def _stop_attribution_health() -> dict:
@@ -4526,6 +4566,7 @@ def _stop_attribution_health() -> dict:
     last: dict | None = None
     total = 0
     tail: list[dict] = []
+    scan: list[dict] = []
     for ln in lines:
         try:
             rec = _one(ln)
@@ -4535,9 +4576,13 @@ def _stop_attribution_health() -> dict:
         tail.append(rec)
         if len(tail) > _STOP_ATTRIBUTION_TAIL:
             tail.pop(0)
+        scan.append(rec)
+        if len(scan) > _STOP_ATTRIBUTION_GHOST_SCAN:
+            scan.pop(0)
     if tail:
         last = tail[-1]
-    return {"present": True, "total": total, "last": last, "tail": tail}
+    return {"present": True, "total": total, "last": last, "tail": tail,
+            "ghost_pattern": _ghost_stop_pattern(scan)}
 
 
 def _record_mic_event(from_state: str, to_state: str) -> None:

@@ -494,6 +494,18 @@ def _lines(deps: DoctorDeps) -> list[str]:
             lines.append(
                 "stop attribution: no ledger — probe not shipped or no stop "
                 "since it landed (install.sh wires it as ExecStop=)")
+        # The pattern is a finding in its own right — even when the LATEST stop
+        # was attributed, because a killer that alternates attributed and
+        # invisible stops must not slip out between two clean-looking lines.
+        ghost = h.get("ghost_pattern") or {}
+        if isinstance(ghost, dict) and ghost.get("seen"):
+            pairs = int(ghost.get("pairs") or 0)
+            lines.append(
+                f"stop attribution: PATTERN — {pairs} invisible stop(s) followed "
+                f"an attributed one within "
+                f"{int(ghost.get('window_min') or 0)} min (last "
+                f"{str(ghost.get('last_ghost_ts') or '')[:19]}) — the "
+                "invisible-killer shape, not a session shutdown")
 
     if deps.crash_log.exists():
         try:
@@ -592,6 +604,13 @@ def doctor_json() -> dict:
         "total": int(sa.get("total") or 0),
         "last": sa.get("last"),
     }
+    if sa.get("present"):
+        # Mirrors cap_refusals: when the ledger exists the pattern is ALWAYS
+        # reported, and `seen: false` is itself a finding ("no pattern" must
+        # be distinguishable from "never checked").
+        ghost = sa.get("ghost_pattern")
+        if isinstance(ghost, dict):
+            out["stop_attribution"]["ghost_pattern"] = dict(ghost)
     # Only when the host measured or estimated something: a host without the
     # dep leaves the JSON exactly as it was, the same way its text report is
     # unchanged. The dict is passed through as the host built it — this module

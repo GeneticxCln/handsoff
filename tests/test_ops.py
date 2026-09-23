@@ -758,6 +758,107 @@ class TestDoctor:
         assert health["total"] == 1 and health["last"]["ts"] == "t1"
         assert "stop attribution: no ledger" not in H.run_doctor()
 
+    # ---- ghost-stop pattern: invisible stops FOLLOWING attributed ones
+
+    @staticmethod
+    def _ghost_ledger(tmp_path, rows):
+        ledger = tmp_path / "stop-attribution.jsonl"
+        ledger.write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        return ledger
+
+    @staticmethod
+    def _attr_row(ts):
+        return {"ts": ts, "unit": "handsoff.service",
+                "callers": [{"pid": 1, "exe": "systemctl", "cmd": "x",
+                             "chain": []}], "note": ""}
+
+    @staticmethod
+    def _ghost_row(ts):
+        return {"ts": ts, "unit": "handsoff.service",
+                "callers": [], "note": "no invoking process visible"}
+
+    def test_ghost_pair_within_the_window_is_flagged(self, H, monkeypatch,
+                                                     tmp_path):
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00"),
+                       self._ghost_row("2026-09-23T09:20:00+02:00")]))
+        text = H.run_doctor()
+        assert "stop attribution: PATTERN — 1 invisible stop(s) followed an " \
+               "attributed one within 60 min (last 2026-09-23T09:20:00) — " \
+               "the invisible-killer shape, not a session shutdown" in text
+        g = H.doctor_json()["stop_attribution"]["ghost_pattern"]
+        assert g == {"seen": True, "pairs": 1, "window_min": 60,
+                     "last_ghost_ts": "2026-09-23T09:20:00+02:00"}
+
+    def test_a_lone_ghost_is_not_a_pattern(self, H, monkeypatch, tmp_path):
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._ghost_row("2026-09-23T09:00:00+02:00")]))
+        text = H.run_doctor()
+        assert "PATTERN" not in text
+        assert "had NO visible caller" in text      # rendered, not flagged
+        # the cap_refusals idiom: when the ledger exists the pattern is
+        # ALWAYS reported, so `seen: false` is a finding, not an omission
+        g = H.doctor_json()["stop_attribution"]["ghost_pattern"]
+        assert g["seen"] is False and g["pairs"] == 0
+
+    def test_ghost_after_the_window_is_not_a_pattern(self, H, monkeypatch,
+                                                     tmp_path):
+        """61 minutes after the attributed stop, it's a different event."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00"),
+                       self._ghost_row("2026-09-23T10:01:00+02:00")]))
+        assert "PATTERN" not in H.run_doctor()
+
+    def test_ghost_before_the_attributed_stop_is_not_a_pattern(self, H,
+                                                               monkeypatch,
+                                                               tmp_path):
+        """Only a stop that FOLLOWS an attributed one counts — an old ghost
+        must not accuse a later attributed stop (negative gap)."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._ghost_row("2026-09-23T09:00:00+02:00"),
+                       self._attr_row("2026-09-23T10:00:00+02:00")]))
+        assert "PATTERN" not in H.run_doctor()
+
+    def test_pattern_flags_even_when_the_last_stop_was_attributed(self, H,
+                                                                  monkeypatch,
+                                                                  tmp_path):
+        """A killer that alternates attributed and invisible stops must not
+        slip out between two clean-looking lines."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00"),
+                       self._ghost_row("2026-09-23T09:30:00+02:00"),
+                       self._attr_row("2026-09-23T09:50:00+02:00")]))
+        text = H.run_doctor()
+        assert "PATTERN — 1 invisible stop(s)" in text
+        assert "by systemctl" in text               # the last-stop line too
+
+    def test_two_pairs_count_two_and_name_the_latest(self, H, monkeypatch,
+                                                     tmp_path):
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00"),
+                       self._ghost_row("2026-09-23T09:10:00+02:00"),
+                       self._attr_row("2026-09-23T09:30:00+02:00"),
+                       self._ghost_row("2026-09-23T09:40:00+02:00")]))
+        assert "PATTERN — 2 invisible stop(s)" in H.run_doctor()
+        g = H.doctor_json()["stop_attribution"]["ghost_pattern"]
+        assert g["pairs"] == 2
+        assert g["last_ghost_ts"] == "2026-09-23T09:40:00+02:00"
+
+    def test_unparseable_ts_never_accuses(self, H, monkeypatch, tmp_path):
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, [self._attr_row("2026-09-23T09:00:00+02:00"),
+                       {"ts": "garbage", "unit": "handsoff.service",
+                        "callers": [], "note": ""}]))
+        assert "PATTERN" not in H.run_doctor()
+
+    def test_ghost_pattern_absent_when_no_ledger(self, H, monkeypatch,
+                                                 tmp_path):
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", tmp_path / "none")
+        health = H._stop_attribution_health()
+        assert health == {"present": False, "total": 0, "last": None}
+        assert "PATTERN" not in H.run_doctor()
+
     def test_doctor_json_shape(self, H, monkeypatch, tmp_path):
         monkeypatch.setattr(H, "CAP_EVENTS_FILE", tmp_path / "none.json")
         d = H.doctor_json()
