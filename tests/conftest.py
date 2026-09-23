@@ -18,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 import weakref
 from pathlib import Path
 
@@ -288,7 +289,13 @@ def sandbox_env(home=None) -> dict:
     # rather than passed on (found by committing, not by reading).
     for name in GIT_PLUMBING:
         env.pop(name, None)
-    home = Path(home or tempfile.mkdtemp(prefix="handsoff-testhome-"))
+    if home is None:
+        # Auto-created homes are registered for the process-exit sweep like
+        # isolated_user_dirs() does — an unregistered mkdtemp leaked a /tmp
+        # directory per driver run (found by audit 2026-09-23).
+        home = tempfile.mkdtemp(prefix="handsoff-testhome-")
+        _SANDBOX_HOMES.append(home)
+    home = Path(home)
     env.update({
         "HOME": str(home),
         "XDG_STATE_HOME": str(home / ".local" / "state"),
@@ -714,8 +721,17 @@ def _snapshot_state(H) -> dict:
             try:
                 snap[name] = (obj, copy.deepcopy(obj))
                 continue
-            except Exception:
-                pass
+            except Exception as exc:
+                # An uncopyable container CANNOT be snapshotted: the identity
+                # fallback below would make _restore_state clear() a live dict
+                # and re-fill it from itself — silently emptying it (found by
+                # audit 2026-09-23). A list is self-assigning and merely loses
+                # isolation; a dict is destroyed. Either way the suite must SAY
+                # so instead of hiding the pollution.
+                warnings.warn(
+                    f"could not deepcopy {name} ({type(obj).__name__}): {exc!r} "
+                    "— test isolation for it is lost",
+                    RuntimeWarning, stacklevel=2)
         # Scalars restore by identity, and a loaded whisper/chatterbox model
         # MUST: deep-copying one would clone gigabytes for no benefit, since
         # `_restore_state` re-assigns the original object anyway.
@@ -729,6 +745,13 @@ def _restore_state(H, snap: dict) -> None:
             setattr(H, name, obj)        # a test swapped the object out
         if _is_restorable(obj):
             obj.restore_state(value)
+        elif value is obj:
+            # An identity snapshot of a MUTABLE container cannot be restored:
+            # clear()-then-update-from-itself would leave it empty (the dict
+            # case destroyed real module state, found by audit 2026-09-23).
+            # Skipping is honest: the snapshot already warned isolation was
+            # lost, and doing nothing corrupts nothing further.
+            continue
         elif isinstance(obj, dict) and isinstance(value, dict):
             obj.clear()
             obj.update(value)

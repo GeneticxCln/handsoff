@@ -44,15 +44,26 @@ OUT="${HANDSOFF_STOP_LOG:-$STATE/stop-attribution.jsonl}"
 UNIT="handsoff.service"
 
 # JSON string body: backslash and quote escaped; control characters are
-# stripped by the callers before reaching here, so nothing can split the line.
+# NEUTRALIZED HERE rather than trusted to the callers (audit 2026-09-23):
+# a process argument may carry a tab, newline or other control byte, and one
+# of those inside a JSON string splits the ledger line into torn rows no
+# reader can parse. Tab/CR/LF become spaces; every other control byte is
+# deleted — the ledger is read by humans and jq, and neither loses anything
+# a space cannot carry.
 json_str() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+    printf '%s' "$1" | tr '\t\n\r' '   ' \
+        | tr -d '\000-\010\013\014\016-\037\177' \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
 hop_json() {  # $1 = pid → {"pid","exe","cmd"} for one process, or nothing
     local p="$1" c exe
     c="$(tr '\0' ' ' <"$PROC_ROOT/$p/cmdline" 2>/dev/null)" || return 1
-    c="$(printf '%s' "$c" | tr -d '\000-\037\177')"
+    # Same rule as json_str, applied at ingest: tab/CR/LF are argument or line
+    # separators a human reads through — map them to spaces so a caller's
+    # command stays readable; every other control byte is deleted. (Both
+    # layers implement the rule so no caller can bypass it.)
+    c="$(printf '%s' "$c" | tr '\t\n\r' '   ' | tr -d '\000-\010\013\014\016-\037\177')"
     [ -n "$c" ] || return 1
     exe="$(readlink "$PROC_ROOT/$p/exe" 2>/dev/null)" || exe=""
     printf '{"pid":%s,"exe":"%s","cmd":"%s"}' \

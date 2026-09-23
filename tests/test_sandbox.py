@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -535,6 +536,32 @@ if probe.exists():      # a guard that went quiet must still leave the tree clea
             "the unguarded child was to clean up after itself, so this control "
             "leaves the checkout as it found it")
         assert not (ROOT / "zz_child_write_probe.txt").exists()
+
+    def test_an_auto_created_home_is_registered_for_cleanup(self):
+        """sandbox_env() with no home argument registers its mkdtemp for the
+        process-exit sweep — the same contract isolated_user_dirs follows.
+        An unregistered home leaked a /tmp directory per driver run (found by
+        audit 2026-09-23); this guard is the leak's tripwire."""
+        import conftest as C
+        before = list(C._SANDBOX_HOMES)
+        env = sandbox_env()
+        home = env["HOME"]
+        assert any(h == home for h in C._SANDBOX_HOMES[len(before):]), (
+            "the auto-created home must be registered for the atexit sweep: "
+            "an unregistered mkdtemp is a /tmp directory leaked per run")
+        assert home.startswith(tempfile.gettempdir()), home
+
+    def test_an_explicit_home_is_never_registered(self, tmp_path):
+        """A caller-owned home (a test's tmp_path, another fixture's dir) is
+        the CALLER's to clean up — registering it would race the fixture's own
+        teardown and delete a directory someone else still points at."""
+        import conftest as C
+        before = list(C._SANDBOX_HOMES)
+        mine = tmp_path / "explicit-home"
+        mine.mkdir(parents=True, exist_ok=True)
+        sandbox_env(mine)
+        assert C._SANDBOX_HOMES == before, (
+            "an explicit home is caller-owned: the sweep must not take it")
 
     def test_the_child_environment_carries_the_shim_and_the_root(self):
         env = sandbox_env()

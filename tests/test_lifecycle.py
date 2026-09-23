@@ -2327,6 +2327,36 @@ class TestStopProbe:
                           / "stop-attribution.jsonl").read_text().strip())
         assert rec["callers"] == [] and rec["note"]
 
+    def test_a_control_byte_in_an_argument_cannot_split_the_ledger_line(
+            self, tmp_path):
+        """A process argument may carry a tab, newline or other control byte —
+        `/bin/sh -c $'a\nb'` is an ordinary thing to find in /proc. One of
+        those inside a JSON string splits the ledger line into torn rows no
+        reader can parse, so the escaper neutralizes them itself: tab/CR/LF
+        become spaces, every other control byte is deleted, and the row stays
+        one line of valid JSON (audit 2026-09-23; the old escaper TRUSTED the
+        callers to have stripped these)."""
+        proc = tmp_path / "proc"
+        proc.mkdir()
+        evil = "systemctl --user stop handsoff.service \"evi\tt\nnew\x01line\""
+        self._proc_entry(proc, 500, 1, "bash",
+                         "bash\x00-c\x00" + evil)
+        result = self._run_probe(tmp_path, proc)
+        assert result.returncode == 0, result.stderr
+        raw = (tmp_path / "state" / "handsoff" / "stop-attribution.jsonl"
+               ).read_text()
+        lines = [l for l in raw.splitlines() if l.strip()]
+        assert len(lines) == 1, (
+            "a control byte in a caller's argument split the row — the ledger "
+            "must be one JSON line per stop")
+        rec = json.loads(lines[0])     # a torn row fails here, not in jq later
+        caller = rec["callers"][0]
+        assert "\n" not in caller["cmd"] and "\t" not in caller["cmd"]
+        assert "\x01" not in caller["cmd"]
+        # tab→space, LF→space, \x01 deleted outright:
+        # "evi<TAB>t<LF>new<X01>line" reads as "evi t newline"
+        assert "evi t newline" in caller["cmd"], caller["cmd"]
+
     def test_ledger_is_private_and_appends(self, tmp_path):
         """The ledger holds stop provenance — 0600, appended, never truncated
         by a second probe run."""

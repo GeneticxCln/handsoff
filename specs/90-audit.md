@@ -2929,3 +2929,70 @@ banners — the experiment chasing itself, caught only because the journal
 kept the receipts. Pinned by `tests/test_lifecycle.py::TestStopProbe` and
 `tests/test_ops.py::TestDoctor`; the on-disk format and rule prose live in
 `specs/50-ops.md` §6.
+
+## The second full scan, triaged: three real fixes, the rest weighed and dismissed (2026-09-23)
+
+The evening scan (111 findings over 38 files) was checked against source one
+by one. THREE held and are fixed:
+
+1. **`tests/conftest.py` destroyed module state on uncopyable containers.**
+   `_snapshot_state` fell back to identity for a dict that `deepcopy` refused,
+   and `_restore_state` then `clear()`ed that live dict and re-filled it *from
+   itself* — irreversibly emptying real module state while silently claiming
+   isolation. Now the snapshot WARNS (isolation is lost, and the suite says
+   so), and `_restore_state` skips identity snapshots of mutable containers
+   instead of destroying them.
+
+2. **`tests/conftest.py` leaked a `/tmp` home per driver run.** `sandbox_env`
+   auto-created `mkdtemp` homes without registering them for the process-exit
+   sweep that `isolated_user_dirs` uses. Every auto-homed driver leaked a
+   directory; they are registered now.
+
+3. **`handsoff-stop-probe` trusted its callers to strip control bytes.** A
+   process argument carrying a tab, newline or other control byte would have
+   split the stop-attribution ledger into torn JSON rows — unreadable by jq,
+   which is the same fate the ledger's own design refuses. The escaper now
+   neutralizes control bytes itself: tab/CR/LF become spaces, the rest are
+   deleted, and the trust comment is rewritten to match the code.
+
+The rest of the scan was dismissed on the evidence:
+
+- **The brain's regex family** (8 findings: thinking-token strips, an
+  unescaped tool-call marker, a closing-tag "typo", a greedy unclosed-block
+  pattern) — the file contains none of it: the regexes are escaped, anchored and
+  already non-greedy; the scan hallucinated source it never had (the file was
+  pre-filtered for size, so its advice came from elsewhere). The one finding
+  aimed at real code — removing `fallback = True` before the recursive
+  tool-fallback call so the outer `finally` would also `q.put(None)` — would
+  INTRODUCE the double-terminator bug it claims to fix; `fallback` exists
+  precisely to suppress it.
+- **`settings_schema.look_setting_key` "critical NameError"** — Python
+  resolves module globals at call time; the definition's position is the
+  design, and the function has worked since it shipped.
+- **`core/registry.py` reclaim "leak"** — arithmetically impossible: a
+  reclaim deletion strictly lowers `len(items)+held`, so the room check that
+  follows cannot fail after it; the code's own comment states this.
+- **`ci/worktree_stamp.py` corrupted-checkpoint "cannot judge"** — pinned
+  intended behavior by `test_a_truncated_checkpoint_is_not_a_previous_state`
+  (`status == 0`), with the rationale in the test's own assert message.
+- **`core/doctor.py` `count=0` misreport** — the `elif audio.get("ok")`
+  branch already renders "NO input devices visible"; the claimed fall-through
+  does not exist.
+- **`core/__init__.py` `BaseException` sites** — both clean up `sys.modules`
+  and RE-RAISE; interrupt propagation is intact by construction.
+- **`hop_ppid` greedy sed "mis-parse"** — right-anchored and correct: after
+  `pid (comm)` the state/ppid fields cannot contain `)`, so greedy matching
+  IS the safe form.
+- **`core/brain.py` model-name case sensitivity, `TurnStream.result`,
+  `full_parts` redundancy** — real but cosmetic; Ollama answers lower-case
+  names and the config is lowercase, the field is a scratch slot, and the
+  buffer duplication is bounded by response size. Recorded, not worked.
+- **`ci/*` hardening suggestions** (path-traversal guards on git's own
+  output, `set -e`, apt retry UX, SHA-pin grep scope) — defense-in-depth for
+  files that run inside a trusted CI sandbox under a repo the maintainer
+  owns; the threat model here is the user's own machine, not a hostile
+  contributor. Dismissed as out-of-model, noted for the day the repo takes
+  outside PRs.
+- **`tests/conftest.py` xdist/parallel claims** — the suite does not run
+  under xdist (the harness's own env isolation is process-wide by design);
+  the session-scoped constructor watcher is safe in the model that exists.

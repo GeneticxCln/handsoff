@@ -80,7 +80,14 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   Settings change is needed for the Yeti to be what the bubble listens to.
   Look at: Settings → Voice → *Input device* — the dropdown should read
   `Blue Microphones: USB Audio (hw:4,0)`, not "System default".
-- ☐ [human] Live test: level meter follows the room; speech passes threshold
+- ✅ [human] Live test: level meter follows the room; speech passes threshold
+  — verified 2026-09-23 15:37: the Voice-tab mic-test meter visibly followed
+  the room while the tester sat silent; machine side the Yeti runs at
+  100 % / 0.00 dB gain (`pactl get-source-volume`), so amplified room tone is
+  real signal, and the bubble's own level pipeline read a flat 0.0 across six
+  idle samples (no false motion). Speech passing the threshold: all three of
+  the day's PTT captures were accepted (frames=13375/38638/31579 @44100 →
+  whisper ran).
   Auto half verified 2026-09-18: during a real PTT capture `--ptt level`
   reported `{"raw": 0.79…1.0, "ui": …, "source": "ptt", "state":
   "listening"}` and fell to `raw 0.149` in the pause — the meter tracks speech
@@ -91,7 +98,17 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   (`frames=148236 rate=44100` → whisper ran).
   Look at: Settings → Voice → the meter while you speak — the bar should move
   with your voice and sit flat when you stop.
-- ☐ [human] Push-to-talk round trip: hold → speak → release; transcript correct
+- ✅ [human] Push-to-talk round trip: hold → speak → release; transcript correct
+  — verified 2026-09-23 15:34–15:35: three real bubble-hold PTT turns on the
+  Yeti (journal): `ptt timing: stop_ms=40/80/66, frames=13375/38638/31579`,
+  `heard (gen=6/9)` with `echo-check: … -> False`, an LLM turn each time, and
+  replies SPOKEN ("How can I help you?" at 15:34:32; the status reply at
+  15:35:01 — note the log line is `saying: …`, which is how an announce renders,
+  vs a turn's `saying response`). history.json holds the correct transcript
+  "Cypher, tell me your status." Finding (real, kept): a 0.72 s hold garbled
+  one phrase ("Same for all your cell phone wear.") — hold through the whole
+  utterance before releasing. Walkthrough correction recorded: there is NO
+  keyboard key; PTT is press-and-HOLD the bubble (HOLD_MS=140, core/bubble.py).
   Auto half verified 2026-09-18 end to end (loopback): a piper utterance of
   "What time is it?" played into the room while `--ptt start` held the mic gave
   `ptt timing: stop_ms=45 submit_ms=1 frames=148236 rate=44100`, whisper
@@ -103,7 +120,38 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   for the memory defect that used to swallow it).
   Look at: hold the key, ask something, release — your own words should appear
   in Settings → History as a `user` turn.
-- ☐ [human] Hands-free wake: say the wake name; engagement window opens
+- ❌ [human] Hands-free wake: say the wake name; engagement window opens
+  — FAILED 2026-09-23 17:12–17:13 with a real voice: hands-free armed via the
+  control verb (confirmation heard by the tester at 17:12:31), the Yeti opened
+  (`opens_ok=1`), and the tester said "Cypher" — but no
+  `wake word — engaged` line ever fired. 49 utterances in 73 s were each
+  transcribed and refused (`ignored (no wake word)`; gen=10→58, journal
+  redacts the text so what whisper heard is unknowable post-hoc). The turn
+  eventually recorded ("Hey, Cypher." → reply spoken 17:14:21) was the
+  tester's bubble PRESS at 17:13:54 (`src=ptt`), which bypasses the gate —
+  evidence the gate-bypass path works, not that the wake path does. Three
+  machine facts bound the failure: (1) the transcript gate is exonerated —
+  offline, `_match_wake` matches "Cypher", "Siphon", "Cipher", "Zypher",
+  "Sypher" (fuzzy skeleton) and "hey cypher …"; (2) the AUDIO spotter cannot
+  help a custom name — it loaded its STOCK set (alexa, hey_jarvis, hey_mycroft,
+  timer, weather): no model exists for "cypher", so engagement rides entirely
+  on whisper producing a matchable transcript; (3) the mic segments hot —
+  49 sub-second utterances in 73 s (Yeti at 100 %/0.00 dB gain, Chrome playing
+  in the room) means whisper never saw a clean "cypher" chunk to transcribe.
+  Sep 18's pass used a synthetic piper "Cypher." played into the room; the
+  first real-voice attempt fails. Defects to fix, in order of leverage:
+  a custom wake model for the configured name (openWakeWord custom training
+  or a fallback: when the spotter is on and the name is custom, ALSO accept a
+  transcript-whole-text match), and VAD segmentation of room noise into
+  1 Hz utterances (each burning a whisper pass) — a real-voice wake retest is
+  owed after either lands. UPGRADE 17:39:29 — the ENGAGEMENT half then passed
+  with real voice: after a settings reload re-armed hands-free, the tester's
+  spoken "Cypher" was transcribed (2.9 s utterance, VAD kept it) and the
+  journal logged `wake word — engaged for 45.0s`. Remaining failure, narrowed:
+  the in-window follow-up (0.86 s) had 100 % of its audio VAD-removed →
+  `ignored (unintelligible while engaged)` — so the wake path works when
+  whisper sees the name, and short utterances die in the VAD. Item stays ❌
+  until a hands-free follow-up survives the gate.
   Auto half verified 2026-09-18: with hands-free on, a piper "Cypher." played
   into the room produced `wake word — engaged for 45.0s`, and a fragment a
   second earlier produced `ignored (no wake word)` — both halves of the gate.
@@ -150,11 +198,16 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   spoke, so the bubble's own voice never entered the conversation.
   Listen for: the reply in the configured voice, and then check Settings →
   History holds nothing attributed to you that you did not say.
-  Verified 2026-09-21 18:16 at the machine: the reply was HEARD, clearly, in the
-  cloned voice — the one clause no monitor can judge, since a muted or
+  Verified 2026-09-21 18:16 at the machine: the reply was HEARD, clearly,  in the cloned voice — the one clause no monitor can judge, since a muted or
   unplugged sink looks identical to a working one from the app's side (the
   sink was checked first: unmuted, 35%, active port analog-output, and
-  `tts_volume` 1.0, so the path to the ears was clear). On the machine side,
+  `tts_volume` 1.0, so the path to the ears was clear).
+  Re-confirmed 2026-09-23 16:20 on the current build (Yeti configured): the
+  tester heard the chatterbox reply clearly. Provenance note kept: that
+  announce was an 85-char `say` whose text matches the status reply minus
+  markup, and no matching turn exists in history.json — a speak without a
+  turn, source not yet named (the GUI voice-test line is 35 chars, so not
+  that button's default). On the machine side,
   `history.json` stayed BYTE-IDENTICAL (6 entries, sha `c8e711419b42fa1d`)
   across 34s of OPEN MICROPHONE while the bubble spoke a 161-character sentence
   containing its own wake word ("Hey Jarvis…"), and again across a
@@ -179,8 +232,15 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   absent from `sounddevice`'s device list entirely (it appears only as an
   OUTPUT, `Blue Microphones: USB Audio (hw:4,0)`, `in=0`), so "the Yeti appears
   in *Input device*" is not merely untested — on this tree it cannot appear.
-- ☐ [human] Barge-in: click the bubble while it speaks → playback stops
+- ✅ [human] Barge-in: click the bubble while it speaks → playback stops
   instantly (needs the bubble audibly speaking; supervised test)
+  — VERIFIED live 2026-09-23 17:38: a 95-char reply began at 17:38:32
+  (`saying: I am ready to search the web…`) and the tester stopped it
+  "instant" by their own report with the ONLY possible trigger: hands-free was
+  off (no capture exists in the journal between 17:38:32 and 17:39:24), no
+  control verb was sent, so a bubble press — `interrupt()` — is the only
+  gesture that cancels playback. Prior auto halves (2026-09-18, 2026-09-21
+  closed-loop monitor measurement) stand below.
   Auto half verified 2026-09-18 except the click itself: `--ptt interrupt`
   DURING a reply truncated it (the monitor counted 3.8 s of audible speech out
   of a far longer reply, then `state=idle`), against a control with no
@@ -569,3 +629,4 @@ checked with a date or explicitly abandoned with a reason.
 | 2026-09-23 | Buffy | Fault-injected --ptt stop-audit's three failure modes against the DEPLOYED copy (torn line via the real CLI with a scratch XDG_STATE_HOME; lying reader + broken exemption via in-process import of ~/.local/bin/handsoff.py, never touching the real ledger). TWO VERDICTS HONEST: a torn line renders [WARN] lines + PASS with 1 warned rc=0 (reported, not hidden, not fatal); a lying reported block FAILs (rc=1). ONE REAL HOLE FOUND: both broken-exemption shapes PASSED — the delta check compares the reader against ITSELF with flags stripped, so (3a) a reader whose shutdown skip is gone lies identically both ways (delta 1 vs 1) and (3b) the one-sided `gained >= 0` bound cannot catch an over-counting reader. FIX: an INDEPENDENT ORACLE — `_expected_ghost_pairs(rows)` reimplements the documented pairing rule straight from the raw rows (deliberate duplication: an oracle sharing the reader's code would share its bugs) and the exemption check now requires EQUALITY, not a bound, in both the sweep-ghost and no-sweep-ghost branches. Guards: 3 new (3a fails via [FAIL] exemption + "independent count 0"; 3b fails with "the raw rows support 1"; the oracle agrees with the reader across five documented shapes — anchor+ghost, sweep exempt, negative gap, no anchor, outside window). Full suite 2138 passed (2135 + 3); freshness 19/19 after regen; ruff delta 0 |
 | 2026-09-23 | Buffy | The audit's last two invisible watchers got their health surfaces: (1) WORLD POLLER — `_world_tick` now records every RAN tick into a lock-guarded `_WORLD_WATCH` store (`ticks`, `degraded_ticks`, `last_error`, `last_tick_ts`), and `_world_watch_health()` computes `last_tick_age_s` at read time — the AGE is the wedge detector, because a dead or blocked loop stops ticking and silence alone can never show that; a poller opted OUT returns without recording, so "off" renders as never-ticked (None) and is never confused with "wedged". (2) QS DESK CLIENT — `core/tools.py` gains a capped per-tool call ledger (`qs_stats_record/snapshot/reset`, 24 entries max, drop-oldest): every quant_space_* call records 'ok' or the DeskError's own state word, failures recorded inside `_qs_refused` (the one chokepoint that already saw every refusal), successes recorded at each tool's return so "all failures" is distinguishable from "never called"; the settings-reload handshake clears the store — a desk problem the user just fixed must not keep reading as current through a stale last_state (the same re-arm logic the notification reader's gave-up path uses). Both blocks ride `--ptt health` beside the reader's block: one mirror-signal shape for every watcher that is quiet when it works. Guards: 5 new (age/None semantics, off-renders-never-ticked, degraded-records-without-changing-behavior, stats shape + cap + reset, snapshot carries both blocks). Full suite 2143 passed (2138 + 5); freshness 19/19 after regen; ruff delta 0 |
 | 2026-09-23 | Buffy | The Blue Yeti restored as the configured capture device — and the "why" answered from the record, not guessed: the Yeti had been swapped to the StreamCam during the 2026-09-21 §4 TTS walk after it went `ptt -> open-failing` (mic-health journal, Sep 22, three events); an earlier restore round today was interrupted before it could write settings, so `mic_device` still read StreamCam. Diagnosis this time: `lsusb` shows the Yeti on the bus (enumerated at today's 10:09 boot with USB errors — descriptor read/64 error -71 twice, then four `failed to get current value for ch` (-22) from snd-usb-audio — all recovered); the first device greps MISSED it because the card names itself "Blue Microphones", not "Yeti" (lesson recorded: grep for the enum name, not the marketing name). Health PROVEN, not assumed: direct `sounddevice` InputStream on `Blue Microphones: USB Audio (hw:4,0)` at 44.1 kHz — 90112 frames in 2.0 s, zero overrun flags, peak 14203 (audio present; silence would have read as dead per the mic-dead rule). Restored through the app's own path: settings.json rewritten atomically (0600, temp+rename), `--ptt reload-settings` accepted, running bubble's health now reports the Yeti as its device. No code changed; docs-only commit |
+| 2026-09-23 | Buffy | OCR scan triaged the house way — 111 comments over 38 files, and the scan ran provider-degraded (Nvidia 404s fell back plan-less), so every headline was verified against real source before acting: THREE fixes with teeth, the rest dismissed with reasons in specs/90-audit.md. (1) conftest `_snapshot_state`: a deepcopy failure fell back to the identity pair, and `_restore_state`'s clear()/update() on (obj, obj) then IRREVERSIBLY EMPTIED that dict/list — test isolation silently corrupting the very state it guards; now raises RuntimeError and fails the test loudly. (2) conftest `sandbox_env()`: an auto-created throw-away home is registered in `_SANDBOX_HOMES` for the process-exit sweep (was one /tmp dir leaked per driver run); an explicit caller-owned home is deliberately NOT registered. (3) stop-probe control bytes, both layers: `json_str` now neutralizes them itself (tab/CR/LF→space, other controls deleted) and `hop_json` applies the SAME rule at cmdline ingest — the scan's finding was half-right (the escaper trusted callers) and half-wrong (the caller did strip, but by deletion, losing readable tabs); both layers now implement one rule. Guards: 2 sandbox (auto-home registered, explicit-home untouched) + 1 probe (a caller argument carrying tab/LF/\x01 yields exactly one parseable row with the mapped text). Dismissals recorded with evidence: the brain regex family is already escaped/anchored/non-greedy (the scan never saw the size-filtered file and hallucinated source); `look_setting_key`'s "critical NameError" is bogus (module globals resolve at call time); the registry reclaim "leak" is arithmetically impossible (a reclaim deletion strictly lowers occupancy, the room check cannot then fail); the truncated-checkpoint refusal is pinned intended behavior (`test_a_truncated_checkpoint_is_not_a_previous_state`); the BaseException sites clean up and re-raise (correct as written). One self-catch: my own dismissal prose tripped the freshness module-size guard — reworded. Full suite 2146 passed; freshness 19/19; ruff delta 0 (4=4, 11=11, 43=43) |
