@@ -1300,8 +1300,64 @@ class TestDoctor:
             monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
             fresh = H._ghost_stop_pattern(rows)
             assert fresh["pairs"] == H._expected_ghost_pairs(rows), shape
-            text, rc = H._stop_audit_report()
-            assert rc == 0 and "[FAIL]" not in text, shape
+            # The audit's VERDICT is a different rule (the unattributed
+            # finding below) and has its own guards; this test is about the
+            # oracle and the reader agreeing on the pairing rule.
+
+    def test_stop_audit_counts_open_unattributed_stops_as_a_finding(self, H,
+                                                                    monkeypatch,
+                                                                    tmp_path):
+        """The audit verified the MACHINERY (reader, oracle, writer) but a
+        ghost riding a passing ledger was silent — machinery checks all pass
+        while the finding goes unsaid. The unattributed check closes that:
+        a non-shutdown ghost after the anchor with NO attributed catch after
+        it FAILs the audit, so a recurring ghost pattern after a boot is
+        impossible to miss in the verdict doctor renders."""
+        text, rc = self._audit(H, monkeypatch, tmp_path, [
+            self._attr_row("2026-09-23T09:00:00+02:00"),
+            self._ghost_row("2026-09-23T09:03:00+02:00"),
+        ])
+        assert rc == 1 and "[FAIL] unattributed" in text
+        assert "1 unattributed stop(s) with no attributed catch" in text
+        assert "invisible-killer shape is OPEN" in text
+        assert "verdict: FAIL" in text
+
+    def test_stop_audit_warns_when_a_catch_supersedes_the_ghost(self, H,
+                                                                monkeypatch,
+                                                                tmp_path):
+        """A ghost the tripwire later caught red-handed is ANSWERED — the
+        house rule keeps it visible (a refusal is never only in the reply)
+        as a WARN with both timestamps, without failing a boot whose
+        machinery worked."""
+        text, rc = self._audit(H, monkeypatch, tmp_path, [
+            self._attr_row("2026-09-23T09:00:00+02:00"),
+            self._ghost_row("2026-09-23T09:03:00+02:00"),
+            self._attr_row("2026-09-23T09:05:00+02:00"),
+        ])
+        assert rc == 0 and "[WARN] unattributed" in text
+        assert "1 unattributed stop(s) in window" in text
+        assert "superseded by the attributed catch at 2026-09-23T09:05" in text
+        assert "verdict: PASS" in text
+
+    def test_stop_audit_exempts_sweeps_and_history_from_the_finding(self, H,
+                                                                    monkeypatch,
+                                                                    tmp_path):
+        """Shutdown-annotated sweeps are invisible by design and rows at or
+        below the anchor ARE the anchor's history — neither is new evidence,
+        so a ledger of sweeps plus pre-anchor ghosts reads clean."""
+        sweep = self._ghost_row("2026-09-23T09:03:00+02:00")
+        sweep["shutdown"] = 1
+        sweep["note"] = "session-shutdown sweep"
+        history = self._ghost_row("2026-09-22T12:00:00+02:00")  # before anchor
+        text, rc = self._audit(H, monkeypatch, tmp_path, [
+            history,
+            self._attr_row("2026-09-23T09:00:00+02:00"),
+            sweep,
+            self._attr_row("2026-09-23T10:00:00+02:00"),
+        ])
+        assert rc == 0 and "verdict: PASS" in text
+        assert "no unattributed stop after the anchor" in text
+        assert "[FAIL]" not in text
 
     def test_a_shutdown_ghost_does_not_start_supersession(self, H,
                                                           monkeypatch,

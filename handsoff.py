@@ -4775,6 +4775,8 @@ def _stop_audit_report() -> tuple[str, int]:
     if torn:
         check("lines", False, f"{torn} torn line(s) skipped", warn=True)
 
+    block = _unexplained_stops_health()
+
     if rows:
         # --- reader self-consistency: the health block must equal a fresh
         # compute over the same rows
@@ -4826,8 +4828,59 @@ def _stop_audit_report() -> tuple[str, int]:
                  if pre_annotation else ""),
               warn=pre_annotation)
 
-    # --- the parity reader keeps its shape
-    block = _unexplained_stops_health()
+        # --- the FINDING, not just the machinery: unattributed, non-shutdown
+        # stops after the newest open incident are the invisible-killer shape
+        # the tripwire exists to catch. A LATER attributed non-shutdown catch
+        # supersedes them (the tripwire answered red-handed — visible as a
+        # WARN, not a failure); one with NOTHING after it is open and FAILs,
+        # so a recurring ghost pattern after a boot cannot hide behind a
+        # passing ledger. Shutdown-annotated sweeps are exempt (the session's
+        # own sweep, invisible by design) and rows at/below the anchor are
+        # the history the anchor itself names — not new evidence.
+        def _t(rec: dict):
+            try:
+                return datetime.datetime.fromisoformat(str(rec.get("ts") or ""))
+            except ValueError:
+                return None
+
+        open_ts = [_t(i) for i in block["open"]]
+        open_ts = [t for t in open_ts if t is not None]
+        anchor = max(open_ts) if open_ts else \
+            _t({"ts": _OPEN_UNEXPLAINED_STOPS_LATEST})
+        ghosts = 0
+        last_ghost_ts = ""
+        superseded_by = ""
+        for rec in rows:
+            t = _t(rec)
+            if t is None or anchor is None or t <= anchor:
+                continue
+            if rec.get("shutdown"):
+                continue
+            if not rec.get("callers"):
+                ghosts += 1
+                last_ghost_ts = str(rec.get("ts"))
+            elif ghosts:
+                superseded_by = str(rec.get("ts"))
+                break
+        if ghosts == 0:
+            check("unattributed", True,
+                  "no unattributed stop after the anchor in the audited window")
+        elif superseded_by:
+            # answered, not clean: WARN is the visibility the house rule
+            # demands (never only in the reply), without failing a boot
+            # whose machinery worked
+            check("unattributed", False,
+                  f"{ghosts} unattributed stop(s) in window (last "
+                  f"{last_ghost_ts[:19]}) — superseded by the attributed "
+                  f"catch at {superseded_by[:19]}", warn=True)
+        else:
+            check("unattributed", False,
+                  f"{ghosts} unattributed stop(s) with no attributed catch "
+                  f"after them (last {last_ghost_ts[:19]}) — the "
+                  "invisible-killer shape is OPEN")
+
+    # --- the parity reader keeps its shape (block is computed above, shared
+    # with the unattributed finding)
     shaped = (set(block) == {"open", "superseded_by"}
               and isinstance(block.get("open"), list)
               and all(isinstance(i, dict) and i.get("ts")
