@@ -9,7 +9,7 @@ copy a size out of it into prose.
 
 | Module | Lines | Owns | Must not import |
 |---|---|---|---|
-| `handsoff.py` | 9556 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
+| `handsoff.py` | 9559 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
 | `core/__init__.py` | 306 | `APP_MODULE_NAME="handsoff_core"`, `claim_app_instance`, `load_module`, origin rule, stdlib-shadow guard | app globals |
 | `core/tools.py` | 3867 | 52 `@tool`s, `ToolBelt`, `set_dependencies` (the host installs its runtime with this), `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
 | `core/bubble.py` | 4076 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |

@@ -112,7 +112,9 @@ fires the probe, so each deployment demonstrates the mechanism for free.
 
 ## Open edges
 
-`--ptt health` does not yet carry the `unexplained_stops` block doctor_json
-has (parity pending); the first annotated real sweep (a night poweroff) is
-expected on the next boot and will retire the last unannotated PATTERN from
-the ledger's history.
+CLOSED (2026-09-23): `--ptt health` now carries the same `unexplained_stops`
+block doctor_json has — both surfaces read `_unexplained_stops_health()`, and
+the equality is pinned by `TestDoctor` (the parity contract IS the equality).
+Still open: the first annotated real sweep (a night poweroff) is expected on
+a future boot and will retire the last unannotated PATTERN from the ledger's
+history.

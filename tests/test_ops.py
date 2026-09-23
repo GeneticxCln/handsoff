@@ -942,6 +942,26 @@ class TestDoctor:
         assert "superseded by" not in text        # but nothing superseded it
         assert H.doctor_json()["unexplained_stops"]["superseded_by"] == ""
 
+    def test_health_carries_the_same_unexplained_block_as_doctor_json(self, H,
+                                                                      monkeypatch,
+                                                                      tmp_path):
+        """--ptt health and doctor_json read the same reader, so the open-items
+        block cannot disagree between the two surfaces — the design note's
+        open edge, closed."""
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", (
+            {"ts": "2026-09-23T07:00:00+02:00", "detail": "stop, boot 0"},
+        ))
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", tmp_path / "none")
+        health_json = H.doctor_json()["unexplained_stops"]
+        # The snapshot builder and doctor deps call the SAME reader, so the
+        # blocks must be equal — that equality IS the parity contract.
+        snap_block = H._unexplained_stops_health()
+        assert health_json == snap_block == {
+            "open": [{"ts": "2026-09-23T07:00:00+02:00",
+                      "detail": "stop, boot 0"}],
+            "superseded_by": "",
+        }
+
     def test_a_shutdown_ghost_does_not_start_supersession(self, H,
                                                           monkeypatch,
                                                           tmp_path):

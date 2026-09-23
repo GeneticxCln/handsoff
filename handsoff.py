@@ -5949,6 +5949,9 @@ class Assistant(QObject):
         snap["deployment"] = _deployment_snapshot()
         snap["laya_corpus"] = _laya_corpus_counts()
         snap["stop_attribution"] = _stop_attribution_health()
+        # Parity with doctor_json: the open-items block rides the same reader,
+        # so both diagnostic surfaces agree on what the mystery list holds.
+        snap["unexplained_stops"] = _unexplained_stops_health()
         try:
             sw = self._selfwatch
         except AttributeError:
