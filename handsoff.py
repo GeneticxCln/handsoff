@@ -1735,6 +1735,7 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         web_lines=_web_lines,
         stop_attribution_health=_stop_attribution_health,
         unexplained_stops=_unexplained_stops_health,
+        boot_stop_audit=_boot_stop_audit_health,
         # ONE story for the card: the tenants, the speech models, the LLM and
         # what the next turn asks for are one host collector behind one doctor
         # section, so no two lines can describe the same memory differently.
@@ -4765,6 +4766,47 @@ def _stop_audit_report() -> tuple[str, int]:
     return "\n".join(lines), (1 if fails else 0)
 
 
+_BOOT_AUDIT_LOCK = threading.Lock()
+_BOOT_AUDIT: dict = {}   # empty = the boot audit has not run in this process
+
+
+def _run_boot_stop_audit() -> None:
+    """Run the stop-attribution audit once at boot and keep its verdict.
+
+    The bubble starts AFTER the start job begins, and the previous stop's
+    ledger line is final by then (ExecStop completes before the start job),
+    so startup is the one moment a boot check can judge a complete story:
+    the stop that preceded this boot, annotated by the probe, read by the
+    reader this process is about to serve. The verdict is stored in memory
+    for doctor — a unit-level ExecStartPost would run in a process the
+    doctor can never see. Best effort twice over: the audit itself never
+    raises, and a failure here must not delay the boot behind it.
+    """
+    try:
+        report, fails = _stop_audit_report()
+        verdict_line = next((ln.strip() for ln in report.splitlines()
+                             if "verdict:" in ln), "")
+        with _BOOT_AUDIT_LOCK:
+            _BOOT_AUDIT.clear()
+            _BOOT_AUDIT.update({
+                "ts": datetime.datetime.now().astimezone().isoformat(
+                    timespec="seconds"),
+                "verdict": "FAIL" if fails else "PASS",
+                "summary": verdict_line,
+            })
+        log.info("boot stop-audit: %s", verdict_line or "no verdict line")
+    except Exception:
+        log.exception("boot stop-audit could not run")
+
+
+def _boot_stop_audit_health() -> dict:
+    """The boot-time audit's verdict, shaped for doctor. Empty dict when the
+    audit has not run in this process — the host's honest "not adjudicated
+    here", which doctor renders as silence rather than a false claim."""
+    with _BOOT_AUDIT_LOCK:
+        return dict(_BOOT_AUDIT)
+
+
 def _record_mic_event(from_state: str, to_state: str) -> None:
     """Append one mic-state transition to the mic-health state file (best
     effort: diagnostics must never break the audio path)."""
@@ -5860,6 +5902,10 @@ class Assistant(QObject):
             # goes through the one classifier rather than a private copy.
             if result and _core_tools.tool_kind(result) == "error":
                 log.error("notification reader startup: %s", result)
+        # Post-boot verification, in-process: judge the stop that preceded
+        # this boot while its ledger line is fresh, and keep the verdict for
+        # doctor (see _run_boot_stop_audit for why it lives here).
+        _run_boot_stop_audit()
         self._empty_streak = 0                   # consecutive empty transcriptions
         self._wake_until = 0.0                   # monotonic: engagement window expiry
         self._followup_until = 0.0               # monotonic: no-wake-word window after a reply

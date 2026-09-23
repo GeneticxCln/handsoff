@@ -86,7 +86,7 @@ class DoctorDeps:
         "remote_ollama_optin_source",
         "cap_refusal_note", "cap_refusals",
         "appearance_look", "web_lines", "stop_attribution_health",
-        "unexplained_stops",
+        "unexplained_stops", "boot_stop_audit",
         "gpu_lines", "gpu_headroom",
         "shutil", "sounddevice", "log",
     )
@@ -123,6 +123,10 @@ class DoctorDeps:
         # Stops the tripwire shipped too late to see: listed until an
         # autopsy explains one or the ledger supersedes the whole item.
         self.unexplained_stops: Callable[[], dict] | None = None
+        # The boot-time stop-audit's verdict (the host runs the audit once at
+        # startup; None means the host never adjudicated, which renders as
+        # silence rather than a false "passed").
+        self.boot_stop_audit: Callable[[], dict] | None = None
         # Cap refusals: how often a bounded registry has turned real work away.
         # A host that does not record them reports none, which is also the
         # truthful answer for a host that has no registries to bound.
@@ -540,6 +544,20 @@ def _lines(deps: DoctorDeps) -> list[str]:
                 f"stop attribution: no unexplained stops — superseded by the "
                 f"attributed catch at {str(u.get('superseded_by'))[:19]}")
 
+    # The verdict the running process computed for the stop that PRECEDED its
+    # own boot. Empty dict = this host never adjudicated (the audit is wired
+    # at startup; older hosts and partial deps render silence, not a claim).
+    ba = getattr(deps, "boot_stop_audit", None)
+    if ba is not None:
+        try:
+            b = ba() or {}
+        except Exception:
+            b = {}
+        if b:
+            lines.append(
+                f"stop attribution: boot audit {b.get('verdict', '?')} at "
+                f"{str(b.get('ts'))[:19]} ({b.get('summary', '')})")
+
     if deps.crash_log.exists():
         try:
             age = time.time() - deps.crash_log.stat().st_mtime
@@ -653,6 +671,16 @@ def doctor_json() -> dict:
         "open": list(us.get("open") or []),
         "superseded_by": us.get("superseded_by") or "",
     }
+    ba_dep = getattr(deps, "boot_stop_audit", None)
+    try:
+        b = (ba_dep() if ba_dep is not None else {}) or {}
+    except Exception:
+        b = {}
+    if b:
+        out["boot_stop_audit"] = {
+            "verdict": b.get("verdict"), "ts": b.get("ts"),
+            "summary": b.get("summary"),
+        }
     # Only when the host measured or estimated something: a host without the
     # dep leaves the JSON exactly as it was, the same way its text report is
     # unchanged. The dict is passed through as the host built it — this module

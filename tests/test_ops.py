@@ -962,6 +962,56 @@ class TestDoctor:
             "superseded_by": "",
         }
 
+    # ---- the boot-time audit, visible in doctor ---------------------------
+
+    def test_boot_audit_verdict_renders_in_doctor(self, H, monkeypatch):
+        """The wiring contract: a verdict stored at boot surfaces in the
+        doctor text AND the doctor_json block — no raw-file reading."""
+        stored = {"ts": "2026-09-23T13:30:00+02:00", "verdict": "PASS",
+                  "summary": "verdict: PASS (6 passed)"}
+        monkeypatch.setattr(H, "_boot_stop_audit_health", lambda: dict(stored))
+        text = H.run_doctor()
+        assert "stop attribution: boot audit PASS at 2026-09-23T13:30" in text
+        assert "verdict: PASS (6 passed)" in text
+        block = H.doctor_json()["boot_stop_audit"]
+        assert block == {"verdict": "PASS", "ts": "2026-09-23T13:30:00+02:00",
+                         "summary": "verdict: PASS (6 passed)"}
+
+    def test_boot_audit_fail_is_visible_in_doctor(self, H, monkeypatch):
+        """A FAIL at boot is the finding the whole feature exists for — it
+        must render with its verdict named, not be softened into prose."""
+        stored = {"ts": "2026-09-23T13:30:00+02:00", "verdict": "FAIL",
+                  "summary": "verdict: FAIL (1 of 6 checks failed)"}
+        monkeypatch.setattr(H, "_boot_stop_audit_health", lambda: dict(stored))
+        text = H.run_doctor()
+        assert "stop attribution: boot audit FAIL at 2026-09-23T13:30" in text
+
+    def test_no_boot_audit_renders_silence_not_a_claim(self, H, monkeypatch):
+        """A host that never adjudicated renders silence — doctor must not
+        manufacture a "passed" for an audit that did not happen."""
+        monkeypatch.setattr(H, "_boot_stop_audit_health", dict)
+        text = H.run_doctor()
+        assert "boot audit" not in text
+        assert "boot_stop_audit" not in H.doctor_json()
+
+    def test_boot_audit_runner_survives_a_raising_audit(self, H, monkeypatch):
+        """The startup runner is best effort: an audit that raises is logged
+        and swallowed — the boot must never be delayed behind diagnostics."""
+        # The store is process-global and an earlier test's Assistant startup
+        # may have populated it with a real verdict; this test owns its state.
+        monkeypatch.setattr(H, "_BOOT_AUDIT", {})
+        monkeypatch.setattr(H, "_stop_audit_report",
+                            lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        H._run_boot_stop_audit()          # must not raise
+        assert H._boot_stop_audit_health() == {}
+        # And the happy path stores a verdict the doctor can read.
+        report = "handsoff stop-audit\n  verdict: PASS (6 passed)"
+        monkeypatch.setattr(H, "_stop_audit_report", lambda: (report, 0))
+        H._run_boot_stop_audit()
+        stored = H._boot_stop_audit_health()
+        assert stored["verdict"] == "PASS" and "6 passed" in stored["summary"]
+        assert stored["ts"]
+
     # ---- --ptt stop-audit: the post-boot check as one built-in verb
 
     def _audit(self, H, monkeypatch, tmp_path, rows, *, no_unexplained=()):
