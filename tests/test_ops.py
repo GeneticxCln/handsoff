@@ -896,14 +896,22 @@ class TestDoctor:
 
     def test_open_unexplained_stops_are_listed(self, H, monkeypatch, tmp_path):
         """The standing item renders while entries remain: an open mystery
-        with no home is how it quietly disappears from doctor."""
+        with no home is how it quietly disappears from doctor. Pinned against
+        injected data, not yesterday's — the 18:xx list RESOLVED by autopsy
+        (four restart jobs from the injection battle's own step boundaries;
+        the verdicts live in the comment beside the now-empty tuple), and a
+        future incident re-opens the item by adding one line of data."""
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", (
+            {"ts": "2026-09-23T07:00:00+02:00", "detail": "stop, boot 0"},
+            {"ts": "2026-09-23T07:05:00+02:00", "detail": "stop, boot 0"},
+        ))
         monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", tmp_path / "none")
         text = H.run_doctor()
-        assert "stop attribution: 3 stop(s) remain UNEXPLAINED (newest " \
-               "2026-09-22T18:41) — predates the tripwire; listed until " \
+        assert "stop attribution: 2 stop(s) remain UNEXPLAINED (newest " \
+               "2026-09-23T07:05) — predates the tripwire; listed until " \
                "explained or superseded" in text
         u = H.doctor_json()["unexplained_stops"]
-        assert len(u["open"]) == 3 and u["superseded_by"] == ""
+        assert len(u["open"]) == 2 and u["superseded_by"] == ""
 
     def test_a_recurrence_caught_red_handed_supersedes(self, H, monkeypatch,
                                                        tmp_path):

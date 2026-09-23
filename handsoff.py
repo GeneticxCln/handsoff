@@ -4487,23 +4487,21 @@ _STOP_ATTRIBUTION_CMD_CHARS = 120   # per-caller cmdline chars health carries
 _STOP_ATTRIBUTION_GHOST_SCAN = 50   # ledger rows the ghost pattern reads back
 _STOP_ATTRIBUTION_GHOST_WINDOW_S = 3600  # ghost must FOLLOW an attributed
 # stop within this window to count as the pattern (a lone unattributed stop
-# is a legal session shutdown; the pair is the invisible-killer shape)
-
-# The stops the tripwire never saw: it shipped 21:09, and these three hit
-# 18:26–18:43 the same evening — mid-session, machine up, no caller the
-# journal could name. Listed by doctor until an autopsy explains an entry
-#    or the ledger supersedes them (the recurrence must RETURN first: an
-# unattributed ghost after the newest incident, then an attributed catch
-# after that ghost — any earlier catch would close the item on day one).
-_OPEN_UNEXPLAINED_STOPS: tuple = (
-    {"ts": "2026-09-22T18:26:00+02:00", "detail": "mid-session stop, boot -1"},
-    {"ts": "2026-09-22T18:30:02+02:00", "detail": "mid-session stop, boot -1"},
-    {"ts": "2026-09-22T18:41:43+02:00",
-     "detail": "mid-session stop, boot -1 — ate a fault-injection answer"},
-)
-# The anchor OUTLIVES the list: when an autopsy empties the entries above,
-# the date the mystery began must stay — supersession ("the tripwire caught
-# the recurrence") is measured from here, not from whatever entries remain.
+# is a legal session shutdown; the pair is the invisible-killer shape)# The 18:xx mystery of boot -1 (Sep 22), RESOLVED by autopsy 2026-09-23 — the
+# list is empty, the verdicts are kept here so the resolution is not folklore:
+# four events (18:26:00, 18:30:02, 18:41:43, 18:43:39 — "18:41–43" was two),
+# each a RESTART job (Stopped+Started same second, fresh startup banner), each
+# starting with the injection battle's own settings fingerprint (handsfree=True
+# for the first two, handsfree=False for the last two — the flag states the
+# passes set between steps). Excluded by evidence: no oomd/oom-kill lines in
+# any window, no logind sweep, no crash (exit was clean). Remaining account:
+# the injection passes' own step-boundary restarts, pre-tripwire, so no caller
+# line exists — the tripwire now attributes exactly this shape (an invoking
+# bash/systemctl chain), which the Sep 23 rehearsal proved verbatim.
+_OPEN_UNEXPLAINED_STOPS: tuple = ()
+# The anchor OUTLIVES the list even when the list resolves: supersession
+# ("the tripwire caught the recurrence") is still measured from the date the
+# mystery BEGAN, and the resolved verdicts above point back to it.
 _OPEN_UNEXPLAINED_STOPS_LATEST = "2026-09-22T18:41:43+02:00"
 
 
