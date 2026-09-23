@@ -104,7 +104,7 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
 2. DONE (2026-09-16) — `tests/test_specs_freshness.py`, its own file rather
    than a class in `test_regression.py` (and listed in `60-test-plan.md`): each
    count is read from the source of truth the spec names for itself — 52 tools,
-   65 settings keys, 22 PTT verbs, 15 core modules, plus 20 permission keys —
+   65 settings keys, 23 PTT verbs, 15 core modules, plus 20 permission keys —
    and every place a spec states one is read back and compared. It also pins
    STRUCTURE, which a count cannot see: every core module in the architecture
    map, every test file in the test plan, every spec in this index. Size claims

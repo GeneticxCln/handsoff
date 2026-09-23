@@ -4661,6 +4661,110 @@ def _unexplained_stops_health() -> dict:
     return {"open": items, "superseded_by": superseded_by}
 
 
+def _stop_audit_report() -> tuple[str, int]:
+    """`--ptt stop-audit`: the post-boot verification as one built-in verb.
+
+    Runs LOCALLY over the ledger (works with the bubble dead — that is when
+    a boot check runs), and encodes the claims the hand-rolled pipeline
+    checked: every line parses, the reader's pattern block matches a fresh
+    compute, the shutdown EXEMPTION actually exempts (the pattern is
+    recomputed with shutdown flags stripped; the exempted rows must never
+    add pairs), the probe's own writer contract holds on annotated rows,
+    and the parity reader keeps its shape. Exit 0 only when nothing FAILED;
+    WARNings (a torn line, a pre-annotation tail row) do not fail the audit
+    because they are environment artifacts, not machinery regressions.
+    """
+    findings: list[tuple[str, str]] = []
+
+    def check(name: str, ok: bool, detail: str, warn: bool = False) -> None:
+        findings.append(("PASS" if ok else ("WARN" if warn else "FAIL"),
+                         f"{name}: {detail}"))
+
+    # --- the ledger, parsed raw (the audit needs the shutdown flags, which
+    # the health tail does not carry beyond 3 rows)
+    rows: list[dict] = []
+    torn = 0
+    try:
+        for ln in STOP_ATTRIBUTION_FILE.read_text(encoding="utf-8").splitlines():
+            if not ln.strip():
+                continue
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                torn += 1
+                continue
+            if isinstance(rec, dict):
+                rows.append(rec)
+    except OSError:
+        pass
+    rows = rows[-_STOP_ATTRIBUTION_GHOST_SCAN:]
+    check("ledger", bool(rows),
+          f"{len(rows)} row(s) parsed" + (f", {torn} torn" if torn else "")
+          if rows or torn else "no ledger — probe not shipped or no stop yet",
+          warn=True)
+    if torn:
+        check("lines", False, f"{torn} torn line(s) skipped", warn=True)
+
+    if rows:
+        # --- reader self-consistency: the health block must equal a fresh
+        # compute over the same rows
+        fresh = _ghost_stop_pattern(rows)
+        reported = _stop_attribution_health().get("ghost_pattern") or {}
+        check("pattern reader", reported == fresh,
+              f"reported {reported} vs fresh {fresh}")
+
+        # --- the exemption actually exempts: with every shutdown flag
+        # stripped the pattern may only GAIN pairs, never lose them, and a
+        # sweep-only ghost must vanish entirely
+        stripped = [{**r, "shutdown": False} for r in rows]
+        off = _ghost_stop_pattern(stripped)
+        sweep_ghosts = [r for r in rows
+                        if r.get("shutdown") and not r.get("callers")]
+        if sweep_ghosts:
+            gained = off["pairs"] - fresh["pairs"]
+            check("exemption", gained >= 0 and fresh["pairs"] <= off["pairs"],
+                  f"{len(sweep_ghosts)} sweep ghost(s) in window; pairs "
+                  f"with exemption {fresh['pairs']} vs without {off['pairs']}")
+        else:
+            check("exemption", True, "no sweep ghosts in the audited window")
+
+        # --- the probe's writer contract on annotated rows
+        bad = [r for r in rows
+               if r.get("shutdown")
+               and ("sweep" in (r.get("note") or "")) != (not r.get("callers"))]
+        check("writer contract", not bad,
+              "annotated rows carry the sweep note iff unattributed"
+              if not bad else f"{len(bad)} annotated row(s) violate the note rule")
+
+        last = rows[-1]
+        pre_annotation = "shutdown" not in last
+        check("tail", bool(last.get("ts")),
+              f"last stop {str(last.get('ts'))[:19]}"
+              + (" (pre-annotation row — written by the old probe)"
+                 if pre_annotation else ""),
+              warn=pre_annotation)
+
+    # --- the parity reader keeps its shape
+    block = _unexplained_stops_health()
+    shaped = (set(block) == {"open", "superseded_by"}
+              and isinstance(block.get("open"), list)
+              and all(isinstance(i, dict) and i.get("ts")
+                      for i in block["open"]))
+    check("parity reader", shaped,
+          f"open={len(block.get('open', []))}, "
+          f"superseded_by={block.get('superseded_by') or '—'}")
+
+    fails = sum(1 for s, _ in findings if s == "FAIL")
+    warns = sum(1 for s, _ in findings if s == "WARN")
+    lines = ["handsoff stop-audit"]
+    lines.extend(f"  [{s}] {d}" for s, d in findings)
+    verdict = (f"FAIL ({fails} of {len(findings)} checks failed)" if fails
+               else f"PASS ({len(findings) - warns} passed"
+                    + (f", {warns} warned" if warns else "") + ")")
+    lines.append(f"  verdict: {verdict}")
+    return "\n".join(lines), (1 if fails else 0)
+
+
 def _record_mic_event(from_state: str, to_state: str) -> None:
     """Append one mic-state transition to the mic-health state file (best
     effort: diagnostics must never break the audio path)."""
@@ -8724,7 +8828,10 @@ PTT_ACTIONS = {"start", "stop", "toggle", "interrupt",
                # The Appearance panel's live preview: the bubble draws a pack
                # that is NOT installed, so a look can be judged on the real
                # desktop before Try it takes it.
-               "preview-pack", "preview-clear"}
+               "preview-pack", "preview-clear",
+               # Local post-boot verification of the stop-attribution ledger
+               # (like selftest/settings it runs without the bubble).
+               "stop-audit"}
 
 
 # Reported when the platform HAS SO_PEERCRED and the call still failed: the
@@ -9296,7 +9403,11 @@ commands:
                  it by itself if nothing renews it)
   preview-clear  stop drawing a previewed pack: back to the saved look
   selftest       run the hardware typing checks (launches scratch windows on
-                 THIS desktop, types only into them, restores the clipboard)"""
+                 THIS desktop, types only into them, restores the clipboard)
+  stop-audit     verify the stop-attribution ledger locally: sweep annotation,
+                 ghost-pattern exemption, parity reader — the post-boot check,
+                 exit 0 only when every claim holds (works even if the bubble
+                 is dead)"""
 
 
 def ptt_client(argv: list[str]) -> int:
@@ -9321,6 +9432,12 @@ def ptt_client(argv: list[str]) -> int:
         # is dead — same contract as `settings`
         print(run_typing_selftest())
         return 0
+    if action == "stop-audit":
+        # runs LOCALLY over the ledger: the check matters most right after a
+        # boot, when the bubble may still be warming or dead
+        text, rc = _stop_audit_report()
+        print(text)
+        return rc
     if action == "doctor":
         # the running bubble knows its live mic/brain state — ask it first;
         # but a dead bubble must still report (deployment hashes, systemd,

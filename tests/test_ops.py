@@ -962,6 +962,94 @@ class TestDoctor:
             "superseded_by": "",
         }
 
+    # ---- --ptt stop-audit: the post-boot check as one built-in verb
+
+    def _audit(self, H, monkeypatch, tmp_path, rows, *, no_unexplained=()):
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", self._ghost_ledger(
+            tmp_path, rows))
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", no_unexplained)
+        return H._stop_audit_report()
+
+    def test_stop_audit_passes_on_a_healthy_ledger(self, H, monkeypatch,
+                                                   tmp_path):
+        text, rc = self._audit(H, monkeypatch, tmp_path, [
+            self._attr_row("2026-09-23T09:00:00+02:00"),
+            self._attr_row("2026-09-23T10:00:00+02:00"),
+        ])
+        assert rc == 0 and "verdict: PASS" in text
+        assert "[FAIL]" not in text and "[WARN]" not in text
+        assert "pattern reader" in text and "parity reader" in text
+
+    def test_stop_audit_flags_a_torn_line_as_warn_not_fail(self, H,
+                                                           monkeypatch,
+                                                           tmp_path):
+        ledger = tmp_path / "stop-attribution.jsonl"
+        good = json.dumps(self._attr_row("2026-09-23T09:00:00+02:00"))
+        ledger.write_text(good + "\n{" + "\n", encoding="utf-8")
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+        text, rc = H._stop_audit_report()
+        assert rc == 0 and "[WARN] lines" in text and "torn" in text
+
+    def test_stop_audit_reports_the_exemption_delta_on_sweep_ghosts(self, H,
+                                                                    monkeypatch,
+                                                                    tmp_path):
+        """The regression detector: with sweep ghosts present, the audit
+        recomputes the pattern with the exemption OFF and reports the delta —
+        if the exemption ever breaks (flags lost, rule regressed), pairs
+        appear here that doctor would wrongly render."""
+        rows = [self._attr_row("2026-09-23T09:00:00+02:00"),
+                {"ts": "2026-09-23T09:03:00+02:00",
+                 "unit": "handsoff.service", "callers": [],
+                 "shutdown": 1, "note": "session-shutdown sweep"}]
+        text, rc = self._audit(H, monkeypatch, tmp_path, rows)
+        assert rc == 0 and "verdict: PASS" in text
+        assert "sweep ghost(s) in window" in text
+        assert "pairs with exemption 0 vs without 1" in text
+
+    def test_stop_audit_fails_when_the_pattern_reader_disagrees(self, H,
+                                                                monkeypatch,
+                                                                tmp_path):
+        """A reader whose reported block diverges from a fresh compute is a
+        machinery regression, not an environment artifact — FAIL, exit 1."""
+        rows = [self._attr_row("2026-09-23T09:00:00+02:00"),
+                self._ghost_row("2026-09-23T09:03:00+02:00")]
+        ledger = tmp_path / "stop-attribution.jsonl"
+        ledger.write_text("\n".join(json.dumps(r) for r in rows) + "\n",
+                          encoding="utf-8")
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+        # The audit re-parses the ledger into its own row objects, so the
+        # only honest seam for the lie is the reported block itself.
+        real_health = H._stop_attribution_health
+
+        def lying_health():
+            block = dict(real_health())
+            block["ghost_pattern"] = {"seen": False, "pairs": 0,
+                                      "window_min": 60, "last_ghost_ts": ""}
+            return block
+
+        monkeypatch.setattr(H, "_stop_attribution_health", lying_health)
+        text, rc = H._stop_audit_report()
+        assert rc == 1 and "[FAIL] pattern reader" in text
+
+    def test_stop_audit_on_a_missing_ledger_warns_and_exits_zero(self, H,
+                                                                 monkeypatch,
+                                                                 tmp_path):
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", tmp_path / "none")
+        monkeypatch.setattr(H, "_OPEN_UNEXPLAINED_STOPS", ())
+        text, rc = H._stop_audit_report()
+        assert rc == 0 and "no ledger" in text and "[WARN] ledger" in text
+
+    def test_stop_audits_verdict_line_is_not_double_labeled(self, H,
+                                                            monkeypatch,
+                                                            tmp_path):
+        text, _rc = self._audit(H, monkeypatch, tmp_path, [
+            self._attr_row("2026-09-23T09:00:00+02:00")])
+        assert "verdict: PASS" in text
+        assert not any(ln.strip().startswith("[PASS] PASS")
+                       for ln in text.splitlines())
+
     def test_a_shutdown_ghost_does_not_start_supersession(self, H,
                                                           monkeypatch,
                                                           tmp_path):

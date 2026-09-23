@@ -77,12 +77,12 @@ brain/mic banner → `acquire_lock()` (flock; second copy exits 0) →
 `app.exec()` → stop/shutdown/join on quit. Headless without
 `WAYLAND_DISPLAY/DISPLAY` warns, window may fail. One bubble per session.
 
-## 4. Control socket (22 verbs)
+## 4. Control socket (23 verbs)
 
 `PTT_ACTIONS` (`handsoff.py:6500`): start stop toggle interrupt handsfree
 handsfree-on handsfree-off handsfree-status dictation dictation-on
 dictation-off status health level doctor settings selftest reload-settings
-clear-history say preview-pack preview-clear. Read-only (no token):
+clear-history say preview-pack preview-clear stop-audit. Read-only (no token):
 `status health level doctor handsfree-status`. Everything else needs
 `token=<64 hex>` first line (constant-time compare); token lives in
 `control.token` (0700 state dir + `_peer_uid` gate). Request caps: 65536 B,
