@@ -832,6 +832,51 @@ def _param_schema(func) -> dict:
         out[pname] = entry
     return out
 
+# The quant_space family's call ledger, for `--ptt health`: counters and the
+# last outcome per tool, so a desk client whose every call fails is visible
+# instead of merely quiet. Mirror-signal shape: the desk says nothing when it
+# works (the user's desk looks exactly the same whether the client is healthy
+# or wedged), so the block exists to make "quiet" readable. Cap at
+# _QS_STATS_MAX entries with a drop-oldest trim; every mutation under a lock.
+# The host clears the store in its settings-reload path (the same re-arm
+# handshake the notification reader uses) — a stale failure must not read as
+# a current one after the user fixes the desk.
+_QS_STATS_LOCK = threading.Lock()
+_QS_STATS: dict = {}
+_QS_STATS_MAX = 24
+
+
+def qs_stats_record(tool: str, state: str) -> None:
+    """Record one quant_space call's outcome: state 'ok' or the DeskError's
+    own state word ("not-running", "untrusted", "not-granted", ...)."""
+    with _QS_STATS_LOCK:
+        entry = _QS_STATS.get(tool)
+        if entry is None:
+            if len(_QS_STATS) >= _QS_STATS_MAX:
+                oldest = min(_QS_STATS, key=lambda k: _QS_STATS[k]["last_ts"])
+                del _QS_STATS[oldest]
+            entry = _QS_STATS[tool] = {"attempts": 0, "last_state": "",
+                                       "last_ts": 0.0}
+        entry["attempts"] += 1
+        entry["last_state"] = str(state)
+        entry["last_ts"] = time.time()
+
+
+def qs_stats_snapshot() -> dict:
+    """The block for `--ptt health`: totals and the last outcome per tool.
+    An empty dict means the family has never been called in this process —
+    which is itself the honest answer for a machine without Quantum Space."""
+    with _QS_STATS_LOCK:
+        return {t: dict(e) for t, e in _QS_STATS.items()}
+
+
+def qs_stats_reset() -> None:
+    """Clear the store: the settings-reload handshake, so a fixed desk does
+    not keep reading as broken through a stale last_state."""
+    with _QS_STATS_LOCK:
+        _QS_STATS.clear()
+
+
 class ToolBelt:
     """The assistant's hands: one safe shell command, file read, file edit."""
     ALLOWED = {'pactl', 'playerctl', 'brightnessctl', 'niri', 'spawn', 'echo', 'cat', 'ls', 'pwd', 'notify-send', 'ps', 'free', 'uptime', 'df', 'ss', 'nvidia-smi'}
@@ -2196,6 +2241,9 @@ class ToolBelt:
                            tool, error.state, error.message)
         log_decision(tool, error.state, "REFUSED" if refused else "ERROR",
                      f"desk: {error.reason or error.state}")
+        # The health-surface half of the same rule: a refusal a model might
+        # swallow is also a signal `--ptt health` must carry.
+        qs_stats_record(tool, error.state)
         teller = getattr(self._deps, "notify", None)
         if teller is not None:
             try:
@@ -2218,6 +2266,9 @@ class ToolBelt:
             sessions = desk.sessions()
         except _qs_desk.DeskError as e:
             return self._qs_refused("quant_space_status", e)
+        # The health-surface half of the same rule: successes count too, so
+        # "all failures" is distinguishable from "never called".
+        qs_stats_record("quant_space_status", "ok")
         return _qs_desk.describe_status(status, sessions)
 
     @tool(gates='quant_space', description='List the sessions open in Quantum Space — each one\'s agent or kind and the folder it is in — together with the session id quant_space_read takes. Use it before reading when the session is not precisely known.')
@@ -2229,6 +2280,7 @@ class ToolBelt:
         except _qs_desk.DeskError as e:
             return self._qs_refused("quant_space_sessions", e)
         index = _qs_desk.session_index(sessions)
+        qs_stats_record("quant_space_sessions", "ok")
         return _qs_desk.describe_sessions(sessions) + (f"\n{index}" if index else "")
 
     @tool(gates='quant_space', description="Read the recent screen output of ONE Quantum Space session, by its id or name from quant_space_sessions. Use for 'what is Claude doing?', 'what did it just say?', 'read me the last thing it printed'.", aliases={'session': ('id', 'name', 'session_id', 'target', 'which'), 'lines': ('tail', 'last', 'n')})
@@ -2251,6 +2303,7 @@ class ToolBelt:
                 # The session IS there and simply has nothing on screen yet:
                 # that is an answer, not a failure, and it is said the same way
                 # an empty read is.
+                qs_stats_record("quant_space_read", "no-output")
                 return _qs_desk.describe_read({**chosen, "text": ""})
             return self._qs_refused("quant_space_read", e)
         # The id in the arguments is whatever the model typed; the entry that
@@ -2262,6 +2315,7 @@ class ToolBelt:
         # `chosen` first: `session.read` answers with `{id, name, kind, agent,
         # text, truncated}` and no folder, and reading a tile whose folder is
         # left out is how "the api one" becomes two identical-looking answers.
+        qs_stats_record("quant_space_read", "ok")
         return _qs_desk.describe_read({**chosen, **result})
 
     @tool(gates='quant_space', description="Diagnose the Quantum Space control link and say which state it is in: not running, the desk refusing on its own Control rules (its own sentence), or — when a session is named — that the session is gone. Use after any quantum_space_* call failed, and when the user asks why the assistant cannot see their desk.", aliases={'session': ('id', 'name', 'session_id')})
@@ -2285,6 +2339,7 @@ class ToolBelt:
             except _qs_desk.DeskError as e:
                 line += "\n" + self._qs_refused("quant_space_check", e,
                                                  diagnostic=True)
+        qs_stats_record("quant_space_check", "ok")
         return line
 
     @tool(description='Control niri workspaces: switch to one, move a window onto one, step one at a time, or list them.', gates='run_command', aliases={'action': ('cmd', 'command', 'op'), 'target': ('arg', 'value', 'ref')})

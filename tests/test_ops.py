@@ -342,6 +342,112 @@ class TestDeploymentReporting:
             f"covers a manifest-less install, so it must hold every module "
             f"install.sh declares")
 
+    # ---- the two watchers that were invisible in health -------------------
+
+    def test_world_watch_block_ages_and_counts_ticks(self, H, monkeypatch):
+        """The wedge detector is the AGE of the last tick: a dead or blocked
+        loop stops ticking, which silence alone can never show. Off-by-default
+        renders as never-ticked (None), not as a fake stale age."""
+        monkeypatch.setattr(H, "_WORLD_WATCH",
+                            {"last_tick_ts": 0.0, "last_tick_age_s": None,
+                             "ticks": 0, "degraded_ticks": 0,
+                             "last_degraded_ts": 0.0, "last_error": ""})
+        fresh = H._world_watch_health()
+        assert fresh["last_tick_age_s"] is None and fresh["ticks"] == 0
+        H._world_watch_record_tick(False)
+        H._world_watch_record_tick(True, "ddg timed out")
+        block = H._world_watch_health()
+        assert block["ticks"] == 2 and block["degraded_ticks"] == 1
+        assert block["last_tick_age_s"] is not None
+        assert block["last_tick_age_s"] < 5
+        assert "ddg timed out" in block["last_error"]
+
+    def test_world_tick_off_renders_never_ticked(self, H, monkeypatch):
+        """A poller that is opted out is not wedged — it is off. The tick
+        returns without recording, so health reads None, not a stale age."""
+        monkeypatch.setattr(H, "_WORLD_WATCH",
+                            {"last_tick_ts": 0.0, "last_tick_age_s": None,
+                             "ticks": 0, "degraded_ticks": 0,
+                             "last_degraded_ts": 0.0, "last_error": ""})
+        monkeypatch.setattr(H, "_setting_flag",
+                            lambda key, default, repair=False:
+                            key != "world_warnings")
+        a = H.Assistant.__new__(H.Assistant)
+        a._world_last_announce = 0.0
+        a._world_tick()
+        assert H._world_watch_health()["ticks"] == 0
+
+    def test_world_tick_degraded_records_and_still_announces(self, H,
+                                                             monkeypatch):
+        """A degraded fetch (network down) is recorded AND the urgent path
+        still works: the tracker must not change the tick's behavior."""
+        monkeypatch.setattr(H, "_WORLD_WATCH",
+                            {"last_tick_ts": 0.0, "last_tick_age_s": None,
+                             "ticks": 0, "degraded_ticks": 0,
+                             "last_degraded_ts": 0.0, "last_error": ""})
+        monkeypatch.setattr(H, "_setting_flag",
+                            lambda key, default, repair=False:
+                            key == "world_warnings")
+        monkeypatch.setattr(H, "SETTINGS",
+                            {"world_cooldown_min": 60.0})
+        monkeypatch.setattr(H, "_announce_ok", lambda last, cooldown: True)
+        monkeypatch.setattr(H, "_world_events",
+                            lambda kind, limit: ([], True))
+        a = H.Assistant.__new__(H.Assistant)
+        a._world_last_announce = 0.0
+        a._world_tick()
+        block = H._world_watch_health()
+        assert block["ticks"] == 1 and block["degraded_ticks"] == 1
+
+    def test_qs_stats_block_shape_and_reset(self, H):
+        """The desk client's block: per-tool attempts and last_state, capped
+        store, and the reload handshake clears it so a fixed desk does not
+        keep reading as broken."""
+        import core.tools as _ct
+        _ct.qs_stats_reset()
+        assert _ct.qs_stats_snapshot() == {}
+        _ct.qs_stats_record("quant_space_status", "ok")
+        _ct.qs_stats_record("quant_space_status", "ok")
+        _ct.qs_stats_record("quant_space_read", "not-granted")
+        snap = _ct.qs_stats_snapshot()
+        assert snap["quant_space_status"]["attempts"] == 2
+        assert snap["quant_space_status"]["last_state"] == "ok"
+        assert snap["quant_space_read"]["last_state"] == "not-granted"
+        # Cap: a 25th tool drops the oldest entry, never raises.
+        for i in range(_ct._QS_STATS_MAX + 2):
+            _ct.qs_stats_record(f"quant_space_x{i}", "not-running")
+        assert len(_ct.qs_stats_snapshot()) <= _ct._QS_STATS_MAX
+        _ct.qs_stats_reset()
+
+    def test_health_carries_both_new_blocks(self, H, monkeypatch):
+        """The snapshot contract: `--ptt health` carries world_watch and
+        quant_space beside the reader's block — one mirror-signal shape for
+        every watcher that is quiet when it works."""
+        a = H.Assistant.__new__(H.Assistant)
+        a._state = "idle"
+        a._handsfree = False
+        a._followup_until = 0.0
+        ln = H.ContinuousListener.__new__(H.ContinuousListener)
+        ln._running = False
+        ln._frames_seen = 0
+        ln._last_nonzero = 0.0
+        ln._capture_rate = None
+        ln._health_utt = 0
+        ln._health_opens_ok = 0
+        ln._health_opens_failed = 0
+        ln._health_open_device = ""
+        ln._health_last_open = ""
+        ln._health_failing_since = None
+        ln._health_stalled_since = None
+        ln._lock = threading.RLock()
+        a._listener = ln
+        monkeypatch.setattr(H, "ollama_available", lambda: True)
+        snap = a.mic_health()
+        assert "world_watch" in snap and "quant_space" in snap
+        assert snap["world_watch"]["last_tick_age_s"] is None or isinstance(
+            snap["world_watch"]["last_tick_age_s"], float)
+        assert "calls" in snap["quant_space"]
+
     def test_health_includes_deployment(self, H, monkeypatch):
         """`--ptt health` must answer 'is the running code the tested code?'"""
         a = H.Assistant.__new__(H.Assistant)

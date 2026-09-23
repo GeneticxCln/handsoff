@@ -4159,6 +4159,42 @@ def _severe_weather_events() -> list:
     return []
 
 
+_WORLD_WATCH_LOCK = threading.Lock()
+_WORLD_WATCH: dict = {
+    "last_tick_ts": 0.0,        # wall clock of the last tick that RAN
+    "last_tick_age_s": None,    # set on each tick; None = never ticked
+    "ticks": 0,
+    "degraded_ticks": 0,
+    "last_degraded_ts": 0.0,
+    "last_error": "",
+}
+
+
+def _world_watch_record_tick(degraded: bool, error: str = "") -> None:
+    """One world-poller tick ran; remember it for the health block."""
+    with _WORLD_WATCH_LOCK:
+        _WORLD_WATCH["last_tick_ts"] = time.time()
+        _WORLD_WATCH["last_tick_age_s"] = 0.0
+        _WORLD_WATCH["ticks"] += 1
+        if degraded:
+            _WORLD_WATCH["degraded_ticks"] += 1
+            _WORLD_WATCH["last_degraded_ts"] = time.time()
+        _WORLD_WATCH["last_error"] = str(error or "")[:120]
+
+
+def _world_watch_health() -> dict:
+    """The world-events poller for `--ptt health` — the age of the last tick
+    is the wedge detector (a dead or blocked loop stops ticking, which "quiet"
+    can never show), plus the degraded count so a wedged FETCH is visible too.
+    Shape mirrors the notification reader's block: quiet is not health."""
+    with _WORLD_WATCH_LOCK:
+        w = dict(_WORLD_WATCH)
+    w["last_tick_age_s"] = (
+        round(time.time() - w["last_tick_ts"], 1)
+        if w["last_tick_ts"] else None)
+    return w
+
+
 def _world_events(kind: str = "all", limit: int = 5) -> tuple:
     """(events, degraded): fixed-query world headlines. Shared by briefing,
     proactive warnings and the world_events tool. Never raises."""
@@ -6143,6 +6179,18 @@ class Assistant(QObject):
         }
         snap["deployment"] = _deployment_snapshot()
         snap["laya_corpus"] = _laya_corpus_counts()
+        # Two watchers whose failure modes were invisible: the world poller
+        # (its loop dying leaves the same silence as "all quiet") and the
+        # Quantum Space desk client (on-demand, so "every call fails" was
+        # only ever written to the model's reply). One block each, the same
+        # mirror-signal shape the notification reader uses.
+        snap["world_watch"] = _world_watch_health()
+        snap["quant_space"] = {
+            "enabled": _setting_flag("permissions", {}).get(
+                "quant_space", True)
+            if isinstance(SETTINGS.get("permissions"), dict) else True,
+            "calls": _core_tools.qs_stats_snapshot(),
+        }
         snap["stop_attribution"] = _stop_attribution_health()
         # Parity with doctor_json: the open-items block rides the same reader,
         # so both diagnostic surfaces agree on what the mystery list holds.
@@ -6483,7 +6531,10 @@ class Assistant(QObject):
         """Proactive severe-world-event warnings; mirrors _resource_tick.
 
         Opt-in: poll (cheap on cooldown), per-event seen-store, one global
-        cooldown, popup always + spoken unless already speaking.
+        cooldown, popup always + spoken unless already speaking. When the
+        setting is off the tick returns WITHOUT recording — a poller that is
+        opted out is not "wedged", it is off, and health must not read the
+        difference the same way.
         """
         if not _setting_flag("world_warnings", False):
             return
@@ -6494,6 +6545,7 @@ class Assistant(QObject):
         if not _announce_ok(self._world_last_announce, cooldown_s):
             return
         events, _degraded = _world_events("all", 5)
+        _world_watch_record_tick(_degraded)
         fresh = [e for e in events
                  if e.get("urgent") and not _world_seen(e.get("key", ""))]
         if not fresh:
@@ -7754,6 +7806,11 @@ class Assistant(QObject):
         refresh_perms = getattr(belt, "set_permissions", None)
         if callable(refresh_perms):
             refresh_perms(SETTINGS.get("permissions"))
+        # The quant_space call-stats store clears on the same handshake: a
+        # desk problem the user just fixed must not keep reading as current
+        # through a stale last_state — the same re-arm logic the notification
+        # reader's gave-up path uses.
+        _core_tools.qs_stats_reset()
         # Both copies go under `_model_cache_lock`, the same lock the mirror
         # uses: dropping one side while a transcribe/get_tts call is between
         # its push and its load is how a dropped model came back and stayed.
