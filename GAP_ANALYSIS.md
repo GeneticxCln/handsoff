@@ -7423,3 +7423,130 @@ PATHS, not owning tests: a write that reaches the real home through a child spaw
 with a hand-built environment is still out of reach — the same seam, stated the
 same way. And `clean-checkout` judges HEAD, so its PASS is about the commit rather
 than these uncommitted bytes.
+
+## The run_command boundary stops failing open on unresolvable paths and
+## refusing data arguments, and the shipped set is guarded (2026-09-24)
+
+asked: close the two findings the full-project audit left standing in the
+`run_command` boundary — the fail-open in `denied_secret_path` and the
+BLOCKED-word over-refusal of whitelisted verbs — with tests that bite, plus
+a guard for the drift class that let a deleted `handsoff-restart` sit in the
+working tree for days.
+
+**The fail-open: a path the kernel cannot resolve used to read as "no
+objection".** `denied_secret_path` resolved FIRST and mapped every resolution
+error to None, so an embedded NUL byte (`ValueError`, "embedded null character
+in path") or an unknown `~user` (`RuntimeError`, "Could not determine home
+directory.") made the GUARD the reason a credential store was read: the caller
+went on to attempt it, and the guard had pre-cleared the name. The fix judges
+the requested name FIRST, before any syscall — `_secret_reason` is purely
+lexical (name, parent directories, home prefix), so it can refuse
+`/tmp/\x00bad.pem` ("matches the credential pattern '*.pem'") and
+`~nosuchuser98765/.ssh/id_rsa` (".ssh/ holds credentials") without resolving
+anything. What survives with no name objection still passes, and the caller's
+own `open()` reports the unresolvable path loudly — the loud end for a path
+that can never name a secret. Measured while fixing: a symlink LOOP resolves
+fine on Linux and dies at `open()` with ELOOP, so it never was a fail-open
+vector and needs no guard of its own.
+
+**The over-refusal, and the bypass the first fix bred.** The BLOCKED-word scan
+ran over the whole command line, refusing DATA the whitelisted verb only
+prints — `echo "run pacman -Syu tomorrow"`, `notify-send "remember: no
+sudo"` — and the first narrowing ("forgive tokens that are not the exe")
+created its own bypass: a separated flag value is just another argument to a
+scan that does not know positions, so `nvidia-smi -x sudo` was forgiven. The
+scan now judges EXECUTION positions — the exe, the exe-adjacent program slot
+of the only whitelisted shapes whose argv[1] executes (git/cargo, behind their
+verb gate; the `spawn` launch shape), and `=`-attached flag values
+(`nvidia-smi --foo=sudo`). The measurement that reshaped it: with shlex, a
+quoted data argument IS argv[1] of a two-token command, so the first
+implementation still refused `echo "run pacman -Syu tomorrow"` — argv[1]
+cannot be scanned blindly. For every other whitelisted exe NO argument
+position executes (the operator refusal already rejected $()/backticks/; | &
+< >, niri spawn re-checks every argument, and the secret-path predicate still
+judges every argument including flag values). An exe the USER added to
+`extra_allowed_commands` keeps the whole-line scan — its argument semantics
+are unknown (`env rm x` must not pass), and the cost is only an occasional
+over-refusal of the user's own entry.
+
+**The shipped set is guarded, because rehearsals cannot see half of it.**
+`install.sh` stages top-level `*.py` and `core/*.py` by GLOB and enumerates by
+name only what it must; the motivating incident — a lost `handsoff-restart`
+sat in this working tree breaking TWELVE unrelated-looking tests (seven in
+`TestStagedRelease`, five in the ops installer/smoke classes) while every
+round that hit them assumed the failures were its own doing — fails a real
+install loudly, but a missing `handsoff-settings.py` or `settings_schema.py`
+is silently glob-skipped and deploys a half-app. `TestShippedSetExistsInCheckout`
+is the static half: it parses every by-name set from its source of truth
+(TOP_REQUIRED, TOP_EXECUTABLE, the switch pairs, CORE_REQUIRED mapped to
+`core/<module>.py`) plus handsoff.py's `_DEPLOY_FILES` floor via
+`ast.literal_eval` of the actual literal, and asserts each named file exists.
+The suite's own checkout-write guard refused the first version of the mutation
+test for deleting a tracked file IN a test — the correct outcome — so the
+guard's failure is exercised on a synthetic checkout (a tmp copy of the two
+SOURCES with ROOT repointed); the real-checkout mutation was then run by hand:
+`rm handsoff-restart` → the guard names exactly that file with the `git
+restore` advice → restored sha256-identical at 0755 → green again.
+
+**The full suite caught a bug of this round's own making, which is the point
+of running it.** The README census guard's `_collected_test_count` built
+`[sys.executable, "-m", "pytest", …]` by hand and ran it on the developer's
+real HOME — `TestChildProcessDriversUseTheSameSandbox` flagged it the first
+time anything ran `test_sandbox.py`. The naive fix collided with the suite's
+own architecture (a nested pytest imports conftest, which arms the guard
+itself, so a shim-armed guard AND conftest's install is two protections over
+different dir sets in one process — "one process, one set of user dirs"); the
+final form is `sandbox_env()` with the two guard-travel variables popped,
+following the precedent already in test_sandbox for special children. Lesson
+recorded without flinching: every targeted run that week was of the files
+touched — `test_sandbox` never ran until the whole suite did.
+
+measured: the full suite **2 162 passed** (5:35) on the final bytes — and the
+same count again from the pre-commit hook, which runs the staged tree itself.
+The two fixes are DEPLOYED: `HANDSOFF_SKIP_SYSTEM_PKGS=1 ./install.sh` (the
+installer's own non-interactive-redeploy path; the pacman transaction it skips
+was already satisfied) staged, switched and restarted the bubble, and
+`--ptt doctor` reads `deployment: in-sync` with the deployed `core/tools.py`
+sha256-identical to HEAD. Freshness guards 20/20 after the spec tables were
+regenerated for `core/tools.py` 3 922 → 3 970; `ci/compile_all.py` clean
+(63 files); README's census moved to the collected count. The synthetic
+cap-refusals backlog (136 pre-DI-pin test entries, recorded here 2026-09-12 as
+a cleanup left open) is removed, so the doctor line reads truthfully.
+
+tests: **8 more** — 2 in `TestSecretPathGuard` (the fail-open set: NUL `.pem`
+refused by name, `~baduser` `.ssh` refused, an ordinary spelling under an
+unknown user still a name-level pass, and the NUL byte refused through
+`run_command` itself; both fail on the resolve-first shape) and 4 in the new
+`TestBlockedWordScan` (data arguments pass — quoted, bare, and as a separated
+flag value; execution positions refused — head of line, interpreter, sudo,
+xargs, `=`-flag value, `spawn curl`, operator; git/cargo verb gate intact;
+an extra-allowed exe keeps the whole-line scan), plus 2 in
+`TestShippedSetExistsInCheckout`. The forgiving and refusing rules are pinned
+on the SAME tokens so neither can regress without the other failing.
+**3/3 scan mutations caught** (whole-line scan back → the data-argument test
+fails; exe-only scan → the execution-positions test fails; resolve-first →
+both fail-open tests fail), every restore verified.
+
+gates: `tests` PASS (**2 162 passed**, twice — once by hand on the working
+tree, once by the hook on the staged tree), `compile` PASS (63 files),
+freshness PASS; deployment `in-sync` (21/21 manifest rows byte-identical,
+running == checkout == installed). `coverage`/`order`/`clean-checkout`/
+`two-writer` not re-run this round; the last full gate run on this shape of
+tree was the previous ledger row's.
+
+**Limits, stated.** The fail-open set collapses only to names `_secret_reason`
+knows: an unresolvable path spelled innocuously still reaches the caller's
+`open()`, by design — the guard refuses what it can NAME and never pretends to
+resolve what it cannot. The scan forgives data by POSITION, so the rule is
+only as true as "no whitelisted exe executes its arguments": a future
+whitelisted verb that runs its argv reopens the class, and the guard list in
+the scan must grow with the whitelist — the docstring says so where the
+whitelist is. The extra-allowed whole-line scan keeps an over-refusal cost the
+user pays on their own entries; that is the honest trade for unknown
+semantics. The shipped-set guard checks EXISTENCE, not content or mode — what
+a staged file contains is the stage's own compile gate, and modes are the
+switch's. And the stop-attribution probe's `shutdown` flag has a race (the
+21:39:26 poweroff ghost read as the invisible-killer shape until the system
+journal said "poweroff requested"): the chosen fix point is the ledger
+CONSUMER exempting `callers:[]` rows that sit on a poweroff, not the shipped
+probe, and that consumer fix is still open.
