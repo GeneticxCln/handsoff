@@ -1072,10 +1072,60 @@ if [ "$REHEARSAL" != "1" ] && ! ollama list 2>/dev/null | awk '{print $1}' | gre
     echo "    pulling $OLLAMA_MODEL (a few GB, one time) ..."
     ollama pull "$OLLAMA_MODEL" || echo "    WARN: pull failed — run 'ollama pull $OLLAMA_MODEL' later"
 fi
-if [ "$REHEARSAL" != "1" ] && ! ollama show "$OLLAMA_MODEL" 2>/dev/null | grep -qi 'tools'; then
-    echo "    WARN: $OLLAMA_MODEL may not support tool calling — desktop control and"
-    echo "    self-modification need a tools-capable model (e.g. qwen3:8b, llama3.1:8b)."
-    echo "    handsoff will still chat, but set HANDSOFF_MODEL to enable tools."
+# `ollama show` is a probe, not an oracle: a transient CLI/server failure
+# produces no stdout, and the old `show | grep tools` pipeline could not tell
+# that apart from a successful model report whose capabilities omit `tools`.
+# Read only the Capabilities section (so a model description containing the word
+# cannot manufacture support), and return three states: 0 supported, 1
+# successfully inspected but unsupported, 2 output unavailable/unknown.
+_ollama_model_tools() {  # $1 = stdout from `ollama show MODEL`
+    awk '
+        /^[[:space:]]*Capabilities[[:space:]]*$/ {
+            in_caps = 1
+            saw_caps = 1
+            next
+        }
+        in_caps && /^[^[:space:]]/ { in_caps = 0 }
+        in_caps {
+            capability = $0
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", capability)
+            if (capability == "tools") found = 1
+        }
+        END {
+            if (!saw_caps) exit 2
+            exit(found ? 0 : 1)
+        }
+    ' <<<"$1"
+}
+
+_check_ollama_tools() {  # $1 = model tag
+    local details
+    if ! details="$(ollama show "$1" 2>/dev/null)"; then
+        echo "    note: could not inspect $1 tool capability (ollama show failed);"
+        echo "          skipping the warning — verify with: ollama show $1"
+        return 0
+    fi
+    if _ollama_model_tools "$details"; then
+        echo "    $1 supports tool calling"
+        return 0
+    else
+        case "$?" in
+            1)
+                echo "    WARN: $1 may not support tool calling — desktop control and"
+                echo "    self-modification need a tools-capable model (e.g. qwen3:8b, llama3.1:8b)."
+                echo "    handsoff will still chat, but set HANDSOFF_MODEL to enable tools."
+                ;;
+            *)
+                echo "    note: could not determine whether $1 supports tool calling"
+                echo "          (unrecognized ollama show output); verify with: ollama show $1"
+                ;;
+        esac
+    fi
+    return 0
+}
+
+if [ "$REHEARSAL" != "1" ]; then
+    _check_ollama_tools "$OLLAMA_MODEL"
 fi
 
 # The app-id is SUBSTITUTED rather than interpolated in the heredoc: the rule

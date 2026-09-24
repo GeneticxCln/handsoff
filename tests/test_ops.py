@@ -2259,6 +2259,34 @@ def _run_resolvers(body: str, home, settings=None, env=None, here=None) -> str:
     return out.stdout
 
 
+def _run_ollama_tool_check(tmp_path, output: str, returncode: int = 0) -> str:
+    """Run the shipped capability tri-state against a fake `ollama show`."""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir(exist_ok=True)
+    ollama = fake_bin / "ollama"
+    ollama.write_text(
+        '#!/bin/sh\nprintf \'%s\' "$FAKE_OLLAMA_SHOW"\n'
+        'exit "$FAKE_OLLAMA_SHOW_RC"\n',
+        encoding="utf-8")
+    ollama.chmod(0o755)
+    body = "\n".join([
+        "set -eu",
+        _installer_function("_ollama_model_tools"),
+        _installer_function("_check_ollama_tools"),
+        '_check_ollama_tools "gemma4:12b"',
+    ])
+    env = dict(os.environ)
+    env.update({
+        "PATH": str(fake_bin) + os.pathsep + env["PATH"],
+        "FAKE_OLLAMA_SHOW": output,
+        "FAKE_OLLAMA_SHOW_RC": str(returncode),
+    })
+    result = subprocess.run(["bash", "-c", body], capture_output=True,
+                            text=True, env=env)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
 class TestInstallerRehearsal:
     """The installer can exercise deployment without touching the host."""
 
@@ -2331,6 +2359,40 @@ class TestInstallerRehearsal:
         assert "${HANDSOFF_MODEL:-$(_read_setting model)}" in source, (
             "the configured model must be the primary source and the named "
             "default only the fallback")
+
+    def test_an_unanswerable_tool_probe_never_becomes_a_false_warning(
+            self, tmp_path):
+        """A failed or unfamiliar `ollama show` is unknown, not unsupported.
+
+        The measured gemma4:12b install emitted this warning after a transient
+        `ollama show` failure even though a live API turn produced a tool call.
+        Empty stdout and a future output format must therefore stay neutral;
+        only a successfully parsed capabilities section can accuse the model.
+        """
+        for output, rc in (("", 1), ("Model\n  architecture gemma\n", 0)):
+            text = _run_ollama_tool_check(tmp_path, output, rc)
+            assert "may not support tool calling" not in text, text
+            assert "skipping the warning" in text \
+                or "unrecognized ollama show output" in text, text
+
+    def test_tool_word_elsewhere_does_not_manufacture_capability(
+            self, tmp_path):
+        text = _run_ollama_tool_check(
+            tmp_path,
+            "Model\n  tools in the model description\n\n"
+            "Capabilities\n    completion\n    tools\n\n"
+            "Projector\n    embedding length 3848\n")
+        assert "gemma4:12b supports tool calling" in text
+        assert "may not support" not in text
+
+    def test_a_parsed_model_without_tools_still_gets_the_warning(
+            self, tmp_path):
+        text = _run_ollama_tool_check(
+            tmp_path,
+            "Model\n  architecture gemma\n\n"
+            "Capabilities\n    completion\n\nProjector\n")
+        assert "gemma4:12b may not support tool calling" in text
+        assert "set HANDSOFF_MODEL to enable tools" in text
 
     def test_rehearsal_downloads_the_size_the_app_loads_and_records_it(
             self, tmp_path):

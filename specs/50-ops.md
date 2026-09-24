@@ -56,6 +56,12 @@ have `tiny` downloaded and recorded in the manifest; a hardcoded loopback was
 probed, started and filled while the bubble talked to another server; and the
 speech repo name was a second copy of the one the app reads.
 
+Step 8's tool-capability check is tri-state. It reads only the `Capabilities`
+section printed by `ollama show`: an exact `tools` entry confirms support, a
+successful parse without it warns, and a failed command or unrecognized output
+is explicitly unanswerable and skips the warning. A transient `ollama show`
+failure must never be presented as evidence that a model lacks tools.
+
 ## 2. Deployment truth
 
 `_deployment_snapshot()` (`handsoff.py:758`) hashes running vs repo vs
