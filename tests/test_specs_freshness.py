@@ -33,7 +33,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from conftest import _load as _load_module, sandbox_env
+from conftest import (_load as _load_module, sandbox_env, _GUARD_ENV,
+                      _PROTECTED_ENV)
 
 HERE = Path(__file__).resolve().parent.parent
 SPECS = HERE / "specs"
@@ -373,6 +374,59 @@ def _counts() -> dict:
 LIVE = _counts()
 
 
+# ---------------------------------------------------------------- test census
+# README is not a spec, but it makes the same kind of claim: "N tests pin
+# the behavior". The number is not in CLAIMS because its source of truth is not
+# a count this process can read off the tree — it is what pytest COLLECTS, a
+# number a rewrite of the suite moves every few days. Collecting is cheap
+# (~2 s: import-time work only, no test bodies run), so the census is taken by
+# a subprocess at guard time rather than by trusting a second hand-written
+# number. The subprocess also inherits this run's environment, so a marker or
+# plugin that filters collection for the guard filters it for the reader too —
+# the same run answers both questions.
+
+
+def _collected_test_count() -> int:
+    """What `pytest --collect-only` says today, read out of its own summary.
+
+    The count is parsed from the standard summary line ("N tests collected in
+    ...") rather than by importing the suite here: a second import of the
+    monolith in-process is exactly the double-load the module docstring in
+    conftest.py warns about, and the collection cache is off so a stale
+    .pytest_cache cannot make the guard agree with a tree that has moved.
+    The child is SANDBOXED (`env=sandbox_env()`): it is an interpreter child
+    built by hand, so it must not inherit the developer's HOME — the same
+    rule `TestChildProcessDriversUseTheSameSandbox` enforces on every other
+    constructor in the suite. The guard's two travel variables are popped:
+    this child imports conftest, which arms the guard ITSELF against its own
+    sandbox HOME — a shim-armed guard AND conftest's install is two
+    protections over different dir sets in one process, and the second
+    refuses ("one process, one set of user dirs"). Collection imports only,
+    so the redirected HOME changes nothing it counts (user site-packages
+    stay importable — sandbox_env keeps them on PYTHONPATH).
+    """
+    env = sandbox_env()
+    env.pop(_GUARD_ENV, None)
+    env.pop(_PROTECTED_ENV, None)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/", "--collect-only", "-q",
+         "-p", "no:cacheprovider"],
+        capture_output=True, text=True, cwd=str(HERE), timeout=300,
+        env=env)
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"pytest --collect-only exited {proc.returncode} while taking the "
+            f"test census — the suite itself is uncollectable, which is the "
+            f"first thing to fix, not the README:\n{proc.stderr[-2000:]}")
+    matches = re.findall(r"^(\d+) tests? collected in", proc.stdout, re.M)
+    if not matches:
+        raise AssertionError(
+            "pytest's collection summary no longer says 'N tests collected in' "
+            "— pytest's output format changed, so this guard is reading nothing. "
+            "Update the parser TOGETHER with whatever changed")
+    return int(matches[-1])
+
+
 def _assert_every_statement_matches(quantity: str) -> None:
     live = LIVE[quantity]
     for spec, pattern in CLAIMS[quantity]:
@@ -404,6 +458,33 @@ class TestSpecFreshness:
 
     def test_the_core_module_census_matches_every_place_a_spec_states_it(self):
         _assert_every_statement_matches("core_modules")
+
+    def test_the_readme_test_census_matches_what_pytest_collects(self):
+        """README's "N tests" is what pytest really collects — by asking pytest.
+
+        The number has already rotted once: it said 1317 when the suite had
+        2153. A doc is not a spec, but this claim misleads the same way — the
+        README is what a new reader runs first, and a count from months ago
+        makes the present suite look like it lost tests. The census is taken
+        from collection (the same command the README tells the reader to run),
+        so every place a README sentence states it is compared against the
+        number pytest itself answers. A reworded README is a FAILURE, not a
+        skip, by the same rule the specs obey above.
+        """
+        live = _collected_test_count()
+        readme = (HERE / "README.md").read_text(encoding="utf-8")
+        found = re.findall(r"(\d[\d,]*) tests", readme)
+        assert found, (
+            "README no longer states a test count in the form 'N tests' — "
+            "either the sentence moved or it was reworded. Update README.md "
+            "and this guard TOGETHER, so the claim stays checked instead of "
+            "going quietly unchecked")
+        wrong = [(stated, live) for stated in found if int(stated.replace(",", "")) != live]
+        assert not wrong, (
+            f"README says {[w[0] for w in wrong]} tests — pytest collects {live}. "
+            f"Update the three README places (the intro, the Development gate "
+            f"list, the coverage command) in the same change"
+        )
 
     def test_the_architecture_map_lists_exactly_the_core_package(self):
         """Both directions: a new module must appear, a deleted one must go.

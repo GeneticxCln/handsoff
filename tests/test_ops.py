@@ -3,6 +3,7 @@ installed-copy smoke test (the bubble must work from ~/.local/bin, not only
 from the checkout)."""
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -2651,3 +2652,84 @@ class TestInstallerProvisionsWhatTheAppDecided:
         assert _installer_assignment("DEFAULT_TTS_REPO") \
             == core_module("audio").TTS_REPO_ID
         assert _installer_assignment("DEFAULT_APP_ID") == H.APP_NAME
+
+
+class TestShippedSetExistsInCheckout:
+    """Every file the installer stages BY NAME must exist in the checkout.
+
+    install.sh stages top-level *.py and core/*.py by GLOB and enumerates by
+    name only what it must: TOP_REQUIRED, CORE_REQUIRED, TOP_EXECUTABLE, the
+    switch pairs — plus handsoff.py's _DEPLOY_FILES floor for a manifest-less
+    install. A name missing from the checkout fails a REAL install loudly,
+    but a rehearsal fails only for the names the stage itself validates
+    (TOP_REQUIRED, CORE_REQUIRED, handsoff-restart, handsoff-stop-probe): a
+    missing handsoff-settings.py or settings_schema.py is silently skipped
+    by the glob, deploys a half-app, and nothing turns red until someone
+    runs the real thing. This guard is the static half — the checkout must
+    be able to stage its own declared set, without running the installer.
+    (The deletion that motivated it: a lost handsoff-restart sat in the
+    working tree for days, because every rehearsal test it broke looked
+    unrelated to whoever had deleted it.)
+    """
+
+    def _required_names(self) -> set[str]:
+        """The union of every by-name shipped set, parsed from their sources.
+
+        SWITCH_FILES_644 may legitimately be empty (the switch fills it from
+        the staged set at run time); TOP_REQUIRED and TOP_EXECUTABLE may not.
+        """
+        names: set[str] = set()
+        for var in ("TOP_REQUIRED", "TOP_EXECUTABLE", "SWITCH_FILES_755",
+                    "SWITCH_FILES_644"):
+            values = _installer_assignment(var)
+            if var in ("TOP_REQUIRED", "TOP_EXECUTABLE"):
+                assert values, f"install.sh declares {var} as an empty list"
+            names.update(values.split())
+        core = _installer_assignment("CORE_REQUIRED")
+        assert core, "install.sh declares CORE_REQUIRED as an empty list"
+        names.update(f"core/{module}.py" for module in core.split())
+        # handsoff.py's own floor for a manifest-less install, read from the
+        # AST so the literal and this guard cannot drift apart either.
+        tree = ast.parse((ROOT / "handsoff.py").read_text(encoding="utf-8"))
+        (floor,) = [n for n in tree.body if isinstance(n, ast.Assign)
+                    and any(getattr(t, "id", None) == "_DEPLOY_FILES"
+                            for t in n.targets)]
+        names.update(ast.literal_eval(floor.value))
+        return names
+
+    def test_every_staged_by_name_file_exists_in_the_checkout(self):
+        missing = sorted(name for name in self._required_names()
+                         if not (ROOT / name).is_file())
+        assert not missing, (
+            "files the installer stages by name are missing from the checkout: "
+            + ", ".join(missing)
+            + " — the glob stages only what exists, so a rehearsal would ship a"
+            " half-app (or fail, for the names the stage validates). Restore"
+            " them (git restore <name>) or drop the stale name from the list.")
+
+    def test_the_guard_names_a_missing_file(self, tmp_path, monkeypatch):
+        """The mutation that proves the guard bites — against a SYNTHETIC
+
+        checkout, not this one. Deleting a tracked checkout file is exactly
+        what the suite's checkout-write guard forbids (rightly: this class
+        exists because a real deletion hid in the tree), so the failure is
+        exercised on a copy of the two SOURCES with ROOT pointed at it: the
+        guard must name what is missing, not merely count it. The real
+        checkout's true-negative is the test above; `git restore
+        handsoff-restart` remains how a real deletion is undone.
+        """
+        fake = tmp_path
+        (fake / "core").mkdir()
+        (fake / "install.sh").write_text(_installer_source(), encoding="utf-8")
+        (fake / "handsoff.py").write_text(
+            (ROOT / "handsoff.py").read_text(encoding="utf-8"), encoding="utf-8")
+        monkeypatch.setattr(sys.modules[__name__], "ROOT", fake)
+        with pytest.raises(AssertionError) as reason:
+            TestShippedSetExistsInCheckout(
+            ).test_every_staged_by_name_file_exists_in_the_checkout()
+        for named in ("handsoff-restart", "handsoff-settings.py",
+                      "core/tools.py"):
+            assert named in str(reason.value), (named, reason.value)
+        # ...and handsoff-restart specifically IS a floor the stage validates,
+        # so the installer's own loud path exists for it too:
+        assert "could not stage handsoff-restart" in _installer_source()

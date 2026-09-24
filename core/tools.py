@@ -625,12 +625,30 @@ def denied_secret_path(path) -> str | None:
     defeats: `~/.ssh/id_rsa` pointing at `/tmp/key` resolved to a name the
     rules do not know, so READING it was allowed (verified 2026-09-20). The
     name the user asked for is judged, whichever file it turns out to be.
+
+    A path the KERNEL cannot resolve at all (an embedded NUL, an unknown
+    `~user`, a name too long for the filesystem) used to fail OPEN — the
+    resolution error mapped to "no objection" and the caller attempted the
+    read. `_secret_reason` is purely lexical (name, parent directories, home
+    prefix), so the requested name is now judged FIRST, before any syscall:
+    the fail-open set collapses to a path whose spelling carries no secret —
+    and a check that cannot run must not be the reason a credential store
+    is read. A remaining error AFTER the name passes is still "no objection
+    from the NAME check": the caller's own open() reports the unresolvable
+    path as its ordinary error, which is the loud end for a path that can
+    never name a secret.
     """
     try:
         expanded = Path(path).expanduser()
+    except (OSError, RuntimeError, ValueError):
+        expanded = Path(str(path))           # un-expandable: judge the spelling
+    name_refusal = _secret_reason(expanded)
+    if name_refusal:
+        return name_refusal
+    try:
         p = expanded.resolve()
     except (OSError, RuntimeError, ValueError):
-        return None                       # unreadable path: the caller reports it
+        return None                       # unresolvable: the caller's open() reports it
     for candidate in (p, expanded):
         reason = _secret_reason(candidate)
         if reason:
@@ -1366,7 +1384,6 @@ class ToolBelt:
                 if denied:
                     return (None, '', f"REFUSED: '{part}' — {denied}. run_command "
                             f"cannot read credential stores into the conversation", False)
-        low = cmd.lower()
         exe_base = Path(argv[0]).name
         _unblocked = ''
         if exe_base in ('git', 'cargo'):
@@ -1390,10 +1407,41 @@ class ToolBelt:
                     for name in _flag_names(a)):
                 return (None, '', 'REFUSED: git is read-only here, and --output '
                         'writes a file wherever it is pointed', False)
+        # The blocked-word scan runs over EXECUTION positions only — the exe,
+        # a launcher's program slot (`spawn curl`), and `=`-attached flag
+        # values (`nvidia-smi --foo=sudo`) — never over the whole line.
+        # Scanning the whole line refused `echo "run pacman -Syu tomorrow"` and
+        # `notify-send "remember: no sudo"` — DATA the whitelisted verb prints,
+        # not a program it runs — and the first narrowing ("forgive tokens that
+        # are not the exe") made it worse in the other direction: a separated
+        # flag value looks exactly like a quoted string to a scan that does not
+        # know positions, so `nvidia-smi -x sudo` was forgiven. Judging
+        # POSITIONS instead of word lists puts the refusing rule and the
+        # forgiving rule on the same tokens, so the bypass and the over-refusal
+        # cannot come back apart. A quoted data argument IS argv[1] of a
+        # two-token command (`echo "run pacman"`), so argv[1] is scanned only
+        # for the exes whose argv[1] really is a program — git/cargo (their own
+        # verb gate above has already passed it) and the `spawn` launch shape.
+        # For every other whitelisted exe NO argument position executes: the
+        # shell-operator refusal above already rejected $()/backticks/;|&<>,
+        # niri spawn re-checks every argument in _validate_niri_spawn, and the
+        # secret-path predicate above still judges every argument including
+        # flag values. An exe the USER added to extra_allowed_commands keeps
+        # the whole-line scan — its argument semantics are unknown (`env rm x`
+        # must not pass), and the cost is only an occasional over-refusal of
+        # the user's own entry.
+        if _unblocked or exe_base.lower() in {c.lower() for c in self.ALLOWED}:
+            exec_words = [argv[0]]
+            if len(argv) > 1 and exe_base in ('git', 'cargo', 'spawn'):
+                exec_words.append(argv[1])       # the sub-command / program slot
+            exec_words.extend(v for tok in argv[1:] for v in _flag_values(tok))
+            scan_text = ' '.join(w.lower() for w in exec_words)
+        else:
+            scan_text = cmd.lower()              # unknown exe: scan everything
         for bad in self.BLOCKED:
             if bad == _unblocked:
                 continue
-            if re.search(f'(^|\\W){re.escape(bad)}(\\W|$)', low):
+            if re.search(f'(^|\\W){re.escape(bad)}(\\W|$)', scan_text):
                 return (None, '', f"REFUSED: '{bad}' is not on the safe whitelist (destructive commands are forbidden)", False)
         exe = argv[0]
         is_restart = exe == str(_dep().RESTART_SCRIPT) or Path(exe).name == _dep().RESTART_SCRIPT.name

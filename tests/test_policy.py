@@ -682,6 +682,72 @@ class TestWhitelistWidening:
             assert out.startswith("REFUSED") and "verb" in out, (target, out)
 
 
+class TestBlockedWordScan:
+    """The BLOCKED-word scan judges execution positions, not the whole line.
+
+    Two bugs lived in this scan at once. Scanning the whole command line
+    refused DATA the whitelisted verb only prints — `echo "run pacman -Syu
+    tomorrow"`, `notify-send "remember: no sudo"` — and the first narrowing
+    ("forgive tokens that are not the exe") created its own bypass: a
+    separated flag value is just another argument to a scan that does not
+    know positions, so `nvidia-smi -x sudo` was forgiven. These tests pin
+    BOTH directions: the forgiving rule and the refusing rule must hold on
+    the same tokens, so neither can regress without the other noticing.
+    """
+
+    def _tb(self, H, monkeypatch):
+        monkeypatch.setattr(H, "SETTINGS", {**H.DEFAULT_SETTINGS})
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {"run_command": True, "self_restart": True}
+        return tb
+
+    def test_data_arguments_are_not_refused_as_programs(self, H, monkeypatch):
+        """A blocked word inside what the verb PRINTS is data, not a program."""
+        tb = self._tb(H, monkeypatch)
+        for cmd in ('echo "run pacman -Syu tomorrow"',
+                    "echo curl is down",
+                    'notify-send "remember: no sudo"',
+                    "echo sudo",            # bare blocked word as a data arg
+                    "nvidia-smi -x sudo"):  # separated flag value = data
+            argv, _, err, _ = tb._validate_command(cmd)
+            assert argv is not None and err is None, (cmd, err)
+
+    def test_execution_positions_still_refused(self, H, monkeypatch):
+        """The head of the line, a launcher's program slot, and '='-attached
+        flag values still name programs and are still refused."""
+        tb = self._tb(H, monkeypatch)
+        for cmd in ("rm -rf /tmp/x",
+                    "bash -c 'echo hi'",
+                    "sudo echo hi",
+                    "xargs echo rm",
+                    "nvidia-smi --foo=sudo",   # '='-attached: can name a program
+                    "spawn curl",              # the exe-adjacent program slot
+                    "echo world; bash"):       # operator refusal, unchanged
+            argv, _, err, _ = tb._validate_command(cmd)
+            assert argv is None and err and "REFUSED" in err, (cmd, err)
+
+    def test_git_and_cargo_keep_their_verb_gate(self, H, monkeypatch):
+        """git/cargo argv[1] is a real sub-command slot; the verb gate above
+        the scan refuses every non-read verb regardless of the scan."""
+        tb = self._tb(H, monkeypatch)
+        for cmd in ("git rm x",
+                    'git commit -m "run pacman"',
+                    "git rm -rf /tmp/x",
+                    "cargo install x"):
+            argv, _, err, _ = tb._validate_command(cmd)
+            assert argv is None and err and "REFUSED" in err, (cmd, err)
+
+    def test_an_extra_allowed_exe_keeps_the_whole_line_scan(self, H, monkeypatch):
+        """An exe the USER added has unknown argument semantics (`env rm x`
+        must not pass), so its whole line stays scanned."""
+        monkeypatch.setattr(H, "SETTINGS",
+                            {**H.DEFAULT_SETTINGS,
+                             "extra_allowed_commands": ["env"]})
+        tb = self._tb(H, monkeypatch)
+        argv, _, err, _ = tb._validate_command("env rm x")
+        assert argv is None and err and "REFUSED" in err, err
+
+
 class TestPermissionCoverage:
     """Every tool gate must have a permissions key (default-allow) so the
     Settings UI can control it — no invisible gates like the pre-existing
@@ -1559,6 +1625,36 @@ class TestSecretPathGuard:
         through.symlink_to(store / "config")
         assert denied_secret_path(through), \
             "a plain name resolving INTO .ssh must still be refused"
+
+    def test_an_unresolvable_path_is_judged_by_its_name(self):
+        """A path the KERNEL cannot resolve used to fail OPEN.
+
+        The old code resolved first and mapped every resolution error to
+        "no objection", so the caller went on to read: a NUL byte
+        (ValueError, "embedded null character in path") or an unknown
+        `~user` (RuntimeError, "Could not determine home directory.") made
+        the guard the reason a credential store was read. The requested NAME
+        is judged first, before any syscall — _secret_reason is purely
+        lexical — and what survives with no name objection is left to the
+        caller's own open(), which reports an unresolvable path loudly
+        instead of silently.
+        """
+        from core.tools import denied_secret_path
+        nul = denied_secret_path("/tmp/\x00bad.pem")
+        assert nul and "pem" in nul, "a NUL byte must not erase the *.pem refusal"
+        bad_user = denied_secret_path("~nosuchuser98765/.ssh/id_rsa")
+        assert bad_user and ".ssh" in bad_user, \
+            "an unknown ~user must not erase the .ssh refusal"
+        # The name check does not grow teeth it never had: an ordinary
+        # spelling under an unknown user stays a name-level pass.
+        assert denied_secret_path("~nosuchuser98765/notes.txt") is None
+
+    def test_a_null_byte_cannot_carry_a_secret_read_through_run_command(self, tb):
+        """The name verdict survives the command path: `cat` of a NUL-carrying
+        .pem is refused for the NAME, not left to fail opaquely inside open()."""
+        belt, _ = tb
+        argv, _, err, _ = belt._validate_command("cat /tmp/\x00bad.pem")
+        assert argv is None and err and "REFUSED" in err and "pem" in err, err
 
     def test_read_file_refuses_and_never_returns_the_body(self, tb, tmp_path):
         belt, _ = tb
