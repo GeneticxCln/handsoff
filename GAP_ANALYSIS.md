@@ -7550,3 +7550,92 @@ switch's. And the stop-attribution probe's `shutdown` flag has a race (the
 journal said "poweroff requested"): the chosen fix point is the ledger
 CONSUMER exempting `callers:[]` rows that sit on a poweroff, not the shipped
 probe, and that consumer fix is still open.
+
+## The ledger consumer asks the journal before an invisible stop accuses anyone (2026-09-24)
+
+asked: close the stop-probe follow-up that row recorded as open — the
+`shutdown` flag's race, in which a night poweroff reaches the ledger as
+`shutdown:0` with `callers:[]` and is read by every consumer as the
+invisible-killer shape.
+
+**The gap was measured before it was designed around.** Both ghosts on this
+desk (2026-09-22 21:34:06 and 2026-09-23 21:39:26) sat within one second of
+the system journal's "poweroff requested … System is powering down", and the
+event each followed was a deploy restart 60–75 minutes earlier — the pair the
+reader flagged was benign both times. The probe's own `exit.target` check is
+the right IDEA on the wrong witness: mid-sweep, the user manager may not have
+the target observable yet, so the flag misses exactly the rows that need it.
+The probe stays untouched; the CONSUMER now arbitrates. `_stop_was_poweroff`
+asks the system journal whether a poweroff was requested within ±2 s of the
+caller-less stop's timestamp, and every consumer exempts a row it excuses:
+the ghost-pattern reader, the boot audit's independent oracle and its
+unattributed finding, and supersession (an excused ghost does not arm the
+"the killer returned" window). Probe-annotated sweeps skip the journal — the
+flag is the fast path, the journal only arbitrating the rows the race
+mislabeled. The ±2 s window is data, not a feeling: the stop lands seconds
+into the sweep and journal skew is bounded, while a wider window would start
+eating REAL ghosts.
+
+**One fetch per sweep, one judgment shared where parity demands it.** The
+audit reads up to 50 rows, so `_poweroff_journal_text` fetches the journal
+once over the rows' span and each row's window is answered from that text —
+per-row subprocesses would slow the boot check for no extra truth. The oracle
+deliberately SHARES the classification with the reader while remaining a
+separate pairing implementation: the classification is evidence from outside
+the ledger, and duplicating the journal call would duplicate its races —
+reader-vs-oracle parity must not fail because the clock moved between two
+fetches. Robustness the failures dictated rather than the spec: journalctl's
+output is parsed with a regex and a month MAP, never `strptime` (`%b` is
+locale-dependent and space-padded days only parse with a warning), stamps
+are compared on the stop's LOCAL wall clock (a UTC conversion misses the
+window by the machine's offset — journalctl reads naive `--since/--until` as
+local), an unparseable timestamp stays an accusation candidate (only a DATED
+match may excuse), an impossible date is skipped, and the journal runner
+treats a missing binary, a non-systemd box, a nonzero exit and a wedged
+journal alike as "unanswerable" — every classification then answers NO, the
+pre-fix behavior.
+
+**The guard class failed before it passed, which is what makes it a guard.**
+Its first run caught three bugs in the fresh code: the classification really
+raised through a doctor render when the runner stub was bypassed (the contract
+now has its own test against the real runner), and two test-data errors that
+proved the tests were computing rather than reciting — the real 20:27 → 21:39
+gap is 71 minutes, OUTSIDE the 60-minute window, so the anchor the fixture
+needed (and the pair the real doctor line had flagged) was the 20:39:26
+restart. Live A/B on this desk settled it: the PRE-fix installed bubble warns
+"1 unattributed stop", the POST-fix checkout passes the audit 7/7 with zero
+warnings on the same ledger and journal.
+
+tests: **9 in `tests/test_ops.py::TestJournalPoweroffClassification`** — the
+21:39:26 incident's own ledger plus its journal lines exempted from the
+pattern (and still rendered as "had NO visible caller"), a ghost the journal
+does not explain STILL accusing, the ±2 s boundary on both sides, oracle and
+finding-loop agreement with the reader, supersession not armed, an
+unparseable timestamp never excused, and the runner's never-die plus bounded-
+argv contracts. `TestDoctor` grew an autouse empty-journal stub: its ledger
+tests feed FABRICATED timestamps and must never answer from the machine's
+real journal. **3/3 mutations caught** (the reader's exemption dropped — 4
+failures; the window widened to an hour — the boundary test fails; the
+oracle's classification dropped — the parity test fails), every restore
+verified.
+
+measured: `tests/test_ops.py` **130 passed** (121 → 130), the touched sweep
+(lifecycle, hardening, freshness) green, `ci/compile_all.py` clean; suite
+2162 → **2171**, README census updated and the module table regenerated for
+the growth. Live: `--ptt stop-audit` PASS (7 passed) where the installed
+pre-fix code warned; the doctor's PATTERN line disappears when the fix
+DEPLOYS (the running bubble still serves the old code over the control
+socket — `--ptt doctor` is a remote verb, stop-audit a local one, which is
+why the same checkout showed both answers on one afternoon).
+
+**Limits, stated.** The exemption needs the system journal: a box where it is
+unavailable or silent answers NO everywhere, which is the pre-fix behavior —
+never worse. The window is ±2 s, so a poweroff whose logind line landed
+farther from the stop than that (a hung sweep) would still read as a ghost;
+that shape has not occurred, and widening the window trades real-ghost
+evidence for it. The probe itself still writes `shutdown:0` through the race
+— only its READER no longer mistakes that row for a killer; a probe-side fix
+would need journal access inside ExecStop, which the probe's no-dependencies
+design (and a mid-sweep journal that may be sealing) argues against. And the
+running bubble serves the OLD reader until the next deploy, by the same
+in-sync rule this project always applies.

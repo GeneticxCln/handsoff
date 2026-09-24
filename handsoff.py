@@ -4546,6 +4546,84 @@ _OPEN_UNEXPLAINED_STOPS: tuple = ()
 # mystery BEGAN, and the resolved verdicts above point back to it.
 _OPEN_UNEXPLAINED_STOPS_LATEST = "2026-09-22T18:41:43+02:00"
 
+# --- poweroff classification for callers-empty stops -------------------------
+# `shutdown:1` is the probe's own annotation, and it has a RACE: during a
+# poweroff sweep the stop job runs while the user manager's exit.target may
+# not be observable yet, so a session-shutdown stop can arrive annotated
+# `shutdown:0` with `callers:[]` — the exact shape the ghost pattern reads as
+# the invisible killer. Measured, twice: the 21:34:06 and 21:39:26 ghosts
+# (2026-09-22/23) were both night poweroffs whose system journal says
+# "poweroff requested ... System is powering down" at the stop's own second.
+# The CONSUMER, not the shipped probe, closes the gap: before an invisible
+# stop can accuse anyone, the system journal is asked whether a poweroff was
+# requested within ±2 s of it (the stop lands seconds into the sweep, and
+# journal clock skew is bounded; a wider window would start eating real
+# ghosts). Probe-annotated sweeps skip the journal entirely — the flag is the
+# fast path, the journal only arbitrating the rows the race mislabeled.
+_STOP_POWEROFF_WINDOW_S = 2.0
+# Month map instead of strptime: %b is LOCALE-dependent ("Sep" fails to parse
+# under a non-C locale) and journalctl space-pads single-digit days, which
+# strptime only accepts with a warning. The regex carries three groups.
+_JOURNAL_MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+                   "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+_JOURNAL_STAMP = re.compile(
+    r"^([A-Z][a-z]{2})\s+(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) ")
+
+
+def _journalctl(argv: list) -> str:
+    """`journalctl ...` stdout, or "" when it cannot answer (no journal, no
+    binary, a non-systemd box, a container). Diagnostics read the ledger;
+    they must not die on the tool that classifies it. Bounded: a wedged
+    journalctl must not hold a doctor render or a boot check."""
+    try:
+        proc = subprocess.run(
+            ["journalctl", *argv], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout or "" if proc.returncode == 0 else ""
+
+
+def _stop_was_poweroff(ts: str, journal_text: str | None = None) -> bool:
+    """Was the system powering down within ±2 s of THIS stop's timestamp?
+
+    `journal_text`, when given, is pre-fetched journal output (the sweep
+    fetches one window instead of one subprocess per row); None asks the
+    journal live. An unparseable timestamp answers NO — an entry the ledger
+    cannot date must stay an accusation candidate, never silently excused.
+    """
+    try:
+        when = datetime.datetime.fromisoformat(str(ts or ""))
+    except ValueError:
+        return False
+    # journalctl prints LOCAL wall-clock stamps and reads naive --since/--until
+    # as local, so the comparison happens on the stop's local wall clock — not
+    # UTC: a UTC conversion misses the window by exactly the machine's offset.
+    if when.tzinfo is not None:
+        when = when.astimezone().replace(tzinfo=None)
+    if journal_text is None:
+        fmt = "%Y-%m-%d %H:%M:%S"
+        journal_text = _journalctl([
+            "--since", (when - datetime.timedelta(
+                seconds=_STOP_POWEROFF_WINDOW_S)).strftime(fmt),
+            "--until", (when + datetime.timedelta(
+                seconds=_STOP_POWEROFF_WINDOW_S)).strftime(fmt),
+            "--no-pager"])
+    for line in journal_text.splitlines():
+        stamp = _JOURNAL_STAMP.match(line)
+        if stamp is None or stamp.group(1) not in _JOURNAL_MONTHS:
+            continue          # not a journal line (blank, banner, continuation)
+        try:
+            stamped = datetime.datetime(
+                when.year, _JOURNAL_MONTHS[stamp.group(1)],
+                int(stamp.group(2)), int(stamp.group(3)),
+                int(stamp.group(4)), int(stamp.group(5)))
+        except ValueError:
+            continue          # an impossible date (Feb 30) is not evidence
+        if abs((stamped - when).total_seconds()) <= _STOP_POWEROFF_WINDOW_S \
+                and "poweroff requested" in line:
+            return True
+    return False
+
 
 def _ghost_stop_pattern(records: list) -> dict:
     """Judge whether invisible stops form a PATTERN, not an accident.
@@ -4557,11 +4635,14 @@ def _ghost_stop_pattern(records: list) -> dict:
     (doctor formats, it does not adjudicate); timestamps are compared as
     parsed datetimes and an unparseable ts can never accuse anyone.
 
-    Exemption: stops the probe annotated "shutdown" (ExecStop ran while
-    exit.target was active — poweroff, logout, session exit) are the
-    session's own sweep, invisible by design, and can never form the
-    pattern. A night poweroff 105 s after a deploy restart is exactly the
-    benign pair that must not cry wolf.
+    Exemption, two layers. Stops the probe annotated "shutdown" (ExecStop
+    ran while exit.target was active — poweroff, logout, session exit) are
+    the session's own sweep, invisible by design, and can never form the
+    pattern. And a caller-less stop whose timestamp sits within ±2 s of a
+    "poweroff requested" line in the system journal is the SAME event seen
+    through the annotation race (the sweep can run before exit.target is
+    observable), not a hidden caller — a night poweroff 105 s after a deploy
+    restart is exactly the benign pair that must not cry wolf.
     """
     def _t(rec: dict):
         try:
@@ -4580,6 +4661,8 @@ def _ghost_stop_pattern(records: list) -> dict:
             continue
         if rec.get("shutdown"):
             continue        # the session's own sweep — exempt, never a pattern
+        if _stop_was_poweroff(str(rec.get("ts") or "")):
+            continue        # the annotation race's poweroff — same exemption
         if t is None or after_attr is None:
             continue
         gap = (t - after_attr).total_seconds()
@@ -4694,6 +4777,8 @@ def _unexplained_stops_health() -> dict:
                 if rec.get("shutdown"):
                     continue
                 if not rec.get("callers"):
+                    if _stop_was_poweroff(str(rec.get("ts") or "")):
+                        continue    # a poweroff ghost is not the recurrence
                     ghost_seen = True
                 elif ghost_seen:
                     superseded_by = str(rec.get("ts"))
@@ -4713,6 +4798,12 @@ def _expected_ghost_pairs(rows: list) -> int:
     oracle that shared the reader's code would share its bugs, which is
     exactly the blind spot fault injection demonstrated (a reader whose
     breakage survives re-parsing passes its own stripped-flags delta).
+    The POWEROFF classification is the one judgment the oracle SHARES
+    with the reader (via _stop_was_poweroff over one shared fetch): it is
+    evidence from outside the ledger, not the reader's own logic, and
+    duplicating the journal call would duplicate its races —
+    reader-vs-oracle parity must not fail because the clock moved between
+    two fetches.
     """
     def _t(rec: dict):
         try:
@@ -4722,18 +4813,50 @@ def _expected_ghost_pairs(rows: list) -> int:
 
     pairs = 0
     after_attr: datetime.datetime | None = None
+    journal_text = _poweroff_journal_text(rows)
     for rec in rows:
         t = _t(rec)
         if rec.get("callers"):
             if t is not None:
                 after_attr = t
             continue
-        if rec.get("shutdown") or t is None or after_attr is None:
+        if rec.get("shutdown") or _stop_was_poweroff(
+                str(rec.get("ts") or ""), journal_text):
             continue
+        if t is None or after_attr is None:
+            continue        # undated, or a ghost before any anchor: no gap
         gap = (t - after_attr).total_seconds()
         if 0 <= gap <= _STOP_ATTRIBUTION_GHOST_WINDOW_S:
             pairs += 1
     return pairs
+
+
+def _poweroff_journal_text(rows: list) -> str:
+    """One journal fetch covering every caller-less row the sweep will judge.
+
+    The audit asks the classification for up to 50 rows; per-row subprocesses
+    would make the boot check seconds slower for no extra truth, so the
+    journal is read ONCE over the rows' time span and each row's ±2 s window
+    is answered from that text. Rows without a parseable ts contribute
+    nothing (they can never be excused), and an unanswerable journal yields
+    "" — every classification then answers NO, the pre-fix behavior.
+    """
+    stamps: list[datetime.datetime] = []
+    for rec in rows:
+        if rec.get("callers") or rec.get("shutdown"):
+            continue
+        try:
+            stamps.append(datetime.datetime.fromisoformat(
+                str(rec.get("ts") or "")))
+        except ValueError:
+            continue
+    if not stamps:
+        return ""
+    fmt = "%Y-%m-%d %H:%M:%S"
+    lo = min(stamps) - datetime.timedelta(seconds=_STOP_POWEROFF_WINDOW_S + 1)
+    hi = max(stamps) + datetime.timedelta(seconds=_STOP_POWEROFF_WINDOW_S + 1)
+    return _journalctl(["--since", lo.strftime(fmt), "--until",
+                        hi.strftime(fmt), "--no-pager"])
 
 
 def _stop_audit_report() -> tuple[str, int]:
@@ -4855,11 +4978,13 @@ def _stop_audit_report() -> tuple[str, int]:
         ghosts = 0
         last_ghost_ts = ""
         superseded_by = ""
+        journal_text = _poweroff_journal_text(rows)
         for rec in rows:
             t = _t(rec)
             if t is None or anchor is None or t <= anchor:
                 continue
-            if rec.get("shutdown"):
+            if rec.get("shutdown") or _stop_was_poweroff(
+                    str(rec.get("ts") or ""), journal_text):
                 continue
             if not rec.get("callers"):
                 ghosts += 1

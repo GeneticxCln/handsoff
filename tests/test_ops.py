@@ -758,7 +758,19 @@ class TestTheHostIsOfferedEveryRefusal:
 
 
 class TestDoctor:
-    """The doctor report: one pass over deployment + dependencies."""
+    """The doctor report: one pass over deployment + dependencies.
+
+    Every test here feeds FABRICATED ledger timestamps; the poweroff
+    classifier would otherwise answer them by asking the REAL system
+    journal, making the whole class machine-dependent (a journal entry at a
+    fabricated stamp, or no journalctl at all, changes verdicts). The stub
+    is the determinism contract: these tests exercise LEDGER logic, and the
+    journal seam's own behavior is TestJournalPoweroffClassification's.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_journal(self, H, monkeypatch):
+        monkeypatch.setattr(H, "_journalctl", lambda argv: "")
 
     def test_report_mentions_deployment_and_deps(self, H):
         text = H.run_doctor()
@@ -1422,6 +1434,174 @@ class TestDoctor:
                                 RuntimeError("no niri in tests"))))
         text = H.run_doctor()
         assert "STALE" in text or "installed-drift" in text
+
+
+class TestJournalPoweroffClassification:
+    """A caller-less stop the journal says was a poweroff is exempt.
+
+    The probe's `shutdown` annotation has a race: during a poweroff sweep the
+    stop job runs while the user manager's exit.target may not be observable
+    yet, so a session-shutdown stop arrives `shutdown:0` with `callers:[]` —
+    the exact shape the ghost pattern reads as the invisible killer. Measured
+    twice on this desk (2026-09-22 21:34:06 and 2026-09-23 21:39:26): both
+    night poweroffs, both read by doctor as the killer shape until the system
+    journal said "poweroff requested" at the stop's own second. The consumer
+    closes it: every caller-less row is classified against the system journal
+    (±2 s of the stop's timestamp) before it can accuse anyone.
+    """
+
+    ANCHOR = "2026-09-23T20:39:26+02:00"   # 60 min before GHOST: in-window
+    GHOST = "2026-09-23T21:39:26+02:00"      # the real measured poweroff ghost
+
+    @staticmethod
+    def _rows(ghost_ts):
+        return [TestDoctor._attr_row(TestJournalPoweroffClassification.ANCHOR),
+                TestDoctor._ghost_row(ghost_ts)]
+
+    @staticmethod
+    def _journal_text(stamp: str) -> str:
+        return (f"Sep 23 {stamp} cachyos-x8664 systemd-logind[742]: "
+                "poweroff requested from client PID 1483161 ('systemctl') "
+                "(unit user@1000.service)...\n"
+                f"Sep 23 {stamp} cachyos-x8664 systemd-logind[742]: "
+                "System is powering down.\n")
+
+    def test_a_poweroff_ghost_is_exempt_from_the_pattern(self, H, monkeypatch,
+                                                         tmp_path):
+        """The exact ledger of the 21:39:26 incident, plus the journal lines
+        it produced: the pair must NOT read as the invisible-killer shape."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", TestDoctor._ghost_ledger(
+            tmp_path, self._rows(self.GHOST)))
+        monkeypatch.setattr(H, "_journalctl",
+                            lambda argv: self._journal_text("21:39:24"))
+        text = H.run_doctor()
+        assert "PATTERN" not in text
+        assert "had NO visible caller" in text       # rendered, never accused
+        g = H.doctor_json()["stop_attribution"]["ghost_pattern"]
+        assert g["seen"] is False and g["pairs"] == 0
+
+    def test_a_ghost_the_journal_does_not_explain_still_accuses(self, H,
+                                                                 monkeypatch,
+                                                                 tmp_path):
+        """The classification may only EXCUSE what the journal supports — the
+        killer shape with no poweroff line anywhere near it stays a finding."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", TestDoctor._ghost_ledger(
+            tmp_path, self._rows(self.GHOST)))
+        monkeypatch.setattr(H, "_journalctl", lambda argv: "")
+        text = H.run_doctor()
+        assert "PATTERN — 1 invisible stop(s)" in text
+        assert "the invisible-killer shape" in text
+
+    def test_the_window_is_two_seconds_each_way(self, H, monkeypatch, tmp_path):
+        """±2 s catches the sweep's own skew; anything wider starts eating
+        real ghosts — the boundary is data, not a feeling."""
+        ledger = TestDoctor._ghost_ledger(tmp_path, self._rows(self.GHOST))
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        for stamp, accused in (("21:39:24", False),   # -2 s: poweroff
+                               ("21:39:28", False),   # +2 s: poweroff
+                               ("21:39:23", True),    # -3 s: too far
+                               ("21:39:29", True)):   # +3 s: too far
+            monkeypatch.setattr(H, "_journalctl",
+                                lambda argv, s=stamp: self._journal_text(s))
+            text = H.run_doctor()
+            assert ("PATTERN" not in text) is (not accused), stamp
+
+    def test_the_audit_and_its_oracle_agree_on_a_poweroff_ghost(self, H,
+                                                                 monkeypatch,
+                                                                 tmp_path):
+        """The stop-audit's reader-vs-oracle parity must not fail because the
+        classification exempted the row — both sides share one fetch and the
+        same rule; a disagreement between them is still machinery drift."""
+        rows = self._rows(self.GHOST)
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", TestDoctor._ghost_ledger(
+            tmp_path, rows))
+        monkeypatch.setattr(H, "_journalctl",
+                            lambda argv: self._journal_text("21:39:26"))
+        fresh = H._ghost_stop_pattern(rows)
+        assert fresh["pairs"] == H._expected_ghost_pairs(rows) == 0
+
+    def test_the_finding_loop_exempts_a_poweroff_ghost_too(self, H, monkeypatch,
+                                                           tmp_path):
+        """`--ptt stop-audit`'s own unattributed finding must not reopen what
+        the pattern just exempted: one classification, every consumer."""
+        rows = self._rows(self.GHOST)
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", TestDoctor._ghost_ledger(
+            tmp_path, rows))
+        monkeypatch.setattr(H, "_journalctl",
+                            lambda argv: self._journal_text("21:39:25"))
+        text, rc = H._stop_audit_report()
+        assert rc == 0
+        assert "unattributed" in text and "no unattributed stop" in text
+
+    def test_a_poweroff_ghost_does_not_open_the_supersession_window(self, H,
+                                                                     monkeypatch,
+                                                                     tmp_path):
+        """`_unexplained_stops_health` measures supersession from the first
+        ghost AFTER the anchor; an excused poweroff ghost is not evidence of
+        the killer's return and must not arm that window."""
+        ledger = TestDoctor._ghost_ledger(tmp_path, [
+            self._rows(self.GHOST)[0],
+            TestDoctor._ghost_row(self.GHOST),
+            TestDoctor._attr_row("2026-09-23T22:00:00+02:00")])
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", ledger)
+        monkeypatch.setattr(H, "_journalctl",
+                            lambda argv: self._journal_text("21:39:26"))
+        block = H._unexplained_stops_health()
+        assert block["superseded_by"] == ""
+
+    def test_unparseable_timestamp_stays_an_accusation_candidate(self, H,
+                                                                  monkeypatch,
+                                                                  tmp_path):
+        """An entry the ledger cannot date must never be silently excused —
+        only a DATED match against the journal may exempt a ghost."""
+        monkeypatch.setattr(H, "STOP_ATTRIBUTION_FILE", TestDoctor._ghost_ledger(
+            tmp_path, [TestDoctor._attr_row(self.ANCHOR),
+                       TestDoctor._ghost_row("garbage")]))
+        monkeypatch.setattr(
+            H, "_journalctl",
+            lambda argv: self._journal_text("99:99:99") * 10)  # any text
+        text = H.run_doctor()
+        assert "PATTERN" not in text       # no anchor->ghost gap to pair on
+        assert H._stop_was_poweroff("garbage",
+                                    self._journal_text("21:39:26")) is False
+
+    def test_the_journal_runner_yields_empty_on_failure(self, H, monkeypatch):
+        """A missing journalctl, a non-systemd box, or a wedged journal must
+        read as "unanswerable" (every classification NO — the pre-fix
+        behavior), never as an exception out of a doctor render. The REAL
+        runner is exercised — a stub with a raiser would bypass the very
+        try/except under test."""
+        def boom(argv, **kw):
+            raise OSError("no journalctl here")
+        monkeypatch.setattr(H.subprocess, "run", boom)
+        assert H._journalctl(["--since", "x"]) == ""
+        assert H._stop_was_poweroff(self.GHOST) is False
+        monkeypatch.setattr(H.subprocess, "run",
+                            lambda argv, **kw: types.SimpleNamespace(
+                                returncode=1, stdout="junk"))
+        assert H._journalctl(["--since", "x"]) == ""
+        monkeypatch.setattr(H.subprocess, "run",
+                            lambda argv, **kw: types.SimpleNamespace(
+                                returncode=0, stdout="poweroff requested"))
+        assert H._journalctl(["--since", "x"]) == "poweroff requested"
+
+    def test_the_runner_uses_a_bounded_real_argv(self, H, monkeypatch):
+        """The seam's real shape: journalctl with a since/until window and
+        --no-pager — and a nonzero exit or a timeout is empty, not truth."""
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append((argv, kw))
+            return types.SimpleNamespace(returncode=0, stdout="ok")
+
+        monkeypatch.setattr(H.subprocess, "run", fake_run, raising=False)
+        out = H._journalctl(["--since", "2026-09-23 21:39:24"])
+        assert out == "ok" and calls[0][0][0] == "journalctl"
+        assert calls[0][1].get("timeout") is not None
+        monkeypatch.setattr(H.subprocess, "run",
+                            lambda argv, **kw: types.SimpleNamespace(
+                                returncode=1, stdout="junk"), raising=False)
+        assert H._journalctl(["--since", "x"]) == ""
 
 
 class TestDoctorModuleExtraction:
