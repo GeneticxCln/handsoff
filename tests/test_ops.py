@@ -2819,6 +2819,36 @@ class TestInstallerProvisionsWhatTheAppDecided:
         assert 'match app-id=r#"^handsoff$"#' not in source, (
             "the rule must not carry its own copy of the app-id")
 
+    def test_the_niri_hint_names_a_verb_that_exists(self):
+        """The closing advice must name a verb the installed niri answers.
+
+        The hint said `niri msg action reload-config`, which fails on this
+        desk's niri with "unrecognized subcommand" — the action is
+        load-config-file, the SAME verb handsoff-settings.py already uses
+        for its live reload (measured 2026-09-24: `niri msg action --help`
+        lists only load-config-file). Advice that errors reads as the merge
+        having failed, and the manual step stays open forever. Gated on
+        niri being present: the machine without it still passes the pin.
+        """
+        source = _installer_source()
+        assert "niri msg action load-config-file" in source, (
+            "install.sh no longer tells the reader how to load the config")
+        assert "reload-config" not in source, (
+            "the stale verb is still in the installer's advice")
+        import shutil as _shutil
+        if _shutil.which("niri") is None:
+            pytest.skip("niri not on PATH — prose pin only")
+        import subprocess as _subprocess
+        verbs = _subprocess.run(
+            ["niri", "msg", "action", "--help"],
+            capture_output=True, text=True, timeout=15)
+        assert "load-config-file" in (verbs.stdout + verbs.stderr), (
+            "the pinned verb is not in this niri's action list — the app's "
+            "own reload (handsoff-settings.py) will be wrong too")
+        assert "reload-config" not in (verbs.stdout + verbs.stderr), (
+            "this niri knows the OLD verb after all — the app and the "
+            "installer are behind it; re-measure and re-pin together")
+
     def test_every_fallback_is_the_apps_own_default(self, H):
         """A fallback that drifts is a machine provisioned for nobody's config."""
         from settings_schema import DEFAULT_SETTINGS, WHISPER_SIZES

@@ -7628,7 +7628,45 @@ DEPLOYS (the running bubble still serves the old code over the control
 socket — `--ptt doctor` is a remote verb, stop-audit a local one, which is
 why the same checkout showed both answers on one afternoon).
 
-**Limits, stated.** The exemption needs the system journal: a box where it is
+## The installer's closing hint names the niri verb this niri answers (2026-09-24)
+
+asked: the last standing manual-step advice (`niri msg action
+reload-config`) errored on this desk's niri with "unrecognized subcommand"
+while verifying the window rule — the action is `load-config-file`, which is
+the verb the app's own settings GUI already uses (handsoff-settings.py:396,
+its live reload). Advice that errors reads as the merge having failed, and
+the manual step stays open forever.
+
+**Measured, then pinned.** `niri msg action --help` lists only
+load-config-file; the settings GUI has called it that for as long as it
+reloads. install.sh's hint, the README's copy of it and specs/50-ops.md's
+step list all said the old verb (the window rule itself was found ALREADY
+merged — twice, the richer `cfg/rules.kdl` variant plus the plain trailing
+copy — so the hint was the only broken half of the step). All three now name
+the working verb; ACCEPTANCE.md's 2026-09-19 mention is history and stays as
+written. The guard runs against the REAL niri when one is on PATH (the pin
+fails if the app's own reload verb is ever wrong too) and degrades to a
+prose-only pin without it.
+
+tests: **1 in `tests/test_ops.py::TestInstallerProvisionsWhatTheAppDecided`**
+— the hint names load-config-file, the stale verb appears nowhere in
+install.sh, and (niri present) the verb is in this niri's own action list
+while the old one is not. **1/1 mutation caught** (installer reverted → the
+guard fails); suite 2171 → **2172**, README census updated; touched sweep
+(test_ops + freshness) green, `bash -n` clean.
+
+gates: the full eight-gate PASS on the PREVIOUS commit (84705d1) stands for
+everything this one-line prose change does not touch; the hook re-runs the
+suite on these staged bytes at commit time.
+
+**Limits, stated.** The pin is version-coupled on purpose: a future niri
+renaming the verb again fails this guard loudly, which is the contract —
+advice that names commands is code, and code has guards. The `--help`
+probe runs at TEST time on the developer's machine, not at install time on
+the victim's: a box whose niri predates the rename would still be handed
+the wrong hint, and the installer cannot know without parsing niri's own
+help — out of scope for a printf line.
+
 unavailable or silent answers NO everywhere, which is the pre-fix behavior —
 never worse. The window is ±2 s, so a poweroff whose logind line landed
 farther from the stop than that (a hung sweep) would still read as a ghost;

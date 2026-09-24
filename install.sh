@@ -1151,7 +1151,7 @@ fi
 echo
 echo "handsoff installed."
 echo "  1. Merge $CONF_DIR/niri-window-rule.kdl into ~/.config/niri/config.kdl"
-echo "     then: niri msg action reload-config"
+echo "     then: niri msg action load-config-file"
 if systemctl --user is-active --quiet handsoff.service 2>/dev/null; then
     echo "  2. running with the new code — verify with:  python ~/.local/bin/handsoff.py --ptt doctor"
 else

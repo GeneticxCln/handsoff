@@ -28,7 +28,7 @@ Sources: `install.sh`, `handsoff.py` (`main`, `_deployment_snapshot`,
    `Restart=always`, `PartOf=graphical-session.target`,
    `WantedBy=graphical-session.target`. Exactly ONE autostart owner:
    systemd enabled → no niri `spawn-at-startup` (checked, not assumed).
-7. niri snippet print (`niri-window-rule.kdl` merge) + `reload-config` hint.
+7. niri snippet print (`niri-window-rule.kdl` merge) + `load-config-file` hint.
 8. Flags: `--help` (pure, CI-smoked), `--rehearsal` (redirect HOME, no host
    changes), `--rollback`, `--uninstall` (manifest loop; `core/` + `~/.local/bin`
    dropped only when empty-or-bytecode — never `rm -rf` a shared dir),
