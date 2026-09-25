@@ -281,13 +281,14 @@ class TestDeploymentReporting:
         assert snap["status"] == "installed-drift"
 
     def test_a_manifestless_install_compares_every_module(self, H, monkeypatch, tmp_path):
-        """_DEPLOY_FILES is the top-level floor; the checkout's core set is the
+        """_DEPLOY_FILES mirrors the declared set; the checkout's core set is the
         ceiling a hand-rolled install must be compared against.
 
-        The floor lists eight entries, three of them core modules, while
-        install.sh declares thirteen — so an install with no manifest compared
-        eight files and reported `in-sync` while half the modules differed.
-        Driven from the checkout, every module the tree ships is compared.
+        Historical shape (now closed): the floor once listed eight entries,
+        three of them core modules, while install.sh declared thirteen — so an
+        install with no manifest compared eight files and reported `in-sync`
+        while half the modules differed. Driven from the checkout, every
+        module the tree ships is compared.
         """
         checkout = tmp_path / "checkout"
         installed = tmp_path / "home" / ".local" / "bin"
@@ -780,6 +781,40 @@ class TestDoctor:
         assert "systemd unit:" in text
         assert "restart script:" in text
         assert "ydotool:" in text
+
+    def test_report_names_the_wake_channel(self, H, monkeypatch):
+        """`wake spotter on` is not the same fact as `the spotter can hear the
+        name you chose`. A custom name has no openWakeWord model, so doctor has
+        to say which door actually opens — otherwise a bubble whose wakes fail
+        reads as a working audio wake everywhere."""
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        monkeypatch.setitem(H.SETTINGS, "wake_spotter", True)
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        # The loader's state is process-global and persists by design, so a
+        # neighbour that left it FAILED would answer this line differently.
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", ["alexa", "hey_jarvis"],
+                            raising=False)
+        monkeypatch.setattr(H, "_spotter_failed", False, raising=False)
+        monkeypatch.setattr(H, "_spotter_model", None, raising=False)
+        text = H.run_doctor()
+        line = next(ln for ln in text.splitlines() if ln.startswith("wake:"))
+        assert "transcript gate only" in line
+        assert "NO model for this name" in line
+
+    def test_a_host_without_wake_rendering_prints_no_wake_line(self, H,
+                                                               monkeypatch):
+        """A partial deps object must print exactly what it printed before the
+        line existed — the same contract the web/gpu line collectors have."""
+        from core import doctor as core_doctor
+        deps = H._build_doctor_deps()
+        del deps.wake_lines          # a host that does not report it
+        token = core_doctor.set_dependencies(deps)
+        try:
+            text = core_doctor.run_doctor()
+        finally:
+            core_doctor.reset_dependencies(token)
+        assert "\nwake:" not in text and not text.startswith("wake:")
+        assert "stt:" in text, "the neighbouring line is unaffected"
 
     def test_report_mentions_whisper_and_python_provenance(self, H, monkeypatch,
                                                             tmp_path):
@@ -3005,3 +3040,124 @@ class TestShippedSetExistsInCheckout:
         # ...and handsoff-restart specifically IS a floor the stage validates,
         # so the installer's own loud path exists for it too:
         assert "could not stage handsoff-restart" in _installer_source()
+
+
+class TestStateHygieneLine:
+    """The doctor's `state:` line: leaked scratch, the last sweep's result
+    and the dir size, as ONE host rendering the doctor places (the wake/gpu
+    lines contract). The host-side reading guards live in test_hardening's
+    TestStateHygieneReading; these pin the DOCTOR surfaces — the text line,
+    the JSON numbers, and the partial-deps contract."""
+
+    def test_the_doctor_prints_the_state_hygiene_line(self, H, monkeypatch,
+                                                      tmp_path):
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path / "state")
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / "tmpab12cd34").mkdir()   # a dead run's TTS dir
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": H.time.time() - 120.0,
+                                                "removed": 3,
+                                                "unreadable": False})
+        text = H.run_doctor()
+        line = next(ln for ln in text.splitlines() if ln.startswith("state:"))
+        assert "1 scratch-shaped entry present" in line
+        assert "last start swept 3 entries 2m ago" in line
+
+    def test_a_clean_state_dir_reads_as_clean(self, H, monkeypatch, tmp_path):
+        """'no leaked scratch' is a positive finding, by the cap-refusal
+        rule: a missing line would be indistinguishable from a doctor that
+        stopped watching."""
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path / "state")
+        (tmp_path / "state").mkdir()
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": H.time.time() - 2.0,
+                                                "removed": 0,
+                                                "unreadable": False})
+        text = H.run_doctor()
+        line = next(ln for ln in text.splitlines() if ln.startswith("state:"))
+        assert "no leaked scratch" in line
+        assert "last start swept nothing (just now)" in line
+
+    def test_the_json_surface_ships_the_numbers(self, H, monkeypatch,
+                                                tmp_path):
+        """The structured doctor carries the same reading the text line does —
+        one host collector behind both, so words and numbers cannot drift."""
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path / "state")
+        (tmp_path / "state").mkdir()
+        (tmp_path / "state" / ".x.1.tmp").write_text("partial")
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": 123.0, "removed": 2,
+                                                "unreadable": False})
+        out = H.doctor_json()["state_hygiene"]
+        assert out["readable"] is True
+        assert out["scratch_left"] == 1
+        assert out["size_bytes"] > 0
+        assert out["entries"] >= 1
+        assert out["last_sweep"] == {"at": 123.0, "removed": 2,
+                                     "unreadable": False}
+
+    def test_the_trend_rides_the_json_surface(self, H, monkeypatch, tmp_path):
+        """The week-over-week numbers must reach the STRUCTURED surface too:
+        the doctor builds that dict key by key, so a trend the host computes
+        and the JSON quietly drops is exactly the drift one collector exists
+        to stop. `None` (never 0) is the answer while the history is shorter
+        than the window — no delta and a delta of nothing are different facts."""
+        state = tmp_path / "state"
+        state.mkdir()
+        monkeypatch.setattr(H, "STATE_DIR", state)
+        now = H.time.time()
+
+        def row(days_ago, size, entries):
+            return json.dumps({"at": now - days_ago * 86400.0, "date": "x",
+                               "scratch_left": 0, "size_bytes": size,
+                               "entries": entries, "swept": 0})
+
+        H._state_hygiene_log().write_text(
+            "\n".join([row(9, 1_000_000_000, 10),
+                       row(0, 2_500_000_000, 31)]) + "\n", encoding="utf-8")
+        out = H.doctor_json()["state_hygiene"]["trend"]
+        assert out["rows"] == 2
+        assert out["since_days"] == 9.0
+        assert out["size_delta"] == 1_500_000_000
+        assert out["entries_delta"] == 21
+        H._state_hygiene_log().write_text(
+            row(2, 1_000_000_000, 10) + "\n", encoding="utf-8")
+        short = H.doctor_json()["state_hygiene"]["trend"]
+        assert short["rows"] == 1
+        assert short["since_days"] is None
+        assert short["size_delta"] is None
+        assert short["entries_delta"] is None
+
+    def test_an_unreadable_state_dir_is_a_finding_in_the_json(
+            self, H, monkeypatch, tmp_path):
+        """`readable: False` with zeroed numbers is the honest JSON answer —
+        the diagnostic watched the one dir it exists to watch and could not
+        see it. Omitting the key would read as healthy. The trend keeps the
+        same shape (every key present, deltas None) and, like the numbers
+        beside it, is zeroed rather than absent: the flag is the disambiguator,
+        and a consumer that reads a delta without reading `readable` first is
+        reading a schema it was told to check."""
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path / "no-such-state")
+        out = H.doctor_json()["state_hygiene"]
+        assert out == {"readable": False, "scratch_left": 0,
+                       "size_bytes": 0, "entries": 0,
+                       "last_sweep": {"at": None, "removed": 0,
+                                      "unreadable": False},
+                       "trend": {"rows": 0, "span_days": 0.0,
+                                 "since_days": None, "size_delta": None,
+                                 "entries_delta": None}}
+
+    def test_a_host_without_the_hygiene_deps_prints_and_ships_nothing(
+            self, H, monkeypatch):
+        """The partial-deps contract: a host that reports neither the line
+        nor the dict prints no `state:` line and ships no JSON key — exactly
+        what it printed before the reading existed."""
+        from core import doctor as core_doctor
+        deps = H._build_doctor_deps()
+        del deps.state_hygiene_line
+        del deps.state_hygiene
+        token = core_doctor.set_dependencies(deps)
+        try:
+            text = core_doctor.run_doctor()
+            out = core_doctor.doctor_json()
+        finally:
+            core_doctor.reset_dependencies(token)
+        assert not any(ln.startswith("state:") for ln in text.splitlines())
+        assert "state_hygiene" not in out

@@ -5,7 +5,7 @@ handsoff — a self-modifying voice assistant bubble for Arch Linux + niri (Wayl
 
 A small frameless translucent bubble floats on your desktop. Hold it with the
 left mouse button and speak; release to send. Speech is transcribed locally
-(faster-whisper), answered by a local Ollama model, and spoken back with Piper.
+(faster-whisper), answered by a local Ollama model, and spoken back with Chatterbox TTS.
 
 States:  idle (blue, breathing) · listening (red, grows with your voice RMS) ·
          thinking (orange, wobbling) · speaking (green, pulsing).
@@ -678,8 +678,20 @@ _DEPLOY_FILES = (
     "settings_schema.py",
     "hardware.py",
     "core/__init__.py",
+    "core/registry.py",
     "core/settings.py",
+    "core/audio.py",
+    "core/brain.py",
+    "core/tools.py",
     "core/doctor.py",
+    "core/lifecycle.py",
+    "core/calendar.py",
+    "core/assistant.py",
+    "core/bubble.py",
+    "core/web.py",
+    "core/theme.py",
+    "core/qs_desk.py",
+    "core/selfwatch.py",
     "handsoff-restart",
     "handsoff-stop-probe",
 )
@@ -784,6 +796,53 @@ def _web_lines() -> list:
         return _web.doctor_lines()
     except Exception:
         log.exception("web doctor lines failed")
+        return []
+
+
+def _wake_lines() -> list:
+    """Which channel can actually WAKE this bubble, as observed.
+
+    The audio spotter only fires for the models it LOADED, and a custom
+    `assistant_name` has no model among its stock set — so for a custom name
+    the transcript gate is the only door, and saying so is the difference
+    between "waking is broken" and "this is how this build wakes". An
+    unloaded spotter reports `untried` rather than a verdict, the same rule the
+    search backends follow: a spotter nobody has started is not a healthy one.
+    """
+    name = _wake_name()
+    try:
+        if not _setting_flag("wake_word_required", False):
+            return ["wake: no wake word required — hands-free answers any "
+                    "speech in the room"]
+        if not _setting_flag("wake_spotter"):
+            return [f"wake: transcript gate only ({name!r}) — audio spotter is "
+                    f"off (wake_spotter false)"]
+        if _spotter_failed:
+            # A FAILED load is not an untried one: the listener already logged
+            # why, and reporting it as "untried" would send the reader looking
+            # for a start that will never cover the name.
+            return [f"wake: transcript gate only ({name!r}) — the audio spotter "
+                    f"FAILED to load (journal: 'wake spotter unavailable'); "
+                    f"install openwakeword/onnxruntime, or turn wake_spotter off"]
+        loaded = list(_SPOTTER_MODEL_NAMES)
+        if not loaded:
+            if _spotter_model is not None:
+                # Loaded, but the model object names nothing we can compare: a
+                # verdict either way would be a guess, so say what is true.
+                return [f"wake: transcript gate ({name!r}) — the audio spotter "
+                        f"is loaded but reports no model names, so whether it "
+                        f"covers this name is unknown"]
+            return [f"wake: transcript gate ({name!r}) — audio spotter "
+                    f"untried (it loads when hands-free starts)"]
+        if _spotter_wakes_for():
+            return [f"wake: audio spotter ({', '.join(loaded)}) + transcript "
+                    f"gate ({name!r})"]
+        return [f"wake: transcript gate only ({name!r}) — the audio spotter "
+                f"loaded [{', '.join(loaded)}] and has NO model for this name, "
+                f"so wake it by SAYING the name clearly (add a matching model "
+                f"to spotter_models for audio wake)"]
+    except Exception:
+        log.exception("wake doctor lines failed")
         return []
 
 
@@ -1580,10 +1639,10 @@ def _deployment_snapshot() -> dict:
     manifest_files = manifest.get("files")
     tracked = set(_DEPLOY_FILES) | (
         set(manifest_files) if isinstance(manifest_files, dict) else set())
-    # _DEPLOY_FILES is only the TOP-LEVEL floor (handsoff.py, the settings app,
-    # the schema, hardware.py, the restart script) plus three core modules, and
-    # install.sh declares thirteen. A manifest-less or hand-rolled install
-    # therefore compared eight files and reported `in-sync` while half the
+    # _DEPLOY_FILES mirrors install.sh's declared set (TOP_REQUIRED +
+    # handsoff-settings.py + every CORE_REQUIRED module + the two scripts),
+    # so a manifest-less install still compares the full shipped set. A
+    # narrower floor therefore compared eight files and reported `in-sync` while half the
     # modules differed — the same class of defect the manifest-driven set fixed
     # for an exported manifest, one install shape over. The checkout's own core
     # set is the honest ceiling for that case, and it is the same glob
@@ -1733,6 +1792,9 @@ def _build_doctor_deps() -> _core_doctor.DoctorDeps:
         crash_log=CRASH_LOG,
         appearance_look=_appearance_note,
         web_lines=_web_lines,
+        wake_lines=_wake_lines,
+        state_hygiene_line=_state_hygiene_line,
+        state_hygiene=_state_hygiene,
         stop_attribution_health=_stop_attribution_health,
         unexplained_stops=_unexplained_stops_health,
         boot_stop_audit=_boot_stop_audit_health,
@@ -2012,11 +2074,483 @@ def _secure_runtime_files() -> bool:
     return all([_core_settings.secure_file(path) for path in paths])
 
 
+SCRATCH_SWEEP_AGE_S = 600  # grace: younger than this is possibly in flight
+# Reclaimed scratch is ARCHIVED, not destroyed: the entry moves into a dated
+# folder under STATE_DIR and stays recoverable for this long, on its own clock
+# (the grace answers "is this scratch?", the TTL answers "how long do we keep
+# the evidence?"). The two shapes are matched by NAME, so the archive is what
+# makes a false positive survivable — a `tmp*` dir is a TTS scratch dir by
+# shape, and the day that is ever wrong the bytes are still on disk.
+SCRATCH_QUARANTINE_NAME = "scratch-quarantine"
+SCRATCH_QUARANTINE_TTL_DAYS = 7
+
+
+_SWEEP_WARNED: set = set()   # one warning per unreadable directory
+# ONE sweep per state dir per start. `_prepare_runtime()` runs TWICE in a
+# service process — once from `main()` (before `setup_logging()`, because the
+# rotated log file lives in the state dir the sweep is cleaning) and again from
+# `ControlServer._serve()` — and the second run can only ever find what the
+# first one emptied. Unguarded, that no-op run re-stamped `_LAST_SWEEP` with
+# `removed=0`, so the doctor reported "last start swept nothing" seconds after
+# a start had in fact reclaimed scratch (found live 2026-09-25: a planted
+# stale `tmp*` dir and a stale `*.tmp` file were both reclaimed while the line
+# still read "swept nothing"). Latched per state dir; like the warn-once set
+# above it is a process-global, so a test that steps on it MUST pin it
+# (order).
+_SWEPT_DIRS: set = set()
+# The LAST sweep's result, read by the doctor's state-hygiene line. A start
+# that found nothing still stamps `at`, so an old timestamp means "nothing to
+# reclaim recently", never "the sweep never ran". Process-global: tests that
+# assert on it MUST pin it (monkeypatch a fresh dict), same rule as the
+# warn-once sets above.
+_LAST_SWEEP: dict = {"at": None, "removed": 0, "unreadable": False}
+# The hygiene TREND. The line above says what the state dir looks like NOW;
+# one number with no history cannot say whether it is growing, so every start
+# also appends the reading to a capped jsonl and the doctor compares it with a
+# reading at least a week old. One row per START, not per doctor read: the
+# doctor is asked on demand and a diagnostic must not write state, while a
+# start is a natural, bounded sample of the same numbers.
+STATE_HYGIENE_LOG_NAME = "state-hygiene.jsonl"
+STATE_HYGIENE_MAX = 400          # hard cap on recorded readings (a year of starts)
+STATE_HYGIENE_TREND_DAYS = 7     # the window a trend delta must cover
+# One row per state dir per process: `_prepare_runtime()` runs twice (main(),
+# then `ControlServer._serve()`) and the second append would double the sample.
+# Process-global, so a test that steps on it MUST pin it (order).
+_HYGIENE_LOGGED: set = set()
+
+
+def _scratch_shaped(name: str, is_dir: bool) -> bool:
+    """Exactly the two scratch shapes this runtime produces in STATE_DIR: a
+    `tmp*` DIRECTORY (TemporaryDirectory's default prefix) and a loose
+    `*.tmp` FILE (the state writers' staging shape). The shapes never cross:
+    a `tmp`-prefixed FILE and a `.tmp`-suffixed DIRECTORY are not scratch.
+    Shared by the sweep and the doctor's hygiene collector, so the two can
+    never disagree about what counts as a leak."""
+    return ((is_dir and name.startswith("tmp"))
+            or (not is_dir and name.endswith(".tmp")))
+
+
+def _scratch_quarantine_dir() -> Path:
+    """The archive root, `STATE_DIR/scratch-quarantine`.
+
+    Derived from STATE_DIR at CALL time, so a redirected state dir (the
+    suite's sandbox) carries its archive with it — and so a
+    `scratch-quarantine` symlink planted in the state dir is refused by
+    `_private_dir` rather than carrying reclaimed state out of the bubble.
+    """
+    return STATE_DIR / SCRATCH_QUARANTINE_NAME
+
+
+def _scratch_quarantine_today(now: float) -> "Path | None":
+    """Today's dated folder inside the archive, created owner-only on first
+    use; None when it cannot be made private, and the caller then leaves the
+    scratch where it is rather than destroy what it cannot keep."""
+    root = _scratch_quarantine_dir()
+    if not _private_dir(root):
+        return None
+    folder = root / datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    return folder if _private_dir(folder) else None
+
+
+def _expire_quarantine(now: float) -> int:
+    """Delete archive folders older than their TTL; returns how many went.
+
+    Only DIRECTORY names that parse as `YYYY-MM-DD` are ever removed, and a
+    folder ages out `SCRATCH_QUARANTINE_TTL_DAYS` days after its own date — the
+    archive's clock, not the sweep's grace. Anything else in there (a stray
+    file, a folder someone else named) is not this runtime's to delete.
+    """
+    try:
+        dated = list(_scratch_quarantine_dir().iterdir())
+    except OSError:
+        return 0
+    today = datetime.datetime.fromtimestamp(now).date()
+    purged = 0
+    for folder in dated:
+        try:
+            if folder.is_symlink() or not folder.is_dir():
+                continue
+            try:
+                day = datetime.date.fromisoformat(folder.name)
+            except ValueError:
+                continue                       # not a dated folder of ours
+            if (today - day).days <= SCRATCH_QUARANTINE_TTL_DAYS:
+                continue
+            shutil.rmtree(folder, ignore_errors=True)
+            purged += 1
+        except OSError:
+            continue
+    return purged
+
+
+def _quarantine_entry(entry: Path, folder: Path) -> bool:
+    """Move one stale scratch entry into the archive, keeping its name.
+
+    A name already taken — the same scratch name reclaimed twice on the same
+    day — gets a `~N` suffix instead of replacing the earlier copy, because
+    keeping BOTH is the point. `shutil.move` rather than `Path.rename`: if the
+    archive ever lands on another filesystem the archive still happens.
+    """
+    dest = folder / entry.name
+    n = 1
+    while dest.exists():
+        dest = folder / f"{entry.name}~{n}"
+        n += 1
+    try:
+        shutil.move(str(entry), str(dest))
+    except OSError:
+        log.warning("could not archive %s for the scratch sweep", entry,
+                    exc_info=True)
+        return False
+    return True
+
+
+def _sweep_stale_scratch(now: "float | None" = None) -> int:
+    """Reclaim scratch that a killed run left behind in STATE_DIR.
+
+    Every spoken reply synthesizes through a `TemporaryDirectory(dir=STATE_DIR)`
+    (default prefix `tmp`) and several state writers go through a loose `*.tmp`
+    sibling; a SIGKILL or a power cut between create and cleanup leaves both
+    behind FOREVER, because the process that owed the cleanup no longer exists.
+    The next start reclaims them — exactly two shapes, the ones this runtime
+    itself produces: a `tmp*` DIRECTORY and a `*.tmp` FILE directly inside
+    STATE_DIR, nothing recursive. A symlink is never followed out of the state
+    dir (skipping keeps the contract the same as the backup sweep's), and
+    anything younger than the grace window is left alone: a sibling instance
+    mid-synthesis can hold a live scratch dir while this one is still starting,
+    and a just-killed run's leftovers are already old by the time anyone
+    looks. Reclaim is REVERSIBLE: nothing is deleted here — the entry MOVES
+    into `scratch-quarantine/<YYYY-MM-DD>/` under STATE_DIR, owner-only, a
+    name collision getting a `~N` suffix so both copies survive, and folders
+    older than `SCRATCH_QUARANTINE_TTL_DAYS` age out of the archive at the
+    start of the run that finds them. Returns how many entries were
+    reclaimed; a state dir that cannot be
+    read is worth a warning, not a crash (the bubble must start with a dirty
+    state dir, not refuse to). The warning and the latch are process-globals
+    and MUST be pinned by any test that can trip either (order). The summary
+    itself is NOT logged here: the sweep runs before logging exists, so
+    `_log_swept_scratch()` says the one line once the journal can hear it.
+    """
+    if STATE_DIR in _SWEPT_DIRS:
+        return 0                 # this start already reclaimed this dir
+    _SWEPT_DIRS.add(STATE_DIR)
+    now = time.time() if now is None else now
+    _expire_quarantine(now)      # the archive's own TTL, before it takes more
+    cutoff = now - SCRATCH_SWEEP_AGE_S
+    removed = 0
+    try:
+        entries = list(STATE_DIR.iterdir())
+    except OSError:
+        if STATE_DIR not in _SWEEP_WARNED:
+            _SWEEP_WARNED.add(STATE_DIR)
+            log.warning("could not enumerate %s for the scratch sweep", STATE_DIR)
+        _LAST_SWEEP.update(at=time.time(), removed=0, unreadable=True)
+        return 0
+    stale = []
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            is_dir = entry.is_dir()
+            # not the host's scratch shapes, or still inside the grace window:
+            # both leave the entry alone
+            if (not _scratch_shaped(entry.name, is_dir)
+                    or entry.stat().st_mtime > cutoff):
+                continue
+            stale.append(entry)
+        except OSError:
+            continue
+    if stale:
+        folder = _scratch_quarantine_today(now)
+        if folder is None:
+            log.warning(
+                "could not make %s private — leaving %d stale scratch "
+                "entr%s in place rather than deleting them unarchived",
+                _scratch_quarantine_dir(), len(stale),
+                "y" if len(stale) == 1 else "ies")
+        else:
+            for entry in stale:
+                if _quarantine_entry(entry, folder):
+                    removed += 1
+    _LAST_SWEEP.update(at=time.time(), removed=removed, unreadable=False)
+    return removed
+
+
+def _log_swept_scratch() -> None:
+    """The sweep's one-line summary, where the journal can hear it.
+
+    The sweep cannot log its own summary: it runs before `setup_logging()`
+    (the rotating handler lives in the state dir it is cleaning), and an INFO
+    record on a logger with no handlers is dropped — `lastResort` is
+    WARNING-only — so a reclaim was invisible in the journal even though it
+    had happened (found live 2026-09-25, on a restart that had just reclaimed
+    eleven leaked scratch entries). Read from `_LAST_SWEEP`, the same dict the
+    doctor's `state:` line reads, so the journal and the doctor can never
+    disagree about what was reclaimed. A start that found nothing says
+    nothing: the doctor is where "swept nothing" belongs."""
+    removed = int(_LAST_SWEEP.get("removed") or 0)
+    if not removed:
+        return
+    log.info("swept %d stale scratch entr%s from %s into %s "
+             "(recoverable for %d days)", removed,
+             "y" if removed == 1 else "ies", STATE_DIR,
+             _scratch_quarantine_dir(), SCRATCH_QUARANTINE_TTL_DAYS)
+
+
+def _dir_size(path: "Path") -> tuple:
+    """(bytes, entries) under `path`, recursively, best-effort.
+
+    Symlinks are counted as single entries and never followed (the runtime
+    hardening rule again: nothing in the state dir may lead out of it). An
+    unreadable subtree simply contributes nothing — a diagnostic must not
+    fail because one entry revoked it the view."""
+    total = 0
+    count = 0
+    try:
+        it = list(path.iterdir())
+    except OSError:
+        return 0, 0
+    for entry in it:
+        try:
+            if entry.is_symlink():
+                count += 1
+                continue
+            if entry.is_dir():
+                add_b, add_c = _dir_size(entry)
+                total += add_b
+                count += 1 + add_c
+            else:
+                total += entry.stat().st_size
+                count += 1
+        except OSError:
+            continue
+    return total, count
+
+
+def _fmt_size(num: float) -> str:
+    """Human size the way the doctor says sizes: 0 B, 512.0 KB, 3.2 MB."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024.0 or unit == "GB":
+            return f"{int(num)} B" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} GB"
+
+
+def _human_ago(seconds: float) -> str:
+    """Human 'how long ago' for a diagnostic line."""
+    if seconds < 5.0:
+        return "just now"
+    if seconds < 90.0:
+        return f"{int(seconds)}s ago"
+    if seconds < 5400.0:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 172800.0:
+        return f"{seconds / 3600.0:.1f}h ago"
+    return f"{seconds / 86400.0:.1f}d ago"
+
+
+def _state_hygiene_log() -> Path:
+    """The trend log's path, derived from STATE_DIR at CALL time so a redirected
+    state dir (the suite's sandbox) carries its history with it."""
+    return STATE_DIR / STATE_HYGIENE_LOG_NAME
+
+
+def _read_state_hygiene_log() -> list:
+    """Every recorded reading, oldest first.
+
+    A line that is not a JSON object carrying a numeric `at` is DROPPED rather
+    than fatal: the log is a diagnostic, a torn last line is exactly what a
+    power cut leaves behind, and a trend that refused to render because its
+    history was malformed would hide the growth it exists to show.
+    """
+    rows = []
+    try:
+        text = _state_hygiene_log().read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return rows
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and isinstance(row.get("at"), (int, float)):
+            rows.append(row)
+    return rows
+
+
+def _fmt_delta(num: float) -> str:
+    """A signed size for a trend: `+412.0 MB`, `-1.2 GB`, `0 B`."""
+    if abs(num) < 1.0:
+        return "0 B"
+    return ("+" if num > 0 else "-") + _fmt_size(abs(num))
+
+
+def _signed(num: int) -> str:
+    """`+3`, `-2`, and a bare `0` — a delta of nothing needs no sign."""
+    return f"{num:+d}" if num else "0"
+
+
+def _hygiene_trend() -> dict:
+    """What the recorded readings say about growth, week over week.
+
+    The newest reading is compared with the newest reading at least
+    `STATE_HYGIENE_TREND_DAYS` older, so a delta always spans a full week or
+    more and never a convenient shorter one. A history shorter than that still
+    reports how much of it exists, and NO deltas — a week-over-week number
+    computed from two hours of samples would be a lie shaped like a trend.
+    """
+    rows = _read_state_hygiene_log()
+    if not rows:
+        return {"rows": 0}
+    newest = rows[-1]
+    span_days = max(0.0, (float(newest["at"])
+                          - float(rows[0]["at"])) / 86400.0)
+    out = {"rows": len(rows), "span_days": round(span_days, 2)}
+    cutoff = float(newest["at"]) - STATE_HYGIENE_TREND_DAYS * 86400.0
+    older = next((r for r in reversed(rows[:-1])
+                  if float(r["at"]) <= cutoff), None)
+    if older is None:
+        return out
+    out["since_days"] = round((float(newest["at"])
+                               - float(older["at"])) / 86400.0, 2)
+    out["size_delta"] = (int(newest.get("size_bytes") or 0)
+                         - int(older.get("size_bytes") or 0))
+    out["entries_delta"] = (int(newest.get("entries") or 0)
+                            - int(older.get("entries") or 0))
+    return out
+
+
+def _record_state_hygiene() -> bool:
+    """Append this start's hygiene reading to the trend log (best effort).
+
+    Called once per start, right after the sweep, so the row is the
+    POST-reclaim state and a start that reclaimed something says so in its own
+    row. Capped and rewritten under the state-file lock like the self-watch
+    log, because an unbounded diagnostic log would become the very leak the
+    line exists to report. A failure here is one log line, never a refused
+    start: a bubble that cannot write its own history is still a bubble.
+    """
+    if STATE_DIR in _HYGIENE_LOGGED:
+        return False
+    _HYGIENE_LOGGED.add(STATE_DIR)
+    info = _state_hygiene()
+    if not info.get("readable"):
+        return False
+    try:
+        now = time.time()
+        line = json.dumps({
+            "at": now,
+            "date": datetime.date.fromtimestamp(now).isoformat(),
+            "scratch_left": int(info.get("scratch_left") or 0),
+            "size_bytes": int(info.get("size_bytes") or 0),
+            "entries": int(info.get("entries") or 0),
+            "swept": int(_LAST_SWEEP.get("removed") or 0),
+        }, sort_keys=True)
+        with _MIC_EVENTS_LOCK:
+            try:
+                lines = _state_hygiene_log().read_text(
+                    encoding="utf-8").splitlines()
+            except (OSError, ValueError):
+                lines = []
+            lines = ([ln for ln in lines if ln.strip()]
+                     [-(STATE_HYGIENE_MAX - 1):] + [line])
+            _core_settings.atomic_private_write(_state_hygiene_log(),
+                                                "\n".join(lines) + "\n")
+        return True
+    except Exception:
+        log.exception("cannot record the state-hygiene reading")
+        return False
+
+
+def _state_hygiene() -> dict:
+    """The state dir's hygiene, as the doctor's line will report it.
+
+    Numbers, not sentences — the doctor owns the wording, this owns the
+    reading (the gpu_lines contract): scratch-shaped entries currently IN the
+    state dir (the same predicate the sweep removes by, minus the age gate —
+    a young scratch dir from a live sibling still shows up here, because a
+    diagnostic reports what is, not what will be swept next start), the last
+    sweep's result, and the dir's total size with an entry count. A state dir
+    that cannot be read reports `readable: False` instead of numbers."""
+    info: dict = {}
+    try:
+        entries = list(STATE_DIR.iterdir())
+    except OSError:
+        info["readable"] = False
+        return info
+    leaked = 0
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                continue
+            if _scratch_shaped(entry.name, entry.is_dir()):
+                leaked += 1
+        except OSError:
+            continue
+    info["readable"] = True
+    info["scratch_left"] = leaked
+    last = dict(_LAST_SWEEP)
+    info["last_sweep"] = last
+    size_b, count = _dir_size(STATE_DIR)
+    info["size_bytes"] = size_b
+    info["entries"] = count
+    info["trend"] = _hygiene_trend()
+    return info
+
+
+def _state_hygiene_line() -> str:
+    """The doctor's `state:` sentence — the host's own rendering of its own
+    reading, shipped through the lines-dep contract (the doctor places it,
+    the host owns the words)."""
+    info = _state_hygiene()
+    if not info.get("readable"):
+        return f"state: {STATE_DIR} could not be read for a hygiene reading"
+    parts = []
+    left = int(info.get("scratch_left") or 0)
+    if left:
+        parts.append(f"{left} scratch-shaped entr{'y' if left == 1 else 'ies'} "
+                     "present (in grace or from a live sibling) — the next "
+                     "start sweeps them")
+    else:
+        parts.append("no leaked scratch")
+    last = info.get("last_sweep") or {}
+    at, removed, unreadable = last.get("at"), int(last.get("removed") or 0), \
+        bool(last.get("unreadable"))
+    if at is None:
+        parts.append("sweep not run this process")
+    elif unreadable:
+        parts.append("last sweep could not read the state dir")
+    else:
+        ago = max(0.0, time.time() - float(at))
+        parts.append("last start swept "
+                     + (f"{removed} entr{'y' if removed == 1 else 'ies'} "
+                        f"{_human_ago(ago)}" if removed
+                        else f"nothing ({_human_ago(ago)})"))
+    size = _fmt_size(float(info.get("size_bytes") or 0))
+    count = int(info.get("entries") or 0)
+    parts.append(f"{size} in {count} entr{'y' if count == 1 else 'ies'}")
+    trend = info.get("trend") or {}
+    if not trend.get("rows"):
+        parts.append("trend: no readings yet")
+    elif "size_delta" not in trend:
+        parts.append(f"trend needs a week ({float(trend.get('span_days') or 0.0):.1f} "
+                     "days recorded)")
+    else:
+        delta = int(trend.get("entries_delta") or 0)
+        parts.append(f"{STATE_HYGIENE_TREND_DAYS}-day trend "
+                     f"{_fmt_delta(float(trend.get('size_delta') or 0))}, "
+                     f"{_signed(delta)} entr{'y' if abs(delta) == 1 else 'ies'}")
+    return f"state: " + "; ".join(parts)
+
+
 def _prepare_runtime() -> bool:
-    """Create the runtime roots privately and harden existing state files."""
+    """Create the runtime roots privately, harden existing state files, and
+    reclaim scratch a killed run left behind."""
     for directory in (CONFIG_DIR, STATE_DIR, WHISPER_MODEL_DIR):
         if not _private_dir(directory):
             return False
+    _sweep_stale_scratch()
+    _record_state_hygiene()      # post-reclaim, so the trend logs what is left
     return _secure_runtime_files()
 
 
@@ -2359,32 +2893,17 @@ def _wake_name() -> str:
     return str(SETTINGS.get("assistant_name", "assistant")).strip().lower() or "assistant"
 
 
-_WAKE_FILLER = {"hey", "ok", "okay", "hi", "yo"}
-
-
+# Phase 4f: core/voice.py owns the wake vocabulary and the matching rules;
+# these keep the historical H.* names as delegations (the tests and the
+# pipeline both use them) with the wake name read LIVE at every call, so a
+# settings change applies without any rebinding.
 def _norm_words(text: str) -> list[str]:
-    return [w.strip(".,!?;:") for w in (text or "").split()]
+    return _voice.norm_words(text)
 
 
 def _is_wake_utt(text: str) -> bool:
     """True when the whole utterance is just the wake name ('hey assistant')."""
-    words = [w for w in _norm_words(text.lower()) if w]
-    name_words = _wake_name().split()
-    if words == name_words:
-        return True
-    return (len(words) == len(name_words) + 1 and words[0] in _WAKE_FILLER
-            and words[1:] == name_words)
-
-
-def _wake_skeleton(word: str) -> str:
-    """Pronunciation-ish skeleton: consonants only, c/k/q/x/z→s, h/w dropped,
-    liquids/nasals (r/l/m) unified to n. Whistle-down of whisper mishearings
-    like 'cypher'→'Siphon' (both → 'spn'): wake matching must err toward
-    LISTENING, not toward ignoring its own user."""
-    w = word.lower().translate(str.maketrans("", "", "hw"))
-    w = w.translate(str.maketrans("ckqxz", "sssss"))
-    w = "".join(ch for ch in w if ch not in "aeiouy")
-    return w.replace("r", "n").replace("m", "n").replace("l", "n")
+    return _voice.is_wake_utt(text, _wake_name().split())
 
 
 def _match_wake(text: str) -> str | None:
@@ -2393,23 +2912,16 @@ def _match_wake(text: str) -> str | None:
     Word-token based, name tried before the filler skip (so a custom name
     that itself starts with 'hey' still works). Falls back to a fuzzy
     pronunciation-skeleton match for misheard names (Siphon~cypher)."""
-    words = _norm_words(text)
-    if not words:
-        return None
-    lw = [w.lower() for w in words]
-    name_words = _wake_name().split()
-    fuzzy_ok = all(len(nw) >= 4 for nw in name_words)   # never fuzzy on tiny names
-    for skip in (0, 1):
-        if skip and (len(lw) <= skip or lw[skip - 1] not in _WAKE_FILLER):
-            continue
-        seg = lw[skip:skip + len(name_words)]
-        if seg == name_words:
-            return " ".join(words[skip + len(name_words):])
-        if (fuzzy_ok and len(seg) == len(name_words)
-                and [_wake_skeleton(w) for w in seg]
-                == [_wake_skeleton(nw) for nw in name_words]):
-            return " ".join(words[skip + len(name_words):])
-    return None
+    return _voice.match_wake(text, _wake_name().split())
+
+
+def _wake_anywhere(text: str) -> str | None:
+    """Engagement when the wake name is not at the START of a short utterance
+    (the custom-name door: no openWakeWord model exists for it, so the
+    transcript is the only way in). Same word matching and same fuzzy skeleton
+    as `_match_wake`, any position, bounded to a short utterance. Returns the
+    text with the name removed (possibly '') or None when it is not there."""
+    return _voice.wake_anywhere(text, _wake_name().split())
 
 
 def _tick_now() -> float:
@@ -2601,76 +3113,22 @@ _core_bubble.configure(SETTINGS)
 _MIC_LAST_OPEN_DEVICE = threading.local()
 
 
+# Phase 4f: the mic open/device primitives live in core/voice.py; this host
+# keeps the historical names as delegations, supplying its own sounddevice
+# module, logger, mic-operation lock and last-open record at every call —
+# which keeps every `monkeypatch.setattr(H, "_open_input", …)` seam live.
 def _available_input_devices() -> list[dict]:
-    """Return input-capable devices without allowing a failed query to escape."""
-    try:
-        devices = sd.query_devices()
-    except Exception:
-        return []
-    if isinstance(devices, dict):
-        devices = [devices]
-    result = []
-    for device in devices or []:
-        if not isinstance(device, dict):
-            continue
-        try:
-            if int(device.get("max_input_channels", 0) or 0) > 0:
-                result.append(device)
-        except (TypeError, ValueError):
-            continue
-    return result
+    return _voice.available_input_devices(sd, log)
 
 
 def _device_is_available(device, devices: list[dict]) -> bool:
-    want = str(device).strip().casefold()
-    for info in devices:
-        name = str(info.get("name", "")).strip().casefold()
-        if want == name or want in name:
-            return True
-    return False
+    return _voice.device_is_available(device, devices)
 
 
 def _open_input_unlocked(device, rate: int, blocksize: int, cb) -> tuple:
-    """Open input, handling stale configured names without querying them."""
-    configured = device is not None and str(device).strip()
-    devices = _available_input_devices() if configured else []
-    candidates = [device]
-    if configured and not _device_is_available(device, devices):
-        log.warning("configured microphone %r is unavailable; falling back to "
-                    "system default", device)
-        candidates = [None]
-        candidates.extend(str(info.get("name", "")) for info in devices
-                          if str(info.get("name", "")))
-
-    last_error = None
-    for candidate in candidates:
-        try:
-            stream = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                                    blocksize=blocksize, callback=cb,
-                                    device=candidate)
-            _MIC_LAST_OPEN_DEVICE.value = candidate
-            return stream, rate
-        except Exception as exc:
-            last_error = exc
-            try:
-                info = (sd.query_devices(candidate, kind="input")
-                        if candidate is not None else
-                        sd.query_devices(kind="input"))
-                native = int(float(info.get("default_samplerate") or rate))
-            except Exception:
-                native = rate
-            if native != rate:
-                try:
-                    stream = sd.InputStream(samplerate=native, channels=1,
-                                            dtype="int16", blocksize=blocksize,
-                                            callback=cb, device=candidate)
-                    _MIC_LAST_OPEN_DEVICE.value = candidate
-                    return stream, native
-                except Exception as exc2:
-                    last_error = exc2
-    if last_error is not None:
-        raise last_error
-    raise ValueError("no input device available")
+    return _voice.open_input_unlocked(
+        device, rate, blocksize, cb, sd=sd, log=log,
+        mic_lock=_audio.MIC_OPERATION_LOCK, last_open=_MIC_LAST_OPEN_DEVICE)
 
 
 def _open_input(device, rate: int, blocksize: int, cb) -> tuple:
@@ -2700,57 +3158,15 @@ def _mic_device_to_open(configured) -> tuple:
     default there would record from the wrong microphone without saying so.
     `None` is how this app says "the system default" everywhere else.
     """
-    # The loader coerces this key to a str (measured: null, 5, "  ", ["a"] and
-    # {"x": 1} all become ""), so `configured` is a string in every path the
-    # file writes -- but SETTINGS is a plain dict that embedders and tests
-    # assign into directly, and `str(None)` is the TRUTHY string "None": a
-    # device name no machine has, which would have warned and notified on every
-    # open. Anything that is not a string means "nothing pinned".
-    if isinstance(configured, str):
-        device = configured.strip() or None
-    else:
-        device = None
-    if device is None or _audio is None:
-        return device, False
-    try:
-        _audio.sd.query_devices(device, kind="input")
-    except ValueError as e:
-        # ValueError is sounddevice's own "No input device matching '<name>'" —
-        # a CONFIRMED absence, and the only answer that justifies standing in
-        # for the user's choice with the default (measured: the same type for a
-        # stale ALSA pin and for a name that never existed).
-        log.warning("configured microphone %r is not on this machine (%s) — "
-                    "using the system default instead", device, e)
-        return None, True
-    except Exception as e:                  # noqa: BLE001 -- unknown is not absent
-        # A broken audio backend, or a wiring mistake in this function itself,
-        # must NOT read as "the device is gone": keeping the pin makes the open
-        # fail loudly, which is the old and honest shape. Only a known absence
-        # substitutes anything.
-        log.warning("could not check whether microphone %r is present (%s) — "
-                    "keeping it", device, e)
-        return device, False
-    return device, False
+    return _voice.mic_device_to_open(configured, _audio, log)
 
 
 def _stop_stream_owned(stream) -> None:
-    """Run stream teardown under the same owner as InputStream construction."""
-    if stream is None:
-        return
-    _audio.MIC_OPERATION_LOCK.acquire()
-    try:
-        stream.stop()
-        stream.close()
-    finally:
-        _audio.MIC_OPERATION_LOCK.release()
+    _voice.stop_stream_owned(stream, _audio.MIC_OPERATION_LOCK)
 
 
 def _start_stream_owned(stream) -> None:
-    _audio.MIC_OPERATION_LOCK.acquire()
-    try:
-        stream.start()
-    finally:
-        _audio.MIC_OPERATION_LOCK.release()
+    _voice.start_stream_owned(stream, _audio.MIC_OPERATION_LOCK)
 
 
 class Recorder(_audio.Recorder):
@@ -3841,8 +4257,11 @@ def _producer_still_here(producer_alive) -> bool:
 
 
 # ------------------------------------------------------------------------ audio in
-# Audio ownership ends at these primitives. ContinuousListener remains in this
-# file for now because it owns Assistant/UI lifecycle state and health hooks.
+# Audio ownership ends at the stateless primitives (Phase 4f moved them to
+# core/voice.py: the gate, wake matching, echo filter, spotter, mic open/device
+# code). ContinuousListener stays in this file — it owns Assistant/UI lifecycle
+# state and health hooks, and the delegation above is what keeps the historical
+# monkeypatch seams live on this module.
 
 
 # ---------------------------------------------------------------------------- tools
@@ -4323,6 +4742,10 @@ def _next_occurrence(h: int, mi: int, se: int, now: float) -> float:
 
 _spotter_model = None
 _spotter_failed = False
+#: What the loader ACTUALLY got, as opposed to what settings asked for. A
+#: custom `assistant_name` has no model in here, and that is the difference
+#: between "wake is broken" and "this build wakes on the transcript".
+_SPOTTER_MODEL_NAMES: list = []
 _SPOTTER_FRAME = 1280                   # 80 ms of 16 kHz int16 audio
 
 
@@ -4335,10 +4758,12 @@ def _get_spotter():
         from openwakeword.model import Model
         models = SETTINGS.get("spotter_models") or []
         _spotter_model = Model(wakeword_models=models) if models else Model()
-        log.info("wake spotter loaded: %s",
-                 sorted(getattr(_spotter_model, "model_names",
-                                _spotter_model.models.keys() if hasattr(
-                                    _spotter_model, "models") else [])) or "stock")
+        names = sorted(str(n) for n in getattr(
+            _spotter_model, "model_names",
+            _spotter_model.models.keys() if hasattr(
+                _spotter_model, "models") else []))
+        _SPOTTER_MODEL_NAMES[:] = names
+        log.info("wake spotter loaded: %s", names or "stock")
     except Exception:
         _spotter_failed = True
         _spotter_model = None
@@ -4346,69 +4771,47 @@ def _get_spotter():
     return _spotter_model
 
 
-class WakeSpotter:
-    """Streaming openWakeWord detector with a 2-second pre-roll buffer.
+def _warn_if_spotter_cannot_cover_this_name() -> None:
+    """Say once, at WARNING, when "wake spotter on" cannot wake the name.
 
-    feed() consumes int16 frames at 16 kHz and returns (True, audio) exactly
-    once per detection, where audio = pre-roll + the speech captured since the
-    hit. The caller keeps feeding to gather trailing speech after the hit."""
+    The toggle reads "wake spotter on", so silence here would advertise an
+    audio wake that cannot fire for the configured name: every wake would then
+    ride on whisper hearing the name, and a user whose wakes fail has nothing
+    to read anywhere. Called when the spotter is armed (once per arm, not per
+    frame), and silent while the spotter is untried or already covers the name.
+    """
+    if _spotter_wakes_for() is not False:
+        return
+    log.warning(
+        "the wake spotter has no model for %r (loaded: %s) — hands-free still "
+        "wakes on the TRANSCRIPT of the name, so say it clearly; add a "
+        "matching model to spotter_models for audio wake",
+        _wake_name(), ", ".join(_SPOTTER_MODEL_NAMES) or "stock set")
 
-    PREROLL_S = 2.0
-    MAXWAIT_S = 8.0                 # give up collecting after this long
-    SCORE_HIT = 0.5
-    SCORE_HOLD = 0.35
 
-    def __init__(self) -> None:
-        self._buf: list = []        # pre-roll ring as a list of frames
-        self._max_pre = int(self.PREROLL_S * SAMPLE_RATE // _SPOTTER_FRAME)
-        self._speech: list = []     # chunks collected after a hit
-        self._armed = False         # a hit is pending collection
-        self._collected = 0.0       # seconds of audio since the hit
-        self._residual = np.empty(0, dtype=np.int16)   # sub-chunk carryover
+def _spotter_wakes_for(name: str | None = None) -> bool | None:
+    """Can the audio spotter fire for the configured wake name?
 
-    def feed(self, frame) -> "tuple[bool, list]":
-        """Process one 16 kHz int16 frame (any length). Returns (fired, audio).
+    True/False once the spotter has LOADED — its model list is then a fact —
+    and None before that, because an untried spotter is not a healthy one and
+    the project's rule is to say `untried` rather than guess. Model names come
+    as slugs (`hey_jarvis`), so they are matched the same way the transcript
+    gate matches speech: same words, or the same pronunciation skeleton.
+    """
+    if not _SPOTTER_MODEL_NAMES:
+        return None
+    want = _wake_name().split()
+    for model in _SPOTTER_MODEL_NAMES:
+        got = [w for w in re.split(r"[^a-z0-9]+", str(model).lower()) if w]
+        if _voice.skeleton_match(got, want):
+            return True
+    return False
 
-        predict() runs EXACTLY once per 1280-sample chunk — the model is
-        stateful and double-feeding corrupts its features. Leftover samples
-        are carried to the next call (the mic delivers 1024-sample frames)."""
-        model = _get_spotter()
-        if model is None:
-            return False, []
-        data = np.concatenate([self._residual, np.asarray(frame).reshape(-1)]) \
-            if len(self._residual) else np.asarray(frame).reshape(-1)
-        n = _SPOTTER_FRAME
-        nfull = len(data) // n
-        for i in range(nfull):
-            chunk = data[i * n:(i + 1) * n]
-            self._buf.append(chunk)
-            del self._buf[:-self._max_pre]
-            try:
-                scores = model.predict(chunk)
-            except Exception:
-                # a predict failure corrupts openWakeWord's internal stream:
-                # drop the residual too, or the next feed() re-feeds stale
-                # samples and every subsequent score is garbage
-                log.exception("wake spotter predict failed")
-                self._residual = np.empty(0, dtype=np.int16)
-                return False, []
-            hot = max(scores.values()) if scores else 0.0
-            if not self._armed and hot > self.SCORE_HIT:
-                self._armed = True
-                self._collected = 0.0
-                self._speech = list(self._buf)     # pre-roll included
-            elif self._armed:
-                self._speech.append(chunk)
-                self._collected += n / SAMPLE_RATE
-                if self._collected >= self.MAXWAIT_S or (
-                        hot < self.SCORE_HOLD and self._collected > 1.0):
-                    self._armed = False
-                    out = self._speech
-                    self._speech = []
-                    return True, out
-        self._residual = data[nfull * n:]
-        return False, []
 
+# Phase 4f: WakeSpotter lives in core/voice.py (stateless given a model, a
+# clock and a chunk size); the ContinuousListener builds it through
+# `_new_spotter` with this host's audio facts. The alias below (after the
+# `_voice` handle exists) keeps the historical H.WakeSpotter name.
 
 
 
@@ -5414,6 +5817,15 @@ def _classify_edit_path(p: Path) -> str:
 # implementation silently diverging from the tested one).
 _core_lifecycle = _load_module("lifecycle")
 
+# Phase 4f: core/voice.py owns the STATELESS voice primitives — the energy
+# gate, the wake vocabulary and matching rules, the echo filter, the wake
+# spotter and the mic open/device primitives. ContinuousListener, Recorder and
+# _speak stay here (assistant/UI lifecycle state and health hooks — see the
+# boundary comment at the audio-in section); the primitives that only need a
+# settings dict, a logger, the sounddevice module and the mic lock take them
+# as parameters, and this handle is the seam every delegation below binds to.
+_voice = _load_module("voice")
+
 # Phase 4c: core.tools owns the extracted runtime. It receives a late-bound host
 # proxy so existing module globals and monkeypatch seams stay live, and the app
 # SUBCLASSES the belt to inject them — which is the only reason `ToolBelt` is a
@@ -5482,49 +5894,30 @@ _core_tools.ToolBelt = ToolBelt
 TOOLS = _core_tools.build_tools()
 
 
-class _SpeechGate:
-    """Energy-based speech detector with an adaptive noise floor.
+# Phase 4f: the energy gate and the wake spotter live in core/voice.py
+# (stateless given a threshold / a model+clock+chunk); these aliases keep the
+# historical H._SpeechGate and H.WakeSpotter names, which the settings app's
+# fake listener and the tests both reach through the host.
+_SpeechGate = _voice.SpeechGate
 
-    Speech starts when `start_frames` consecutive frames exceed
-    max(noise_floor*2.5, threshold); it ends after `hangover_frames`
-    quiet frames. The floor tracks the room while nobody speaks."""
 
-    def __init__(self, threshold: int, start_frames: int = 2,
-                 hangover_frames: int = 14) -> None:
-        self.threshold = float(threshold)
-        self.start_frames = start_frames
-        self.hangover_frames = hangover_frames
-        self.floor = max(50.0, self.threshold * 0.5)
-        self.in_speech = False
-        self._loud = 0
-        self._quiet = 0
+def WakeSpotter(sample_rate=None, frame=None, model=None, log=None):
+    """The historical bare constructor, with THIS host's audio facts as the
+    defaults: `H.WakeSpotter()` still builds a working spotter (the tests do
+    exactly that, and the model still arrives late through `_get_spotter`, so
+    `H._spotter_model` patches stay live), while the listener's `_new_spotter`
+    passes all four explicitly. The class constants the tests read travel on
+    the factory, as they did on the class."""
+    return _voice.WakeSpotter(
+        SAMPLE_RATE if sample_rate is None else sample_rate,
+        _SPOTTER_FRAME if frame is None else frame,
+        model=model if model is not None else _get_spotter,
+        log=log if log is not None else logging.getLogger("handsoff"))
 
-    def feed(self, rms: float) -> str:
-        """Feed one frame's RMS; returns '', 'start' or 'end'."""
-        if not self.in_speech:
-            self.floor = 0.97 * self.floor + 0.03 * rms
-            if rms > max(self.floor * 2.5, self.threshold):
-                self._loud += 1
-                if self._loud >= self.start_frames:
-                    self.in_speech = True
-                    self._quiet = 0
-                    return "start"
-            else:
-                self._loud = 0
-            return ""
-        if rms > max(self.floor * 1.6, self.threshold * 0.7):
-            self._quiet = 0
-        else:
-            self._quiet += 1
-        if self._quiet >= self.hangover_frames:
-            self.in_speech = False
-            self._loud = 0
-            return "end"
-        return ""
 
-    def reset(self) -> None:
-        self.in_speech = False
-        self._loud = self._quiet = 0
+for _const in ("PREROLL_S", "MAXWAIT_S", "SCORE_HIT", "SCORE_HOLD"):
+    setattr(WakeSpotter, _const, getattr(_voice.WakeSpotter, _const))
+del _const
 
 
 class ContinuousListener:
@@ -5812,10 +6205,16 @@ class ContinuousListener:
             old.join(timeout=2.0)         # old thread closes its own stream
         log.warning("mic self-heal: capture stream restarted")
 
+    def _new_spotter(self) -> "WakeSpotter":
+        """A fresh spotter bound to THIS host's audio facts (rate, chunk size,
+        the late-read model loader and this module's logger)."""
+        return _voice.WakeSpotter(
+            SAMPLE_RATE, _SPOTTER_FRAME, model=_get_spotter, log=log)
+
     def reset(self) -> None:
         self._discard = True
         if self._spotter is not None:
-            self._spotter = WakeSpotter()   # drop any pending detection
+            self._spotter = self._new_spotter()   # drop any pending detection
 
     def _process_frame(self, indata: "np.ndarray", gate: "_SpeechGate",
                        frames: list, max_frames: int, min_frames: int) -> None:
@@ -5876,7 +6275,7 @@ class ContinuousListener:
                     audio = np.concatenate(
                         [*self._spotter._speech, audio]).reshape(-1)
                     self._assistant._spotter_wake = True
-                self._spotter = WakeSpotter()
+                self._spotter = self._new_spotter()
                 self._assistant.sigUtterance.emit(audio)
                 self._health_utt += 1
             frames.clear()
@@ -5924,8 +6323,9 @@ class ContinuousListener:
         spotter_on = (_setting_flag("wake_spotter")
                       and _setting_flag("wake_word_required"))
         if spotter_on and _get_spotter() is not None:
-            self._spotter = WakeSpotter()
+            self._spotter = self._new_spotter()
             log.info("audio wake spotter active (openWakeWord)")
+            _warn_if_spotter_cannot_cover_this_name()
         else:
             self._spotter = None
 
@@ -7805,7 +8205,7 @@ class Assistant(QObject):
         words = [w for w in _norm_words(text.lower()) if w]
         if not words:
             return False
-        if words and words[0] in _WAKE_FILLER:
+        if words and words[0] in _voice.WAKE_FILLER:
             words = words[1:]
         if not words:
             return False
@@ -8295,9 +8695,28 @@ class Assistant(QObject):
             elif self._handsfree and _setting_flag("wake_word_required", False):
                 now = _tick_now()
                 if _is_wake_utt(text):
-                    # bare wake name ('assistant' / 'hey assistant'): engage
-                    # and confirm out loud (check BEFORE prefix match —
-                    # _match_wake returns '' for bare names)
+                    # bare wake name ('assistant' / 'hey assistant'): 'rest'
+                    # empty means engage and confirm out loud below (checked
+                    # BEFORE the prefix match — _match_wake returns '' for
+                    # bare names)
+                    rest = ""
+                else:
+                    rest = _match_wake(text)
+                    if rest is None and now >= self._wake_until:
+                        # The audio spotter can only fire for the models it
+                        # LOADED, and none of them is a custom assistant_name —
+                        # so for a custom name the transcript is the only door
+                        # left, and it has to open for a name whisper did not
+                        # put first (a split chunk, a mishearing). Only while
+                        # NOT engaged: a name mentioned mid-sentence in a live
+                        # conversation is not a new wake, and stripping it
+                        # would edit the user's command.
+                        rest = _wake_anywhere(text)
+                        if rest is not None:
+                            log.info("wake word — heard inside the utterance "
+                                     "(the spotter has no model for %r)",
+                                     _wake_name())
+                if rest == "":
                     self._wake_until = now + float(SETTINGS.get("engage_seconds", 45.0))
                     log.info("wake word — engaged for %ss", SETTINGS.get("engage_seconds"))
                     self._set(gen, IDLE)
@@ -8306,7 +8725,6 @@ class Assistant(QObject):
                         f"{int(SETTINGS.get('engage_seconds', 45.0))} seconds.",
                         gen, cancel)
                     return
-                rest = _match_wake(text)
                 if rest is not None:
                     self._wake_until = now + float(SETTINGS.get("engage_seconds", 45.0))
                     log.info("wake word — engaged for %ss", SETTINGS.get("engage_seconds"))
@@ -9062,33 +9480,9 @@ def _save_memory(items: list[dict]) -> None:
         log.exception("cannot save memory")
 
 
-_ECHO_STOPWORDS = frozenset("""
-a an the is are am i you me my your it its this that these those of to in on at
-for and or but so do does did can could would should will what when where who
-how why please just now ok okay hey there then
-""".split())
-
-
-def _is_echo(text: str, recent: list[str]) -> bool:
-    """True if the freshly transcribed capture substantially repeats lines we
-    just spoke aloud. Compares distinctive (non-stopword) words: a capture is
-    an echo when its single distinctive word matches, or >= 60% of its
-    distinctive words appear in the recent TTS text."""
-    if not text or not recent:
-        return False
-
-    def _words(s: str) -> list[str]:
-        return [w for w in re.findall(r"[a-z']+", s.lower())
-                if len(w) > 2 and w not in _ECHO_STOPWORDS]
-
-    said = set(_words(" ".join(recent)))
-    got = set(_words(text))
-    if not got or not said:
-        return False
-    overlap = sum(1 for w in got if w in said)
-    if len(got) == 1:
-        return overlap == 1
-    return overlap >= max(2, int(0.6 * len(got)))
+# Phase 4f: is_echo (and its stopword set) lives in core/voice.py; this alias
+# keeps the historical H._is_echo name the echo tests use.
+_is_echo = _voice.is_echo
 
 
 def _msg_tokens(m: dict) -> int:
@@ -9939,6 +10333,7 @@ def main() -> int:
             "not private or are redirected by a symlink.\n")
         return 1
     setup_logging()
+    _log_swept_scratch()   # the sweep ran before the journal existed
     sys.excepthook = lambda *a: log.exception("uncaught exception", exc_info=a)
     threading.excepthook = lambda a: log.exception("uncaught thread exception", exc_info=a.exc_type)
     crash_fh = open(CRASH_LOG, "a", buffering=1)

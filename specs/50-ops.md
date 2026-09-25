@@ -75,7 +75,16 @@ only).
 
 ## 3. Runtime (`main()`)
 
-`_prepare_runtime()` (private dirs + 0600, symlink-refuse) → logging +
+`_prepare_runtime()` (private dirs + 0600, symlink-refuse, stale-scratch
+sweep ARCHIVED under `scratch-quarantine/<date>/` for
+`SCRATCH_QUARANTINE_TTL_DAYS` days rather than deleted, recorded into
+`_LAST_SWEEP` for the doctor; latched once per state dir
+per start, because `ControlServer._serve()` calls `_prepare_runtime()` again
+and a second no-op sweep would overwrite the reclaim's own record) →
+logging + `_log_swept_scratch()` (the sweep runs before the journal exists:
+it has to, the rotated log lives in the state dir it cleans; the same start
+appends its post-reclaim reading to the capped `state-hygiene.jsonl` trend,
+`_record_state_hygiene()`) +
 `threading.excepthook` + faulthandler on `crash.log` → version/settings/
 brain/mic banner → `acquire_lock()` (flock; second copy exits 0) →
 `QApplication` (`setApplicationName`, Wayland app-id for niri rules) →
@@ -91,7 +100,13 @@ dictation-off status health level doctor settings selftest reload-settings
 clear-history say preview-pack preview-clear stop-audit. Read-only (no token):
 `status health level doctor handsfree-status`. Everything else needs
 `token=<64 hex>` first line (constant-time compare); token lives in
-`control.token` (0700 state dir + `_peer_uid` gate). Request caps: 65536 B,
+`control.token` (0700 state dir + `_peer_uid` gate). The doctor's `state:`
+line (and the JSON surface's `state_hygiene` key) reports the state dir's
+hygiene from ONE host collector: scratch-shaped entries present (the same
+`_scratch_shaped` predicate the sweep removes by, minus the age gate), the
+last sweep's result (`_LAST_SWEEP`: when, how many removed, whether the dir
+was unreadable), and total size/entry count — a host without the dep prints
+no line. Request caps: 65536 B,
 5 s wall budget; single accept thread; runs admitted via
 `BoundedRegistry("control", 1)`; diagnostics via `("diagnostic", 1)` (second
 request refused by name with the cause in the reply). `ptt_client` maps verbs
@@ -151,6 +166,29 @@ between two clean lines; `seen: false` is reported whenever the ledger
 exists (the cap-refusals idiom: "none" must be distinguishable from
 "never checked"), and a shutdown-annotated ghost renders `expected, not an
 anomaly`. The reader adjudicates; doctor formats.
+
+`ci/desk_retest.py` is the desk retest in one command (ACCEPTANCE §10's
+automated half): it plants `tmpdeskcheck*` probes in the real state dir,
+restarts the unit once per check that needs a fresh start, reads the journal
+and the doctor's `state:`/`wake:` lines back, and prints a paste-ready
+evidence block whose last line names the items only a person can close (A1–A4,
+a real voice). `--only B1,C4` narrows it, `--dry-run` changes nothing, and
+`--simulate` rehearses the whole thing against a throwaway state dir with the
+checkout's own code and no systemd (B1's SIGKILL and A5's arming warning then
+report themselves desk-only); on the real backend B1 speaks aloud and kills
+the bubble mid-synthesis on purpose, and B5 briefly renames the real
+`scratch-quarantine`. Its restarts are PACED to the unit's own
+`StartLimitBurst`/`StartLimitIntervalSec`, counted from the journal (every
+start systemd actually performed, including a previous run's tail and
+`Restart=always` respawns) and kept one start under the burst — the first two
+live runs tripped `start-limit-hit` and left the bubble down minutes, which
+is why pacing reads the journal rather than a process-local list. Readiness
+is the control socket rather than the doctor (`doctor` answers for a dead
+bubble from a LOCAL report, `specs/50-ops.md` §5); a start that does not come
+back is recovered with the documented `reset-failed` + `start`; a client-side
+doctor report is refused rather than graded; and a run that begins on a
+`failed` unit revives it before judging anything. Exit 0 when every automated item passed — a desk tool,
+never a CI gate; its guards are `tests/test_desk_retest.py`.
 
 ## 7. Environment + deps
 

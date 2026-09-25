@@ -1035,20 +1035,52 @@ def _is_cuda_error(exc: BaseException) -> bool:
         _CUDA_ERR_RE.search(str(exc)))
 
 
+#: A clip at most this long whose VAD-filtered pass finds NO speech at all is
+#: retried once with the filter off. This is the announce-and-listen shape —
+#: "… and tomorrow?" is well under a second — and silero needs more context
+#: than such a clip gives it, so the filter removes the WHOLE utterance and the
+#: turn dies downstream as "unintelligible while engaged". A longer clip is
+#: left to the filter: there an empty transcript really is silence, and
+#: inventing words for a room is a worse failure than the one this fixes.
+VAD_RETRY_MAX_S = 3.0
+
+
 def transcribe(audio_int16: np.ndarray, model_getter=None) -> str:
     global _whisper_model, _whisper_cpu_fallback
     with _TRANSCRIBE_LOCK:
         getter = model_getter or get_whisper
         model = getter()
+        samples = audio_int16.astype(np.float32) / 32768.0
+        seconds = len(audio_int16) / float(SAMPLE_RATE)
 
         def _read(segments):
             return " ".join(s.text.strip() for s in segments).strip()
 
-        try:
-            segments, _info = model.transcribe(
-                audio_int16.astype(np.float32) / 32768.0, vad_filter=True,
-                language="en", beam_size=1)
+        def _pass(m, vad_filter: bool) -> str:
+            segments, _info = m.transcribe(samples, vad_filter=vad_filter,
+                                           language="en", beam_size=1)
             return _read(segments)
+
+        def _with_vad_retry(m) -> str:
+            """The filter's answer, or a second look without it.
+
+            Only a SHORT clip with nothing at all to show for the filtered
+            pass is retried, and only once: a retry is a second full decode,
+            and doing it on every silent hands-free fragment would double the
+            cost of exactly the traffic this listener discards most.
+            """
+            text = _pass(m, True)
+            if text or seconds > VAD_RETRY_MAX_S:
+                return text
+            retried = _pass(m, False)
+            if retried:
+                log.info("whisper's VAD found no speech in a %.1fs clip — "
+                         "retried without the filter and read %d char(s)",
+                         seconds, len(retried))
+            return retried
+
+        try:
+            return _with_vad_retry(model)
         except (RuntimeError, OSError) as exc:
             if _whisper_cpu_fallback or not _is_cuda_error(exc):
                 raise
@@ -1057,10 +1089,7 @@ def transcribe(audio_int16: np.ndarray, model_getter=None) -> str:
             with _whisper_lock:
                 _whisper_model = None
                 _whisper_cpu_fallback = True
-            segments, _info = getter().transcribe(
-                audio_int16.astype(np.float32) / 32768.0, vad_filter=True,
-                language="en", beam_size=1)
-            return _read(segments)
+            return _with_vad_retry(getter())
 
 
 def tts_to_wav(text: str, wav_path: Path, voice_getter=None) -> None:

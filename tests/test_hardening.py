@@ -632,3 +632,568 @@ class TestMissingBrainFallback:
         assert report["chat"] == {"content": "ok"}
         assert report["call_tools"] == [True, False]
         assert report["state"] == {"tools_supported": False}
+
+
+class TestSweepStaleScratch:
+    """Scratch a killed run left behind in STATE_DIR is reclaimed at startup.
+
+    The leak is real: every spoken reply synthesizes through a
+    `TemporaryDirectory(dir=STATE_DIR)` (default prefix `tmp`) and several
+    state writers go through a loose `*.tmp` sibling — a SIGKILL or a power
+    cut between create and cleanup strands both, forever, because the process
+    that owed the cleanup no longer exists. The sweep runs inside
+    `_prepare_runtime()` with a grace window, because a sibling instance can
+    still be mid-synthesis while this one starts.
+    """
+
+    NOW = 1_800_000_000.0
+
+    @staticmethod
+    def _age(path: Path, now: float, age_s: float = 10_000.0) -> None:
+        """Stamp `path`'s OWN mtime `age_s` before `now` (default ~2.8 h,
+        past the grace). Everything is stamped relative to the test's clock:
+        real mtimes would read as arbitrarily old against a fictional now."""
+        past = now - age_s
+        os.utime(path, (past, past), follow_symlinks=False)
+
+    def test_a_leftover_tmp_directory_from_a_killed_run_is_reclaimed(
+            self, H, sandbox, monkeypatch):
+        """The exact shape `_speak` leaves when the process dies mid-turn:
+        a `TemporaryDirectory(dir=STATE_DIR)` that never got its cleanup."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        leaked = H.STATE_DIR / "tmpab12cd34"       # tempfile's default prefix
+        leaked.mkdir()
+        (leaked / "tts.wav").write_bytes(b"RIFF....")
+        self._age(leaked, self.NOW)
+        assert H._sweep_stale_scratch(self.NOW) == 1
+        assert not leaked.exists()
+
+    def test_a_loose_tmp_file_from_an_interrupted_write_is_reclaimed(
+            self, H, sandbox, monkeypatch):
+        """The second shape: state writers stage through an in-directory
+        `*.tmp` file (`atomic_private_write`'s mkstemp, the laya corpus
+        writer); a kill mid-write strands it beside the real file."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        leaked = H.STATE_DIR / ".reminders.json.a1b2c3.tmp"
+        leaked.write_text("{\"partial\"", encoding="utf-8")
+        self._age(leaked, self.NOW)
+        assert H._sweep_stale_scratch(self.NOW) == 1
+        assert not leaked.exists()
+
+    def test_younger_than_the_grace_window_is_left_alone(
+            self, H, sandbox, monkeypatch):
+        """A sibling instance can be mid-synthesis while this one starts:
+        fresh scratch belongs to the living and is never swept."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        fresh_dir = H.STATE_DIR / "tmpfresh01"
+        fresh_dir.mkdir()
+        (fresh_dir / "tts.wav").write_bytes(b"RIFF")
+        fresh_file = H.STATE_DIR / ".world-events-seen.x9y8z7.tmp"
+        fresh_file.write_text("{}", encoding="utf-8")
+        self._age(fresh_dir, self.NOW, age_s=10.0)    # 10 s old: inside grace
+        self._age(fresh_file, self.NOW, age_s=10.0)
+        assert H._sweep_stale_scratch(self.NOW) == 0
+        assert fresh_dir.exists() and fresh_file.exists()
+
+    def test_reclaimed_scratch_is_archived_not_destroyed(self, H, sandbox,
+                                                        monkeypatch):
+        """Reclaim is REVERSIBLE: the entry MOVES into a dated folder inside
+        the state dir, owner-only, bytes intact — the shapes are matched by
+        NAME, so the day that match is ever wrong the content is recoverable
+        instead of gone."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        leaked = H.STATE_DIR / "tmpab12cd34"
+        leaked.mkdir()
+        (leaked / "tts.wav").write_bytes(b"RIFF....")
+        loose = H.STATE_DIR / ".reminders.json.a1b2.tmp"
+        loose.write_text("{\"partial\"", encoding="utf-8")
+        self._age(leaked, self.NOW)
+        self._age(loose, self.NOW)
+        assert H._sweep_stale_scratch(self.NOW) == 2
+        assert not leaked.exists() and not loose.exists()   # out of the way
+        day = H.datetime.datetime.fromtimestamp(self.NOW).strftime("%Y-%m-%d")
+        folder = H.STATE_DIR / H.SCRATCH_QUARANTINE_NAME / day
+        assert (folder / "tmpab12cd34" / "tts.wav").read_bytes() == b"RIFF...."
+        assert (folder / ".reminders.json.a1b2.tmp").read_text() == "{\"partial\""
+        assert (folder.stat().st_mode & 0o777) == 0o700
+
+    def test_the_archive_expires_on_its_own_ttl(self, H, sandbox, monkeypatch):
+        """The archive's clock is its own: a dated folder survives its TTL and
+        is gone after it, and entries in there that are not dated folders of
+        ours (a stray file, someone else's folder) are never deleted."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        root = H.STATE_DIR / H.SCRATCH_QUARANTINE_NAME
+        root.mkdir(parents=True)
+        today = H.datetime.datetime.fromtimestamp(self.NOW).date()
+
+        def dated(days_ago):
+            folder = root / (today
+                             - H.datetime.timedelta(days=days_ago)).isoformat()
+            folder.mkdir()
+            (folder / "tts.wav").write_bytes(b"RIFF")
+            return folder
+
+        keep_today = dated(0)
+        keep_boundary = dated(H.SCRATCH_QUARANTINE_TTL_DAYS)
+        gone = dated(H.SCRATCH_QUARANTINE_TTL_DAYS + 1)
+        foreign_dir = root / "notes"                    # not a date
+        foreign_dir.mkdir()
+        foreign_file = root / "README"
+        foreign_file.write_text("mine", encoding="utf-8")
+        assert H._sweep_stale_scratch(self.NOW) == 0     # nothing to reclaim
+        assert keep_today.is_dir() and keep_boundary.is_dir()
+        assert not gone.exists()
+        assert foreign_dir.is_dir() and foreign_file.exists()
+
+    def test_a_name_collision_in_the_archive_keeps_both_copies(
+            self, H, sandbox, monkeypatch):
+        """Two runs can reclaim the same scratch name on the same day; the
+        earlier copy must not be replaced by the later one — keeping both is
+        the whole point of an archive."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        day = H.datetime.datetime.fromtimestamp(self.NOW).strftime("%Y-%m-%d")
+        folder = H.STATE_DIR / H.SCRATCH_QUARANTINE_NAME / day
+        (folder / "tmpab12cd34").mkdir(parents=True)
+        (folder / "tmpab12cd34" / "tts.wav").write_bytes(b"FIRST")
+        leaked = H.STATE_DIR / "tmpab12cd34"
+        leaked.mkdir()
+        (leaked / "tts.wav").write_bytes(b"SECOND")
+        self._age(leaked, self.NOW)
+        assert H._sweep_stale_scratch(self.NOW) == 1
+        assert (folder / "tmpab12cd34" / "tts.wav").read_bytes() == b"FIRST"
+        assert (folder / "tmpab12cd34~1" / "tts.wav").read_bytes() == b"SECOND"
+
+    def test_a_symlinked_archive_is_refused_and_nothing_is_destroyed(
+            self, H, sandbox, monkeypatch):
+        """The runtime hardening rule, applied to the archive: a planted
+        `scratch-quarantine` symlink must not become a way to carry reclaimed
+        state out of the bubble — and when the archive cannot be made private
+        the stale entry stays where it is rather than being deleted."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        outside = sandbox / "outside"
+        outside.mkdir()
+        (H.STATE_DIR / H.SCRATCH_QUARANTINE_NAME).symlink_to(outside)
+        leaked = H.STATE_DIR / "tmpab12cd34"
+        leaked.mkdir()
+        self._age(leaked, self.NOW)
+        assert H._sweep_stale_scratch(self.NOW) == 0
+        assert leaked.is_dir()                           # left where it was
+        assert list(outside.iterdir()) == []             # nothing carried out
+
+    def test_a_clean_start_creates_no_archive(self, H, sandbox, monkeypatch):
+        """No stale scratch, no new directory: a healthy state dir is left
+        exactly as it was (the archive is made on first use, not at import)."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        assert H._sweep_stale_scratch(self.NOW) == 0
+        assert not (H.STATE_DIR / H.SCRATCH_QUARANTINE_NAME).exists()
+
+    def test_prepare_runtime_runs_the_sweep(self, H, sandbox, monkeypatch):
+        """Reclamation is part of startup hardening, not an extra step a
+        caller can forget — proven through `_prepare_runtime` itself, the
+        path both `main()` and the control-socket server take."""
+        monkeypatch.setattr(H.time, "time", lambda: self.NOW)
+        leaked = H.STATE_DIR / "tmpdeadbeef"
+        leaked.mkdir(parents=True)
+        (leaked / "tts.wav").write_bytes(b"RIFF")
+        self._age(leaked, H.time.time())   # genuinely old on the REAL clock
+        assert H._prepare_runtime() is True
+        assert not leaked.exists()
+
+    def test_ordinary_state_entries_are_never_swept(
+            self, H, sandbox, monkeypatch):
+        """The sweep names exactly two shapes; everything a live runtime owns
+        survives it — old files of other shapes, backups, and a directory
+        whose name merely ENDS with .tmp (the suffix is the FILE shape, the
+        prefix the directory shape, never crossed)."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        keepers = [H.STATE_DIR / "decisions.jsonl",
+                   H.STATE_DIR / "handsoff.lock",
+                   H.STATE_DIR / "laya-turns.jsonl",
+                   H.STATE_DIR / "reminders.json.bak",   # backup, not scratch
+                   H.STATE_DIR / "not-scratch.tmp",      # a DIRECTORY
+                   H.STATE_DIR / "tmp-notes.txt"]        # a FILE with the prefix
+        for k in keepers[:-2]:
+            k.write_text("{}", encoding="utf-8")
+        keepers[-2].mkdir()
+        keepers[-1].write_text("notes", encoding="utf-8")
+        for k in keepers:
+            self._age(k, self.NOW)
+        assert H._sweep_stale_scratch(self.NOW) == 0
+        for k in keepers:
+            assert k.exists(), k
+
+    def test_a_symlink_is_never_followed_out_of_the_state_dir(
+            self, H, sandbox, monkeypatch):
+        """Same contract as the backup sweep: a stale-looking scratch name
+        that is a symlink is skipped, and the target outside the state dir
+        keeps its bytes."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        outside = sandbox / "outside.txt"
+        outside.write_text("keep", encoding="utf-8")
+        link = H.STATE_DIR / "tmpattack.tmp"
+        link.symlink_to(outside)
+        self._age(link, self.NOW)   # the LINK's own mtime, not the target's
+        assert H._sweep_stale_scratch(self.NOW) == 0
+        assert link.is_symlink()
+        assert outside.read_text(encoding="utf-8") == "keep"
+
+    def test_an_unreadable_state_dir_is_a_warning_not_a_crash(
+            self, H, sandbox, monkeypatch, caplog):
+        """The bubble must start with a dirty state dir, not refuse to:
+        enumeration failing costs a warning and zero removals. The
+        warn-once flags are process-globals, so they are pinned EMPTY here —
+        a neighbour that already tripped the warning must not rewrite this
+        test's answer (the same order-sensitivity the spotter-state pins
+        cover elsewhere)."""
+        monkeypatch.setattr(H, "_SWEEP_WARNED", set())
+        monkeypatch.setattr(H, "_SWEPT_DIRS", set())
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "no-such-state")
+        with caplog.at_level("WARNING", logger="handsoff"):
+            assert H._sweep_stale_scratch() == 0
+        assert any("could not enumerate" in r.message for r in caplog.records)
+
+    def test_the_sweep_is_wired_into_prepare_runtime(self, H):
+        """A wiring pin: without this, a refactor of the startup sequence can
+        drop the call and every behavioural guard above still passes against
+        a function nobody calls."""
+        import inspect
+        source = inspect.getsource(H._prepare_runtime)
+        assert "_sweep_stale_scratch()" in source
+
+    def test_a_second_sweep_cannot_erase_the_first_ones_reclaim(
+            self, H, sandbox, monkeypatch):
+        """One start, one sweep — and one recorded result.
+
+        `_prepare_runtime()` runs twice in a service process (`main()`, then
+        `ControlServer._serve()`); the second pass is a no-op, but it used to
+        re-stamp `_LAST_SWEEP` with `removed=0` and erase what the start had
+        just reclaimed, so the doctor read "last start swept nothing" seconds
+        after a start that had swept (found live on this desk 2026-09-25).
+        """
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": None, "removed": 0,
+                                                "unreadable": False})
+        monkeypatch.setattr(H, "_SWEPT_DIRS", set())
+        monkeypatch.setattr(H, "_SWEEP_WARNED", set())
+        monkeypatch.setattr(H.time, "time", lambda: self.NOW)
+        leaked = H.STATE_DIR / "tmpdeadbeef"
+        leaked.mkdir(parents=True)
+        (leaked / "tts.wav").write_bytes(b"RIFF")
+        self._age(leaked, self.NOW)
+        assert H._prepare_runtime() is True             # the start's sweep
+        assert H._LAST_SWEEP["removed"] == 1
+        # the control server's second pass: the record must survive it
+        assert H._sweep_stale_scratch() == 0
+        assert H._LAST_SWEEP["removed"] == 1
+        assert not leaked.exists()
+        assert "last start swept 1 entry" in H._state_hygiene_line()
+
+    def test_the_summary_is_logged_once_the_journal_exists(
+            self, H, sandbox, monkeypatch, caplog):
+        """The reclaim has to be VISIBLE in production.
+
+        The sweep runs before `setup_logging()`, and an INFO record on a
+        logger with no handlers is dropped (`lastResort` is WARNING-only), so
+        logging the summary where the work happens loses it. `main()` says the
+        line right after logging is up, reading the same `_LAST_SWEEP` the
+        doctor reads — one dict, so the journal and the doctor cannot
+        disagree. A clean start says nothing.
+        """
+        import inspect
+        order = inspect.getsource(H.main)
+        assert (order.index("_log_swept_scratch()")
+                > order.index("setup_logging()")), "emitted before the journal"
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": H.time.time(),
+                                                "removed": 2,
+                                                "unreadable": False})
+        with caplog.at_level("INFO", logger="handsoff"):
+            H._log_swept_scratch()
+        assert any("swept 2 stale scratch entries" in r.message
+                   and "recoverable for" in r.message
+                   for r in caplog.records), caplog.text
+        caplog.clear()
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": H.time.time(),
+                                                "removed": 0,
+                                                "unreadable": False})
+        with caplog.at_level("INFO", logger="handsoff"):
+            H._log_swept_scratch()
+        assert not [r for r in caplog.records if "swept" in r.message]
+
+
+class TestStateHygieneReading:
+    """`_state_hygiene` / `_state_hygiene_line`: the doctor's state-dir
+    hygiene reading. The collector and the sweep share ONE shape predicate
+    (`_scratch_shaped`), so a diagnostic can never disagree with the sweep
+    about what a leak is — and the line is the host's own rendering of the
+    same dict the JSON surface ships, so words and numbers cannot drift."""
+
+    def test_the_collector_and_the_sweep_share_one_shape_predicate(
+            self, H, sandbox):
+        """A tmp* dir and a *.tmp file count as scratch; a tmp-prefixed FILE,
+        a .tmp-suffixed DIRECTORY and ordinary state entries do not — the
+        same two shapes the sweep removes, minus the age gate."""
+        state = H.STATE_DIR = sandbox / "state"
+        state.mkdir(parents=True)
+        (state / "tmpab12cd34").mkdir()
+        (state / ".reminders.json.a1b2.tmp").write_text("x")
+        (state / "tmp-notes.txt").write_text("x")       # tmp-prefixed FILE
+        (state / "not-scratch.tmp").mkdir()             # .tmp-suffixed DIR
+        (state / "decisions.jsonl").write_text("{}")
+        info = H._state_hygiene()
+        assert info["readable"] is True
+        assert info["scratch_left"] == 2
+        assert info["entries"] == 5
+        assert info["size_bytes"] > 0
+
+    def test_a_young_scratch_entry_still_shows_in_the_reading(
+            self, H, sandbox):
+        """The reading has NO age gate, on purpose: a diagnostic reports what
+        IS (a live sibling's in-flight scratch shows up), while the sweep
+        with its grace window removes only what is old. That difference is
+        the point of the line — "present, swept next start"."""
+        state = H.STATE_DIR = sandbox / "state"
+        state.mkdir(parents=True)
+        (state / "tmpfresh01").mkdir()
+        info = H._state_hygiene()
+        assert info["scratch_left"] == 1
+        line = H._state_hygiene_line()
+        assert "in grace or from a live sibling" in line
+
+    def test_the_line_reports_the_last_sweep_honestly(self, H, sandbox,
+                                                      monkeypatch):
+        """No sweep yet reads as `not run this process` (never a false
+        "nothing was leaking"); a run that removed entries reads what and
+        when; a start that found nothing reads `nothing`."""
+        state = H.STATE_DIR = sandbox / "state"
+        state.mkdir(parents=True)
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": None, "removed": 0,
+                                                "unreadable": False})
+        assert "sweep not run this process" in H._state_hygiene_line()
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": H.time.time() - 30.0,
+                                                "removed": 10,
+                                                "unreadable": False})
+        line = H._state_hygiene_line()
+        assert "last start swept 10 entries" in line
+        assert "30s ago" in line
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": H.time.time() - 2.0,
+                                                "removed": 0,
+                                                "unreadable": False})
+        assert "last start swept nothing (just now)" in H._state_hygiene_line()
+
+    def test_the_sweep_records_its_result_for_the_doctor(
+            self, H, sandbox, monkeypatch):
+        """The wiring: a real sweep run stamps `_LAST_SWEEP` — removals, an
+        unreadable dir, and a clean run all leave the honest stamp. The dict
+        is pinned fresh first (process-global, order rule)."""
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": None, "removed": 0,
+                                                "unreadable": False})
+        monkeypatch.setattr(H, "_SWEEP_WARNED", set())
+        monkeypatch.setattr(H, "_SWEPT_DIRS", set())
+        state = H.STATE_DIR = sandbox / "state"
+        state.mkdir(parents=True)
+        stale = state / "tmpdeadbeef"
+        stale.mkdir()
+        TestSweepStaleScratch._age(stale, H.time.time())
+        assert H._sweep_stale_scratch() == 1
+        assert H._LAST_SWEEP["removed"] == 1
+        assert H._LAST_SWEEP["at"] is not None
+        assert H._LAST_SWEEP["unreadable"] is False
+        # and the unreadable case stamps too, rather than leaving the last
+        # good reading standing in for a failed one
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "no-such-state")
+        H._sweep_stale_scratch()
+        assert H._LAST_SWEEP["unreadable"] is True
+
+    def test_an_unreadable_state_dir_reads_as_unreadable(self, H, sandbox):
+        """The diagnostic must not fail on the one dir it exists to watch: a
+        state dir that cannot be read reports `readable: False`, and the
+        line says so instead of showing stale numbers."""
+        H.STATE_DIR = sandbox / "no-such-state"
+        assert H._state_hygiene() == {"readable": False}
+        assert "could not be read" in H._state_hygiene_line()
+
+    def test_the_size_reader_never_follows_a_symlink_out(self, H, sandbox):
+        """The runtime hardening rule, in miniature: nothing in the state dir
+        may lead out of it — the size reader counts a symlink as an entry
+        and does not walk it."""
+        state = H.STATE_DIR = sandbox / "state"
+        outside = sandbox / "outside"
+        outside.mkdir()
+        (outside / "big.bin").write_bytes(b"x" * 4096)
+        state.mkdir()
+        (state / "tmpthing").symlink_to(outside)
+        size_b, count = H._dir_size(state)
+        assert size_b == 0                       # the target was never read
+        assert count == 1                        # ...but the link is an entry
+
+
+class TestStateHygieneTrend:
+    """The trend log: one reading per start, and growth over a week.
+
+    A single size says nothing about whether the state dir is GROWING, which is
+    the question an operator actually has. Every start appends its reading to a
+    capped jsonl (`state-hygiene.jsonl`) and the doctor compares the newest
+    reading with one at least `STATE_HYGIENE_TREND_DAYS` old — never with a
+    convenient shorter one — so the number on the line is a week of evidence
+    rather than an hour of it wearing a weekly label.
+    """
+
+    NOW = 1_800_000_000.0
+
+    def _history(self, H, rows) -> Path:
+        """Write synthetic readings `(days_ago, size_bytes, entries)`; returns
+        the log path. The timestamps are the test's own clock, so the window
+        arithmetic is decided by the fixture and not by when the suite runs."""
+        lines = [json.dumps({"at": self.NOW - days * 86400.0,
+                             "date": "2026-01-01", "scratch_left": 0,
+                             "size_bytes": size, "entries": entries,
+                             "swept": 0}, sort_keys=True)
+                 for days, size, entries in rows]
+        log = H._state_hygiene_log()
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return log
+
+    def test_a_start_records_one_row_of_the_reading(self, H, sandbox,
+                                                   monkeypatch):
+        """The row IS the reading the line shows: same collector, one dict,
+        so a trend cannot be computed from numbers the doctor never saw."""
+        monkeypatch.setattr(H, "_HYGIENE_LOGGED", set())
+        # `_LAST_SWEEP` is a process global every sweep test leaves a mark on;
+        # unpinned, this row's `swept` is whichever neighbour swept last, which
+        # the test-order shuffle exposed (seed 424242, 2026-09-25)
+        monkeypatch.setattr(H, "_LAST_SWEEP", {"at": None, "removed": 0,
+                                                "unreadable": False})
+        state = H.STATE_DIR = sandbox / "state"
+        state.mkdir(parents=True)
+        (state / "handsoff.lock").write_text("x", encoding="utf-8")
+        before = H._state_hygiene()          # taken BEFORE the row exists
+        assert H._record_state_hygiene() is True
+        rows = H._read_state_hygiene_log()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["entries"] == before["entries"]
+        assert row["size_bytes"] == before["size_bytes"]
+        assert row["scratch_left"] == before["scratch_left"] == 0
+        assert row["swept"] == 0
+        assert row["date"] == H.datetime.date.fromtimestamp(
+            row["at"]).isoformat()
+        assert (H._state_hygiene_log().stat().st_mode & 0o777) == 0o600
+
+    def test_one_row_per_start_not_per_call(self, H, sandbox, monkeypatch):
+        """`_prepare_runtime()` runs twice per service process, so the append
+        is latched exactly as the sweep is: two rows a second apart are not a
+        trend, they are one sample recorded twice."""
+        monkeypatch.setattr(H, "_HYGIENE_LOGGED", set())
+        state = H.STATE_DIR = sandbox / "state"
+        state.mkdir(parents=True)
+        assert H._record_state_hygiene() is True
+        assert H._record_state_hygiene() is False        # the second pass
+        assert len(H._read_state_hygiene_log()) == 1
+
+    def test_the_trend_compares_against_a_reading_a_week_old(
+            self, H, sandbox, monkeypatch):
+        """Three readings, one inside the window: the delta must come from the
+        OLDER one, because a week is the claim the line makes."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True)
+        self._history(H, [(12, 1_000_000_000, 10),
+                          (6, 2_000_000_000, 15),
+                          (0, 2_000_000_000, 30)])
+        trend = H._hygiene_trend()
+        assert trend["rows"] == 3
+        assert trend["span_days"] == 12.0
+        assert trend["since_days"] == 12.0      # NOT the 6-day-old reading
+        assert trend["size_delta"] == 1_000_000_000
+        assert trend["entries_delta"] == 20
+        line = H._state_hygiene_line()
+        assert "7-day trend +953.7 MB, +20 entries" in line
+
+    def test_a_short_history_reports_its_span_and_no_deltas(
+            self, H, sandbox, monkeypatch):
+        """A week-over-week number computed from three days of samples would
+        be a lie shaped like a trend, so none is offered."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True)
+        self._history(H, [(3, 1_000_000_000, 10), (0, 2_000_000_000, 30)])
+        trend = H._hygiene_trend()
+        assert trend["rows"] == 2
+        assert "size_delta" not in trend and "entries_delta" not in trend
+        assert "trend needs a week (3.0 days recorded)" in H._state_hygiene_line()
+
+    def test_no_history_at_all_says_so(self, H, sandbox, monkeypatch):
+        """A missing clause would be indistinguishable from a trend that
+        stopped being computed, so an empty log is a positive finding."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True)
+        assert H._hygiene_trend() == {"rows": 0}
+        assert "trend: no readings yet" in H._state_hygiene_line()
+
+    def test_a_torn_or_foreign_line_is_dropped_not_fatal(
+            self, H, sandbox, monkeypatch):
+        """A power cut leaves a torn last line, and the log is a diagnostic:
+        the history must still render (what it can read) instead of throwing
+        away the growth it exists to show."""
+        monkeypatch.setattr(H, "STATE_DIR", sandbox / "state")
+        H.STATE_DIR.mkdir(parents=True)
+        H._state_hygiene_log().write_text(
+            "not json at all\n"
+            "{}\n"                                  # no `at`
+            "{\"at\": \"soon\"}\n"                  # not a number
+            f"{json.dumps({'at': self.NOW, 'size_bytes': 5, 'entries': 1})}\n"
+            '{"at": 17, "size_b',                  # torn mid-line
+            encoding="utf-8")
+        rows = H._read_state_hygiene_log()
+        assert len(rows) == 1 and rows[0]["at"] == self.NOW
+        assert "trend needs a week (0.0 days recorded)" in H._state_hygiene_line()
+
+    def test_the_log_is_capped_and_drops_the_oldest(self, H, sandbox,
+                                                   monkeypatch):
+        """Unbounded diagnostics are the leak this line reports: the log is
+        capped, and the cap drops the OLDEST rows, not the newest."""
+        monkeypatch.setattr(H, "_HYGIENE_LOGGED", set())
+        monkeypatch.setattr(H.time, "time", lambda: self.NOW)
+        state = H.STATE_DIR = sandbox / "state"
+        state.mkdir(parents=True)
+        count = H.STATE_HYGIENE_MAX + 10
+        H._state_hygiene_log().write_text(
+            "".join(json.dumps({"at": self.NOW - i, "size_bytes": i,
+                                "entries": i}) + "\n" for i in range(count)),
+            encoding="utf-8")
+        assert H._record_state_hygiene() is True
+        rows = H._read_state_hygiene_log()
+        assert len(rows) == H.STATE_HYGIENE_MAX
+        assert rows[-1]["at"] == self.NOW            # the new reading is last
+        assert rows[0]["at"] == self.NOW - 11        # the oldest were dropped
+
+    def test_an_unreadable_state_dir_records_nothing(self, H, sandbox,
+                                                    monkeypatch):
+        """Nothing to read, nothing to record — and no file conjured up in a
+        directory the reading just said it could not see."""
+        monkeypatch.setattr(H, "_HYGIENE_LOGGED", set())
+        H.STATE_DIR = sandbox / "no-such-state"
+        assert H._record_state_hygiene() is False
+        assert not H._state_hygiene_log().exists()
+
+    def test_prepare_runtime_records_the_post_reclaim_reading(
+            self, H, sandbox, monkeypatch):
+        """The wiring, and the ORDER: the row is taken after the sweep, so a
+        start that reclaimed scratch says so in its own row."""
+        monkeypatch.setattr(H, "_HYGIENE_LOGGED", set())
+        leaked = H.STATE_DIR / "tmpdeadbeef"
+        leaked.mkdir(parents=True)
+        (leaked / "tts.wav").write_bytes(b"RIFF")
+        TestSweepStaleScratch._age(leaked, H.time.time())
+        assert H._prepare_runtime() is True
+        rows = H._read_state_hygiene_log()
+        assert len(rows) == 1
+        assert rows[0]["swept"] == 1                 # the sweep ran first
+        assert rows[0]["scratch_left"] == 0
+        assert not leaked.exists()

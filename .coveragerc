@@ -30,6 +30,21 @@ omit =
     # report then cannot find and refuses to print a TOTAL for. Not source, and
     # not the suite's: omitted rather than left to pollute the gate's output.
     */handsoff-guard-*/sitecustomize.py
+    # The self-edit tests (tests/test_policy.py) write scratch `handsoff.py`
+    # files under pytest's tmp tree, and `_import_smoke`'s child inherits
+    # COVERAGE_PROCESS_START — so the coverage data arrives for fixtures the
+    # report cannot trust: `test_a_new_file_that_cannot_load_is_removed_again`
+    # asserts the half-installed file is DELETED (its rollback is the point),
+    # leaving data with no source — the measured `No source for code:
+    # /tmp/pytest-of-…/handsoff.py` warning of 2026-09-24 — while its three
+    # write-keeping siblings show as 100% `/tmp/...` rows in the table. Test
+    # fixture, not source: omitted rather than left to pollute the gate, the
+    # same shape as the shim above. The glob is the subtree form: coverage's
+    # `*` stops at one path segment and every pattern is anchored whole-path
+    # (`*/pytest-of-*` therefore matched NOTHING — measured, the first edit
+    # left all three 100% rows in the table), while `**/pytest-of-*/**` spans
+    # any prefix, the pytest-of-<user> directory, and everything under it.
+    **/pytest-of-*/**
 
 [report]
 # The floor tracks measured reality, not aspiration, and the PER-FILE shape is

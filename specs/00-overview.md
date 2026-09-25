@@ -45,7 +45,7 @@ desk verification stays in `ACCEPTANCE.md`, history stays in `GAP_ANALYSIS.md`.
 
 ## Scale
 
-- `core/`: 15 modules (sizes and ownership in `20-architecture.md` §1, which is
+- `core/`: 16 modules (sizes and ownership in `20-architecture.md` §1, which is
   GENERATED from the tree — a size copied into prose starts lying that day).
 - `handsoff.py` is the app: bootstrap, `Assistant`, `ControlServer`, voice
   pipeline, memory, `main()`; `handsoff-settings.py` is the 6-tab GUI.

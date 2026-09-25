@@ -629,3 +629,22 @@ class TestModelCacheProbe:
                            "whisper_model_dir": str(whisper),
                            "whisper_size": "small"})
         assert out["whisper_cached"] is True, out
+
+    def test_hf_hub_cache_mirrors_core_audio(self, HW, tmp_path, monkeypatch):
+        """hardware.py stays stdlib-only, so its cache answer duplicates
+        core.audio.hf_hub_cache(). Both must agree or doctor and the
+        installer ask the same question and get different directories."""
+        from core.audio import hf_hub_cache as core_cache
+
+        cases = [
+            {"HF_HUB_CACHE": str(tmp_path / "hub-a")},
+            {"HUGGINGFACE_HUB_CACHE": str(tmp_path / "hub-b")},
+            {"HF_HOME": str(tmp_path / "hf-home")},
+            {},
+        ]
+        for env in cases:
+            for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME"):
+                monkeypatch.delenv(var, raising=False)
+            for var, value in env.items():
+                monkeypatch.setenv(var, value)
+            assert HW._hf_hub_cache() == core_cache(), env

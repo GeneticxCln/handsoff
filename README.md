@@ -38,7 +38,7 @@ voice clip you pick. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 2175 tests pin the behavior (`python -m pytest tests/`),
+automatically. 2278 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
 regression, ops, and fault injection — including offscreen-Qt scenarios that
 drive the settings GUI itself.
@@ -260,16 +260,15 @@ in VRAM between questions).
   and an export of an animated look ships every frame and the fps — a look
   that moves travels as a look that moves. The preview strip shows an
   animation's FIRST frame: a decision aid, not a projector.
-- **Avatar decoration** — the Image design can wear a **ring light**: arcs drawn
-  *around* the avatar that rotate with the animation energy, brighten and quicken
-  with your voice, and carry the state colour. The Appearance tab's **Avatar
-  decoration** row is a closed choice (Ring light / Off) and applies live. The
-  picture hands the ring its band by shrinking to fit (the picture can never
-  overlap its own decoration), the whole design still stays inside the aperture,
-  and `doctor` names the ring beside the pack so "what is that light" has an
-  answer. Art with OPAQUE corners — an ordinary rectangular photo — is clipped
-  to a feathered circle so the avatar is round rather than a pasted rectangle;
-  art that already carries its own silhouette (a character PNG) is untouched.
+- **Where the decoration lives** — the Appearance tab's **Decoration** card
+  holds the picker (`Off`, or one of the nine animations) and the decoration
+  colour, and both apply live. Whichever one is chosen, the picture hands it
+  its band by shrinking to fit (the picture can never overlap its own
+  decoration), the whole design still stays inside the aperture, and `doctor`
+  names the decoration beside the pack so "what is that light" has an answer.
+  Art with OPAQUE corners — an ordinary rectangular photo — is clipped to a
+  feathered circle so the avatar is round rather than a pasted rectangle; art
+  that already carries its own silhouette (a character PNG) is untouched.
 - **The preview is drawn on the BUBBLE too**, so a look can be judged where it
   will actually live — against your wallpaper, beside your other windows, at the
   size this bubble really is — instead of only in a strip inside a settings
@@ -328,8 +327,17 @@ real time and the bubble says so at startup.
 
 Say the assistant's name (default "assistant", configurable — e.g. "cypher")
 to engage in hands-free mode; you then have an engagement window (default
-45 s) of free conversation. While it speaks, saying **"stop"**, **"quiet"**,
-**"shut up"**, **"never mind"** silences it instantly — no LLM involved.
+45 s) of free conversation. The name may land anywhere in a short utterance,
+so a chunk whisper splits ("… so, Cypher, what's the weather") still wakes it,
+and the name is stripped from what reaches the model. The audio spotter,
+when on, fires only for the wake models it loaded — its stock set has none for
+a custom name — so a custom name is woken by the *transcript*, and
+`--ptt doctor` says which of the two doors is actually open (the journal warns
+once when "spotter on" cannot wake the name you chose). While it speaks,
+saying **"stop"**, **"quiet"**, **"shut up"**, **"never mind"** silences it
+instantly — no LLM involved. A question that follows a reply within
+`followup_seconds` needs no wake name at all, and a short one is no longer
+lost to the speech filter that removed quiet utterances wholesale.
 
 Example things to say:
 
@@ -408,9 +416,18 @@ re-run `install.sh`. The installer writes the manifest; the doctor, the
 
 **Doctor** — `python ~/.local/bin/handsoff.py --ptt doctor` (or the
 `handsoff_doctor` tool) runs one diagnostic pass: deployment status, Ollama
-reachability, TTS/STT readiness, mic visibility, niri IPC, ydotool, restart
-script, systemd unit `Restart=`, and the crash log. It works even when the
-bubble is dead.
+reachability, TTS/STT readiness, mic visibility, which wake channel is live
+(a custom name has no openWakeWord model, so this line names the transcript as
+the door that opens), state-dir hygiene (leaked scratch, the last startup
+sweep's result, and total state-dir size — a killed run's leftovers show here
+before and after they are reclaimed; reclaim is reversible, the entry moves
+into `scratch-quarantine/<date>/` in the state dir and ages out of it after a
+week; and a week-over-week trend, because one number cannot say whether the
+dir is growing — every start appends its reading to `state-hygiene.jsonl` and
+the line reports the change since a reading at least seven days old), niri
+IPC, ydotool, restart script,
+systemd unit `Restart=`, and the crash log. It works even when the bubble is
+dead.
 
 **Decision log** — every tool decision lands in
 `~/.local/state/handsoff/decisions.jsonl` with an action id, timestamp, tool,
@@ -646,7 +663,7 @@ Each gate is the pipeline's job, run against your own interpreter and the
 dependencies the bubble already uses (it installs nothing):
 
 ```bash
-python -m pytest tests/ -q              # 2175 tests
+python -m pytest tests/ -q              # 2278 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 
@@ -666,7 +683,7 @@ nothing is broken:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70     # 2175 tests, 83.7%
+  --cov-report=term-missing --cov-fail-under=70     # 2278 tests, 83.7%
 ```
 
 The suite is self-contained: it imports the bubble against a throw-away
@@ -733,7 +750,11 @@ forget action, and the tool-decision log (`decisions.jsonl`) — so "why did
 it say/do that" has a GUI answer. `tests/fake_ollama.py` fakes the Ollama
 API for the streaming tests.
 
-Known limitations: the ICS parser handles DAILY/WEEKLY recurrence plus
-EXDATE and RECURRENCE-ID (canceled/moved instances of recurring events are
-suppressed/replaced correctly); calendar RRULE MONTHLY/YEARLY fall back to
-the single occurrence. See `GAP_ANALYSIS.md` for the current roadmap.
+Known limitations: the ICS parser handles DAILY, WEEKLY, MONTHLY and YEARLY
+recurrence (INTERVAL, UNTIL and COUNT; nth-weekday BYDAY like `2TU`/`-1FR` and
+BYMONTHDAY for MONTHLY, BYMONTH for YEARLY, with Feb 29 skipped in a
+non-leap year) plus EXDATE and RECURRENCE-ID, so canceled or moved instances
+of a recurring event are suppressed or replaced correctly. What still falls
+back to the single occurrence is a MONTHLY rule whose BYDAY carries no ordinal
+(`BYDAY=TU`), and a non-numeric BYMONTHDAY or BYMONTH. See `GAP_ANALYSIS.md`
+for the current roadmap.

@@ -94,6 +94,8 @@ atomic + 0600 (`atomic_private_write`, mkstemp in-dir, no predictable
 | `STATE_DIR/cap-refusals.json` | {totals, last} | ≤50; storm-proof |
 | `STATE_DIR/self-watch.jsonl` | one line per sampler tick with findings: `{t, findings:[{prefix, kind, since_s}], state}` | ≤200 lines, 0600; written whether or not the speaking switch is on — the file is the diagnosis, the announcement the convenience |
 | `STATE_DIR/decisions.jsonl` | JSON lines | ≤500 (`_DECISIONS_MAX`) |
+| `STATE_DIR/scratch-quarantine/<YYYY-MM-DD>/` | reclaimed scratch moved verbatim | `SCRATCH_QUARANTINE_TTL_DAYS` (7) days, then dropped |
+| `STATE_DIR/state-hygiene.jsonl` | one line per start: `{at, date, scratch_left, size_bytes, entries, swept}` | ≤`STATE_HYGIENE_MAX` (400) readings, 0600; the doctor's week-over-week trend |
 | `STATE_DIR/laya-turns.jsonl` | one line per completed turn: `{ts, text, tools}` | append-only; folded by `ci/laya_corpus.py` on every read, 0600 |
 | `STATE_DIR/laya-turns.cursor` | `{lines, hash, at}` | how much of the queue was folded; the hash catches a replaced queue |
 | `STATE_DIR/laya-corpus.jsonl` | grown corpus rows `{text, family, source, first_seen, last_seen, count}` | written by `ci/laya_corpus.py`, never into the checkout, 0600 |
@@ -105,6 +107,41 @@ atomic + 0600 (`atomic_private_write`, mkstemp in-dir, no predictable
 `CONFIG_DIR = ~/.config/handsoff`, `STATE_DIR = $XDG_STATE_HOME/handsoff`
 (`~/.local/state/handsoff`). `_secure_runtime_files()` enforces 0600 +
 uid + non-symlink (lstat first: broken symlinks refused) at every start.
+The same start runs `_sweep_stale_scratch()`: scratch a killed run left
+behind — `tmp*` DIRECTORIES (`TemporaryDirectory(dir=STATE_DIR)`, e.g.
+`_speak`'s) and loose `*.tmp` FILES, the only two shapes this runtime
+produces there, both directly in STATE_DIR and both older than a 600 s
+grace — is reclaimed; symlinks are never followed out, a dirty state dir
+is swept with a warning rather than refusing startup. Reclaim is REVERSIBLE:
+nothing is deleted, the entry MOVES into `scratch-quarantine/<YYYY-MM-DD>/`
+under STATE_DIR (owner-only; a name collision gets a `~N` suffix so both
+copies survive, and an archive that cannot be made private — a planted
+`scratch-quarantine` symlink is refused — leaves the scratch in place rather
+than destroying it). Folders older than `SCRATCH_QUARANTINE_TTL_DAYS` (7) age
+out of the archive on the start that finds them; only names that parse as a
+date are ever removed, and only directories. The archive exists because the
+two shapes are matched by NAME, so it is what makes a false positive
+survivable. One sweep per state
+dir per start: the control-socket server calls `_prepare_runtime()` a second
+time, and the no-op pass must not overwrite what the start reclaimed. What
+was reclaimed is then said once, by `_log_swept_scratch()` after logging
+exists, from the same `_LAST_SWEEP` the doctor reads.
+
+One reading with no history cannot say whether the state dir is GROWING, which
+is the question an operator actually has, so the same start appends its hygiene
+numbers to `state-hygiene.jsonl` (`_record_state_hygiene()`, called right after
+the sweep, so a row is the POST-reclaim state and carries that start's `swept`
+count). One row per start, not per doctor read: the doctor is asked on demand
+and a diagnostic must not write state. The file is capped and rewritten
+atomically under the state-file lock (the self-watch log's shape), because an
+unbounded diagnostic log would be the very leak the line reports. The doctor
+compares the newest reading with the newest one at least
+`STATE_HYGIENE_TREND_DAYS` (7) older — never a convenient shorter span — and
+reports the delta beside the span it came from; a shorter history reports how
+much exists and NO deltas, and a torn or foreign line is dropped rather than
+fatal (a power cut leaves exactly that). The structured surface ships the same
+number as `state_hygiene.trend`, with `null` (never 0) for a delta the history
+cannot support.
 
 ## 3. Vocabularies
 

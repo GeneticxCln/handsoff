@@ -589,6 +589,24 @@ if probe.exists():      # a guard that went quiet must still leave the tree clea
             "the shim's scratch directory is not omitted from coverage, so the "
             "coverage gate will refuse a TOTAL over a file outside the checkout")
 
+    def test_the_self_edit_scratch_tree_is_not_measured_by_the_coverage_gate(
+            self):
+        """The self-edit tests' scratch `handsoff.py` under pytest's tmp tree is
+        the same measurement noise as the shim: `_import_smoke` loads it in a
+        COVERAGE-inherited child, and `test_a_new_file_that_cannot_load_is_removed_
+        again` then asserts the product DELETED it — so report time holds data
+        for a source that is gone (`No source for code: /tmp/pytest-of-*/…/
+        handsoff.py`, measured 2026-09-24) while its three write-keeping siblings
+        show as 100% `/tmp/...` rows. Pinned because the omission is invisible
+        until the next coverage gate run."""
+        text = (ROOT / ".coveragerc").read_text(encoding="utf-8")
+        assert "**/pytest-of-*/**" in text, (
+            "pytest's tmp tree is not omitted from coverage, so the gate will "
+            "warn `No source for code` over a fixture the product removed — and "
+            "the pattern must be the SUBTREE form: coverage's `*` stops at one "
+            "path segment with a whole-path anchor, so `*/pytest-of-*` matches "
+            "nothing (measured 2026-09-24: all three rows stayed in the table)")
+
     def test_the_predicate_judges_the_boundary_and_the_artifacts(self):
         """The decision table, one row per way it could be wrong."""
         table = [

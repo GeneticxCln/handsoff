@@ -158,8 +158,13 @@ jobs:
           list=$(mktemp)
           find . -type f \
             -not -path './.git/*' -not -path './attic/*' \
+            -not -path './.freebuff/*' -not -path './.claude-flow/*' \
+            -not -path './.swarm/*' -not -path './.agents/*' \
+            -not -path './.codex/*' \
             -not -path './.venv/*' -not -path './venv/*' -not -path './env/*' \
-            -not -path './node_modules/*' -not -path './build/*' -not -path './dist/*' | sort > "$list"
+            -not -path './node_modules/*' -not -path './build/*' -not -path './dist/*' \
+            -not -path './.tox/*' -not -path './.mypy_cache/*' \
+            -not -path './site-packages/*' | sort > "$list"
           while IFS= read -r f; do
             first=$(head -c 128 -- "$f" 2>/dev/null | tr -d '\000' | head -n 1) || continue
             case "$first" in

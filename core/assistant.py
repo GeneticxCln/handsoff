@@ -641,7 +641,7 @@ class NotificationReader:
                             log.info("notification muted from %s", app)
                             continue
                     except Exception:
-                        pass
+                        log.exception("notification mute check failed for %s", app)
                     now = time.monotonic()
                     with self._cooldown_lock:
                         last = self._app_last.get(app.lower())

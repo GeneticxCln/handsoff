@@ -85,7 +85,8 @@ class DoctorDeps:
         "control_sock", "crash_log", "remote_ollama_allowed",
         "remote_ollama_optin_source",
         "cap_refusal_note", "cap_refusals",
-        "appearance_look", "web_lines", "stop_attribution_health",
+        "appearance_look", "web_lines", "wake_lines", "stop_attribution_health",
+        "state_hygiene_line", "state_hygiene",
         "unexplained_stops", "boot_stop_audit",
         "gpu_lines", "gpu_headroom",
         "shutil", "sounddevice", "log",
@@ -142,6 +143,21 @@ class DoctorDeps:
         # host owns the vocabulary (which backends exist, which reader was used)
         # and the doctor owns the placement, so the two cannot disagree.
         self.web_lines: Callable[[], list] = lambda: []
+        # Which channel can WAKE the bubble, when the host reports one. Lines
+        # for the same reason as the web lines above: the host owns the
+        # vocabulary (which spotter models loaded, whether a wake word is
+        # required at all) and the doctor owns the placement, so a custom name
+        # with no openWakeWord model cannot read as a working audio wake.
+        self.wake_lines: Callable[[], list] = lambda: []
+        # The state dir's hygiene, as ONE host rendering: the host owns the
+        # vocabulary (what counts as scratch, how long ago the sweep ran) and
+        # the doctor owns the placement, exactly like the web/wake/gpu line
+        # collectors. `state_hygiene` is the same reading as a dict for the
+        # JSON surface — one reading behind both surfaces, so the words and
+        # the numbers cannot drift. A host that does not report it prints no
+        # line at all, which is the partial-deps contract.
+        self.state_hygiene_line: Callable[[], str] = lambda: ""
+        self.state_hygiene: Callable[[], dict] = lambda: {}
         # The card's WHOLE story: every tenant on it, what this bubble's speech
         # models hold, what the LLM holds, and what the next turn would ask for.
         # Lines for the same reason as the two above (the host owns the
@@ -242,6 +258,42 @@ def _web_lookup_lines(deps: "DoctorDeps") -> list[str]:
     except Exception:
         lines = []
     return [str(line) for line in lines if line]
+
+
+def _wake_lines(deps: "DoctorDeps") -> list[str]:
+    """Which channel wakes the bubble, when the host knows.
+
+    Empty for a host that does not report it, so a partial deps object prints
+    exactly what it printed before this line existed. The lines are produced by
+    the host (see `handsoff._wake_lines`): an unloaded spotter says `untried`
+    and a name the loaded spotter cannot fire for is named as such, because
+    "wake spotter on" in Settings is not the same fact as "the spotter can hear
+    the name you chose".
+    """
+    getter = getattr(deps, "wake_lines", None)
+    if getter is None:
+        return []
+    try:
+        return [str(line) for line in (getter() or []) if line]
+    except Exception:
+        return []
+
+
+def _state_hygiene_lines(deps: "DoctorDeps") -> list[str]:
+    """The state dir's hygiene line, when the host has one to tell.
+
+    Same contract as the wake/web/appearance line collectors: empty for a
+    host that does not report it (a partial deps object prints what it
+    printed before the line existed), and the words are the host's — it owns
+    the reading and the sweep that produced it."""
+    getter = getattr(deps, "state_hygiene_line", None)
+    if getter is None:
+        return []
+    try:
+        line = getter()
+    except Exception:
+        return []
+    return [line] if line else []
 
 
 def _gpu_story_lines(deps: "DoctorDeps") -> list[str]:
@@ -350,6 +402,8 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append(
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
+        lines.extend(_wake_lines(deps))
+        lines.extend(_state_hygiene_lines(deps))
         lines.extend(_gpu_story_lines(deps))
         lines.extend(_appearance_lines(deps))
         lines.extend(_web_lookup_lines(deps))
@@ -394,6 +448,8 @@ def _lines(deps: DoctorDeps) -> list[str]:
         lines.append(
             f"{_tts_line(deps)}; "
             f"stt: {'whisper loaded' if deps.whisper_model is not None else 'whisper NOT loaded yet'}")
+        lines.extend(_wake_lines(deps))
+        lines.extend(_state_hygiene_lines(deps))
         lines.extend(_gpu_story_lines(deps))
         lines.extend(_appearance_lines(deps))
         lines.extend(_web_lookup_lines(deps))
@@ -635,6 +691,38 @@ def doctor_json() -> dict:
         "by_registry": refusals.get("by_registry", {}),
         "last": refusals.get("last"),
     }
+    try:
+        hyg = deps.state_hygiene() or {}
+    except Exception:
+        hyg = {}
+    if isinstance(hyg, dict) and hyg:
+        last = hyg.get("last_sweep") or {}
+        trend = hyg.get("trend") or {}
+        out["state_hygiene"] = {
+            "readable": bool(hyg.get("readable")),
+            "scratch_left": int(hyg.get("scratch_left") or 0),
+            "size_bytes": int(hyg.get("size_bytes") or 0),
+            "entries": int(hyg.get("entries") or 0),
+            "last_sweep": {
+                "at": last.get("at"),
+                "removed": int(last.get("removed") or 0),
+                "unreadable": bool(last.get("unreadable")),
+            },
+            # The week-over-week reading. `size_delta`/`entries_delta` are
+            # None (never 0) when the history is shorter than the window: a
+            # delta of zero and no delta at all are different facts, and the
+            # structured surface must not flatten them together.
+            "trend": {
+                "rows": int(trend.get("rows") or 0),
+                "span_days": float(trend.get("span_days") or 0.0),
+                "since_days": (float(trend["since_days"])
+                               if "since_days" in trend else None),
+                "size_delta": (int(trend["size_delta"])
+                               if "size_delta" in trend else None),
+                "entries_delta": (int(trend["entries_delta"])
+                                  if "entries_delta" in trend else None),
+            },
+        }
     out["systemd_unit"] = {
         "present": deps.systemd_unit_file.exists(),
         "auto_restart": False,

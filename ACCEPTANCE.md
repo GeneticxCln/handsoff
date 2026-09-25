@@ -152,6 +152,25 @@ Verified-by codes: [auto] scriptable end-to-end on this machine ·
   `ignored (unintelligible while engaged)` — so the wake path works when
   whisper sees the name, and short utterances die in the VAD. Item stays ❌
   until a hands-free follow-up survives the gate.
+  FIXES LANDED IN THE CHECKOUT (2026-09-24, NOT yet retested on this desk —
+  the retest below is still owed; §10 part A is its executable form). Both
+  named defects are addressed in code:
+  (1) *the VAD*, at its cause — `core/audio.transcribe` retries a clip of at
+  most `VAD_RETRY_MAX_S` (3 s) ONCE with the filter off when the filtered
+  pass returns nothing, because that is the follow-up shape the filter
+  removes wholesale; a longer clip is not retried (there an empty transcript
+  really is silence) and the retry is journaled
+  (`whisper's VAD found no speech in a 0.9s clip — retried without the
+  filter`). (2) *a custom name's only door*, widened — the spotter can never
+  fire for a name it has no model for, so the transcript gate now accepts the
+  name ANYWHERE in a short utterance (`_wake_anywhere`, ≤ 8 words, same fuzzy
+  skeleton, disabled while already engaged so a name mentioned mid-sentence
+  is not stripped out of a command); and the silence around it is gone:
+  arming the spotter warns once when it has no model for the configured name
+  (`the wake spotter has no model for 'cypher' (loaded: alexa, hey_jarvis…)`),
+  and doctor gains a `wake:` line naming the channel that actually opens
+  (`wake: transcript gate only ('cypher') — the audio spotter loaded […] and
+  has NO model for this name`).
   Auto half verified 2026-09-18: with hands-free on, a piper "Cypher." played
   into the room produced `wake word — engaged for 45.0s`, and a fragment a
   second earlier produced `ignored (no wake word)` — both halves of the gate.
@@ -363,10 +382,10 @@ clipboard. First live run 2026-09-09: `verdict: PASS (5/5 checks)`.
   909 rows) and every row carries id, tool, target, decision, result —
   including all of this session's tool calls (2026-09-09)
 
-## 9. How to close the remaining 13 (the walk-through)
+## 9. How to close the remaining 8 + 1 failed (the walk-through)
 
 Every automatable line in sections 1–8 has been run and is recorded above; the
-13 ☐ items are all `[human]`, and they need the machine, not more code. This
+8 ☐ items are all `[human]` (plus 1 ❌ hands-free wake follow-up), and they need the machine, not more code. This
 section is the order that closes them with the least sitting-down, what to
 LISTEN FOR on each, and the one line of evidence to add afterwards. Nothing here
 needs a code change.
@@ -445,6 +464,256 @@ it, and all three are now fixed or named. After the list is closed, the project
 is complete by its own definition: every automatable line green on a clean
 checkout of HEAD, the bubble deployed in-sync, and every human line either
 checked with a date or explicitly abandoned with a reason.
+
+## 10. Wake-name fixes, sweep & `state:` line — the owed desk retest (2026-09-25)
+
+Nothing here needs another code change. All three landed and are deployed
+(`in-sync`); what is owed is the part `tests/` cannot reach — a real voice at
+this microphone, and a real `kill -9` on this machine. Run it in one sitting:
+hands-free ON with the Yeti on the bus for part A, terminal work for B and C.
+Each item names the exact command, the exact string to look for, and the one
+line of evidence to paste back. Only **A1–A4** need a person now — a real voice
+at this microphone; everything else is staged by one command:
+
+- `python ci/desk_retest.py` — the real unit, real state dir, real journal.
+  It restarts `handsoff.service` once per check that needs a fresh start, and
+  PACES those restarts to the unit's own `StartLimitBurst` /
+  `StartLimitIntervalSec`, counted from the JOURNAL (every start systemd
+  actually performed — this run's, an earlier run's tail, `Restart=always`
+  respawns) and kept one start under the burst: a burst of restarts is a crash
+  loop to systemd, and a retest that trips the limit leaves the bubble
+  `failed` for minutes. Both of this driver's first two live runs did exactly
+  that (2026-09-25, once for ~3 minutes and once until the run was killed),
+  which is why the pacing is not optional and why a process-local start list
+  is not enough. It also waits for the control socket to answer before it
+  judges anything (`--ptt doctor` answers for a DEAD bubble too, from a local
+  report, and a slow start must not read as a failed sweep), revives a unit
+  it finds down (`reset-failed` + `start`, held to the same budget), and
+  leaves at most one start of systemd's burst free for a real crash. For B1
+  it starts a spoken reply and `kill -9`s the bubble mid-synthesis, out loud
+  and on purpose (`Restart=always` brings it back — that IS the scenario);
+  for B5 it briefly renames the real `scratch-quarantine` and puts it back.
+  Its own probes are the only thing it deletes. Expect several minutes of
+  restarts: say so if anyone is listening.
+- `--dry-run` prints what would run and changes nothing; `--only B1,C4` runs
+  just those items; `--simulate` rehearses against a throwaway state dir with
+  no systemd (A5 and B1 then report themselves as desk-only); `--python`
+  picks the interpreter.
+- The output is the evidence block for A5, B1–B5 and C1–C4: one line per
+  item, ending `OWED at the desk (real voice — no substitute): A1 A2 A3 A4`.
+  Paste it under these items; exit status is 0 when every automated item
+  passed, 1 otherwise (a desk tool, not a CI gate). The driver's own `C5` is
+  C4's by-hand delta computed on a synthetic week in a thrown-away root, so it
+  answers honestly even on a desk whose own history is younger than 7 days.
+  Its unit guards are `tests/test_desk_retest.py`.
+
+### A. Wake-name fixes, with a real voice
+
+*What changed* (`core/audio.py`, `handsoff.py`): a clip of at most
+`VAD_RETRY_MAX_S` (3 s) whose VAD found nothing is transcribed ONCE more with
+the filter off; the transcript gate accepts the configured name ANYWHERE in a
+short (≤ 8 word) utterance while NOT engaged (`_wake_anywhere`); arming warns
+once when the spotter has no model for the name; and doctor's `wake:` line
+names the channel that actually opens. §3's ❌ follow-up is what A2 closes.
+
+- ☐ [human] **A1 — engagement with a real voice.** Say the configured name
+  clearly, once, from about a metre, hands-free ON.
+  Listen for: `Yes? I'm listening for the next 45 seconds.`
+  Journal proof: `wake word — engaged for 45.0s`.
+  Note: for a custom name the transcript gate is the ONLY door (the spotter
+  has no model for `cypher`), so this passing does not prove the spotter
+  worked — A5 is where that is recorded. Engagement was last seen with a
+  synthetic piper voice (2026-09-18); the real voice is the owed half.
+- ☐ [human] **A2 — the follow-up that used to die (the ❌ item).** Inside the
+  45 s window, ask a SHORT question WITHOUT the name — the ~1 s shape whose
+  audio the VAD used to remove wholesale.
+  Listen for: an answer. Journal: if the filter ate the clip,
+  `whisper's VAD found no speech in a 0.9s clip — retried without the filter
+  and read N char(s)` — that line IS the fix firing, and its absence beside a
+  successful answer means the clip never needed the retry. Pass either way;
+  `ignored (unintelligible while engaged)` is the failure this exists to kill.
+- ☐ [human] **A3 — the name not first.** From idle, say
+  "hey cypher, what's the weather" in one breath.
+  Listen for: engagement AND the weather answer (the name is stripped).
+  Journal proof: `wake word — heard inside the utterance (the spotter has no
+  model for 'cypher')`.
+- ☐ [human] **A4 — the deliberate limit.** While ENGAGED, say a sentence
+  longer than 8 words that merely contains the name mid-sentence.
+  Listen for: it treated as a COMMAND with the name left in place (the answer
+  must reflect the whole sentence). `_wake_anywhere` is disabled while engaged
+  precisely so a name mentioned in conversation is not stripped out of a live
+  command.
+- ☐ [auto] **A5 — the silence is gone: the warning and the `wake:` line.**
+  With `wake_word_required` ON and `spotter_models` empty (this desk's state),
+  restart the unit and read the journal for one warning — `the wake spotter has
+  no model for 'cypher' (loaded: alexa, hey_jarvis, …) — hands-free still
+  wakes on the TRANSCRIPT of the name, so say it clearly; add a matching model
+  to spotter_models for audio wake` (`loaded: stock set` is the same warning
+  when no model names are known) — then
+  `python ~/.local/bin/handsoff.py --ptt doctor | grep '^wake:'`.
+  Any ONE of these three readings is a PASS, because each names the truth:
+  before hands-free starts, `wake: transcript gate ('cypher') — audio spotter
+  untried (it loads when hands-free starts)`; after a failed load,
+  `wake: transcript gate only ('cypher') — the audio spotter FAILED to load
+  (journal: 'wake spotter unavailable'); install openwakeword/onnxruntime, or
+  turn wake_spotter off`; after a good load with no model for the name, `… the
+  audio spotter loaded [alexa, hey_jarvis, hey_mycroft, timer, weather] and
+  has NO model for this name, so wake it by SAYING the name clearly (add a
+  matching model to spotter_models for audio wake)`. A missing line, or a
+  claim of coverage for a name with no model, IS the failure.
+  Recorded 2026-09-25 (auto — `ci/desk_retest.py`): `wake: transcript gate
+  ('cypher') — audio spotter untried (it loads when hands-free starts)`;
+  journal: no arming warning — hands-free was off, so the spotter was never
+  armed (the line above is what can be read without it).
+
+### B. The scratch sweep, now reversible
+
+*What changed* (`handsoff.py`): a stale `tmp*` directory or `*.tmp` file — the
+only two shapes this runtime produces directly in `STATE_DIR` — older than
+`SCRATCH_SWEEP_AGE_S` (600 s) is MOVED into
+`STATE_DIR/scratch-quarantine/<YYYY-MM-DD>/` (owner-only, `~N` suffix on a name
+collision) instead of deleted, and folders older than
+`SCRATCH_QUARANTINE_TTL_DAYS` (7) age out at the start that finds them.
+
+- ☐ [auto] **B1 — the real leak: kill it mid-synthesis.** The case no unit
+  test can produce. Start a long reply, then while it speaks:
+  `kill -9 $(systemctl --user show -p MainPID --value handsoff.service)` and
+  `ls -d ~/.local/state/handsoff/tmp*` for the stranded TTS dir.
+  `Restart=always` brings the bubble straight back, and THAT start is inside
+  the 600 s grace — so it must NOT reclaim the dir. Backdate it, then restart
+  deliberately:
+  `systemctl --user stop handsoff` → `touch -d '20 minutes ago'
+  ~/.local/state/handsoff/tmpXXXXXXXX` → `systemctl --user start handsoff`.
+  Expect: journal `swept 1 stale scratch entry from
+  /home/quinton/.local/state/handsoff into
+  /home/quinton/.local/state/handsoff/scratch-quarantine (recoverable for
+  7 days)`; the dir gone from the top level; present under
+  `scratch-quarantine/<today>/` with its `tts.wav` intact. Pass is the journal
+  line PLUS the file at the new path — a reclaim nobody can find in the
+  archive has failed this item.
+  Recorded 2026-09-25 (auto — `ci/desk_retest.py`, `--only B1`): spoke first,
+  killed PID 453521 mid-synthesis; stranded `tmptq9yudu_`; journal
+  `swept 1 into /home/quinton/.local/state/handsoff/scratch-quarantine`;
+  archived at `scratch-quarantine/2026-09-25/tmptq9yudu_`.
+- ☐ [auto] **B2 — recover it by hand.** `cp` the archived `tts.wav`
+  somewhere, `file` it (`RIFF … WAVE audio`), `aplay` it if you like — it is
+  the reply the bubble actually synthesized. Then `mv` the whole archived dir
+  back out and confirm it is an ordinary directory again. Bytes the old sweep
+  would have destroyed are recoverable; that is the point of the change.
+  Recorded 2026-09-25 (auto): planted sha256 `fd037b70ade0` →
+  `scratch-quarantine/2026-09-25/tmpdeskcheck-recover`; recovered sha256
+  `fd037b70ade0` (identical), 24 bytes. Owed by hand: `aplay` it.
+- ☐ [auto] **B3 — the grace window at the desk.**
+  `mkdir ~/.local/state/handsoff/tmpdeskcheck` → `systemctl --user restart
+  handsoff`. Expect it to SURVIVE (younger than 600 s) and doctor to say
+  `1 scratch-shaped entry present (in grace or from a live sibling) — the next
+  start sweeps them`. Then `touch -d '20 minutes ago'` it, restart again, and
+  it is archived. Do not read the first result as a failure: fresh scratch
+  belongs to the living, and a sibling mid-synthesis must never lose its
+  working directory.
+  Recorded 2026-09-25 (auto): fresh probe survived and was reported — `… last
+  start swept 1 entry just now; 3.1 GB in 41 entries …`; backdated probe
+  reclaimed into `scratch-quarantine/2026-09-25/tmpdeskcheck-fresh`.
+- ☐ [auto] **B4 — the archive's own TTL.**
+  `mkdir -p ~/.local/state/handsoff/scratch-quarantine/$(date -d '8 days ago'
+  +%F)` and put a file in it, then `systemctl --user restart handsoff`.
+  Expect: the 8-day-old folder GONE, `$(date +%F)` still there. The TTL is
+  enforced by a start, so a bubble that never restarts never expires anything
+  — the designed (and honest) limit.
+  Recorded 2026-09-25 (auto): expired `2026-09-17` dropped; `2026-09-25`
+  kept.
+- ☐ [auto] **B5 — a planted archive is refused, not followed.** Stop the
+  unit, then: `mv ~/.local/state/handsoff/scratch-quarantine
+  ~/.local/state/handsoff/sq.real` → `mkdir -p ~/scratch-target` →
+  `ln -s ~/scratch-target ~/.local/state/handsoff/scratch-quarantine` →
+  `mkdir ~/.local/state/handsoff/tmpdeskcheck2` → `touch -d '20 minutes ago'
+  ~/.local/state/handsoff/tmpdeskcheck2` → `systemctl --user start handsoff`.
+  Expect: the journal warning `could not make …/state/scratch-quarantine
+  private — leaving 1 stale scratch entry in place rather than deleting them
+  unarchived`; `tmpdeskcheck2` STILL in the state dir (nothing destroyed);
+  `~/scratch-target` EMPTY (nothing carried out of the bubble).
+  Restore: `rm` the symlink, `mv` the real archive back.
+  Recorded 2026-09-25 (auto — `--only B5`): nothing was carried out of the
+  state dir; the probe is still in place; journal: refusal warning present;
+  the real archive was restored intact.
+
+### C. The doctor's `state:` line
+
+- ☐ [auto] **C1 — the line agrees with the disk.**
+  `python ~/.local/bin/handsoff.py --ptt doctor | grep '^state:'`, then
+  `ls -a ~/.local/state/handsoff | grep -E '^tmp|\.tmp$'` and
+  `du -sh ~/.local/state/handsoff`.
+  Expect four clauses that match the disk: `no leaked scratch` (or `N
+  scratch-shaped entries present …`), `last start swept N entries <when>` (or
+  `nothing (<when>)`), `X in N entries`, and the trend clause of C4. Read the
+  size honestly: it is the WHOLE state dir recursively and ~3.2 GB of it is
+  `laya-finetune`; the scratch shapes themselves are kilobytes — the
+  misreading that opened the 2026-09-25 restart-check.
+  Recorded 2026-09-25 (auto): `state: no leaked scratch; last start swept
+  nothing (just now); 3.1 GB in 39 entries; trend needs a week (0.1 days
+  recorded)` — disk: 0 scratch-shaped, 39 entries counted by the line.
+- ☐ [auto] **C2 — the lie is really gone (the regression this fixed).**
+  Immediately after B1's reclaiming restart the line must read `last start
+  swept 1 entry just now` (or whatever N was) AND the journal must carry the
+  matching `swept N …` line. `swept nothing` beside a journal that says
+  otherwise is exactly the defect the restart-check found live — a second
+  `_prepare_runtime()` call from `ControlServer._serve()` overwriting the
+  record — and its unit guard is
+  `test_a_second_sweep_cannot_erase_the_first_ones_reclaim`. Paste the two
+  lines together: that pairing is the pass.
+  Recorded 2026-09-25 (auto): line `last start swept 2 entries just now` ==
+  journal `swept 2` (2 probes planted) — the restart-check regression,
+  graded closed live.
+- ☐ [auto] **C4 — the weekly trend.** `cat
+  ~/.local/state/handsoff/state-hygiene.jsonl` → one row per start
+  (`{at, date, scratch_left, size_bytes, entries, swept}`, capped at 400). The
+  line's last clause is exactly one of: `trend: no readings yet` (nothing
+  recorded), `trend needs a week (X.X days recorded)` while the history is
+  younger than 7 days, or `7-day trend +412.0 MB, +3 entries` once a reading
+  at least a week old exists. The delta must count from the OLDEST reading at
+  least seven days back, never from yesterday's — check it by hand:
+  `python -c "import json,sys;rows=[json.loads(l) for l in open(sys.argv[1])];print(rows[-1]['size_bytes']-rows[0]['size_bytes'], rows[-1]['entries']-rows[0]['entries'])" ~/.local/state/handsoff/state-hygiene.jsonl`.
+  On a fresh install `needs a week` is a PASS (it is the honest answer);
+  record which of the three readings you saw. Two restarts a minute apart must
+  produce exactly ONE new row: the append is latched per start, not per
+  `_prepare_runtime()` call.
+  Recorded 2026-09-25 (auto): rows 16 → 17 for one start (exactly one row per
+  start, 0600); clause `trend needs a week (0.1 days recorded)` — the honest
+  reading for a history younger than 7 days.
+- ☐ [auto] **C5 — the week arithmetic, without a week.** Produced only by
+  `ci/desk_retest.py` (`C5`, in both back ends): it builds a synthetic
+  nine-day history in a throwaway root and asks the DELIVERED copy to render
+  it — three rows, the 3-day-old one inside the window, so the delta must
+  come from the 9-day-old baseline. Expect `7-day trend +1.4 GB, -13
+  entries` on the line and `"since_days": 9.0` in the JSON: the by-hand
+  delta C4 asks for, computed on a history that cannot lie about itself.
+  Recorded 2026-09-25 (auto): the line read `… 7-day trend +1.4 GB, -13
+  entries`; the trend JSON carried `"since_days": 9.0, "size_delta":
+  1500000000, "entries_delta": -13`.
+- ☐ [auto] **C3 — the structured surface.**
+  `python -c "import sys; sys.path.insert(0, '$HOME/.local/bin'); import
+  handsoff as H, json;
+  print(json.dumps(H.doctor_json()['state_hygiene']))"`.
+  Expect `readable: true`, `scratch_left` equal to C1's count, and
+  `entries`/`size_bytes` matching `du`. `last_sweep.at: null` is CORRECT
+  here: a fresh client process has not run `_prepare_runtime`, which is also
+  the proof that this command sweeps nothing (read 2026-09-25:
+  `{"readable": true, "scratch_left": 0, "size_bytes": 3381314980,
+  "entries": 38, "last_sweep": {"at": null, "removed": 0, "unreadable":
+  false}}`).
+  Recorded 2026-09-25 (auto): `{"entries": 39, "last_sweep": {"at": null,
+  "removed": 0, "unreadable": false}, "readable": true, "scratch_left": 0,
+  "size_bytes": 3381353853, "trend": {"rows": 16, "span_days": 0.06}}` —
+  agrees with C1's line.
+
+Every automated item above (A5, B1–B5, C1–C5) PASSED on this desk on
+2026-09-25 — run as three `python ci/desk_retest.py` invocations (the quiet
+subset `A5,B2,B3,B4,C1,C2,C3,C4,C5`, then `--only B1`, then `--only B5`), the
+unit's start limit respected throughout; the full one-shot run is what a
+fresh desk should use. What remains owed is exactly the part no command can
+substitute: **A1–A4, a real voice at this microphone** (closing them closes
+§3's ❌ item), plus B2's human half — `aplay` the recovered `tts.wav` and
+hear that it is the reply the bubble actually synthesized.
 
 ## Sign-off
 
@@ -633,3 +902,11 @@ checked with a date or explicitly abandoned with a reason.
 | 2026-09-23 | Buffy | stop-audit's verdict now carries the FINDING, not just the machinery: a new `unattributed` check counts non-shutdown, unattributed stops after the newest open incident (anchor = newest open item, else the pinned anchor) — with NO attributed non-shutdown catch after them it FAILs the audit (rc 1), so a recurring ghost pattern after tomorrow's boot is impossible to miss in the verdict doctor renders; when a later catch supersedes the ghost (the red-handed shape), it renders as a WARN naming both timestamps — answered, not clean — and a clean window renders PASS. Shutdown-annotated sweeps and rows at/below the anchor are exempt (the sweep flag and the anchor's own history are not new evidence). Two design notes kept honest: the check reuses the supersession shape rather than the PATTERN window, so the pre-tripwire 21:34:06 ghost now renders VISIBLE as `superseded by the attributed catch at 2026-09-23T10:02:41` (previously it rode silently behind passing machinery checks — the audit verified the reader, the oracle and the writer while the finding went unsaid); and the oracle-agreement test's charter narrowed to oracle-vs-reader equality (its loop no longer asserts audit rc=0 for ghost shapes, since an open ghost legitimately FAILs — the verdict has its own three guards). Guards: 3 new (open ghost FAILs with the OPEN verdict text, superseded ghost WARNs with both timestamps and rc 0, sweeps+history exempt and clean). Live ledger verified in-process: 16 rows, `PASS (6 passed, 1 warned)` with the 21:34:06 WARN. Full suite 2149 passed (2146 + 3 new; the oracle-agreement loop narrowed to its charter); freshness 19/19 after regen (module line count); ruff delta 0 (120=120, 16=16) |
 | 2026-09-23 | Buffy | Audit round 1 — the two installer P1s, both found by the full-project audit and fixed at the source. (1) PROBE MODE: TOP_EXECUTABLE omitted handsoff-stop-probe, so the rollback loop (`is_exec`) and the switch-fail case (a 3-name list) restored it 0644 — and the unit's ExecStop= executes the probe DIRECTLY, so a rolled-back install had a stop job that dies on Permission denied (a failed ExecStop marks the whole unit failed); the fresh-install path was the only one that chmod 755. Fix: probe joins TOP_EXECUTABLE, which is the single source the rollback loop and the switch case both consult. Guard: `test_rollback_and_switch_keep_the_probe_executable` — a real rehearsal install + real `--rollback`, asserting the mode (755) of the INSTALLED probe both before and after rollback; tests previously asserted bytes/strings only, never modes. (2) PURGE XDG PATH: `--uninstall --purge` tarred the hardcoded `.local/state/handsoff` while the `rm -rf` deletes the XDG-resolved `$STATE_DIR` — under an XDG-redirected HOME the archive holds a wrong-or-absent tree while the real state is destroyed. Fix: the tar names the SAME relative path (`${STATE_DIR#$HOME/}`), one source of truth. Guard: `test_purge_backs_up_the_xdg_redirected_state_it_deletes` — purges with XDG_STATE_HOME pointed OUTSIDE .local and asserts the archive contains `xdg-state/handsoff/…` and NOT `.local/state/handsoff`. bash -n clean; both guards fail on the unfixed installer (verified for the mode guard via revert; the purge guard's tar-listing assertion is the failing line under the old path) |
 | 2026-09-23 | Buffy | Audit round 2 — the ReminderStore data-loss P1, reproduced by the audit before fixing: a reminders.json that exists but cannot be PARSED (invalid JSON / non-list body) made load() return [] silently, and the next update() then (a) saved a fresh queue over the corrupt file and (b) save()'s _backup()-first ordering copied the CORRUPT bytes over the good .bak — the audit measured it: live=[{water plants}], bak=[{water plants}], file="{ CORRUPT" → after update(): live=[{new}], bak={ CORRUPT. Zero log lines, queue destroyed, recovery copy destroyed. Fix, in core/assistant.py: load() distinguishes an ABSENT file (real empty, first run) from an UNREADABLE one (OSError — logged, load_failed=True) and an UNPARSEABLE one (quarantined via injected core.settings.quarantine_file — the same rule settings.json follows — and logged, load_failed=True); update() ABORTS the transaction when load_failed, leaving the file on disk for recovery and saying why at error level. The store stays DI-clean: quarantine is an injected dependency (default noop), the host binds _core_settings.quarantine_file. Guards: 2 new in TestReminderStore — a corrupt file + update() must leave the corrupt file in place un-replaced (no save ran) with no .bak corruption, and load() on a non-list body must quarantine (file moved aside) rather than silently empty. Full suite 2151 passed at the installer commit's staged run + these two (2153 total); freshness 19/19 after regen (assistant.py line count); ruff delta 0 (6=6, 214=214, 1=1) |
+| 2026-09-24 | Buffy | Scratch sweep — the state dir carried ten leaked `tmp*` TTS scratch dirs from killed runs: every `_speak` reply synthesizes through `TemporaryDirectory(dir=STATE_DIR)`, whose cleanup dies with the process (SIGKILL, power cut), and loose `*.tmp` siblings from interrupted state writes strand the same way. New `_sweep_stale_scratch()` runs inside `_prepare_runtime()` at every start and reclaims EXACTLY the two shapes this runtime itself produces — a `tmp*` DIRECTORY and a `*.tmp` FILE directly inside STATE_DIR, nothing recursive — older than a 600 s grace (`SCRATCH_SWEEP_AGE_S`: a sibling instance mid-synthesis is never swept; fresh scratch belongs to the living). Symlinks are never followed out (the backup sweep's contract), and an unreadable state dir is one warning, never a refusal — the bubble starts with a dirty state dir. The `swept N stale scratch entries` summary and the unreadable-dir warning each fire once per process (`_SWEEP_NOTE`/`_SWEEP_WARNED` process-globals, pinned empty by the guards — order). Guards: 8 in `tests/test_hardening.py::TestSweepStaleScratch` — both leaked shapes reclaimed, inside-grace entries untouched, the sweep through `_prepare_runtime` itself plus a wiring pin, ordinary state entries never swept (lock, jsonl, a backup, a `.tmp`-suffixed DIRECTORY, a `tmp`-prefixed FILE — the two shapes never cross), a symlink skipped with its target intact, an unreadable dir warns with zero removals. Mutations 4/4 caught (age gate removed, `tmp` prefix dropped, symlink skip removed, call unwired — the last caught by two guards). Docs: 50-ops runtime line, 40-data hardening paragraph, README census 2207→2215 ×3, architecture table regenerated. 2215 green in all three orders (default, seed 424242, file order 7); `compile_all` 63 files; `bash -n` clean |
+| 2026-09-24 | Buffy | Phase 4f — the monolith cut finishes: the STATELESS voice primitives move to a new `core/voice.py` (16th core module) behind the alias contract the other core modules use. Moved: `SpeechGate` (the energy VAD), the whole wake vocabulary and matching rules (`norm_words`, `is_wake_utt`, `match_wake`, `skeleton_match`/`wake_skeleton`, `wake_anywhere`, `WAKE_FILLER`, `WAKE_ANYWHERE_WORDS`), the echo filter (`is_echo` + its stopword set), `WakeSpotter` (openWakeWord pre-roll detector — the model, sample rate and chunk size arrive as constructor parameters, so the host keeps the process-global model cache and its `H._spotter_model` patch seams), and the mic open/device primitives (`available_input_devices`, `device_is_available`, `open_input_unlocked`, `mic_device_to_open`, `stop_stream_owned`, `start_stream_owned` — the sd module, logger, `MIC_OPERATION_LOCK` and last-open record are parameters). Deliberately NOT moved, per the monolith's own boundary comment: `ContinuousListener`, `Recorder` and `_speak` — assistant/UI lifecycle state and per-process health hooks; the host keeps thin delegating wrappers (`H._match_wake` reads `_wake_name()` LIVE at every call, `H._open_input_unlocked` supplies the host context per call), so every historical monkeypatch seam (`_open_input`, `Recorder`, spotter state) and the settings app's `H._SpeechGate` stay live. Guards: 7 in `tests/test_audio.py::TestVoiceSeam` — the alias contract resolves through the host, the gate IS the seam class, wake delegates read the settings live (a call-time flip changes the next answer), the matching rules come from the seam not a re-derivation, the mic-open delegation carries the host context (a source pin captured before the spy, after the spy masked the first body mutation), the bare `H.WakeSpotter()` constructor still works with the model arriving late, and the class constants travel on the factory. Mutations 4/4 caught (a frozen wake name, the seam call dropped from `_open_input_unlocked` — caught only after the pin became a source pin, the constants loop emptied, the gate alias turned into a diverging subclass). Deployment/census surfaces caught by their own guards and updated: `CORE_REQUIRED` names `voice` (the installer-floor guard refused the undeclared module), intent-to-add staged so the shipped-glob hygiene test sees an owned path, architecture map + census 15→16 in all four spec places, README census 2215→2222. 2222 green in all three orders (default, seed 424242, file order 7); `compile_all` 64 files; `bash -n` clean |
+| 2026-09-24 | Buffy | The doctor now reports STATE-DIR HYGIENE: a `state:` line (and a `state_hygiene` key on the JSON surface) built on the scratch sweep — scratch-shaped entries currently present, the last sweep's result (when, how many removed, whether the dir was unreadable), and the dir's total size with an entry count. One host collector behind both surfaces (`_state_hygiene` → dict, `_state_hygiene_line` → the host's own rendering, shipped through the lines-dep contract like wake/gpu), so the words and the numbers cannot drift; the doctor owns only placement. The collector and the sweep share ONE shape predicate (`_scratch_shaped`: a `tmp*` DIRECTORY or a `*.tmp` FILE — a `tmp`-prefixed FILE and a `.tmp`-suffixed DIRECTORY are not scratch), so a diagnostic can never disagree with the sweep about what a leak is; the reading deliberately has NO age gate (a live sibling's in-flight scratch shows as "present — the next start sweeps them", because a diagnostic reports what is, not what will be reclaimed). `_sweep_stale_scratch` now stamps `_LAST_SWEEP` on every run including the unreadable-dir case (a failed reading must not leave the last good one standing in for it), and a start that found nothing still stamps `at`, so an old timestamp reads as "nothing to reclaim recently", never "the sweep never ran". The size reader follows the runtime hardening rule in miniature: symlinks count as entries and are never walked out of the state dir. Live proof on this desk: the line reads `state: 11 scratch-shaped entries present (in grace or from a live sibling) — the next start sweeps them; sweep not run this process; 3.1 GB in 52 entries` — the audit's leak, visible before the service's next restart reclaims it. Guards: 6 host-side (`TestStateHygieneReading` — the shared predicate, the no-age-gate difference, honest last-sweep renderings, the sweep's stamp on all three outcomes, `readable: False`, the symlink rule) + 5 doctor-side (`TestStateHygieneLine` — the line through `run_doctor`, the clean dir as a positive finding, the JSON numbers, `readable: False` as an explicit JSON finding, and the partial-deps contract: no dep → no line, no key). Mutations 4/4 caught (the shape predicate falsified — two guards, sweep and collector; leaks rendered as clean; the JSON key suppressed; `_LAST_SWEEP` never stamped), all restored, no mutant strings left in the tree. Docs: 50-ops runtime + control-socket paragraphs, README Doctor sentence, census 2222→2233 ×3, architecture table regenerated. 2233 green in all three orders (default, seed 424242, file order 7); `compile_all` 64 files |
+| 2026-09-25 | Buffy | Restart-check of the deployed bubble caught the doctor's new `state:` line LYING about its own sweep, on the real state dir. The check itself first: `deployment: in-sync`, and a controlled live proof on `~/.local/state/handsoff` — a planted stale `tmp*` DIRECTORY (with a file inside) and a stale `*.tmp` FILE were both reclaimed by the restart while a FRESH `tmp*` dir inside the grace window survived, exactly the two-shape/no-age-gate contract (3 → 1 scratch entries, 42 → 38 recursive entries). But the line read `last start swept nothing (10s ago)` over a sweep that had just removed two entries, and the journal carried no `swept N` line. Root cause, both halves found live: `_prepare_runtime()` runs TWICE in a service process — `main()`, then again from `ControlServer._serve()` — and since the sweep is a start action the second pass is a no-op that RE-STAMPED `_LAST_SWEEP` with `removed=0`, erasing the reclaim the first pass had recorded; and the sweep runs BEFORE `setup_logging()` (it must: the rotating handler lives in the state dir it cleans), so its INFO summary was dropped by `logging.lastResort`, which is WARNING-only — the reclaim was invisible in the journal even while it happened. That also closes the earlier mystery: the eleven leaked entries vanished at the 21:06 install-restart because the sweep DID reclaim them; only the reporting was broken. Fix: `_SWEPT_DIRS` latches one sweep per state dir per start (the no-op pass cannot rewrite the record), and the summary moves to `_log_swept_scratch()`, called in `main()` immediately after `setup_logging()`, rendering the SAME `_LAST_SWEEP` the doctor reads — one dict, so the journal and the doctor cannot disagree (a clean start says nothing; the doctor is where "swept nothing" belongs). Honest correction to this task's premise: the "3.1 GB" was never scratch — `_state_hygiene`'s size/entries are the WHOLE state dir recursively, and 3.2 GB of it is `laya-finetune`, untouched by design; the eleven entries were TTS temp dirs (kilobytes). Guards: 2 new in `tests/test_hardening.py::TestSweepStaleScratch` (a second sweep cannot erase the first one's reclaim — asserts the record survives `_prepare_runtime()` → `_sweep_stale_scratch()` and that the line still reads "swept 1 entry"; the summary is logged once the journal exists — INFO record from a non-zero `_LAST_SWEEP`, silence from a clean one, plus the source-order pin that `main()` calls it after `setup_logging()`), with the two `_SWEEP_NOTE` pins retargeted to `_SWEPT_DIRS`. Mutations 3/3 caught (latch removed — the record is erased; clean-start logging — the silence assertion; emitted pre-logging — the source pin), all restored, no mutant strings left. Docs: 40-data hardening paragraph + 50-ops runtime step, README census 2233→2235 ×3, architecture table regenerated. 2235 green in all three orders (default 342 s, seed 424242 353 s, file order 7 325 s); `compile_all` 64 files; `bash -n` clean. One environmental note: a full-suite run taken while the freshly-restarted bubble was still loading models (GPU at 91%) failed 4 `tests/test_hardware_watch.py::TestMicDead` count assertions; the same file then passed 4 consecutive runs and the full suite is green — those tests read real GPU/mic state, so it is a flake of the desk's load, not of this change |
+| 2026-09-25 | Buffy | The scratch sweep is now REVERSIBLE. Reclaim used to `rmtree`/`unlink` a stale entry on sight; the two shapes are matched by NAME (`tmp*` dir, `*.tmp` file), so a false positive destroyed real state with no copy anywhere. Now the entry is MOVED into `STATE_DIR/scratch-quarantine/<YYYY-MM-DD>/`, created 0700 only on the first reclaim of a run (a clean start leaves no new directory) and derived from `STATE_DIR` at CALL time so a redirected state dir carries its archive with it. Three behaviours carry the reversibility: a name already taken in that day's folder gets a `~N` suffix rather than replacing the earlier copy — both survive, which is the point of an archive; the archive has its OWN clock, `SCRATCH_QUARANTINE_TTL_DAYS` (7) days after a folder's own date, purged by the start that finds it and only ever for DIRECTORY names that parse as a date (a stray file or someone else's folder is not ours to delete); and an archive that cannot be made private REFUSES — a planted `scratch-quarantine` symlink (the runtime hardening rule, via `_private_dir`) leaves the stale entry exactly where it was plus one warning, rather than carrying reclaimed state out of the bubble or deleting what it cannot keep. The sweep's summary line now names the destination and the retention (`swept 2 stale scratch entries from X into X/scratch-quarantine (recoverable for 7 days)`), so the journal says where the bytes went. Guards: 5 new in `tests/test_hardening.py::TestSweepStaleScratch` (content intact under the dated folder and mode 0700; the TTL boundary — a folder at exactly the TTL survives, one past it is gone, non-dated entries untouched; a same-day name collision keeps BOTH copies; a symlinked archive reclaims nothing and carries nothing out; a clean start creates no archive at all), and the summary guard now pins the archive wording. Mutations 5/5 caught (delete instead of archive, TTL collapsed to zero days, collision handling dropped, symlink refusal replaced with a bare mkdir, lazy creation made eager), all restored, no mutant strings left. Docs: 40-data hardening paragraph, 50-ops runtime step, README Doctor sentence, census 2235→2240 ×3, architecture table regenerated. 2240 green in all three orders (default 327 s, seed 424242 329 s, file order 7 326 s); `compile_all` 64 files |
+| 2026-09-25 | Buffy (live redeploy) | uncommitted wake-name + sweep/archive + `state:`-line set (running == checkout == installed, `deployment: in-sync`) | The deployable half is done and the HUMAN half is now written down instead of remembered: new **§10** is the executable desk retest for the three features this session closed — the wake-name fixes (§3's ❌ follow-up), the scratch sweep with its reversible archive, and the doctor's `state:` line, including C2, the `swept nothing` regression the restart-check caught live. **13 ☐ items**, each naming the exact command, the exact journal string and the one evidence line to paste back; A1–A4 (real voice) and B1 (a real `kill -9` mid-synthesis) have no automated equivalent at all, and every quoted string in the checklist was read off the deployed copy while writing it (the B5 refusal message and the C3 JSON reading were both captured live 2026-09-25). §3's hands-free follow-up stays ❌ until A2 passes. OWED: §10 A1–A5, B1–B5, C1–C3. Automatable state of this set: 2240 green in all three orders (default 327 s, seed 424242 329 s, file order 7 326 s), `compile_all` 64 files, mutations 3/3 (clobber fix) and 5/5 (archive) caught |
+| 2026-09-25 | Buffy (live redeploy) | uncommitted hygiene-TREND set (running == checkout == installed) | The hygiene reading now has a history: every start appends `{at, date, scratch_left, size_bytes, entries, swept}` to `STATE_DIR/state-hygiene.jsonl` (`_record_state_hygiene()`, called from `_prepare_runtime()` right after the sweep, so a row is the POST-reclaim state and carries that start's reclaim count), and the doctor reports growth — one number could never say whether the dir is growing, which is the question an operator actually has. Design choices, each because the alternative lies: **one row per START, not per doctor read** (the doctor is asked on demand and a diagnostic must not write state; a start is a bounded, natural sample), **latched per start** like the sweep (`_HYGIENE_LOGGED`, so the second `_prepare_runtime()` cannot double the sample), **capped at 400 readings** and rewritten atomically under the state-file lock (the self-watch log's shape — an unbounded diagnostic log would BE the leak this line reports), and the trend compares the newest reading with the newest one **at least 7 days older** so the delta always spans a real week; a shorter history reports its span and NO deltas (a week-over-week number from two hours of samples is a lie shaped like a trend), and a torn or foreign line is dropped rather than fatal (a power cut leaves exactly that). The structured surface ships the same numbers, with `null` — never 0 — for a delta the history cannot support, so "no delta" and "a delta of nothing" stay different facts. Guards: 9 host-side (`TestStateHygieneTrend` — the recorded row matches the reading it came from and lands 0600; one row per start; the delta comes from the ≥7-day-old row and NOT the 6-day-old one, with `+953.7 MB, +20 entries` on the line; a short history offers no deltas; an empty log says `no readings yet`; torn/foreign/at-less lines are dropped; the cap drops the OLDEST rows; an unreadable dir records nothing and conjures no file; `_prepare_runtime` records post-reclaim with `swept == 1`) + 1 doctor-side (`test_the_trend_rides_the_json_surface`, because the doctor builds that dict key by key and a trend the JSON drops is exactly the drift one collector exists to stop), with the unreadable-JSON guard extended to the new key. Mutations 8/8 caught (window ignored, sign dropped, latch removed, recorded before the sweep, cap dropping the newest, foreign rows kept verbatim, short history fabricating a delta, the doctor dropping the trend), all restored, no mutant strings left. Docs: 40-data on-disk map (two new rows: the trend log and the `scratch-quarantine/` archive) + the trend paragraph, 50-ops runtime step, README Doctor sentence, census 2240→2250 ×3, architecture table regenerated; ACCEPTANCE §10 C1 now expects FOUR clauses and gains **C4**, the desk check for the trend (including the by-hand delta and the one-row-per-start rule). 2250 green in all three orders (default 326 s, seed 424242 389 s, file order 7 329 s); `compile_all` 64 files; `bash -n` clean. Live: deployed (`in-sync`) and proved on the real state dir — the line reads `… 3.1 GB in 39 entries; trend needs a week (0.0 days recorded)`, the log holds exactly ONE row per start (two restarts → two rows, not four, so the production latch holds) and is 0600, and a sandboxed run of the DELIVERED copy over a synthetic week rendered `7-day trend +308.7 KB, -13 entries` with `since_days: 9.0` in the JSON — a real DECLINE over the week, which is the sweep's reclaim showing up as history. Nothing committed |
+| 2026-09-25 | Buffy (live desk run) | uncommitted desk-retest driver set (`ci/desk_retest.py`, 28 guards; running == checkout == installed) | §10's automated half is now ONE command (`python ci/desk_retest.py` — plants the probes, restarts the unit paced to its own start limit, reads the journal and the doctor's lines back, prints the paste-ready block ending `OWED at the desk (real voice — no substitute): A1 A2 A3 A4`), and it PASSED on this desk: **11/11 automated items** (A5, B1–B5, C1–C5) with evidence recorded under each — C2, the `swept nothing` regression, graded closed live, and B1's real `kill -9` mid-synthesis caught a stranded TTS dir and archived it. **OWED: §10 A1–A4 only** (a real voice; plus B2's `aplay` half). The driver was hardened by its own first live runs, all found the hard way: restarts are PACED to the unit's `StartLimitBurst=5`/`StartLimitIntervalSec=120` counted from the JOURNAL with one start of reserve (run one tripped the limit and left the bubble down ~3 min; run two tripped it again because a process-local start list cannot see a previous run's tail or a `Restart=always` respawn; a third run was killed by a dead session and left the unit `failed` — the driver now also revives a unit it finds down before judging anything), readiness is the control socket and never the doctor (`doctor` answers for a dead bubble from a LOCAL report, which C2 once graded), a `start-limit-hit` start is recovered with the documented `reset-failed` + `start`, a client-side doctor report is refused rather than graded, and one real parser bug fell out of `--simulate`: a mature `7-day trend … entries` clause was swallowed by the size clause that also ends in `entries`. Guards: 28 in `tests/test_desk_retest.py` (readers, block, CLI, one end-to-end `--simulate`, the desk-only wiring by shape, and the real back end's start policy), **28/28 mutations caught across three sweeps, every restore byte-exact**; the +3 reserve tests also exposed one pre-existing order-flake, fixed at its cause (`test_a_start_records_one_row_of_the_reading` now pins `_LAST_SWEEP`, deterministic under seed 424242). 2278 green in all three orders (default 330 s, seed 424242 332 s, file order 7 335 s), `compile_all` 66 files, `bash -n` clean; docs: ACCEPTANCE §10 (+C5), 50-ops, 60-test-plan, README census ×3. Nothing committed |

@@ -1272,6 +1272,230 @@ class TestWakeWord:
         assert H._match_wake("hey bubble what time") == "what time"
         assert H._is_wake_utt("hey bubble")
 
+
+class TestWakeAnywhere:
+    """A custom name has no audio-spotter model, so the transcript is the only
+    door — and it has to open for a name whisper did not put FIRST (a split
+    chunk or a mishearing). Bounded to a short utterance: a sentence that
+    merely mentions the assistant is not an attempt to wake it."""
+
+    @pytest.fixture()
+    def cypher(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+
+    def test_name_later_in_a_short_utterance_engages(self, H, cypher):
+        rest = H._wake_anywhere("so cypher what's the weather")
+        assert rest is not None and "weather" in rest
+        assert "cypher" not in rest.lower(), "the name is not part of the command"
+
+    def test_a_filler_before_the_name_goes_with_it(self, H, cypher):
+        assert H._wake_anywhere("okay hey cypher open firefox") == "okay open firefox"
+        # ...and when the filler lands after the name, it goes too
+        assert H._wake_anywhere("so cypher hey open firefox") == "so open firefox"
+
+    def test_a_misheard_name_still_engages(self, H, cypher):
+        """Same fuzzy skeleton the prefix rule uses (Siphon ~ cypher)."""
+        assert H._wake_anywhere("well siphon what time is it") == \
+            "well what time is it"
+
+    def test_the_name_alone_returns_empty(self, H, cypher):
+        assert H._wake_anywhere("cypher") == ""
+
+    def test_a_long_sentence_that_mentions_the_name_is_not_a_wake(
+            self, H, cypher):
+        sentence = "i told cypher the other day that the weather was bad"
+        assert H._wake_anywhere(sentence) is None, \
+            "talking ABOUT the assistant must not open the window"
+
+    def test_no_name_is_none_and_no_false_positive(self, H, cypher):
+        assert H._wake_anywhere("what's the weather") is None
+        assert H._wake_anywhere("") is None
+        # the classic trap: 'a' must not match out of 'a stainless steel…'
+        assert H._wake_anywhere("a stainless steel bottle") is None
+
+    def test_tiny_names_are_never_fuzzy(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "al")
+        assert H._wake_anywhere("all what time is it") is None, \
+            "a two-letter name must match exactly or not at all"
+
+
+class TestCustomNameEngagementPath:
+    """End to end through the gate: the name mid-utterance opens the window and
+    the command reaches the brain without it; a long mention does not."""
+
+    def _mk(self, H, monkeypatch, transcribed):
+        monkeypatch.setattr(H, "transcribe", lambda audio: transcribed)
+        monkeypatch.setattr(H, "tts_to_wav", lambda text, wav: None)
+        monkeypatch.setattr(_core_audio, "play_wav", lambda wav, cancel: None)
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        a = H.Assistant.__new__(H.Assistant)
+        a._handsfree = True
+        a._followup_until = 0.0
+        a._wake_until = 0.0
+        a._spotter_wake = False
+        a._models_ready = threading.Event(); a._models_ready.set()
+        a._recently_spoken = []
+        a._last_transcript = ("", 0, 0.0)
+        a._empty_streak = 0
+        a._try_snooze = lambda *a_: False
+        a._set = lambda gen, state: None
+        return a
+
+    def test_a_split_utterance_engages_and_keeps_the_command(
+            self, H, monkeypatch):
+        seen = {}
+        a = self._mk(H, monkeypatch, "so cypher what is the weather")
+        a._brain_turn = lambda text, gen, cancel: seen.update(text=text)
+        a._pipeline(np.zeros(16000, dtype="int16"), 0, threading.Event())
+        assert "cypher" not in seen.get("text", "").lower(), seen
+        assert "weather" in seen.get("text", ""), seen
+        assert a._wake_until > time.monotonic(), "the window must open"
+
+    def test_a_mention_in_a_long_sentence_stays_ignored(self, H, monkeypatch):
+        seen = {}
+        a = self._mk(H, monkeypatch,
+                     "i was telling cypher that the weather looks bad tomorrow")
+        a._brain_turn = lambda text, gen, cancel: seen.update(text=text)
+        a._pipeline(np.zeros(16000, dtype="int16"), 0, threading.Event())
+        assert "text" not in seen, "a remark about the assistant is not a wake"
+        assert a._wake_until == 0.0
+
+
+class TestSpotterCannotCoverACustomName:
+    """The spotter fires only for its OWN models: when the configured name has
+    none, the transcript is the only door and the journal must say so."""
+
+    @pytest.fixture()
+    def loaded(self, H, monkeypatch):
+        """Pin the loader's module-global state and hand back the name list.
+
+        `_spotter_model` and `_spotter_failed` are process-global and persist
+        by design (a load that failed is remembered), so a neighbour that left
+        the loader FAILED would change every answer here — measured in a full
+        run, where this class passed alone and failed in the suite.
+        """
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", [], raising=False)
+        monkeypatch.setattr(H, "_spotter_failed", False, raising=False)
+        monkeypatch.setattr(H, "_spotter_model", None, raising=False)
+        return H._SPOTTER_MODEL_NAMES
+
+    def test_untried_spotter_is_not_a_verdict(self, H, loaded):
+        assert H._spotter_wakes_for() is None, \
+            "a spotter nobody started is not a healthy one"
+
+    def test_stock_slugs_match_the_spelled_name(self, H, monkeypatch, loaded):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "hey jarvis")
+        loaded[:] = ["alexa", "hey_jarvis", "hey_mycroft"]
+        assert H._spotter_wakes_for() is True
+
+    def test_a_custom_name_is_not_covered(self, H, monkeypatch, loaded):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        loaded[:] = ["alexa", "hey_jarvis", "hey_mycroft", "timer", "weather"]
+        assert H._spotter_wakes_for() is False
+
+    def test_the_arm_says_it_out_loud(self, H, monkeypatch, loaded, caplog):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        loaded[:] = ["alexa", "hey_jarvis"]
+        with caplog.at_level("WARNING", logger="handsoff"):
+            H._warn_if_spotter_cannot_cover_this_name()
+        assert any("has no model for" in r.getMessage()
+                   and "hey_jarvis" in r.getMessage()
+                   for r in caplog.records), "the covered channel must be named"
+
+    def test_a_covered_name_is_not_warned_about(self, H, monkeypatch, loaded,
+                                                caplog):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "hey jarvis")
+        loaded[:] = ["hey_jarvis"]
+        with caplog.at_level("WARNING", logger="handsoff"):
+            H._warn_if_spotter_cannot_cover_this_name()
+        assert not [r for r in caplog.records if "has no model for" in r.getMessage()]
+
+    def test_an_untried_spotter_is_not_warned_about(self, H, monkeypatch, loaded,
+                                                    caplog):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        with caplog.at_level("WARNING", logger="handsoff"):
+            H._warn_if_spotter_cannot_cover_this_name()
+        assert not caplog.records, "nothing loaded yet is not a defect to report"
+
+
+class TestWakeDoctorLines:
+    """Which channel can wake the bubble, as doctor reports it."""
+
+    @pytest.fixture(autouse=True)
+    def _spotter_state(self, H, monkeypatch):
+        """Same pin as TestSpotterCannotCoverACustomName: the loader's state is
+        process-global, so a neighbour's failure would rewrite these lines."""
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", [], raising=False)
+        monkeypatch.setattr(H, "_spotter_failed", False, raising=False)
+        monkeypatch.setattr(H, "_spotter_model", None, raising=False)
+
+    def test_no_wake_word_required(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", False)
+        line = H._wake_lines()[0]
+        assert line.startswith("wake: no wake word required")
+
+    def test_spotter_off_names_the_transcript_gate(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        monkeypatch.setitem(H.SETTINGS, "wake_spotter", False)
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        line = H._wake_lines()[0]
+        assert "transcript gate only" in line and "audio spotter is off" in line
+
+    def test_unloaded_spotter_says_untried(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        monkeypatch.setitem(H.SETTINGS, "wake_spotter", True)
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", [], raising=False)
+        monkeypatch.setattr(H, "_spotter_failed", False, raising=False)
+        monkeypatch.setattr(H, "_spotter_model", None, raising=False)
+        assert "untried" in H._wake_lines()[0]
+
+    def test_a_loaded_spotter_with_no_readable_names_is_unknown(
+            self, H, monkeypatch):
+        """Loaded but nameless: a verdict either way would be a guess."""
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        monkeypatch.setitem(H.SETTINGS, "wake_spotter", True)
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", [], raising=False)
+        monkeypatch.setattr(H, "_spotter_failed", False, raising=False)
+        monkeypatch.setattr(H, "_spotter_model", object(), raising=False)
+        line = H._wake_lines()[0]
+        assert "reports no model names" in line
+        assert "NO model for this name" not in line, \
+            "an unreadable model list is not an accusation"
+
+    def test_a_failed_spotter_is_not_reported_as_untried(self, H, monkeypatch):
+        """The one shape a reader must not chase: a load that already failed."""
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        monkeypatch.setitem(H.SETTINGS, "wake_spotter", True)
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", [], raising=False)
+        monkeypatch.setattr(H, "_spotter_failed", True, raising=False)
+        monkeypatch.setattr(H, "_spotter_model", None, raising=False)
+        line = H._wake_lines()[0]
+        assert "FAILED to load" in line and "untried" not in line
+
+    def test_a_custom_name_reads_as_transcript_only(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        monkeypatch.setitem(H.SETTINGS, "wake_spotter", True)
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        loaded = ["alexa", "hey_jarvis"]
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", loaded, raising=False)
+        line = H._wake_lines()[0]
+        assert "transcript gate only" in line
+        assert "NO model for this name" in line
+        assert "hey_jarvis" in line, "what it DID load is the actionable half"
+
+    def test_a_covered_name_reads_as_both_channels(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "wake_word_required", True)
+        monkeypatch.setitem(H.SETTINGS, "wake_spotter", True)
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "hey jarvis")
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", ["hey_jarvis"],
+                            raising=False)
+        line = H._wake_lines()[0]
+        assert "audio spotter" in line and "transcript gate" in line
+
     def test_new_settings_coerce(self, H, tmp_path, monkeypatch):
         f = tmp_path / "settings.json"
         f.write_text(json.dumps({"assistant_name": "  Nova  ",
@@ -3428,6 +3652,81 @@ class TestWhisperCudaFallback:
             "must attempt CPU once, then raise (apology path preserved)"
 
 
+class TestVadRetryOnShortUtterance:
+    """A short utterance the VAD removes ENTIRELY is read again without it.
+
+    This is the announce-and-listen failure: "… and tomorrow?" is well under a
+    second, silero needs more context to call it speech, the filtered pass
+    returns nothing, and the turn then dies downstream as "unintelligible while
+    engaged" — the user asked a question and the bubble said nothing at all. A
+    LONG clip is deliberately not retried: there an empty transcript really is
+    silence, and inventing words for a room would answer noise.
+    """
+
+    class _Model:
+        """Records the filter setting of every pass; answers per that setting."""
+
+        def __init__(self, vad_text, unfiltered_text):
+            self.vad_text = vad_text
+            self.unfiltered_text = unfiltered_text
+            self.passes: list = []
+
+        def transcribe(self, _audio, vad_filter=True, **_kw):
+            self.passes.append(vad_filter)
+            text = self.vad_text if vad_filter else self.unfiltered_text
+
+            def _gen():
+                if text:
+                    yield types.SimpleNamespace(text=text)
+
+            return _gen(), None
+
+    def _transcribe(self, H, monkeypatch, model, seconds):
+        monkeypatch.setattr(H, "get_whisper", lambda: model)
+        monkeypatch.setattr(H, "_whisper_model", None, raising=False)
+        frames = int(seconds * H.SAMPLE_RATE)
+        return H.transcribe(np.zeros(frames, dtype=np.int16))
+
+    def test_short_clip_removed_by_vad_is_read_again(self, H, monkeypatch):
+        model = self._Model(vad_text="", unfiltered_text="and tomorrow")
+        out = self._transcribe(H, monkeypatch, model, 0.9)
+        assert out == "and tomorrow", "the question must survive the VAD"
+        assert model.passes == [True, False], \
+            "the retry is the filter off, once, after the filtered pass"
+
+    def test_retry_is_visible_in_the_journal(self, H, monkeypatch, caplog):
+        model = self._Model(vad_text="", unfiltered_text="what about friday")
+        with caplog.at_level("INFO", logger="handsoff"):
+            self._transcribe(H, monkeypatch, model, 0.8)
+        assert any("retried without the filter" in r.getMessage()
+                   for r in caplog.records), \
+            "a retry that changed the answer must be readable afterwards"
+
+    def test_long_clip_is_not_retried(self, H, monkeypatch):
+        """Silence in a long clip is silence: one pass, no invention."""
+        model = self._Model(vad_text="", unfiltered_text="thank you for watching")
+        out = self._transcribe(H, monkeypatch, model, 30.0)
+        assert out == "", "a long silent clip must stay empty"
+        assert model.passes == [True], "no second decode for a long clip"
+
+    def test_speech_found_by_the_filter_is_never_retried(self, H, monkeypatch):
+        """The normal path pays nothing: one pass, filter on."""
+        model = self._Model(vad_text="hello there", unfiltered_text="junk")
+        out = self._transcribe(H, monkeypatch, model, 1.0)
+        assert out == "hello there"
+        assert model.passes == [True]
+
+    def test_both_passes_empty_still_reads_as_silence(self, H, monkeypatch):
+        model = self._Model(vad_text="", unfiltered_text="")
+        out = self._transcribe(H, monkeypatch, model, 0.5)
+        assert out == ""
+        assert model.passes == [True, False]
+
+    def test_the_bound_is_a_constant_not_a_magic_number(self, H):
+        """The window that gets the retry is one named value in core.audio."""
+        assert _core_audio.VAD_RETRY_MAX_S == 3.0
+
+
 class TestStreamingFallback:
     def test_tools_fallback_emits_one_terminator(self, H, monkeypatch):
         """A tools-unsupported retry must not enqueue duplicate sentinels."""
@@ -3950,7 +4249,8 @@ class TestWatchdogReopenLoop:
             tick(s)
         monkeypatch.setattr(H.time, "sleep", fake_sleep)
         ln._run(7)
-        real_sleep(0)
+
+
         return state["ticks"]
 
     # ---- stalled: frames stop arriving → REOPEN_S later the stream reopens
@@ -4383,3 +4683,113 @@ class TestAMicrophoneThatIsNotOnTheMachine:
 
         monkeypatch.setattr(H.time, "sleep", fake_sleep)
         ln._run(7)
+
+
+class TestVoiceSeam:
+    """core/voice.py is the seam; these pin the HOST-side alias contract that
+    keeps the app's historical names live — the properties the extraction
+    promised, each one a way a future edit could quietly break a patch seam
+    or a settings read without any behavioural test noticing."""
+
+    def test_the_alias_contract_names_still_resolve_through_the_host(self, H):
+        """Every name the host promised to keep, still real on H."""
+        for name in ("_SpeechGate", "WakeSpotter", "_is_wake_utt",
+                     "_match_wake", "_wake_anywhere", "_is_echo",
+                     "_norm_words", "_open_input", "_open_input_unlocked",
+                     "_mic_device_to_open", "_available_input_devices",
+                     "_device_is_available", "_stop_stream_owned",
+                     "_start_stream_owned"):
+            assert callable(getattr(H, name)), name
+
+    def test_the_gate_is_the_seam_class_and_behaves_like_one(self, H):
+        """H._SpeechGate is core.voice.SpeechGate itself (no copy), and a
+        built gate still starts on the second loud frame — the shared
+        implementation, not a diverging twin."""
+        import core.voice as voice
+        assert H._SpeechGate is voice.SpeechGate
+        g = H._SpeechGate(600)
+        assert g.feed(5000.0) == ""
+        assert g.feed(5000.0) == "start"
+
+    def test_wake_delegates_read_the_settings_live(self, H, monkeypatch):
+        """The wake name is read at CALL time, not frozen at import: flipping
+        `assistant_name` in the settings dict changes the very next answer."""
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "marlowe")
+        assert H._is_wake_utt("hey marlowe") is True
+        assert H._match_wake("hey marlowe what time") == "what time"
+        # 'so' is not a filler: the name goes, the surrounding words stay
+        assert H._wake_anywhere("so, Marlowe, the weather") == "so the weather"
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "cypher")
+        assert H._is_wake_utt("hey marlowe") is False
+        assert H._match_wake("hey cypher go") == "go"
+
+    def test_the_wake_helpers_read_the_seam_not_a_private_copy(self, H):
+        """The matching rules come from core/voice.py (one implementation):
+        a private re-implementation in the host is the drift this cut exists
+        to prevent."""
+        import core.voice as voice
+        src = inspect.getsource(H._match_wake)
+        assert "_voice.match_wake" in src
+        assert "_voice.skeleton_match" not in src  # composed, not re-derived
+        assert H._voice.skeleton_match(["siphon"], ["cypher"]) is True
+        assert voice.WAKE_FILLER == {"hey", "ok", "okay", "hi", "yo"}
+
+    def test_mic_open_delegations_carry_the_host_context(self, H, monkeypatch):
+        """`H._open_input` still routes through `_open_input_unlocked` AND
+        answers (stream, rate) — the seam call supplies the host's sd module,
+        logger, mic lock and last-open record, so the historical monkeypatch
+        seam stays live. A host that stops delegating fails the routing pin,
+        not just the shape."""
+        seen = {}
+        marker = object()
+
+        def _spy(device, rate, blocksize, cb):
+            seen.update(device=device, rate=rate, blocksize=blocksize)
+            return marker, rate
+
+        # the delegation itself is a source pin, captured BEFORE the spy
+        # replaces the function: the seam call must carry the host context
+        # (sd, logger, mic lock, last-open record) — a body that stops
+        # routing through core/voice fails this, not just the shape
+        src = inspect.getsource(H._open_input_unlocked)
+        assert "_voice.open_input_unlocked" in src
+        for kwarg in ("sd=", "log=", "mic_lock=", "last_open="):
+            assert kwarg in src, kwarg
+
+        monkeypatch.setattr(H, "_open_input_unlocked", _spy)
+        stream, rate = H._open_input(None, 16_000, 1024, lambda *a: None)
+        assert stream is marker and rate == 16_000
+        assert seen == {"device": None, "rate": 16_000, "blocksize": 1024}
+
+    def test_the_bare_spotter_constructor_still_works_and_reads_live_state(
+            self, H, monkeypatch):
+        """`H.WakeSpotter()` builds a working spotter with the host's audio
+        facts as defaults, the model arriving LATE through the host loader —
+        so `H._spotter_model` patches stay live. The class constants travel
+        on the factory, as they did on the class."""
+        calls = []
+
+        class FakeModel:
+            def predict(self, chunk):
+                calls.append(1)
+                return {"hey jarvis": 0.9 if len(calls) == 1 else 0.0}
+
+        monkeypatch.setattr(H, "_spotter_model", FakeModel())
+        monkeypatch.setattr(H, "_spotter_failed", False)
+        s = H.WakeSpotter()
+        # the hot frame arms it; >1 s of cool frames ends the collection and
+        # fires (1280 samples = 80 ms, so ~14 cool chunks clear the 1 s hold)
+        fired, audio = None, None
+        for _ in range(30):
+            f, a = s.feed(H.np.full(1280, 1, dtype=H.np.int16))
+            if f and fired is None:
+                fired, audio = f, a
+        assert fired is True and len(audio) > 0
+        assert H.WakeSpotter.PREROLL_S == 2.0
+        assert H.WakeSpotter.MAXWAIT_S == 8.0
+
+    def test_the_settings_app_gate_is_the_same_class(self, H):
+        """handsoff-settings.py builds its fake listener's gate through
+        `H._SpeechGate`; that name is the seam class, so the GUI's fake and
+        the bubble's real gate share one implementation."""
+        assert H._SpeechGate(300).start_frames == 2
