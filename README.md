@@ -38,7 +38,7 @@ voice clip you pick. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 2286 tests pin the behavior (`python -m pytest tests/`),
+automatically. 2291 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
 regression, ops, and fault injection — including offscreen-Qt scenarios that
 drive the settings GUI itself.
@@ -663,7 +663,7 @@ Each gate is the pipeline's job, run against your own interpreter and the
 dependencies the bubble already uses (it installs nothing):
 
 ```bash
-python -m pytest tests/ -q              # 2286 tests
+python -m pytest tests/ -q              # 2291 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
 
@@ -683,7 +683,7 @@ nothing is broken:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70     # 2286 tests, 83.7%
+  --cov-report=term-missing --cov-fail-under=70     # 2291 tests, 83.7%
 ```
 
 The suite is self-contained: it imports the bubble against a throw-away

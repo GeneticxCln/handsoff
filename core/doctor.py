@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import time
 from contextvars import ContextVar
@@ -364,7 +365,38 @@ def _lines(deps: DoctorDeps) -> list[str]:
         "running-missing": "running source unreadable",
     }.get(status, status)
     lines.append(f"deployment: {status} — {deploy_note}")
+    # The deployed commit, from the manifest install.sh wrote. A paste of this
+    # line should answer "what is running" without a second question, so the
+    # short SHA rides the headline when the manifest carries one AND the
+    # checkout's HEAD agrees. Every other shape degrades honestly rather than
+    # inventing a verdict: a manifest whose commit differs from a READABLE
+    # checkout HEAD gets the full 40-hex SHA with the mismatch named (that is
+    # exactly when a reader needs the whole thing); no checkout, or an old
+    # manifest without the keys, prints exactly the line this always printed.
     manifest = d.get("manifest") if isinstance(d.get("manifest"), dict) else {}
+    commit = manifest.get("git_commit")
+    dirty = manifest.get("git_dirty")
+    repo_dir = d.get("repo_path")
+    suffix = ""
+    if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit):
+        head = ""
+        if isinstance(repo_dir, str) and repo_dir:
+            try:
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"], cwd=repo_dir,
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                head = ""
+        if head == commit:
+            suffix = f" at {commit[:12]}"
+            if dirty:
+                suffix += " (dirty: shipped paths)"
+        elif head:
+            suffix = f" at {commit} (manifest != HEAD)"
+        else:
+            suffix = f" at {commit} (unverified — no checkout HEAD)"
+    lines[-1] += suffix
     revision = manifest.get("whisper_revision") or "unknown"
     digest = manifest.get("whisper_sha256") or "unknown"
     lines.append(f"whisper: revision {revision}; sha256 {digest}")

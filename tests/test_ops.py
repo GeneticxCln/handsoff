@@ -836,6 +836,7 @@ class TestDoctor:
         assert "whisper: revision unknown; sha256 unknown" in text
         assert "python: " in text
 
+
     # ---- stop-attribution ledger in doctor + health -----------------------
 
     def test_doctor_reports_a_named_stopper(self, H, monkeypatch, tmp_path):
@@ -1469,6 +1470,82 @@ class TestDoctor:
                                 RuntimeError("no niri in tests"))))
         text = H.run_doctor()
         assert "STALE" in text or "installed-drift" in text
+
+
+class TestTheDeploymentLineCarriesTheCommit:
+    """`deployment:` answers "what is running" in one paste.
+
+    The manifest has named its commit since install.sh learned to write one;
+    the doctor's headline line is what every sign-off and incident note
+    actually pastes, so the short SHA rides there when the manifest's commit
+    is VERIFIABLE against a readable checkout HEAD. Every other shape
+    degrades honestly — a mismatch is spelled with the full SHA (that is
+    exactly when a reader needs all 40 hex), a commit with no checkout to
+    check is called unverified, and an old manifest prints the line this
+    always printed. Pinned at `_lines` level on synthetic snapshots with a
+    REAL scratch repository for the match case — no mocks of git itself.
+    """
+
+    @staticmethod
+    def _fake_repo(tmp_path):
+        repo = tmp_path / "src"
+        repo.mkdir()
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        (repo / "f.txt").write_text("x", encoding="utf-8")
+        for argv in (["git", "init", "-q"], ["git", "add", "."],
+                     ["git", "commit", "-qm", "head"]):
+            subprocess.run(argv, cwd=repo, env=env, check=True,
+                           capture_output=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                              capture_output=True, text=True,
+                              check=True).stdout.strip()
+        return repo, head
+
+    @staticmethod
+    def _deployment_line(manifest, repo=None):
+        from core import doctor as core_doctor
+        snap = {"status": "in-sync", "manifest": manifest}
+        if repo is not None:
+            snap["repo_path"] = str(repo)
+        deps = core_doctor.DoctorDeps(deployment_snapshot=lambda: snap)
+        return next(ln for ln in core_doctor._lines(deps)
+                    if ln.startswith("deployment:"))
+
+    def test_a_matching_head_prints_the_short_sha(self, tmp_path):
+        repo, head = self._fake_repo(tmp_path)
+        line = self._deployment_line({"git_commit": head}, repo=repo)
+        assert line == (f"deployment: in-sync — installed copy matches "
+                        f"the checkout at {head[:12]}"), line
+
+    def test_a_dirty_manifest_says_so(self, tmp_path):
+        repo, head = self._fake_repo(tmp_path)
+        line = self._deployment_line(
+            {"git_commit": head, "git_dirty": True}, repo=repo)
+        assert head[:12] in line and "dirty" in line, line
+
+    def test_a_manifest_behind_head_is_named_with_the_full_sha(
+            self, tmp_path):
+        repo, _head = self._fake_repo(tmp_path)
+        other = "b" * 40
+        line = self._deployment_line({"git_commit": other}, repo=repo)
+        assert line.endswith(f"at {other} (manifest != HEAD)"), line
+        assert "in-sync" in line, (
+            "the hash verdict must ride beside the file verdict, not "
+            "replace it — the files still match their checkout")
+
+    def test_an_unverifiable_commit_says_so_without_guessing(self, tmp_path):
+        commit = "c" * 40
+        line = self._deployment_line({"git_commit": commit}, repo=None)
+        assert line.endswith(f"at {commit} (unverified — no checkout HEAD)"), (
+            "no checkout to verify against is a fact to state, not silence")
+
+    def test_an_old_or_malformed_manifest_prints_the_classic_line(self):
+        classic = "deployment: in-sync — installed copy matches the checkout"
+        assert self._deployment_line({}) == classic
+        # a sha256 (64 hex) is not a commit; neither is any other prose
+        assert self._deployment_line({"git_commit": "d" * 64}) == classic
+        assert self._deployment_line({"git_commit": "nope"}) == classic
 
 
 class TestJournalPoweroffClassification:
