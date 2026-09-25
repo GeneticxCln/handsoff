@@ -79,6 +79,12 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     banner = _order_banner()
     if banner:
         terminalreporter.write_line(banner)
+    # The census note was decided at collection (the early warning); echoing
+    # the STORED verdict means a long full run that scrolled the note away
+    # still ends with it — and a partial run echoes nothing, because its
+    # collection was never the claim's scope.
+    if _CENSUS_NOTE:
+        terminalreporter.write_line(_CENSUS_NOTE)
 
 
 def pytest_collection_modifyitems(session, config, items):
@@ -96,6 +102,86 @@ def pytest_collection_modifyitems(session, config, items):
     order = list(groups)
     random.Random(files_seed).shuffle(order)
     items[:] = [item for path in order for item in groups[path]]
+
+
+# ------------------------------------------------------------ README census
+# The README's "N tests" is graded at COMMIT time by the pre-commit gate, which
+# runs the suite against the STAGED tree — so a stage that carries new tests
+# but yesterday's census is refused there, minutes into the hook. This warning
+# is the same comparison made the cheap way — this session's own collection,
+# no subprocess — at the moment the count moves (right after collection, before
+# any test body runs), so the fix happens while editing instead of while
+# waiting on the gate. `readme_census_drift` is the ONE reader of the claim:
+# `test_specs_freshness` imports it for the gate-grade, so the warning and the
+# guard cannot disagree about what "N tests" means. (`pytest_report_header`
+# cannot do this: it fires before collection and cannot know the count yet.)
+_COLLECTED_COUNT = 0              # what this session collected (or 0, pre-run)
+_CENSUS_NOTE: str | None = None   # the run's verdict, decided at collection
+#: The claim's one shape, shared with `test_specs_freshness` — a second regex
+#: would let the warning and the gate disagree about what "N tests" means.
+README_COUNT_RE = re.compile(r"(\d[\d,]*) tests")
+README_CENSUS_NOTE = (
+    "the pre-commit gate will refuse the commit until README.md states the "
+    "same number (all three places: the intro, the Development gate list, "
+    "the coverage command)")
+
+
+def readme_census_drift(live: int, path: Path | None = None) -> str | None:
+    """The drift sentence for `live` tests vs README's claim, or None.
+
+    None both when the tree agrees and when README states no count at all —
+    whether README makes the claim is the gate guard's business, not the
+    warning's. `path` exists for the guards: they pin this reader against
+    planted READMEs instead of writing the real one.
+    """
+    try:
+        readme = (path or (HERE / "README.md")).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    stated = README_COUNT_RE.findall(readme)
+    if not stated:
+        return None
+    wrong = [s for s in dict.fromkeys(stated)
+             if int(s.replace(",", "")) != live]
+    if not wrong:
+        return None
+    return (f"NOTE: README says {', '.join(wrong)} tests; this run collects "
+            f"{live}. {README_CENSUS_NOTE}")
+
+
+def _collecting_the_whole_suite(session) -> bool:
+    """Is this session's collection the scope the README claim describes?
+
+    The claim is about the WHOLE suite, so the warning is only honest for a
+    session that collected it: a one-file run collects 85 and would read
+    85-vs-2284 as drift — found live 2026-09-25 (the first demonstration
+    warned on `pytest tests/test_sandbox.py`, and the summary echoed it
+    twice). Conservative in the false-negative direction: an unusual spelling
+    (`pytest ./tests`) stays silent rather than inventing a complaint.
+    """
+    if getattr(session.config.option, "keyword", None) \
+            or getattr(session.config.option, "markexpr", None):
+        return False                     # -k / -m deselect within the session
+    args = list(getattr(session.config, "args", []) or [])
+    if not args:
+        return True                      # no args: pytest.ini's testpaths (tests)
+    return len(args) == 1 and args[0].rstrip("/") in (
+        "tests", str(HERE / "tests"))
+
+
+def pytest_collection_finish(session):
+    global _COLLECTED_COUNT, _CENSUS_NOTE
+    _COLLECTED_COUNT = len(session.items)
+    _CENSUS_NOTE = (readme_census_drift(_COLLECTED_COUNT)
+                    if _collecting_the_whole_suite(session) else None)
+    if _CENSUS_NOTE:
+        # A bare print would land inside pytest's capture and be swallowed;
+        # the terminal reporter is what a person actually reads.
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_line(_CENSUS_NOTE)
+        else:
+            print(f"\n{_CENSUS_NOTE}", flush=True)
 
 
 def wait_for(pred, timeout: float = 5.0, interval: float = 0.01) -> bool:

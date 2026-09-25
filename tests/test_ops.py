@@ -2458,6 +2458,48 @@ class TestInstallerRehearsal:
         assert "@APP_ID@" not in snippet, (
             "the app-id placeholder must be substituted, not shipped raw")
 
+    def test_the_manifest_records_which_commit_was_deployed(self, tmp_path):
+        """The manifest names the COMMIT, not only per-file hashes.
+
+        "What is running" was reconstructable only by replaying hashes; the
+        sign-off ledger wanted the SHA itself. Where the checkout HAS a
+        repository, the recorded commit is the real HEAD. Dirtiness is judged
+        over the SHIPPED paths only — this checkout regularly carries
+        uncommitted test/docs edits beside shipped sources, and an install of
+        pure committed sources must not record dirty because a guard moved;
+        the installer's own edit does not count either (it is not deployed
+        code). The expectation is recomputed the same way, so the test holds
+        on a clean tree and a dirty one alike.
+
+        Where there is NO repository — the gate's staged copy, which has no
+        `.git` — the keys must be ABSENT, not fabricated: that no-git
+        contract is exercised for real every time this suite runs from the
+        staged tree (the hook refused this commit once for exactly the
+        missing case).
+        """
+        result, root, _sentinel = self._run(tmp_path)
+        assert result.returncode == 0, result.stderr
+        manifest = json.loads(
+            (root / ".config" / "handsoff" / "deployment.json").read_text())
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=HERE,
+            capture_output=True, text=True).stdout.strip()
+        if not head:
+            assert "git_commit" not in manifest
+            assert "git_dirty" not in manifest, (
+                "a no-git install must omit the git keys, not guess them")
+            return
+        assert manifest["git_commit"] == head, (
+            "the manifest must name the commit whose sources were shipped")
+        assert isinstance(manifest["git_dirty"], bool)
+        expected_dirty = any(
+            subprocess.run(
+                ["git", "status", "--porcelain", "--", rel], cwd=HERE,
+                capture_output=True, text=True).stdout.strip()
+            for rel in manifest["files"])
+        assert manifest["git_dirty"] is expected_dirty, (
+            "git_dirty must be exactly 'some shipped path differs from HEAD'")
+
     def _expected_shipped(self):
         """The set the installer must deliver, derived the way IT derives it.
 

@@ -79,7 +79,7 @@ atomic + 0600 (`atomic_private_write`, mkstemp in-dir, no predictable
 | Path | Format | Cap / note |
 |---|---|---|
 | `CONFIG_DIR/settings.json` | JSON + `version` | the 65 keys above |
-| `CONFIG_DIR/deployment.json` | `{files: {rel: {source_sha256, installed_sha256}}, …}` | written by install.sh; read by `_deployment_snapshot` |
+| `CONFIG_DIR/deployment.json` | `{files: {rel: {source_sha256, installed_sha256}}, git_commit, git_dirty, …}` (`git_*` judged over the SHIPPED paths only, present only inside a git work tree) | written by install.sh; read by `_deployment_snapshot` |
 | `CONFIG_DIR/history.json` | [{role, content, images?}] | token-budget trimmed, images stripped on save |
 | `CONFIG_DIR/memory.json` | [{key, fact}] | ≤24, oldest dropped |
 | `CONFIG_DIR/design-packs/<slug>/` | `pack.json` + art | installed copies only; `<slug>.previous` one generation |

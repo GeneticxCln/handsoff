@@ -26,6 +26,7 @@ vacuous — the defect this whole file exists to refuse.
 from __future__ import annotations
 
 import ast
+import inspect
 import re
 import shutil
 import subprocess
@@ -34,7 +35,7 @@ import tempfile
 from pathlib import Path
 
 from conftest import (_load as _load_module, sandbox_env, _GUARD_ENV,
-                      _PROTECTED_ENV)
+                      _PROTECTED_ENV, readme_census_drift, README_COUNT_RE)
 
 HERE = Path(__file__).resolve().parent.parent
 SPECS = HERE / "specs"
@@ -473,7 +474,7 @@ class TestSpecFreshness:
         """
         live = _collected_test_count()
         readme = (HERE / "README.md").read_text(encoding="utf-8")
-        found = re.findall(r"(\d[\d,]*) tests", readme)
+        found = README_COUNT_RE.findall(readme)   # conftest's one shared reader
         assert found, (
             "README no longer states a test count in the form 'N tests' — "
             "either the sentence moved or it was reworded. Update README.md "
@@ -485,6 +486,84 @@ class TestSpecFreshness:
             f"Update the three README places (the intro, the Development gate "
             f"list, the coverage command) in the same change"
         )
+
+    def test_the_early_census_warning_reads_the_same_claim_the_gate_grades(
+            self, tmp_path):
+        """conftest's development-time warning and this guard share ONE reader.
+
+        The warning fires the moment a session's collection moves the count,
+        so a missed census edit costs a note during editing instead of minutes
+        of hook — but only if it reads the claim the way the gate does. Its
+        reader is pinned here on planted READMEs (never the real one: the
+        checkout guard forbids writing it), and `README_COUNT_RE` is the
+        shared pattern itself, so warning and gate cannot drift apart.
+        """
+        readme = tmp_path / "README.md"
+
+        def drift(text):
+            readme.write_text(text, encoding="utf-8")
+            return readme_census_drift(2282, path=readme)
+
+        assert drift("automatically. 2282 tests pin the behavior.") is None
+        assert drift("2,282 tests pin the behavior.") is None, (
+            "the reader must normalize commas exactly as the gate does")
+        assert drift("no test count is claimed here") is None, (
+            "README stating no claim is the gate's refusal, not a warning")
+        note = drift("2278 tests pin the behavior\n"
+                     "python -m pytest tests/ -q   # 2278 tests\n"
+                     "--cov-fail-under=70          # 2278 tests, 83.7%")
+        assert note and "2278" in note and "2282" in note
+        assert "pre-commit gate" in note, note
+        assert drift("3 tests in an unrelated sentence") is not None, (
+            "any stale 'N tests' claim warns, not only the census sentence")
+
+    def test_the_warning_prints_from_both_session_hooks(self):
+        """The note exists only if a run actually shows it.
+
+        `pytest_collection_finish` is the early warning (the count is known
+        there, before any test body runs) and gates it on collecting the
+        whole suite; `pytest_terminal_summary` echoes the STORED verdict so a
+        long full run that scrolled the note away still ends with it — and a
+        partial run echoes nothing. Pinned by shape: both hooks consult the
+        shared reader path, and a hook that stops is a warning nobody sees.
+        """
+        import conftest as C
+        finish = inspect.getsource(C.pytest_collection_finish)
+        summary = inspect.getsource(C.pytest_terminal_summary)
+        assert "readme_census_drift" in finish and "print(" in finish
+        assert finish.index("readme_census_drift") < finish.index("print(")
+        assert "_collecting_the_whole_suite" in finish, (
+            "the early warning must gate on the claim's scope — a partial "
+            "run collects 85 and would warn 85-vs-2284 (found live)")
+        assert "_CENSUS_NOTE" in summary and "readme_census_drift(" \
+            not in summary, (
+            "the summary echoes the collection-time verdict; recomputing "
+            "there is how the partial-run warning got echoed twice")
+
+    def test_the_scope_gate_knows_which_sessions_speak_for_the_suite(self):
+        """Only a whole-suite collection may compare counts with the README.
+
+        The claim describes the tree; a run of one file describes nothing of
+        the sort. `-k`/`-m` deselect inside the session even when the arg is
+        `tests`, so they stay silent too; an empty arg list is the testpaths
+        default and speaks for the suite.
+        """
+        import conftest as C
+
+        def session(*args, **opt):
+            config = type("C", (), {"args": list(args), "option":
+                                    type("O", (), opt)()})()
+            return type("S", (), {"config": config})()
+
+        assert C._collecting_the_whole_suite(session())
+        assert C._collecting_the_whole_suite(session("tests"))
+        assert C._collecting_the_whole_suite(session(str(HERE / "tests")))
+        assert not C._collecting_the_whole_suite(session("tests/test_sandbox.py"))
+        assert not C._collecting_the_whole_suite(session("tests", "tests"))
+        assert not C._collecting_the_whole_suite(
+            session("tests", keyword="sandbox"))
+        assert not C._collecting_the_whole_suite(
+            session("tests", markexpr="slow"))
 
     def test_the_architecture_map_lists_exactly_the_core_package(self):
         """Both directions: a new module must appear, a deleted one must go.
@@ -909,6 +988,14 @@ class TestSpecFreshness:
         flagged as one the first time an audit entry was headed that way — a
         guard that calls a date a line count teaches people to stop writing
         dates.
+
+        The test plan's own row count is stripped the same way, and only the
+        count cell: `| `test_ops.py` | 143 | …the app-id read out of
+        `handsoff.py`… |` carries a three-digit TEST count in the same line
+        as module names it legitimately names, and a count of tests is not a
+        count of lines. Stripping the whole row would excuse a real restated
+        size hidden mid-row, so the cell alone is blanked and the rest of the
+        line stays checked.
         """
         spec_tables = _generator()
         labels = sorted({label for label, _path in spec_tables.modules()})
@@ -925,6 +1012,8 @@ class TestSpecFreshness:
                     continue
                 text_ = re.sub(r"`?[\w/]+\.py`?:\d+", "", line)   # citations
                 text_ = re.sub(r"\d{4}-\d{2}-\d{2}", "", text_)     # dates
+                text_ = re.sub(r"^(\| `test_[a-z_]+\.py` \| )\d+( \|)",
+                               r"\1\2", text_)                      # own count
                 if not re.search(r"\d{3,}", text_):
                     continue
                 named = [label for label in labels if label in text_]

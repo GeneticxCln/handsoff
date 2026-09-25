@@ -17,9 +17,15 @@ What it touches on this desk, so nobody is surprised by a quiet assistant:
   retest that restarts in a burst is a crash loop to systemd and would leave
   the bubble down for the rest of the limit window (measured live 2026-09-25);
 * it plants probe files directly in the real state dir and removes them again —
-  the probes are the only things it deletes, and `--only` narrows the run;
+  the probes are the only things it deletes, and they carry the `tmpdeskcheck`
+  prefix (the stranded real TTS dir B1 archives is NOT one: it survives the
+  run, so the person can play it back per §10's B2, and the archive's own
+  7-day TTL reclaims it in the end)
 * for B1 it sends SIGKILL to the running bubble on purpose (systemd's
-  `Restart=always` brings it straight back; that is the scenario).
+  `Restart=always` brings it straight back; that is the scenario) — but only
+  once the reply's `tts.wav` holds bytes, because a kill during the voice's
+  load strands an EMPTY dir with nothing for B2 to play (found live
+  2026-09-25); and it grades the wav's presence, as §10's B1 always asked.
 
 Two backends, one set of checks:
 
@@ -238,7 +244,19 @@ class Desk:
 
     # ---------------------------------------------------------------- cleanup
     def cleanup(self) -> None:
+        """Remove what this run PLANTED, and nothing else.
+
+        Bounded by `PROBE_PREFIX` on purpose: B1 registers the REAL stranded
+        TTS dir it just reclaimed, and the run's first live session destroyed
+        that archived reply at exit — the exact artifact §10's B2 exists to
+        `cp`/`file`/`aplay` by hand, found live 2026-09-25 (the earlier
+        session's `tmptq9yudu_` was gone before this session started, and
+        this session's `tmpklue3jp7` vanished between B1's PASS and the
+        `cp`). The 7-day TTL is the reply's designed way out, not the run's.
+        """
         for path in reversed(self.created):
+            if not path.name.startswith(PROBE_PREFIX):
+                continue
             try:
                 if path.is_dir():
                     shutil.rmtree(path, ignore_errors=True)
@@ -246,10 +264,14 @@ class Desk:
                     path.unlink(missing_ok=True)
             except OSError:
                 pass
-        # ...and the archived copies, which live under the date folder the run
-        # itself chose: a retest that left its own probes in the archive would
-        # be exactly the leak it is checking for.
+        # ...and the archived copies of those probes, which live under the
+        # date folder the run itself chose: a retest that left its own probes
+        # in the archive would be exactly the leak it is checking for. Real
+        # scratch (B1's reply) keeps its name `tmpXXXXXXXX`, so the prefix
+        # gate cannot touch it.
         for path in list(self.created):
+            if not path.name.startswith(PROBE_PREFIX):
+                continue
             archived = self.archived(path.name)
             if archived is not None:
                 try:
@@ -757,13 +779,26 @@ def check_b1(d: Desk) -> Result:
     speech = d.speak("Please read this out slowly for the desk retest, "
                      "because the process has to be killed while it is still "
                      "speaking this sentence out loud.")
-    time.sleep(3.0)               # mid-synthesis: the scratch dir exists now
+    # Kill MID-synthesis, not during the voice's load: the scratch dir exists
+    # from the first moment, but its `tts.wav` only appears once synthesis
+    # starts writing, and a kill before that strands an EMPTY dir — nothing
+    # for B2's `aplay` to play (both live runs of 2026-09-25 did exactly
+    # that). So wait until the wav has bytes, then kill while it writes.
+    stranded_now: list[str] = []
+    deadline = time.time() + 60.0
+    while time.time() < deadline:
+        stranded_now = sorted(set(d.scratch_names()) - before)
+        if any((d.state / n / "tts.wav").is_file()
+               and (d.state / n / "tts.wav").stat().st_size > 0
+               for n in stranded_now):
+            break
+        time.sleep(1.0)
     pid = d.kill9()
     speech.poll()
     time.sleep(2.0)
     stranded = sorted(set(d.scratch_names()) - before)
     for name in stranded:
-        d.created.append(d.state / name)      # ours to clean up afterwards
+        d.created.append(d.state / name)      # ours to account for afterwards
     evidence = [f"killed PID {pid} mid-synthesis"]
     if not stranded:
         return r.failed(
@@ -771,6 +806,15 @@ def check_b1(d: Desk) -> Result:
             "speaking (start a long reply first) or the cleanup ran",
             *evidence)
     evidence.append("stranded: " + ", ".join(stranded))
+    empty = [n for n in stranded
+             if not (d.state / n / "tts.wav").is_file()
+             or (d.state / n / "tts.wav").stat().st_size == 0]
+    if empty:
+        return r.failed(
+            f"the stranded dir holds no tts.wav bytes ({', '.join(empty)}) — "
+            "§10's B1 asks for the reply archived `with its tts.wav intact`, "
+            "and an empty dir has nothing for B2 to play back",
+            *evidence)
     # the automatic respawn is INSIDE the grace window and must not reclaim it
     deadline = time.time() + 60.0
     while time.time() < deadline and not d.is_active():

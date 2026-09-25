@@ -807,6 +807,20 @@ PY_EOF
 )"; then :; else whisper_sha256=""; fi
 manifest_whisper_sha256=""
 [ -n "$whisper_sha256" ] && manifest_whisper_sha256="  \"whisper_sha256\": \"$whisper_sha256\","
+# Which git state produced this deployment — "what is running" has always had
+# per-file answers (the hashes above); this names the COMMIT. Scope matters:
+# the checkout is regularly carrying committed work plus uncommitted test/docs
+# edits, so `git status --porcelain` over EVERYTHING would smear an honest
+# claim — a deployment of pure committed sources would record dirty because a
+# guard test moved. So dirtiness is judged per SHIPPED path only (the same
+# membership rule the manifest loops below use), and only when a commit could
+# be read at all. Outside a git work tree both keys are simply absent, like
+# every other git-derived fact a tarball install cannot know.
+GIT_COMMIT=""
+GIT_DIRTY=false
+if [ "$HAVE_GIT" = "1" ]; then
+    GIT_COMMIT="$(git -C "$HERE" rev-parse HEAD 2>/dev/null || true)"
+fi
 # Hash every core module staged (glob, not a list) so doctor's drift check
 # covers a new module the moment it ships -- the reason the missing
 # core/theme.py went unnoticed is that the manifest never mentioned it.
@@ -817,6 +831,12 @@ for f in "$HERE"/core/*.py; do
     ship_core "$base" || continue     # same membership rule as staging
     manifest_core_files="$manifest_core_files
     \"$rel\": {\"source_sha256\": \"$(sha_of "$HERE/$rel")\", \"installed_sha256\": \"$(sha_of "$BIN_DIR/$rel")\"},"
+    # Dirty over the SHIPPED set only (see the GIT_COMMIT note above):
+    # porcelain is non-empty when this path's worktree/index differs from HEAD.
+    if [ -n "$GIT_COMMIT" ] \
+        && [ -n "$(git -C "$HERE" status --porcelain -- "$rel" 2>/dev/null)" ]; then
+        GIT_DIRTY=true
+    fi
 done
 # Same for the top-level modules: discovered beside handsoff.py, so doctor's
 # drift check and `--uninstall` both learn about a new file automatically.
@@ -829,7 +849,22 @@ for f in "$HERE"/*.py; do
     ship_top "$rel" || continue
     manifest_top_files="$manifest_top_files
     \"$rel\": {\"source_sha256\": \"$(sha_of "$HERE/$rel")\", \"installed_sha256\": \"$(sha_of "$BIN_DIR/$rel")\"},"
+    if [ -n "$GIT_COMMIT" ] \
+        && [ -n "$(git -C "$HERE" status --porcelain -- "$rel" 2>/dev/null)" ]; then
+        GIT_DIRTY=true
+    fi
 done
+# The two non-Python artifacts ship too, so they count for dirtiness as well.
+for rel in handsoff-restart handsoff-stop-probe; do
+    if [ -n "$GIT_COMMIT" ] \
+        && [ -n "$(git -C "$HERE" status --porcelain -- "$rel" 2>/dev/null)" ]; then
+        GIT_DIRTY=true
+    fi
+done
+manifest_git_commit=""
+[ -n "$GIT_COMMIT" ] && manifest_git_commit="  \"git_commit\": \"$GIT_COMMIT\","
+manifest_git_dirty=""
+[ -n "$GIT_COMMIT" ] && manifest_git_dirty="  \"git_dirty\": $GIT_DIRTY,"
 atomic_write "$CONF_DIR/deployment.json" 600 <<MANIFEST_EOF
 {
   "installed_at": "$(date -Is)",
@@ -837,6 +872,8 @@ atomic_write "$CONF_DIR/deployment.json" 600 <<MANIFEST_EOF
   "whisper_model": "$WHISPER_SIZE",
   "whisper_revision": "$WHISPER_RESOLVED_REVISION",
 $manifest_whisper_sha256
+$manifest_git_commit
+$manifest_git_dirty
   "python": "$PYBIN",
   "files": {
 $manifest_top_files

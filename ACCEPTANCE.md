@@ -493,7 +493,9 @@ at this microphone; everything else is staged by one command:
   it starts a spoken reply and `kill -9`s the bubble mid-synthesis, out loud
   and on purpose (`Restart=always` brings it back — that IS the scenario);
   for B5 it briefly renames the real `scratch-quarantine` and puts it back.
-  Its own probes are the only thing it deletes. Expect several minutes of
+  Its own probes are the only thing it deletes — every one named
+  `tmpdeskcheck*`; B1's stranded REAL reply is not a probe and survives the
+  run, which is what B2's `aplay` plays. Expect several minutes of
   restarts: say so if anyone is listening.
 - `--dry-run` prints what would run and changes nothing; `--only B1,C4` runs
   just those items; `--simulate` rehearses against a throwaway state dir with
@@ -594,7 +596,15 @@ collision) instead of deleted, and folders older than
   Recorded 2026-09-25 (auto — `ci/desk_retest.py`, `--only B1`): spoke first,
   killed PID 453521 mid-synthesis; stranded `tmptq9yudu_`; journal
   `swept 1 into /home/quinton/.local/state/handsoff/scratch-quarantine`;
-  archived at `scratch-quarantine/2026-09-25/tmptq9yudu_`.
+  archived at `scratch-quarantine/2026-09-25/tmptq9yudu_`. Replayed the same
+  day (committed driver, `a44c0c1`): PID 1415, stranded `tmpklue3jp7`,
+  archived — and the run then deleted that archive at exit, which is the
+  cleanup flaw recorded under B2. Replayed again after both fixes: PID
+  151993, stranded `tmpvx6hlcwf`, archived WITH its `tts.wav` (319448
+  bytes, sha256 `b6705fc9…`) — the earlier replays had stranded EMPTY dirs
+  (the kill landed during the voice's load, before synthesis wrote bytes),
+  which §10's own criterion (`with its tts.wav intact`) grades a fail; the
+  driver now waits for wav bytes before the kill and fails an empty dir.
 - ☐ [auto] **B2 — recover it by hand.** `cp` the archived `tts.wav`
   somewhere, `file` it (`RIFF … WAVE audio`), `aplay` it if you like — it is
   the reply the bubble actually synthesized. Then `mv` the whole archived dir
@@ -602,7 +612,22 @@ collision) instead of deleted, and folders older than
   would have destroyed are recoverable; that is the point of the change.
   Recorded 2026-09-25 (auto): planted sha256 `fd037b70ade0` →
   `scratch-quarantine/2026-09-25/tmpdeskcheck-recover`; recovered sha256
-  `fd037b70ade0` (identical), 24 bytes. Owed by hand: `aplay` it.
+  `fd037b70ade0` (identical), 24 bytes. Owed by hand: `aplay` it — and the
+  hand found the driver had already eaten it: its exit cleanup deleted B1's
+  archived REAL reply (the first session's `tmptq9yudu_` was gone before the
+  next session began; the replay's `tmpklue3jp7` vanished between B1's PASS
+  and the `cp`). Fixed in the same change: cleanup is bounded to
+  `tmpdeskcheck*` probes, so the real reply survives the run and leaves via
+  the archive's own 7-day TTL (guards in `tests/test_desk_retest.py::
+  TestWhatTheRunCleansUp`). Then the hand ran for real (2026-09-25, driver
+  with both fixes): the replay archived `tmpvx6hlcwf` WITH its reply —
+  `tts.wav`, 319448 bytes, sha256
+  `b6705fc967f5935f861c8c41fa4ca23a572a73dc200a10bee49324e643a4486a`,
+  `RIFF … WAVE audio, Microsoft PCM, 16 bit, mono 24000 Hz`; `cp` out,
+  `file` says RIFF WAVE, `aplay` played it out loud (`Playing WAVE …
+  24000 Hz, Mono`, exit 0) — the killed reply's own voice; the whole
+  archived dir then `mv`ed out and back as an ordinary directory.
+  B2 CLOSED.
 - ☐ [auto] **B3 — the grace window at the desk.**
   `mkdir ~/.local/state/handsoff/tmpdeskcheck` → `systemctl --user restart
   handsoff`. Expect it to SURVIVE (younger than 600 s) and doctor to say
@@ -710,10 +735,11 @@ Every automated item above (A5, B1–B5, C1–C5) PASSED on this desk on
 2026-09-25 — run as three `python ci/desk_retest.py` invocations (the quiet
 subset `A5,B2,B3,B4,C1,C2,C3,C4,C5`, then `--only B1`, then `--only B5`), the
 unit's start limit respected throughout; the full one-shot run is what a
-fresh desk should use. What remains owed is exactly the part no command can
-substitute: **A1–A4, a real voice at this microphone** (closing them closes
-§3's ❌ item), plus B2's human half — `aplay` the recovered `tts.wav` and
-hear that it is the reply the bubble actually synthesized.
+fresh desk should use. B2's human half is closed (2026-09-25: the recovered `tts.wav` was
+`aplay`ed out loud and is the reply the bubble was synthesizing when it
+was killed). What remains owed is exactly the part no command can
+substitute: **A1–A4, a real voice at this microphone** (closing them
+closes §3's ❌ item).
 
 ## Sign-off
 
@@ -910,3 +936,5 @@ hear that it is the reply the bubble actually synthesized.
 | 2026-09-25 | Buffy (live redeploy) | uncommitted wake-name + sweep/archive + `state:`-line set (running == checkout == installed, `deployment: in-sync`) | The deployable half is done and the HUMAN half is now written down instead of remembered: new **§10** is the executable desk retest for the three features this session closed — the wake-name fixes (§3's ❌ follow-up), the scratch sweep with its reversible archive, and the doctor's `state:` line, including C2, the `swept nothing` regression the restart-check caught live. **13 ☐ items**, each naming the exact command, the exact journal string and the one evidence line to paste back; A1–A4 (real voice) and B1 (a real `kill -9` mid-synthesis) have no automated equivalent at all, and every quoted string in the checklist was read off the deployed copy while writing it (the B5 refusal message and the C3 JSON reading were both captured live 2026-09-25). §3's hands-free follow-up stays ❌ until A2 passes. OWED: §10 A1–A5, B1–B5, C1–C3. Automatable state of this set: 2240 green in all three orders (default 327 s, seed 424242 329 s, file order 7 326 s), `compile_all` 64 files, mutations 3/3 (clobber fix) and 5/5 (archive) caught |
 | 2026-09-25 | Buffy (live redeploy) | uncommitted hygiene-TREND set (running == checkout == installed) | The hygiene reading now has a history: every start appends `{at, date, scratch_left, size_bytes, entries, swept}` to `STATE_DIR/state-hygiene.jsonl` (`_record_state_hygiene()`, called from `_prepare_runtime()` right after the sweep, so a row is the POST-reclaim state and carries that start's reclaim count), and the doctor reports growth — one number could never say whether the dir is growing, which is the question an operator actually has. Design choices, each because the alternative lies: **one row per START, not per doctor read** (the doctor is asked on demand and a diagnostic must not write state; a start is a bounded, natural sample), **latched per start** like the sweep (`_HYGIENE_LOGGED`, so the second `_prepare_runtime()` cannot double the sample), **capped at 400 readings** and rewritten atomically under the state-file lock (the self-watch log's shape — an unbounded diagnostic log would BE the leak this line reports), and the trend compares the newest reading with the newest one **at least 7 days older** so the delta always spans a real week; a shorter history reports its span and NO deltas (a week-over-week number from two hours of samples is a lie shaped like a trend), and a torn or foreign line is dropped rather than fatal (a power cut leaves exactly that). The structured surface ships the same numbers, with `null` — never 0 — for a delta the history cannot support, so "no delta" and "a delta of nothing" stay different facts. Guards: 9 host-side (`TestStateHygieneTrend` — the recorded row matches the reading it came from and lands 0600; one row per start; the delta comes from the ≥7-day-old row and NOT the 6-day-old one, with `+953.7 MB, +20 entries` on the line; a short history offers no deltas; an empty log says `no readings yet`; torn/foreign/at-less lines are dropped; the cap drops the OLDEST rows; an unreadable dir records nothing and conjures no file; `_prepare_runtime` records post-reclaim with `swept == 1`) + 1 doctor-side (`test_the_trend_rides_the_json_surface`, because the doctor builds that dict key by key and a trend the JSON drops is exactly the drift one collector exists to stop), with the unreadable-JSON guard extended to the new key. Mutations 8/8 caught (window ignored, sign dropped, latch removed, recorded before the sweep, cap dropping the newest, foreign rows kept verbatim, short history fabricating a delta, the doctor dropping the trend), all restored, no mutant strings left. Docs: 40-data on-disk map (two new rows: the trend log and the `scratch-quarantine/` archive) + the trend paragraph, 50-ops runtime step, README Doctor sentence, census 2240→2250 ×3, architecture table regenerated; ACCEPTANCE §10 C1 now expects FOUR clauses and gains **C4**, the desk check for the trend (including the by-hand delta and the one-row-per-start rule). 2250 green in all three orders (default 326 s, seed 424242 389 s, file order 7 329 s); `compile_all` 64 files; `bash -n` clean. Live: deployed (`in-sync`) and proved on the real state dir — the line reads `… 3.1 GB in 39 entries; trend needs a week (0.0 days recorded)`, the log holds exactly ONE row per start (two restarts → two rows, not four, so the production latch holds) and is 0600, and a sandboxed run of the DELIVERED copy over a synthetic week rendered `7-day trend +308.7 KB, -13 entries` with `since_days: 9.0` in the JSON — a real DECLINE over the week, which is the sweep's reclaim showing up as history. Nothing committed |
 | 2026-09-25 | Buffy (live desk run) | uncommitted desk-retest driver set (`ci/desk_retest.py`, 28 guards; running == checkout == installed) | §10's automated half is now ONE command (`python ci/desk_retest.py` — plants the probes, restarts the unit paced to its own start limit, reads the journal and the doctor's lines back, prints the paste-ready block ending `OWED at the desk (real voice — no substitute): A1 A2 A3 A4`), and it PASSED on this desk: **11/11 automated items** (A5, B1–B5, C1–C5) with evidence recorded under each — C2, the `swept nothing` regression, graded closed live, and B1's real `kill -9` mid-synthesis caught a stranded TTS dir and archived it. **OWED: §10 A1–A4 only** (a real voice; plus B2's `aplay` half). The driver was hardened by its own first live runs, all found the hard way: restarts are PACED to the unit's `StartLimitBurst=5`/`StartLimitIntervalSec=120` counted from the JOURNAL with one start of reserve (run one tripped the limit and left the bubble down ~3 min; run two tripped it again because a process-local start list cannot see a previous run's tail or a `Restart=always` respawn; a third run was killed by a dead session and left the unit `failed` — the driver now also revives a unit it finds down before judging anything), readiness is the control socket and never the doctor (`doctor` answers for a dead bubble from a LOCAL report, which C2 once graded), a `start-limit-hit` start is recovered with the documented `reset-failed` + `start`, a client-side doctor report is refused rather than graded, and one real parser bug fell out of `--simulate`: a mature `7-day trend … entries` clause was swallowed by the size clause that also ends in `entries`. Guards: 28 in `tests/test_desk_retest.py` (readers, block, CLI, one end-to-end `--simulate`, the desk-only wiring by shape, and the real back end's start policy), **28/28 mutations caught across three sweeps, every restore byte-exact**; the +3 reserve tests also exposed one pre-existing order-flake, fixed at its cause (`test_a_start_records_one_row_of_the_reading` now pins `_LAST_SWEEP`, deterministic under seed 424242). 2278 green in all three orders (default 330 s, seed 424242 332 s, file order 7 335 s), `compile_all` 66 files, `bash -n` clean; docs: ACCEPTANCE §10 (+C5), 50-ops, 60-test-plan, README census ×3. Nothing committed |
+| 2026-09-25 | Buffy (live desk run, B2 by hand) | `a44c0c1` + uncommitted driver fixes (cleanup bounded to `tmpdeskcheck*` probes; B1 kills only after the reply's `tts.wav` has bytes and grades it) | §10's B2 CLOSED by hand: the recovered reply (319448-byte `tts.wav`, `RIFF … WAVE audio, PCM 16 bit mono 24000 Hz`, sha256 `b6705fc9…`) `cp`ied out, `file`d, `aplay`ed out loud (exit 0), and its archived dir `mv`ed out and back as an ordinary directory. Two driver defects found and fixed in the same change (28 → 32 guards, docs + census 2282 ×3): the exit cleanup deleted B1's archived REAL reply — the exact artifact B2 exists to play; it destroyed both of the day's earlier archives — and the kill landed during the voice's LOAD, stranding EMPTY dirs that still graded PASS against §10's own `with its tts.wav intact` criterion. OWED: §10 A1–A4 only |
+| 2026-09-25 | Buffy (live redeploy) | `a44c0c1` — now recorded in `deployment.json` (`git_commit` + `git_dirty`, the flag judged over the SHIPPED paths only) | The manifest names the commit it deployed, not only per-file hashes: this deploy recorded `git_commit a44c0c1…`, `git_dirty: false` (the checkout's uncommitted test/docs edits correctly did not smear the claim — the shipped set is exactly HEAD), 22 files all `source==installed`, and the doctor answered `deployment: in-sync` — running == checkout == installed == a44c0c1. First live attempt stopped at step 1's pacman probe (non-interactive sudo; both packages are the installer's own pip-provided notes) and deployed nothing; `HANDSOFF_SKIP_SYSTEM_PKGS=1` completed it. Guards: the rehearsal manifest must carry the real HEAD and a recomputed dirty flag (`tests/test_ops.py`, 77 → 78); specs 40-data + 50-ops document the keys. Human-only items unchanged (§10 A1–A4) |

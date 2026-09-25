@@ -11,7 +11,9 @@ that; the reader is pinned here.
 Three things are guarded: the interpreters that decide what the journal and the
 line MEAN (`sweep_entries`, `parse_state_line`, `wake_line_ok`), the evidence
 block a person pastes (its marks, its reasons, and the OWED line naming what is
-still a human's), and the CLI behaviour (`--only`, `--dry-run`, litter).The desk-only checks (B1's real SIGKILL, A5's arming warning) cannot run here, so
+still a human's), and the CLI behaviour (`--only`, `--dry-run`, litter) — and,
+added when B2's first by-hand attempt found the reply already gone, what the
+run itself deletes. The desk-only checks (B1's real SIGKILL, A5's arming warning) cannot run here, so
 their WIRING is pinned by shape instead — the same split the driver itself
 makes when it reports them as `not run here`. The real back end's own
 constraints are pinned the same way, because the first live run of the driver
@@ -290,6 +292,71 @@ class TestTheDeskOnlyWiring:
         killed = body.index("d.kill9()")
         assert spoken < killed
         assert "time.sleep(" in body[spoken:killed]
+
+    def test_b1_waits_for_the_wav_so_the_reply_is_playable(self, D):
+        """A kill during the voice's LOAD strands an EMPTY dir: the scratch
+        dir exists from the first moment, but `tts.wav` only appears once
+        synthesis starts writing. Both live runs of 2026-09-25 killed too
+        early and archived nothing playable — B2's `aplay` had nothing to
+        play, though both runs PASSED. So the kill waits for wav bytes, and
+        the check grades the wav itself, exactly as §10's B1 asks ("with its
+        `tts.wav` intact")."""
+        body = inspect.getsource(D.check_b1)
+        waited = body.index("tts.wav")
+        killed = body.index("d.kill9()")
+        assert waited < killed, "the kill must wait for the wav to have bytes"
+        assert body.index("tts.wav", killed) > killed, (
+            "the stranded dir's wav is graded AFTER the kill, per §10's B1 "
+            "criterion — an empty dir is a fail, not a pass")
+
+
+class TestWhatTheRunCleansUp:
+    """`cleanup()` deletes what the run PLANTED, and nothing else.
+
+    Found live 2026-09-25: the run's archive sweep deleted B1's REAL stranded
+    TTS dir at exit — the reply the bubble actually synthesized, which is the
+    exact artifact §10's B2 exists to `cp`/`file`/`aplay` by hand. The earlier
+    session's `tmptq9yudu_` was already gone when the session owing the
+    `aplay` began, and `tmpklue3jp7` vanished between B1's PASS and the `cp`.
+    Probes carry the `tmpdeskcheck` prefix; real scratch is named `tmp` plus
+    eight random characters (11 chars, `mkdtemp`) and can never carry that
+    prefix, so it is the whole boundary. The archived reply's way out is the
+    archive's own 7-day TTL, not the retest.
+    """
+
+    def test_a_real_stranded_dir_survives_cleanup_its_probes_do_not(
+            self, D, tmp_path):
+        desk = D.SimDesk(tmp_path / "root", HERE, "python")
+        reply = desk.plant_dir("tmpklue3jp7")       # B1's real scratch
+        probe = desk.plant_dir(f"{D.PROBE_PREFIX}-fresh")
+        desk.cleanup()
+        assert reply.is_dir(), (
+            "the run deleted B1's real stranded dir — the reply B2's human "
+            "half exists to play back")
+        assert not probe.exists(), "the run left its own probe behind"
+
+    def test_an_archived_probe_is_removed_a_real_archived_reply_is_not(
+            self, D, tmp_path):
+        desk = D.SimDesk(tmp_path / "root", HERE, "python")
+        day = desk.dated_archive()
+        day.mkdir(parents=True, exist_ok=True)
+        (day / "tmpklue3jp7").mkdir()               # the real archived reply
+        (day / f"{D.PROBE_PREFIX}-recover").mkdir()  # a probe, archived
+        desk.created.append(desk.state / "tmpklue3jp7")
+        desk.created.append(desk.state / f"{D.PROBE_PREFIX}-recover")
+        desk.cleanup()
+        assert (day / "tmpklue3jp7").is_dir(), (
+            "the archive sweep deleted the real archived reply — the one "
+            "artefact a person is owed")
+        assert not (day / f"{D.PROBE_PREFIX}-recover").exists()
+
+    def test_both_cleanup_loops_are_bounded_by_the_probe_prefix(self, D):
+        """By shape, because the delete-only-probes contract is the guard: a
+        revert of either loop must fail here, not on someone's desk."""
+        source = inspect.getsource(D.Desk.cleanup)
+        assert source.count("startswith(PROBE_PREFIX)") == 2, (
+            "the state sweep and the archive sweep are BOTH bounded by "
+            "PROBE_PREFIX — one unbounded loop deletes real scratch")
 
 
 class _FakeClock:

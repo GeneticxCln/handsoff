@@ -23,7 +23,9 @@ Sources: `install.sh`, `handsoff.py` (`main`, `_deployment_snapshot`,
    checked.
 5. Atomic switch `~/.local/bin` (0755 entry points), previous release kept
    for `--rollback`; manifest written to `deployment.json` (per-file
-   sha256, whisper sha, model ids).
+   sha256, whisper sha, model ids, and the deployed git state: `git_commit`
+   + `git_dirty`, the dirty flag judged over the shipped paths only so
+   uncommitted test/docs edits beside a clean deploy stay honest).
 6. systemd user unit `handsoff.service`: `ExecStart %h/.local/bin/handsoff.py`,
    `Restart=always`, `PartOf=graphical-session.target`,
    `WantedBy=graphical-session.target`. Exactly ONE autostart owner:
@@ -175,9 +177,12 @@ evidence block whose last line names the items only a person can close (A1–A4,
 a real voice). `--only B1,C4` narrows it, `--dry-run` changes nothing, and
 `--simulate` rehearses the whole thing against a throwaway state dir with the
 checkout's own code and no systemd (B1's SIGKILL and A5's arming warning then
-report themselves desk-only); on the real backend B1 speaks aloud and kills
-the bubble mid-synthesis on purpose, and B5 briefly renames the real
-`scratch-quarantine`. Its restarts are PACED to the unit's own
+report themselves desk-only);on the real backend B1 speaks aloud and kills the bubble mid-synthesis on
+purpose, and B5 briefly renames the real
+`scratch-quarantine`. Its cleanup deletes only its own `tmpdeskcheck*`
+probes: B1's archived REAL reply survives the run for §10's B2 `aplay` and
+leaves through the archive's own 7-day TTL (the first live session deleted it
+at exit, found 2026-09-25). Its restarts are PACED to the unit's own
 `StartLimitBurst`/`StartLimitIntervalSec`, counted from the journal (every
 start systemd actually performed, including a previous run's tail and
 `Restart=always` respawns) and kept one start under the burst — the first two
