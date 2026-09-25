@@ -1492,7 +1492,7 @@ class TestTheDeploymentLineCarriesTheCommit:
         repo.mkdir()
         env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                    GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
-        (repo / "f.txt").write_text("x", encoding="utf-8")
+        (repo / "handsoff.py").write_text("x = 1\n", encoding="utf-8")
         for argv in (["git", "init", "-q"], ["git", "add", "."],
                      ["git", "commit", "-qm", "head"]):
             subprocess.run(argv, cwd=repo, env=env, check=True,
@@ -1504,10 +1504,17 @@ class TestTheDeploymentLineCarriesTheCommit:
 
     @staticmethod
     def _deployment_line(manifest, repo=None):
+        """`repo_path` mirrors production: the checkout's handsoff.py FILE.
+
+        The first live deploy printed the full SHA as `unverified` because the
+        doctor handed git the file as its cwd; the tests had set a directory
+        and so passed. Both now use the production shape — and the fake repo
+        gets a real handsoff.py-sized file so the snapshot's value is honest.
+        """
         from core import doctor as core_doctor
         snap = {"status": "in-sync", "manifest": manifest}
         if repo is not None:
-            snap["repo_path"] = str(repo)
+            snap["repo_path"] = str(repo / "handsoff.py")
         deps = core_doctor.DoctorDeps(deployment_snapshot=lambda: snap)
         return next(ln for ln in core_doctor._lines(deps)
                     if ln.startswith("deployment:"))
@@ -1539,6 +1546,21 @@ class TestTheDeploymentLineCarriesTheCommit:
         line = self._deployment_line({"git_commit": commit}, repo=None)
         assert line.endswith(f"at {commit} (unverified — no checkout HEAD)"), (
             "no checkout to verify against is a fact to state, not silence")
+
+    def test_the_repo_path_is_a_file_and_git_still_finds_the_repo(
+            self, tmp_path):
+        """The live defect, pinned: repo_path names a FILE.
+
+        _deployment_snapshot's `repo_path` is the checkout's handsoff.py, so
+        git must be handed its PARENT — a cwd that is a file makes rev-parse
+        fail and an in-sync deployment print `unverified`, which the first
+        live deploy did. Regression is exact: the snapshot's value is the
+        file path, verbatim.
+        """
+        repo, head = self._fake_repo(tmp_path)
+        line = self._deployment_line({"git_commit": head}, repo=repo)
+        assert line == (f"deployment: in-sync — installed copy matches "
+                        f"the checkout at {head[:12]}"), line
 
     def test_an_old_or_malformed_manifest_prints_the_classic_line(self):
         classic = "deployment: in-sync — installed copy matches the checkout"

@@ -380,10 +380,16 @@ def _lines(deps: DoctorDeps) -> list[str]:
     suffix = ""
     if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit):
         head = ""
+        # `repo_path` is the checkout's handsoff.py FILE (the same value the
+        # `checkout:` line prints), not a directory — git needs the parent.
+        # Found live 2026-09-25: the first deploy printed the full SHA as
+        # `unverified` because git was handed a file as its cwd.
         if isinstance(repo_dir, str) and repo_dir:
+            base = Path(repo_dir)
+            base = base.parent if base.is_file() or base.suffix else base
             try:
                 head = subprocess.run(
-                    ["git", "rev-parse", "HEAD"], cwd=repo_dir,
+                    ["git", "rev-parse", "HEAD"], cwd=str(base),
                     capture_output=True, text=True, timeout=5,
                 ).stdout.strip()
             except (OSError, subprocess.SubprocessError):
