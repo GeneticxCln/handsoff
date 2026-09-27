@@ -780,6 +780,81 @@ class TestControlSocket:
         s.close()
         return reply.decode()
 
+    def test_a_verb_the_socket_cannot_run_is_refused_not_acked(
+            self, server, monkeypatch):
+        """`selftest` and `stop-audit` are the CLI's, and the socket must SAY so.
+
+        Both fall through the socket's generic arm to
+        `sigCommand.emit(action); reply = f"ok: {action}"`, and
+        `Assistant._on_command` has no arm for either — they run locally, over
+        scratch windows and the ledger, precisely so they work when the bubble
+        is DEAD and there is no socket to ask. So the socket acked two commands
+        it had not run: a client binding a keybind to the socket and pressing it
+        got "ok" and nothing happened, with no log line and no speech
+        (measured 2026-09-27 by driving this socket with a valid token).
+        """
+        H, delivered, app = server
+        for verb in sorted(H.PTT_CLI_ONLY):
+            text = self._roundtrip(H.CONTROL_SOCK, verb)
+            assert text.startswith("error:"), (verb, text)
+            assert verb in text and "--ptt" in text, (verb, text)
+            assert "ok:" not in text, (verb, text)
+        # and it did not dispatch them either
+        app.processEvents()
+        assert not [d for d in delivered if d in H.PTT_CLI_ONLY], delivered
+        # the socket does not advertise what it refuses
+        listing = self._roundtrip(H.CONTROL_SOCK, "no-such-verb")
+        for verb in H.PTT_CLI_ONLY:
+            assert verb not in listing.split("commands:")[-1], (verb, listing)
+
+    def test_every_advertised_verb_is_run_by_something(self, server):
+        """The property behind the fix, so the NEXT verb cannot repeat it.
+
+        The socket's last arm acks optimistically — `sigCommand.emit(action)`
+        then `reply = f"ok: {action}"` — because a Qt signal cannot report back
+        what the receiver did with it. That is honest only for a verb somebody
+        handles, so every advertised verb has to be answered by the socket's own
+        dispatch or by an `Assistant._on_command` arm. A verb with neither was
+        the defect: "ok", and nothing.
+        """
+        H, _delivered, _app = server
+        import ast
+        tree = ast.parse(inspect.getsource(H))
+        arms: dict[str, set[str]] = {}
+        for cls in tree.body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            found = set()
+            for node in ast.walk(cls):
+                if not isinstance(node, ast.If):
+                    continue
+                test = node.test
+                # `action == "x"` and `action in ("x", "y")` BOTH dispatch; the
+                # dictation verbs are a tuple membership test, and reading only
+                # the equality form reports three working verbs as unhandled.
+                targets: list[ast.expr] = []
+                if isinstance(test, ast.Compare) and len(test.ops) == 1:
+                    left = ast.unparse(test.left)
+                    if left == "action":
+                        if isinstance(test.ops[0], ast.In):
+                            targets = list(test.comparators)
+                        else:
+                            targets = [test.comparators[0]]
+                for target in targets:
+                    for sub in ast.walk(target):
+                        if (isinstance(sub, ast.Constant)
+                                and isinstance(sub.value, str)):
+                            found.add(sub.value)
+            if found:
+                arms[cls.name] = found
+        handled = arms.get("ControlServer", set()) | arms.get("Assistant", set())
+        unhandled = sorted((H.PTT_ACTIONS - H.PTT_CLI_ONLY) - handled)
+        assert not unhandled, (
+            f"{unhandled} are advertised by the control socket but nothing "
+            f"handles them: no ControlServer arm, no Assistant._on_command arm. "
+            f"The socket answers 'ok' having run nothing — add a handler, or "
+            f"put the verb in PTT_CLI_ONLY if only the CLI can run it")
+
     def test_a_state_changing_verb_without_the_token_is_refused(
             self, server, monkeypatch):
         """`say` in the user's voice, dropping the conversation and swapping

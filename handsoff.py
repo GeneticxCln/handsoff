@@ -180,6 +180,20 @@ _CONTROL_TOKEN_BYTES = 32          # 64 hex characters of os.urandom
 #: same-UID client. Everything else in PTT_ACTIONS needs the token.
 PTT_READ_ONLY = frozenset({"status", "health", "level", "doctor",
                            "handsfree-status"})
+#: Verbs in PTT_ACTIONS that only the COMMAND LINE runs, on purpose: they drive
+#: their own scratch windows or read the ledger directly, and they have to work
+#: when the bubble is DEAD — which is exactly when a socket command cannot be
+#: sent. They are in PTT_ACTIONS because main() validates `--ptt` against the
+#: same set, and a keybind may be bound to either interface.
+#:
+#: The socket used to advertise them anyway and then do nothing: both fell
+#: through its generic arm to `sigCommand.emit(action); reply = f"ok: {action}"`,
+#: and `Assistant._on_command` has no arm for either — so the client was told
+#: the command succeeded and no work was done, silently (measured 2026-09-27 by
+#: driving the real socket with a valid token: `stop-audit` answered
+#: "ok: stop-audit" and ran nothing). So they are named here and refused by
+#: name, with the path that does work.
+PTT_CLI_ONLY = frozenset({"selftest", "stop-audit"})
 MIC_EVENTS_FILE = STATE_DIR / "mic-health.json"   # mic transitions + last briefing
 MIC_EVENTS_MAX = 200                              # hard cap on recorded transitions
 _MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
@@ -10125,6 +10139,18 @@ class ControlServer:
                             reply = self._assistant.set_pack_preview(action_arg)
                         elif action == "preview-clear":
                             reply = self._assistant.clear_pack_preview()
+                        elif action in PTT_CLI_ONLY:
+                            # Refused BY NAME, with the path that works. The
+                            # generic arm below would answer "ok" and do
+                            # nothing, because _on_command has no arm for
+                            # these — they run locally, over scratch windows
+                            # and the ledger, so they work even when the
+                            # bubble is dead and a socket is not there to ask.
+                            reply = (f"error: '{action}' is a command-line "
+                                     f"command, not a socket one — it runs "
+                                     f"locally so it works when the bubble is "
+                                     f"down. Use: python3 {Path(__file__).name} "
+                                     f"--ptt {action}")
                         elif action == "settings":
                             if SETTINGS_APP.exists():
                                 subprocess.Popen(
@@ -10135,11 +10161,18 @@ class ControlServer:
                             else:
                                 reply = f"ERROR: settings app missing at {SETTINGS_APP}"
                         else:
+                            # The last arm forwards to the assistant and acks
+                            # OPTIMISTICALLY, because a Qt signal cannot report
+                            # back what the receiver did with it. That is only
+                            # honest for a verb the receiver actually handles,
+                            # so the two it does not are refused above rather
+                            # than falling through to a bare "ok" for work that
+                            # never happened.
                             self._assistant.sigCommand.emit(action)
                             reply = f"ok: {action}"
                     else:
                         reply = (f"error: unknown command '{action}'. "
-                                 f"commands: {' '.join(sorted(PTT_ACTIONS))}")
+                                 f"commands: {' '.join(sorted(PTT_ACTIONS - PTT_CLI_ONLY))}")
                     conn.sendall((reply + "\n").encode("utf-8"))
                 except OSError:
                     pass
