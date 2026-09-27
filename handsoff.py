@@ -453,6 +453,23 @@ def _fallback_strip_thinking(text: str) -> str:
                   flags=re.MULTILINE).strip()
 
 
+def _fallback_sayable(sentence):
+    """The no-core/brain bundle's copy of `core.brain.sayable`.
+
+    Same reason as the reader below, and a third instance of the same defect
+    class this file already fixed twice: a second copy of a rule that decides
+    what the user HEARS cannot be left to drift from the first. Measured
+    2026-09-27 on the real copy, with a stream whose first chunk carried
+    `<|im_start|>assistant\\n`: dropping the whole sentence took the opening
+    sentence of the answer with the token, so the reply started one sentence
+    late.
+    """
+    if not _fallback_is_leaked_markup(sentence):
+        return sentence
+    _token, newline, tail = sentence.partition("\n")
+    return tail.strip() if newline else ""
+
+
 def _fallback_read_http_error(error) -> str:
     """The no-core/brain bundle's copy of `core.brain._read_http_error`.
 
@@ -566,13 +583,13 @@ except ImportError:
                             if not match:
                                 break
                             sentence, buf = buf[:match.end()], buf[match.end():]
-                            sentence = cls.strip_thinking(sentence)
-                            if sentence and not cls.is_leaked_markup(sentence):
+                            sentence = _fallback_sayable(cls.strip_thinking(sentence))
+                            if sentence:
                                 q.put(sentence)
                 # no tail flush after a barge-in: it would be spoken over the user
                 if not (cancel is not None and cancel.is_set()):
-                    tail = cls.strip_thinking(buf)
-                    if tail and not cls.is_leaked_markup(tail):
+                    tail = _fallback_sayable(cls.strip_thinking(buf))
+                    if tail:
                         q.put(tail)
             except urllib.error.HTTPError as error:
                 detail = cls._read_http_error(error)
@@ -585,7 +602,23 @@ except ImportError:
                         base=base, model=model, num_ctx=num_ctx, guard=guard,
                         logger=logger, state=state, urlopen=urlopen,
                         keep_alive=keep_alive)
+                # Same two sentences the non-streaming arm above speaks, and
+                # for the same reason: this branch is a whole second copy of
+                # the streamer, and a copy that has drifted is how the two
+                # were fixed once already (the shared filters, the shared
+                # error reader). Measured 2026-09-27 on this copy: a 404
+                # naming the model reached the user with no `ollama pull` in
+                # it while its own sibling arm had the command, and a refused
+                # connection escaped as URLError so the turn said
+                # "URLError: <urlopen error [Errno 111] ...>" instead of the
+                # server and `systemctl start ollama`.
+                if error.code == 404 and "model" in str(detail).lower():
+                    detail += f" — run: ollama pull {model}"
                 raise RuntimeError(f"Ollama error {error.code}: {detail}") from None
+            except urllib.error.URLError as error:
+                raise RuntimeError(
+                    f"cannot reach Ollama at {base} ({error.reason}). "
+                    "Start it with: systemctl start ollama") from None
             finally:
                 if not fallback:
                     q.put(None)

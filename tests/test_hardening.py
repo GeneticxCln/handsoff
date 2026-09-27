@@ -525,7 +525,7 @@ class TestMissingBrainFallback:
 
     DRIVER = textwrap.dedent(
         """
-        import importlib.util, io, json, logging, os, sys, urllib.error
+        import importlib.util, io, json, logging, os, queue, sys, urllib.error
         _real_spec = importlib.util.spec_from_file_location
 
         def _unbuildable(name, *args, **kwargs):
@@ -602,6 +602,119 @@ class TestMissingBrainFallback:
             state=state, urlopen=urlopen)
         report["call_tools"] = ["tools" in call for call in calls]
         report["state"] = state
+
+        # ---- the STREAMING arm, which is the DEFAULT turn path -------------
+        # A whole second copy of `core.brain.ollama_chat_stream`, and a third
+        # instance of the defect class this branch has already been fixed for
+        # twice (the shared filters, the shared error reader). Measured
+        # 2026-09-27 by driving it: a 404 naming the model reached the user
+        # with no `ollama pull` in it while its own non-streaming sibling had
+        # the command, and a refused connection escaped as URLError so the
+        # turn said "URLError: <urlopen error [Errno 111] ...>" instead of the
+        # server and `systemctl start ollama`.
+        # `chr(10)` rather than a backslash escape: this driver is a string
+        # inside a string, so a newline written the obvious way arrives in
+        # the child as two characters. And no docstrings below either --
+        # a triple quote in here closes the string holding the driver.
+        EOL = chr(10)
+
+        def ndjson(*pieces):
+            return [(json.dumps({"message": {"content": p}}) + EOL).encode()
+                    for p in pieces]
+
+        def leaked(token):
+            # one NDJSON line: a control token, then a newline of its own
+            return (json.dumps({"message": {"content": token + EOL}})
+                    + EOL).encode("utf-8")
+
+        def answered(text):
+            return (json.dumps({"message": {"content": text}}) + EOL).encode()
+
+        class StreamResp:
+            def __init__(self, lines):
+                self.lines = lines
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(self):
+                return iter(self.lines)
+
+            def read(self):
+                return b"".join(self.lines)
+
+        BASE = "http://127.0.0.1:11434"
+        log = logging.getLogger("driver")
+
+        def speaking(lines):
+            q = queue.Queue()
+            legacy.ollama_chat_stream(
+                [{"role": "user", "content": "hi"}], q, None, None,
+                base=BASE, model="gpt-oss:20b", num_ctx=8,
+                guard=lambda: None, logger=log,
+                urlopen=lambda req, timeout=None: StreamResp(list(lines)))
+            return list(q.queue)
+
+        report["stream_said"] = speaking(ndjson("One. ", "Two more"))
+        # the leaked-token rule, both directions: a token glued to a
+        # sentence costs only its own line, a bare one costs the line
+        report["stream_leaked"] = speaking(
+            [leaked("<|im_start|>assistant"), answered("Here.")])
+        report["stream_bare_token"] = speaking(
+            [leaked("<|im_start|>"), answered("Here.")])
+        # and the two failure sentences, against the REAL functions
+        def failing(kind):
+            def urlopen(req, timeout=None):
+                if kind == "refused":
+                    raise urllib.error.URLError(
+                        ConnectionRefusedError(111, "Connection refused"))
+                raise http_error(json.dumps(
+                    {"error": 'model "gpt-oss:20b" not found'}).encode(),
+                    code=404, reason="Not Found")
+            q = queue.Queue()
+            try:
+                legacy.ollama_chat_stream(
+                    [{"role": "user", "content": "hi"}], q, None, None,
+                    base=BASE, model="gpt-oss:20b", num_ctx=8,
+                    guard=lambda: None, logger=log, urlopen=urlopen)
+            except Exception as exc:
+                return f"{type(exc).__name__}: {exc}"
+            return "NO RAISE"
+
+        report["stream_refused"] = failing("refused")
+        report["stream_missing_model"] = failing("404")
+
+        # the SAME two failures through the real `core.brain`, so the report
+        # carries both sentences and the test compares them
+        def core_arm(kind):
+            def urlopen(req, timeout=None):
+                if kind == "refused":
+                    raise urllib.error.URLError(
+                        ConnectionRefusedError(111, "Connection refused"))
+                raise http_error(json.dumps(
+                    {"error": 'model "gpt-oss:20b" not found'}).encode(),
+                    code=404, reason="Not Found")
+            call = (real_brain.ollama_chat_stream
+                    if kind == "refused" else real_brain.ollama_chat)
+            args = ([{"role": "user", "content": "hi"}], queue.Queue())
+            try:
+                if kind == "refused":
+                    call(*args, None, None, base=BASE, model="gpt-oss:20b",
+                         num_ctx=8, guard=lambda: None, logger=log,
+                         urlopen=urlopen)
+                else:
+                    call(args[0], None, base=BASE, model="gpt-oss:20b",
+                         num_ctx=8, guard=lambda: None, logger=log,
+                         urlopen=urlopen)
+            except Exception as exc:
+                return f"{type(exc).__name__}: {exc}"
+            return "NO RAISE"
+
+        report["core_refused"] = core_arm("refused")
+        report["core_missing_model"] = core_arm("404")
         print(json.dumps(report))
         """
     )
@@ -632,6 +745,40 @@ class TestMissingBrainFallback:
         assert report["chat"] == {"content": "ok"}
         assert report["call_tools"] == [True, False]
         assert report["state"] == {"tools_supported": False}
+
+    def test_its_streaming_arm_says_the_same_things_core_does(self, tmp_path):
+        """The copy and the original, on the sentences the user HEARS.
+
+        A second copy of a rule cannot be left to drift: this branch was fixed
+        twice already for exactly that, and both fixes were things the
+        non-streaming sibling in the same class had and the streaming one did
+        not. Driven here rather than compared by reading, because the whole
+        point is that reading the two and seeing them agree is not evidence.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        proc = run_driver(
+            ["-c", self.DRIVER, str(HERE)], home=home,
+            capture_output=True, text=True, timeout=180,
+        )
+        assert proc.returncode == 0, proc.stderr[-3000:]
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        # the queue: sentences, then exactly one terminator
+        assert report["stream_said"] == ["One.", "Two more", None], \
+            report["stream_said"]
+        # the leak rule, in the direction that lost a sentence until 2026-09-27
+        assert report["stream_leaked"] == ["Here.", None], report["stream_leaked"]
+        assert report["stream_bare_token"] == ["Here.", None], \
+            report["stream_bare_token"]
+        # the two failure sentences, identical in both copies
+        assert report["stream_refused"] == report["core_refused"], (
+            report["stream_refused"], report["core_refused"])
+        assert "systemctl start ollama" in report["stream_refused"], \
+            report["stream_refused"]
+        assert report["stream_missing_model"] == report["core_missing_model"], (
+            report["stream_missing_model"], report["core_missing_model"])
+        assert "run: ollama pull gpt-oss:20b" in report["stream_missing_model"], \
+            report["stream_missing_model"]
 
 
 class TestSweepStaleScratch:

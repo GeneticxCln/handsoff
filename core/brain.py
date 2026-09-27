@@ -26,6 +26,24 @@ def is_leaked_markup(sentence: str) -> bool:
     return bool(_LEAKED_MARKUP.match(sentence or ""))
 
 
+def sayable(sentence: str) -> str:
+    """The sentence to speak: a leaked control token's LINE removed, not all.
+
+    The token is the leak; the words that follow it are the answer, and
+    dropping the whole sentence took the answer with it. Measured 2026-09-27,
+    in `tests/test_brain.py`: a stream whose first chunk carried
+    `<|im_start|>assistant\\n` lost every word up to the next full stop, so
+    the reply started one sentence late — a hole exactly the size of the first
+    thing the model says. A token with nothing after it on its own line still
+    returns "", which is the case `is_leaked_markup` was written for and the
+    one `test_regression.py` pins.
+    """
+    if not is_leaked_markup(sentence):
+        return sentence
+    _token, newline, tail = sentence.partition("\n")
+    return tail.strip() if newline else ""
+
+
 def strip_thinking(text: str) -> str:
     """Clean model output before it is sent to speech."""
     value = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
@@ -109,7 +127,18 @@ def _messages_system_first(messages: list[dict],
     kept = [m for m in rest if m.get("role") != "system"]
     note = "\n\n".join(parts)
     if not note and len(head) < 2:
-        return messages
+        # A tail system message with NO CONTENT is still a system message in a
+        # position the renderer refuses, and folding it into a user turn would
+        # add nothing to read. It used to be returned here untouched, which is
+        # the one list this function handed back that its own docstring forbids:
+        # measured 2026-09-27, a turn whose conversation carried an empty
+        # re-injected note reached the server and came back "Ollama error 500:
+        # system message must be at the beginning" — the whole turn lost to a
+        # message that said nothing. Dropped instead, which cannot lose
+        # information: there is nothing in it for the model to read.
+        return [m for m in messages
+                if not (m.get("role") == "system"
+                        and not str(m.get("content") or ""))]
     if note:
         target = next((i for i in range(len(kept) - 1, -1, -1)
                        if kept[i].get("role") == "user"), None)
@@ -461,14 +490,14 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                     if not match:
                         break
                     sentence, buf = buf[:match.end()], buf[match.end():]
-                    sentence = strip_thinking(sentence).strip()
-                    if sentence and not is_leaked_markup(sentence):
+                    sentence = sayable(strip_thinking(sentence).strip())
+                    if sentence:
                         q.put(sentence)
         # Only flush what is still pending if the turn was NOT cancelled:
         # after a barge-in the tail was queued anyway and spoken over the user.
         if not (cancel is not None and cancel.is_set()):
-            tail = strip_thinking(buf).strip()
-            if tail and not is_leaked_markup(tail):
+            tail = sayable(strip_thinking(buf).strip())
+            if tail:
                 q.put(tail)
     except urllib.error.HTTPError as error:
         detail = _read_http_error(error)
@@ -481,6 +510,18 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                 messages, q, cancel, None, base=base, model=model,
                 num_ctx=num_ctx, guard=guard, logger=logger, state=state,
                 urlopen=urlopen, keep_alive=keep_alive)
+        # The fix hint the non-streaming arm gives, and for the same reason:
+        # `streaming_tts` defaults ON (handsoff.py `_setting_flag(..., True)`),
+        # so this arm is the path every turn takes — and it was the only path
+        # that did not name the command. Measured 2026-09-27: a 404 naming a
+        # model the host does not have produced the spoken line "Sorry, my
+        # brain is offline. RuntimeError: Ollama error 404: model 'x' not
+        # found, try pulling it first" on the default path, and the same
+        # server on the non-default one appended "— run: ollama pull x". The
+        # user is told the model is missing in a sentence they cannot act on
+        # and the one command that fixes it is only in the journal.
+        if error.code == 404 and "model" in str(detail).lower():
+            detail += f" — run: ollama pull {model}"
         logger.error("streaming chat HTTP error: %s", error)
         raise RuntimeError(f"Ollama error {error.code}: {detail}") from None
     except urllib.error.URLError as error:
