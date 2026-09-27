@@ -1,0 +1,45 @@
+# The lint gate's rule set. Pinned here so the answer does not move when ruff
+# ships a new default, and kept SMALL on purpose: a gate that opens with 200
+# findings nobody reads is decoration, and decoration is what the suite's own
+# comment about "a gate that cannot run" is defending against.
+#
+# SCOPE: the production sources — what actually ships to a desktop. The test
+# tree is deliberately NOT linted. It carries 129 findings under these rules,
+# 90 of them re-exports that exist so a fixture can be imported by name, and a
+# gate whose first act is to silence 90 correct lines teaches everyone to
+# ignore the gate. The 2296-test suite is what holds the tests.
+#
+# NOT SELECTED, each measured on this tree on 2026-09-25:
+#   SIM   126 findings — collapsible ifs, `open()` outside a context manager
+#                       for the lock and crash-log handles that are SUPPOSED
+#                       to live for the process, `dict()` against `{}`.
+#   RUF    268 findings — import order, quoted annotations, and 18 "value is
+#                       already an int" casts ruff will only remove as an
+#                       UNSAFE fix (it cannot prove the cast is redundant).
+#   PLW    151 findings — 25 `subprocess.run` calls with no explicit `check=`.
+#                       Every one of them reads `returncode` as DATA on
+#                       purpose: that is this app's contract with the model,
+#                       where a non-zero exit is a spoken answer, not a raise.
+# Each of those three was a larger diff than the defects it would have found.
+# Revisit them when the tree is smaller, not before.
+#
+# F401 on handsoff.py: it re-exposes PySide6's painting classes so
+# `core/bubble.py`, `core/theme.py` and the tests reach them through the app
+# module (78+ references). Ruff cannot see that indirection; deleting the
+# imports would break the app rather than tidy it.
+#
+# E402 on the two files that import late ON PURPOSE, and it is architecture
+# rather than untidiness: the app module is assembled in stages (constants, then
+# the dependency-injection defaults, then the core package loaded by name so a
+# missing module is a loud ImportError), and `core/tools.py` installs its
+# subprocess seam after the imports it proxies. Hoisting any of these changes
+# what exists when the next line runs.
+
+target-version = "py312"
+
+[lint]
+select = ["E4", "E7", "E9", "F", "B", "PLE"]
+
+[lint.per-file-ignores]
+"handsoff.py" = ["E402", "F401"]
+"core/tools.py" = ["E402"]

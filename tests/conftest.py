@@ -154,7 +154,7 @@ def _collecting_the_whole_suite(session) -> bool:
 
     The claim is about the WHOLE suite, so the warning is only honest for a
     session that collected it: a one-file run collects 85 and would read
-    85-vs-2284 as drift — found live 2026-09-25 (the first demonstration
+    85-vs-2296 as drift — found live 2026-09-25 (the first demonstration
     warned on `pytest tests/test_sandbox.py`, and the summary echoed it
     twice). Conservative in the false-negative direction: an unusual spelling
     (`pytest ./tests`) stays silent rather than inventing a complaint.
@@ -162,6 +162,25 @@ def _collecting_the_whole_suite(session) -> bool:
     if getattr(session.config.option, "keyword", None) \
             or getattr(session.config.option, "markexpr", None):
         return False                     # -k / -m deselect within the session
+    # --lf rewrites collection down to the tests that last failed, and
+    # --deselect drops named ones, so both collect a SUBSET and would read as
+    # drift — "README says 2296 tests; this run collects 3" — on a run that
+    # never claimed to be the whole suite. `--ff` is NOT here on purpose: it
+    # reorders the run but still collects all of it, so the count is the whole
+    # suite and the warning is honest. Measured 2026-09-25: the first
+    # demonstration of the warning missed this and --lf, the one command a
+    # developer types straight after a failure, was the one that misfired.
+    # getoption rather than the option object, so a pytest that does not know
+    # the name yields the default instead of raising; and a config that cannot
+    # be asked at all is SILENCE, because a development-time warning is not
+    # worth crashing a session over. Unknown loses a warning, which is the
+    # cheap direction — the gate still grades the real thing.
+    try:
+        if session.config.getoption("lf", default=False) \
+                or session.config.getoption("deselect", default=None):
+            return False
+    except AttributeError:                  # no getoption to ask
+        return False                        # see above: unknown is silence
     args = list(getattr(session.config, "args", []) or [])
     if not args:
         return True                      # no args: pytest.ini's testpaths (tests)

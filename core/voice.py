@@ -16,7 +16,6 @@ hooks, and the host documents why they stay with it.
 from __future__ import annotations
 
 import re
-import threading
 
 
 # ---------------------------------------------------------------- speech gate

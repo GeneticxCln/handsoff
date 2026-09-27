@@ -1,9 +1,74 @@
-# Generated direct-dependency constraints for the supported Python 3.12/3.13
-# CI matrix. Versions only: no hashes are invented for unresolved packages.
-numpy==2.5.3
-PySide6==6.11.2
-sounddevice==0.5.6
+# handsoff - resolved dependency closure (constraints, not a requirements set)
+# closure: 41 packages (7 direct, 34 transitive)
+#
+# WHAT THIS IS. Every distribution reachable from requirements.txt, pinned to
+# the version a fresh resolve selects - 41 packages, not the 7 direct ones.
+# The earlier file named the direct dependencies only, so ~34 transitive
+# packages (tokenizers, ctranslate2, scipy, scikit-learn, huggingface-hub,
+# av, ...) floated freely on a machine that installs a 3.8 GB neural speech
+# model and holds the microphone, the desktop and the filesystem.
+#
+# MEASURED, NOT ASSUMED. Resolved for each matrix leg with
+#   pip download --only-binary=:all: --python-version <3.12|3.13|3.14> \
+#       -r requirements.txt -c requirements-lock.txt
+# and all three returned the IDENTICAL set below - so one lock serves every
+# leg and no environment markers are needed. Regenerate the same way after
+# touching requirements.txt, and expect the closure size to move.
+#
+# NO HASHES, DELIBERATELY. A hash-pinned closure is per-platform: these wheels
+# are manylinux x86_64, and `--require-hashes` refuses every other machine
+# rather than degrade. This is a desktop app that people run on whatever they
+# own, so a lock that only works on one architecture is a worse failure than
+# a lock that pins versions. Integrity stays where it can be exact and
+# platform-independent instead: CI images are pinned by digest and the
+# speech weights are SHA256-verified before use (see install.sh).
+#
+# INSTALLED-COPY DRIFT IS EXPECTED. A machine installed before this file
+# existed can hold older versions; re-sync with
+#   pip install --user -r requirements.txt -c requirements-lock.txt
+# to make the pin mean what it says. tests/test_ops.py guards the shape.
+
+# --- DIRECT (requirements.txt) ---
 faster-whisper==1.2.1
-openwakeword==0.4.0
+numpy==2.5.3
 onnxruntime==1.29.0
+openwakeword==0.4.0
+pyside6==6.11.2
 pytest==9.1.1
+sounddevice==0.5.6
+
+# --- TRANSITIVE (resolved closure; pinned, never edited by hand) ---
+anyio==4.15.1
+av==18.1.0
+certifi==2026.7.22
+cffi==2.1.1
+click==8.5.0
+cloudpickle==3.1.2
+ctranslate2==4.8.2
+filelock==4.0.3
+flatbuffers==25.12.19
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface-hub==1.33.0
+idna==3.20
+iniconfig==2.3.0
+joblib==1.6.0
+narwhals==2.26.0
+packaging==26.3
+pluggy==1.6.0
+protobuf==7.36.2
+pycparser==3.0
+pygments==2.21.0
+pyside6-addons==6.11.2
+pyside6-essentials==6.11.2
+pyyaml==6.0.3
+scikit-learn==1.9.1
+scipy==1.18.1
+shiboken6==6.11.2
+threadpoolctl==3.7.0
+tokenizers==0.23.2
+tqdm==4.70.1
+typing-extensions==4.16.0

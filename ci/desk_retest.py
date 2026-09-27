@@ -1179,8 +1179,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"would run ({desk.mode}): "
               + " ".join(c.__name__.split("_")[-1].upper() for c in checks))
         print(f"state dir: {desk.state}")
-        print(f"restarts:  one per check that needs a fresh start, paced to "
-              f"the unit's own start limit")
+        print("restarts:  one per check that needs a fresh start, paced to "
+              "the unit's own start limit")
         print(f"owed to a human afterwards: {' '.join(OWED_HUMAN)}")
         if args.simulate:
             shutil.rmtree(desk.root, ignore_errors=True)
@@ -1195,7 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
             item = check.__name__.split("_")[-1].upper()
             if desk.mode == "simulate" and item in SKIP_UNDER_SIM:
                 results.append(Result(item, "desk-only").skipped(
-                    f"needs the real unit (--simulate carries no systemd)"))
+                    "needs the real unit (--simulate carries no systemd)"))
                 continue
             result = check(desk)
             results.append(result)

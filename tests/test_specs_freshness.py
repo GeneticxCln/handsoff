@@ -547,12 +547,20 @@ class TestSpecFreshness:
         the sort. `-k`/`-m` deselect inside the session even when the arg is
         `tests`, so they stay silent too; an empty arg list is the testpaths
         default and speaks for the suite.
+
+        `--lf` and `--deselect` collect a SUBSET by rewriting the session, so
+        they are silence too — and `--lf` is the one command a developer types
+        straight after a failure, which is exactly when an invented "README
+        says 2292 tests; this run collects 3" is least welcome. `--ff` is
+        deliberately NOT silence: it reorders the run but still collects all
+        of it, so its count IS the whole suite.
         """
         import conftest as C
 
         def session(*args, **opt):
             config = type("C", (), {"args": list(args), "option":
                                     type("O", (), opt)()})()
+            config.getoption = lambda name, default=None: opt.get(name, default)
             return type("S", (), {"config": config})()
 
         assert C._collecting_the_whole_suite(session())
@@ -564,6 +572,12 @@ class TestSpecFreshness:
             session("tests", keyword="sandbox"))
         assert not C._collecting_the_whole_suite(
             session("tests", markexpr="slow"))
+        assert not C._collecting_the_whole_suite(session("tests", lf=True))
+        assert not C._collecting_the_whole_suite(
+            session("tests", deselect=["tests/test_sandbox.py"]))
+        assert not C._collecting_the_whole_suite(
+            session("tests", lf=True, deselect=["tests/test_sandbox.py"]))
+        assert C._collecting_the_whole_suite(session("tests", ff=True))
 
     def test_the_architecture_map_lists_exactly_the_core_package(self):
         """Both directions: a new module must appear, a deleted one must go.
@@ -934,6 +948,272 @@ class TestSpecFreshness:
             f"ci/spec_tables.py exited {proc.returncode}:\n"
             f"{proc.stdout}\n{proc.stderr}")
         assert "STALE" not in proc.stdout, proc.stdout
+
+    def test_the_index_slugs_match_githubs_own_fixtures(self):
+        """ci/doc_index.py's slug is a transcription of GitHub's anchor function
+        (github-slugger), and a transcription is only as good as its pin.
+
+        These vectors are github-slugger's OWN test fixtures plus the two
+        shapes these ledgers actually use — the em-dash Addendum titles and the
+        `\u00a71a` section. The subtle one is "a - dash" -> "a---dash": every
+        space becomes ONE hyphen and nothing collapses, so `Addendum \u2014
+        2026` anchors `addendum--2026` with the DOUBLE hyphen — and the old
+        whitespace-collapsing slug, which got this wrong on nearly every row
+        here, is exactly what this test would have caught. Without these pins,
+        "real anchor" in the neighbouring test is just this repo's opinion of
+        what the renderer does.
+        """
+        doc = _load_module("doc_index", HERE / "ci" / "doc_index.py")
+        for raw, want in (
+                ("alpha", "alpha"),
+                ("bravoCharlieDelta", "bravocharliedelta"),
+                ("__proto__", "__proto__"),
+                ("heading with a - dash", "heading-with-a---dash"),
+                ("heading with an _ underscore", "heading-with-an-_-underscore"),
+                ("heading with a period.txt", "heading-with-a-periodtxt"),
+                ("exchange.bind_headers(exchange, routing [, bindCallback])",
+                 "exchangebind_headersexchange-routing--bindcallback"),
+                ("apostrophe\u2019s should be trimmed",
+                 "apostrophes-should-be-trimmed"),
+                ("I \u2665 unicode", "i--unicode"),
+                ("en\u2013dash", "endash"),
+                ("em\u2014dash", "emdash"),
+                ("\U0001F604 unicode emoji", "-unicode-emoji"),
+                ("\U0001F604 - an emoji", "---an-emoji"),
+                ("\U0001F604_\U0001F604 unicode emoji", "_-unicode-emoji"),
+                ("\u041f\u0440\u0438\u0432\u0435\u0442 non-latin \u4f60\u597d",
+                 "\u043f\u0440\u0438\u0432\u0435\u0442-non-latin-\u4f60\u597d"),
+                ("Addendum \u2014 2026-09-12 third audit batch: turn-counter "
+                 "atomicity, the model",
+                 "addendum--2026-09-12-third-audit-batch-turn-counter-atomicity-"
+                 "the-model"),
+                ("core/settings.py pays its \u00a71a debt (2026-09-16)",
+                 "coresettingspy-pays-its-1a-debt-2026-09-16")):
+            assert doc._slug(raw) == want, raw
+        # Duplicate numbering is the page-wide rule, and it is NOT "same base
+        # gets -1": a heading whose own slug lands on an anchor already taken is
+        # bumped too (github-slugger's fixtures: echo, echo, echo 1, echo-1,
+        # echo anchor as echo, echo-1, echo-1-1, echo-1-2, echo-2).
+        text = "## echo\n\n## echo\n\n## echo 1\n\n## echo-1\n\n## echo\n"
+        assert [a for _, _, a, _ in doc.anchors(text)] == [
+            "echo", "echo-1", "echo-1-1", "echo-1-2", "echo-2"]
+
+    def test_the_link_checker_reports_exactly_the_dead_links_a_fixture_contains(
+            self, tmp_path):
+        """`ci/link_check.py` is a gate, and a gate nobody can exercise is a gate
+        nobody can weaken without finding out.
+
+        The shape of the risk is specific: this repository is currently CLEAN, so
+        the checker's whole observed behaviour on the real tree is "reports
+        nothing". A checker edited to return `[]`, to stop parsing setext
+        headings, to treat every fragment as valid, or to give up on a file it
+        cannot read would still report nothing here — and would go on reporting
+        nothing until a reader clicked a dead link in a 500 KB ledger. So it is
+        run here against a fixture that deliberately contains one dead link of
+        every class it claims to catch, and the expected verdict is spelled out
+        EXACTLY (file, line, target, reason): a report that gains a class fails
+        as loudly as one that loses it.
+
+        The valid links in the fixture matter as much as the dead ones — a
+        checker that reports everything is as useless as one that reports
+        nothing, and both look identical on a clean tree. The fixture's line
+        numbers are DERIVED from the text rather than written out: a
+        hand-counted expectation keeps describing the test after the file it
+        describes has changed.
+        """
+        checker = _load_module("link_check", HERE / "ci" / "link_check.py")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "other.md").write_text(
+            "# Other\n\n## A real heading here\n\n"
+            "## A real heading here\n",         # the duplicate: -1
+            encoding="utf-8")
+        (tmp_path / "page.py").write_text("# not a doc, but a real file\n",
+                                          encoding="utf-8")
+        page_lines = [
+            "# Title",
+            "## Kept heading",                       # #kept-heading
+            "Setext kept",
+            "==========",                             # #setext-kept
+            '<a id="byhand"></a>',
+            "## Under a hand id",
+            "## Em dash — in the title",             # #em-dash--in-the-title
+            "## Kept {#kramdown-not-real}",          # GitHub reads no id here
+            "",
+            "[ok same file](#kept-heading)",
+            "[ok setext](#setext-kept)",
+            "[ok hand id](#byhand)",
+            "[ok em dash, double hyphen](#em-dash--in-the-title)",
+            "[ok kramdown is just text](#kept-kramdown-not-real)",
+            "[ok cross file](sub/other.md#a-real-heading-here)",
+            "[ok cross file duplicate](sub/other.md#a-real-heading-here-1)",
+            "[ok angle and title](<sub/other.md#a-real-heading-here> 'x')",
+            "[ok plain file](sub/other.md)",
+            "[ok external](https://example.com/nope#frag)",
+            "[ok top of page](#)",
+            "[ok code line anchor](page.py#L1)",
+            "",
+            "[dead absent](#no-such-heading)",
+            "[dead case](#Kept-Heading)",
+            "[dead kramdown id](#kramdown-not-real)",
+            "[dead in other file](sub/other.md#nope)",
+            "[dead missing file](sub/gone.md#x)",
+            "[dead line anchor](#L12)",
+            "[dead escapes the tree](../../etc/passwd#x)",
+            "",
+            "[dead in a definition][d]",
+            "[d]: #also-absent",
+            "",
+            "```",
+            "[fenced, ignored](#no-such-heading)",
+            "## Fenced heading, not a heading",
+            "```",
+        ]
+        text = "\n".join(page_lines) + "\n"
+        (tmp_path / "page.md").write_text(text, encoding="utf-8")
+
+        def line_of(fragment: str) -> int:
+            """Where a line of the fixture sits — derived, never hand-counted.
+
+            Hand-counted line numbers in a fixture are the one part that rots
+            silently: insert a line and the expectations stop describing the
+            file while still describing the test.
+            """
+            for n, line in enumerate(page_lines, 1):
+                if fragment in line:
+                    return n
+            raise AssertionError(f"fixture no longer contains {fragment!r}")
+
+        found = checker.check(tmp_path)
+        # (file, line, target, the reason's opening words)
+        got = {(f, ln, t, why.split()[0]) for f, ln, t, why in found}
+        want = {
+            ("page.md", line_of("[dead absent]"), "#no-such-heading", "no"),
+            ("page.md", line_of("[dead case]"), "#Kept-Heading", "no"),
+            ("page.md", line_of("[dead kramdown id]"),
+             "#kramdown-not-real", "no"),
+            ("page.md", line_of("[dead in other file]"),
+             "sub/other.md#nope", "sub/other.md"),
+            ("page.md", line_of("[dead missing file]"), "sub/gone.md#x", "file"),
+            ("page.md", line_of("[dead line anchor]"), "#L12", "no"),
+            ("page.md", line_of("[dead escapes the tree]"),
+             "../../etc/passwd#x", "points"),
+            ("page.md", line_of("[d]:"), "#also-absent", "no"),
+        }
+        assert got == want, (
+            "the link checker's verdict on a fixture with one dead link of every "
+            f"class differs.\\n  only reported: {sorted(got - want)}\\n"
+            f"  not reported:   {sorted(want - got)}")
+
+        # The half that keeps a report honest, spelled out rather than counted:
+        # every shape the fixture contains, in the order they appear, and NOT
+        # the fenced one. A checker that reports everything, skips a shape, or
+        # reads inside a code block fails here rather than in a 500 KB ledger —
+        # and counting instead of listing would hide a shape that quietly
+        # stopped being seen.
+        want_links = [
+            "#kept-heading", "#setext-kept", "#byhand",
+            "#em-dash--in-the-title", "#kept-kramdown-not-real",
+            "sub/other.md#a-real-heading-here",
+            "sub/other.md#a-real-heading-here-1",     # the duplicate anchor
+            "sub/other.md#a-real-heading-here",       # angle brackets + title
+            "sub/other.md", "https://example.com/nope#frag", "#", "page.py#L1",
+            "#no-such-heading", "#Kept-Heading", "#kramdown-not-real",
+            "sub/other.md#nope", "sub/gone.md#x", "#L12", "../../etc/passwd#x",
+            "#also-absent",                            # the link definition
+        ]
+        assert [t for _ln, t in checker.links(text)] == want_links, (
+            "the set (or order) of links the checker finds in a known document "
+            "has moved: a shape it no longer reads is as much a defect as one "
+            "it starts inventing")
+        assert "Fenced heading, not a heading" not in checker.page_anchors(
+            text), (
+            "a heading inside a fence is not a heading — the ledger generator "
+            "counts 112 sections for a reason")
+
+    def test_the_ledger_indexes_link_to_headings_that_exist(self):
+        """The two append-only ledgers carry a generated index, and a generated
+        index is only better than none if every link RESOLVES.
+
+        GAP_ANALYSIS.md is 106 sections and specs/90-audit.md is 32, both
+        append-only, both read by someone hunting for the one pass that touched
+        their file. The contract is checked against the test's OWN walk of the
+        raw file, not the generator's opinion of itself: a row is right when it
+        links to an anchor the page really has and every `##` section is one
+        click away. That is what catches the two defects this guard was blind
+        to when it compared the generator with its own output (found
+        2026-09-26): wrapped headings — two literal `## ` lines — were joined
+        and slugged as one, an anchor matching NEITHER rendered heading, and a
+        real section starting with a lowercase NAME (`## core/lifecycle.py seam
+        exists ...`) was swallowed whole into the section before it. A wrap is
+        a continuation only when the line directly above it is also a `##`
+        line and its text starts lowercase; both failure directions now degrade
+        toward an extra row whose link works, never toward a dead or missing
+        one. `test_the_index_slugs_match_githubs_own_fixtures` pins what
+        "really has" means. The generator is also run as a COMMAND, because its
+        exit status is half the contract (`ci/doc_index.py --write` is the fix,
+        printed by the failure).
+        """
+
+        def real_headings(lines):
+            """(line index, title) for `##` headings outside code fences — the
+            test's own walk, deliberately not the generator's helper."""
+            out, in_code = [], False
+            for i, line in enumerate(lines):
+                if line.strip().startswith("```"):
+                    in_code = not in_code
+                elif not in_code and line.startswith("## "):
+                    out.append((i, line[3:].strip()))
+            return out
+
+        doc = _load_module("doc_index", HERE / "ci" / "doc_index.py")
+        for rel in ("GAP_ANALYSIS.md", "specs/90-audit.md"):
+            path = HERE / rel
+            text = path.read_text(encoding="utf-8")
+            lines = text.splitlines()
+            assert text.count("<!-- INDEX:BEGIN") == 1, (
+                f"{rel} has lost (or gained) its index block. Re-run "
+                f"`python ci/doc_index.py --write`.")
+            assert text.count("<!-- INDEX:END") == 1, rel
+            block = doc.current(text)
+            listed = [(a, t) for t, a in re.findall(
+                r"^- \[(.*)\]\(#(.*)\)$", block, re.M)]
+            assert listed, f"{rel} parsed to no rows — the guard is vacuous"
+            for anchor, title in listed:
+                assert anchor, f"{rel}: a row has an empty anchor: {title!r}"
+            # Every anchor the page really has — the slug is fixture-pinned, so
+            # this map is ground truth for "the link resolves".
+            page = {i: a for i, _lv, a, _t in doc.anchors(text)}
+            real = set(page.values())
+            dead = sorted({a for a, _t in listed} - real)
+            assert not dead, (
+                f"{rel}: index rows link to headings the page does not have "
+                f"(dead links): {dead[:3]}")
+            # The test's own expectation of the rows, so a swallowed section or
+            # a wrong grouping cannot agree with the generator by construction.
+            expect = []
+            for i, title in real_headings(lines):
+                prev = lines[i - 1] if i else ""
+                if expect and prev.startswith("## ") and title[:1].islower():
+                    expect[-1] = (expect[-1][0], f"{expect[-1][1]} {title}")
+                else:
+                    expect.append((page[i], title))
+            if listed != expect:
+                first = next(
+                    ((l, e) for l, e in zip(listed, expect) if l != e),
+                    (listed[len(expect):] or "<none>",
+                     expect[len(listed):] or "<none>"))
+                raise AssertionError(
+                    f"{rel}: the index has {len(listed)} rows for "
+                    f"{len(expect)} sections — a swallowed section, a spurious "
+                    f"row, or a wrap grouped differently than the raw file. "
+                    f"First difference (index, wanted): {first}")
+        proc = subprocess.run(
+            [sys.executable, str(HERE / "ci" / "doc_index.py")],
+            capture_output=True, text=True, cwd=str(HERE),
+            env=sandbox_env(), timeout=120)
+        assert proc.returncode == 0, (
+            f"ci/doc_index.py exited {proc.returncode} — the ledgers' index "
+            f"has drifted from their headings:\n{proc.stdout}\n{proc.stderr}")
 
     def test_every_line_citation_points_at_a_line_that_exists(self):
         """A citation is `module.py:NNN`; the file and the line must still be there.

@@ -348,6 +348,31 @@ class TestTheDiscoveryFileIsNotOursToTrust:
         assert "JSON" in caught.value.message
         assert bridge.count == 0
 
+    def test_a_file_that_is_not_text_is_refused_and_never_dialled(
+            self, profile, bridge):
+        """Not text is not a broken JSON file; it is a different file.
+
+        `read_text` refuses it with UnicodeDecodeError — a ValueError, not an
+        OSError — so before the `except UnicodeDecodeError` arm in `_load`
+        this walked straight past all ten states and out of the client: none
+        of the four tools' six `except DeskError` handlers saw it, and what
+        the user got was the tool loop's own guard saying the ASSISTANT's
+        check had failed before the tool ran (measured 2026-09-27, a 0600
+        file whose ninth byte is 0xff).
+        """
+        path = _control(profile, port=bridge.port)
+        path.write_bytes(b'{"app": "\xff\xfe not text", "protocol": 1, '
+                         b'"port": 48213, "token": "9f9f"}')
+        os.chmod(path, 0o600)
+        with pytest.raises(_qs.DeskError) as caught:
+            _qs.connect().status()
+        assert caught.value.state == "untrusted", caught.value.state
+        assert "not UTF-8 text" in caught.value.message, caught.value.message
+        assert "JSON" not in caught.value.message, (
+            "a file that is not text must not be reported as bad JSON — it is "
+            "not a JSON file at all")
+        assert bridge.count == 0, "an untrusted file must never be dialled"
+
     def test_a_live_foreign_pid_means_another_app_owns_that_file(
             self, profile, bridge, monkeypatch):
         """`kill(0)` succeeding is ours; PermissionError is someone else's pid."""
@@ -446,6 +471,25 @@ class TestWhatADeskRefusesToBeBuiltFrom:
         with pytest.raises(ValueError) as caught:
             _qs.Desk(["config/control.json"])
         assert "absolute" in str(caught.value)
+
+    def test_one_non_path_in_a_list_is_refused_by_name_too(self, profile,
+                                                           bridge):
+        """The same mistake one spelling in is still the same mistake.
+
+        `Desk(7)` is refused by name, and `Desk([path, 7])` answered with
+        Python's own `argument should be a str or an os.PathLike object…`
+        (measured 2026-09-27) — naming neither what was wanted nor the
+        mistake, and reading like a bug in this module rather than in the
+        call. A list is not a special case.
+        """
+        path = _control(profile, port=bridge.port)
+        with pytest.raises(TypeError) as caught:
+            _qs.Desk([str(path), 7])
+        said = str(caught.value)
+        assert "7" in said and "int" in said, said
+        assert "discovery-file path" in said, said
+        assert _qs.connect().status().get("app") == "quant-space", (
+            "the desk that IS running is still reachable by the right call")
 
     def test_an_empty_path_list_is_refused_not_answered(self):
         """Nothing to try would make every call say 'not running' for ever."""
@@ -707,6 +751,36 @@ class TestShapingAnAnswerForAVoice:
         assert "more than one" in caught.value.message
         assert "api-1" in caught.value.message and "api-2" in caught.value.message
 
+    def test_two_tiles_with_the_same_name_are_still_refused(self):
+        """The confident version of the same refusal, and it had no test.
+
+        Found by measurement rather than by reading: the coverage gate
+        reported `core/qs_desk.py:657` uncovered (2026-09-27), which is the
+        EXACT-name branch — the half-match above is the only one the walk's
+        corpus reaches, because both `raise _ambiguous(...)` sites are hops
+        and a corpus keyed by class name has one entry for them. So a user
+        who said exactly what the desk calls a tile, and was still wrong
+        because two tiles answer to it, was the one shape of this refusal
+        nothing exercised.
+
+        What is pinned is the refusal, not its wording: reading the wrong
+        agent's screen is worse than asking, and that is true whichever
+        branch the ambiguity came from. The CHOICES this sentence lists are
+        the same word twice when the names collide, so the "say which one"
+        it ends with is not yet actionable — that is reported, not pinned
+        here, because the fix is a wording decision about what a person
+        should hear and not a test's to make.
+        """
+        twin = [{"id": "w1_p_1", "name": "claude", "cwd": "/home/u/api"},
+                {"id": "w1_p_2", "name": "claude", "cwd": "/home/u/web"}]
+        with pytest.raises(_qs.DeskError) as caught:
+            _qs.resolve_session(twin, "claude")
+        assert "more than one" in caught.value.message, caught.value.message
+        assert "claude" in caught.value.message
+        # the id is the tie-breaker the caller has, and it must not resolve
+        # silently: a name that is exact is still refused, not guessed
+        assert _qs.resolve_session(twin, "w1_p_2")["id"] == "w1_p_2"
+
     def test_a_name_that_is_gone_lists_what_is_open(self):
         with pytest.raises(_qs.DeskError) as caught:
             _qs.resolve_session(SESSIONS, "ghost")
@@ -868,6 +942,26 @@ class TestTheTools:
         assert text.startswith("Quantum Space is running (v0.5.1)")
         assert "claude in the api folder" in text
         assert [m for m, _p in case.bridge.desk.seen][:2] == ["hello", "desk.status"]
+
+    def test_an_unreadable_control_file_reaches_the_user_as_its_own_sentence(
+            self, case):
+        """The sentence has to arrive, not the loop's excuse for it.
+
+        A discovery file that is not text used to leave the client as a
+        `UnicodeDecodeError`, which no `except DeskError` in these tools
+        catches — so the user heard the tool loop report that the
+        ASSISTANT's own check had failed before the tool ran, which is a
+        different and wrong story about a desk that was sitting right there.
+        """
+        case.control.write_bytes(b'{"app": "\xff\xfe", "protocol": 1}')
+        os.chmod(case.control, 0o600)
+        text, err = case.run("quant_space_status")
+        assert err, text
+        assert text.startswith("ERROR:"), text
+        assert "not UTF-8 text" in text, text
+        assert "could not be evaluated" not in text, (
+            "the assistant's check did not fail — the desk's file was not "
+            f"text, and that is what the user has to be told: {text}")
 
     def test_sessions_gives_the_model_the_ids_it_has_to_hand_back(self, case):
         text, err = case.run("quant_space_sessions")

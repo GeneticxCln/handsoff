@@ -250,13 +250,16 @@ def _read_fetch(url: str, timeout: float, connect_to=None) -> tuple:
         try:
             target = urllib.parse.urljoin(current, location)
         except ValueError:
+            # refusal: redirect_to_an_unusable_address
             return b"", current, (f"{current} redirected to {location!r}, which "
                                   f"is not a usable address")
         clean, pins, problem = _public_target(target)
         if problem:
+            # refusal: redirect_to_a_refused_address
             return b"", current, (f"{current} redirected to {target}, which is "
                                   f"not fetched: {problem}")
         current = clean
+    # refusal: too_many_redirects
     return b"", current, (f"{url} redirected more than {MAX_REDIRECTS} times — "
                           f"refused rather than followed")
 
@@ -833,23 +836,30 @@ def _public_target(url: str) -> tuple:
     """
     raw = str(url or "").strip()
     if not raw:
+        # refusal: ssrf_no_address
         return "", [], "no address given"
     if not re.match(r"^https?://", raw, re.I):
+        # refusal: ssrf_not_an_http_address
         return "", [], f"{raw!r} is not an http(s) address"
     try:
         parts = urllib.parse.urlsplit(raw)
     except ValueError:
+        # refusal: ssrf_not_a_usable_address
         return "", [], f"{raw!r} is not a usable address"
     host = (parts.hostname or "").strip()
     if not host:
+        # refusal: ssrf_no_host
         return "", [], "the address has no host"
     if parts.username or parts.password:
+        # refusal: ssrf_address_carries_credentials
         return "", [], "addresses with credentials are not fetched"
     if _is_private_ip(host):
+        # refusal: ssrf_private_network
         return "", [], f"{host} is on this machine or a private network"
     if (host.casefold() == "localhost" or host.casefold().endswith(".local")
             or host.casefold().endswith(".internal")
             or host.casefold().endswith(".home.arpa") or "." not in host):
+        # refusal: ssrf_not_a_public_host
         return "", [], f"{host} is not a public host"
     # `urlsplit` defers the port check to the `.port` property, which RAISES on
     # anything outside 0-65535 or non-numeric — and this is a model-supplied
@@ -859,15 +869,18 @@ def _public_target(url: str) -> tuple:
     try:
         port = parts.port or (443 if parts.scheme == "https" else 80)
     except ValueError:
+        # refusal: ssrf_port_is_not_a_number
         return "", [], (f"{raw!r} has a port that is not a number between 0 "
                          f"and 65535")
     infos, problem = _resolve_host(host, port)
     if problem:
         return "", [], problem
     if not infos:
+        # refusal: ssrf_host_has_no_address
         return "", [], f"{host} has no address"
     for info in infos:
         if _is_private_ip(str(info[4][0])):
+            # refusal: ssrf_name_resolves_private
             return "", [], (f"{host} resolves to a private address "
                             f"({info[4][0]})")
     pins = [(str(info[4][0]), info[4][1]) for info in infos]
@@ -941,15 +954,18 @@ def read_page(url: str, max_chars: int = READ_MAX_CHARS) -> tuple:
         raw, _final, hop_problem = _read_fetch(JINA_READER + clean, READ_TIMEOUT)
         if hop_problem:
             _record(_READER_SEEN, "jina", False, hop_problem)
+            # refusal: read_page_reader_hop_refused
             return "", "", (f"{hop_problem}; local fetch: {local_why}")
         body = raw.decode("utf-8", "replace")
     except Exception as exc:
         _record(_READER_SEEN, "jina", False, _reason(exc))
+        # refusal: read_page_nothing_readable
         return "", "", (f"nothing readable at {clean} — local fetch: {local_why}; "
                          f"the third-party reader failed too ({_reason(exc)})")
     blocked = _antibot(body)
     if blocked:
         _record(_READER_SEEN, "jina", False, blocked[0])
+        # refusal: read_page_blocked_by_the_site
         return "", "", (f"the site refuses automated readers ({blocked[0]}); "
                          f"local fetch: {local_why}")
     _record(_READER_SEEN, "jina", True)

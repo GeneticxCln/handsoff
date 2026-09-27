@@ -47,11 +47,27 @@ def _assistant(H, monkeypatch, state="idle", handsfree=False):
 @pytest.fixture()
 def quiet_box(H, monkeypatch):
     """No GPU binary, generous disk: the tick stays fully quiet."""
-    monkeypatch.setattr(H.shutil, "which", lambda name: None)
+    _no_gpu(H, monkeypatch)
     monkeypatch.setattr(H._hardware, "disk_free",
                         lambda path="/": {"ok": True, "total": 10 ** 12,
                                           "free": 100 * 2 ** 30})
     return H
+
+
+def _no_gpu(H, monkeypatch):
+    """Make the tick's own GPU probe unreachable.
+
+    `_hardware_tick` calls `shutil.which("nvidia-smi")` every tick and shells
+    out for a VRAM reading on every 2nd one, so a test that fakes the disk and
+    the audio TTL but leaves that alone is reading the HOST'S REAL CARD. The
+    tick counter is incremented before the parity check, so the query lands on
+    the 2nd tick of a test — exactly the tick a two-strike rule wants to be
+    the only thing speaking. Measured on the box that recorded this (RTX 4060
+    Ti): with the card at 91% the mic-dead tests announced "GPU memory at
+    91%" and four of them failed. `TestCrossings` has always stubbed `which`
+    for exactly this reason; the mic tests had no such stub.
+    """
+    monkeypatch.setattr(H.shutil, "which", lambda name: None)
 
 
 class TestOff:
@@ -230,7 +246,8 @@ class TestMicDead:
 
     def _silent(self, H, monkeypatch, device="Blue Yeti"):
         a, said, popped = _assistant(H, monkeypatch)
-        monkeypatch.setattr(H._hardware, "disk_free",
+        _no_gpu(H, monkeypatch)      # see _no_gpu: otherwise this class
+        monkeypatch.setattr(H._hardware, "disk_free",   # reads the real card
                             lambda path="/": {"ok": True, "total": 10 ** 12,
                                                "free": 100 * 2 ** 30})
         a._listener = types.SimpleNamespace(
@@ -307,10 +324,48 @@ class TestMicDead:
     def test_exploding_snapshot_never_raises(self, H, watch_settings,
                                              monkeypatch):
         a, said, popped = _assistant(H, monkeypatch)
-        a._listener = types.SimpleNamespace(
+        _no_gpu(H, monkeypatch)      # one tick is odd, so the query is not
+        a._listener = types.SimpleNamespace(  # the only thing saving this
             mic_snapshot=lambda: (_ for _ in ()).throw(RuntimeError("boom")))
         a._hardware_tick()
         assert said == [] and popped == []
+
+    def test_a_full_card_cannot_mute_the_deaf_mic(self, H, watch_settings,
+                                                 monkeypatch):
+        """The alert the app cannot self-heal must outrank the one it can.
+
+        The nvidia-smi probe sits ABOVE the mic rules in `_hardware_tick` and
+        every urgent site used to say `urgent = urgent or ...`, so the first
+        writer took the floor. On the host that recorded this (RTX 4060 Ti at
+        91% VRAM) the tick spoke "GPU memory at 91%", the mic-dead line lost
+        the `or` — and since `last["mic_dead"]` latches the moment the
+        condition is seen, the deafness never announced again for the whole
+        episode. Two things are pinned here: the mic keeps its tick, and the
+        card's notice is DEFERRED, not destroyed.
+        """
+        class _NvidiaSmi:
+            stdout = "95, 100\n"
+
+        a, said, popped = self._silent(H, monkeypatch)
+        monkeypatch.setattr(H.shutil, "which",
+                            lambda name: "/usr/bin/nvidia-smi")
+        monkeypatch.setattr(H.subprocess, "run", lambda *a, **k: _NvidiaSmi())
+        a._hardware_tick()                    # strike 1: odd, no query yet
+        assert said == [] and popped == []
+        a._hardware_tick()                    # strike 2: the card is at 95%
+        assert len(said) == 1 and len(popped) == 1
+        assert "Blue Yeti" in said[0] and "silence" in said[0]
+        assert a._hardware_last["mic_dead"] is True
+        # the card lost the floor, so it must still be armed: a latch that
+        # means "seen once" drops the notice until the card drains
+        assert not a._hardware_last.get("vram_alerted")
+        a._hardware_tick()                    # still dead: the mic holds
+        assert len(said) == 1                  # the latch, and adds nothing
+        a._hardware_last_urgent = 0.0          # cooldown expired, as in
+        a._hardware_tick()                    # test_recovery_rearms_with_a_note
+        assert len(said) == 2 and len(popped) == 2
+        assert said[1].startswith("GPU memory at 95%"), said
+        assert a._hardware_last["vram_alerted"] is True
 
 
 class TestRobustness:

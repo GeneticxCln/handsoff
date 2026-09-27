@@ -1229,11 +1229,21 @@ class TestAuditNineFindings:
         assert executed == [], "interpreter spawn reached subprocess!"
 
     def test_1_spawn_legit_app_still_works(self, H, monkeypatch):
-        """Legitimate GUI spawn must keep working through the basename check."""
+        """Legitimate GUI spawn must keep working through the basename check.
+
+        The `which` stub answers per PROGRAM rather than for everything: the
+        allowlist also judges a command NAMED BY PATH by identity, and a stub
+        that returns the terminal for any question cannot answer that one
+        honestly. It used to blanket-return alacritty, which is what a real
+        `which` never does, and the interaction only surfaced once the
+        identity check started asking.
+        """
         monkeypatch.setattr(H.subprocess, "run",
                             lambda argv, **kw: type("R", (), {
                                 "returncode": 0, "stdout": "", "stderr": ""})())
-        monkeypatch.setattr(H.shutil, "which", lambda p: "/usr/bin/alacritty")
+        monkeypatch.setattr(
+            H.shutil, "which",
+            lambda p: f"/usr/bin/{p}" if p in ("alacritty", "niri") else None)
         belt = H.ToolBelt(on_restart_pending=lambda: None)
         out, err = belt.execute(
             "run_command", {"command": "/usr/bin/niri msg action spawn -- alacritty"})

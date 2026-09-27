@@ -183,6 +183,13 @@ PTT_READ_ONLY = frozenset({"status", "health", "level", "doctor",
 MIC_EVENTS_FILE = STATE_DIR / "mic-health.json"   # mic transitions + last briefing
 MIC_EVENTS_MAX = 200                              # hard cap on recorded transitions
 _MIC_EVENTS_LOCK = threading.Lock()   # both writers are read-modify-write
+# The state-hygiene ledger is its OWN read-modify-write, on its OWN file, and
+# for a while it borrowed the mic-events lock above. That was correct only by
+# accident of sharing: the lock's name and its comment both describe mic-health,
+# so the day someone tidies the name the hygiene writer loses its mutual
+# exclusion silently and two readings interleave into a corrupt ledger. Named
+# for what it guards, so the two invariants stay legible separately.
+_HYGIENE_LOG_LOCK = threading.Lock()
 # Self-watch findings: what the sampler saw and when, so a death or wedge is
 # still diagnosable after the process that saw it is gone (the same reasoning
 # as the cap-refusals file).
@@ -2446,7 +2453,7 @@ def _record_state_hygiene() -> bool:
             "entries": int(info.get("entries") or 0),
             "swept": int(_LAST_SWEEP.get("removed") or 0),
         }, sort_keys=True)
-        with _MIC_EVENTS_LOCK:
+        with _HYGIENE_LOG_LOCK:
             try:
                 lines = _state_hygiene_log().read_text(
                     encoding="utf-8").splitlines()
@@ -2540,7 +2547,7 @@ def _state_hygiene_line() -> str:
         parts.append(f"{STATE_HYGIENE_TREND_DAYS}-day trend "
                      f"{_fmt_delta(float(trend.get('size_delta') or 0))}, "
                      f"{_signed(delta)} entr{'y' if abs(delta) == 1 else 'ies'}")
-    return f"state: " + "; ".join(parts)
+    return "state: " + "; ".join(parts)
 
 
 def _prepare_runtime() -> bool:
@@ -4075,7 +4082,7 @@ Useful examples:
 - Media: playerctl play-pause, playerctl next, playerctl previous
 - Brightness: brightnessctl set 30%
 - Windows: niri msg action focus-window-right, focus-window-left, focus-workspace-down, focus-workspace-up, move-window-right, toggle-window-floating, maximize-column, overview
-- Launch an app: niri msg action spawn -- alacritty
+- Launch an app: open_app (any installed app by name, and it waits for the window). niri msg action spawn -- <app> also opens GUI apps, but only from a short fixed list and only bare, with no arguments.
 Never attempt destructive or unsafe commands (sudo, rm, pacman, shutdown, ...). If a request is unsafe, refuse politely in one short sentence.
 - Long builds: start_command = background job; poll job_status; finish announced. Same whitelist as run_command.
 - handsoff_doctor self-reports hashes/Ollama/mic/niri/systemd. "CONFIRM REQUIRED": NEXT turn confirm_action. "DRY-RUN": nothing ran.
@@ -6355,7 +6362,9 @@ class ContinuousListener:
                 self._stream, rate = _open_input(
                     device, SAMPLE_RATE, self.FRAME, cb)
                 _start_stream_owned(self._stream)
-            except Exception as e:
+            except Exception:
+                # log.exception below reports it; binding the error here would
+                # only add a name ruff then flags as unused
                 open_failures += 1
                 self._health_opens_failed += 1
                 if self._health_failing_since is None:
@@ -7158,6 +7167,35 @@ class Assistant(QObject):
             self._hardware_tick_n = self._hardware_tick_n + 1
             notes: list = []
             urgent: str | None = None
+            urgent_rank: int = 0
+            urgent_latch: str = ""
+            # -- ONE line per tick, but WHICH line is a severity question, not
+            # a source-order question. Every site used to say
+            # `urgent = urgent or ...`, so the first writer took the floor and
+            # the nvidia-smi probe sits ABOVE the mic rules in this function.
+            # Measured on an RTX 4060 Ti host sitting at 91% VRAM: the tick
+            # spoke "GPU memory at 91%", latched last["vram_alerted"] (so the
+            # GPU never offers that urgent again while it stays full), and the
+            # mic-dead line was swallowed by the `or` — while
+            # last["mic_dead"] had ALREADY latched True a few lines above, so
+            # the one alert the app cannot recover from by itself never
+            # announced again for the whole episode. The assistant was deaf
+            # and had said so. Ranks are explicit now: a mic it cannot hear
+            # (30) outranks a brain that is down (20), which outranks
+            # resource pressure the doctor can also show you (10). A tie
+            # keeps the earlier writer, so every single-cause tick still
+            # speaks byte-identical text. With the mic on top, the mic's own
+            # latch can only ever be consumed by another mic alert — which
+            # is the right thing to have swallowed it. `latch` names the
+            # `last[]` key a line owns, and it is set when the line is
+            # actually SPOKEN, not when the condition is seen: a notice that
+            # lost the floor (or met a live cooldown) stays armed and speaks
+            # on a later tick instead of being dropped for as long as its
+            # condition holds.
+            def _raise(rank: int, text: str, latch: str = "") -> None:
+                nonlocal urgent, urgent_rank, urgent_latch
+                if urgent is None or rank > urgent_rank:
+                    urgent, urgent_rank, urgent_latch = text, rank, latch
             # -- mic: consume the listener state machine, never duplicate it
             try:
                 mic = self._listener.mic_snapshot()
@@ -7168,8 +7206,8 @@ class Assistant(QObject):
             if prev_mic is not None and cur_mic != prev_mic:
                 if (self._handsfree and cur_mic[0] == "open-failing"
                         and prev_mic[0] != "open-failing"):
-                    urgent = (f"Microphone failed ({cur_mic[1]}): "
-                              "hands-free is deaf")
+                    _raise(30, f"Microphone failed ({cur_mic[1]}): "
+                               "hands-free is deaf")
                 else:
                     notes.append(f"Mic: {prev_mic[0]} → {cur_mic[0]} "
                                  f"({cur_mic[1]})")
@@ -7205,8 +7243,8 @@ class Assistant(QObject):
                 if free_gb < disk_gb:
                     if not last.get("disk_low"):
                         last["disk_low"] = True
-                        urgent = urgent or (f"Disk critically low: "
-                                            f"{free_gb:.1f} GiB free")
+                        _raise(10, f"Disk critically low: "
+                                   f"{free_gb:.1f} GiB free")
                 else:
                     if last.get("disk_low"):
                         notes.append(f"Disk recovered: {free_gb:.1f} GiB free")
@@ -7255,8 +7293,12 @@ class Assistant(QObject):
                     vlim = 90.0
                 if gpu_util >= vlim:
                     if not last.get("vram_alerted"):
-                        last["vram_alerted"] = True
-                        urgent = urgent or (f"GPU memory at {gpu_util:.0f}%")
+                        # armed, not announced: `vram_alerted` is set at the
+                        # moment this line is SPOKEN, so losing the floor to
+                        # the mic defers the notice one tick instead of
+                        # losing it until the card drains below the limit
+                        _raise(10, f"GPU memory at {gpu_util:.0f}%",
+                               "vram_alerted")
                 else:
                     last["vram_alerted"] = False
             # -- Ollama flip from TTL cache only; 2 consecutive fresh-cache
@@ -7273,13 +7315,13 @@ class Assistant(QObject):
                     if last["ollama_miss"] >= 2 \
                             and not last.get("ollama_down"):
                         last["ollama_down"] = True
-                        urgent = urgent or "Ollama is down: voice brain offline"
+                        _raise(20, "Ollama is down: voice brain offline")
             # -- mic count via TTL-10 audio (peek only, never forced)
             audio = _fresh("audio")
             if isinstance(audio, dict) and self._handsfree \
                     and audio.get("ok") and not audio.get("count") \
                     and last.get("audio_count"):
-                urgent = urgent or "Microphone unplugged: no input devices"
+                _raise(30, "Microphone unplugged: no input devices")
             if isinstance(audio, dict) and audio.get("count") is not None:
                 last["audio_count"] = audio.get("count")
             # -- mic dead: the device OPENS but yields nothing. Two shapes
@@ -7313,9 +7355,8 @@ class Assistant(QObject):
                     tail = (f"Switch me to {backup} in settings."
                             if backup else
                             "No other input device is visible.")
-                    urgent = urgent or (
-                        f"My microphone ({dev}) {why} — I cannot hear "
-                        f"you. {tail}")
+                    _raise(30, f"My microphone ({dev}) {why} — "
+                               f"I cannot hear you. {tail}")
             else:
                 if last.get("mic_dead"):
                     notes.append("Microphone is producing audio again")
@@ -7331,6 +7372,8 @@ class Assistant(QObject):
                     cd = 3600.0
                 if _announce_ok(self._hardware_last_urgent, cd):
                     self._hardware_last_urgent = time.monotonic()
+                    if urgent_latch:
+                        last[urgent_latch] = True
                     log.warning("hardware watch: %s", urgent)
                     notify(urgent)
                     if self.state != SPEAKING:
@@ -8880,6 +8923,55 @@ class Assistant(QObject):
                 + list(self._history)
                 + [{"role": "user", "content": injected + user_content}])
 
+    def _tool_result_entry(self, tc: dict) -> dict:
+        """ONE tool call, as the message the model will read.
+
+        A tool that fails is a MESSAGE here, not the end of the turn.
+        `ToolBelt.execute` already turns a raising tool BODY into an error
+        string, and the belt now turns its own decision path into one too, so
+        what is left for this to catch is the belt raising where no handler
+        was — and the argument handling, which is where the second measured
+        escape was: the log line sorted the RAW parsed arguments, so three
+        ordinary answers from a model raised out of `sorted()` and lost the
+        turn before any tool was called (measured 2026-09-26):
+        `"arguments": "[{\\"a\\": 1}, {\\"b\\": 2}]"` ('<' not supported between
+        instances of 'dict' and 'dict'), `"[7]"` ('int' object is not
+        iterable), `"7"` (same). A ONE-element array happened to survive —
+        sorting a one-item list never compares — which is why this sat
+        unnoticed. Arguments are normalised to a dict FIRST now, which is
+        what the call below did with them anyway.
+
+        `except Exception`, never `BaseException`: a shutdown signal still has
+        to shut the app down, and this is not the place to swallow one.
+        """
+        fn = tc.get("function") or {}
+        name = fn.get("name", "")
+        args = fn.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if not isinstance(args, dict):
+            log.info("tool call: %s (arguments were %s, not an object)",
+                     name, type(args).__name__)
+            args = {}
+        log.info("tool call: %s (argument names=%s)", name, sorted(args))
+        try:
+            result, _err = self._tools.execute(name, args)
+        except Exception:
+            log.exception("tool %s raised out of the belt", name)
+            result = (f"ERROR: the assistant failed while running the {name} "
+                      "tool — its own check raised before the tool reported "
+                      "anything. The traceback is in the log; do not retry "
+                      "this call unchanged.")
+        entry = {"role": "tool", "tool_name": name, "content": result}
+        if self._tools._last_images:
+            entry["images"] = self._tools._last_images
+            log.info("attaching %d screenshot(s) to tool result",
+                     len(entry["images"]))
+        return entry
+
     def _brain_turn(self, text: str, gen: int, cancel: threading.Event) -> None:
         set_turn = getattr(self._tools, "_set_user_turn", None)
         if set_turn is not None:
@@ -9039,20 +9131,7 @@ class Assistant(QObject):
             for tc in tool_calls:
                 if cancel.is_set():
                     return
-                fn = tc.get("function") or {}
-                name = fn.get("name", "")
-                args = fn.get("arguments") or {}
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
-                log.info("tool call: %s (argument names=%s)", name, sorted(args))
-                result, _err = self._tools.execute(name, args if isinstance(args, dict) else {})
-                entry = {"role": "tool", "tool_name": name, "content": result}
-                if self._tools._last_images:
-                    entry["images"] = self._tools._last_images
-                    log.info("attaching %d screenshot(s) to tool result", len(entry["images"]))
+                entry = self._tool_result_entry(tc)
                 conversation.append(entry)
                 if getattr(self._tools, "_last_confirmation_offer", False):
                     stop_tool_loop = True

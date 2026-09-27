@@ -33,7 +33,6 @@ import tempfile
 import threading
 import time
 import urllib.request
-import wave
 from datetime import datetime as _dt
 from pathlib import Path
 

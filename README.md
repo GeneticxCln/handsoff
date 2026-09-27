@@ -38,7 +38,7 @@ voice clip you pick. Everything runs on your machine.
 
 All tools are declared in one place (`@tool`-decorated methods in
 `handsoff.py`); schemas, the system prompt, and permissions stay in sync
-automatically. 2292 tests pin the behavior (`python -m pytest tests/`),
+automatically. 2360 tests pin the behavior (`python -m pytest tests/`),
 split by area: audio, policy, desktop, calendar, settings, lifecycle,
 regression, ops, and fault injection — including offscreen-Qt scenarios that
 drive the settings GUI itself.
@@ -656,16 +656,21 @@ you would rather know before pushing:
 ```bash
 bash ci/gates.sh                        # every gate, in CI's order (~10 min)
 bash ci/gates.sh --no-order             # skip the two ordering re-runs (~5 min)
-bash ci/gates.sh shell compile smoke    # only the fast gates (seconds)
+bash ci/gates.sh shell compile lint links smoke   # only the fast gates (seconds)
 ```
 
 Each gate is the pipeline's job, run against your own interpreter and the
 dependencies the bubble already uses (it installs nothing):
 
 ```bash
-python -m pytest tests/ -q              # 2292 tests
+python -m pytest tests/ -q              # 2360 tests
 python -m py_compile handsoff.py handsoff-settings.py
 bash -n install.sh
+
+# Every markdown anchor link in the docs resolves to a real heading. A heading
+# link is the one link that fails silently: rename a heading and nothing
+# complains, the reader clicks and nothing happens.
+python ci/link_check.py
 
 # Re-run in a different order — the suite must not care what order it runs in.
 # Seeded and reproducible: the seed is printed in the run header and summary.
@@ -683,7 +688,7 @@ nothing is broken:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70     # 2292 tests, 83.7%
+  --cov-report=term-missing --cov-fail-under=70     # 2360 tests, ~85% measured, floor 70
 ```
 
 The suite is self-contained: it imports the bubble against a throw-away
@@ -707,16 +712,21 @@ banner prints.
 
 CI (`.github/workflows/ci.yml`, mirrored gate-for-gate in `.gitlab-ci.yml` for
 the GitLab remote) runs exactly these gates on every push: the suite on
-Python 3.12 and 3.13 (offscreen Qt, no audio hardware needed), a coverage
+Python 3.12, 3.13 and 3.14 (offscreen Qt, no audio hardware needed), a coverage
 floor job, an ordering-dependence probe (the suite re-run with the tests
 shuffled, then with only the file order shuffled), byte-compilation of every
-source file, shell syntax checks with supply-chain pin guards, and an installer
-smoke test. Background-thread exceptions fail the run via `pytest.ini` rather
-than passing silently. Every shell script is checked by SHEBANG rather than by a
-list or an extension glob — the two workflows' lists had already drifted apart,
-and `handsoff-restart` has no extension to glob. The same gates run locally as
-`bash ci/gates.sh`: the pipeline is a finite resource, and a gate that cannot
-run is not a gate.
+source file, a **lint job** (ruff, rule set pinned in `ruff.toml` — it was
+added because a tree this size with no linter makes an unused import, a
+shadowed name and a `zip()` that silently drops a row all look like style, and
+all three were present), shell syntax checks with supply-chain pin guards, and
+an installer smoke test. Background-thread exceptions fail the run via
+`pytest.ini` rather than passing silently. Every shell script is checked by
+SHEBANG rather than by a list or an extension glob — the two workflows' lists
+had already drifted apart, and `handsoff-restart` has no extension to glob. The
+same gates run locally as `bash ci/gates.sh`: the pipeline is a finite resource,
+and a gate that cannot run is not a gate. `lint` SKIPs with an install hint
+when ruff is absent, because a gate that passes because it never ran is the
+failure this script exists to avoid.
 
 **When the pipeline goes red, read the summary before the log.** Each suite job
 writes a junit report (GitLab's native *Test summary* tab and merge-request test

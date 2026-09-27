@@ -5,12 +5,10 @@ object whose attributes provide settings, paths, callbacks, and I/O helpers.
 """
 from __future__ import annotations
 
-import ast as _ast
 import base64
 import datetime
 import difflib
 import fnmatch
-import functools
 import inspect
 import json
 import logging
@@ -177,8 +175,11 @@ _DEFAULT_DEPS.SELF_PATH = SELF_PATH
 _DEFAULT_DEPS.SELF_MARKER = SELF_MARKER
 
 # Host replacements (notably H.subprocess in tests) remain visible through DI.
+# The module-level name is REPLACED by a proxy on purpose — that is the seam
+# every test reaches through — so the "unused import" ruff sees is the
+# dependency being injected, not a leftover.
 import subprocess as _subprocess
-subprocess = _InjectedProxy(_subprocess)
+subprocess = _InjectedProxy(_subprocess)  # noqa: F811
 def _belt_tools():
     """Every decorated tool on the belt, once each — the ONE walk.
 
@@ -496,7 +497,7 @@ class BoundedJob:
         rc = self.proc.returncode
         return f'job {self.id}: finished, exit code {rc} ({elapsed:.0f}s) — {self.command}'
 
-def tool(func=None, *, name=None, gates=None, aliases=None, description=None, required=None):
+def tool(func=None, *, name=None, gates=None, aliases=None, description=None, required=None, raises=()):
     """Mark a ToolBelt method as an AI-callable tool.
 
     The Ollama JSON schema is generated automatically from the function's
@@ -512,6 +513,17 @@ def tool(func=None, *, name=None, gates=None, aliases=None, description=None, re
     aliases:     {param: (alt names...)} small models sometimes emit
     description: pinned model-facing description (default: docstring para 1)
     required:    override required-params list (default: params w/o defaults)
+    raises:      the exception TYPES this body raises ON PURPOSE, to refuse a
+                 call in words the tool itself wrote — one class or a tuple
+                 of them (`core.qs_desk.DeskError`). The dispatch hands a
+                 declared one to the model as the refusal it is; anything else
+                 is a BUG in the tool and is reported as one. Empty — the
+                 default — is the claim "my body does not raise", and a class
+                 generic enough to also mean a bug (RuntimeError, ValueError,
+                 OSError, Exception) is NOT a contract and must not be
+                 declared: declaring it would turn every crash in that tool
+                 into a polite refusal. What the contract MEANS is enforced by
+                 `TestTheToolsExceptionContract`.
     """
 
     def wrap(f):
@@ -521,6 +533,11 @@ def tool(func=None, *, name=None, gates=None, aliases=None, description=None, re
         f._tool_aliases = dict(aliases or {})
         f._tool_description = description
         f._tool_required = required
+        # one class or several: `raises=DeskError` is what a tool with a
+        # single refusal class should read like, and making it a tuple here
+        # means nothing downstream has to ask which it was given
+        f._tool_raises = ((raises,) if isinstance(raises, type)
+                          else tuple(raises or ()))
         return f
     return wrap(func) if func else wrap
 
@@ -578,6 +595,36 @@ def _flag_names(tok: str) -> tuple[str, ...]:
     return tuple(name)
 
 
+def _first_verb(argv: list, long_value: frozenset, short_value: frozenset) -> tuple:
+    """`(index, token)` of the first argument that is a VERB, not an option.
+
+    A sub-command gate that looks at `argv[1]` reads an OPTION's value as the
+    verb, and then a gate keyed on the verb is keyed on a format name. All
+    three spellings of a value are handled because all three were measured on
+    pactl 2026-09-26: attached (`pactl -fjson get-default-sink`), after `=`
+    (`--format=json get-default-sink`) and separated (`-f json
+    get-default-sink`) all return the sink, so a `-f json` prefix must not
+    make `json` look like the verb. A long option's own `=` value needs no
+    state — the token ends there — while a short one arms a slot that the NEXT
+    token fills, exactly as a short option followed by a value does.
+    """
+    want_value = False
+    for i, tok in enumerate(argv[1:], 1):
+        if want_value:
+            want_value = False
+            continue
+        if tok.startswith('--'):
+            want_value = tok in long_value
+            continue
+        if tok.startswith('-'):
+            body = tok[1:]
+            slot = next((j for j, c in enumerate(body) if c in short_value), None)
+            want_value = slot is not None and slot == len(body) - 1
+            continue
+        return (i, tok)
+    return (None, '')
+
+
 def _flag_values(tok: str) -> tuple[str, ...]:
     """What an argument carries BEHIND its leading dash that could name a path.
 
@@ -595,10 +642,25 @@ def _flag_values(tok: str) -> tuple[str, ...]:
     return (tok.split('=', 1)[1],)
 
 
+#: `/proc` is the one filesystem where the interesting content is GENERATED
+#: rather than stored, so a rule about file NAMES has nothing to match. The name
+#: `environ` is a kernel interface that answers with a copy of a process's
+#: environment, and `cmdline` answers with its arguments — where a single token
+#: is routinely a credential (`psql postgres://user:pass@host`, `curl -H
+#: 'Authorization: Bearer …'`). Both are readable by their owner, and `ps` is
+#: whitelisted, so a pid can be listed and then read. Measured 2026-09-26:
+#: `cat /proc/self/environ` and `cat /proc/1234/environ` were ACCEPTED.
+#: Resolving cannot help here — there is no path to follow; the bytes are
+#: synthesised on open, which is also why a symlink cannot redirect this rule
+#: and a deny-by-name rule is the only shape that can.
+_PROC_GENERATED_SECRETS = ("environ", "cmdline")
+
+
 def _secret_reason(p: Path) -> str | None:
     """Why THIS path is one of the denied stores, judged by name and place."""
     for anc in p.parents:
         if anc.name.lower() in _SECRET_DIRS:
+            # refusal: secret_by_directory
             return f"{anc.name}/ holds credentials or key material"
     try:
         rel = p.relative_to(Path.home()).as_posix().strip("/").lower()
@@ -606,12 +668,22 @@ def _secret_reason(p: Path) -> str | None:
         rel = ""
     for d in _SECRET_DIRS:
         if rel == d or rel.startswith(d + "/"):
+            # refusal: secret_by_home_prefix
             return f"~/{d}/ holds credentials or key material"
     name = p.name.lower()
+    if (len(p.parts) >= 3 and p.parts[0] == p.anchor and p.parts[1] == "proc"
+            and name in _PROC_GENERATED_SECRETS):
+        # refusal: secret_generated_by_the_kernel
+        return (f"/proc/*/{name} is a live process's environment/command line — "
+                f"the kernel GENERATES it on open, so it hands over every "
+                f"secret that process was given, and no path rule can see it "
+                f"because there is no file to resolve")
     if name in _SECRET_FILES:
+        # refusal: secret_by_file_name
         return f"{p.name} is a credential or shell-history file"
     for pat in _SECRET_GLOBS:
         if fnmatch.fnmatch(name, pat):
+            # refusal: secret_by_credential_pattern
             return f"{p.name} matches the credential pattern {pat!r}"
     return None
 
@@ -903,6 +975,148 @@ class ToolBelt:
     # Flags, not verbs: a read verb plus one of these is a WRITE.
     _GIT_DELETE_FLAGS = {'d', 'D', 'delete'}
     _GIT_WRITE_FLAGS = {'output'}
+    # `remote` is a noun, not a verb, so `_GIT_READ` used to hand it the whole
+    # sub-command set: `remote add`, `set-url`, `remove`, `rename` and `prune`
+    # all WRITE .git/config. `set-url` is the sharp one — repointing `origin`
+    # at another URL turns every LATER pull or push the USER runs in a
+    # terminal into a fetch from whoever wrote that URL, and nothing in the
+    # assistant's own session would look unusual afterwards. Only the two
+    # sub-verbs that print stay; a bare `git remote` (and `-v`) is the listing
+    # form and is what the setting was actually wanted for.
+    _GIT_REMOTE_READ = {'show', 'get-url'}
+    # Whitelisting a PROGRAM is not whitelisting its verbs, and pactl is the
+    # next one after git to need saying out loud. `pactl --help` lists 26
+    # sub-commands; the read ones and the volume/mute family are the
+    # assistant's business (`handsoff.py` tells the model to use
+    # `pactl set-sink-volume @DEFAULT_SINK@ -10%`, and README documents
+    # `pactl list sources short`), and the remaining twelve change the machine:
+    # load/unload-module, exit, send-message, the three sample verbs,
+    # suspend-sink/source, set-card-profile, set-sink-formats and
+    # set-port-latency-offset. An ALLOW-list, not a deny-list, for the same
+    # reason `_GIT_READ` is one: a deny-list is correct until the next release
+    # adds a verb, and the failure mode of missing that is a silent write.
+    # `list-sinks`/`list-sources`/`list-cards`/`get-card-profile`/
+    # `get-sink-formats` are the NEWER pactl spellings of the same reads (this
+    # host's pactl 17.0-98 still spells them `list short sinks`); they are
+    # allowed so
+    # the gate does not refuse a read on a newer server, and the cost if that
+    # is wrong is a refusal of something this host's pactl would have rejected
+    # anyway — it answers "No valid command specified." and still exits 0.
+    _PACTL_OK = frozenset({
+        # reads
+        'info', 'list', 'stat', 'subscribe', 'help', 'get-default-sink',
+        'get-default-source', 'get-sink-volume', 'get-sink-mute',
+        'get-source-volume', 'get-source-mute',
+        'list-sinks', 'list-sources', 'list-cards', 'get-card-profile',
+        'get-sink-formats',
+        # the volume/mute family, which IS the feature
+        'set-sink-volume', 'set-source-volume', 'set-sink-input-volume',
+        'set-source-output-volume', 'set-sink-mute', 'set-source-mute',
+        'set-sink-input-mute', 'set-source-output-mute', 'set-default-sink',
+        'set-default-source', 'set-sink-port', 'set-source-port',
+        'move-sink-input', 'move-source-output',
+        # the older spellings of the same two, which are also real verbs in
+        # older pulseaudio: an allow-list may hold a name this host does not
+        # have, because pactl then answers "No valid command specified." and
+        # changes nothing — the reverse mistake is the one that costs
+        'move-sink-input-stream', 'move-source-output-stream', 'send-key',
+    })
+    # pactl's own value-taking options, from `pactl --help`: -f/--format,
+    # -s/--server, -n/--client-name. The first is the trap: `pactl -f json
+    # list sinks` is a READ, and a gate that read `json` as the verb would
+    # refuse it for being an unknown sub-command.
+    _PACTL_VALUE_LONG = frozenset({'--format', '--server', '--client-name'})
+    _PACTL_VALUE_SHORT = frozenset('fsn')
+    # Why each refused pactl verb is refused, so the message can say WHICH
+    # harm rather than asserting that a write is a write. Every clause is from
+    # `pactl --help` on this host; none of them was RUN — `pactl exit` would
+    # have taken the user's audio server down, which is the point.
+    _PACTL_REFUSALS = {
+        'load-module': "loads a MODULE into the audio server — a shared "
+                       "library, and module-native-protocol-* opens a TCP "
+                       "control port on every host that can reach it",
+        'unload-module': "unloads a live module, which can take the user's "
+                         "audio device down with it",
+        'exit': "asks the audio server to quit, so the user's sound dies and "
+                "does not come back on its own",
+        'send-message': "is the server's general RPC channel: any method, on "
+                        "any object, with any arguments",
+        'upload-sample': "writes a file's contents into the server's sample "
+                         "cache",
+        'play-sample': "plays a sample out of the server's cache",
+        'remove-sample': "removes an entry from the server's sample cache",
+        'suspend-sink': "suspends a sink, silencing it for every client",
+        'suspend-source': "suspends a source, silencing every recording from it",
+        'set-card-profile': "switches a card's profile, which can take the "
+                            "device it names out of the session",
+        'set-sink-formats': "restricts a sink to one sample format, so a "
+                            "client asking for anything else stops hearing "
+                            "audio",
+        'set-port-latency-offset': "rewrites a port's latency offset, which "
+                                   "the user's own recording app also writes",
+    }
+    # nvidia-smi's log-to-file flag, the same class of write as `git
+    # diff --output` and for the same reason: measured 2026-09-26 on driver
+    # 615.71.09, `nvidia-smi -f /tmp/x.csv` created a 2609-byte file as the
+    # calling user, exit 0, nothing printed — and the file it writes is
+    # ordinary text, so pointing it at settings.json silently resets every
+    # permission switch while printing a GPU table into the journal. The
+    # driver's own help: "-f, --filename=  Log to a specified file, rather
+    # than to stdout."
+    #
+    # `log-file`, `log-file-size` and `log-file-type` are the same write under
+    # the spelling other driver releases use; this one answers "Option
+    # --log-file=… is not recognized", so those three are refused as
+    # unreachable-here rather than demonstrated-here, and refusing them costs
+    # nothing. What is deliberately NOT in the set is `-l` and `-lms`: on the
+    # measured version those are `--loop=SEC` and `--loop-ms=ms`, READS
+    # (`nvidia-smi --loop=1` printed its table twice until the timeout killed
+    # it), so refusing the letter would break a legitimate watch-the-GPU query
+    # to close nothing — the same letter-versus-keyword trap as `ps e`.
+    _NVIDIA_LOG_FLAGS = frozenset({'f', 'filename', 'log-file', 'log-file-size',
+                                   'log-file-type'})
+    # Every sub-verb git's `remote` really has (builtin/remote.c's option
+    # table), so a refusal can say WHICH kind of wrong thing it found instead
+    # of accusing a remote NAME of writing. Two of the ten read; the other
+    # eight write .git/config, refs or the fetch refspec.
+    _GIT_REMOTE_SUBCOMMANDS = {'add', 'rename', 'rm', 'remove', 'set-head',
+                               'set-branches', 'get-url', 'set-url', 'show',
+                               'prune', 'update'}
+    # NOT a spelling: `git remote --get-url <name>`. An audit pass flagged its
+    # refusal as a false positive, because git registers the sub-commands as
+    # pseudo long options and the dashed form looks plausible. Disproved
+    # against the source (2026-09-26): parse_options' long-option matcher
+    # skips OPTION_SUBCOMMAND entries outright (parse-options.c), so `--get-url`
+    # is an unknown option, and the sub-command table in v1.8.4, v2.0.0, v2.20.0
+    # and master contains no such string. The verdict was right; the MESSAGE
+    # was the defect, and this comment is here so the next pass does not
+    # "fix" it back into a hole.
+    _GIT_REMOTE_GET_URL_SPELLING = 'get-url'
+    # Flags that make a "read" verb RUN something. `-c`/`--config-env` inject
+    # config git then executes (`core.fsmonitor`, `diff.external`, `core.pager`,
+    # `core.sshCommand`, `credential.helper`, `uploadpack.packObjectsHook`)
+    # and `--exec-path` points git at a different git. The verb gate looks at
+    # the FIRST non-flag token, so `git -c X=Y status` was refused by ACCIDENT
+    # (the config value read as the verb) while `git status -c X=Y` walked
+    # straight through — and the blocked-word scan could not catch it either,
+    # because `_flag_values` only unwraps a value carried by a token that
+    # itself starts with '-', and here `key=value` is its own argument. Same
+    # class the niri-spawn guard already closes for -e/-c/--eval, on the
+    # executable's basename; closed here for the git gate. Refused for git
+    # only: cargo's `-c` is `--config`, and it is not a read verb anyway.
+    _GIT_EXEC_FLAGS = {'c', 'config-env', 'exec-path'}
+    # cargo's spelling of the same trick is `--config KEY=VALUE`, which sets
+    # build.rustc-wrapper, build.rustc and target.*.runner — cargo RUNS
+    # whatever those name, so `cargo test --config build.rustc-wrapper=/tmp/x`
+    # executed /tmp/x under a verb the gate calls harmless (measured
+    # 2026-09-26). The note here used to say "refused for git only: cargo's -c
+    # is --config, and it is not a read verb anyway", which missed that the
+    # claim being protected is 'cargo only builds/tests' — and --config voids
+    # exactly that. The long NAME only, never the letter `c`: cargo's --config
+    # has no short form, and a letter match would refuse the very ordinary
+    # clippy form `cargo clippy -- -Aclippy::pedantic`, whose split cluster
+    # letters happen to include a c.
+    _CARGO_EXEC_FLAGS = {'config'}
     BLOCKED = ('sudo', 'rm', 'pacman', 'yay', 'paru', 'shutdown', 'poweroff', 'reboot', 'halt', 'mkfs', 'dd', 'kill', 'chmod', 'chown', 'mount', 'umount', 'curl', 'wget', 'bash', 'sh', 'zsh', 'fish', 'python', 'python3', 'pip', 'mv', 'cp', 'tar', 'zip', '7z', 'make', 'gcc', 'systemctl', 'journalctl', 'tee', 'xargs', 'env', 'eval', 'exec')
     # The bubble's own runtime stores. They are not source and not the user's
     # notes: `history.json` and `memory.json` are injected into EVERY future
@@ -1063,7 +1277,16 @@ class ToolBelt:
             return False
         try:
             compile(content, 'self-edit-preview', 'exec')
-        except SyntaxError:
+        except (SyntaxError, ValueError):
+            # ValueError is the same refusal from the other side: a NUL byte
+            # or a lone surrogate is source `compile` rejects without a
+            # SyntaxError, and this method's whole job is to let such a
+            # payload fall through to edit_file's own sentence rather than
+            # ask the user to confirm a write that will not happen. It did
+            # not: the exception left `_self_edit_needs_confirm`, and
+            # `execute` has no handler either, so the CONFIRM check was the
+            # second place the same payload killed the turn (measured
+            # 2026-09-26, the lone-surrogate self-edit).
             return False
         return True
 
@@ -1186,7 +1409,6 @@ class ToolBelt:
     def _self_edit_preview(args: dict, limit: int=800) -> str:
         """Unified diff of the proposed self-edit against the live source,
         for the spoken-then-shown confirmation offer."""
-        import difflib
         try:
             old = _dep().SELF_PATH.read_text(encoding='utf-8', errors='replace')
         except OSError as e:
@@ -1200,7 +1422,6 @@ class ToolBelt:
     @staticmethod
     def _split_edit_preview(args: dict, limit: int=800) -> str:
         """Unified diff of a proposed split-module edit against its live file."""
-        import difflib
         try:
             target = Path(str(args.get('path') or '')).expanduser().resolve()
         except (OSError, RuntimeError, ValueError):
@@ -1246,6 +1467,40 @@ class ToolBelt:
             _CURRENT.reset(token)
 
     def _execute(self, name: str, args: dict) -> ToolResult:
+        """The one door every tool call goes through, and it does not raise.
+
+        A raising tool BODY has always been an error message (the `fn(**kwargs)`
+        handler below), but the DECISION that precedes the dispatch is the
+        belt's own code, and it was unguarded: `edit_file`'s CONFIRM pre-check
+        compiles the payload, and a payload `compile` rejects with ValueError —
+        a NUL byte, a lone surrogate — raised UnicodeEncodeError straight out
+        of here, out of `execute()` and out of the app's tool loop, which has no
+        handler either (measured 2026-09-26). One malformed payload ended the
+        whole turn on the pipeline's "Sorry, something went wrong", with no
+        tool message in the conversation and nothing for the model to read. The
+        tool could not help it: it was never reached.
+
+        So the whole decision path is wrapped, and the message says what
+        actually happened — the ASSISTANT's check failed, not the tool — and
+        says the call was not dispatched. That claim is structural rather than
+        hopeful: every line after `log_decision(..., 'dispatched')` is inside
+        the inner handler, so anything that escapes to here ran before the tool
+        did. `log.exception` keeps the traceback, because a swallowed
+        exception with no traceback is a bug that can never be found again.
+        `except Exception`, not `BaseException`: a shutdown signal must still
+        shut the app down.
+        """
+        try:
+            return self._execute_decision(name, args)
+        except Exception as e:
+            _dep().log.exception('tool %s could not be evaluated', name)
+            return ToolResult(
+                f"ERROR: {name} could not be evaluated — the assistant's own "
+                f"check for this call failed with {type(e).__name__} before "
+                f"the tool ran, so nothing was dispatched. The traceback is "
+                f"in the log; do not retry this call unchanged.", 'error')
+
+    def _execute_decision(self, name: str, args: dict) -> ToolResult:
         self._last_images = []
         self._last_confirmation_offer = False
         self._last_rearm_retry = False
@@ -1340,16 +1595,76 @@ class ToolBelt:
                     kwargs[pname] = coerce_number_arg(raw, float)
                 else:
                     kwargs[pname] = str(raw) if raw is not None else ''
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
+            # ARGUMENTS, and only arguments. This is the one failure the model
+            # can fix by asking for something else, so it is the one failure
+            # that belongs to the binding step. The `TypeError` used to be
+            # caught down here instead, around the DISPATCH, where it could
+            # only have come from inside the tool — and a tool's own
+            # `None.strip()` was reported to the model as "bad arguments"
+            # (measured 2026-09-27), which points the fix at the call instead
+            # of at the bug.
             return ToolResult(f'ERROR: bad arguments for {name}: {e}', 'error')
+        # The exception contract, in the one place a tool body can raise:
+        # what this tool SAID it might raise, and what it actually did.
+        declared = fn._tool_raises
         try:
             out = fn(**kwargs)
             return ToolResult(out, tool_kind(out))
-        except TypeError as e:
-            return ToolResult(f'ERROR: bad arguments for {name}: {e}', 'error')
+        except declared as e:
+            return self._declared_refusal(name, e)
         except Exception as e:
-            _dep().log.exception('tool %s failed', name)
-            return ToolResult(f'ERROR: {e}', 'error')
+            return self._tool_bug(name, e)
+
+    def _declared_refusal(self, name: str, exc) -> ToolResult:
+        """A tool raised what it declared it would raise: say what it said.
+
+        The sentence is the tool's own, unprefixed and unedited, because the
+        whole point of declaring a class is that this tool knows how to word
+        this refusal — the desk's ten states are written for a person, and
+        rewrapping one in "ERROR:" would throw away the only part the user can
+        act on. Logged at warning, not exception: a refusal is an answer, and
+        a traceback per "the desk is not running" would fill the journal with
+        stack traces of things that worked.
+
+        A declared class raised with NO message is not a refusal — it is a
+        tool that promised a sentence and did not deliver — so it fails CLOSED
+        into the bug arm, where the traceback is kept.
+        """
+        said = str(exc).strip()
+        if not said:
+            return self._tool_bug(
+                name, exc, why=f"{name} declared {type(exc).__name__} as a "
+                               f"refusal and raised it without saying why")
+        _dep().log.warning('tool %s refused: %s', name, said)
+        return ToolResult(said, 'refused')
+
+    def _tool_bug(self, name: str, exc, why: str = '') -> ToolResult:
+        """A tool that RAISED, having declared nothing: a bug, reported as one.
+
+        Measured 2026-09-27, the two shapes this sentence replaces. A body
+        raising with no message (`raise ValueError()`) produced the entire
+        message `ERROR: ` — the model is told something failed and given
+        nothing at all, which is the failure this whole path exists to
+        prevent. And a `TypeError` from inside a body produced "ERROR: bad
+        arguments for read_file: …", sending the model to re-check arguments
+        when the tool is what is broken.
+
+        So the message names the tool, the exception type, whatever the
+        exception said (or says plainly that it said nothing), and which of
+        the two things went wrong: the tool, or — for the arguments — the
+        call. The traceback stays in the log, because a swallowed exception
+        with no traceback is a bug that can never be found again.
+        """
+        _dep().log.exception('tool %s raised %s', name, type(exc).__name__)
+        said = str(exc).strip()
+        detail = f": {said}" if said else " (it raised without a message)"
+        cause = f"{why} — " if why else ""
+        return ToolResult(
+            f"ERROR: {name} failed with {type(exc).__name__}{detail} — {cause}"
+            f"that is a bug in the tool, not a refusal, and the arguments are "
+            f"not what is wrong. The traceback is in the log; do not retry this "
+            f"call unchanged.", 'error')
 
     def _validate_command(self, command: str) -> tuple[list | None, str, str | None, bool]:
         """Validate without executing: shlex.split + policy checks.
@@ -1359,16 +1674,28 @@ class ToolBelt:
         not double-exec via run_command) and never arms the restart hook —
         the caller arms it ONLY after a successful launch.
         """
-        cmd = command.strip()
+        cmd = command
         if not cmd:
+            # refusal: empty_command
             return (None, '', 'REFUSED: empty command', False)
+        # The emptiness test is on the RAW command and the parse is on the
+        # stripped one, and the reason is REACHABILITY: stripping first made
+        # `if not argv` below dead code (a whitespace-only command was already
+        # gone), so no command could ever reach that refusal — which is what
+        # `TestCommandPolicyRefusalReachability` reported. Now "" is refused
+        # here and "   " is refused below, `argv[0]` stays guarded, and a None
+        # command is a refusal instead of an AttributeError on `.strip()`.
+        cmd = cmd.strip()
         if any((c in cmd for c in ';|&`$\n\r<>')):
+            # refusal: shell_operators
             return (None, '', 'REFUSED: shell operators (pipes, ;, &&, redirects) are not allowed', False)
         try:
             argv = shlex.split(cmd)
         except ValueError as e:
+            # refusal: unparseable_command
             return (None, '', f'REFUSED: cannot parse command ({e})', False)
         if not argv:
+            # refusal: no_argv_after_parse
             return (None, '', 'REFUSED: empty command', False)
         argv[0] = os.path.expanduser(argv[0])
         # `cat` is on the whitelist, so validating only the executable would
@@ -1382,6 +1709,7 @@ class ToolBelt:
                     continue
                 denied = denied_secret_path(part)
                 if denied:
+                    # refusal: secret_path_read
                     return (None, '', f"REFUSED: '{part}' — {denied}. run_command "
                             f"cannot read credential stores into the conversation", False)
         exe_base = Path(argv[0]).name
@@ -1391,22 +1719,122 @@ class ToolBelt:
             if exe_base == 'git' and verb in self._GIT_READ or (exe_base == 'cargo' and verb in self._CARGO_OK):
                 _unblocked = exe_base
             else:
+                # refusal: git_cargo_verb
                 return (None, '', f"REFUSED: '{exe_base} {verb or '(no verb)'}' is not allowed — git is read-only (status/diff/log/show/branch/remote), cargo only builds/tests", False)
-            if _unblocked == 'git' and any(
-                    name in self._GIT_DELETE_FLAGS
-                    for a in argv[2:] if a.startswith('-')
-                    for name in _flag_names(a)):
-                return (None, '', 'REFUSED: deleting branches (git branch -d/-D) is not allowed', False)
-            # git is allowed READ-ONLY, and `--output` is the one flag that
-            # turns a read verb into a write: it writes the diff/log wherever it
-            # is pointed, permission checks and confirmation included. Refusing
-            # the flag closes the channel for every verb at once.
-            if _unblocked == 'git' and any(
-                    name in self._GIT_WRITE_FLAGS
-                    for a in argv[2:] if a.startswith('-')
-                    for name in _flag_names(a)):
-                return (None, '', 'REFUSED: git is read-only here, and --output '
-                        'writes a file wherever it is pointed', False)
+            if exe_base == 'git':
+                for _arg in argv[1:]:
+                    for _fname in _flag_names(_arg):
+                        if _fname in self._GIT_EXEC_FLAGS:
+                            # refusal: git_flag_runs_a_program
+                            return (None, '', f"REFUSED: git {_fname} is not allowed here — it makes a read verb run a program of the model's choosing (core.fsmonitor, diff.external, core.pager, core.sshCommand), so 'git is read-only' would be a claim about nothing", False)
+                # Position of the VERB, not the first spelling of it: the
+                # sub-verb scan has to start where the verb actually is, or a
+                # flag value that happens to read `remote` would move it.
+                _vpos = next((i for i, _a in enumerate(argv[1:], 1)
+                              if not _a.startswith('-')), None)
+                if verb == 'remote' and _vpos is not None:
+                    _sub = next((a for a in argv[_vpos + 1:]
+                                 if not a.startswith('-')), '')
+                    if _sub and _sub not in self._GIT_REMOTE_READ:
+                        if _sub in self._GIT_REMOTE_SUBCOMMANDS:
+                            # refusal: git_remote_write
+                            return (None, '', f"REFUSED: 'git remote {_sub}' writes .git/config — only the read-only remote sub-verbs are allowed here ({', '.join(sorted(self._GIT_REMOTE_READ))}), and 'git remote set-url' would repoint origin at another server", False)
+                        # Not a sub-verb at all: a remote NAME where a
+                        # sub-verb belongs, or a mistyped option (`--get-url`
+                        # is the one that gets typed, and git has never
+                        # accepted it). Say THAT rather than claim a listing
+                        # name would rewrite .git/config — a refusal that
+                        # explains itself wrongly teaches the reader that
+                        # the gate does not know what git accepts.
+                        # refusal: git_remote_unknown_subverb
+                        return (None, '', f"REFUSED: 'git remote {_sub}' — git has no such `remote` sub-verb, so this is a mistyped form or a remote name where a sub-verb belongs. Nothing ran. The read forms are: git remote, git remote -v, git remote show <name>, git remote {self._GIT_REMOTE_GET_URL_SPELLING} <name> (spelled without dashes — git rejects '--get-url')", False)
+            if exe_base == 'cargo':
+                for _arg in argv[1:]:
+                    for _fname in _flag_names(_arg):
+                        if _fname in self._CARGO_EXEC_FLAGS:
+                            # refusal: cargo_flag_runs_a_program
+                            return (None, '', f"REFUSED: cargo {_fname} is not allowed here — it makes a verb that only builds and tests run a program of the model's choosing (build.rustc-wrapper, build.rustc, target.*.runner), so 'cargo only builds/tests' would be a claim about nothing", False)
+        if exe_base == 'spawn':
+            # The whitelisted `spawn` PROGRAM takes the program to launch as
+            # its first argument — the blocked-words scan has always read
+            # argv[1] here as "the exe-adjacent program slot" — and nothing
+            # else judged it, so `spawn touch /tmp/x` reached a program the
+            # niri route refuses. Same capability, so the same owner: an
+            # allowlisted bare name, no arguments. Its own flag grammar is
+            # unknown (it is not installed on the host that recorded this),
+            # which is exactly why it is judged BARE rather than by a flag
+            # list nobody could verify.
+            err = self._gui_app_verdict(argv[1:])
+            if err:
+                return (None, '', err, False)
+        # procps' `e` is a MODIFIER, not a flag, and it is the one that leaks:
+        # as a BSD KEYWORD it appends every selected process's ENVIRONMENT to
+        # the output. Measured 2026-09-26 by counting words so that no secret
+        # was printed: `ps -C sleep` gave 8, `ps e -C sleep` gave 11, and
+        # `ps ef` gave 11 — the everyday `ps ef` idiom dumps every exported
+        # secret in the session into the conversation, and `ps` is whitelisted.
+        #
+        # The rule is the UNDASHED keyword, and that is not a preference between
+        # two spellings of one letter — both were measured on 2026-09-26 with a
+        # marker variable in a child's environment: `ps e -p N`, `ps ew`, `ps
+        # ef`, `ps aew`, `ps axew` and `ps ue` all printed it; `ps -e`, `ps
+        # -ew`, `ps -ef`, `ps -Aew` and `ps -Aewf` printed none. procps parses a
+        # dashed cluster as FLAGS, where `e` is the documented all-processes
+        # flag (`ps --help simple`: `-A, -e  all processes`), so refusing
+        # `-Aew` would break the listing idiom and close nothing.
+        #
+        # Positions, not words: a selector in an option's value slot is letters
+        # too — `ps -C firefox`, `ps -o etime`, `ps -eo pid,etime,comm` — and
+        # refusing those refuses the command that asks how long a process has
+        # been running. The arities below are procps' own, read off its error
+        # strings (`ps -o` → "format specification must follow -o", `ps -C` →
+        # "list of command names must follow -C", and so on); `-L` and `-s` are
+        # deliberately absent because they are NOT value-taking (`ps -L` prints
+        # threads, `ps -s` prints the signal format), and an option that
+        # swallowed the next token would hide a real modifier.
+        _PS_VALUE_LETTERS = frozenset('oCpuGtGUN')
+        _PS_VALUE_LONG = frozenset({'--format', '--user', '--pid', '--ppid',
+                                    '--quick-pid', '--sid', '--group',
+                                    '--sort', '--deselect', '--cols',
+                                    '--width', '--columns', '--rows',
+                                    '--lines', '--context', '--delimiter'})
+        if exe_base == 'ps':
+            _want_value = False
+            for _arg in argv[1:]:
+                if _arg.startswith('--'):
+                    _want_value = _arg in _PS_VALUE_LONG
+                    continue
+                if _arg.startswith('-'):
+                    # A short CLUSTER: `-eo`, `-Cfirefox`, `-oetime`. A value
+                    # letter arms the slot, and anything after it IS the value.
+                    _letters = _arg[1:]
+                    _slot = next((i for i, _c in enumerate(_letters)
+                                  if _c in _PS_VALUE_LETTERS), None)
+                    _want_value = _slot is not None and _slot == len(_letters) - 1
+                    continue
+                if _want_value:
+                    _want_value = False
+                    continue                 # a selector or a name, not a keyword
+                if 'e' in _arg.lower():
+                    # refusal: ps_environment_modifier
+                    return (None, '', f"REFUSED: 'ps {_arg}' is the procps ENVIRONMENT modifier — as an undashed keyword it appends every selected process's environment (every exported secret in this session) to the output. Use the dashed 'ps -e' (all processes) or 'ps -ef', which print every process and no environment at all", False)
+        if _unblocked == 'git' and any(
+                name in self._GIT_DELETE_FLAGS
+                for a in argv[2:] if a.startswith('-')
+                for name in _flag_names(a)):
+            # refusal: git_branch_delete
+            return (None, '', 'REFUSED: deleting branches (git branch -d/-D) is not allowed', False)
+        # git is allowed READ-ONLY, and `--output` is the one flag that
+        # turns a read verb into a write: it writes the diff/log wherever it
+        # is pointed, permission checks and confirmation included. Refusing
+        # the flag closes the channel for every verb at once.
+        if _unblocked == 'git' and any(
+                name in self._GIT_WRITE_FLAGS
+                for a in argv[2:] if a.startswith('-')
+                for name in _flag_names(a)):
+            # refusal: git_output_writes_a_file
+            return (None, '', 'REFUSED: git is read-only here, and --output '
+                    'writes a file wherever it is pointed', False)
         # The blocked-word scan runs over EXECUTION positions only — the exe,
         # a launcher's program slot (`spawn curl`), and `=`-attached flag
         # values (`nvidia-smi --foo=sudo`) — never over the whole line.
@@ -1442,14 +1870,45 @@ class ToolBelt:
             if bad == _unblocked:
                 continue
             if re.search(f'(^|\\W){re.escape(bad)}(\\W|$)', scan_text):
+                # refusal: blocked_word
                 return (None, '', f"REFUSED: '{bad}' is not on the safe whitelist (destructive commands are forbidden)", False)
         exe = argv[0]
-        is_restart = exe == str(_dep().RESTART_SCRIPT) or Path(exe).name == _dep().RESTART_SCRIPT.name
-        if is_restart:
+        restart = _dep().RESTART_SCRIPT
+        # Which checks APPLY is still decided by name — a path, or a bare name
+        # the shell will resolve — so the restart permission and the "run
+        # install.sh" diagnostic still reach the invocations that meant the
+        # script. Whether the file that will actually RUN is the script is a
+        # separate question, answered by identity below. Keeping the two apart
+        # is the whole fix: the old code let ANY file called
+        # `handsoff-restart` through the name test and then certified
+        # ~/.local/bin's copy existed, so an arbitrary file ran — and because
+        # the restart note is written BEFORE the exec (the script kills this
+        # process), the crash-recovery hook was armed on the strength of a
+        # different file's existence.
+        names_restart = exe == str(restart) or Path(exe).name == restart.name
+        if names_restart:
             if not self._perm.get('self_restart', True):
+                # refusal: self_restart_disabled
                 return (None, '', 'REFUSED: self-restart is disabled in handsoff settings', False)
-            if not (_dep().RESTART_SCRIPT.exists() and os.access(_dep().RESTART_SCRIPT, os.X_OK)):
-                return (None, '', f'ERROR: restart script missing at {_dep().RESTART_SCRIPT} — run install.sh', False)
+            if not (restart.exists() and os.access(restart, os.X_OK)):
+                # refusal: restart_script_missing
+                return (None, '', f'ERROR: restart script missing at {restart} — run install.sh', False)
+            if os.path.basename(exe) == exe and shutil.which(exe) is None:
+                # A bare name with nothing by that name on PATH — the install
+                # directory not being in this process's PATH is a normal state
+                # (a service's PATH, a shell that has not reloaded). Run the
+                # CONFIGURED script rather than refusing a command the user
+                # plainly meant. Safe in the direction that matters: argv[0]
+                # now names the real file, and the identity check below still
+                # has to agree. If PATH *does* hold something by that name and
+                # it is not the script, nothing is substituted and the check
+                # refuses — which is the case worth refusing.
+                argv[0] = str(restart)
+                exe = argv[0]
+            if not self._is_the_script(exe, restart):
+                # refusal: restart_script_is_an_impostor
+                return (None, '', f"REFUSED: '{exe}' is not the restart script at {restart} — a file with that NAME is a different program, and this one may only be run by identity", False)
+        is_restart = names_restart
         # Built and compared in ONE case. The allowlist is typed by a human
         # while the command comes from the model, and exec is case-sensitive —
         # so a GUI entry "Pactl" never matched a real `pactl` invocation, and
@@ -1462,16 +1921,279 @@ class ToolBelt:
                    | {Path(c.strip().split()[0]).name.lower()
                       for c in _dep().SETTINGS.get("extra_allowed_commands")
                       or [] if c.strip()})
+        _configured_exes = {os.path.expanduser(c.strip().split()[0])
+                            for c in _dep().SETTINGS.get("extra_allowed_commands")
+                            or [] if c.strip()}
         if not is_restart:
             if exe_base.lower() not in allowed and exe_base != _unblocked:
+                # refusal: not_on_the_whitelist
                 return (None, '', f"REFUSED: '{exe}' is not on the safe shell-command whitelist. Note: REFUSED does NOT mean the program is missing — it only means you may not run it via run_command. If it is one of your own tools (like ydotool for typing), use that tool instead. Allowed: " + ', '.join(sorted(allowed)) + f', {_dep().RESTART_SCRIPT}', False)
+            # Membership above is a BASENAME test; exec below uses the caller's
+            # own argv[0], so `/tmp/ls`, `./ps` and `~/Downloads/pactl` all
+            # ran (measured 2026-09-25) — and a downloads directory is exactly
+            # where a browser leaves something called `pactl`. A bare name is
+            # left to the shell, which resolves it on PATH; a name that CARRIES
+            # a path has to BE the file PATH would have resolved, or it is a
+            # different program wearing the right name. An entry the user typed
+            # into extra_allowed_commands is their own decision and is exempt.
+            if (exe != exe_base and exe not in _configured_exes
+                    and not self._is_the_program(exe, exe_base)):
+                # refusal: path_is_not_the_program
+                return (None, '', f"REFUSED: '{exe}' is not the {exe_base} this whitelist means — only the real {exe_base} may be run by path, because a file NAMED {exe_base} somewhere else is a different program", False)
         _dep().log.info('run_command: %s', _dep()._log_metadata(cmd, 'command'))
-        if Path(argv[0]).name == 'niri' and 'spawn' in argv:
-            err = self._validate_niri_spawn(argv)
-            if err:
-                return (None, '', err, False)
+        if Path(argv[0]).name == 'niri':
+            _route = self._niri_spawn_route(argv)
+            if _route is not None:
+                err = self._validate_niri_spawn(argv, _route)
+                if err:
+                    return (None, '', err, False)
+        err = self._validate_write_verb(argv, exe_base)
+        if err:
+            return (None, '', err, False)
         return (argv, exe_base, None, is_restart)
+
+    def _validate_write_verb(self, argv: list, exe_base: str) -> str | None:
+        """Why this whitelisted PROGRAM's arguments are a WRITE, or None.
+
+        Two whitelisted programs write files or reconfigure the machine
+        without a verb at all, so a verb-shaped gate would miss both — this
+        sits at the END of `_validate_command` for the same reason the niri
+        route check does, and it is the last thing before the allow decision
+        becomes an exec. (A guard block inserted in the middle of that
+        function once nested the two git write-flag checks inside a
+        `if exe_base == 'ps':` and disabled them; nothing follows this one but
+        the return, so that cannot happen to it.)
+
+        nvidia-smi's flags are read with `_flag_names`, which splits a short
+        cluster into letters. The driver itself accepts no clusters and no
+        attached values — measured 2026-09-26: `nvidia-smi -qf`, `-i0` and
+        `-f/tmp/x.csv` each answer "Option … is not recognized" — so the
+        splitter matches a SUPERSET of what the driver takes. That is the safe
+        direction: a spelling the driver would reject is refused here with a
+        reason about writing, instead of being handed to the driver.
+        """
+        if exe_base == 'nvidia-smi':
+            for _arg in argv[1:]:
+                _hit = next((n for n in _flag_names(_arg)
+                             if n in self._NVIDIA_LOG_FLAGS), None)
+                if _hit is not None:
+                    # refusal: nvidia_smi_logs_to_a_file
+                    return (f"REFUSED: 'nvidia-smi {_arg}' writes the query "
+                            f"output to a FILE instead of returning it here — a "
+                            f"read-only probe that overwrites whatever it is "
+                            f"pointed at (settings.json, a .bashrc) as the "
+                            f"calling user, with no confirmation and no output "
+                            f"to notice it by; nvidia-smi's own help says "
+                            f"'{_hit}' logs to a specified file. Drop the flag "
+                            f"and the same query prints into the conversation")
+        if exe_base == 'pactl':
+            _i, verb = _first_verb(argv, self._PACTL_VALUE_LONG,
+                                   self._PACTL_VALUE_SHORT)
+            # A bare `pactl` prints its usage and exits 1 (measured
+            # 2026-09-26), so there is no verb to judge and nothing to refuse.
+            if verb and verb not in self._PACTL_OK:
+                why = self._PACTL_REFUSALS.get(verb)
+                if why is None:
+                    # A MISTYPED verb is not a write, and saying it changes the
+                    # audio server would be a lie: pactl prints "No valid
+                    # command specified." and still exits 0, so the mistake
+                    # looks like it worked. That silence is why this branch
+                    # exists, and it hands over the whole vocabulary.
+                    # refusal: pactl_verb_does_not_exist
+                    return (f"REFUSED: 'pactl {verb}' is not a sub-command pactl "
+                            f"has, and pactl will not say so itself — it prints "
+                            f"'No valid command specified.' and still exits 0 "
+                            f"(measured 2026-09-26), so the mistyped command "
+                            f"looks like it worked. Nothing ran. pactl's "
+                            f"sub-commands are: "
+                            f"{', '.join(sorted(self._PACTL_OK | set(self._PACTL_REFUSALS)))}")
+                # refusal: pactl_verb_is_a_write
+                return (f"REFUSED: 'pactl {verb}' {why}. pactl is allowed the "
+                        f"reads and the volume/mute family: "
+                        f"{', '.join(sorted(self._PACTL_OK))}")
+        return None
+
     _INTERPRETERS = ('python', 'python3', 'node', 'perl', 'ruby', 'lua', 'php', 'bash', 'sh', 'zsh', 'fish', 'pwsh', 'busybox')
+
+    # niri exposes THREE ways to run a program, and they are not the same shape:
+    # `niri msg spawn [--] PROG ARGS`, `niri msg action spawn [--] PROG ARGS`,
+    # and `niri msg action spawn-sh "SHELL STRING"`. The guard used to key on the
+    # exact token 'spawn', so the third route reached niri's shell with a command
+    # the gate never saw: `niri msg action spawn-sh "touch /tmp/pwned"`,
+    # `… "id"` and `… "ffmpeg …"` were all ACCEPTED (measured 2026-09-26) while
+    # the identical `msg action spawn` form was refused — a guard that covers one
+    # spelling of a three-spelled route is decoration. Match the ROUTE.
+    _NIRI_SPAWN_ROUTES = ('spawn', 'spawn-sh')
+    # What the spawn route may LAUNCH. A denylist was the wrong shape for a
+    # capability this wide: the old rule refused interpreters, git, cargo,
+    # blocked words and script flags, and allowed everything else that had a
+    # PATH entry — so `touch`, `id` and `ffmpeg` launched happily (measured
+    # 2026-09-26) while the identical `spawn` form of the same names was
+    # refused for being interpreters. "A GUI app" is not a shape argv can
+    # prove, so it is a LIST, and the list IS the policy: a user who wants
+    # another app adds it here, or uses open_app, which takes any installed
+    # app by name and is the route with a window to wait for.
+    _NIRI_SPAWN_TERMINALS = frozenset({
+        'alacritty', 'contour', 'foot', 'ghostty', 'gnome-terminal', 'guake',
+        'kitty', 'konsole', 'lxterminal', 'ptyxis', 'qterminal', 'rio', 'st',
+        'stterm', 'terminator', 'terminology', 'tilix', 'urxvt', 'warp',
+        'wezterm', 'xfce4-terminal', 'xterm'})
+    _NIRI_SPAWN_APPS = _NIRI_SPAWN_TERMINALS | frozenset({
+        # browsers
+        'brave', 'chromium', 'chromium-browser', 'epiphany', 'falkon',
+        'firefox', 'firefox-esr', 'google-chrome', 'konqueror', 'librewolf',
+        'opera', 'qutebrowser', 'vivaldi',
+        # files and archives
+        'engrampa', 'file-roller', 'nautilus', 'nemo', 'pcmanfm', 'thunar',
+        'xarchiver',
+        # documents, images, design
+        'blender', 'drawio', 'evince', 'freecad', 'gimp', 'gnome-text-editor',
+        'gwenview', 'inkscape', 'kicad', 'krita', 'libreoffice', 'loupe',
+        'mousepad', 'obsidian', 'okular', 'ristretto', 'sioyek', 'soffice',
+        'zathura', 'zathura-gtk', 'zim',
+        # code
+        'codium', 'code', 'geany', 'kate', 'kwrite', 'subl', 'sublime_text',
+        'zed',
+        # media
+        'audacity', 'celluloid', 'kdenlive', 'mpv', 'obs', 'rhythmbox',
+        'shotcut', 'spotify', 'strawberry', 'vlc',
+        # chat, mail, notes
+        'discord', 'element', 'evolution', 'geary', 'hexchat', 'joplin',
+        'logseq', 'mailspring', 'signal-desktop', 'slack', 'thunderbird',
+        'typora',
+        # system panels, settings, diagnostics
+        'baobab', 'blueman-manager', 'cpupower-gui', 'flameshot',
+        'gnome-disk-utility', 'gnome-tweaks', 'hardinfo', 'hardinfo2',
+        'ksnip', 'ksystemsettings5', 'ksystemsettings6', 'lshw-gtk',
+        'nm-connection-editor', 'pavucontrol', 'spectacle', 'waybar',
+        # this project's own settings GUI, installed under its .py name
+        'handsoff-settings.py',
+    })
+
+    @classmethod
+    def _gui_app_verdict(cls, rest: list) -> str | None:
+        """Why this spawn may not launch a GUI app, or None.
+
+        ONE owner for the allowlist, because a launch capability has more than
+        one door in this file: the niri spawn routes, and the whitelisted
+        `spawn` program, whose program slot is the same shape and had no
+        policy of its own.
+
+        The order matters, and it is the order of how bad the refusal is. A
+        name that is an interpreter, a blocked program or git/cargo gets ITS
+        reason first — that is the sharp case, and "it is not on a list" is
+        true but useless to the reader, who asked why the assistant will not
+        open a terminal to run a command. The allowlist is then the general
+        refusal, the reason that closes the hole the old denylist left open:
+        everything not named is refused, rather than everything not forbidden
+        being allowed. Two further rules:
+
+        - a name that CARRIES a directory must BE that program, by realpath
+          (`/tmp/firefox` is a different file that borrowed the name — the
+          same rule `_validate_command` applies to every path-shaped
+          executable, and the reason `_is_the_program` exists);
+        - NO ARGUMENTS. Not a flag scan, no arguments at all. The list holds
+          script hosts (gimp's `--batch-interpreter`, inkscape's `--actions`,
+          LibreOffice's `macro:///` URLs), and a flag list this gate
+          maintains for a list it does not own is a list that is wrong the
+          day someone adds an app. A bare name cannot execute anything, and it
+          is the shape `open_app` has always taken.
+        """
+        if not rest:
+            # refusal: spawn_has_no_program
+            return 'REFUSED: niri spawn needs a program to launch'
+        raw = rest[0]
+        low = os.path.basename(raw).lower()
+        if any((re.search(f'(^|\\W){re.escape(b)}(\\W|$)', low)
+                for b in cls.BLOCKED)):
+            # refusal: spawn_of_a_blocked_program
+            return (f"REFUSED: niri spawn of '{raw}' is blocked — spawn must "
+                    f"not bypass the blocked-programs list")
+        if cls._is_interpreter(low):
+            # refusal: spawn_of_an_interpreter
+            return (f"REFUSED: spawning interpreter '{raw}' is not allowed — "
+                    f"an interpreter is how a launch becomes arbitrary "
+                    f"execution, and GUI apps are opened by name instead (or "
+                    f"use open_app)")
+        if low in ('git', 'cargo'):
+            # refusal: spawn_of_git_or_cargo
+            return (f"REFUSED: spawning '{raw}' is not allowed — use "
+                    f"run_command, which gates git/cargo by verb")
+        if low not in cls._NIRI_SPAWN_APPS:
+            # refusal: spawn_of_a_non_app
+            return (f"REFUSED: '{raw}' is not a launchable app — the spawn "
+                    f"route opens GUI apps from a fixed list of "
+                    f"{len(cls._NIRI_SPAWN_APPS)} (terminals, browsers, file "
+                    f"managers, editors, media, chat, the system panels), and "
+                    f"this gate cannot tell an app from a tool that happens to "
+                    f"be installed, so it launches only what it can name. "
+                    f"Nothing ran. To open anything else, use open_app with "
+                    f"the app's name")
+        if os.path.dirname(raw) and not cls._is_the_program(raw, low):
+            # refusal: spawn_path_is_not_the_app
+            return (f"REFUSED: '{raw}' is not the {low} this list means — only "
+                    f"the real {low} may be launched by path, because a file "
+                    f"NAMED {low} somewhere else is a different program")
+        if rest[1:]:
+            # refusal: spawn_with_arguments
+            return (f"REFUSED: '{raw}' takes no arguments here — a launchable "
+                    f"app is opened by NAME, because this list includes script "
+                    f"hosts (gimp --batch-interpreter, inkscape --actions, "
+                    f"LibreOffice macro:/// URLs) whose flags would have to be "
+                    f"enumerated by hand to stay safe. Open the app, then use "
+                    f"type_text or the app's own tools")
+        return None
+
+    @classmethod
+    def _niri_spawn_route(cls, argv: list) -> tuple | None:
+        """`(index, token)` of the spawn route in this niri command, or None.
+
+        Any argument naming a spawn route puts the command under the guard,
+        wherever it sits in the chain — the same deliberate over-refusal as the
+        old `'spawn' in argv`, now covering `spawn-sh` and any future
+        `spawn-*` action. Over-refusing a command that MENTIONS spawn costs one
+        confused turn; under-guarding one that SPAWNS costs the machine.
+        """
+        for i, tok in enumerate(argv[1:], 1):
+            if tok in cls._NIRI_SPAWN_ROUTES or tok.startswith('spawn'):
+                return (i, tok)
+        return None
+
+    @staticmethod
+    def _resolved(candidate: str) -> "str | None":
+        """`candidate` as a path: a bare name through PATH, a path as written.
+
+        `~` is already expanded by the caller, so this is the one place that
+        decides which of the two shapes the model wrote.
+        """
+        if os.path.basename(candidate) == candidate:
+            return shutil.which(candidate)
+        return candidate
+
+    @classmethod
+    def _is_the_program(cls, exe: str, base: str) -> bool:
+        """Is `exe` the same FILE that `base` resolves to on PATH?
+
+        Identity, not spelling: realpath on both sides, so a symlinked /bin
+        still matches and a lookalike in a downloads directory does not. An
+        unresolvable `base` is False — there is no known-good file to be.
+        """
+        found = shutil.which(base)
+        try:
+            return (found is not None
+                    and os.path.realpath(exe) == os.path.realpath(found))
+        except OSError:
+            return False
+
+    @classmethod
+    def _is_the_script(cls, exe: str, restart) -> bool:
+        """Is `exe` the restart script itself, rather than its basename?"""
+        path = cls._resolved(exe)
+        try:
+            return (path is not None
+                    and os.path.realpath(path) == os.path.realpath(restart))
+        except OSError:
+            return False
 
     @staticmethod
     def _is_interpreter(base: str) -> bool:
@@ -1483,36 +2205,54 @@ class ToolBelt:
         b = (base or '').lower()
         return any((b == tok or re.fullmatch(f'{re.escape(tok)}[\\d.]+', b) for tok in ToolBelt._INTERPRETERS))
 
-    def _validate_niri_spawn(self, argv: list) -> str | None:
-        """Spawn-specific capability checks (no execution)."""
-        i = argv.index('spawn')
-        rest = [a for a in argv[i + 1:] if a != '--']
-        target = os.path.basename(rest[0]) if rest else ''
-        low_target = target.lower()
-        if not target:
-            return 'REFUSED: niri spawn needs a program to launch'
-        if any((re.search(f'(^|\\W){re.escape(b)}(\\W|$)', low_target) for b in self.BLOCKED)):
-            return f"REFUSED: niri spawn of '{target}' is blocked — spawn must not bypass the blocked-programs list"
-        if self._is_interpreter(low_target):
-            return f"REFUSED: spawning interpreter '{target}' is not allowed — launch GUI apps by name instead (or use open_app)"
-        if low_target in ('git', 'cargo'):
-            return f"REFUSED: spawning '{target}' is not allowed — use run_command, which gates git/cargo by verb"
-        for extra in rest[1:]:
-            eb = os.path.basename(extra).lower()
-            if not eb or eb.startswith('-'):
-                continue
-            if any((re.search(f'(^|\\W){re.escape(b)}(\\W|$)', eb) for b in self.BLOCKED)):
-                return f"REFUSED: niri spawn arg '{extra}' is blocked — spawn must not bypass the blocked-programs list"
-            if self._is_interpreter(eb) or eb in ('git', 'cargo'):
-                return f"REFUSED: niri spawn arg '{extra}' is not allowed"
-        _terms = ('alacritty', 'kitty', 'foot', 'konsole', 'xterm', 'urxvt', 'wezterm', 'warp', 'ghostty', 'tilix', 'terminator', 'qterminal', 'gnome-terminal', 'xfce4-terminal', 'ptyxis', 'stterm', 'terminology', 'console', 'terminal')
-        if low_target in _terms and len(rest) > 1:
-            return 'REFUSED: spawning a terminal with arguments is not allowed'
+    def _validate_niri_spawn(self, argv: list, route: tuple) -> str | None:
+        """Spawn-specific capability checks (no execution).
+
+        `route` is `(index, token)` from `_niri_spawn_route`, so the payload is
+        read from the position the ROUTE occupies rather than from a hardcoded
+        spelling — that is what lets the `spawn-sh` shell string be split here
+        instead of sailing past the gate.
+        """
+        i, route_name = route
+        if route_name.endswith('-sh'):
+            # niri's `msg action spawn-sh` takes ONE string and hands it to a
+            # SHELL, so the command lives inside a single argv element: a
+            # program name and its arguments, invisible to both this gate and
+            # the blocked-words scan (which for niri only sees argv[0] and flag
+            # values). Parsed here with the same shlex the top-level command
+            # check uses, then judged by the same rules as the `spawn` form.
+            payload = argv[i + 1:]
+            if len(payload) != 1:
+                # refusal: spawn_sh_arity
+                return ('REFUSED: niri spawn-sh takes exactly ONE command string '
+                        f'(got {len(payload)} arguments) — a spawn form this gate '
+                        'cannot read is a spawn form it cannot allow')
+            try:
+                rest = shlex.split(payload[0])
+            except ValueError as e:
+                # refusal: spawn_sh_unreadable_payload
+                return (f'REFUSED: the niri spawn-sh payload does not parse ({e}) '
+                        '— an unreadable payload cannot be an allowed one')
+        else:
+            rest = [a for a in argv[i + 1:] if a != '--']
+        err = self._gui_app_verdict(rest)
+        if err:
+            return err
+        target = os.path.basename(rest[0])
+        # The arg-scanning this function used to do — blocked words and
+        # interpreters in the argument slots, terminals-with-arguments, the
+        # script/code flag scan — is DELETED, not commented out. The
+        # allowlist above admits a bare name or nothing, so none of it could
+        # run: it was four refusals no command could reach, which is what
+        # `TestCommandPolicyRefusalReachability` reported on its first run.
+        # A comment claiming to be a safety net for a rule that makes it
+        # unreachable is worse than no net, because it reads like one.
+        # `TestCommandPolicyRefusalReachability` is the net that replaced it:
+        # relaxing the no-arguments rule fails that walk until every check
+        # comes back WITH a command that provably reaches it.
         if shutil.which(rest[0]) is None:
+            # refusal: spawn_app_not_installed
             return f"ERROR: no program named '{target}' is installed"
-        arg_str = ' '.join((shlex.quote(a) for a in rest[1:])).lower()
-        if ' -e ' in f' {arg_str} ' or '--command' in arg_str or '--eval' in arg_str or ('--print' in arg_str) or ('--script' in arg_str) or ('-x' == arg_str.strip()) or (' -x ' in f' {arg_str} ') or ('-c' == arg_str.strip()) or ('source ' in arg_str) or ('.lua' in arg_str) or ('.js' in arg_str) or ('.py' in arg_str):
-            return 'REFUSED: passing script/code flags to spawned programs is not allowed'
         return None
 
     @tool(description='Run one safe whitelisted command (pactl, playerctl, brightnessctl, niri, spawn, echo, cat, ls, pwd, notify-send, system probes like ps/free/df/ss/nvidia-smi, read-only git (status/diff/log/show/branch), cargo build/check/test/clippy, restart script). One command only — pipes, ; and && are refused.')
@@ -2304,7 +3044,7 @@ class ToolBelt:
             return f"{prefix}: {_qs_desk.describe_state(error)}"
         return f"{prefix}: {error.message}"
 
-    @tool(gates='quant_space', description='Whether Quantum Space is running and what its desk has open right now: the app version, the open folder, and every session in it. Use for "is Quantum Space running?", "what is open in Quantum Space?". For one session\'s screen output use quant_space_read.')
+    @tool(gates='quant_space', raises=_qs_desk.DeskError, description='Whether Quantum Space is running and what its desk has open right now: the app version, the open folder, and every session in it. Use for "is Quantum Space running?", "what is open in Quantum Space?". For one session\'s screen output use quant_space_read.')
     def quant_space_status(self) -> str:
         """Ask the Quantum Space desk what is open right now."""
         desk = self._qs_client()
@@ -2319,7 +3059,7 @@ class ToolBelt:
         qs_stats_record("quant_space_status", "ok")
         return _qs_desk.describe_status(status, sessions)
 
-    @tool(gates='quant_space', description='List the sessions open in Quantum Space — each one\'s agent or kind and the folder it is in — together with the session id quant_space_read takes. Use it before reading when the session is not precisely known.')
+    @tool(gates='quant_space', raises=_qs_desk.DeskError, description='List the sessions open in Quantum Space — each one\'s agent or kind and the folder it is in — together with the session id quant_space_read takes. Use it before reading when the session is not precisely known.')
     def quant_space_sessions(self) -> str:
         """What the desk has open, as one spoken sentence and an id list."""
         desk = self._qs_client()
@@ -2331,7 +3071,7 @@ class ToolBelt:
         qs_stats_record("quant_space_sessions", "ok")
         return _qs_desk.describe_sessions(sessions) + (f"\n{index}" if index else "")
 
-    @tool(gates='quant_space', description="Read the recent screen output of ONE Quantum Space session, by its id or name from quant_space_sessions. Use for 'what is Claude doing?', 'what did it just say?', 'read me the last thing it printed'.", aliases={'session': ('id', 'name', 'session_id', 'target', 'which'), 'lines': ('tail', 'last', 'n')})
+    @tool(gates='quant_space', raises=_qs_desk.DeskError, description="Read the recent screen output of ONE Quantum Space session, by its id or name from quant_space_sessions. Use for 'what is Claude doing?', 'what did it just say?', 'read me the last thing it printed'.", aliases={'session': ('id', 'name', 'session_id', 'target', 'which'), 'lines': ('tail', 'last', 'n')})
     def quant_space_read(self, session: str, lines: int=0) -> str:
         """The tail of ONE session's screen, resolved against the desk's list.
 
@@ -2366,7 +3106,7 @@ class ToolBelt:
         qs_stats_record("quant_space_read", "ok")
         return _qs_desk.describe_read({**chosen, **result})
 
-    @tool(gates='quant_space', description="Diagnose the Quantum Space control link and say which state it is in: not running, the desk refusing on its own Control rules (its own sentence), or — when a session is named — that the session is gone. Use after any quantum_space_* call failed, and when the user asks why the assistant cannot see their desk.", aliases={'session': ('id', 'name', 'session_id')})
+    @tool(gates='quant_space', raises=_qs_desk.DeskError, description="Diagnose the Quantum Space control link and say which state it is in: not running, the desk refusing on its own Control rules (its own sentence), or — when a session is named — that the session is gone. Use after any quantum_space_* call failed, and when the user asks why the assistant cannot see their desk.", aliases={'session': ('id', 'name', 'session_id')})
     def quant_space_check(self, session: str='') -> str:
         """Which state the desk link is in, in one line.
 
@@ -3358,6 +4098,7 @@ class ToolBelt:
     def kill_process(self, target: str) -> str:
         target = str(target or '').strip()
         if not target:
+            # refusal: kill_needs_a_target
             return 'ERROR: name the process or the port it listens on'
         cands: list[tuple[int, str]] = []
         if target.isdigit() and 0 < int(target) <= 65535:
@@ -3369,14 +4110,18 @@ class ToolBelt:
             low = target.lower()
             cands = [(p, n) for p, n in self._same_user_procs() if n.lower() == low]
         if not cands:
+            # refusal: kill_no_such_process
             return f"ERROR: no process of yours matches {target!r} (exact name or listening port; other users' processes are invisible)"
         if len(cands) > 1:
             listing = ', '.join((f'{n} (pid {p})' for p, n in cands[:6]))
+            # refusal: kill_ambiguous
             return f'ERROR: {len(cands)} processes match — kill_process needs an EXACT single match, these all match: {listing}'
         pid, name = cands[0]
         if pid == os.getpid():
+            # refusal: kill_refuses_itself
             return 'REFUSED: that is me — for a restart of the assistant, ask me to restart myself instead'
         if name == 'systemd':
+            # refusal: kill_refuses_systemd_user
             return 'REFUSED: systemd --user manages your whole session — killing it would stop every user service, including me'
         _dep()._kill_offer.arm(self.KILL_CONFIRM_S, pid=pid, name=name)
         _dep().log.info('kill_process: offered pid %d (%s), awaiting confirm', pid, name)
@@ -3390,14 +4135,18 @@ class ToolBelt:
         offer, expired = _dep()._kill_offer.state()
         if offer is None:
             if expired:
+                # refusal: confirm_kill_offer_expired
                 return 'ERROR: the kill offer expired — run kill_process again'
+            # refusal: confirm_kill_nothing_pending
             return 'ERROR: nothing to confirm — call kill_process first'
         ans = str(answer or 'yes').strip().lower()
         if ans not in ('yes', 'no', 'y', 'n'):
             # NOT consumed: an unusable answer leaves the offer open.
+            # refusal: confirm_kill_bad_answer
             return 'ERROR: answer with yes or no'
         claimed = _dep()._kill_offer.consume()
         if claimed is None:
+            # refusal: confirm_kill_already_claimed
             return 'ERROR: nothing to confirm — call kill_process first'
         if ans in ('no', 'n'):
             _dep().log.info('kill_process: cancelled by user/model')
@@ -3408,6 +4157,7 @@ class ToolBelt:
         except ProcessLookupError:
             return f'{name} (pid {pid}) already exited.'
         except PermissionError:
+            # refusal: kill_permission_denied
             return f'ERROR: not allowed to stop {name} (pid {pid})'
         _dep().log.warning('kill_process: SIGTERM pid %d (%s) confirmed', pid, name)
         return f'Stopped {name} (pid {pid}) (SIGTERM sent).'
@@ -3877,17 +4627,22 @@ class ToolBelt:
             pass
         denied = denied_secret_path(p)
         if denied:
+            # refusal: read_refuses_a_secret_path
             return (f'REFUSED: {p} — {denied}. This goes into the conversation '
                     f'(and may leave the machine); ask the user to read it themselves.')
         if not p.exists():
+            # refusal: read_of_a_missing_file
             return f'ERROR: no such file: {p}'
         if p.is_dir():
+            # refusal: read_of_a_directory
             return 'ERROR: path is a directory, not a file'
         try:
             data = p.read_bytes()
         except OSError as e:
+            # refusal: read_error_is_reported
             return f'ERROR: cannot read {p}: {e}'
         if b'\x00' in data[:4096]:
+            # refusal: read_refuses_a_binary
             return f'ERROR: {p} looks like a binary file'
         text = data.decode('utf-8', errors='replace')
         if len(text) > self.MAX_READ:
@@ -3903,28 +4658,51 @@ class ToolBelt:
         """
         p = Path(path).expanduser().resolve()
         if len(content) > self.MAX_WRITE:
+            # refusal: edit_content_too_large
             return 'REFUSED: content too large'
         kind = _dep()._classify_edit_path(p)
         if kind in ("self", "split") and len(content) > self.MAX_SELF_EDIT:
+            # refusal: edit_self_too_large
             return f'REFUSED: self/split edit too large ({len(content)} > {self.MAX_SELF_EDIT} bytes) — keep the diff minimal'
         if not kind:
+            # refusal: edit_path_not_editable
             return f"REFUSED: you may only edit your own source ({_dep().SELF_PATH}), the split modules beside it or in {_dep().HOME / '.local/bin'} ({', '.join(sorted(_dep()._SPLIT_EDIT_FILES))}, core/settings.py, core/__init__.py), or files inside {_dep().CONFIG_DIR}/"
         is_self = kind == 'self'
         if p in (_dep().SETTINGS_FILE, _dep().SETTINGS_FILE.with_suffix('.json')) or p.name.startswith('settings.json'):
+            # refusal: edit_refuses_settings_json
             return 'REFUSED: settings.json controls your own permissions — the user manages it via the settings app'
         if p.name.lower() in self._RUNTIME_STORES:
+            # refusal: edit_refuses_a_runtime_store
             return (f'REFUSED: {p.name} is a runtime store the bubble keeps — '
                     'changing it by hand would change what every future turn is '
                     'told or which alarms fire. The user changes it through the '
                     'app (or clears history), not through a file edit.')
         if is_self:
             if _dep().SELF_MARKER not in content:
+                # refusal: edit_self_needs_the_marker
                 return f"REFUSED: self-edit must keep the marker line '{_dep().SELF_MARKER}'"
         if is_self or (kind == 'split' and p.suffix == '.py'):
             try:
                 compile(content, str(p), 'exec')
             except SyntaxError as e:
+                # refusal: edit_refuses_uncompilable_source
                 return f'REFUSED: new source does not compile: {e}'
+            except ValueError as e:
+                # `compile` raises ValueError, not SyntaxError, for source it
+                # cannot even turn into text — a NUL byte ("source code string
+                # cannot contain null bytes") and a lone surrogate
+                # ("'utf-8' codec can't encode character"), and both escape a
+                # SyntaxError-only guard. Measured 2026-09-26: a self-edit
+                # whose content carried a lone surrogate raised
+                # UnicodeEncodeError straight out of edit_file AND out of
+                # execute(), whose tool loop has no handler — so one malformed
+                # payload ended the whole turn on "Sorry, something went
+                # wrong" with nothing in the conversation for the model. The
+                # file was correctly NOT written; what was missing was the
+                # sentence saying so.
+                # refusal: edit_refuses_unencodable_source
+                return (f'REFUSED: new source cannot be encoded as text ({e}) — '
+                        'a NUL byte or a lone surrogate is not source code')
             try:
                 import py_compile as _py_compile
                 with tempfile.NamedTemporaryFile('w', suffix='.py', delete=False, encoding='utf-8') as tf:
@@ -3938,6 +4716,7 @@ class ToolBelt:
                     except OSError:
                         pass
             except Exception as e:
+                # refusal: edit_fails_py_compile
                 return f'REFUSED: new source fails py_compile: {e}'
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -3949,6 +4728,7 @@ class ToolBelt:
                 os.chmod(bak, 0o600)
             _dep().atomic_private_write(p, content)
         except OSError as e:
+            # refusal: edit_write_error
             return f'ERROR: cannot write {p}: {e}'
         _dep().log.info('edit_file wrote %d bytes to %s', len(content), _dep()._log_metadata(p, 'path'))
         if is_self or (kind == 'split' and p.suffix == '.py'):
@@ -3957,6 +4737,7 @@ class ToolBelt:
                 _dep().log.error(
                     'edit_file: %s compiles but does not load — rolling back (%s)',
                     _dep()._log_metadata(p, 'path'), problem)
+                # refusal: edit_rolled_back_when_it_cannot_load
                 return (f'ERROR: {p.name} compiles but does not load — '
                         f'{problem}. {self._restore_previous(p)}. Nothing was '
                         f'restarted: a module that cannot be imported would '

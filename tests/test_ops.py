@@ -3302,3 +3302,74 @@ class TestStateHygieneLine:
             core_doctor.reset_dependencies(token)
         assert not any(ln.startswith("state:") for ln in text.splitlines())
         assert "state_hygiene" not in out
+
+
+class TestDependencyClosureLock:
+    """requirements-lock.txt pins the RESOLVED closure, not the manifest.
+
+    It used to name the seven direct dependencies only, which is the shape that
+    reads correct and floats everything else: on a machine that installs a
+    3.8 GB neural speech model and holds the microphone, the desktop and the
+    filesystem, ~34 transitive packages (tokenizers, ctranslate2, scipy,
+    scikit-learn, huggingface-hub, av) resolved fresh on every install. These
+    guards are offline — no index, no resolver — so what they can hold is the
+    SHAPE: the manifest is pinned exactly, the closure is more than the
+    manifest, nothing is loose, and the header's own count is true.
+    """
+
+    LOCK = HERE / "requirements-lock.txt"
+    MANIFEST = HERE / "requirements.txt"
+
+    def _pins(self) -> dict:
+        pins = {}
+        for raw in self.LOCK.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            name, sep, version = line.partition("==")
+            assert sep == "==", (
+                f"every line of the lock is an exact `name==version` pin; this "
+                f"one is not: {raw!r}. A loose constraint is how the closure "
+                f"quietly stops being a closure.")
+            assert version and not any(c in version for c in "<>=!~*, "), raw
+            pins[name.strip().lower()] = version.strip()
+        return pins
+
+    def _direct(self) -> set:
+        """The manifest's requirement names, comments and all."""
+        names = set()
+        for raw in self.MANIFEST.read_text(encoding="utf-8").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if line:
+                names.add(re.split(r"[<>=!~\[]", line, maxsplit=1)[0]
+                            .strip().lower())
+        return names
+
+    def test_every_direct_requirement_is_pinned_exactly(self):
+        pins, direct = self._pins(), self._direct()
+        assert direct, "the manifest parsed to nothing — this guard is vacuous"
+        missing = sorted(direct - set(pins))
+        assert not missing, (
+            f"requirements.txt asks for {missing} and the lock does not pin "
+            f"them, so a fresh install resolves them by hand")
+
+    def test_the_closure_is_more_than_the_manifest(self):
+        pins, direct = self._pins(), self._direct()
+        transitive = set(pins) - direct
+        assert len(transitive) >= 20, (
+            f"only {len(transitive)} transitive packages are pinned. The lock "
+            f"has gone back to naming the manifest, which is the shape that "
+            f"lets tokenizers/scipy/huggingface-hub float on a machine that "
+            f"holds the mic and the desktop. If the closure really did shrink, "
+            f"regenerate it (see the header) rather than lowering this number")
+
+    def test_the_header_states_the_closure_size_it_actually_has(self):
+        pins = self._pins()
+        stated = re.search(r"^# closure: (\d+) packages", self.LOCK.read_text(
+            encoding="utf-8"), re.M)
+        assert stated, (
+            "the lock no longer states its closure size, so the header's "
+            "prose about what a regeneration returns is uncheckable")
+        assert int(stated.group(1)) == len(pins), (
+            f"the header says {stated.group(1)} packages; the file pins "
+            f"{len(pins)}. One of them is a lie about the install")

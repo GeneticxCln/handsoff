@@ -3239,7 +3239,8 @@ class BubbleWidget(QWidget):
         # -- ears: before the head, which hides their bases. The inner ear is
         #    the state colour lightened and it brightens with the voice, so the
         #    cat visibly prickles; the rim keeps the ear readable on its own.
-        for ear, sign in zip(_cat_ears(cx, cy, R, reach), (-1.0, 1.0)):
+        for ear, sign in zip(_cat_ears(cx, cy, R, reach), (-1.0, 1.0),
+                             strict=True):
             p.setBrush(QBrush(shade(76)))
             p.setPen(QPen(shade(155), max(1.0, R * 0.028)))
             p.drawPolygon(ear)

@@ -56,7 +56,6 @@ import argparse
 import copy
 import datetime
 import json
-import os
 import pathlib
 import random
 import shutil
@@ -184,7 +183,7 @@ def evaluate(model, items: list[dict], agent, device, dtype, batch_size: int = 8
                                 b["qtype"].cpu(), b["marker_mask"].cpu())
             log_scores.extend([float(v) for v in rew])
             act0.extend([float(v) for v in torch.softmax(act.float(), -1).cpu().numpy()[:, 0]])
-            for row, probs in zip(chunk, p):
+            for row, probs in zip(chunk, p, strict=True):
                 order = list(np.argsort(-probs))
                 want = keys.index(row["family"])
                 picks.append(keys[int(order[0])])
@@ -527,12 +526,12 @@ def main(argv: list[str]) -> int:
     print(f"  {'majority':<14} {majority_n / len(rows):>4.0%}     "
           f"(always answering {majority_family})")
     print(summarise("zero-shot r@3", base_metrics, "recall3"))
-    print(summarise(f"fine-tuned r@3", tuned_metrics, "recall3"))
+    print(summarise("fine-tuned r@3", tuned_metrics, "recall3"))
     mean = lambda rows_, key: sum(m[key] for m in rows_) / len(rows_)  # noqa: E731
     print(f"  log-score    zero-shot {mean(base_metrics, 'log_score'):+.3f}"
           f"  fine-tuned {mean(tuned_metrics, 'log_score'):+.3f}"
           f"   (raw logits, temperature 1)")
-    print(f"\n=== calibration: what the temperature table does to the SAME decisions ===")
+    print("\n=== calibration: what the temperature table does to the SAME decisions ===")
     print(f"  ECE  zero-shot raw (T=1)      {mean(base_metrics, 'ece'):.3f}")
     print(f"  ECE  zero-shot as SHIPPED     {mean(base_shipped, 'ece'):.3f}"
           f"   (table says {shipped_temp:.4g} for {bucket})")
@@ -610,11 +609,22 @@ def main(argv: list[str]) -> int:
                                  + (f"-holdout{hold}" if hold else ""))
         record["trained_on"] = len(train_set)
         record["holdout_fold"] = hold
-        rev = ""
+        # What this checkpoint was BUILT from, so a directory of saved
+        # fine-tunes is traceable back to a base model instead of only to a
+        # timestamp. It sat here half-written for a while: a `rev = ""` that
+        # nothing ever read, and an import of `scan_cache_dir` marked unused
+        # because the thing it was imported FOR was never written down. Read
+        # from the local hub cache, and treat a cache that cannot be read as
+        # absent rather than as a failure — the training has already happened
+        # by this line, and provenance is a nicety, not a gate.
         try:
-            from huggingface_hub import scan_cache_dir  # noqa: F401
-        except Exception:  # noqa: BLE001 - the revision is a nicety, not a gate
-            pass
+            from huggingface_hub import scan_cache_dir
+            revs = sorted(f"{r.repo_id}@{r.revision}"
+                          for r in scan_cache_dir().repos)
+        except Exception:  # noqa: BLE001 - see above: never fails a save
+            revs = []
+        if revs:
+            record["hub_revisions"] = revs
         record["trainable_params"] = info["params"]
         record["final_history"] = info["history"]
         record["saved_to"] = str(out_dir)

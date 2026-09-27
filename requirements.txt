@@ -6,7 +6,11 @@
 #
 # Versions below remain compatibility floors. When requirements-lock.txt is
 # present, install.sh and CI add it as a constraints file for reproducibility.
-# Regenerate that file from a clean supported interpreter after upgrades; do
+# The lock pins the RESOLVED CLOSURE (41 packages, not just these 7) — it used
+# to name only the direct dependencies, which let tokenizers, ctranslate2,
+# scipy, scikit-learn, huggingface-hub and ~28 others float on a machine that
+# installs a 3.8 GB neural speech model and holds the mic and the desktop.
+# Regenerate it with the command in its own header after any change here; do
 # not add hashes for packages that have not been resolved.
 #
 # Install everything:        pip install --user -r requirements.txt

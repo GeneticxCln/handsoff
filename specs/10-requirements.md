@@ -103,6 +103,8 @@ it says rather than deciding for it (`core/qs_desk.py`).
   (`core/settings.py:_secure_file`); clipboard/notifications/screen/mic are
   permission-gated; secret paths (credential stores, keys, shell history,
   browser profiles) refused at `read_file`/`watch_file`/`run_command(cat)`;
+  a process's environment or command line refused however it is asked
+  (`/proc/*/environ`, `/proc/*/cmdline`, procps' `e` modifier);
   ICS token never logged or spoken; remote Ollama needs explicit opt-in.
 - N3 Loud degradation: every fault-injection seam (Ollama down, mic empty,
   dbus dead, ENOSPC, missing models, wedged daemon, backward clock) produces

@@ -33,7 +33,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        # 3.14 is not decoration: install.sh takes whatever `python3` is on PATH
+        # with no version check, so on a current Arch box the shipped
+        # interpreter IS 3.14 while the gates below only spoke for 3.12/3.13 —
+        # a green about a python nobody runs. Mirrored in .gitlab-ci.yml as
+        # tests:3.14, and bounded below by the 3.12 floor in specs/90-audit.md.
+        python-version: ["3.12", "3.13", "3.14"]
     env:
       # The offscreen-launch test spawns the real bubble without a display.
       QT_QPA_PLATFORM: offscreen
@@ -135,6 +140,46 @@ jobs:
           python ci/compile_all.py
 
   # Shell syntax checks for every shipped script.
+  # The lint gate (ci/gates.sh `lint`, ruff.toml). It was added because a
+  # 41,000-line tree with no linter is a tree where an unused import, a
+  # shadowed name and a zip() that silently drops a row all look like style —
+  # and all three were present. ruff is pinned here AND in the gate's SKIP
+  # message, so the local answer and this job's answer are the same rules.
+  lint:
+    name: Lint (ruff, pinned rule set)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install the pinned linter
+        run: pip install 'ruff==0.16.4'
+      - name: ruff check (the production sources, per ruff.toml)
+        run: |
+          ruff check --no-cache \
+            handsoff.py handsoff-settings.py hardware.py settings_schema.py \
+            core/ ci/
+
+  # Every markdown anchor link resolves to a real heading (ci/gates.sh
+  # `links`, ci/link_check.py). A heading link is the one link that fails
+  # SILENTLY: rename a heading and nothing complains, the reader clicks and
+  # nothing happens — and 137 of the 138 anchor links here are the two
+  # ledgers' generated indexes, so a rename strands a quarter of the
+  # navigation. Stdlib only: no install step, no network, nothing to be missing.
+  links:
+    name: Docs link check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Every anchor link resolves
+        run: python ci/link_check.py
+
   shell:
     name: Shell syntax checks
     runs-on: ubuntu-latest

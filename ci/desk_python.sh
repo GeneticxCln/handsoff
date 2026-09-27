@@ -8,11 +8,14 @@
 # running a single test. So the gates run on the desk runner, a project runner on
 # the developer's own machine, where a job is not billed at all.
 #
-# That machine is Arch, and its system python is newer than BOTH legs of the
-# matrix (3.14 against 3.12 and 3.13). Running the suite on an interpreter the
-# CI does not use would trade one kind of red for another — a green about a
-# python nobody ships — so the interpreter each job would have got from its image
-# is fetched by uv into a per-version venv under ~/.cache, and reused warm.
+# That machine is Arch, and its system python is 3.14 — the newest leg of the
+# matrix and newer than the 3.12/3.13 legs its other jobs ask for. Running a
+# leg on the desk's own interpreter instead of the one it names would trade one
+# kind of red for another — a green about a python nobody asked for, or a red
+# about one nobody runs — so the interpreter each job would have got from its
+# image is fetched by uv into a per-version venv under ~/.cache, and reused
+# warm. 3.14 is a leg now (the one install.sh would use here), and it needs no
+# special case: the script is version-agnostic and checks the answer.
 #
 # Prints the venv's bin directory on STDOUT and nothing else, so a job can write
 #     - export PATH="$(bash ci/desk_python.sh):$PATH"

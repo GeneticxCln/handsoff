@@ -118,9 +118,12 @@ def _table_body(text: str, header: str) -> list:
     lines = text.splitlines()
     try:
         start = lines.index(header)
-    except ValueError:
+    except ValueError as e:
+        # `from e`: the ValueError names the list that was searched, and a
+        # generator failure with no cause is a failure that reads like the
+        # spec is simply worded differently.
         raise SystemExit(f"the table `{header}` is gone from the spec — this "
-                         f"generator edits it, so reword both together")
+                         f"generator edits it, so reword both together") from e
     rows = []
     for line in lines[start + 2:]:          # header + separator
         if not line.startswith("|"):

@@ -165,6 +165,18 @@ tests:3.13:
     PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
     PY_VERSION: "3.13"
 
+# The third leg is the one the desk actually runs: install.sh takes whatever
+# `python3` is on PATH, which on Arch is 3.14, so a matrix without it graded a
+# python nobody ships. Mirrors GH's `python-version` list — change one, change
+# both. It costs a third suite run on the desk's wall clock, which is why the
+# legs share the `handsoff-suite` resource_group below rather than overlapping.
+tests:3.14:
+  extends: .tests_base
+  variables:
+    QT_QPA_PLATFORM: offscreen
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+    PY_VERSION: "3.14"
+
 # --- Ordering-dependence probe (GH: `order` job) ---------------------------
 # The suite must pass whatever order it runs in; the default collection order
 # is what hides a dependence on it. Two full re-runs: tests shuffled, then
@@ -284,6 +296,23 @@ suite:hosted:
 # py_compile never imports: no Qt libs or dependencies needed at all. It runs on
 # the OLDEST version in the matrix, because that is what catches syntax the
 # newest interpreter accepts and the shipped floor does not.
+# The lint gate, mirroring GH's `lint` job and `ruff.toml` gate-for-gate: the
+# rule set is pinned in one file both sides read, and ruff is pinned here to
+# the same version so the desk's answer and GitHub's are the same answer. It
+# installs ONE thing (ruff) into a throwaway job venv — not the bubble's
+# environment — so this costs the desk a few seconds and nothing else.
+lint:
+  stage: static
+  tags:
+    - desk
+  variables:
+    PY_VERSION: "3.12"
+  script:
+    - *desk_python
+    - pip install 'ruff==0.16.4'
+    - ruff check --no-cache
+      handsoff.py handsoff-settings.py hardware.py settings_schema.py core/ ci/
+
 compile:
   stage: static
   tags:
@@ -296,6 +325,21 @@ compile:
     # added module — exactly how core/theme.py escaped the installer. attic/
     # (provenance archive) stays out, matching .coveragerc's omit list.
     - python ci/compile_all.py
+
+# The docs link gate (ci/gates.sh `links`, ci/link_check.py). A heading link
+# fails silently — rename a heading and markdown does not complain, the reader
+# clicks and nothing happens — and 137 of the 138 anchor links in this repo are
+# the two ledgers' generated indexes. Stdlib only, no network, ~1 s: nothing to
+# install and nothing that can be missing, so this gate never SKIPs.
+links:
+  stage: static
+  tags:
+    - desk
+  variables:
+    PY_VERSION: "3.12"
+  script:
+    - *desk_python
+    - python ci/link_check.py
 
 # --- Shell checks + pin guards (GH: `shell` job) ----------------------------
 shell:

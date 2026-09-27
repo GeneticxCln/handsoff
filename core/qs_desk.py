@@ -190,24 +190,42 @@ def _load(path) -> _Endpoint | None:
     except FileNotFoundError:
         return None
     except OSError as e:
+        # refusal: control_file_stat_fails
         raise DeskError(
             "untrusted",
             f"Quantum Space's control file {path} could not be read "
             f"({type(e).__name__}) — refusing to use it.") from None
     if not _stat.S_ISREG(info.st_mode):
+        # refusal: control_file_is_not_a_regular_file
         raise DeskError(
             "untrusted",
             f"Quantum Space's control file {path} is not a regular file — "
             f"refusing to use it.")
     mode = _stat.S_IMODE(info.st_mode)
     if mode != 0o600:
+        # refusal: control_file_is_not_private
         raise DeskError(
             "untrusted",
             f"Quantum Space's control file {path} is mode {mode:04o}, not 0600 "
             f"— refusing to use a file that holds a control token.")
     try:
         raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # A file that is not TEXT is not a damaged version of the file, it is
+        # a different file. `read_text` says so with UnicodeDecodeError, which
+        # is a ValueError and NOT an OSError, so before this arm it walked
+        # straight out of `_load` — out of every `except DeskError` in the
+        # four desk tools, and into the tool loop's own guard, which reports
+        # the failure as the assistant's check refusing to run the tool
+        # (measured 2026-09-27: a 0600 file whose ninth byte is 0xff). The
+        # file is not ours to trust either way, and the state is `untrusted`.
+        # refusal: control_file_is_not_text
+        raise DeskError(
+            "untrusted",
+            f"Quantum Space's control file {path} is not UTF-8 text — "
+            f"refusing to use it.") from None
     except OSError as e:
+        # refusal: control_file_read_fails
         raise DeskError(
             "untrusted",
             f"Quantum Space's control file {path} could not be read "
@@ -215,16 +233,19 @@ def _load(path) -> _Endpoint | None:
     try:
         data = json.loads(raw)
     except ValueError:
+        # refusal: control_file_is_not_json
         raise DeskError(
             "untrusted",
             f"Quantum Space's control file {path} is not valid JSON — "
             f"refusing to use it.") from None
     if not isinstance(data, dict):
+        # refusal: control_file_is_not_a_json_object
         raise DeskError("untrusted",
                         f"Quantum Space's control file {path} is not a JSON "
                         f"object — refusing to use it.")
     protocol = data.get("protocol")
     if protocol != PROTOCOL:
+        # refusal: control_file_names_another_protocol
         raise DeskError(
             "protocol",
             f"Quantum Space's control file {path} names desk protocol "
@@ -232,11 +253,13 @@ def _load(path) -> _Endpoint | None:
             f"mismatch, not a connection problem.")
     port = data.get("port")
     if not isinstance(port, int) or isinstance(port, bool) or not 0 < port < 65536:
+        # refusal: control_file_names_no_usable_port
         raise DeskError("untrusted",
                         f"Quantum Space's control file {path} names no usable "
                         f"port — refusing to use it.")
     token = data.get("token")
     if not isinstance(token, str) or not token.strip():
+        # refusal: control_file_carries_no_token
         raise DeskError("untrusted",
                         f"Quantum Space's control file {path} carries no control "
                         f"token — refusing to use it.")
@@ -288,16 +311,21 @@ def _status_sentence(status: int) -> str:
     before it ever parsed one.
     """
     if status == 403:
+        # refusal: shape_refused_with_an_origin
         return ("Quantum Space refused the request's shape (403) — it refuses "
                 "any request carrying an Origin header and requires a 127.0.0.1 "
                 "Host, so something on this machine rewrote it. Nothing was read.")
     if status == 405:
+        # refusal: only_post_is_accepted
         return ("Quantum Space only accepts POST (405) — handsoff sent the wrong "
                 "verb.")
     if status == 400:
+        # refusal: the_request_was_not_json
         return "Quantum Space could not parse the request as JSON (400)."
     if status == 413:
+        # refusal: the_request_was_over_the_body_cap
         return "The request was over Quantum Space's body cap (413)."
+    # refusal: an_unmapped_status_is_named_plainly
     return f"Quantum Space refused the request with HTTP {status}."
 
 
@@ -309,6 +337,7 @@ def _rpc_error(method: str, error) -> DeskError:
     message we speak, and it is never rewritten into our own words.
     """
     if not isinstance(error, dict):
+        # refusal: a_malformed_error_object
         return DeskError("error", f"Quantum Space answered {method!r} with a "
                                   f"malformed error.")
     message = str(error.get("message") or "").strip()
@@ -319,20 +348,25 @@ def _rpc_error(method: str, error) -> DeskError:
     if reason == "not-granted":
         # Control switched off, or handsoff not allowed yet: one wire reason,
         # and the desk's sentence is the one that tells them apart.
+        # refusal: not_granted_falls_back_to_our_own_sentence
         return DeskError("not-granted", message or _NOT_GRANTED_FALLBACK,
                          reason=reason, detail=message)
     if reason == "session-not-found":
+        # refusal: a_session_that_is_gone_is_its_own_state
         return DeskError("session-gone", _SESSION_GONE, reason=reason,
                          detail=message)
     if reason == "no-output":
+        # refusal: no_output_falls_back_to_our_own_sentence
         return DeskError("no-output",
                          message or "That session has nothing readable yet.",
                          reason=reason, detail=message)
     if reason in ("unknown-method", "invalid-request"):
+        # refusal: an_unknown_method_is_a_version_mismatch
         return DeskError("error",
                          f"Quantum Space does not accept {method!r} as handsoff "
                          f"sends it ({reason}) — a version mismatch, not a "
                          f"permission problem.", reason=reason, detail=message)
+    # refusal: an_unheard_reason_gets_our_own_sentence
     return DeskError("error",
                      message or f"Quantum Space refused {method!r} "
                                 f"(code {error.get('code')!r}).",
@@ -372,6 +406,7 @@ class Desk:
             if state == "live":
                 return endpoint
             if state == "foreign":
+                # refusal: a_foreign_pid_is_another_apps_file
                 raise DeskError(
                     "untrusted",
                     f"Quantum Space's control file {path} names pid "
@@ -380,6 +415,7 @@ class Desk:
         # Neither profile has a file, or the one that has it names a pid that is
         # gone: from where the user sits those are the same answer, which is why
         # they are one state and one sentence.
+        # refusal: nothing_is_running
         raise DeskError("not-running", _NOT_RUNNING)
 
     def call(self, method: str, params=None) -> dict:
@@ -390,6 +426,7 @@ class Desk:
         try:
             body = json.dumps(payload).encode("utf-8")
         except (TypeError, ValueError):
+            # refusal: a_request_handsoff_cannot_encode
             raise DeskError("error",
                             f"handsoff could not encode its own {method!r} "
                             f"request.") from None
@@ -400,6 +437,7 @@ class Desk:
             response = conn.getresponse()
             status, raw = response.status, response.read()
         except (OSError, http.client.HTTPException) as e:
+            # refusal: nothing_answered_on_the_port
             raise DeskError(
                 "unreachable",
                 f"Quantum Space's control file is there, but nothing answered "
@@ -408,10 +446,12 @@ class Desk:
         finally:
             conn.close()
         if status == 202:
+            # refusal: a_notification_answer_is_not_a_silent_success
             raise DeskError("refused",
                             "Quantum Space took the request as a notification "
                             "and answered nothing (202) — it expected an id.")
         if status != 200:
+            # refusal: the_control_token_was_refused
             raise DeskError("auth" if status == 401 else "refused",
                             ("Quantum Space refused the control token (401) — "
                              "handsoff read it a moment too late. Try again."
@@ -419,10 +459,12 @@ class Desk:
         try:
             doc = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
+            # refusal: the_answer_was_not_json
             raise DeskError("error",
                             f"Quantum Space's answer to {method!r} was not "
                             f"JSON.") from None
         if not isinstance(doc, dict):
+            # refusal: the_answer_was_not_a_json_object
             raise DeskError("error",
                             f"Quantum Space's answer to {method!r} was not a "
                             f"JSON object.")
@@ -430,6 +472,7 @@ class Desk:
             raise _rpc_error(str(method), doc["error"])
         result = doc.get("result")
         if not isinstance(result, dict):
+            # refusal: the_answer_had_no_result
             raise DeskError("error",
                             f"Quantum Space answered {method!r} without a "
                             f"result.")
@@ -444,6 +487,7 @@ class Desk:
         """Offer the desk our name; it answers whether it will hear us."""
         result = self.call("hello", {"client": self.client})
         if result.get("granted") is not True:
+            # refusal: a_hello_that_does_not_grant_is_a_refusal
             raise DeskError("not-granted", _NOT_GRANTED_FALLBACK)
         return result
 
@@ -462,12 +506,14 @@ class Desk:
         """The tail of one session, by the id ``sessions()`` reported."""
         wanted = str(session_id or "").strip()
         if not wanted:
+            # refusal: a_read_needs_a_session
             raise DeskError("error", "No session was named to read.")
         params = {"client": self.client, "id": wanted}
         if lines:
             try:
                 params["lines"] = max(1, min(int(lines), MAX_LINES))
             except (TypeError, ValueError):
+                # refusal: lines_have_to_be_a_number
                 raise DeskError("error",
                                 f"{lines!r} is not a number of lines.") from None
         return self.call("session.read", params)
@@ -490,19 +536,36 @@ def _as_paths(paths) -> list:
     try:
         items = list(paths)
     except TypeError:
+        # refusal: paths_must_be_a_list_of_paths
         raise TypeError(
             f"Desk() wants discovery-file paths, not {type(paths).__name__} — "
             f"pass paths (or nothing, for the profile directories) and the "
             f"client name as client=.") from None
     if not items:
+        # refusal: an_empty_path_list_is_refused
         raise ValueError(
             "Desk() was given an empty path list: there would be nothing to "
             "try, and every call would answer that the desk is not running. "
             "Pass no paths to search the profile directories.")
     out = []
     for item in items:
-        path = Path(item)
+        try:
+            path = Path(item)
+        except TypeError:
+            # One entry of a list is as capable of being a typo as the whole
+            # argument is: `Desk([path, 7])` reached `Path(7)` and answered
+            # with Python's own `argument should be a str or an os.PathLike…`
+            # (measured 2026-09-27), which names neither what to pass nor the
+            # mistake — while `Desk(7)`, the same mistake one spelling out,
+            # is refused by name. It is a TypeError for the same reason: the
+            # thing given is not a path, which is a fact about its type.
+            # refusal: a_path_list_holds_a_non_path
+            raise TypeError(
+                f"Desk() was given a path list holding {item!r}, which is a "
+                f"{type(item).__name__}, not a discovery-file path — pass "
+                f"paths (or nothing, for the profile directories).") from None
         if not path.is_absolute():
+            # refusal: a_client_name_is_not_a_path
             raise ValueError(
                 f"Desk() wants absolute discovery-file paths; got {str(item)!r}, "
                 f"which cannot be one. To name the client, use "
@@ -581,6 +644,7 @@ def resolve_session(sessions, needle) -> dict:
     """
     wanted = str(needle or "").strip()
     if not wanted:
+        # refusal: a_lookup_needs_a_session
         raise DeskError("error", "No session was named to read.")
     low = wanted.lower()
     for session in sessions:
@@ -597,6 +661,7 @@ def resolve_session(sessions, needle) -> dict:
         return partial[0]
     if len(partial) > 1:
         raise _ambiguous(wanted, partial)
+    # refusal: a_name_that_is_gone_lists_what_is_open
     raise DeskError("session-gone",
                     f"{_SESSION_GONE} Open now: "
                     f"{', '.join(session_names(sessions)) or 'nothing'}.",
@@ -604,6 +669,7 @@ def resolve_session(sessions, needle) -> dict:
 
 
 def _ambiguous(needle: str, matches) -> DeskError:
+    # refusal: an_ambiguous_name_is_refused_rather_than_guessed
     return DeskError("error",
                      f"'{needle}' matches more than one session "
                      f"({', '.join(session_names(matches))}) — say which one.")

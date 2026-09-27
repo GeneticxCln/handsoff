@@ -3,7 +3,7 @@
 #
 # Why this exists: the pipeline's gates are the project's definition of "green",
 # but the pipeline is a remote resource with a finite quota, and a run that
-# cannot happen is not a gate at all. This script runs the same seven jobs a
+# cannot happen is not a gate at all. This script runs the same jobs a
 # developer can run here, using the same env vars (.gitlab-ci.yml's coverage
 # job sets COVERAGE_PROCESS_START/COVERAGE_FILE — omitting them is what made an
 # earlier local measurement read 62% instead of 82%), and prints the same
@@ -71,7 +71,7 @@ SEED=${HANDSOFF_ORDER_SEED:-$(git rev-parse --short HEAD 2>/dev/null || echo loc
 JUNIT="$ROOT/tests/report.xml"
 FIRST_FAILURE="$ROOT/tests/report.first-failure.xml"
 
-ALL_GATES="tests order coverage compile shell smoke clean-checkout two-writer"
+ALL_GATES="tests order coverage compile lint links shell smoke clean-checkout two-writer"
 WANT_ORDER=1
 declare -a WANTED=()
 # Which gate failed FIRST. The failure digest below reads the first failing
@@ -385,6 +385,39 @@ gate_coverage() {
 
 gate_compile() {
     "$PYTHON" ci/compile_all.py
+}
+
+# The lint gate. It exists because there was none: a 41,000-line tree with no
+# linter is a tree where an unused import, a shadowed name and a `zip()` that
+# silently drops a row are all indistinguishable from style, and all three were
+# present. The rule set is pinned in ruff.toml and deliberately small — a gate
+# that opens with 200 findings nobody reads is decoration.
+#
+# SKIPs (exit 2, not a pass) when ruff is not installed, because a gate that
+# silently succeeds because it never ran is the exact failure this script
+# exists to avoid. Install it with: pip install --user 'ruff==0.16.4'
+gate_lint() {
+    local ruff
+    if ! ruff=$(command -v ruff 2>/dev/null); then
+        echo "ruff is not on PATH — cannot lint."
+        echo "  install: pip install --user 'ruff==0.16.4'"
+        return 2
+    fi
+    # The production sources, spelled out here as well as in ruff.toml so the
+    # gate says what it covered even when ruff says nothing at all.
+    "$ruff" check --no-cache \
+        handsoff.py handsoff-settings.py hardware.py settings_schema.py \
+        core/ ci/
+}
+
+# A heading link is the only link that fails SILENTLY: rename a heading and
+# markdown does not complain — the reader clicks and nothing happens. 137 of
+# the 138 anchor links in this repository are the two ledgers' generated
+# indexes, so this is the gate that notices a rename stranding a quarter of
+# the navigation. It is cheap (stdlib, no network, ~1 s over 1.5 MB of
+# markdown) and therefore never SKIPs: there is no dependency to be missing.
+gate_links() {
+    "$PYTHON" ci/link_check.py
 }
 
 gate_shell() {
@@ -702,7 +735,7 @@ if [ "$FAILED" = 1 ]; then
                 # Same digest the pipeline's after_script prints, minus the MR comment.
                 "$PYTHON" ci/pytest_summary.py "$FIRST_FAILURE" || true
             else
-                echo "a gate failed before any junit report was written (compile/shell/smoke)."
+                echo "a gate failed before any junit report was written (compile/lint/links/shell/smoke)."
             fi
             ;;
         *)

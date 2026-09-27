@@ -188,6 +188,26 @@ esac
 # rather than reading this file for the literals.
 PYBIN="${HANDSOFF_PYTHON:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}"
 
+# The interpreter is taken as found, with no version check — which is correct
+# for a desktop app (it runs on whatever the machine has) and wrong for a
+# green check, because the suite only ever gates the three versions below. A
+# 3.15 box would install, run and pass the suite locally while every CI job
+# spoke for someone else's python. Said out loud here rather than refused:
+# the install is the user's call, and an untested interpreter is a fact they
+# need, not a reason to stop. 3.14 was added to the matrix for exactly this
+# reason — it is the version an Arch box hands this script.
+_handsoff_py_version() {
+    "$PYBIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo ""
+}
+_PY_VER=$(_handsoff_py_version)
+case "$_PY_VER" in
+    3.12|3.13|3.14) ;;
+    "") echo "    WARN: could not read the version of $PYBIN — the suite gates 3.12, 3.13 and 3.14" ;;
+    *)  echo "    WARN: python $_PY_VER ($PYBIN) is outside the versions the suite gates (3.12, 3.13, 3.14)." >&2
+        echo "    WARN: the install will work, but no CI job speaks for this interpreter." >&2
+        echo "    WARN: run the suite here to find out whether it does: bash ci/gates.sh tests" >&2 ;;
+esac
+
 # A setting exactly as the bubble will see it: `true`/`false` for a bool, the
 # number or text otherwise, nothing at all when it is absent or unusable. Only
 # scalars are printed — a list is not a value any caller here can use, and a
