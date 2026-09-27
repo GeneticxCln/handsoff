@@ -12,6 +12,7 @@ import fnmatch
 import inspect
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -890,13 +891,27 @@ def setting_flag(key: str, default: bool = False) -> bool:
 
 
 def coerce_number_arg(raw, kind) -> "int | float":
-    """int/float for model-supplied args; raises instead of guessing 0."""
+    """int/float for model-supplied args; raises instead of guessing 0.
+
+    Non-finite floats are rejected here rather than left to each tool. `float()`
+    accepts "nan", "inf", "-inf" and "1e400", and NaN then defeats EVERY
+    ordinary range check: `nan < lo` and `nan > hi` are both False, so
+    `if x and (x < lo or x > hi)` lets it straight through. One `nan` reached
+    set_reminder's repeat field, was persisted, and quietly turned a repeating
+    reminder into a one-shot forever (measured 2026-09-27). This is the one
+    place that sees every model-supplied number, so it is the one place that
+    has to refuse them: every float tool arg is a duration or a count, and no
+    duration or count is ever legitimately infinite or NaN.
+    """
     if isinstance(raw, bool):
         raise ValueError(f"expected a number, got {raw!r}")
     try:
-        return kind(raw)
+        value = kind(raw)
     except (TypeError, ValueError) as e:
         raise ValueError(f"expected {kind.__name__}, got {raw!r}") from e
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"expected a finite number, got {raw!r}")
+    return value
 
 
 def _param_schema(func) -> dict:
@@ -3570,9 +3585,24 @@ class ToolBelt:
             repeat = float(repeat_hours)
         except (TypeError, ValueError):
             return 'ERROR: repeat_hours must be a number of hours'
-        if repeat and (repeat < 1 / 60 or repeat > 24 * 31):
+        # The chained form, NOT `repeat and (repeat < lo or repeat > hi)`. Every
+        # comparison with NaN is False, so the `or` form waved it through while
+        # `not (lo <= x <= hi)` — what pomodoro, snooze_reminder and the click
+        # coordinates already use — rejects it, because `lo <= nan` is False and
+        # the chain short-circuits. This was the only NaN-blind range check in
+        # the file, and it guarded the one field that gets written to disk.
+        if repeat and not (1 / 60 <= repeat <= 24 * 31):
             return 'ERROR: repeat_hours must be between ~1 minute and a month'
+        # The confirmation sentence is built BEFORE the store is touched. It
+        # used to be built after, so anything that raised while formatting it
+        # left the reminder saved with no confirmation and an `error` handed
+        # back to the model — the queue and the user were told different
+        # things about the same call (measured 2026-09-27: a non-finite repeat
+        # persisted, then _fmt_dur raised, and the tool reported "that is a bug
+        # in the tool" about what was really a junk argument).
         name = name[:200]
+        rep = f', repeating every {_dep()._fmt_dur(repeat * 3600)}' if repeat else ''
+        reply = f"reminder '{name}' set for {_dep()._fmt_when(due)}{rep}"
         try:
 
             def _set(items: list[dict]) -> list[dict]:
@@ -3584,8 +3614,7 @@ class ToolBelt:
             _dep()._update_reminders(_set)
         except OSError as e:
             return f'ERROR: could not save reminder ({type(e).__name__})'
-        rep = f', repeating every {_dep()._fmt_dur(repeat * 3600)}' if repeat else ''
-        return f"reminder '{name}' set for {_dep()._fmt_when(due)}{rep}"
+        return reply
 
     @tool(gates='reminders', description='List pending reminders, soonest first.')
     def list_reminders(self) -> str:

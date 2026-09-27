@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import subprocess
 import threading
@@ -882,6 +883,17 @@ class ReminderStore:
             try:
                 r["repeat_hours"] = float(r.get("repeat_hours") or 0)
             except (TypeError, ValueError):
+                r["repeat_hours"] = 0.0
+            # A non-finite repeat is junk that survived a write: `float(nan)`
+            # and `float("nan")` both SUCCEED, so the except arm above never saw
+            # it. It then compares False against 0, so `split_due_reminders`
+            # fired the reminder once and never again — silently, across every
+            # restart, because nan is truthy enough to survive `or 0`. And
+            # `list_reminders` formats the same value, so one poisoned entry
+            # took down the listing of every OTHER reminder with it. Reading is
+            # where a value written by an older build gets repaired, so nothing
+            # already on disk stays broken.
+            if not math.isfinite(r["repeat_hours"]):
                 r["repeat_hours"] = 0.0
             out.append(r)
         return out

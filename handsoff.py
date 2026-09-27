@@ -5683,6 +5683,41 @@ def _today_events_summary() -> str:
 
 
 
+#: Number words, anchored so a number word can only ever be a WHOLE word. The
+#: boundary matters: the pattern used to be `(\d+(?:\.\d+)?|a|an|one|two|three)`
+#: with no anchor, so the `a` alternative matched the first LETTER of any word
+#: beginning with a — "an hour" tokenised as ("a", "n"), and "2 hours and 30
+#: minutes" as ("a", "nd"). Both then hit a unit that is not a unit and the
+#: whole parse returned None, so "remind me in an hour" was rejected by
+#: set_reminder with "could not understand when_due" (measured 2026-09-27) —
+#: the single most ordinary way to ask for a reminder in English. Digits
+#: deliberately carry NO trailing boundary, so "1h30m" still reads as 1 hour
+#: and 30 minutes rather than splitting at the digit/letter seam.
+_DURATION_RE = r"(\d+(?:\.\d+)?|an?\b|one\b|two\b|three\b)\s*([a-z]+)"
+
+_DURATION_NUMBERS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}
+
+#: "and" is deliberately NOT special-cased here. It used to be: leaving it as
+#: an unknown unit failed every phrasing that joins two spans, so it was tried
+#: as a connector to skip. A mutation check showed that branch was reachable
+#: only for "2 and 30 minutes" — a number immediately followed by "and" —
+#: because the word boundary above had already stopped "and" being read as a
+#: number word in every ordinary phrasing. So it guarded nothing, and it
+#: quietly turned a malformed phrase into a wrong time (the 2 dropped, 30
+#: minutes kept). A number paired with "and" is now just an unknown unit, and
+#: fails the parse the way "3pm" does.
+
+
+#: "and a half" names a quantity but not a unit, so the unit it refers to is
+#: whichever unit the rest of the phrase ends on — and that is true whichever
+#: side of it the unit sits ("an hour and a half", "one and a half hours"). The
+#: strict number-then-unit pattern cannot see that: in the second phrasing the
+#: number and its unit are separated by exactly these words, so the pair is
+#: lifted out first and the half is added against the unit actually parsed.
+_DURATION_TRAILING_HALF = re.compile(r"\band\s+(?:a\s+|one\s+)?half\b")
+_DURATION_LEADING_HALF = re.compile(r"\ba\s+half\s+([a-z]+)")
+
+
 def _parse_duration(text: str) -> float | None:
     """'in 2 hours 5 minutes' / '45 min' / '3 days' / 'a week' → seconds, or None."""
     t = text.strip().lower()
@@ -5695,14 +5730,38 @@ def _parse_duration(text: str) -> float | None:
         "d": 86400, "day": 86400, "days": 86400,
         "w": 604800, "week": 604800, "weeks": 604800,
     }
+    # "and a half" is lifted out FIRST because it is the specific idiom: it
+    # names a quantity whose unit is whichever unit the rest of the phrase
+    # ends on, and removing it is what lets a number pair with a unit it was
+    # separated from ("one and a half HOURS"). "a half HOUR" is the fallback
+    # for the order where the fraction comes first; doing it the other way
+    # round let the fallback swallow the idiom and dropped the leading number
+    # ("one and a half hours" came to mean half an hour).
+    trailing_half = bool(_DURATION_TRAILING_HALF.search(t))
+    t = _DURATION_TRAILING_HALF.sub(" ", t)
+    t = _DURATION_LEADING_HALF.sub(r"0.5 \1", t)
     total = 0.0
     matched = False
-    for num, unit in re.findall(r"(\d+(?:\.\d+)?|a|an|one|two|three)\s*([a-z]+)", t):
+    units_seen = 0
+    last_unit = 0.0            # seconds in ONE unit, for "an hour and a half"
+    for num, unit in re.findall(_DURATION_RE, t):
         if unit not in units:
             return None
-        n = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}.get(num) or float(num)
+        n = _DURATION_NUMBERS.get(num) or float(num)
         total += n * units[unit]
+        last_unit = float(units[unit])
+        units_seen += 1
         matched = True
+    if trailing_half:
+        # The half belongs to ONE unit, and when the phrase also names another
+        # there is no way to tell which — "an hour and a half and 20 minutes"
+        # charged the half against the trailing 20 minutes and came to 1h20m30s,
+        # a reminder silently half an hour early. A wrong due time is worse than
+        # an honest refusal, and this only fires on a phrase that already has
+        # the idiom plus a second unit.
+        if units_seen != 1:
+            return None
+        total += 0.5 * last_unit
     if not matched or total <= 0:
         return None
     return total
@@ -8175,15 +8234,30 @@ class Assistant(QObject):
         out = self._tools.type_text(text)
         log.info("dictation: typed %d chars", len(text))
         # The tool hands back its text; the KIND is what says whether that text
-        # is a refusal. Sniffing the prefix here was a second, quieter copy of
+        # is a failure. Sniffing the prefix here was a second, quieter copy of
         # the same convention core.tools already owns.
-        if _core_tools.tool_kind(out) == "refused":
-            log.warning("dictation refused: %s", out[:120])
-            self._set_dictation(False, gen, cancel)
-            self._speak("Dictation stopped — I can't type into the focused "
-                        "window.", gen, cancel)
-        else:
+        #
+        # "ok" is the ONLY kind that means the words reached the window. The
+        # test used to be `== "refused"`, which left every other failure kind
+        # reading as SUCCESS: with ydotool down, type_text answers "ERROR:
+        # typing failed entirely", dictation treated that as a normal typing
+        # and went back to idle — so the utterance was consumed, nothing was
+        # typed, NOTHING WAS SPOKEN, and dictation stayed armed. The user
+        # talked into a void with no idea anything had failed (measured
+        # 2026-09-27). A silent loss of what somebody just said aloud is the
+        # worst thing this loop can do, so every non-ok kind is announced, and
+        # both failure kinds stop the mode for the same reason: the next
+        # utterance would hit the same wall and repeat the complaint.
+        kind = _core_tools.tool_kind(out)
+        if kind == "ok":
             self._set(gen, IDLE)
+            return True
+        log.warning("dictation %s: %s", kind, out[:120])
+        self._set_dictation(False, gen, cancel)
+        self._speak("Dictation stopped — I can't type into the focused window."
+                    if kind == "refused" else
+                    "Dictation stopped — typing failed, so what you said did "
+                    "not reach the window.", gen, cancel)
         return True
 
     def _set_dictation(self, on: bool, gen: int,

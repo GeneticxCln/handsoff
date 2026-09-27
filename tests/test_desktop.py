@@ -969,6 +969,66 @@ class TestDictationMode:
         assert a._dictation is False
         assert any("Dictation stopped" in s for s in a.spoken)
 
+    def test_a_failed_typing_is_announced_not_swallowed(self, H, monkeypatch):
+        """A kind other than "ok" is a failure the user MUST hear about.
+
+        The test used to be `== "refused"`, so every other failure kind read as
+        SUCCESS. Driven through the REAL type_text here, not a stub, because
+        the whole defect is in the text the real tool produces: with ydotool
+        unreachable it answers "ERROR: typing failed entirely", dictation
+        treated that as a normal typing, and the utterance was consumed with
+        nothing typed, nothing spoken and the mode still armed — the user talked
+        into a void (measured 2026-09-27).
+        """
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "firefox",
+                                          "title": "Firefox"})
+        monkeypatch.setattr(belt.__class__, "_ydotool",
+                            lambda self, *a: "ydotool: no display socket")
+        a = self._mk(H, monkeypatch)
+        a._dictation = True
+        a._tools = belt
+        out = belt.execute("type_text", {"text": "the quick brown fox"}).text
+        assert out.startswith("ERROR:"), out
+        assert a._try_dictation("the quick brown fox", 1,
+                                threading.Event()) is True
+        assert a._dictation is False
+        assert any("Dictation stopped" in s and "typing failed" in s
+                   for s in a.spoken), a.spoken
+
+    def test_only_an_ok_typing_is_silent(self, H, monkeypatch):
+        """The complement: a successful typing says nothing and keeps the mode.
+        Without this, "announce every non-ok kind" could be satisfied by a
+        branch that never returns to idle.
+
+        The three kinds are the three `tool_kind` can actually return from a
+        tool's own text. "unknown" is NOT one of them — it comes from
+        `ToolResult`'s constructor failing CLOSED on an unrecognised kind
+        string, and a tool that returns bare text never reaches it — so
+        anything beyond these three is unreachable from this loop and pinning
+        it here would pin a fiction.
+        """
+        assert {H._core_tools.tool_kind(t) for t in (
+            "typed 17 chars", "REFUSED: a terminal", "ERROR: it broke")} == {
+            "ok", "refused", "error"}
+        a = self._mk(H, monkeypatch)
+        a._dictation = True
+        for kind, text in (("ok", "typed 17 chars into Firefox"),
+                           ("refused", "REFUSED: the focused window is a terminal"),
+                           ("error", "ERROR: typing failed entirely")):
+            a._dictation = True
+            a.spoken = []
+            monkeypatch.setattr(a, "_tools", types.SimpleNamespace(
+                type_text=lambda t, _t=text: _t))
+            assert a._try_dictation("hello there", 1, threading.Event()) is True
+            said = [s for s in a.spoken if "Dictation stopped" in s]
+            if kind == "ok":
+                assert a._dictation is True and not said, (kind, a.spoken)
+            else:
+                assert a._dictation is False, kind
+                assert said, (kind, a.spoken)
+
     def test_socket_actions_exist(self, H):
         assert {"dictation", "dictation-on", "dictation-off"} <= H.PTT_ACTIONS
         usage = H.__dict__.get("USAGE", "") or inspect.getsource(H)[

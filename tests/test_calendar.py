@@ -85,6 +85,120 @@ class TestRemindersAndCalendar:
         out, err = belt.execute("cancel_reminder", {"name": "nope"})
         assert not err and "no reminder" in out, out
 
+    def test_a_non_finite_repeat_is_bad_arguments_and_saves_nothing(
+            self, H, monkeypatch, tmp_path):
+        """One junk argument must not reach the disk, and must be NAMED as the
+        argument it is.
+
+        `float()` accepts "nan", and NaN then defeats every ordinary range
+        check — `nan < lo` and `nan > hi` are both False, so set_reminder's
+        `if repeat and (repeat < lo or repeat > hi)` waved it through, saved
+        `repeat_hours: NaN`, and only then raised while formatting the
+        confirmation (measured 2026-09-27). The result outlived the call: NaN
+        compares False against 0, so the reminder fired once and never again,
+        bare `NaN` is not valid JSON, and list_reminders — which shows EVERY
+        reminder — died on it too, reporting "that is a bug in the tool" about
+        what was really a junk argument.
+        """
+        rf = tmp_path / "reminders.json"
+        monkeypatch.setattr(H, "REMINDERS_FILE", rf)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        for junk in ("nan", "NaN", "inf", "-inf", "1e400"):
+            out, err = belt.execute("set_reminder",
+                                    {"wake_name": "standup",
+                                     "when_due": "in 5 minutes",
+                                     "repeat_hours": junk})
+            assert err, junk
+            # named as the ARGUMENT, not as a bug in the tool
+            assert "bad arguments" in out and "bug in the tool" not in out, out
+        # nothing was written at all, so there is no corrupt value to inherit
+        assert not rf.exists()
+        # and the binder is where it is caught, for every float tool arg
+        for junk in ("nan", "inf"):
+            for name, args in (("pomodoro", {"action": "start",
+                                             "work_minutes": junk}),
+                               ("snooze_reminder", {"name": "x",
+                                                    "minutes": junk}),
+                               ("wait", {"seconds": junk})):
+                res = belt.execute(name, args)
+                assert res.kind == "error" and "bad arguments" in res.text, (junk, res)
+
+    def test_the_repeat_range_check_catches_a_non_finite_float_by_itself(
+            self, H, monkeypatch, tmp_path):
+        """The tool's OWN range check, reached the way a second caller reaches
+        it: directly, not through the binder that now rejects non-finite floats.
+
+        The binder is the primary guard, so the range check's own NaN-safety was
+        unpinned — reverting it to `repeat and (repeat < lo or repeat > hi)`
+        changed no test, because NaN never got that far. Two guards that are
+        never both exercised is one guard with a comment. This calls the method
+        with a NaN float, which is what a store-loaded or in-process caller
+        hands it, and requires the chained comparison to catch it.
+        """
+        rf = tmp_path / "reminders.json"
+        monkeypatch.setattr(H, "REMINDERS_FILE", rf)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        for junk in (float("nan"), float("inf"), float("-inf")):
+            out = belt.set_reminder("standup", "in 5 minutes", junk)
+            assert out.startswith("ERROR: repeat_hours must be"), (junk, out)
+        assert not rf.exists()   # a refused range must not reach the disk
+
+    def test_a_confirmation_that_cannot_be_built_saves_nothing(
+            self, H, monkeypatch, tmp_path):
+        """The reply is built BEFORE the store is written, so a failure while
+        building it leaves the queue untouched.
+
+        It used to be built after. The store was written, then the sentence was
+        formatted, then the exception went back to the model as a tool bug —
+        so the queue and the person were told two different things about one
+        call (measured 2026-09-27: a non-finite repeat persisted, _fmt_dur
+        raised, and the tool reported "that is a bug in the tool, not a
+        refusal"). Whatever raises in here now, nothing is saved.
+        """
+        rf = tmp_path / "reminders.json"
+        monkeypatch.setattr(H, "REMINDERS_FILE", rf)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        belt.execute("set_reminder", {"wake_name": "call mum",
+                                      "when_due": "in 1 hour"})
+        assert [r["name"] for r in H.json.loads(rf.read_text())] == ["call mum"]
+
+        def boom(seconds):
+            raise RuntimeError("formatter exploded")
+        monkeypatch.setattr(H, "_fmt_dur", boom)
+        out, err = belt.execute("set_reminder", {"wake_name": "call dad",
+                                                 "when_due": "in 2 hours",
+                                                 "repeat_hours": 3})
+        assert err, out
+        # the existing reminder is untouched and the new one was never added
+        assert [r["name"] for r in H.json.loads(rf.read_text())] == ["call mum"]
+
+    def test_a_store_poisoned_by_an_older_build_is_repaired_when_it_is_read(
+            self, H, monkeypatch, tmp_path):
+        """A non-finite repeat already on disk must not stay broken.
+
+        `float(r.get("repeat_hours") or 0)` cannot catch it: `float(nan)`
+        SUCCEEDS, and nan is truthy enough to survive the `or 0`. So reading is
+        where a value written by an older build gets repaired — otherwise one
+        poisoned entry keeps taking down the listing of every other reminder
+        for as long as the file exists.
+        """
+        rf = tmp_path / "reminders.json"
+        rf.write_text(H.json.dumps(
+            [{"name": "poisoned", "due": H.time.time() + 600,
+              "repeat_hours": float("nan")},
+             {"name": "healthy", "due": H.time.time() + 1200,
+              "repeat_hours": 2}]))
+        monkeypatch.setattr(H, "REMINDERS_FILE", rf)
+        loaded = H._load_reminders()
+        by_name = {r["name"]: r for r in loaded}
+        assert by_name["poisoned"]["repeat_hours"] == 0.0
+        assert by_name["healthy"]["repeat_hours"] == 2.0
+        # the listing survives, and shows the other reminder too
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute("list_reminders", {})
+        assert not err, out
+        assert "poisoned" in out and "healthy" in out, out
+
     def test_due_reminders_repeat_advance_no_backlog(self, H):
         now = H.time.time()
         fired, kept = H._due_reminders(
@@ -190,6 +304,56 @@ class TestRemindersAndCalendar:
         assert H._parse_duration("3 days") == 3 * 86400
         assert H._parse_duration("bananas") is None
         assert H._parse_duration("in 0 minutes") is None
+
+    def test_a_number_word_is_a_whole_word(self, H):
+        """A number word has to be a WHOLE word, and "and" is a connector.
+
+        The pattern had no boundary on its word alternatives, so the `a`
+        matched the first LETTER of any word starting with one: "an hour"
+        tokenised as ("a", "n") and "2 hours and 30 minutes" as ("a", "nd").
+        Both landed on a unit that is not a unit, the parse returned None, and
+        set_reminder answered "could not understand when_due" — measured
+        2026-09-27, on the most ordinary way to ask for a reminder in English.
+        """
+        for phrase, want in [("in an hour", 3600),
+                             ("in 2 hours and 30 minutes", 9000),
+                             ("in an hour and 20 minutes", 4800),
+                             ("in one hour", 3600),
+                             ("in two hours", 7200),
+                             ("in three days", 3 * 86400),
+                             ("in 2 hrs and 5 mins", 7500),
+                             # "1h30m" still splits at the digit/letter seam,
+                             # so the boundary went on the WORDS only
+                             ("in 1h30m", 5400),
+                             ("in 1.5 hours", 5400)]:
+            assert H._parse_duration(phrase) == want, phrase
+        # still fails closed on a unit that is not one, connector or not
+        for phrase in ("meet at 3pm", "in 2 apples", "in a fortnight",
+                       "in 2 apples and 3 hours", "in 2 and 30 minutes"):
+            assert H._parse_duration(phrase) is None, phrase
+
+    def test_half_a_span_means_half_of_the_unit_beside_it(self, H):
+        """The idiom works whichever side of the phrase the unit sits on.
+
+        "and a half" names a quantity without naming a unit, and the unit is
+        wherever the rest of the phrase puts it — so the two orders have to
+        agree, or one of them silently means half of what was asked for.
+        """
+        assert H._parse_duration("in an hour and a half") == 5400
+        assert H._parse_duration("in one and a half hours") == 5400
+        assert H._parse_duration("in 2 hours and a half") == 9000
+        assert H._parse_duration("in a half hour") == 1800
+        assert H._parse_duration("in a half hour and 10 minutes") == 2400
+        # A half alone, or with no unit to halve, is not a duration
+        for phrase in ("half", "in half", "in a half"):
+            assert H._parse_duration(phrase) is None, phrase
+
+    def test_an_unattributable_half_is_refused_rather_than_guessed(self, H):
+        """"an hour and a half and 20 minutes" names two units, and the half
+        belongs to one of them. Charging it against the trailing 20 minutes
+        gave 1h20m30s — a reminder half an hour early, which is worse than
+        saying nothing, so the ambiguity is refused."""
+        assert H._parse_duration("in an hour and a half and 20 minutes") is None
 
     def test_prompt_documents_reminders(self, H):
         assert "set_reminder" in H.SYSTEM_PROMPT
