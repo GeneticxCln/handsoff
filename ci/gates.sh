@@ -479,6 +479,12 @@ gate_smoke() {
     out=$(bash install.sh --help) || return 1
     echo "$out" | grep -q "Options:" || return 1
     echo "$out" | grep -q -- "--uninstall"
+    # --skip-system-packages is what a non-interactive redeploy needs, and a
+    # redeploy that cannot see it stops at a sudo password prompt having
+    # installed nothing. Checked HERE as well as in the suite because this gate
+    # is a second, and the flag is the difference between a deploy that works
+    # unattended and one that does not.
+    echo "$out" | grep -q -- "--skip-system-packages"
 }
 
 # Does a fresh checkout of HEAD agree with itself? The freshness guard reads the

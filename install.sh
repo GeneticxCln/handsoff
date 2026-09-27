@@ -24,11 +24,47 @@ case "${1:-}" in
         echo "  --help            show this help"
         echo "  --rehearsal       install into HANDSOFF_REHEARSAL_ROOT without host changes"
         echo "  --rollback        restore the previous release saved by the last install"
+        echo "  --skip-system-packages  install without the pacman step (no sudo prompt)"
         echo "  --uninstall       remove binaries, unit and snippet"
         echo "  --uninstall --purge  also wipe config/state (backs up first)"
         exit 0
         ;;
 esac
+
+# ONE resolved answer about the system packages, read at both places that must
+# agree on it: the pacman transaction in step 1 and the ollama system service in
+# step 8. Skipping the packages is a PROMISE not to touch the system, so the
+# service start has to honour the same answer — otherwise the flag removes the
+# sudo prompt at step 1 and then asks for a password again at step 8, which is
+# the failure it exists to prevent (measured 2026-09-27: a non-interactive
+# redeploy stopped dead on `sudo pacman` before installing anything).
+#
+# $1 only, like every other mode flag in this file (`--rehearsal`, `--rollback`,
+# `--uninstall` are all positional, `--purge` is the $2 modifier). A flag that
+# worked in any position would be worse than this one: `--skip-system-packages
+# --rollback` would quietly run a full install instead of rolling back, and
+# nothing would say so.
+#
+# A function, and not four inline lines, so the suite can slice it out of the
+# SHIPPED file and run it — the same trick `_installer_function` uses for the
+# resolvers. A parse nobody exercises is a parse that rots, and this one is the
+# difference between a redeploy that works unattended and one that stops at a
+# password prompt.
+parse_args() {
+    SKIP_SYSTEM_PKGS=0
+    if [ "${1:-}" = "--skip-system-packages" ]; then
+        SKIP_SYSTEM_PKGS=1
+    fi
+    # HANDSOFF_SKIP_SYSTEM_PKGS=1 is the pre-flag spelling and still works. The
+    # rehearsal tests pass it, the audit record quotes it, and a deploy script
+    # somebody already wrote should not stop working because the flag arrived;
+    # it is read ONCE, here, so the two spellings cannot drift apart.
+    if [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ]; then
+        SKIP_SYSTEM_PKGS=1
+    fi
+    export SKIP_SYSTEM_PKGS
+}
+parse_args "${1:-}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REHEARSAL=0
@@ -480,10 +516,11 @@ echo "==> [1/8] System packages (pacman)"
 PYTHON_PKGS="python-pyside6 python-sounddevice python-numpy python-pip"
 ARCH_PKGS=""
 PACMAN="sudo pacman"
-# HANDSOFF_SKIP_SYSTEM_PKGS=1: trust the system packages are already present
-# (CI, redeploys from a non-interactive shell where sudo cannot prompt, or a
-# pre-provisioned box). Package probes still run; only the transaction is
-# skipped.
+# --skip-system-packages (or HANDSOFF_SKIP_SYSTEM_PKGS=1): trust the system
+# packages are already present (CI, redeploys from a non-interactive shell
+# where sudo cannot prompt, or a pre-provisioned box). Package probes still
+# run; only the transaction is skipped, so the run still says out loud which
+# packages it wanted and did not install.
 if [ "$REHEARSAL" = "1" ]; then
     echo "    skipping system package probes and transaction (rehearsal)"
     PACMAN=""
@@ -496,8 +533,8 @@ else
         fi
     done
 fi
-if [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ]; then
-    echo "    skipping system package transaction (HANDSOFF_SKIP_SYSTEM_PKGS=1)"
+if [ "$SKIP_SYSTEM_PKGS" = "1" ]; then
+    echo "    skipping system package transaction (--skip-system-packages)"
     PACMAN=""
 fi
 if [ "${HANDSOFF_FULL_UPGRADE:-0}" = "1" ]; then
@@ -1110,8 +1147,11 @@ elif ! curl -s --max-time 2 "$OLLAMA_HOST_URL/api/tags" >/dev/null; then
         echo "    $OLLAMA_HOST_URL (settings.json ollama_host) is not answering, and it is not"
         echo "    on this machine — the local ollama service is left alone. Start ollama"
         echo "    on that host, or point ollama_host back at $OLLAMA_DEFAULT."
-    # ponytail: never touch the system service when pkgs are skipped or opted out.
-    elif [ "${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1" ] || [ "${HANDSOFF_NO_OLLAMA_SERVICE:-0}" = "1" ]; then
+    # ponytail: never touch the system service when pkgs are skipped or opted
+    # out. Reads the ONE resolved answer parse_args exported, not the env var,
+    # so a redeploy that skipped the packages cannot be asked for a sudo
+    # password at step 8 after declining one at step 1.
+    elif [ "$SKIP_SYSTEM_PKGS" = "1" ] || [ "${HANDSOFF_NO_OLLAMA_SERVICE:-0}" = "1" ]; then
         echo "    ollama not running — leaving the service alone (skip/opt-out)"
     else
         echo "    starting the ollama service ..."

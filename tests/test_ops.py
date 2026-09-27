@@ -2354,6 +2354,22 @@ def _installer_function(name: str) -> str:
     return "".join(lines[start:end + 1])
 
 
+def _installer_call(name: str) -> str:
+    """The shipped top-level call to `name`, verbatim.
+
+    Slicing out a FUNCTION and calling it with an invocation written here tests
+    the function, not the WIRING — and a mutation that turned the shipped
+    `parse_args "${1:-}"` into `parse_args "$@"` survived exactly that way,
+    because the harness supplied its own call and never saw the real one. The
+    call is part of the decision too, so it is sliced and run like everything
+    else.
+    """
+    for line in _installer_source().splitlines():
+        if line.startswith(f"{name} ") or line == name:
+            return line
+    raise AssertionError(f"install.sh never calls {name}")
+
+
 def _installer_assignment(name: str) -> str:
     """The literal value of a top-level `NAME="..."` assignment."""
     found = re.search(rf'^{re.escape(name)}="([^"]*)"', _installer_source(), re.M)
@@ -2419,6 +2435,84 @@ def _run_ollama_tool_check(tmp_path, output: str, returncode: int = 0) -> str:
                             text=True, env=env)
     assert result.returncode == 0, result.stderr
     return result.stdout
+
+
+class TestInstallerSystemPackages:
+    """`--skip-system-packages`: the flag a non-interactive redeploy needs.
+
+    A redeploy from a script or an agent hit `sudo pacman` at step 1 and died
+    there, installing nothing (measured 2026-09-27, and again on 2026-09-25 and
+    2026-09-21 before it). The escape hatch existed, but only as an environment
+    variable — invisible in `--help`, undiscoverable by anyone who reads the
+    options list, and the sort of thing an unattended run cannot guess.
+    """
+
+    def _resolved(self, argv=(), env=None) -> str:
+        """Run the SHIPPED parse_args and report what it resolved to."""
+        lines = ["set -eu",
+                 _installer_function("parse_args"),
+                 _installer_call("parse_args"),
+                 'printf "%s" "$SKIP_SYSTEM_PKGS"']
+        child = dict(os.environ)
+        child.pop("HANDSOFF_SKIP_SYSTEM_PKGS", None)
+        child.update(env or {})
+        out = subprocess.run(["bash", "-c", "\n".join(lines), "--", *argv],
+                             capture_output=True, text=True, env=child)
+        assert out.returncode == 0, out.stderr
+        return out.stdout
+
+    def test_the_flag_is_the_way_to_skip_and_the_env_var_still_works(self):
+        assert self._resolved(("--skip-system-packages",)) == "1"
+        assert self._resolved(()) == "0"
+        # the flag does not fire on some other argument
+        assert self._resolved(("--rehearsal",)) == "0"
+        # the pre-flag spelling is honoured, so an existing deploy script keeps
+        # working: it is read ONCE and both spellings land on the same answer
+        assert self._resolved((), {"HANDSOFF_SKIP_SYSTEM_PKGS": "1"}) == "1"
+        assert self._resolved(("--skip-system-packages",),
+                              {"HANDSOFF_SKIP_SYSTEM_PKGS": "1"}) == "1"
+        # and anything else in the environment is not mistaken for consent
+        assert self._resolved((), {"HANDSOFF_SKIP_SYSTEM_PKGS": "0"}) == "0"
+
+    def test_the_flag_is_in_help_so_it_can_be_discovered_at_all(self):
+        """The whole point: an env var cannot be found by reading the options."""
+        out = subprocess.run(["bash", str(HERE / "install.sh"), "--help"],
+                             capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        assert "--skip-system-packages" in out.stdout, out.stdout
+        assert "no sudo prompt" in out.stdout, out.stdout
+
+    def test_the_flag_is_positional_like_every_other_mode_flag(self):
+        """`$1` only, deliberately — and this is what pins that decision.
+
+        `--rollback`, `--rehearsal` and `--uninstall` are all read from `$1`
+        (`--purge` is the `$2` modifier). A flag that fired in ANY position
+        would make `--skip-system-packages --rollback` run a full install where
+        the user asked for a rollback, and nothing in the output would say so.
+        So the second position resolves to "do not skip", not to "skip anyway".
+        """
+        assert self._resolved(("--rehearsal", "--skip-system-packages")) == "0"
+
+    def test_both_decision_sites_read_the_one_resolved_answer(self):
+        """Skipping the packages is a promise not to touch the system.
+
+        Step 8 starts the ollama SYSTEM service with sudo when the brain is not
+        answering, so if that site read the environment variable directly while
+        step 1 read the flag, an unattended redeploy would decline a password at
+        step 1 and be asked for one at step 8 — the exact failure the flag
+        exists to prevent, and one no `--help` reader would predict.
+        """
+        source = _installer_source()
+        # read in exactly one place, so the two spellings cannot drift
+        assert source.count('"${HANDSOFF_SKIP_SYSTEM_PKGS:-0}" = "1"') == 1, (
+            "the environment variable must be resolved in ONE place")
+        for site in ('if [ "$SKIP_SYSTEM_PKGS" = "1" ]; then',
+                     'elif [ "$SKIP_SYSTEM_PKGS" = "1" ]'):
+            assert site in source, site
+        # and the service branch must not consult the variable itself
+        service = source.split("# ponytail: never touch the system service")[1]
+        assert "HANDSOFF_SKIP_SYSTEM_PKGS" not in service.split("fi")[0], (
+            "the ollama service branch must read the resolved answer")
 
 
 class TestInstallerRehearsal:
