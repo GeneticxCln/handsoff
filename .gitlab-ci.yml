@@ -326,6 +326,27 @@ compile:
     # (provenance archive) stays out, matching .coveragerc's omit list.
     - python ci/compile_all.py
 
+# The mutation gate (ci/gates.sh `mutation`, ci/mutation_gate.py). Would the
+# tests this change SHIPPED notice if the code it touched were wrong? A green
+# suite and a test that asserts nothing are the same observation from the
+# outside — and this repository was bitten by that twice in one session, when a
+# mutation harness scored 11 of 11 mutations "caught" while every run was
+# failing for want of pytest. So the gate refuses to score anything unless its
+# OWN baseline is green, which is the habit the first run did not have.
+#
+# It lays HEAD down in a scratch git worktree and breaks the code there, never
+# in the checkout the job is running in, and it needs a history to diff against.
+mutation:
+  stage: static
+  tags:
+    - desk
+  variables:
+    PY_VERSION: "3.12"
+  script:
+    - *desk_python
+    - pip install pytest
+    - python ci/mutation_gate.py --base HEAD~1
+
 # The docs link gate (ci/gates.sh `links`, ci/link_check.py). A heading link
 # fails silently — rename a heading and markdown does not complain, the reader
 # clicks and nothing happens — and 137 of the 138 anchor links in this repo are

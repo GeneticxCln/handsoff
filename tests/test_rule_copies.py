@@ -29,12 +29,16 @@ there.
 
 Four grades, and the tree settles into them:
 
-  MIRROR   a program re-exposes a core rule as `_name` (19 today). The mirror
+  MIRROR   a program re-exposes a core rule as `_name` or as
+           `_fallback_name` (24 today, 5 of them the second form). The mirror
            may add bookkeeping — a GPU touch, a repaint, an error wrapper — but
            it must still NAME the rule it mirrors. A mirror that grows its own
            logic stops naming it, and that is the moment there are two rules.
-           No manifest: all 19 already hold, so this is a property of the tree
-           rather than a list of promises.
+           No manifest: all 24 already hold, so this is a property of the tree
+           rather than a list of promises. The `_fallback_` form was added
+           after measurement showed the whole family was graded NOTHING —
+           see `FALLBACK_PREFIX` — which is the defect class this file exists
+           for, invisible to the file written to find it.
   SEAM     one name, two files, the second re-exposing the first (11 today).
   COPY     one name, two files, two implementations of the same rule (1 today,
            `_http_get`). The check is that the two bodies are the SAME code:
@@ -141,8 +145,49 @@ def _fingerprint(node: ast.AST) -> str:
     return hashlib.sha256(ast.dump(clone).encode()).hexdigest()[:12]
 
 
-def _mirrors(mods) -> dict[str, list[tuple[str, str, ast.AST]]]:
-    """A program's module-level `_name`, where a core module has `name`."""
+#: The SECOND naming convention this file knows, for the copies that cannot be
+#: a `_name` mirror: `_fallback_<name>` in a program, `<name>` in a core module.
+#:
+#: Found by measurement, not by design, and the family it covers is the one
+#: this repository has been bitten by four times. All five of these were graded
+#: NOTHING before this was added — not MIRROR, because `lstrip("_")` leaves
+#: `fallback_` on the front, not SEAM, because the name is defined in ONE file,
+#: and not a branch copy, because they are module level rather than inside the
+#: `except ImportError`. The whole family that produces these defects was
+#: invisible to the census written to catch exactly that, and adding a sixth
+#: one would have been invisible too.
+FALLBACK_PREFIX = "fallback_"
+
+
+def _owner_names(name: str) -> list[str]:
+    """The core-module names a program's definition could be mirroring.
+
+    Both conventions, in order, because a name may match either. Keeping them
+    as alternatives rather than a substitution is what leaves the nineteen
+    existing mirrors derived exactly as they were.
+    """
+    bare = name.lstrip("_")
+    out = [bare]
+    if bare.startswith(FALLBACK_PREFIX) and len(bare) > len(FALLBACK_PREFIX):
+        owner = bare[len(FALLBACK_PREFIX):]
+        # A core rule may be PRIVATE too, which is the case for two of the
+        # five: `core/brain.py` holds `_messages_system_first` and
+        # `_read_http_error`, so the fallback mirrors a name that also starts
+        # with an underscore.
+        out += [owner, f"_{owner}"]
+    return out
+
+
+def _mirrors(mods) -> dict[str, list[tuple[str, str, ast.AST, str]]]:
+    """A program's module-level `_name`, where a core module has `name`.
+
+    Each site is `(program, owner_file, node, owner)`. The owner is CARRIED
+    rather than recovered from the node at the check, because the two naming
+    conventions disagree about it: a `_name` mirror is named by stripping the
+    underscore, a `_fallback_name` mirror by stripping the infix as well, and
+    re-deriving it downstream is how one of the two would end up checked
+    against the wrong name — which is the defect this file exists to find.
+    """
     out: dict[str, list[tuple[str, str, ast.AST]]] = {}
     for pname, defs in mods.items():
         if pname not in PROGRAMS:
@@ -150,13 +195,13 @@ def _mirrors(mods) -> dict[str, list[tuple[str, str, ast.AST]]]:
         for name, node in defs.items():
             if not name.startswith("_") or name.startswith("__"):
                 continue
-            owner = name.lstrip("_")
-            owners = sorted(c for c, cdefs in mods.items()
-                            if c != pname and c not in PROGRAMS
-                            and owner in cdefs)
-            for owner_file in owners:
+            owners = sorted({(c, owner) for owner in _owner_names(name)
+                             for c, cdefs in mods.items()
+                             if c != pname and c not in PROGRAMS
+                             and owner in cdefs})
+            for owner_file, owner in owners:
                 out.setdefault(f"{pname}:{name}", []).append(
-                    (pname, owner_file, node))
+                    (pname, owner_file, node, owner))
     return out
 
 
@@ -211,7 +256,7 @@ def _defs_under(node, prefix: str = "") -> list[tuple[str, ast.AST]]:
 class TestAMirrorAlwaysNamesItsOwner:
     """The property with no manifest behind it, because the tree satisfies it.
 
-    All nineteen hold today, which is what makes it a property rather than a
+    All twenty-four hold today, which is what makes it a property rather than a
     list of promises: the check below is "a mirror mentions the rule it
     mirrors", and nothing in this file has to be updated for it to keep
     running. A mirror that grows its own logic stops mentioning the owner, and
@@ -225,14 +270,13 @@ class TestAMirrorAlwaysNamesItsOwner:
             "the mirror derivation found nothing — the sweep has stopped "
             "seeing the shape it exists for, and a guard that finds nothing "
             "passes")
-        assert len(mirrors) >= 19, (
-            f"only {len(mirrors)} mirrors found where there were 19; the "
-            "derivation is not looking at the tree the manifest was written "
+        assert len(mirrors) >= 24, (
+            f"only {len(mirrors)} mirrors found where there were 24; the "
+            "derivation is not looking at the tree the floor was written "
             "against")
         silent = {}
         for key, sites in sorted(mirrors.items()):
-            pname, owner_file, node = sites[0]
-            owner = node.name.lstrip("_")
+            pname, owner_file, node, owner = sites[0]
             source = _body(ROOT / pname, node)
             # Loose on purpose: the delegation is not always a call. Four of
             # these go through `getattr(SCHEMA, "page_groups")` and one through
@@ -260,9 +304,9 @@ class TestAMirrorAlwaysNamesItsOwner:
         one shows up here rather than as a silent second seam.
         """
         mirrors = _mirrors(_by_file())
-        pairs = [(pname, owner_file, node.name)
+        pairs = [(pname, owner_file, node.name, owner)
                  for sites in mirrors.values()
-                 for pname, owner_file, node in sites]
+                 for pname, owner_file, node, owner in sites]
         assert len(pairs) == len(set(pairs)), (
             f"a rule is mirrored twice: "
             f"{[p for p in pairs if pairs.count(p) > 1]}")

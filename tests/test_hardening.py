@@ -744,6 +744,91 @@ class TestMissingBrainFallback:
 
         report["core_refused"] = core_arm("refused")
         report["core_missing_model"] = core_arm("404")
+
+        # ---- the system-first fold, in BOTH arms ------------------------
+        # A fourth copy of a rule, and the one nothing held: measured
+        # 2026-09-27 by driving this class with a conversation carrying a
+        # per-turn note as a system message, the shape the rule exists for.
+        # Both arms put it on the wire AFTER the first
+        # (['system', 'user', 'system', 'assistant', 'user']), where Ollama
+        # answers the whole request with HTTP 500 -- so a turn was lost on
+        # exactly the bundles this class is here to keep working, and silently
+        # worked everywhere `core/brain.py` loads.
+        TAIL = [{"role": "system", "content": "you are a voice assistant"},
+                {"role": "user", "content": "what is the weather"},
+                {"role": "system", "content": "the user is in Ghent"},
+                {"role": "assistant", "content": "it is raining"},
+                {"role": "user", "content": "and tomorrow?"}]
+        # a tail system message with NO CONTENT: still a system message in a
+        # position the renderer refuses, and core's copy drops it.
+        EMPTY = [{"role": "system", "content": "you are a voice assistant"},
+                 {"role": "user", "content": "what is the weather"},
+                 {"role": "system", "content": ""}]
+        # TWO leading system messages, so `head[1:]` is non-empty. Without
+        # this shape the first `parts = [...]` line is dead: measured as a
+        # surviving mutation, because a corpus with one leading system message
+        # leaves that list empty however it is written.
+        TWO_HEADS = [{"role": "system", "content": "you are a voice assistant"},
+                     {"role": "system", "content": "answer in one sentence"},
+                     {"role": "user", "content": "what is the weather"},
+                     {"role": "system", "content": "the user is in Ghent"}]
+        # A LEADING system message with no content AND a tail one with no
+        # content, which is the only input the empty-tail drop actually
+        # decides. Both halves are needed and both were arrived at by the
+        # corpus being wrong first: a lone empty leading system is answered by
+        # the early return (there is no tail system, so nothing is out of
+        # order) and a non-empty leading system is answered identically by the
+        # drop and by the merge, which is why two earlier corpora reported the
+        # drop as an equivalent mutant. Here the merge path would hand back
+        # [{"role": "system", "content": ""}] — legal for Ollama, and a system
+        # prompt with nothing in it. This is the shape the original core
+        # defect had: an empty re-injected note.
+        EMPTY_HEAD = [{"role": "system", "content": ""},
+                      {"role": "user", "content": "what is the weather"},
+                      {"role": "system", "content": ""}]
+        SHAPES = (TAIL, EMPTY, TWO_HEADS, EMPTY_HEAD)
+
+        captured = []
+
+        def wire(messages, stream):
+            sent2 = []
+
+            def rec(req, timeout=None):
+                captured.append(1)
+                sent2.append(json.loads(req.data.decode()))
+                return StreamResp([(json.dumps(
+                    {"message": {"content": "ok"}}) + EOL).encode()])
+            if stream:
+                legacy.ollama_chat_stream(
+                    messages, queue.Queue(), None, None, base=BASE, model="m",
+                    num_ctx=8, guard=lambda: None, logger=log, urlopen=rec)
+            else:
+                legacy.ollama_chat(
+                    messages, None, base=BASE, model="m", num_ctx=8,
+                    guard=lambda: None, logger=log, urlopen=rec)
+            return sent2[0]
+
+        report["fold_wire"] = [wire(m, st) for m in SHAPES
+                               for st in (False, True)]
+        # How many requests were ACTUALLY opened. This is the only evidence
+        # here that a fold function cannot forge: the payload's `stream` and
+        # `model` can be written by hand, and the folded list can be computed
+        # without sending anything, so a driver that never touched the wire
+        # satisfied every other assertion — measured twice, as two different
+        # forgeries of the same hole. A request was opened or it was not.
+        report["wire_calls"] = len(captured)
+        # the SAME lists through core's own fold, so the report carries both
+        # and the test compares rather than re-deriving the expectation
+        report["fold_core"] = [real_brain._messages_system_first(m, log)
+                               for m in SHAPES]
+        # The copy called DIRECTLY, as a third source. Without it the two above
+        # can be the same function and the equality below is a tautology:
+        # measured as a surviving mutation, where recording core's answer as
+        # what went on the wire left every assertion passing. Tying the wire to
+        # the copy that produced it, and the copy to core, is what makes the
+        # three distinct.
+        report["fold_legacy"] = [legacy._messages_system_first(m, log)
+                                 for m in SHAPES]
         print(json.dumps(report))
         """
     )
@@ -774,6 +859,91 @@ class TestMissingBrainFallback:
         assert report["chat"] == {"content": "ok"}
         assert report["call_tools"] == [True, False]
         assert report["state"] == {"tools_supported": False}
+
+    def test_its_arms_fold_a_tail_system_message_exactly_as_core_does(
+            self, tmp_path):
+        """The copy and the original, on what the SERVER receives.
+
+        Ollama refuses the whole request with HTTP 500 when a system message
+        follows the first, and a caller that appends a per-turn note as one
+        loses every turn. `core.brain._messages_system_first` is the one place
+        every request passes through to enforce that, and until now the
+        fallback had none: measured 2026-09-27, BOTH arms of this class put
+        the note on the wire in third position, so a turn died on exactly the
+        bundles this class exists to keep working and worked everywhere else.
+
+        Both arms, both shapes, compared against core's own fold on the same
+        inputs — because a copy that has quietly stopped matching is the whole
+        defect class, and reading the two and seeing them agree is not evidence.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        proc = run_driver(
+            ["-c", self.DRIVER, str(HERE)], home=home,
+            capture_output=True, text=True, timeout=180,
+        )
+        assert proc.returncode == 0, proc.stderr[-3000:]
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        wire, core = report["fold_wire"], report["fold_core"]
+        copied = report["fold_legacy"]
+        assert len(wire) == 8 and len(core) == 4 and len(copied) == 4, (
+            f"the driver drove {len(wire)} wire cases, {len(core)} core and "
+            f"{len(copied)} copy ones; the two arms and the four shapes are "
+            "the claim")
+
+        def misordered(messages):
+            # Ollama's rule, stated rather than trusted: at most the FIRST
+            # message may be a system one.
+            return [m["role"] for m in messages][1:].count("system") > 0
+
+        # The records are PAYLOADS, not message lists, and that is the check
+        # that a fold function cannot forge: `stream` says which arm ran, so
+        # these four flags prove both arms were driven and that what the test
+        # reads came off a request. Measured as a surviving mutation without
+        # it — a driver that recorded core's answer in place of the wire
+        # satisfied every other assertion here, because when the two copies
+        # agree all three sources agree and the equality is a tautology.
+        assert [p["stream"] for p in wire] == [False, True] * 4, (
+            f"the wire records do not alternate between the two arms: "
+            f"{[p.get('stream') for p in wire]}")
+        assert all(p.get("model") == "m" for p in wire), wire
+        assert report["wire_calls"] == 8, (
+            f"the fallback opened {report['wire_calls']} request(s) where 8 "
+            "were driven, so the wire records were not read off a request")
+        sent_lists = [p["messages"] for p in wire]
+
+        assert not any(map(misordered, sent_lists)), (
+            f"a fallback arm put a system message after the first: {sent_lists}")
+        for index, sent in enumerate(sent_lists):
+            shape = index // 2
+            # THREE sources, not two. The wire is what the server was sent and
+            # `copied` is the fallback's own fold called directly; either one
+            # on its own leaves the equality below satisfiable by a driver that
+            # computed both sides from the same function, which is a real hole
+            # and was measured as one.
+            assert sent == copied[shape], (
+                f"arm {index % 2} sent a different list from the copy that "
+                f"produced it.\n  wire: {sent}\n  copy: {copied[shape]}")
+            assert copied[shape] == core[shape], (
+                f"the fallback's fold and core's disagree.\n"
+                f"  fallback: {copied[shape]}\n  core:     {core[shape]}")
+
+        # And the shapes, so the equality above is not two empty lists.
+        # Expected against core's OWN answer rather than a list written here,
+        # because a second hand-written expectation is a second thing to drift.
+        assert [m["role"] for m in core[0]] == ["system", "user", "assistant",
+                                                "user"], core[0]
+        assert "the user is in Ghent" in core[0][-1]["content"], (
+            "the note was dropped rather than folded into the user turn: "
+            f"{core[0]}")
+        # two leading system messages MERGE into one, in order
+        assert len(core[2]) == 2 and core[2][0]["role"] == "system", core[2]
+        assert "you are a voice assistant" in core[2][0]["content"], core[2]
+        assert "answer in one sentence" in core[2][0]["content"], core[2]
+        assert "the user is in Ghent" in core[2][-1]["content"], core[2]
+        # and a LEADING empty system message is dropped rather than kept
+        assert core[3] == [{"role": "user", "content": "what is the weather"}], (
+            f"an empty leading system message was kept: {core[3]}")
 
     def test_its_streaming_arm_says_the_same_things_core_does(self, tmp_path):
         """The copy and the original, on the sentences the user HEARS.

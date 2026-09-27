@@ -162,6 +162,35 @@ jobs:
             handsoff.py handsoff-settings.py hardware.py settings_schema.py \
             core/ ci/
 
+  # Would the tests this change SHIPPED notice if the code it touched were
+  # wrong (ci/gates.sh `mutation`, ci/mutation_gate.py)?
+  #
+  # A green suite and a test that asserts nothing are the same observation from
+  # the outside, and this repository was bitten by that twice in one session — a
+  # mutation harness that scored 11 of 11 mutations "caught" while every run was
+  # failing for want of pytest. The gate lays HEAD down in a scratch worktree,
+  # breaks the functions the diff touched one mutant at a time, and refuses to
+  # score anything if its own baseline is red. It needs pytest, so unlike
+  # `links` it is not stdlib-only; a pipeline checkout is already clean, which
+  # is the other thing the gate insists on locally.
+  mutation:
+    name: Mutation (are a new test's guards load-bearing?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A history to diff against. The gate measures HEAD against a base
+          # commit, and on a push that base is HEAD~1.
+          fetch-depth: 2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install the test runner
+        run: pip install pytest
+      - name: Every mutant of the touched lines is caught
+        run: python ci/mutation_gate.py --base HEAD~1
+
   # Every markdown anchor link resolves to a real heading (ci/gates.sh
   # `links`, ci/link_check.py). A heading link is the one link that fails
   # SILENTLY: rename a heading and nothing complains, the reader clicks and

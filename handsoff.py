@@ -442,10 +442,23 @@ _LEAKED_MARKUP_RE = re.compile(
 
 
 def _fallback_is_leaked_markup(sentence: str) -> bool:
+    """The no-core/brain bundle's copy of `core.brain.is_leaked_markup`.
+
+    One line and no docstring until 2026-09-27, which is what
+    `tests/test_rule_copies.py`'s mirror census reports when this family
+    became visible to it: a copy of a rule with nothing in it saying so, so a
+    reader has no way to know a fix to core's was not a fix to this one. That
+    is the shape the `sayable` defect took.
+    """
     return bool(_LEAKED_MARKUP_RE.match(sentence or ""))
 
 
 def _fallback_strip_thinking(text: str) -> str:
+    """The no-core/brain bundle's copy of `core.brain.strip_thinking`.
+
+    Named for the same reason as the line above: this is a second copy of a
+    rule, and a copy nobody can identify is a copy nobody keeps in step.
+    """
     value = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
     # an UNCLOSED block must go too, or the reasoning is spoken aloud
     value = re.sub(r"<think>.*\Z", "", value, flags=re.DOTALL)
@@ -468,6 +481,86 @@ def _fallback_sayable(sentence):
         return sentence
     _token, newline, tail = sentence.partition("\n")
     return tail.strip() if newline else ""
+
+
+_FALLBACK_TAIL_SYSTEM_WARNED = False
+
+
+def _fallback_messages_system_first(messages, logger):
+    """The no-core/brain bundle's copy of `core.brain._messages_system_first`.
+
+    Same reason as the reader and `sayable` above, and a fourth instance of the
+    defect class this file has already fixed three times: a second copy of a
+    rule, with the fix applied to the first. Ollama refuses the WHOLE request
+    with HTTP 500 ("system message must be at the beginning") when a system
+    message follows the first, and this fold is the one place every request
+    passes through to enforce that.
+
+    It cannot BE core's function: this fallback exists precisely when
+    `core/brain.py` is absent. Measured 2026-09-27 by driving the real
+    fallback with the module unbuildable, against the same corpus
+    `tests/test_hardening.py::TestMissingBrainFallback` drives the other two
+    copies through: BOTH arms put a system message after the first on the
+    wire, where core's own fold hands back
+    `['system', 'user', 'assistant', 'user']`. A caller that appends a
+    per-turn note as a system message — the shape this rule exists for — lost
+    the whole turn to a 500 on exactly the bundles this class is here to keep
+    working, and silently worked on every bundle where `core/brain.py` loads.
+
+    The copy is held by `tests/test_hardening.py`, which drives it in both
+    directions and compares the result against `core.brain`'s on the same
+    inputs, and by `tests/test_rule_copies.py`'s mirror census, which is what
+    makes a second one of these visible at all.
+    """
+    global _FALLBACK_TAIL_SYSTEM_WARNED
+    if not any(m.get("role") == "system" for m in messages[1:]):
+        return messages
+    head = []
+    rest = list(messages)
+    # at most one leading system message may stay: two of them is the same
+    # shape that 500s (the renderer allows only the first)
+    for index, message in enumerate(rest):
+        if message.get("role") == "system":
+            head.append(str(message.get("content") or ""))
+            continue
+        rest = rest[index:]
+        break
+    else:
+        rest = []
+    parts = [s for s in head[1:] if s]
+    parts += [str(m.get("content") or "")
+              for m in rest
+              if m.get("role") == "system" and str(m.get("content") or "")]
+    kept = [m for m in rest if m.get("role") != "system"]
+    note = "\n\n".join(parts)
+    if not note and len(head) < 2:
+        # A tail system message with NO CONTENT is still a system message in a
+        # position the renderer refuses. core's copy drops it (measured
+        # 2026-09-27: a turn whose conversation carried an empty re-injected
+        # note reached the server and came back "Ollama error 500"), and
+        # dropping it here is the same decision, because there is nothing in
+        # it for the model to read.
+        return [m for m in messages
+                if not (m.get("role") == "system"
+                        and not str(m.get("content") or ""))]
+    if note:
+        target = next((i for i in range(len(kept) - 1, -1, -1)
+                       if kept[i].get("role") == "user"), None)
+        if target is None:
+            kept.append({"role": "user", "content": note})
+        else:
+            kept[target] = {**kept[target],
+                            "content": note + "\n\n"
+                            + str(kept[target].get("content") or "")}
+        if not _FALLBACK_TAIL_SYSTEM_WARNED:
+            _FALLBACK_TAIL_SYSTEM_WARNED = True
+            logger.warning(
+                "model call had a system message after the first (Ollama "
+                "answers HTTP 500); folded into the user turn: %s", note[:200])
+    if not head:
+        return kept
+    merged = "\n\n".join(h for h in head if h)
+    return [{"role": "system", "content": merged}] + kept
 
 
 def _fallback_read_http_error(error) -> str:
@@ -503,6 +596,8 @@ except ImportError:
         strip_thinking = staticmethod(_fallback_strip_thinking)
         is_leaked_markup = staticmethod(_fallback_is_leaked_markup)
         _read_http_error = staticmethod(_fallback_read_http_error)
+        _messages_system_first = staticmethod(
+            _fallback_messages_system_first)
 
         @staticmethod
         def ollama_available(*, base, guard, urlopen):
@@ -519,6 +614,10 @@ except ImportError:
                         guard, logger, state=None, urlopen=urllib.request.urlopen,
                         keep_alive=None):
             guard()
+            # Before the payload, so what the server sees is the folded
+            # list: the fold rewrites the roles, and building the payload
+            # first would send the unfolded copy of the same list.
+            messages = cls._messages_system_first(messages, logger)
             payload = {"model": model, "messages": messages, "stream": False,
                        "think": False, "keep_alive": keep_alive or os.environ.get(
                            "HANDSOFF_KEEP_ALIVE", "1h"),
@@ -554,6 +653,10 @@ except ImportError:
                                model, num_ctx, guard, logger, state=None,
                                urlopen=urllib.request.urlopen, keep_alive=None):
             guard()
+            # The same fold, in the same place, as the arm above. This is
+            # the DEFAULT turn path, so the arm that is shipped and the arm
+            # that is rarely taken were the two most likely to drift.
+            messages = cls._messages_system_first(messages, logger)
             payload = {"model": model, "messages": messages, "stream": True,
                        "think": False, "keep_alive": keep_alive or os.environ.get(
                            "HANDSOFF_KEEP_ALIVE", "1h"),
@@ -6631,6 +6734,10 @@ class Assistant(QObject):
         self._memory = _load_memory()
         self._turn_spoke = False
         self._last_spoken = ""
+        # Set per TURN by `_brain_turn`; declared here so a `_speak` from a
+        # timer, a snooze or a crash report — none of which is a turn — can
+        # still record a failed utterance without an AttributeError.
+        self._turn_speech_failed = False
         self._recently_spoken: list[str] = []   # last TTS lines, for echo rejection
         self._handsfree = _setting_flag("handsfree", False, repair=True)
         # True while a missing pinned microphone is being stood in for by the
@@ -9104,6 +9211,14 @@ class Assistant(QObject):
         # own.
         hist_at_entry = len(getattr(self, "_history", None) or [])
         self._turn_spoke = False
+        # "A reply this turn was supposed to say could not be said" — kept
+        # apart from `_turn_spoke` on purpose. "Nothing was spoken" is also
+        # true of a turn that never had anything to say, and a tool round that
+        # answers through the card rather than the speaker is one of those:
+        # keying the history rule on absence alone would throw away the
+        # assistant turn of every turn the tests drive with a stubbed
+        # `_speak`, and, worse, of every real one that had no words to speak.
+        self._turn_speech_failed = False
 
         def _rearm_nudge() -> dict:
             # The one in-turn retry: the model stopped at a re-arm gate
@@ -9220,7 +9335,15 @@ class Assistant(QObject):
                     _t.join(0.2)
                 if "err" in box:
                     log.error("ollama: %s", box["err"])
-                    self._speak(f"Sorry, my brain is offline. {box['err']}", gen, cancel)
+                    # The exception CLASS is part of the sentence, exactly as
+                    # the streaming arm has always spoken it: it is what tells
+                    # a reader whether the brain refused or the network broke.
+                    # This arm interpolated the exception alone and so dropped
+                    # it, and the two arms said different sentences for the
+                    # same event. Measured 2026-09-27.
+                    self._speak(f"Sorry, my brain is offline. "
+                                f"{type(box['err']).__name__}: {box['err']}",
+                                gen, cancel)
                     return
                 msg = box.get("msg") or {}
                 content = _brain.strip_thinking(msg.get("content") or "")
@@ -9312,14 +9435,29 @@ class Assistant(QObject):
         if fresh:
             # The corpus grows from this turn — before history is sealed, and
             # best-effort: a corpus write must never be the reason a turn fails.
+            # It sees the exchange WHOLE: a broken voice or a dead speaker says
+            # nothing about whether the model's text was any good, and the
+            # corpus is a judgement on the text.
             _record_turn_for_corpus(text, fresh)
-            _strip_images(fresh)   # screenshots: this turn's model call only
-            _seal_tool_calls(fresh)  # no unanswered call may enter the prefix
-            self._history = _trim_history(self._history + fresh)
+            kept = fresh
+            if not self._turn_spoke and self._turn_speech_failed:
+                # A turn whose answer COULD NOT BE SAID keeps its question and
+                # drops its answer. Publishing the answer anyway put a
+                # sentence into the next turn's prompt that the user has no
+                # memory of hearing — so the model carried on from a reply that
+                # was never made and could ask about it. A barge-in that cut
+                # the reply short is not this case: nothing failed, the user
+                # simply stopped listening. Measured 2026-09-27.
+                kept = [m for m in fresh if m.get("role") != "assistant"]
+                log.info("the reply could not be spoken; published the "
+                         "question without its answer")
+            _strip_images(kept)   # screenshots: this turn's model call only
+            _seal_tool_calls(kept)  # no unanswered call may enter the prefix
+            self._history = _trim_history(self._history + kept)
             self._save_history()
             if gen != self._gen:
                 log.info("turn superseded at history-write; kept its %d "
-                         "message(s)", len(fresh))
+                         "message(s)", len(kept))
 
     # -- speaking -----------------------------------------------------------------
 
@@ -9355,9 +9493,20 @@ class Assistant(QObject):
                     wav = Path(td) / "tts.wav"
                     tts_to_wav(text, wav)
                     with _ANNOUNCE_LOCK:
-                        if not cancel.is_set():
-                            log.info("saying response (%d chars)", len(text))
-                            _audio.play_wav(wav, cancel)
+                        if cancel.is_set():
+                            # The same withdraw-and-leave the streaming loop
+                            # makes one step below this one. Skipping the call
+                            # without leaving the `try` fell out of it
+                            # normally, ran the `else:`, and recorded a line
+                            # as SPOKEN that the user never heard — opening the
+                            # follow-up window on nothing and leaving the echo
+                            # filter armed on a sentence that was never said.
+                            # Measured 2026-09-27 (see "What the user hears
+                            # when a turn fails" in GAP_ANALYSIS.md).
+                            self._unarm_speech(text)
+                            return
+                        log.info("saying response (%d chars)", len(text))
+                        _audio.play_wav(wav, cancel)
             except Exception as exc:
                 log.exception("TTS failed")
                 # "Spoke" must mean the user HEARD it: these three used to be
@@ -9365,6 +9514,7 @@ class Assistant(QObject):
                 # bubble believing it had replied — the follow-up window
                 # opened on nothing and the user's next utterance was
                 # echo-filtered against a line that was never spoken.
+                self._turn_speech_failed = True
                 self._unarm_speech(text)
                 self._report_speech_failure(exc)
             else:
@@ -9417,13 +9567,22 @@ class Assistant(QObject):
                 with tempfile.TemporaryDirectory(dir=str(STATE_DIR)) as td:
                     wav = Path(td) / "tts.wav"
                     tts_to_wav(sentence, wav)
-                    with _ANNOUNCE_LOCK:
-                        if cancel.is_set():
-                            return
-                        log.info("saying: %s", sentence)
-                        _audio.play_wav(wav, cancel)
+                with _ANNOUNCE_LOCK:
+                    if cancel.is_set():
+                        # Withdraw rather than leave armed: this sentence was
+                        # queued for the echo filter before synthesis (the mic
+                        # hears our own voice while it plays), so returning
+                        # without unarming it leaves the user's NEXT words
+                        # dropped as a repeat of something never said. The
+                        # non-streaming arm above has the same withdraw on its
+                        # own cancel path; measured 2026-09-27.
+                        self._unarm_speech(sentence)
+                        return
+                    log.info("saying: %s", sentence)
+                    _audio.play_wav(wav, cancel)
             except Exception as exc:
                 log.exception("TTS failed (streaming)")
+                self._turn_speech_failed = True
                 self._unarm_speech(sentence)
                 self._report_speech_failure(exc)
                 continue

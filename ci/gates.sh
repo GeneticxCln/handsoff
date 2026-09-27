@@ -57,6 +57,12 @@
 # checkout can see files that are not committed. A commit whose plan names a test
 # file it does not contain passes every gate above and fails the moment anybody
 # clones it. Local only, like the stamp: a pipeline checkout is already clean.
+#
+# `mutation` is the one gate that breaks something on purpose. It asks whether
+# the tests a change SHIPPED would notice if the code that change touched were
+# wrong — the question a green suite cannot answer, because a green suite and a
+# test that asserts nothing look identical from the outside. It breaks the code
+# in a scratch worktree of HEAD, never in this one, and says so.
 
 set -u
 
@@ -71,7 +77,7 @@ SEED=${HANDSOFF_ORDER_SEED:-$(git rev-parse --short HEAD 2>/dev/null || echo loc
 JUNIT="$ROOT/tests/report.xml"
 FIRST_FAILURE="$ROOT/tests/report.first-failure.xml"
 
-ALL_GATES="tests order coverage compile lint links shell smoke clean-checkout two-writer"
+ALL_GATES="tests order coverage compile lint links mutation shell smoke clean-checkout two-writer"
 WANT_ORDER=1
 declare -a WANTED=()
 # Which gate failed FIRST. The failure digest below reads the first failing
@@ -385,6 +391,31 @@ gate_coverage() {
 
 gate_compile() {
     "$PYTHON" ci/compile_all.py
+}
+
+# The mutation gate (ci/mutation_gate.py). It is the only gate here that
+# deliberately BREAKS production code: it rewrites the functions a change
+# touched, one mutant at a time, in a scratch worktree of HEAD, and asks
+# whether the tests that change SHIPPED notice. A green suite cannot answer
+# that — a test that asserts nothing and a test that pins a rule are both
+# green — so without this gate a new test can merge holding nothing.
+#
+# It never touches this checkout, and it refuses (SKIP 2) if this checkout has
+# uncommitted changes rather than laying a worktree down beside a tree being
+# written to. Its own baseline must be green or it REFUSES (exit 1) rather
+# than scoring every mutant "caught" against a red suite — the failure mode
+# that made this project's first mutation run report 11/11 while every run was
+# failing for want of pytest.
+#
+# It SKIPs (exit 2) when there is nothing to measure: no base commit, no
+# production file in the diff, no test changed, or no mutant site in the
+# touched lines. Those are honest skips, not passes.
+gate_mutation() {
+    local out rc=0
+    out=$("$PYTHON" ci/mutation_gate.py --root "$ROOT" 2>&1) && rc=0 || rc=$?
+    printf '%s\n' "$out"
+    # 0 pass, 1 fail, 2 skip. Propagate all three; the runner reads them.
+    return "$rc"
 }
 
 # The lint gate. It exists because there was none: a 41,000-line tree with no
