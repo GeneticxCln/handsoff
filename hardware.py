@@ -438,8 +438,18 @@ def _ydotool(probers: dict) -> dict:
     except Exception as e:
         return _deg(e)
 
-def _gib(n) -> int:
-    """Bytes → GiB, truncating; non-numeric → 0 (exact input, no guessing)."""
+def _gib_or_zero(n) -> int:
+    """Bytes → GiB, truncated; anything unreadable is 0.
+
+    NOT `core.brain._gib`, which is the same name and the opposite rule: there
+    an unreadable size is None because zero would read as "fits anywhere" to
+    the arithmetic that consumes it. Here the two call sites are a doctor's
+    one-line RAM/disk summary, where a number is what the line is for and a
+    missing reading has nothing to print. Measured 2026-09-27 by
+    `tests/test_rule_copies.py`'s shared-name census: two functions with one
+    name and opposite policies is how a fix to one is read as a fix to the
+    other, so the name says which is which.
+    """
     try:
         return int(float(n)) // (1024 ** 3)
     except (TypeError, ValueError):
@@ -549,8 +559,8 @@ def prompt_context(snap: dict, max_chars: int = 600) -> str:
         gpus = ", ".join(ff.get("gpu") or []) or "no GPU"
         sys_line = (f"Sys: {ff.get('os')} · {ff.get('host')} · "
                     f"{ff.get('cpu')} · {gpus} · "
-                    f"RAM {_gib(ff.get('memory_total'))} GiB · "
-                    f"Disk {_gib(ff.get('disk_free'))} GiB free · "
+                    f"RAM {_gib_or_zero(ff.get('memory_total'))} GiB · "
+                    f"Disk {_gib_or_zero(ff.get('disk_free'))} GiB free · "
                     f"Socket: {sock} ({'present' if mounts.get('sock_present') else 'missing'})")
     else:
         sys_line = (f"Control socket: {sock} "

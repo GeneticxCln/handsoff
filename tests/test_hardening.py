@@ -687,6 +687,35 @@ class TestMissingBrainFallback:
         report["stream_refused"] = failing("refused")
         report["stream_missing_model"] = failing("404")
 
+        # the readiness probe: a whole second copy of `core.brain`'s, and until
+        # 2026-09-27 nothing in the suite held it. Found by
+        # `tests/test_rule_copies.py`'s branch census, which asks every copy in
+        # a compatibility branch to name the test that holds it — and this one
+        # had none. It is a copy because it must be: the module it would
+        # delegate to is the one that failed to load.
+        def probe(urlopen):
+            return legacy.ollama_available(base=BASE, guard=lambda: None,
+                                          urlopen=urlopen)
+
+        def tags(payload):
+            def urlopen(url, timeout=None):
+                if isinstance(payload, BaseException):
+                    raise payload
+                return StreamResp([payload])
+            return urlopen
+
+        report["probe_up"] = probe(tags(json.dumps({"models": []}).encode()))
+        report["probe_html"] = probe(tags(b"<html>a captive portal</html>"))
+        report["probe_down"] = probe(tags(
+            urllib.error.URLError(ConnectionRefusedError(111, "refused"))))
+        core_probe = real_brain.ollama_available
+        report["core_probe"] = [
+            core_probe(base=BASE, guard=lambda: None, urlopen=urlopen)
+            for urlopen in (tags(json.dumps({"models": []}).encode()),
+                            tags(b"<html>a captive portal</html>"),
+                            tags(urllib.error.URLError(
+                                ConnectionRefusedError(111, "refused"))))]
+
         # the SAME two failures through the real `core.brain`, so the report
         # carries both sentences and the test compares them
         def core_arm(kind):
@@ -779,6 +808,17 @@ class TestMissingBrainFallback:
             report["stream_missing_model"], report["core_missing_model"])
         assert "run: ollama pull gpt-oss:20b" in report["stream_missing_model"], \
             report["stream_missing_model"]
+        # and the readiness probe, whose second copy had no holder at all
+        assert report["probe_up"] is True, report["probe_up"]
+        assert report["probe_html"] is False, (
+            "a 200 with an HTML body is a captive portal or a wrong port, not "
+            "a brain: reading it as up gets the user a turn that fails on "
+            "every utterance")
+        assert report["probe_down"] is False, report["probe_down"]
+        assert [report["probe_up"], report["probe_html"],
+                report["probe_down"]] == report["core_probe"], (
+            "the fallback's copy of the probe and core's answer differently "
+            f"on the same three servers: {report['core_probe']}")
 
 
 class TestSweepStaleScratch:
