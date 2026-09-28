@@ -696,3 +696,96 @@ class TestBothOrderRunsKeepTheirOwnReport:
             assert "junit: tests/report.xml" in text, (
                 f"{name} runs the suite but uploads no junit report, so its "
                 f"failures are a log to read rather than a Test-tab entry")
+
+
+class TestTheDeskRunnerOnlyEverRunsProtectedCode:
+    """Every job runs on `desk` — a self-hosted runner on the developer's OWN
+    machine — so an untrusted pipeline is an arbitrary-code-execution problem,
+    not a test-infrastructure one.
+
+    Audit finding P1 (2026-09-27). Two properties carried it, and both are
+    pinned here because both are the kind of edit that looks like tidy-up:
+
+      * `workflow.rules` used to ADMIT `merge_request_event`, so a merge
+        request's own `tests/`, `ci/` and `install.sh` ran on the workstation
+        — with the runner account's home directory, SSH agent, GPU and audio
+        devices. The rule must stay present AND carry `when: never`.
+      * `.shared`'s `after_script` runs the CHECKED-OUT tree's
+        `ci/pytest_summary.py`, which reads `GITLAB_SUMMARY_TOKEN` from the
+        environment — a real personal access token, not a job token, because a
+        job token cannot create notes. It must not run on a ref that is not
+        protected.
+
+    The first property is the one that matters: refuse the pipeline and there is
+    no window for the second to matter. The second is defence in depth for
+    anyone who re-admits MR pipelines later without reading this.
+    """
+
+    def _workflow_rules(self) -> str:
+        text = (HERE / ".gitlab-ci.yml").read_text(encoding="utf-8")
+        start = text.index("\nworkflow:\n")
+        rest = text[start + 1:]
+        end = rest.index("\n\n", rest.index("  rules:"))
+        return rest[:end]
+
+    def test_merge_request_pipelines_are_refused_not_admitted(self):
+        rules = self._workflow_rules()
+        assert "merge_request_event" in rules, (
+            "the merge_request_event rule was removed outright. Deleting it "
+            "re-admits MR pipelines through the trailing `- if: "
+            "$CI_COMMIT_BRANCH`, which matches an MR's source branch. The rule "
+            "must stay, with `when: never` — the refusal IS the rule.")
+        mr = rules.split('CI_PIPELINE_SOURCE == "merge_request_event"')[1]
+        assert "when: never" in mr.split("\n- if:")[0], (
+            "merge_request_event is admitted without `when: never`, so an "
+            "untrusted MR runs its own tests on the self-hosted desk runner")
+
+    def test_the_token_bearing_after_script_asks_whether_the_ref_is_protected(self):
+        shared = _gitlab_blocks()[".shared"]
+        assert "CI_COMMIT_REF_PROTECTED" in shared, (
+            ".shared's after_script no longer gates on CI_COMMIT_REF_PROTECTED, "
+            "so the tree's own ci/pytest_summary.py runs — with "
+            "GITLAB_SUMMARY_TOKEN in the environment — on any ref")
+        assert "GITLAB_SUMMARY_TOKEN" in shared and "unset" in shared, (
+            "the non-protected branch must also UNSET the token, not merely "
+            "skip the post: the variable is already in the job's environment")
+
+    def test_the_summary_token_is_still_required_to_post(self):
+        """The guard must not have quietly disabled posting on protected refs.
+
+        A fix that made every note stop appearing would pass the two guards
+        above. The protected branch still has to run the real script.
+        """
+        shared = _gitlab_blocks()[".shared"]
+        assert "ci/pytest_summary.py" in shared, (
+            "the summary digest is how a failure becomes a short list of names "
+            "instead of a log to read; it must still run on a protected ref")
+        assert "--post" in shared
+
+    def test_no_desk_job_is_left_unguarded_by_the_workflow_rules(self):
+        """The rules only help if the jobs inherit them — sanity, not a proxy.
+
+        Every desk job is admitted by the SAME workflow rules, so this asserts
+        the file still has one `workflow:` block governing them all, rather
+        than a per-job `rules:` that could re-admit something.
+        """
+        blocks = _gitlab_blocks()
+        assert "workflow" in blocks, "the workflow block was removed"
+        # The `desk` TAG, not the word: `suite:hosted` runs in a frozen
+        # container and merely mentions the desk in a comment, so a substring
+        # match would pull a job that is not on the workstation into this
+        # assertion — and `suite:hosted` legitimately carries its own `rules:`
+        # (web/api only, manual, allowed to fail), which is exactly the shape
+        # this test forbids everywhere else.
+        desk = sorted(name for name in blocks
+                      if not name.startswith(".")
+                      and re.search(r"^\s*-\s+desk\s*$", blocks[name], re.M))
+        assert desk, "no desk job found — this test would be vacuous"
+        for name in desk:
+            # A YAML KEY, not the substring: the `shell` job's own trust guard
+            # greps for the literal text `^  rules:` inside a shell string, so
+            # matching on the word finds the guard that protects this file.
+            per_job = re.search(r"^\s{2}rules:", blocks[name], re.M)
+            assert per_job is None, (
+                f"{name} is a desk job with its own `rules:`; a per-job rule "
+                f"can re-admit a pipeline the workflow rules refuse")

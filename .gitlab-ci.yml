@@ -58,11 +58,28 @@ default:
 # open merge request is judged by that MR's pipeline instead of by it AND a
 # second branch pipeline saying the same thing — which is how a quota gets spent
 # twice on one commit.
+#
+# TRUST (2026-09-27, audit finding P1): `merge_request_event` is GONE from these
+# rules, and that is the load-bearing half of the fix. Every job below is tagged
+# `desk` — a self-hosted runner on the developer's OWN machine (see the header
+# above), not an ephemeral container. Admitting MR pipelines therefore executed
+# the MR author's own `tests/`, `ci/` and `install.sh` with the runner account's
+# home directory, SSH agent, GPU and audio devices. The first rule below is
+# therefore a REFUSAL: an MR pipeline is not created at all, so there is no
+# window in which untrusted code is on the desk. The remaining rules are the
+# ones whose code comes from this repository's own protected branches and tags.
+#
+# If a fork's MR must be gated, run it on an ISOLATED ephemeral runner (a
+# container with no host socket, no volume mounts, no runner credentials) under
+# a different tag — do NOT re-admit `merge_request_event` onto `desk`.
 workflow:
   auto_cancel:
     on_new_commit: interruptible
   rules:
+    # Untrusted contributor code: refused. This is the rule that keeps a fork's
+    # tests/*.py and ci/*.sh off the developer's workstation.
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
     - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
       when: never
     - if: $CI_COMMIT_TAG
@@ -89,9 +106,37 @@ workflow:
     reports:
       junit: tests/report.xml
   # A fresh shell with a reset cwd, so both paths are absolute.
+  #
+  # TRUST (2026-09-27, audit finding P1): this runs the CHECKED-OUT tree's own
+  # ci/pytest_summary.py, and that script reads GITLAB_SUMMARY_TOKEN (or
+  # GITLAB_API_TOKEN) straight from the environment — a real personal access
+  # token, because a CI job token cannot create notes (GitLab issue #464591;
+  # ci/pytest_summary.py:26-29). So a pipeline whose source tree is not a
+  # protected ref would be handing that token to whatever the tree contains.
+  #
+  # The rule above already refuses merge-request pipelines, so every pipeline
+  # reaching here is a push or a tag from this repository. This second guard is
+  # the defence in depth that does not depend on remembering that: it refuses
+  # to run the tree's script at all unless the ref is protected, and it drops
+  # the token from the environment either way, so the script's own
+  # "token not set — skipping" path runs rather than a posting path.
+  #
+  # GITLAB_SUMMARY_TOKEN must ALSO be configured as Protected in the project's
+  # CI/CD variables. Masked alone only hides the value in logs; Protected is
+  # what stops it being injected into a pipeline from a non-protected ref. This
+  # file cannot enforce that setting — it is a project configuration, and the
+  # `shell` job below fails CI if this guard is ever removed.
   after_script:
-    - python "$CI_PROJECT_DIR/ci/pytest_summary.py"
-      "$CI_PROJECT_DIR/tests/report.xml" --post
+    - |
+      if [ "${CI_COMMIT_REF_PROTECTED:-false}" = "true" ]; then
+        python "$CI_PROJECT_DIR/ci/pytest_summary.py" \
+          "$CI_PROJECT_DIR/tests/report.xml" --post
+      else
+        echo "summary: ref '$CI_COMMIT_REF_NAME' is NOT protected — the"
+        echo "  merge-request note is skipped and GITLAB_SUMMARY_TOKEN is not"
+        echo "  exposed to this pipeline. See .gitlab-ci.yml (.shared)."
+        unset GITLAB_SUMMARY_TOKEN GITLAB_API_TOKEN
+      fi
 
 # The runtime layer every suite job inherits. It is a SCRIPT, not a one-liner:
 # a single unknown package name fails the whole `apt-get install`, the `&&`
@@ -382,6 +427,41 @@ shell:
         echo "$bad"
         exit 1
       fi
+    # TRUST guard (2026-09-27, audit finding P1). Every job in this file runs
+    # on the `desk` runner — a self-hosted runner on the developer's own
+    # machine — so a pipeline whose source tree is not a protected ref would
+    # execute untrusted code on that workstation. Two properties are load-
+    # bearing, and this job fails CI if either is removed:
+    #
+    #   1. `merge_request_event` is refused by the workflow rules, so an MR's
+    #      own tests/ci/install.sh never runs on the desk.
+    #   2. the `.shared` after_script only runs the tree's ci/pytest_summary.py
+    #      on a protected ref, and unsets GITLAB_SUMMARY_TOKEN otherwise.
+    #
+    # Checked by text, not by a YAML parse, for the same reason the rest of
+    # this job is: PyYAML is not in requirements.txt and must not be.
+    - |
+      fail=0
+      if ! grep -A6 '^  rules:' .gitlab-ci.yml \
+           | grep -q 'CI_PIPELINE_SOURCE == "merge_request_event"'; then
+        echo "ERROR: workflow.rules no longer mentions merge_request_event."
+        echo "  Keep the rule present WITH 'when: never' — it is what keeps"
+        echo "  merge-request code off the self-hosted desk runner."
+        fail=1
+      elif ! grep -A2 'CI_PIPELINE_SOURCE == "merge_request_event"' .gitlab-ci.yml \
+           | grep -q 'when: never'; then
+        echo "ERROR: merge_request_event is admitted without 'when: never'."
+        echo "  That would run untrusted MR code on the desk runner."
+        fail=1
+      fi
+      if ! grep -q 'CI_COMMIT_REF_PROTECTED' .gitlab-ci.yml; then
+        echo "ERROR: .shared after_script no longer checks CI_COMMIT_REF_PROTECTED."
+        echo "  GITLAB_SUMMARY_TOKEN is a personal access token read from the"
+        echo "  environment by ci/pytest_summary.py; it must not reach a"
+        echo "  pipeline whose ref is not protected."
+        fail=1
+      fi
+      [ "$fail" = 0 ] || exit 1
     # Every shell script DISCOVERED, not listed, and discovered by SHEBANG:
     # `handsoff-restart` has no extension, so an extension glob misses exactly
     # the file the old hand-written list remembered — and the two workflows'
