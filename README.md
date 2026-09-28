@@ -166,6 +166,30 @@ desk. On top of the switches, enforced in code:
   separate next-turn `confirm_action('yes')`. **Dry-run** mode makes the
   desktop-action tools report what they would do instead of doing it.
 
+### What still leaves, even with a local SearXNG
+
+A SearXNG on your own machine moves only the *first* stop of some queries, and
+only while it is up. Measured against the routing in `core/web.py`:
+
+| tool | where it goes | what it sends |
+|---|---|---|
+| `web_search`, general or news | SearXNG → `lite.duckduckgo.com` → `en.wikipedia.org` | your query text |
+| `web_search`, a question containing "error", "api", "pip", "docker", "python"… | `api.stackexchange.com` **first** — SearXNG is the 4th fallback | your query text |
+| `web_search`, a question containing "repo", "github", "changelog"… | `api.github.com` **first** | your query text |
+| `get_weather` | `geocoding-api.open-meteo.com`, then `api.open-meteo.com` | your `home_place`, then its coordinates |
+| `lookup_fact` | `en.wikipedia.org` | the thing you asked about |
+| `world_events` | `lite.duckduckgo.com` — never SearXNG | fixed queries, plus the last part of `home_place` |
+| `read_page` | the site itself | the URL, and it sees your IP. The r.jina.ai fallback is its own switch, off by default |
+
+So a local SearXNG is worth running and is not a wall: two of the three search
+routes do not start there, every route falls through to DuckDuckGo when it is
+down, and weather, facts and world warnings always go out. It is not a complete
+answer either — SearXNG queries the engines it is configured with, so an engine
+still sees the text. What it removes is *handsoff* sending it.
+
+Everything else — speech, memory, reminders, the calendar, the desk, music and
+every desktop action — is local whatever is switched on.
+
 ## Configure
 
 `~/.config/handsoff/settings.json`, edited by the settings app. The keys worth
