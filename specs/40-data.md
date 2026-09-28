@@ -3,12 +3,15 @@
 Sources: `settings_schema.py`, `core/settings.py`,
 `handsoff.py` paths/caps, `core/calendar.py`, `core/web.py`, `hardware.py`.
 
-## 1. settings.json (65 keys, `SETTINGS_VERSION = 2`)
+## 1. settings.json (65 keys, `SETTINGS_VERSION = 3`)
 
 Precedence: built-in defaults ← environment ← `settings.json`.
-Stamped `version` on every write. v0→v2 migration stepwise
-(`piper_voice` → `tts_reference`); future versions load-with-warn, never
-drop unknown keys; retired keys (`piper_voice`) dropped on load AND write.
+Stamped `version` on every write. v0→v3 migration stepwise
+(`piper_voice` → `tts_reference`; then `web_access`/`hosted_reader` → off, with
+a warning naming the switch and the way back — the v2 defaults had them on, so
+an install that was never touched inherited a leak nobody chose); future
+versions load-with-warn, never drop unknown keys; retired keys
+(`piper_voice`) dropped on load AND write.
 
 Brain: `ollama_host` (`http://127.0.0.1:11434`), `allow_remote_ollama`
 False, `model` (`qwen3:8b`), `num_ctx` 32768, `history_tokens` 0 (= auto).

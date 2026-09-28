@@ -950,10 +950,40 @@ def _web_lines() -> list:
     availability is a local service rather than a remote site.
     """
     try:
-        return _web.doctor_lines()
+        lines = _web.doctor_lines()
     except Exception:
         log.exception("web doctor lines failed")
         return []
+    return lines + _knowledge_disclosure_lines()
+
+
+def _knowledge_disclosure_lines() -> list:
+    """Where the knowledge switches are sending things, whenever one is on.
+
+    A STANDING line rather than a one-shot notice. The v3 migration logs that
+    it moved a switch, and then that line is gone from the next start — but the
+    user who deliberately turned internet knowledge back on is owed exactly as
+    much as the one who never did, and the only thing that reaches them is
+    whatever `--ptt doctor` says on the day they ask. So the disclosure lives
+    here and repeats for as long as the switch is on.
+
+    Named endpoints, not a reassurance: the settings checkbox is the thing a
+    user reads at the moment they decide, and this is the receipt afterwards.
+    """
+    try:
+        perms = SETTINGS.get("permissions") or {}
+    except Exception:
+        return []
+    out = []
+    if perms.get("web_access") is True:
+        out.append("knowledge: ON — your search text, the fact you ask about "
+                   "and home_place go to DuckDuckGo, StackExchange, Hacker "
+                   "News, GitHub, Wikipedia and Open-Meteo; a local SearXNG, if "
+                   "one is running, serves search instead of DuckDuckGo")
+    if perms.get("hosted_reader") is True:
+        out.append("third-party reader: ON — the ADDRESS of a page this "
+                   "machine could not read is handed to r.jina.ai")
+    return out
 
 
 def _wake_lines() -> list:

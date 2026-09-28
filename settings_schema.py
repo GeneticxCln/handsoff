@@ -11,8 +11,12 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-SETTINGS_VERSION: int = 2   # bumped on incompatible settings.json layout changes
+SETTINGS_VERSION: int = 3   # bumped on incompatible settings.json layout changes
                             # v2: piper_voice -> tts_reference (Piper -> chatterbox)
+                            # v3: the two knowledge switches default OFF, and an
+                            #     install carrying the v2 defaults gets them
+                            #     turned off rather than inheriting a leak
+                            #     nobody chose (see core/settings.py _migrate)
 
 # Keys a past version wrote that this build deliberately retired. They are
 # dropped from settings.json on the next WRITE as well as on load, because

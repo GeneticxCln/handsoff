@@ -459,7 +459,7 @@ class TestPiperToChatterboxMigration:
         assert s["tts_reference"] == "", "an .onnx voice is not a reference clip"
         assert s["tts_rate"] == 1.4 and s["assistant_name"] == "cypher", \
             "an unrelated setting must not be collateral damage"
-        assert s["version"] == H.SETTINGS_VERSION == 2
+        assert s["version"] == H.SETTINGS_VERSION == 3
         # The migration must be what explains the drop. Asserting merely that
         # the line mentions 'piper_voice' is satisfied by the loader's generic
         # `unknown settings key 'piper_voice' — ignored` warning, so the suite
@@ -563,6 +563,195 @@ class TestPiperToChatterboxMigration:
         s = self._load(H, tmp_path, monkeypatch, {"tts_reference": ["a", "b"]})
         assert s["tts_reference"] == "", (
             "a list here must not reach the loader, which would try to open it")
+
+
+class TestPrivacySwitchMigration:
+    """A v2 install inherited two switches that were ON because nobody
+    switched them on.
+
+    `web_access` defaulted True in v2, and the settings app writes the whole
+    permissions dict on every save, so an untouched install carries
+    `web_access: true` in exactly the shape one where the user went looking
+    for it and turned it on would. The file cannot tell them apart. v3 takes
+    the side the README promises — off — and says what it took and the way
+    back, because a value removed in silence is the thing a user learns to
+    distrust a migration for.
+    """
+
+    @staticmethod
+    def _load(H, tmp_path, monkeypatch, payload):
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps(payload))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        return H._load_settings()
+
+    def test_a_v2_install_comes_up_with_both_switches_off(self, H, tmp_path,
+                                                          monkeypatch):
+        s = self._load(H, tmp_path, monkeypatch, {
+            "version": 2,
+            "permissions": {"web_access": True, "media": True, "operator": False},
+        })
+        assert s["permissions"]["web_access"] is False, (
+            "the whole point of the step: an install that never chose this must "
+            "not keep sending queries to DuckDuckGo")
+        assert s["permissions"]["hosted_reader"] is False
+        assert s["version"] == H.SETTINGS_VERSION == 3
+
+    def test_the_migration_says_what_it_took_and_how_to_get_it_back(
+            self, H, tmp_path, monkeypatch, caplog):
+        """The disclosure is load-bearing, so it is asserted as its own thing.
+
+        Asserting only the resulting value would pass with the warning deleted,
+        and a switch the user never sees move is indistinguishable from a bug.
+        """
+        caplog.set_level("WARNING", logger="handsoff")
+        self._load(H, tmp_path, monkeypatch, {
+            "version": 2, "permissions": {"web_access": True}})
+        messages = "\n".join(r.getMessage() for r in caplog.records)
+        assert "web_access" in messages, messages
+        assert "v2 -> v3" in messages, (
+            f"the line must name the step it belongs to; got {messages}")
+        assert "Permissions" in messages, (
+            f"a value taken away is only fair if the user is told where to put "
+            f"it back; got {messages}")
+
+    def test_an_install_that_had_them_off_is_not_told_it_changed_something(
+            self, H, tmp_path, monkeypatch, caplog):
+        """A migration that reports work it did not do is noise that trains
+        people to skip the log."""
+        caplog.set_level("WARNING", logger="handsoff")
+        s = self._load(H, tmp_path, monkeypatch, {
+            "version": 2,
+            "permissions": {"web_access": False, "hosted_reader": False}})
+        messages = "\n".join(r.getMessage() for r in caplog.records)
+        assert "switched" not in messages, (
+            f"nothing moved here, so the migration must stay quiet; got {messages}")
+        assert s["permissions"]["web_access"] is False
+
+    def test_a_v3_file_is_left_exactly_as_it_is(self, H, tmp_path, monkeypatch):
+        """The deliberate re-enable. Once a file is stamped v3 the step never
+        runs again, so a user who turns internet knowledge back ON keeps it —
+        which is the only reason the v2 step above is safe to have shipped.
+        """
+        s = self._load(H, tmp_path, monkeypatch, {
+            "version": 3,
+            "permissions": {"web_access": True, "hosted_reader": False}})
+        assert s["permissions"]["web_access"] is True
+        assert s["permissions"]["hosted_reader"] is False
+
+    def test_a_v0_file_still_walks_every_step(self, H, tmp_path, monkeypatch):
+        """Both steps, in order: dropping the dead voice AND the switches.
+
+        Asserted together because the failure mode of adding a step is a `ver`
+        that skips the one before it — each step tested alone would not notice.
+        """
+        s = self._load(H, tmp_path, monkeypatch, {
+            "version": 0, "piper_voice": "old.onnx",
+            "permissions": {"web_access": True}})
+        assert "piper_voice" not in s
+        assert s["permissions"]["web_access"] is False
+        assert s["version"] == H.SETTINGS_VERSION == 3
+
+    def test_unrelated_settings_are_not_collateral_damage(self, H, tmp_path,
+                                                          monkeypatch):
+        s = self._load(H, tmp_path, monkeypatch, {
+            "version": 2,
+            "permissions": {"web_access": True, "media": True, "pomodoro": True},
+            "tts_rate": 1.4, "assistant_name": "cypher", "mic_threshold": 700,
+        })
+        assert s["tts_rate"] == 1.4 and s["assistant_name"] == "cypher"
+        assert s["mic_threshold"] == 700
+        assert s["permissions"]["media"] is True, (
+            "only the two knowledge switches move; the rest of the dict is "
+            "the user's")
+        assert s["permissions"]["pomodoro"] is True
+
+    def test_a_file_with_no_permissions_key_gains_none(self, H, tmp_path,
+                                                       monkeypatch):
+        """The v1 step's own warning, applied here: inserting a key the user
+        never wrote is how a migration starts editing settings it has no
+        business touching. The merge supplies the v3 default anyway.
+        """
+        s = self._load(H, tmp_path, monkeypatch, {"version": 2, "tts_rate": 1.2})
+        assert s["permissions"]["web_access"] is False, (
+            "the shipped default is off, so the merged answer is the same")
+        assert s["tts_rate"] == 1.2
+
+    def test_the_migration_survives_a_single_key_save(self, H, tmp_path,
+                                                      monkeypatch):
+        """A migration is only real if a later WRITE cannot resurrect it — the
+        lesson `piper_voice` taught, and the reason the step stamps the version.
+        """
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"version": 2,
+                                 "permissions": {"web_access": True},
+                                 "tts_rate": 1.5}))
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        H._SETTINGS_OBJ.settings_file = f
+        H._SETTINGS_OBJ.config_dir = tmp_path
+        assert H._SETTINGS_OBJ.persist("tts_volume", 0.8) is True
+        on_disk = json.loads(f.read_text())
+        assert on_disk["version"] == 3, (
+            "an un-stamped save would re-run the step on every start, and the "
+            "user's saved value would lose to it every time")
+        assert on_disk["permissions"]["web_access"] is False, on_disk
+        assert on_disk["tts_rate"] == 1.5 and on_disk["tts_volume"] == 0.8
+
+    def test_the_schema_says_three_and_the_switches_say_off(self):
+        import settings_schema
+        assert settings_schema.SETTINGS_VERSION == 3
+        perms = settings_schema.DEFAULT_SETTINGS["permissions"]
+        assert perms["web_access"] is False
+        assert perms["hosted_reader"] is False
+
+
+class TestTheDoctorDisclosesTheKnowledgeSwitches:
+    """A one-shot migration log is gone by the next start. The disclosure that
+    has to outlive it is the one a user asks for on demand — and it is owed to
+    the user who deliberately switched internet knowledge ON just as much as to
+    the one who never did.
+    """
+
+    def _lines(self, H, monkeypatch, **perms):
+        monkeypatch.setitem(H.SETTINGS, "permissions",
+                            {"web_access": False, "hosted_reader": False,
+                             **perms})
+        return "\n".join(H._knowledge_disclosure_lines())
+
+    def test_on_names_the_endpoints_the_query_reaches(self, H, monkeypatch):
+        out = self._lines(H, monkeypatch, web_access=True)
+        assert "knowledge: ON" in out
+        for host in ("DuckDuckGo", "StackExchange", "Hacker News", "GitHub",
+                     "Wikipedia", "Open-Meteo"):
+            assert host in out, f"{host} is named nowhere in: {out!r}"
+        assert "SearXNG" in out, (
+            "the line must also say how to stop the search going out at all, "
+            f"or it is a disclosure with no action attached: {out!r}")
+
+    def test_the_page_reader_disclosure_names_the_host(self, H, monkeypatch):
+        out = self._lines(H, monkeypatch, hosted_reader=True)
+        assert "third-party reader: ON" in out
+        assert "r.jina.ai" in out, out
+
+    def test_off_says_nothing_at_all(self, H, monkeypatch):
+        """Silence is the correct output when nothing leaves — a line reading
+        'knowledge: off' on every doctor run is a line nobody reads."""
+        assert self._lines(H, monkeypatch) == ""
+
+    def test_both_on_reports_both(self, H, monkeypatch):
+        out = self._lines(H, monkeypatch, web_access=True, hosted_reader=True)
+        assert "knowledge: ON" in out and "third-party reader: ON" in out
+
+    def test_the_web_lines_carry_the_disclosure(self, H, monkeypatch):
+        """Wiring: a disclosure that never reaches the doctor's output is a
+        function nobody calls."""
+        monkeypatch.setitem(H.SETTINGS, "permissions",
+                            {"web_access": True, "hosted_reader": False})
+        out = "\n".join(H._web_lines())
+        assert "search:" in out and "reader:" in out, (
+            "the observed-backend lines must still be there")
+        assert "knowledge: ON" in out, out
 
 
 class TestSchemaWiring:

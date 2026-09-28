@@ -490,6 +490,12 @@ _CUSTOM_COERCERS = {
 
 # ------------------------------------------------------------------ migration
 
+# The two switches that put something of the user's on someone else's server.
+# A default is a choice made FOR the user, which is why these two are the ones
+# v3 applies retroactively rather than only to a fresh file.
+_KNOWLEDGE_SWITCHES = ("web_access", "hosted_reader")
+
+
 def _migrate_settings(data: dict, _slog: "logging.Logger | None" = None) -> dict:
     """Migrate an older settings.json layout to SETTINGS_VERSION.
 
@@ -525,6 +531,44 @@ def _migrate_settings(data: dict, _slog: "logging.Logger | None" = None) -> dict
             log2.info("settings.json migrated: dropped piper_voice (%s); "
                       "TTS now uses the built-in chatterbox voice", old_voice)
         ver = 2
+    if ver < 3:
+        # v2 -> v3: the two switches that send something off this machine are
+        # OFF for an install that never chose them.
+        #
+        # `web_access` defaulted True in v2, and the settings app writes the
+        # WHOLE dict on every save, so an install nobody has touched carries
+        # `web_access: true` in exactly the same shape as one where the user
+        # went looking for it and turned it on. Nothing in the file records
+        # which of the two happened, and a marker invented now cannot
+        # retroactively separate them either.
+        #
+        # So this takes the side the README promises — off — and says so
+        # loudly, with the way back, because a value silently taken away is the
+        # thing users stop trusting a migration for. The alternative, keeping
+        # it, is the defect this step exists to remove: a default that ships
+        # query text and page addresses to third parties and is on because
+        # nobody ever opened the settings.
+        #
+        # A file with NO `permissions` key is deliberately left alone. The
+        # merge below then applies the v3 default, which is the same answer
+        # without inserting a key the user never wrote — the mistake the v1 step
+        # above warns about in the other direction.
+        perms = data.get("permissions")
+        if isinstance(perms, dict):
+            turned_off = [k for k in _KNOWLEDGE_SWITCHES
+                          if perms.get(k) is not False]
+            for k in _KNOWLEDGE_SWITCHES:
+                perms[k] = False
+            if turned_off:
+                log2.warning(
+                    "settings.json migrated v2 -> v3: switched %s OFF. These "
+                    "send your search text (and, for the page reader, the "
+                    "address of the page you are reading) to third parties, "
+                    "and the v2 defaults had them on, so an install that was "
+                    "never touched inherited that. Settings -> Permissions "
+                    "switches them back on.",
+                    " and ".join(turned_off))
+        ver = 3
     if ver < SETTINGS_VERSION:
         log2.info("settings.json migrated v%d -> v%d", ver, SETTINGS_VERSION)
     data["version"] = SETTINGS_VERSION
