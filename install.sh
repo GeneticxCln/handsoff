@@ -1246,7 +1246,7 @@ fi
 # expansion, so the placeholder is swapped after the text is written.
 niri_rule() {
     cat <<'NIRI_EOF'
-// handsoff voice-assistant bubble — merge into ~/.config/niri/config.kdl
+// handsoff voice-assistant bubble — float it, no border, no shadow.
 window-rule {
     match app-id=r#"^@APP_ID@$"#
     open-floating true
@@ -1256,6 +1256,179 @@ window-rule {
     shadow { off; }
 }
 NIRI_EOF
+}
+# The markers are what make the merge REPLACEABLE rather than additive: the
+# block between them is ours, so a re-install rewrites it instead of appending
+# a second copy, and a user who edits inside it is warned they will lose the
+# edit. They are the same idea as the settings app's AUTOSTART_COMMENT, and the
+# same backup/reload discipline below — one rule in this repo, not two.
+NIRI_BLOCK_BEGIN="// >>> handsoff managed block — re-install rewrites this, edits inside are lost >>>"
+NIRI_BLOCK_END="// <<< handsoff managed block end <<<"
+# The block this installer used to ASK the reader to paste by hand had no
+# markers, so every desk that followed the old advice already carries an
+# unmarked copy. Recognising it is a migration, not a nicety: without it the
+# next install adds a marked block beside the old one and niri applies two
+# window rules for one app-id. The marked block is matched FIRST, so the
+# comment inside our own block can never be read as a legacy one.
+NIRI_LEGACY_BEGIN="// handsoff voice-assistant bubble"
+# ONE autostart owner: systemd (if the user unit is actually enabled) OR
+# niri spawn-at-startup — never both. SYSTEMD_EDITOR says nothing about
+# whether systemd manages the app; check the real unit state instead.
+niri_autostart() {
+    if [ "$REHEARSAL" = "1" ] || systemctl --user is-enabled handsoff.service >/dev/null 2>&1; then
+        # systemd owns the bubble — do NOT write spawn-at-startup (a unit
+        # restart would spawn duplicates)
+        return 0
+    fi
+    printf '// launch at startup:\nspawn-at-startup "%s" "%s"\n' \
+        "$PYBIN" "$BIN_DIR/handsoff.py"
+}
+# ONE definition, three consumers: the snippet the rehearsal verifies, the
+# block merged into the user's config, and the idempotency comparison. A
+# second copy of this text is a second thing that can drift.
+niri_managed_block() {
+    printf '%s\n' "$NIRI_BLOCK_BEGIN"
+    niri_rule | sed "s/@APP_ID@/$APP_ID/"
+    niri_autostart
+    printf '%s\n' "$NIRI_BLOCK_END"
+}
+# The block currently in the file, or nothing. Stops at the FIRST end marker,
+# so a stray second copy pasted below cannot make the comparison read as
+# "unchanged" while the rest of the file differs.
+niri_existing_block() {
+    awk -v b="$NIRI_BLOCK_BEGIN" -v e="$NIRI_BLOCK_END" '
+        index($0, b) { grab = 1 }
+        grab        { print }
+        grab && index($0, e) { exit }
+    ' "$1"
+}
+# Every copy of our block, removed. A file that somehow accumulated two must
+# end with one, or the rule is applied twice and the second floats nothing.
+niri_strip_blocks() {
+    awk -v b="$NIRI_BLOCK_BEGIN" -v e="$NIRI_BLOCK_END" -v g="$NIRI_LEGACY_BEGIN" '
+        index($0, b)         { skip = 1; next }
+        skip && index($0, e) { skip = 0; next }
+        skip                 { next }
+        # A legacy block ends at the column-0 brace that closes window-rule.
+        index($0, g)         { legacy = 1; next }
+        legacy && /^\}/     { legacy = 0; next }
+        legacy               { next }
+                            { print }
+    ' "$1"
+}
+# Whether anything of ours is still in the file OUTSIDE the marked block — i.e.
+# a leftover legacy copy. The "already current" shortcut must not fire while
+# one is there, or the duplicate it would leave is exactly the defect above.
+niri_has_legacy_block() {
+    awk -v b="$NIRI_BLOCK_BEGIN" -v e="$NIRI_BLOCK_END" -v g="$NIRI_LEGACY_BEGIN" '
+        index($0, b)         { skip = 1; next }
+        skip && index($0, e) { skip = 0; next }
+        skip                 { next }
+        index($0, g)         { print "yes"; exit }
+    ' "$1"
+}
+# The reload is best-effort by design: `niri msg action load-config-file` is
+# the verb this niri actually has (measured 2026-09-24 — see
+# tests/test_ops.py::test_the_niri_hint_names_a_verb_that_exists), and it
+# answers only while the compositor is running. A failure here is reported,
+# never fatal: the file on disk is the deliverable and the next login reads it.
+niri_reload() {
+    command -v niri >/dev/null 2>&1 || {
+        echo "     niri: not on PATH — the config takes effect at next login"
+        return 0
+    }
+    if timeout 5 niri msg action load-config-file >/dev/null 2>&1; then
+        echo "     niri: reloaded the running compositor"
+    else
+        echo "     niri: could not reload a running compositor (is niri running?); the config takes effect at next login"
+    fi
+}
+# Merge the block into the user's niri config. Prints what it did; returns 1
+# only when it could not leave the file in a state it understands.
+niri_merge_rule() {
+    local target="$1" block existing kept bak
+    if [ ! -d "$(dirname "$target")" ]; then
+        mkdir -p "$(dirname "$target")" || {
+            echo "     WARN: could not create $(dirname "$target"); niri config not touched" >&2
+            return 1
+        }
+    fi
+    block="$(niri_managed_block)"
+    # An EMPTY block is a silent no-op install: the markers land, the
+    # idempotency check is satisfied by the empty block, and the installer
+    # reports "merged" while the bubble comes up un-floated — the exact defect
+    # this step replaced. `niri_rule` is a `cat | sed` pipeline, so a missing
+    # sed produces exactly this. Measured during this change. Refuse instead.
+    case "$block" in
+        *"window-rule {"*) : ;;
+        *)
+            echo "     WARN: could not build the window rule; not touching the config" >&2
+            return 1
+            ;;
+    esac
+    if [ ! -f "$target" ]; then
+        printf '// niri config\n\n%s\n' "$block" | atomic_write "$target" 644 || return 1
+        niri_reload
+        echo "     niri: created $target with the window rule"
+        return 0
+    fi
+    existing="$(niri_existing_block "$target")"
+    if [ -n "$existing" ] && [ "$existing" = "$block" ] \
+            && [ -z "$(niri_has_legacy_block "$target")" ]; then
+        echo "     niri: window rule already current in $target (not rewritten)"
+        return 0
+    fi
+    # Backup BEFORE the first write, once, and never over an existing backup:
+    # the first backup is the user's config as it was before handsoff ever
+    # touched it, and a second install must not replace that with a copy that
+    # already contains our block.
+    # "a backup exists" is NOT "a usable backup exists". `[ -e ]` alone is
+    # satisfied by a directory or a truncated file at that path, and taking it
+    # as a done backup means writing the config with no recoverable copy of
+    # what was there — measured: a directory named config.kdl.bak-handsoff
+    # sailed past this guard and the merge reported success. So the backup
+    # counts only as present when it is a non-empty regular file.
+    bak="$target.bak-handsoff"
+    if [ -e "$bak" ]; then
+        if [ ! -f "$bak" ] || [ ! -s "$bak" ]; then
+            echo "     WARN: $bak exists but is not a readable file; not touching the config" >&2
+            return 1
+        fi
+    else
+        cp -p -- "$target" "$bak" || {
+            echo "     WARN: could not back up $target to $bak; not touching the config" >&2
+            return 1
+        }
+    fi
+    # Two different things make the strip come back empty, and answering them
+    # the same way is how a merge turns into a WIPE. Measured here: the first
+    # version of this branch could not tell them apart, and either answer was
+    # wrong for one of them.
+    #   (a) the file held nothing but our block(s) — empty is CORRECT, and the
+    #       answer is to write the new block;
+    #   (b) the strip failed (a missing awk is rc 127) or lost the user's
+    #       content — empty is a LIE, and the answer is to write nothing.
+    # So: the exit status separates a failed tool from an empty result, and
+    # for an empty result the presence of a begin marker is what explains it.
+    strip_rc=0
+    kept="$(niri_strip_blocks "$target")" || strip_rc=$?
+    if [ "$strip_rc" -ne 0 ]; then
+        echo "     WARN: could not read the block structure of $target; not touching the config" >&2
+        return 1
+    fi
+    if [ -n "${kept//[[:space:]]/}" ]; then
+        printf '%s\n\n%s\n' "$kept" "$block" | atomic_write "$target" 644 || return 1
+    elif [ -s "$target" ] && ! grep -qF "$NIRI_BLOCK_BEGIN" "$target"; then
+        echo "     WARN: reading $target lost the rest of it; not touching the config" >&2
+        return 1
+    else
+        printf '// niri config\n\n%s\n' "$block" | atomic_write "$target" 644 || return 1
+    fi
+    niri_reload
+    echo "     niri: merged the window rule into $target (backup: $bak)"
+    if [ -n "$existing" ]; then
+        echo "     niri: replaced the previous handsoff block in place"
+    fi
 }
 niri_rule | sed "s/@APP_ID@/$APP_ID/" \
     | atomic_write "$CONF_DIR/niri-window-rule.kdl" 644
@@ -1267,10 +1440,18 @@ if [ "$REHEARSAL" = "1" ] || systemctl --user is-enabled handsoff.service >/dev/
     # do NOT write spawn-at-startup (a unit restart would spawn duplicates)
     echo "     (systemd manages autostart; add 'Mod+Shift+S => spawn settings' to niri manually)"
 else
-    printf '\n// launch at startup:\nspawn-at-startup "%s" "%s"\n' \
-        "$PYBIN" "$BIN_DIR/handsoff.py" >> "$CONF_DIR/niri-window-rule.kdl"
+    niri_autostart >> "$CONF_DIR/niri-window-rule.kdl"
     echo "     (no systemd: added spawn-at-startup — check the path contains no wrong username)"
 fi
+# The window rule is MERGED, not printed as a step the reader has to finish by
+# hand. NIRI_CONFIG is honoured for the same reason handsoff-settings.py
+# honours it (a test, or a desk whose config is not where niri looks it up);
+# in rehearsal HOME is the rehearsal root, so the rehearsaled merge is actually
+# exercised in a throw-away config rather than skipped.
+niri_merge_rule "${NIRI_CONFIG:-$HOME/.config/niri/config.kdl}" || {
+    echo "     WARN: the rule is in $CONF_DIR/niri-window-rule.kdl but was NOT merged" >&2
+    echo "     WARN: merge it by hand, then: niri msg action load-config-file" >&2
+}
 
 if [ "$REHEARSAL" = "1" ]; then
     "${PYBIN}" - "$CONF_DIR/deployment.json" <<'PY_EOF'
@@ -1313,8 +1494,7 @@ fi
 
 echo
 echo "handsoff installed."
-echo "  1. Merge $CONF_DIR/niri-window-rule.kdl into ~/.config/niri/config.kdl"
-echo "     then: niri msg action load-config-file"
+echo "  1. niri window rule merged into ${NIRI_CONFIG:-$HOME/.config/niri/config.kdl} (see the lines above)"
 if systemctl --user is-active --quiet handsoff.service 2>/dev/null; then
     echo "  2. running with the new code — verify with:  python ~/.local/bin/handsoff.py --ptt doctor"
 else

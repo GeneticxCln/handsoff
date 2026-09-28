@@ -60,7 +60,9 @@ cd ~/Projects/handsoff && ./install.sh
 It upgrades the system, installs the Python extras, puts `handsoff.py`,
 `handsoff-settings.py` and `handsoff-restart` in `~/.local/bin`, downloads a
 SHA256-verified whisper model and the speech weights, writes a systemd **user**
-service (`Restart=always`), and prints the niri window-rule snippet to merge.
+service (`Restart=always`), and merges the niri window rule into your
+`config.kdl` — it takes a `.bak-handsoff` first, rewrites only its own marked
+block, and reloads the compositor if one is running.
 
 The pacman step is the only one that needs your password. For a script, a CI
 job, or an agent that cannot answer a prompt, pass `--skip-system-packages`
@@ -75,10 +77,14 @@ Exactly one autostart owner: with the unit enabled the installer will not also
 add `spawn-at-startup` to niri.
 
 ```bash
-# merge ~/.config/handsoff/niri-window-rule.kdl into ~/.config/niri/config.kdl
-niri msg action load-config-file
 systemctl --user start handsoff
 ```
+
+The window rule lands in a block marked `>>> handsoff managed block`, so a
+re-install rewrites that block instead of stacking a second copy, and a block
+you pasted in by hand from an older install is replaced rather than left
+beside it. To undo the whole thing, restore
+`~/.config/niri/config.kdl.bak-handsoff`.
 
 Before installing: `HANDSOFF_MODEL` (default `qwen3:8b`), `HANDSOFF_WHISPER`
 (`tiny`…`large-v3`), `HANDSOFF_TTS_REPO`.
@@ -242,7 +248,7 @@ switch auto-restores); a bad self-edit has a `.bak` beside it; `./install.sh
 ```bash
 bash ci/gates.sh                     # every gate, in CI's order (~10 min)
 bash ci/gates.sh compile lint links shell    # the fast ones (seconds)
-python -m pytest tests/ -q           # 2592 tests
+python -m pytest tests/ -q           # 2607 tests
 git config core.hooksPath githooks   # then every commit runs the suite too
 ```
 
@@ -258,7 +264,7 @@ suite reads ~60% and "fails" the floor for no reason:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70   # 2592 tests, 86.09% measured
+  --cov-report=term-missing --cov-fail-under=70   # 2607 tests, 86.10% measured
 ```
 
 CI (GitHub, mirrored gate-for-gate in `.gitlab-ci.yml`) runs the suite on

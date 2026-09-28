@@ -2344,14 +2344,45 @@ def _installer_source() -> str:
     return (HERE / "install.sh").read_text(encoding="utf-8")
 
 
+#: A heredoc opener: `<<WORD`, `<<'WORD'`, `<<"WORD"`. A here-STRING (`<<<`)
+#: is excluded on BOTH sides, and both are load-bearing: a leading guard alone
+#: still matches the THIRD `<` of `<<<"$1"` and reads `"$1"` as a terminator,
+#: which is how `_ollama_model_tools` stopped slicing (measured). A here-string
+#: has no terminator line, so treating it as a heredoc eats the rest of the file.
+_HEREDOC_OPEN = re.compile(
+    r"(?<!<)<<(?!<)\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))")
+
+
 def _installer_function(name: str) -> str:
-    """The shell function exactly as shipped, sliced by its own closing brace."""
+    """The shell function exactly as shipped, sliced by its own closing brace.
+
+    Heredocs are SKIPPED, not just ignored. The body of a heredoc is text, so a
+    `}` at column 0 inside one is not the end of the function: `niri_rule`
+    closes its `window-rule {` block at column 0, and slicing on the first
+    such brace returned 11 lines that are not valid bash at all — truncated
+    before the `NIRI_EOF` terminator. A test that drove those bytes would
+    assert against a function that does not exist, and a "it ran" assertion
+    would fail for the wrong reason while a "it contains" assertion could
+    pass on the fragment. Measured, not assumed: that is exactly the shape the
+    niri-merge tests need, so the trap was live the moment they were written.
+    """
     lines = _installer_source().splitlines(keepends=True)
     start = next(i for i, line in enumerate(lines)
                  if line.startswith(f"{name}() {{"))
-    end = next(i for i in range(start + 1, len(lines))
-               if lines[i].startswith("}"))
-    return "".join(lines[start:end + 1])
+    terminator = None
+    for i in range(start, len(lines)):
+        line = lines[i]
+        if terminator is not None:
+            if line.strip() == terminator:
+                terminator = None
+            continue
+        match = _HEREDOC_OPEN.search(line)
+        if match:
+            terminator = next(g for g in match.groups() if g is not None)
+            continue
+        if i > start and line.startswith("}"):
+            return "".join(lines[start:i + 1])
+    raise AssertionError(f"{name}() has no closing brace at column 0")
 
 
 def _installer_call(name: str) -> str:
@@ -2894,6 +2925,405 @@ class TestInstallerRehearsal:
         )
         assert result.returncode != 0
         assert unit.read_text() == original
+
+
+def _niri_markers() -> tuple[str, str]:
+    """The block markers exactly as install.sh ships them."""
+    begin = end = None
+    for line in _installer_source().splitlines():
+        if line.startswith("NIRI_BLOCK_BEGIN="):
+            begin = line.split("=", 1)[1].strip().strip('"')
+        elif line.startswith("NIRI_BLOCK_END="):
+            end = line.split("=", 1)[1].strip().strip('"')
+    assert begin and end, "install.sh no longer defines both block markers"
+    return begin, end
+
+
+def _niri_legacy_block() -> str:
+    """The block the OLD installer told the reader to paste by hand.
+
+    Reproduced from the pre-change `niri_rule` output, because the point of the
+    migration test is the shape that is already sitting in users' configs.
+    """
+    return (
+        "// handsoff voice-assistant bubble — merge into ~/.config/niri/config.kdl\n"
+        "window-rule {\n"
+        '    match app-id=r#"^handsoff$"#\n'
+        "    open-floating true\n"
+        '    default-floating-position x=16 y=16 relative-to="bottom-right"\n'
+        "    focus-ring { off; }\n"
+        "    border { off; }\n"
+        "    shadow { off; }\n"
+        "}\n"
+    )
+
+
+class TestTheNiriRuleIsMergedNotPrinted:
+    """The window rule is MERGED into the niri config, not printed as a step.
+
+    The installer used to finish by telling the reader to merge the snippet by
+    hand and then run `niri msg action load-config-file`. That is advice, not
+    behaviour: the install completed and reported success while the rule was
+    still unwritten, so the bubble came up un-floated and the reader had no way
+    to tell the install was incomplete. The merge now happens here, with the
+    same three properties the settings app's own niri writer already had
+    (`handsoff-settings.py::set_autostart`): a backup taken before the first
+    write and never overwritten, an atomic replace, and a best-effort reload.
+
+    These drive the REAL shell functions, sliced out of `install.sh` with the
+    suite's own `_installer_function` — not a re-implementation in Python, which
+    would be free to be correct while the shipped script is wrong.
+    """
+
+    _FUNCTIONS = ("atomic_write", "niri_rule", "niri_autostart",
+                  "niri_managed_block", "niri_existing_block",
+                  "niri_strip_blocks", "niri_has_legacy_block",
+                  "niri_reload", "niri_merge_rule")
+    #: Everything the merge shells out to. Used to build a PATH that has the
+    #: tools the step needs but NOT niri, so "niri is not installed" can be
+    #: tested without also removing coreutils and modelling a broken machine.
+    _TOOLS = ("awk", "cat", "chmod", "cp", "dirname", "mkdir", "mv",
+              "mktemp", "rm", "sed", "timeout")
+
+    def _driver(self, tmp_path, rehearsal="1"):
+        """A bash script holding the shipped functions plus a stub niri.
+
+        `niri_reload` shells out to a real compositor, which a test must not
+        require and a sandbox must not poke. Putting a stub `niri` FIRST on
+        PATH keeps the reload path exercised (it runs, and its rc is read)
+        without the compositor being involved.
+        """
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        stub = bin_dir / "niri"
+        stub.write_text("#!/bin/sh\necho \"stub niri $*: ok\"\nexit 0\n")
+        stub.chmod(0o755)
+        parts = []
+        for name in self._FUNCTIONS:
+            parts.append(_installer_function(name))
+        # The two markers are assignments, not functions.
+        for line in _installer_source().splitlines(keepends=True):
+            if line.startswith(("NIRI_BLOCK_BEGIN=", "NIRI_BLOCK_END=",
+                                "NIRI_LEGACY_BEGIN=")):
+                parts.append(line)
+        script = tmp_path / "drive.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -u\n"
+            f"PATH={bin_dir}:$PATH\n"
+            "APP_ID=handsoff\n"
+            f"REHEARSAL={rehearsal}\n"
+            "PYBIN=/usr/bin/python3\n"
+            "BIN_DIR=" + str(tmp_path / "local" / "bin") + "\n"
+            "CONF_DIR=" + str(tmp_path / "conf") + "\n"
+            + "".join(parts) +
+            f'printf \"%s\\n" "${{NIRI_BLOCK_BEGIN}}"\n'
+            'niri_merge_rule "$1"\n'
+            'echo "rc=$?"\n',
+            encoding="utf-8",
+        )
+        return script, config
+
+    def _run_merge(self, tmp_path, config, rehearsal="1"):
+        script, _ = self._driver(tmp_path, rehearsal)
+        return subprocess.run(["bash", str(script), str(config)],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_the_rule_lands_in_the_config_without_being_asked_for(self, tmp_path):
+        """The whole point: the file the reader was told to edit by hand now
+        carries the rule, and the run says it merged rather than printing a
+        step."""
+        result = self._run_merge(tmp_path, tmp_path / "niri" / "config.kdl")
+        assert result.returncode == 0, result.stderr
+        text = (tmp_path / "niri" / "config.kdl").read_text(encoding="utf-8")
+        assert "window-rule" in text, text
+        assert 'match app-id=r#"^handsoff$"#' in text, (
+            "the merged rule must carry the substituted app-id, not the "
+            f"placeholder: {text}")
+        assert "@APP_ID@" not in text
+        assert "merged" in result.stdout or "created" in result.stdout, result.stdout
+
+    def test_a_second_install_does_not_append_a_second_copy(self, tmp_path):
+        """Idempotence, measured: the block count must stay at ONE, and the
+        second run must say it did not rewrite."""
+        config = tmp_path / "niri" / "config.kdl"
+        first = self._run_merge(tmp_path, config)
+        assert first.returncode == 0, first.stderr
+        second = self._run_merge(tmp_path, config)
+        assert second.returncode == 0, second.stderr
+        text = config.read_text(encoding="utf-8")
+        assert text.count(">>> handsoff managed block") == 1, (
+            f"a re-install appended a duplicate block:\n{text}")
+        assert "not rewritten" in second.stdout, second.stdout
+
+    def test_the_users_own_config_survives_the_merge(self, tmp_path):
+        """A merge that dropped the user's binds would be worse than no merge
+        at all, and it would be silent."""
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            "// MY DESK\n"
+            "binds {\n"
+            "    Mod+Q { quit }\n"
+            "}\n"
+            'layout "tiling"\n',
+            encoding="utf-8",
+        )
+        result = self._run_merge(tmp_path, config)
+        assert result.returncode == 0, result.stderr
+        text = config.read_text(encoding="utf-8")
+        assert "Mod+Q" in text and "tiling" in text, (
+            f"the merge destroyed the user's own config:\n{text}")
+        assert "window-rule" in text
+
+    def test_the_backup_is_the_config_as_it_was_before_handsoff(self, tmp_path):
+        """A backup taken AFTER our block was written is no backup at all — it
+        would restore the state we are trying to escape."""
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        original = '// MINE\nbinds { Mod+Q { quit } }\n'
+        config.write_text(original, encoding="utf-8")
+        assert self._run_merge(tmp_path, config).returncode == 0
+        backup = tmp_path / "niri" / "config.kdl.bak-handsoff"
+        assert backup.exists(), "the merge wrote the config with no backup"
+        assert backup.read_text(encoding="utf-8") == original, (
+            "the backup is not the pre-handsoff config")
+
+    def test_a_second_install_does_not_overwrite_the_original_backup(self, tmp_path):
+        """The first backup is the only copy of the pre-handsoff config. A
+        later install that refreshed it would destroy the thing it exists to
+        preserve."""
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        original = "// MINE\n"
+        config.write_text(original, encoding="utf-8")
+        assert self._run_merge(tmp_path, config).returncode == 0
+        backup = tmp_path / "niri" / "config.kdl.bak-handsoff"
+        # An upgrade: the block we would write now is DIFFERENT.
+        script, _ = self._driver(tmp_path)
+        upgraded = script.read_text(encoding="utf-8").replace(
+            "APP_ID=handsoff", "APP_ID=handsoff-v2")
+        script.write_text(upgraded, encoding="utf-8")
+        again = subprocess.run(["bash", str(script), str(config)],
+                               capture_output=True, text=True, timeout=60)
+        assert again.returncode == 0, again.stderr
+        assert backup.read_text(encoding="utf-8") == original, (
+            "the second install overwrote the original backup")
+        text = config.read_text(encoding="utf-8")
+        assert 'handsoff-v2' in text, f"the upgrade did not land: {text}"
+        assert 'match app-id=r#"^handsoff$"#' not in text, (
+            f"the stale rule survived the upgrade: {text}")
+        assert text.count(">>> handsoff managed block") == 1, text
+
+    def test_two_copies_in_the_file_collapse_to_one(self, tmp_path):
+        """A hand-edited file can end up with the block twice; the merge must
+        not preserve that, because the second rule floats nothing."""
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        begin, end = _niri_markers()
+        config.write_text(
+            f"{begin}\n"
+            'window-rule { match app-id=r#"^stale$"# }\n'
+            f"{end}\n"
+            f"{begin}\n"
+            'window-rule { match app-id=r#"^stale2$"# }\n'
+            f"{end}\n",
+            encoding="utf-8",
+        )
+        result = self._run_merge(tmp_path, config)
+        assert result.returncode == 0, result.stderr
+        text = config.read_text(encoding="utf-8")
+        assert text.count(">>> handsoff managed block") == 1, (
+            f"the duplicate was kept: {text}")
+        assert "stale" not in text, f"the stale rule survived: {text}"
+
+    def test_a_compositor_that_is_not_running_is_reported_not_fatal(self, tmp_path):
+        """The file on disk is the deliverable; a missing compositor only means
+        the reload cannot happen yet. Failing the install for that would make
+        the installer depend on a running GUI session."""
+        config = tmp_path / "niri" / "config.kdl"
+        script, _ = self._driver(tmp_path)
+        # A `niri` that refuses, standing in for a compositor that is not up.
+        no_niri = tmp_path / "bin" / "niri"
+        no_niri.write_text("#!/bin/sh\nexit 1\n")
+        no_niri.chmod(0o755)
+        result = subprocess.run(["bash", str(script), str(config)],
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, (
+            f"a dead compositor failed the install: {result.stderr}")
+        assert "next login" in result.stdout, result.stdout
+        assert "window-rule" in config.read_text(encoding="utf-8")
+
+    def test_no_niri_on_path_still_writes_the_config(self, tmp_path):
+        """A desk without niri installed must still get the rule written, or the
+        next install elsewhere would have to know to do it."""
+        config = tmp_path / "niri" / "config.kdl"
+        script, _ = self._driver(tmp_path)
+        # A PATH holding every tool the merge needs EXCEPT niri. Blanking the
+        # PATH instead (the first attempt) also removed coreutils, so the step
+        # died on `dirname` and never reached the niri check at all — it
+        # modelled a broken machine, not a desk without a compositor.
+        tools = tmp_path / "tools"
+        tools.mkdir(exist_ok=True)
+        import shutil as _shutil
+        for tool in self._TOOLS:
+            found = _shutil.which(tool)
+            assert found, f"{tool} is required by the merge but not on PATH"
+            (tools / tool).symlink_to(found)
+        text = script.read_text(encoding="utf-8")
+        text = text.replace(f"PATH={tmp_path / 'bin'}:$PATH", f"PATH={tools}")
+        script.write_text(text, encoding="utf-8")
+        result = subprocess.run(["bash", str(script), str(config)],
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        assert "not on PATH" in result.stdout, result.stdout
+        assert "window-rule" in config.read_text(encoding="utf-8")
+
+    def test_a_config_that_cannot_be_backed_up_is_not_overwritten(self, tmp_path):
+        """If the backup fails, the merge must refuse rather than proceed: the
+        user's only copy of their config is the file itself."""
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        original = "// MINE\n"
+        config.write_text(original, encoding="utf-8")
+        # A directory where the backup belongs makes `cp` fail.
+        (tmp_path / "niri" / "config.kdl.bak-handsoff").mkdir()
+        result = self._run_merge(tmp_path, config)
+        assert "rc=1" in result.stdout, result.stdout
+        assert config.read_text(encoding="utf-8") == original, (
+            "the config was written even though the backup failed")
+
+    def test_the_closing_advice_no_longer_asks_the_reader_to_merge_by_hand(self):
+        """The prose is the defect being removed; a test that only checks the
+        function would pass while the installer still told the reader to do the
+        work."""
+        source = _installer_source()
+        assert "Merge $CONF_DIR/niri-window-rule.kdl" not in source, (
+            "the installer still prints the manual merge step")
+        assert "niri msg action load-config-file" in source
+
+    def test_a_strip_that_fails_must_not_become_a_wipe(self, tmp_path):
+        """The one that would have destroyed a desk's config.
+
+        `niri_strip_blocks` is the step that decides what survives the merge.
+        If it returns nothing — a missing awk, a read error, anything — and the
+        code cannot tell that apart from "the file was only ever our block",
+        the answer is to write a config containing the rule and NOTHING else.
+        The user's binds, layout and every other setting gone, and the install
+        reporting success. Measured as a live defect during this change: the
+        original `else` branch could not tell those two cases apart.
+        """
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        original = '// MY DESK\nbinds {\n    Mod+Q { quit }\n}\n'
+        config.write_text(original, encoding="utf-8")
+        script, _ = self._driver(tmp_path)
+        # Make the strip produce nothing while the file is very much not empty.
+        broken = script.read_text(encoding="utf-8").replace(
+            "niri_strip_blocks() {", "niri_strip_blocks() {\n    return 0\n")
+        script.write_text(broken, encoding="utf-8")
+        result = subprocess.run(["bash", str(script), str(config)],
+                                capture_output=True, text=True, timeout=60)
+        assert "rc=1" in result.stdout, result.stdout
+        assert "not touching the config" in result.stderr, result.stderr
+        assert config.read_text(encoding="utf-8") == original, (
+            "a failed strip still wrote the config — this is the wipe")
+
+    def test_the_config_a_legacy_manual_paste_left_is_upgraded_not_doubled(self, tmp_path):
+        """Every desk that followed the OLD installer's advice has an unmarked
+        hand-pasted block. The new installer must replace it, not add a marked
+        block beside it: niri would then apply two window rules to one app-id,
+        and the duplicate is invisible until someone reads the config."""
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            'layout "tiling"\n' + _niri_legacy_block(),
+            encoding="utf-8",
+        )
+        result = self._run_merge(tmp_path, config)
+        assert result.returncode == 0, result.stderr
+        text = config.read_text(encoding="utf-8")
+        assert text.count("window-rule {") == 1, (
+            f"the legacy block was left beside the new one: {text}")
+        assert 'tiling' in text, f"the user's own config was lost: {text}"
+        assert "merge into ~/.config/niri" not in text, (
+            f"the legacy header survived: {text}")
+
+    def test_an_unchanged_rule_still_repairs_a_leftover_legacy_copy(self, tmp_path):
+        """The "already current" shortcut compares the marked block only. With a
+        legacy copy also present the block IS current, and taking the shortcut
+        leaves the duplicate in place — the exact defect above, reached by a
+        different door. This one is reached by installing twice."""
+        config = tmp_path / "niri" / "config.kdl"
+        assert self._run_merge(tmp_path, config).returncode == 0
+        # A user then pastes the old snippet in as well, as the old advice said.
+        with config.open("a", encoding="utf-8") as fh:
+            fh.write("\n" + _niri_legacy_block())
+        result = self._run_merge(tmp_path, config)
+        assert result.returncode == 0, result.stderr
+        text = config.read_text(encoding="utf-8")
+        assert text.count("window-rule {") == 1, (
+            f"the second install left the pasted copy in place: {text}")
+
+    def test_a_rule_that_cannot_be_built_is_refused_not_written_empty(self, tmp_path):
+        """An empty block is a silent no-op, which is the defect being removed.
+
+        `niri_rule` is a `cat | sed` pipeline, so a desk without `sed` on PATH
+        produces a block that is nothing but the two marker comments. Written,
+        that satisfies the idempotency comparison on every later run, the
+        installer says "merged", and the bubble comes up unfloated — the manual
+        step was removed and nothing took its place. Measured during this
+        change: the first version wrote the empty block and reported success.
+        """
+        config = tmp_path / "niri" / "config.kdl"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        original = "// MY DESK\n"
+        config.write_text(original, encoding="utf-8")
+        script, _ = self._driver(tmp_path)
+        # A `sed` that yields nothing, FIRST on PATH. Defining a shell function
+        # named sed inside niri_rule does not do this: niri_rule is the left
+        # side of a pipeline and runs in a subshell, so the function dies with
+        # it and the real sed still substitutes the app-id (measured — the
+        # first attempt at this test passed vacuously for that reason).
+        nosed = tmp_path / "nosed"
+        nosed.mkdir(exist_ok=True)
+        broken_sed = nosed / "sed"
+        broken_sed.write_text("#!/bin/sh\nexit 0\n")
+        broken_sed.chmod(0o755)
+        text = script.read_text(encoding="utf-8").replace(
+            f"PATH={tmp_path / 'bin'}:$PATH", f"PATH={nosed}:{tmp_path / 'bin'}:$PATH")
+        script.write_text(text, encoding="utf-8")
+        result = subprocess.run(["bash", str(script), str(config)],
+                                capture_output=True, text=True, timeout=60)
+        assert "rc=1" in result.stdout, result.stdout
+        assert "could not build the window rule" in result.stderr, result.stderr
+        assert config.read_text(encoding="utf-8") == original, (
+            "the empty block was written — a merge that does nothing, reported "
+            "as a merge")
+
+    def test_spawn_at_startup_joins_the_same_managed_block(self, tmp_path):
+        """Without systemd the block carries the autostart line, and it must be
+        inside the markers so a later systemd install can REPLACE it rather
+        than leave both."""
+        config = tmp_path / "niri" / "config.kdl"
+        script, _ = self._driver(tmp_path, rehearsal="0")
+        # Stand in for "systemd does not own autostart".
+        text = script.read_text(encoding="utf-8").replace(
+            "REHEARSAL=0",
+            "systemctl() { return 1; }\nREHEARSAL=0")
+        script.write_text(text, encoding="utf-8")
+        result = subprocess.run(["bash", str(script), str(config)],
+                                capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stderr
+        merged = config.read_text(encoding="utf-8")
+        assert "spawn-at-startup" in merged, merged
+        begin = merged.index(">>> handsoff managed block")
+        end = merged.index("<<< handsoff managed block end")
+        assert begin < merged.index("spawn-at-startup") < end, (
+            "the autostart line escaped the managed block, so a later systemd "
+            f"install cannot replace it: {merged}")
 
 
 class TestBoundedJobBuffer:

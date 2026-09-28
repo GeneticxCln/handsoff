@@ -30,7 +30,14 @@ Sources: `install.sh`, `handsoff.py` (`main`, `_deployment_snapshot`,
    `Restart=always`, `PartOf=graphical-session.target`,
    `WantedBy=graphical-session.target`. Exactly ONE autostart owner:
    systemd enabled → no niri `spawn-at-startup` (checked, not assumed).
-7. niri snippet print (`niri-window-rule.kdl` merge) + `load-config-file` hint.
+7. niri window rule MERGED into `~/.config/niri/config.kdl` (honouring
+   `NIRI_CONFIG`), inside a marker-delimited managed block: a non-empty
+   `.bak-handsoff` taken before the first write and never overwritten, an
+   atomic replace, the pre-marker block this installer used to ask the reader
+   to paste by hand recognised and replaced rather than doubled, and a
+   best-effort `niri msg action load-config-file` that reports rather than
+   fails when no compositor is running. The `niri-window-rule.kdl` snippet is
+   still written, as the copy the rehearsal verifies.
 8. Flags: `--help` (pure, CI-smoked), `--rehearsal` (redirect HOME, no host
    changes), `--rollback`, `--uninstall` (manifest loop; `core/` + `~/.local/bin`
    dropped only when empty-or-bytecode — never `rm -rf` a shared dir),
