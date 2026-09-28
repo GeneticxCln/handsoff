@@ -809,6 +809,15 @@ class TestICSDailyOldEvent:
     answer — "no events" for a meeting that is on every single day.
     """
 
+    # The window ends are built with `timedelta`, not `(y, m, today.day + n)`.
+    # The tuple form raises `ValueError: day 31 must be in range 1..30` the
+    # moment the arithmetic leaves the month, so these three tests measured
+    # nothing on the 29th and 30th of a 30-day month — and on the 28th, which
+    # is how this was found: 2026-09-28 + 3 days is the 31st of September.
+    # A test that fails on a date rather than on a defect is a test with a
+    # second, invisible subject, and the rest of this class had already moved
+    # to the safe form (`.timetuple()[:3]`); these were the stragglers.
+
     def _events(self, H, dtstart, rrule, win_s, win_e, summary="Ev"):
         text = "\r\n".join([
             "BEGIN:VCALENDAR", "VERSION:2.0",
@@ -828,9 +837,9 @@ class TestICSDailyOldEvent:
             hour=0, minute=0, second=0, microsecond=0)
         start = today - H.datetime.timedelta(days=800)
         ev = self._events(
-            H, start.strftime("%Y%m%dT090000"), "FREQ=DAILY",
+            H, start.strftime("%Y%m%dT090000"),            "FREQ=DAILY",
             (today.year, today.month, today.day),
-            (today.year, today.month, today.day + 1))
+            (today + H.datetime.timedelta(days=1)).timetuple()[:3])
         assert len(ev) == 1, ev
         assert ev[0]["start"].date() == today.date()
 
@@ -843,9 +852,9 @@ class TestICSDailyOldEvent:
             hour=0, minute=0, second=0, microsecond=0)
         start = today - H.datetime.timedelta(days=800)
         ev = self._events(
-            H, start.strftime("%Y%m%dT090000"), "FREQ=DAILY;COUNT=500",
+            H, start.strftime("%Y%m%dT090000"),            "FREQ=DAILY;COUNT=500",
             (today.year, today.month, today.day),
-            (today.year, today.month, today.day + 1))
+            (today + H.datetime.timedelta(days=1)).timetuple()[:3])
         assert ev == [], f"a COUNT-finished recurrence came back from the dead: {ev}"
 
     def test_interval_alignment_is_preserved_across_the_jump(self, H):
@@ -856,9 +865,9 @@ class TestICSDailyOldEvent:
             hour=0, minute=0, second=0, microsecond=0)
         start = today - H.datetime.timedelta(days=901)
         ev = self._events(
-            H, start.strftime("%Y%m%dT090000"), "FREQ=DAILY;INTERVAL=3",
+            H, start.strftime("%Y%m%dT090000"),            "FREQ=DAILY;INTERVAL=3",
             (today.year, today.month, today.day),
-            (today.year, today.month, today.day + 3))
+            (today + H.datetime.timedelta(days=3)).timetuple()[:3])
         days = [e["start"].date() for e in ev]
         phase = (start.date() - days[0]).days % 3 if days else None
         assert days and phase == 0, (days, phase)
