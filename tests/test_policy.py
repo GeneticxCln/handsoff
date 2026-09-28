@@ -1795,6 +1795,11 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
              "_the_reader_is_unreachable"),
             ("read_page_blocked_by_the_site", "http://example.com/",
              "_the_reader_is_blocked"),
+            # The third-party reader's own switch, off. Reached the same way
+            # the ones above are — through `read_page`, so the sentence the
+            # model reads is the one this refusal produces.
+            ("read_page_hosted_reader_switched_off", "http://example.com/",
+             "_the_hosted_reader_is_switched_off"),
         ),
         "edit": (
             ("edit_content_too_large", "@big", "_content_too_large"),
@@ -2007,7 +2012,15 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
         The composition: the local half is a block page (so the reader is
         tried at all) and the reader's hop is a redirect into the link-local
         metadata address.
+
+        The switch is ON, explicitly. It defaults to off in the shipped
+        settings, and these three entries are about what the fallback DOES
+        when it runs — the refusal for it being off is its own corpus entry
+        (`_the_hosted_reader_is_switched_off`). Left implicit, the new gate
+        shadows all three and each one reports as unreachable, which is the
+        honest signal that the setup no longer reaches what it claims.
         """
+        monkeypatch.setattr(_core_module("web"), "_HOSTED_READER", True)
         block = ("<html><body>Please enable JavaScript to continue. "
                  "</body></html>").encode("utf-8")
         self._hop_seam(H, monkeypatch, lambda n: (
@@ -2015,6 +2028,10 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
             (block, "http://169.254.169.254/latest/meta-data/")))
 
     def _the_reader_is_unreachable(self, H, monkeypatch, tmp_path, subject):
+        # The switch is ON (see `_the_reader_hop_is_refused`): this entry is
+        # about the fallback failing, which cannot happen while it is refused.
+        monkeypatch.setattr(_core_module("web"), "_HOSTED_READER", True)
+
         def hop(url, timeout, connect_to=None):
             raise OSError("the reader is not answering")
 
@@ -2025,8 +2042,28 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
     def _the_reader_is_blocked(self, H, monkeypatch, tmp_path, subject):
         # a phrase from `_ANTIBOT` verbatim, so this is the block page the
         # reader is judged by and not a page that merely looks short
+        monkeypatch.setattr(_core_module("web"), "_HOSTED_READER", True)
         block = b"<html><body>Just a moment...</body></html>"
         self._hop_seam(H, monkeypatch, lambda n: (block, ""))
+
+    def _the_hosted_reader_is_switched_off(self, H, monkeypatch, tmp_path,
+                                          subject):
+        """The user's own switch says no, so the address stays here.
+
+        Two halves, and the order matters: the local fetch must be USELESS (a
+        JavaScript shell — the shape that makes the fallback the next step)
+        AND the switch must be off. A readable page returns before the gate is
+        ever consulted, so with a readable page this corpus entry would pass
+        without reaching the refusal at all.
+
+        The switch is set on the SEAM rather than on SETTINGS, so this walks
+        the same path the host wires it: a value the reader consults per call.
+        """
+        shell = (b"<html><head><script>" + b"app()\n" * 400
+                 + b"</script></head><body><div id=\"root\"></div></body></html>")
+        self._hop_seam(H, monkeypatch, lambda n: (shell, ""))
+        web = _core_module("web")
+        monkeypatch.setattr(web, "_HOSTED_READER", False)
 
     # -- edit: every one of these builds a REAL call, because the refusals
     # sit at different depths and a shared fake path would reach the wrong one

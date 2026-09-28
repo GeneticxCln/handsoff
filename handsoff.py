@@ -4573,6 +4573,14 @@ _web.configure(
     http_get_hop=lambda url, timeout=10.0, connect_to=None: _http_get_hop(
         url, timeout, connect_to=connect_to),
     searxng_url=lambda: str(SETTINGS.get("searxng_url") or ""),
+    # The third-party reader's own switch, a RESOLVER so a settings save takes
+    # effect on the next read rather than at next start. It is a PERMISSION —
+    # read out of the `permissions` dict beside every other switch, and drawn
+    # by the same permission grid. `is True` and not truthiness: the shipped
+    # value is a bool, but a hand-edited settings.json carrying the string
+    # "false" must read as OFF here, not as the third party being on because a
+    # non-empty string is truthy.
+    hosted_reader=lambda: (SETTINGS.get("permissions") or {}).get("hosted_reader") is True,
     logger=log,
 )
 

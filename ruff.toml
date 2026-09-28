@@ -7,7 +7,7 @@
 # tree is deliberately NOT linted. It carries 129 findings under these rules,
 # 90 of them re-exports that exist so a fixture can be imported by name, and a
 # gate whose first act is to silence 90 correct lines teaches everyone to
-# ignore the gate. The 2296-test suite is what holds the tests.
+# ignore the gate. The 2571-test suite is what holds the tests.
 #
 # NOT SELECTED, each measured on this tree on 2026-09-25:
 #   SIM   126 findings — collapsible ifs, `open()` outside a context manager

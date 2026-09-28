@@ -367,8 +367,11 @@ os.PathLike…`, naming neither what to pass nor the mistake, while `Desk(7)`
 fallback walk with per-backend failure record (`failure_reasons()`),
 one in-flight request per backend via `BoundedRegistry`, TTL cache 300 s,
 per-backend timeout 6 s, reader 8 s / 40 000 chars / 6000 into context.
-`read_page`: local fetch first, Jina Reader fallback — and the text says
-which served it. SSRF: loopback/link-local/private/`.local` refused, the
+`read_page`: local fetch first, Jina Reader fallback **only when the
+`hosted_reader` setting is on** (default off since 2026-09-27 — the fallback
+sends the target ADDRESS, not the search text, so it has its own switch; an
+unwired seam, a False resolver or one that raises all read as off) — and the
+text says which served it. SSRF: loopback/link-local/private/`.local` refused, the
 redirect chain walked one hop at a time with EVERY hop put back through the
 same destination check, and the addresses each hop was checked at handed to
 the fetch (`connect_to`) so the address dialled is the address checked — the

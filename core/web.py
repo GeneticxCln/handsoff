@@ -93,6 +93,11 @@ _LOG = None
 # different question from `_HTTP_GET` above.
 _HTTP_HOP = None
 _HTTP_HOP_IS_FN = True
+# The hosted reader's switch: a resolver returning bool, or None. None means
+# "no host wired this", which is REFUSED rather than allowed — the fallback
+# sends the user's target address to a third party, so the safe reading of an
+# absent seam is "off". Set by `configure(hosted_reader=...)`.
+_HOSTED_READER = None
 
 
 def _warn(msg: str, *args) -> None:
@@ -127,15 +132,25 @@ def _takes_a_url(fn) -> bool:
 
 
 def configure(http_get=None, searxng_url=None, logger=None,
-              http_get_hop=None) -> None:
+              http_get_hop=None, hosted_reader=None) -> None:
     """Inject the host's seams. See the module docstring: pass resolvers.
 
     `http_get_hop` is the READER's seam: one request that does NOT follow
     redirects, returning `(body, Location or "")`. It exists because
     `http_get` follows them inside the host's urlopen, and a redirect is a new
     address that was never checked — see `_read_fetch`.
+
+    `hosted_reader` is a RESOLVER for the `hosted_reader` setting: True when the
+    user has switched the third-party reader on. It gates the `r.jina.ai`
+    fallback and nothing else, and it is a resolver (not a bound bool) for the
+    same reason `searxng_url` is: the setting can be changed on a live settings
+    save, and binding the value once would leave the fallback answering for a
+    switch the user has since turned off. Absent (None) means the fallback is
+    REFUSED, because the shipped default is off and a host that never wired the
+    seam must not silently inherit an on-switch.
     """
     global _HTTP_GET, _HTTP_IS_FN, _SEARXNG_URL, _LOG, _HTTP_HOP, _HTTP_HOP_IS_FN
+    global _HOSTED_READER
     if http_get is not None:
         _HTTP_GET = http_get
         _HTTP_IS_FN = _takes_a_url(http_get)
@@ -144,6 +159,8 @@ def configure(http_get=None, searxng_url=None, logger=None,
         _HTTP_HOP_IS_FN = _takes_a_url(http_get_hop)
     if searxng_url is not None:
         _SEARXNG_URL = searxng_url
+    if hosted_reader is not None:
+        _HOSTED_READER = hosted_reader
     if logger is not None:
         _LOG = logger
 
@@ -266,6 +283,27 @@ def _read_fetch(url: str, timeout: float, connect_to=None) -> tuple:
 
 def _searxng_url() -> str:
     return str(_resolve(_SEARXNG_URL) or "").strip().rstrip("/")
+
+
+def _hosted_reader_enabled() -> bool:
+    """True when the user has switched the third-party reader on.
+
+    Three readings, all of which mean "no" unless something says otherwise:
+    no seam wired at all (a partial install, or a test that patched only the
+    plain fetch), a resolver that returns something that is not True, and a
+    resolver that raises. The last one matters because this is a privacy
+    switch: a settings object that is mid-reload, or a resolver that trips
+    over a half-written value, must not be the difference between the user's
+    address staying on this machine and going to a third party. Anything
+    uncertain is OFF, and the caller says so in a sentence naming the switch.
+    """
+    if _HOSTED_READER is None:
+        return False
+    try:
+        return _resolve(_HOSTED_READER) is True
+    except Exception:
+        _warn("hosted_reader switch could not be read; treating it as OFF")
+        return False
 
 
 # ----------------------------------------------------------------- results
@@ -945,9 +983,21 @@ def read_page(url: str, max_chars: int = READ_MAX_CHARS) -> tuple:
         local_why = f"fetch failed ({_reason(exc)})"
         _record(_READER_SEEN, "local", False, local_why)
         _warn("local fetch of %s failed: %s", clean, exc)
-    # Fallback: the hosted reader. Only now, and the caller is told below — the
-    # failure sentence names BOTH attempts, because "nothing readable" on its
-    # own would hide which half of the pipeline gave up.
+    # Fallback: the hosted reader. Gated, because this is where the user's
+    # TARGET ADDRESS — not their search text — leaves the machine, and the
+    # audit of 2026-09-27 found it riding on the same checkbox as a search
+    # query, under a label that described neither. The refusal is a sentence
+    # naming the switch, in the same shape as every other refusal here, because
+    # a silent empty result would read as "that page has no text".
+    #
+    # A RESOLVER, read per call: the user can turn this on in the settings app
+    # while the bubble is running, and the next read must honour it.
+    if not _hosted_reader_enabled():
+        # refusal: read_page_hosted_reader_switched_off
+        return "", "", (f"nothing readable at {clean} — local fetch: "
+                        f"{local_why}. The third-party reader (r.jina.ai) is "
+                        f"switched off in handsoff settings; turn on 'Third-"
+                        f"party page reader' to allow it.")
     try:
         # Same walk for the fallback: the reader's own hops are addresses too,
         # and a hosted reader is not a licence to follow one into the LAN.

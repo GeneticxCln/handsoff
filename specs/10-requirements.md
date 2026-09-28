@@ -45,7 +45,10 @@ screen `see_screen`/`read_screen_text`/`screen_elements` (gate
 `screen_access`), pointer `click_element`/`click_at`/`scroll` (gate `operator`,
 default OFF), files `read_file`/`edit_file`, diagnostics `handsoff_doctor`
 (ungated), meta `confirm_action` (ungated), `get_datetime`.
-Knowledge (gate `web_access`): `get_weather`, `web_search`, `read_page`,
+Knowledge (gate `web_access`, **default OFF** since 2026-09-27 — the audit
+measured a stock install sending queries to DuckDuckGo/Wikipedia/StackExchange
+/HN/GitHub/Open-Meteo against a README that promised nothing would):
+`get_weather`, `web_search`, `read_page`,
 `world_events`, `lookup_fact`. Music (gate `media`): `media_play`,
 `media_control`, `media_volume`, `now_playing`, `search_library`. Time
 (gate `calendar`): `calendar_month`, `read_calendar`. Personal (gate
@@ -120,12 +123,16 @@ it says rather than deciding for it (`core/qs_desk.py`).
 - N6 Platform: Arch/CachyOS + niri, NVIDIA strongly recommended (26B ≈
   14 GB VRAM), mic + speakers, Ollama, MPD for music, ydotoold for typing.
 
-## 8. Permission model (20 keys, `settings_schema.py:296`)
+## 8. Permission model (21 keys, `settings_schema.py:296`)
 
-Defaults ON: run/read/edit/self_restart/type/press_keys/web/media/screen/
+Defaults ON: run/read/edit/self_restart/type/press_keys/media/screen/
 paste/copy/reminders/calendar/focus/get_datetime/pomodoro/watchers/
-quant_space. Defaults OFF: `operator` (real pointer), `notifications`
-(private).
+quant_space. Defaults OFF: `web_access` (Internet knowledge) and
+`hosted_reader` (r.jina.ai) — both since 2026-09-27, when the audit measured a
+stock install already sending query text to DuckDuckGo, Wikipedia,
+StackExchange, HN, GitHub and Open-Meteo, against a README that promised
+nothing would leave the machine until the user said so — plus `operator` (real
+pointer) and `notifications` (private).
 `dry_run` False, `confirm_seconds` 90.0, `command_policy` per-tool
 ALLOW/DENY/CONFIRM, `extra_allowed_commands` extends the shell whitelist.
 `press_hotkey` rides the `press_keys` gate; `workspace`, `close_window`,

@@ -297,7 +297,33 @@ DEFAULT_SETTINGS: dict = {
         "run_command": True, "read_file": True,
         "edit_file": True, "self_restart": True,
         "type_text": True, "press_keys": True,
-        "web_access": True,
+        # OFF by default, and this is the README's promise made true rather
+        # than a caution that is easier to ignore. The audit of 2026-09-27
+        # measured a stock install with this key ON: the user had never turned
+        # anything on, and `web_search` was already sending their literal query
+        # to DuckDuckGo Lite, StackExchange, HN Algolia and the GitHub API,
+        # `lookup_fact` to Wikipedia and `get_weather` their `home_place` to
+        # Open-Meteo — against README.md:7, "Nothing leaves the machine unless
+        # you turn that on."
+        #
+        # So the first line of code that turns a switch on must be the USER.
+        # Everything degrades honestly from here: the schemas are filtered out
+        # of the model's tool list entirely (core.tools.permitted_tools), and
+        # `_switched_off_families` puts the family name in the system prompt so
+        # a request for the weather is answered by naming the switch rather
+        # than by guessing. The setting is a checkbox in Settings → Permissions
+        # labelled "Internet knowledge", and the label now names the endpoints
+        # instead of calling them "fixed".
+        "web_access": False,
+        # `read_page`'s third-party fallback is a SEPARATE switch, also off.
+        # When a local fetch yields nothing usable, the reader can hand the
+        # target URL to r.jina.ai — a different kind of leak from a search
+        # query, because it discloses WHICH page the user is on, not what they
+        # asked. Folding it into `web_access` meant one checkbox whose label
+        # ("read-only, fixed endpoints") described neither. Defaulting this off
+        # is what makes README.md:7 true of the shipped configuration: with
+        # both keys off, nothing leaves the machine.
+        "hosted_reader": False,
         "media": True,
         "screen_access": True,
         "operator": False,    # mouse control (click_element/click_at) — OFF by
@@ -941,6 +967,14 @@ SETTINGS_FIELDS: tuple = (
        placeholder="http://127.0.0.1:8888   (empty: keyless backends only)",
        tip="A local SearXNG to search through, if you run one. Best results "
            "and no rate limits; the built-in readers are used when empty.", group="tools"),
+    # `hosted_reader` is a PERMISSION, not a top-level row: the permission grid
+    # renders the `permissions` dict and its own label table
+    # (handsoff-settings.py:3204), which is why every other switch in here —
+    # screen_access, operator, notifications — has no `SETTINGS_FIELDS` row
+    # either. A top-level row would break the table/defaults contract in
+    # tests/test_settings_contract.py, which is the test that stops a setting
+    # being declared in one place and read from another. The runtime reads it
+    # through `SETTINGS["permissions"]`; see the host seam in handsoff.py.
     _f("extra_allowed_commands", "str_list", cap=64, tab="permissions",
        title="Extra allowed commands", ctrl="lines", height=110,
        placeholder="e.g.\ngrep\ndate\nfree",

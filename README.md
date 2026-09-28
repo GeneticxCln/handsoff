@@ -4,7 +4,14 @@ A self-modifying voice assistant that lives as a small round bubble on your
 desktop (Arch Linux / CachyOS + niri Wayland). Hold the bubble, speak, release:
 it transcribes locally (faster-whisper), answers with a local Ollama model and
 speaks back with chatterbox-turbo — its own voice, or a clone of a clip you
-pick. Nothing leaves the machine unless you turn that on.
+pick. Nothing leaves the machine unless you turn that on — the two switches
+that can send something out are **off** in a fresh install, and the sentence
+is enforced rather than promised: *Internet knowledge* (your search text, the
+fact you ask about, and your home place go to DuckDuckGo, Wikipedia,
+StackExchange, Hacker News, GitHub and Open-Meteo) and *Third-party page
+reader* (when a page cannot be read locally, its address is handed to
+r.jina.ai). Both are in Settings → Permissions. Speech, memory, reminders,
+the calendar, the desk and every desktop action stay local either way.
 
 ![the bubble, cycling its four states](docs/bubble.gif)
 
@@ -35,8 +42,8 @@ module's own: blue idle · red listening · orange thinking · green speaking.*
   read-only over the local channel it opens, and only once it allows this
   assistant by name.
 
-52 tools, declared in one place (`@tool` methods in `handsoff.py`), so schemas,
-the system prompt and the permissions cannot drift apart.
+52 tools, declared in one place (`@tool` methods in `core/tools.py`), so
+schemas, the system prompt and the permissions cannot drift apart.
 
 ## Requirements
 
@@ -211,7 +218,7 @@ switch auto-restores); a bad self-edit has a `.bak` beside it; `./install.sh
 ```bash
 bash ci/gates.sh                     # every gate, in CI's order (~10 min)
 bash ci/gates.sh compile lint links shell    # the fast ones (seconds)
-python -m pytest tests/ -q           # 2564 tests
+python -m pytest tests/ -q           # 2571 tests
 git config core.hooksPath githooks   # then every commit runs the suite too
 ```
 
@@ -227,7 +234,7 @@ suite reads ~60% and "fails" the floor for no reason:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70   # 2564 tests, 84.99% measured
+  --cov-report=term-missing --cov-fail-under=70   # 2571 tests, 85.01% measured
 ```
 
 CI (GitHub, mirrored gate-for-gate in `.gitlab-ci.yml`) runs the suite on

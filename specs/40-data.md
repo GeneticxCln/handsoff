@@ -23,7 +23,7 @@ Bubble: `bubble_size` 128, `bubble_design` orb, `design_image_path` "",
 `bubble_accent` 0.5, `animation_energy` 1.0, `colors`
 `{idle #4f8cff, listening #ff4d5e, thinking #ff9e2c, speaking #3ecf6e}`.
 Web/place: `searxng_url` (`http://127.0.0.1:8888`, "" disables),
-`home_place` "", `calendar_ics` []. Policy: `permissions` (20, see
+`home_place` "", `calendar_ics` []. Policy: `permissions` (21, see
 10-requirements §8), `extra_allowed_commands` [], `tool_call_times` None,
 `max_tool_calls` 0 (= unlimited), `command_policy` {}, `confirm_seconds`
 90.0, `dry_run` False. Behaviour: `streaming_tts` True, `autostart` False,

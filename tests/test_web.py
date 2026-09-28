@@ -54,6 +54,12 @@ def web(monkeypatch):
     monkeypatch.setattr(mod, "_HTTP_HOP", None)
     monkeypatch.setattr(mod, "_HTTP_HOP_IS_FN", True)
     monkeypatch.setattr(mod, "_SEARXNG_URL", "")
+    # The third-party reader's switch, reset like every other seam. The default
+    # here is ON so the tests that exercise the fallback keep testing it; the
+    # SHIPPED default is off (settings_schema.py), and
+    # `TestTheHostedReaderIsGated` covers the off side explicitly. A test that
+    # needs the refusal must therefore set it False rather than inherit it.
+    monkeypatch.setattr(mod, "_HOSTED_READER", True)
     monkeypatch.setattr(mod, "_LOG", None)
     monkeypatch.setattr(mod.socket, "getaddrinfo", _public_dns)
     return mod
@@ -1168,3 +1174,102 @@ class TestLive:
         assert reason == "no results" or reason.startswith("failed ("), (
             f"the reason has to be the vocabulary the rest of the module uses, "
             f"not a raw exception: {reason!r}")
+
+
+class TestTheHostedReaderIsGated:
+    """The fallback to r.jina.ai is the one place the user's TARGET ADDRESS
+    leaves the machine — not their search text, which is what `web_access`
+    already governs.
+
+    Audit finding P1 (2026-09-27): the fallback rode on the same default-on
+    checkbox as a search query, under a settings label that read "read-only,
+    fixed endpoints" and described neither. It now has its own setting,
+    `hosted_reader`, shipped OFF.
+
+    These tests pin the OFF side against the behaviours it could quietly
+    break, because a privacy switch that also breaks the feature is a switch
+    that gets turned back on.
+    """
+
+    # The same `thin_shell` shape `TestReader.SHELL` uses, and the bulk has to
+    # sit inside a `<script>` for the same reason it does there: `html_to_text`
+    # strips script bodies, so the page is BIG and almost text-free. Padding
+    # with visible `<div>x</div>` instead yields 900 characters of real text,
+    # which is over `MIN_LOCAL_TEXT` — so the page reads locally, the fallback
+    # is never reached, and every test below would pass without testing
+    # anything. That is the trap this comment is here to stop.
+    JS_SHELL = (b"<html><head><script>" + b"app()\n" * 400
+                + b"</script></head><body><div id=\"root\"></div></body></html>")
+
+    def test_off_means_the_address_never_reaches_the_third_party(self, web,
+                                                                 monkeypatch):
+        monkeypatch.setattr(web, "_HOSTED_READER", False)
+        f = serve(web, Fetch(**{"example.com": self.JS_SHELL}))
+        text, via, problem = web.read_page("https://example.com/app")
+        assert not text and not via
+        assert problem, "a refused fallback must be reported, not returned as "
+        assert all("r.jina.ai" not in u for u in f.urls), (
+            f"the switch was off and the address still went out: {f.urls!r}")
+
+    def test_the_refusal_names_the_switch_rather_than_saying_nothing(self, web,
+                                                                     monkeypatch):
+        """A silent empty result would read as "that page has no text"."""
+        monkeypatch.setattr(web, "_HOSTED_READER", False)
+        serve(web, Fetch(**{"example.com": self.JS_SHELL}))
+        _text, _via, problem = web.read_page("https://example.com/app")
+        assert "r.jina.ai" in problem, problem
+        assert "local fetch" in problem, (
+            f"the refusal must still say what the local attempt managed: "
+            f"{problem!r}")
+        assert "settings" in problem.casefold(), (
+            f"the user can only act on this if told where the switch is: "
+            f"{problem!r}")
+
+    def test_a_page_readable_locally_is_unaffected_by_the_switch(self, web,
+                                                                 monkeypatch):
+        """The gate is on the FALLBACK, not on reading."""
+        monkeypatch.setattr(web, "_HOSTED_READER", False)
+        serve(web, Fetch(**{"example.com": LOCAL_PAGE}))
+        text, via, problem = web.read_page("https://example.com/page")
+        assert not problem and via == web.VIA_LOCAL
+        assert "Title & Co" in text
+
+    def test_an_unwired_seam_reads_as_off_not_on(self, web, monkeypatch):
+        """A partial install must not inherit an on-switch by default."""
+        monkeypatch.setattr(web, "_HOSTED_READER", None)
+        f = serve(web, Fetch(**{"example.com": self.JS_SHELL}))
+        web.read_page("https://example.com/app")
+        assert all("r.jina.ai" not in u for u in f.urls), (
+            "no wired seam is the ABSENCE of consent, and absence is off")
+
+    def test_a_resolver_that_raises_reads_as_off(self, web, monkeypatch):
+        """A settings object mid-reload is not consent to send the address."""
+        def _broken():
+            raise RuntimeError("settings are being rewritten")
+        monkeypatch.setattr(web, "_HOSTED_READER", _broken)
+        f = serve(web, Fetch(**{"example.com": self.JS_SHELL}))
+        web.read_page("https://example.com/app")
+        assert all("r.jina.ai" not in u for u in f.urls), (
+            "an unreadable switch must fail closed, not open")
+
+    def test_a_resolver_is_read_per_call_so_a_live_switch_takes_effect(self, web,
+                                                                     monkeypatch):
+        """A settings save must be honoured by the NEXT read, not the next
+        start — the same reason searxng_url is a resolver."""
+        state = {"on": False}
+        monkeypatch.setattr(web, "_HOSTED_READER", lambda: state["on"])
+        f = serve(web, Fetch(**{"example.com": self.JS_SHELL,
+                                "r.jina.ai": b"Markdown Content:\nReader copy"}))
+        web.read_page("https://example.com/app")
+        assert not any("r.jina.ai" in u for u in f.urls)
+        state["on"] = True
+        _text, via, _problem = web.read_page("https://example.com/app")
+        assert via == web.VIA_JINA, "turning the switch on must take effect now"
+
+    def test_the_doctor_line_says_the_fallback_was_off(self, web, monkeypatch):
+        """Otherwise the doctor reports 'Jina fallback unused' with no way to
+        tell a user WHY their page could not be read."""
+        monkeypatch.setattr(web, "_HOSTED_READER", False)
+        serve(web, Fetch(**{"example.com": self.JS_SHELL}))
+        web.read_page("https://example.com/app")
+        assert "local fetch FAILED" in web.reader_note()

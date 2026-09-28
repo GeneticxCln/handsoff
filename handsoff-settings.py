@@ -3201,8 +3201,27 @@ drifting apart one forgotten key at a time.
                          "grids"),
             "focus_window": ("Focus windows", "raise any window by (part of its) "
                              "title — e.g. 'bring up the calculator'"),
-            "web_access": ("Internet knowledge", "weather (Open-Meteo), facts (Wikipedia), "
-                           "web search (DuckDuckGo), world warnings — read-only, fixed endpoints"),
+            # NAMES the endpoints, because the old wording ("read-only, fixed
+            # endpoints") described neither what happens nor what leaves: a
+            # DuckDuckGo result is an HTML scrape of a page, not an API call,
+            # and the user's literal query text is the thing that is sent.
+            # Off by default since 2026-09-27, so this label is what a user
+            # reads at the moment they decide to turn it on.
+            "web_access": ("Internet knowledge — OFF by default",
+                           "your search text, the fact you ask about and your "
+                           "home place are sent to DuckDuckGo, Wikipedia, "
+                           "StackExchange, Hacker News, GitHub and Open-Meteo. "
+                           "Nothing is sent until you switch this on."),
+            # Its own switch, not a rider on the one above, because the leak is
+            # a different one: a search query discloses WHAT was asked, this
+            # discloses WHICH page is being read. Labelled with the host so the
+            # name is not a surprise at the moment it first appears in a log.
+            "hosted_reader": ("Third-party page reader (r.jina.ai)",
+                              "when a page cannot be read from this machine, "
+                              "hand its address to a third-party reader which "
+                              "fetches it from their servers — that discloses "
+                              "which page you are reading, not what you asked. "
+                              "Off: such a page is reported unreadable instead."),
             "screen_access": ("See the screen", "screenshots + OCR of your display; the "
                               "AI can look at what you look at"),
             "operator": ("Mouse control", "move the pointer and click UI elements "
