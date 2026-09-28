@@ -3467,3 +3467,49 @@ class TestDependencyClosureLock:
         assert int(stated.group(1)) == len(pins), (
             f"the header says {stated.group(1)} packages; the file pins "
             f"{len(pins)}. One of them is a lie about the install")
+
+    def test_every_pin_satisfies_the_manifest_requirement_it_claims_to_pin(self):
+        """A pin that contradicts the manifest is an install that cannot work.
+
+        The two guards above check the lock's SHAPE — every name pinned, every
+        pin exact. Neither asks the question that matters: does the pinned
+        version still satisfy the range the manifest asked for? A hand-edit
+        (or a regeneration against a newer index) can put `numpy==2.9.0` beside
+        `numpy>=2.0,<3` and every shape check still passes, because the lock
+        never said otherwise and nothing in this repository is offline enough
+        to notice until pip refuses to install it on a fresh machine.
+
+        Scope, deliberately: the DIRECT requirements only. Checking the
+        transitive half needs the packages' own metadata, which is a property
+        of whatever index is reachable at the time — not something CI can
+        assert. That is why the three pins handsoff lowered to stop breaking its
+        neighbours (see the lock header) live in PROSE and not here.
+        """
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        pins = self._pins()
+        checked = 0
+        for raw in self.MANIFEST.read_text(encoding="utf-8").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = re.split(r"([<>=!~\[])", line, maxsplit=1)
+            name = parts[0].strip().lower()
+            spec = "".join(parts[1:]).strip()
+            if name not in pins:
+                continue          # test_every_direct_requirement_is_pinned_exactly
+            assert spec, (
+                f"{name} is pinned in the lock but requirements.txt states it "
+                f"with no range, so there is nothing here to check the pin "
+                f"against — say what the app actually needs")
+            version = Version(pins[name])
+            assert SpecifierSet(spec).contains(version, prereleases=True), (
+                f"the lock pins {name}=={pins[name]} but requirements.txt asks "
+                f"for {name}{spec}. pip will refuse this pair, and a fresh "
+                f"install fails on a version line that every shape check here "
+                f"is happy with")
+            checked += 1
+        assert checked >= 5, (
+            f"only {checked} direct requirements were range-checked; the guard "
+            f"is nearly vacuous, which is how a pin quietly goes wrong")

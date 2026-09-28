@@ -23,6 +23,35 @@
 # platform-independent instead: CI images are pinned by digest and the
 # speech weights are SHA256-verified before use (see install.sh).
 #
+# NOT "WHATEVER A FRESH RESOLVE PICKS" (2026-09-28). "The version a fresh
+# resolve selects" is the wrong target for this lock, and it was wrong in a way
+# that only showed up on somebody's machine. install.sh installs with
+# `--user --break-system-packages` into a site-packages that ALSO holds the
+# user's own tools, so a pin here is not a statement about handsoff — it is a
+# statement about every other program on the box. Resolving newest-first picked
+# filelock 4.0.3, tokenizers 0.23.2 and fsspec 2026.9.0, all three inside
+# handsoff's own ranges (huggingface-hub wants filelock>=3.10, fsspec>=2023.5.0;
+# faster-whisper wants tokenizers<1,>=0.13) and all three BREAKING a neighbour:
+# virtualenv 21.x needs filelock<4, transformers 5.x needs tokenizers<=0.23.0,
+# datasets 4.x needs fsspec<=2025.9.0. pip printed the conflict and installed
+# anyway, and the app was fine, so nothing looked wrong until the user noticed
+# their other tools were unhappy.
+#
+# So three pins sit BELOW the newest the resolver offers, at the top of the
+# range both sides accept. The intersection, measured 2026-09-28:
+#   filelock    handsoff >=3.10.0        x virtualenv >=3.24.2,<4   -> 3.32.7
+#   tokenizers  handsoff <1,>=0.13       x transformers >=0.22.0,<=0.23.0
+#                                                                  -> 0.22.2
+#   fsspec      handsoff >=2023.5.0      x datasets >=2023.1.0,<=2025.9.0
+#                                                                  -> 2025.9.0
+# REGENERATING? Re-read this section first. A plain
+# `pip download -r requirements.txt` puts these three back to newest and
+# re-breaks the neighbours, silently, because nothing in handsoff fails.
+#
+# CAVEAT, still true: install.sh step [2b/8] installs chatterbox-tts with NO
+# constraints file, so it re-resolves that engine's closure afterwards and can
+# still move these. It is the step that actually decides the final versions.
+#
 # INSTALLED-COPY DRIFT IS EXPECTED. A machine installed before this file
 # existed can hold older versions; re-sync with
 #   pip install --user -r requirements.txt -c requirements-lock.txt
@@ -45,9 +74,9 @@ cffi==2.1.1
 click==8.5.0
 cloudpickle==3.1.2
 ctranslate2==4.8.2
-filelock==4.0.3
+filelock==3.32.7
 flatbuffers==25.12.19
-fsspec==2026.9.0
+fsspec==2025.9.0
 h11==0.16.0
 hf-xet==1.6.0
 httpcore==1.0.9
@@ -69,6 +98,6 @@ scikit-learn==1.9.1
 scipy==1.18.1
 shiboken6==6.11.2
 threadpoolctl==3.7.0
-tokenizers==0.23.2
+tokenizers==0.22.2
 tqdm==4.70.1
 typing-extensions==4.16.0
