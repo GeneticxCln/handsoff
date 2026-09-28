@@ -457,6 +457,27 @@ import os
 import sys
 from pathlib import Path
 
+# COVERAGE FIRST, and it is here because this file SHADOWS coverage's own
+# sitecustomize (2026-09-28). Subprocess measurement is normally started by
+# coverage installing a sitecustomize that reads COVERAGE_PROCESS_START; this
+# shim goes first on PYTHONPATH, so in every child coverage's hook never runs
+# and the variable it was given is read by nobody. The measured consequence
+# was a whole compatibility branch reported as uncovered: handsoff.py's
+# `except ImportError` fallback (the legacy brain), which the suite DOES boot
+# and drive — in a child, from tests/test_hardening.py, whose data was
+# silently dropped on the floor. A test that runs and a line that is never
+# attributed are the same blind spot in different clothes.
+#
+# Wrapped in its own try/except because this shim also runs in children the
+# coverage job knows nothing about, and a guard must not be the thing that
+# stops a child from starting.
+if os.environ.get("COVERAGE_PROCESS_START"):
+    try:
+        import coverage
+        coverage.process_startup()
+    except Exception:
+        pass
+
 _root = os.environ.get("HANDSOFF_CHECKOUT_GUARD")
 if _root:
     _path = Path(_root) / "tests" / "checkout_guard.py"

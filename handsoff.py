@@ -9336,8 +9336,25 @@ class Assistant(QObject):
                     if cancel.is_set():
                         return
                     log.error("ollama stream: %s", turn.result["error"])
-                    self._speak(f"Sorry, my brain is offline. {turn.result['error']}",
-                                gen, cancel)
+                    # A stream that died PART-WAY has already been heard. The
+                    # consumer speaks sentences as they arrive, so by the time
+                    # the producer's exception lands here the answer is in the
+                    # user's ear — and "my brain is offline" is then a
+                    # sentence that contradicts what was just said, out loud,
+                    # immediately. Say what actually happened instead. Measured
+                    # 2026-09-27, fixed 2026-09-28.
+                    #
+                    # The turn is still dropped whole by the `return`: the
+                    # question goes unpublished along with the partial answer,
+                    # so the next prompt does not carry a reply the model never
+                    # recorded. Dropping both halves is the coherent choice —
+                    # recording the question alone is the shape that confuses
+                    # the next turn.
+                    if self._turn_spoke:
+                        self._speak("Sorry — my brain cut off there.", gen, cancel)
+                    else:
+                        self._speak(f"Sorry, my brain is offline. {turn.result['error']}",
+                                    gen, cancel)
                     return
                 tool_calls = turn.result.get("tool_calls") or []
                 content = turn.result.get("content", "")

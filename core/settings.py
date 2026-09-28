@@ -919,8 +919,23 @@ class Settings:
         return self._data.get(key, default)
 
     def as_dict(self) -> dict:
-        """The live dict (handsoff re-exports this as its SETTINGS global)."""
+        """The live dict (handsoff re-exports this as its SETTINGS global).
+
+        LIVE, not a copy: mutating it mutates the object `write_all` merges
+        against, and `write_all` refuses when a caller hands it the same dict
+        twice. Use `copy_dict()` for anything you intend to hold on to.
+        """
         return self._data
+
+    def copy_dict(self) -> dict:
+        """A deep copy of the live settings — the safe thing to snapshot.
+
+        What `ensure_loaded()` returns is the same object `as_dict()` returns,
+        so keeping it as a "snapshot" and editing the other one edits both, and
+        the merge that follows discards the edit. Measured 2026-09-28; see
+        `write_all`.
+        """
+        return copy.deepcopy(self._data)
 
     # -- lifecycle -----------------------------------------------------------
     def load(self) -> dict:
@@ -950,7 +965,35 @@ class Settings:
     def write_all(self, data: dict, *, expected_data: dict | None = None) -> dict:
         """Version-stamped, backed-up full-file write (the settings app's
         save path). ``expected_data`` is the snapshot read by the editor;
-        changed keys are merged and conflicting keys are rejected."""
+        changed keys are merged and conflicting keys are rejected.
+
+        REFUSES when ``data`` and ``expected_data`` are the same object, and
+        the reason is measured rather than theoretical. `as_dict()` hands back
+        the LIVE dict, so the obvious read-modify-write —
+
+            snap = obj.ensure_loaded()
+            data = obj.as_dict()          # the same object
+            data["permissions"]["web_access"] = True
+            obj.write_all(data, expected_data=snap)
+
+        — mutates the snapshot too. The three-way merge then sees candidate ==
+        expected ("you changed nothing"), keeps whatever is on disk, and
+        DISCARDS the edit without a word. That is not a hypothetical: it is how
+        the v3 privacy migration's own advertised escape hatch ("switch it back
+        on in Settings") was measured failing on this machine, and the file
+        came back with the old value and no complaint.
+
+        The settings app is not affected — it builds its own candidate and
+        keeps ``self._loaded_cfg`` as a deepcopy — but nothing in the API said
+        so, and the failure mode is a setting silently not being saved. Use
+        `copy_dict()` for the snapshot. Measured 2026-09-28.
+        """
+        if expected_data is not None and expected_data is data:
+            raise ValueError(
+                "write_all was given the same dict as both the edit and the "
+                "snapshot it is merged against — the edit would be compared "
+                "with itself and silently dropped. Snapshot with "
+                "copy_dict() (or copy.deepcopy), not as_dict().")
         written = write_settings(
             data, self.settings_file, self.config_dir,
             expected_data=expected_data)

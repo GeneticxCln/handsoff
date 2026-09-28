@@ -624,7 +624,23 @@ else
     else
         echo "    no distro torch — pip will pull its default wheel (large)"
     fi
-    "${PYBIN}" -m pip install --user --break-system-packages --upgrade \
+    # NO `--upgrade`, and constrained. Both measured 2026-09-28, from the log
+    # of one real install: with `--upgrade` and nothing else, this step
+    # re-resolved chatterbox's whole closure and overwrote the pins step [2/8]
+    # had just applied — filelock 4.0.3 -> 3.32.7, tokenizers 0.23.2 -> 0.22.2
+    # — forty seconds after the lock was applied, and without ever being told
+    # the lock existed. `--upgrade` is what did it: it tells pip to bring every
+    # reachable package to the newest it can resolve, not just the one named.
+    # Dropping it means this step changes only what chatterbox genuinely needs.
+    # requirements-speech.txt pins the three packages that live in the shared
+    # user site and that the rest of the machine also depends on; see that file
+    # for why it is three lines and not the whole lock.
+    SPEECH_CONSTRAINTS=()
+    if [ -f "$HERE/requirements-speech.txt" ]; then
+        SPEECH_CONSTRAINTS+=("-c" "$HERE/requirements-speech.txt")
+    fi
+    "${PYBIN}" -m pip install --user --break-system-packages \
+        "${SPEECH_CONSTRAINTS[@]+"${SPEECH_CONSTRAINTS[@]}"}" \
         "chatterbox-tts>=0.1.7"
     if ! "${PYBIN}" -c "import chatterbox.tts_turbo" >/dev/null 2>&1; then
         echo "    FATAL: chatterbox-turbo is not importable after install — the" >&2

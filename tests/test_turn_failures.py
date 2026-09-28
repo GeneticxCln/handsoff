@@ -417,15 +417,20 @@ class TestTheLineTheUserHears:
             assert turn.history == [{"role": "user",
                                      "content": "what time is it"}], turn.history
 
-    def test_a_stream_that_dies_part_way_speaks_the_answer_and_the_apology(
+    def test_a_stream_that_dies_part_way_says_it_cut_off_not_that_it_is_offline(
             self, H, monkeypatch):
-        """MEASURED: the two sentences contradict each other.
+        """MEASURED 2026-09-27, FIXED 2026-09-28. Kept in the survey because the
+        measurement is the point: the two sentences used to contradict each
+        other, out loud, in that order.
 
-        The sentences already queued are spoken as they arrive, then the
-        failure appends "Sorry, my brain is offline" to the same turn. The
-        user hears the answer and then is told the brain is down, and neither
-        half reaches history — `turn.result["error"]` returns before the
-        publish, so the turn is remembered as nothing at all.
+        Sentences already queued are spoken as they arrive, so by the time the
+        failure lands the user has the answer in their ear. The error branch
+        then spoke the full "my brain is offline <cause>" anyway, which is not
+        a better apology — it is a false statement about a brain that was
+        demonstrably working moments earlier. The turn now says what happened
+        to it instead. `TestTheStreamThatDiedHalfway` drives the same failure
+        and covers the other half, where nothing was spoken and the full
+        apology with its cause is still the right thing to say.
         """
         def half(req):
             class Partial:
@@ -444,13 +449,11 @@ class TestTheLineTheUserHears:
         turn = drive(H, monkeypatch, half)
         assert turn.played == [
             "The time is half past four.",
-            "Sorry, my brain is offline. RuntimeError: cannot reach Ollama at "
-            "http://127.0.0.1:11434 (connection reset by peer). Start it with: "
-            "systemctl start ollama",
+            "Sorry — my brain cut off there.",
         ], turn.played
         assert turn.history == [], (
-            "the answer the user just heard was written to no memory at all: "
-            f"{turn.history}")
+            "a turn that died half-way must leave neither half in the next "
+            f"prompt: {turn.history}")
 
     def test_a_model_without_tools_is_retried_and_still_answers(self, H, monkeypatch):
         """The 400 that is not a failure: tools are dropped and the turn works."""
@@ -584,3 +587,88 @@ class TestTheTurnNobodyHeard:
         assert turn.history == [{"role": "user", "content": "what time is it"}], (
             f"broken={broken} streaming={streaming}: the bubble remembers "
             f"answering a turn the user never heard answered: {turn.history}")
+
+
+class _DiesMidStream:
+    """A stream that delivers `content` and then the connection drops.
+
+    The chunks are yielded one at a time rather than listed, because the whole
+    point is that the producer raises AFTER the consumer has already taken a
+    sentence — the interleaving is the defect, so a response that fails on the
+    first `next()` would never reproduce it.
+    """
+
+    def __init__(self, content):
+        self._pending = [_chunk(content)] if content is not None else []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._pending:
+            return self._pending.pop(0)
+        raise http.client.IncompleteRead(b"the stream stopped")
+
+
+def _dies_after(content):
+    return lambda req: _DiesMidStream(content)
+
+
+class TestTheStreamThatDiedHalfway:
+    """The last defect the turn-failure survey left open, fixed 2026-09-28.
+
+    Streaming TTS speaks each sentence as it arrives, so a stream that dies
+    part-way has ALREADY been heard by the time the producer's exception
+    reaches the error branch. That branch spoke the full apology regardless,
+    so the user was told the answer and then, immediately, told the brain was
+    offline — two sentences that cannot both be true, said out loud in order.
+    """
+
+    def test_the_apology_does_not_contradict_what_was_just_said(self, H, monkeypatch):
+        turn = drive(H, monkeypatch, _dies_after("Berlin is in Germany."),
+                     streaming=True)
+        said = list(turn.said)
+        assert "Berlin is in Germany." in said, (
+            f"the sentence that arrived was never spoken, so this is not the "
+            f"case under test: {said}")
+        assert not any("my brain is offline" in s for s in said), (
+            f"the user was told the answer and then told the brain was "
+            f"offline: {said}")
+        assert any("cut off" in s for s in said), (
+            f"the turn should say what actually happened to it: {said}")
+
+    def test_a_stream_that_died_before_a_word_still_gets_the_full_apology(self, H, monkeypatch):
+        """The other half, and the reason the fix is a branch and not a change.
+
+        Nothing was said, so there is nothing to have cut off, and "my brain is
+        offline" with the cause is the right thing to say. A fix that replaced
+        the apology outright would take this away from the user.
+        """
+        turn = drive(H, monkeypatch, _dies_after(None), streaming=True)
+        said = list(turn.said)
+        assert not any("cut off" in s for s in said), (
+            f"nothing was said, so nothing was cut off: {said}")
+        assert any("my brain is offline" in s for s in said), (
+            f"a stream that failed outright must still be reported with its "
+            f"cause: {said}")
+
+    def test_the_dropped_turn_publishes_neither_half(self, H, monkeypatch):
+        """What history keeps, and why it is the coherent choice.
+
+        The error branch returns before the publish block, so the question
+        goes unpublished along with the partial answer. Recording the question
+        alone is the shape that confuses the next turn: the model would be
+        asked something it has no reply for. Pinned because the alternative —
+        publishing the partial answer — looks like the obvious fix and is not.
+        """
+        turn = drive(H, monkeypatch, _dies_after("Berlin is in Germany."),
+                     streaming=True)
+        assert turn.history == [], (
+            f"a turn that died half-way must not leave half of itself in the "
+            f"prompt: {turn.history}")

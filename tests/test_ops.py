@@ -3468,6 +3468,51 @@ class TestDependencyClosureLock:
             f"the header says {stated.group(1)} packages; the file pins "
             f"{len(pins)}. One of them is a lie about the install")
 
+    def test_the_speech_step_cannot_undo_the_lock(self):
+        """install.sh's two pip steps used to fight, and the second won.
+
+        Step [2/8] applies this lock; step [2b/8] then installed chatterbox-tts
+        with `--upgrade` and no constraints, re-resolving that engine's closure
+        and overwriting the pins about forty seconds later. Measured from one
+        install log: filelock 4.0.3 -> 3.32.7, tokenizers 0.23.2 -> 0.22.2, both
+        by step [2b/8], which had never heard of the lock.
+
+        Two invariants, and the second is the one that matters:
+        """
+        script = (HERE / "install.sh").read_text(encoding="utf-8")
+        speech = script.split("chatterbox-tts>=0.1.7")[0]
+        speech = speech.rsplit("${PYBIN}", 1)[-1] if "${PYBIN}" in speech else speech
+        assert "--upgrade" not in speech, (
+            "step [2b/8] must not pass --upgrade: it tells pip to bring every "
+            "reachable package to the newest it can resolve, not just "
+            "chatterbox-tts, which is how it overwrote the lock")
+        assert "requirements-speech.txt" in script, (
+            "step [2b/8] installs into the same user site-packages as every "
+            "other tool on the machine and must be told what it may not move")
+
+        # The disagreement IS the bug. Two files naming different versions of
+        # the same package is precisely the state in which the steps fight, and
+        # nothing else in the repository would notice.
+        lock = self._pins()
+        speech_pins = {}
+        for raw in (HERE / "requirements-speech.txt").read_text(
+                encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            name, sep, version = line.partition("==")
+            assert sep == "==", f"not an exact pin: {raw!r}"
+            speech_pins[name.strip().lower()] = version.strip()
+        assert speech_pins, (
+            "the speech constraints file is empty — it would constrain nothing "
+            "and the step would go back to resolving freely")
+        disagree = sorted(
+            f"{n}: lock {lock[n]} vs speech {v}" for n, v in speech_pins.items()
+            if lock.get(n) != v)
+        assert not disagree, (
+            "the two constraint files name different versions of the same "
+            f"package, so the steps will undo each other: {disagree}")
+
     def test_every_pin_satisfies_the_manifest_requirement_it_claims_to_pin(self):
         """A pin that contradicts the manifest is an install that cannot work.
 

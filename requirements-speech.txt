@@ -1,0 +1,37 @@
+# handsoff — constraints for the SPEECH ENGINE install (step [2b/8])
+#
+# WHY THIS FILE EXISTS (2026-09-28). install.sh step [2/8] applies
+# requirements-lock.txt, and step [2b/8] then installed chatterbox-tts with
+# `--upgrade` and NO constraints — so it re-resolved that engine's whole
+# transitive closure and overrode the lock thirty seconds after applying it.
+# The two steps fought, and [2b/8] won because it ran last.
+#
+# Measured on this machine, from the install log of a single run:
+#   [2/8]  Successfully installed filelock-4.0.3 tokenizers-0.23.2
+#   [2b/8] Uninstalling tokenizers-0.23.2 ... Successfully uninstalled
+#          Successfully installed filelock-3.32.7 tokenizers-0.22.2
+# So the lock was decorative: the versions the lock named existed for about
+# forty seconds, and the versions that survived were chosen by a step that was
+# never told about the lock.
+#
+# This file is deliberately NOT the whole lock. Constraining chatterbox with
+# requirements-lock.txt would also constrain the 41 packages of handsoff's own
+# closure, which is a different dependency graph, and an unsatisfiable pair
+# there FATALs the installer on a machine that has neither package. Three pins
+# are the whole problem: the packages that live in a user site-packages this
+# installer shares with the user's own tools.
+#
+# The same three are lowered in requirements-lock.txt for the same reason, and
+# the ranges are the intersection of what handsoff's closure and the
+# neighbours both accept. Verified with `pip check` clean on all three.
+#
+#   filelock    handsoff (huggingface-hub) >=3.10.0
+#               neighbour (virtualenv)      >=3.24.2,<4      -> 3.32.7
+#   tokenizers  handsoff (faster-whisper) <1,>=0.13
+#               neighbour (transformers)    >=0.22.0,<=0.23.0 -> 0.22.2
+#   fsspec      handsoff (huggingface-hub) >=2023.5.0
+#               neighbour (datasets)        >=2023.1.0,<=2025.9.0 -> 2025.9.0
+
+filelock==3.32.7
+tokenizers==0.22.2
+fsspec==2025.9.0

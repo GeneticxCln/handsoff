@@ -705,6 +705,64 @@ class TestPrivacySwitchMigration:
         assert perms["web_access"] is False
         assert perms["hosted_reader"] is False
 
+    def test_the_advertised_way_back_actually_saves(self, H, tmp_path,
+                                                    monkeypatch):
+        """The migration's own escape hatch, driven the way a script would.
+
+        "Settings -> Permissions switches them back on" is what the warning
+        tells the user, and this is the shape that follows from reading the
+        API: snapshot with `ensure_loaded`, edit with `as_dict`, write the lot.
+        That shape is a TRAP — both calls return the same live dict, so the
+        edit lands in the snapshot too, the merge sees candidate == expected,
+        and the file comes back with the old value and no complaint. Measured
+        on this machine 2026-09-28, which is why `write_all` now refuses it.
+        """
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"version": 3,
+                                 "permissions": {"web_access": False}}))
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        H._SETTINGS_OBJ.settings_file = f
+        H._SETTINGS_OBJ.config_dir = tmp_path
+        H._SETTINGS_OBJ.load()   # not ensure_loaded: that is a no-op once
+                                 # loaded, so a previous test's in-memory value
+                                 # would decide this one
+        live = H._SETTINGS_OBJ.as_dict()
+        live["permissions"]["web_access"] = True
+        with pytest.raises(ValueError, match="silently dropped"):
+            H._SETTINGS_OBJ.write_all(live, expected_data=live)
+        on_disk = json.loads(f.read_text())
+        assert on_disk["permissions"]["web_access"] is False, (
+            "the refusal must happen BEFORE the write, not after it")
+
+    def test_copy_dict_is_the_snapshot_that_does_not_alias(self, H, tmp_path,
+                                                           monkeypatch):
+        """The documented way round the trap, and the reason it is documented.
+
+        The settings app already does this — `self._loaded_cfg` is a deepcopy —
+        so this is the shape that is known to work, promoted to a method
+        because the API gave no way to say so.
+        """
+        f = tmp_path / "settings.json"
+        f.write_text(json.dumps({"version": 3,
+                                 "permissions": {"web_access": False}}))
+        monkeypatch.setattr(H, "CONFIG_DIR", tmp_path)
+        H._SETTINGS_OBJ.settings_file = f
+        H._SETTINGS_OBJ.config_dir = tmp_path
+        H._SETTINGS_OBJ.load()
+        snapshot = H._SETTINGS_OBJ.copy_dict()
+        live = H._SETTINGS_OBJ.as_dict()
+        live["permissions"]["web_access"] = True
+        assert snapshot["permissions"]["web_access"] is False, (
+            "copy_dict must not share the nested dicts, or it is the same "
+            "aliasing with an extra step")
+        H._SETTINGS_OBJ.write_all(live, expected_data=snapshot)
+        on_disk = json.loads(f.read_text())
+        assert on_disk["permissions"]["web_access"] is True, (
+            f"the documented way back must actually save: {on_disk}")
+        on_disk = json.loads(f.read_text())
+        assert on_disk["permissions"]["web_access"] is True, (
+            f"the documented way back must actually save: {on_disk}")
+
 
 class TestTheDoctorDisclosesTheKnowledgeSwitches:
     """A one-shot migration log is gone by the next start. The disclosure that
