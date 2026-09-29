@@ -13,6 +13,7 @@ fails the Super-chord check closed, and the screenshot lands 0600.
 """
 import json
 import os
+import pathlib
 import re
 import threading
 from pathlib import Path
@@ -120,14 +121,50 @@ class TestReadFileBoundaries:
         out, err = belt.execute("read_file", {"path": "/dev/null"})
         assert err and "not a regular file" in out, out
 
-    def test_a_large_file_is_read_bounded(self, H, tmp_path):
+    def test_a_large_file_is_read_bounded(self, H, tmp_path, monkeypatch):
+        """The read is bounded at the OPEN, not merely truncated after.
+
+        Truncation-only is observationally identical for a regular file — the
+        post-read clip produces the same string — so this test spies on the
+        size argument the read makes: with the bound removed, the file is
+        read WHOLE into memory before any clip. A 5x file here stands in for
+        the 3.6 GB `/dev/zero` read the bound exists to prevent (the special-
+        file refusal catches devices; this catches the regular-file case).
+        """
         belt = _belt(H)
         big = tmp_path / "big.txt"
         big.write_text("x" * (belt.MAX_READ * 5), encoding="utf-8")
+        asked = []
+        real_open = pathlib.Path.open
+
+        def spying_open(self, mode="r", *a, **k):
+            fh = real_open(self, mode, *a, **k)
+
+            class Spy:
+                def __getattr__(self, name):
+                    return getattr(fh, name)
+
+                def __enter__(self):
+                    fh.__enter__()
+                    return self
+
+                def __exit__(self, *exc):
+                    return fh.__exit__(*exc)
+
+                def read(self, n=-1):
+                    asked.append(n)
+                    return fh.read(n)
+
+            return Spy()
+
+        monkeypatch.setattr(pathlib.Path, "open", spying_open)
         out, err = belt.execute("read_file", {"path": str(big)})
         assert not err, out
         assert "[truncated" in out, out[:200]
-        assert len(out) < belt.MAX_READ + 500
+        # The read asked for a BOUND, and the bytes it got back stayed under
+        # it: `read()` with no size (n == -1) would have taken all 800k.
+        assert asked and asked[0] not in (-1, None), asked
+        assert asked[0] < len("x" * (belt.MAX_READ * 5)), asked
 
 
 class TestTheDecisionLogTellsTheTruth:

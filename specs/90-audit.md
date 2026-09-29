@@ -3298,3 +3298,43 @@ in 501 s, so the wedge was environmental, not a code defect: the same
 tree, re-run end to end, passes. The lesson recorded twice before is
 recorded again: a hung run is a FINDING until the same tree passes, and
 an unwatched `-x` run is not evidence of anything.
+
+
+### The mutation check on the security boundary: eight mutants, seven caught, one test strengthened (2026-09-29)
+
+The fixes in `core/tools.py` and `core/web.py` were mutation-checked by hand
+— green baseline, one semantic mutation at a time, the named test must go
+red, restore byte-identical (`git show HEAD:file | cmp -s - file`) — with
+each cycle in a single foreground command after one mutant survived a session
+restart and had to be found sitting in the tree (the diff WAS the mutant;
+`git diff` is how it was caught). Two lessons are now procedure: never let a
+mutant outlive the command that applied it, and a kill-guard test is run in
+its own session because a surviving kill-guard SIGTERMs the harness that
+would have reported it.
+
+Caught (test went red with the mutant in): the cargo floor reverted to the
+raw-string split (`test_leading_whitespace_and_tab_still_confirm`); CGNAT
+dropped from the private ranges (6 red — the boundary VALUES and the
+end-to-end read_page refusals both pin it); the world gate reading a raising
+resolver as allow (`test_an_uncertain_gate_reads_as_off`); the https→http
+downgrade check disabled (`test_an_https_read_refuses_a_downgrade_to_http`);
+the think-filter state not carried across fragments (2 red); `set_reminder`
+dropped from dry-run coverage; the recycled-pid guard disabled — which
+SIGTERMed its own pytest rather than failing an assert, a survivor signature
+worth knowing: the probe test kills the process that would have flagged it,
+so it is run quarantined and judged by its exit (143 = kill went through =
+SURVIVED), never by an assert.
+
+The one SURVIVOR was the read-bound test — and the survivor is the
+interesting verdict. `test_a_large_file_is_read_bounded` asserted the
+OUTPUT (`[truncated` in the returned text), and the post-read clip at
+`core/tools.py:4818` produces the same output for a regular file whether the
+read is bounded or not: the mutant `fh.read()` loads 800k chars, the clip
+makes the bytes identical, and the assert cannot tell. The ATTACK (a 3.6 GB
+`/dev/zero`) is separately refused by the special-file check, but the
+REGULAR-FILE bound — the thing the audit actually asked for — was held by
+nothing observable. The test now spies on the size argument the read passes
+(`read(n)` with a bound, never `read()` with none): with the mutant back in,
+it goes red; on the fixed code it is green. The bound is now load-bearing.
+
+Baseline after the strengthening: 149 passed across the three files touched.
