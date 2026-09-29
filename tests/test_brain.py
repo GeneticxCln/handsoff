@@ -415,6 +415,55 @@ class TestTheSentenceSplitter:
             f"{result['content']!r} vs {reply!r}")
         assert list(q.queue)[-1] is None
 
+    _CHUNKING_CORPUS = _LOSSLESS_CORPUS + (
+        "It's 18.5 degrees and 3.2 inches of rain.",
+        "Visit example.com or a.b.c now.",
+        "Really?! Yes... maybe. Okay!",
+        "Price is $4.99. Tax is 0.5%.",
+    )
+
+    @pytest.mark.parametrize("reply", _CHUNKING_CORPUS)
+    def test_the_sentences_do_not_depend_on_where_the_stream_was_cut(
+            self, brain, reply):
+        """The same reply, cut at EVERY position, is the same sentences.
+
+        The stream arrives a token at a time and a tokenizer emits "." on its
+        own ("It's 18", ".", "5 degrees"), so a full stop that is the last thing
+        in the buffer cannot be told from a decimal point, a version number, a
+        domain or the first half of "?!" / "...". The splitter used to take the
+        end of the buffer as a boundary: the reply "It's 18.5 degrees" was
+        spoken as "It's 18." and then "5 degrees", and which reply the user heard
+        depended on the network. The word-conservation test above cannot see it
+        (the words are all there); the SENTENCES are what differ.
+        """
+        def sentences(pieces):
+            q: queue.Queue = queue.Queue()
+            _stream(brain, q, _ok_stream(*[_chunk(p) for p in pieces]))
+            return _spoken(q)
+
+        whole = sentences([reply])
+        diverged = [
+            (i, sentences([reply[:i], reply[i:]]))
+            for i in range(1, len(reply))
+            if sentences([reply[:i], reply[i:]]) != whole]
+        assert not diverged, (
+            f"{reply!r} is {whole} whole, but cut in two it is {diverged[:3]}")
+        # and one character at a time, the worst case a token stream can be
+        assert sentences(list(reply)) == whole
+
+    def test_a_decimal_split_across_tokens_is_spoken_whole(self, brain):
+        q: queue.Queue = queue.Queue()
+        _stream(brain, q, _ok_stream(*[
+            _chunk(p) for p in ("It's 18", ".", "5 degrees today", ".")]))
+        assert _spoken(q) == ["It's 18.5 degrees today."], _spoken(q)
+
+    def test_a_reply_that_ends_on_a_full_stop_is_still_spoken(self, brain):
+        """The terminator that ends the stream has no whitespace after it; the
+        end-of-stream flush is what says it."""
+        q: queue.Queue = queue.Queue()
+        _stream(brain, q, _ok_stream(_chunk("Done"), _chunk(".")))
+        assert list(q.queue) == ["Done.", None], list(q.queue)
+
     def test_a_sentence_holding_several_chunks_is_spoken_once_it_is_whole(
             self, brain):
         q: queue.Queue = queue.Queue()

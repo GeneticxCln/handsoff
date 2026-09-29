@@ -655,7 +655,10 @@ except ImportError:
                         buf += piece
                         full += piece
                         while True:
-                            match = re.search(r"[.!?…](\s|$)", buf)
+                            # a terminator run followed by whitespace: see
+                            # core.brain._SENTENCE_END (this is the bundle
+                            # copy for a checkout with no core/brain.py)
+                            match = re.search(r"[.!?…]+\s", buf)
                             if not match:
                                 break
                             sentence, buf = buf[:match.end()], buf[match.end():]
@@ -8138,12 +8141,15 @@ class Assistant(QObject):
         garbage duration — an unmeasured reload releases, and should.
         """
         try:
-            t0 = time.time()
+            # monotonic: this is a DURATION, and the idle release weighs its
+            # decision on it — a wall-clock step (NTP, resume from suspend)
+            # inside the warm would record a negative or hours-long "load".
+            t0 = time.monotonic()
             warm_msgs = ([{"role": "system", "content": SYSTEM_PROMPT}]
                          + list(self._history)
                          + [{"role": "user", "content": "hi"}])
             ollama_chat(warm_msgs, TOOLS)
-            elapsed = time.time() - t0
+            elapsed = time.monotonic() - t0
             _note_llm_load(OLLAMA_MODEL, elapsed)
             log.info("LLM warmed in %.1fs (prompt prefix cached)", elapsed)
         except Exception:

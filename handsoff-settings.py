@@ -2581,14 +2581,14 @@ drifting apart one forgotten key at a time.
         self._status(f"testing {model} …")
 
         def fetch():
-            t0 = time.time()
+            t0 = time.monotonic()
             reply = http_json(base + "/api/chat", {
                 "model": model, "stream": False, "think": False,
                 "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
                 "options": {"num_ctx": 2048},
             }, timeout=120)
             text = (reply.get("message") or {}).get("content", "").strip()
-            return f"{model} replied “{text[:60]}” in {time.time() - t0:.1f}s"
+            return f"{model} replied “{text[:60]}” in {time.monotonic() - t0:.1f}s"
 
         def done(ok, result):
             self.test_btn.setEnabled(True)
@@ -2843,8 +2843,8 @@ drifting apart one forgotten key at a time.
 
                 with sd.InputStream(samplerate=16000, channels=1, dtype="int16",
                                     blocksize=1024, callback=cb, device=device):
-                    deadline = time.time() + 3.0
-                    while time.time() < deadline:
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
                         time.sleep(0.05)
             except Exception as e:  # noqa: BLE001
                 box["err"] = e

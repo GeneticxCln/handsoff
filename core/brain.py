@@ -59,6 +59,20 @@ def strip_thinking(text: str) -> str:
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
+# Where the streamed reply is cut into sentences: a run of terminators FOLLOWED
+# BY WHITESPACE. The lookahead is the point. The stream arrives one token at a
+# time and a tokenizer emits "." on its own — "It's 18", ".", "5 degrees" — so
+# a terminator at the END of the buffer cannot be told from a decimal point, a
+# version ("3.12"), a domain ("example.com") or the first half of "?!" / "...".
+# The old pattern took the end of the buffer as a boundary (`(\s|$)`), and the
+# sentence boundaries then depended on where the network happened to cut the
+# stream: "It's 18." was spoken, then "5 degrees today." — a different reply
+# from the one the model wrote. A terminator that is still the last thing in the
+# buffer is simply undecided: the next token's leading space settles it, and the
+# end of the stream flushes whatever is left. The property is chunking
+# independence — the same reply cut anywhere gives the same sentences.
+_SENTENCE_END = re.compile(r"[.!?…]+\s")
+
 
 def _speech_fragment(fragment: str, in_think: bool) -> tuple[str, bool]:
     """(speech, still-in-think) for one fragment of a streamed reply.
@@ -557,7 +571,7 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                 buf += piece
                 full_parts.append(piece)
                 while True:
-                    match = re.search(r"[.!?…](\s|$)", buf)
+                    match = _SENTENCE_END.search(buf)
                     if not match:
                         break
                     sentence, buf = buf[:match.end()], buf[match.end():]

@@ -4934,6 +4934,66 @@ def the_decision_log_viewer_survives_a_torn_last_line():
     assert "run_command" in text, text
 
 
+@scenario
+def the_mic_test_records_a_bounded_window_and_reports_the_peak():
+    # The Test-microphone button holds a stream open for a fixed window and
+    # reports the loudest block. The window is timed on the MONOTONIC clock (a
+    # wall-clock step during it would end the test early or hold the stream open
+    # for hours), and the fake clock here advances half a second per reading so
+    # the count of waits is exact: three seconds is five sleeps, and a loop that
+    # runs one more or one fewer is a window of the wrong length.
+    import types as _types
+    import numpy as _np
+    readings = {"n": 0}
+    sleeps = []
+
+    class _Clock:
+        @staticmethod
+        def monotonic():
+            value = readings["n"] * 0.5
+            readings["n"] += 1
+            return value
+
+        @staticmethod
+        def sleep(seconds):
+            sleeps.append(seconds)
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    opened = []
+
+    class _Stream:
+        def __init__(self, **kw):
+            opened.append(kw)
+            self._cb = kw["callback"]
+
+        def __enter__(self):
+            self._cb(_np.full((1024, 1), 100, dtype=_np.int16), 1024, None, None)
+            self._cb(_np.full((1024, 1), 900, dtype=_np.int16), 1024, None, None)
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    settings_app.time = _Clock()
+    settings_app.sd = _types.SimpleNamespace(InputStream=_Stream)
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    win.mic_threshold.setValue(700)
+    win.test_mic()
+    deadline = time.time() + 10
+    while not win.mic_test_btn.isEnabled() and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    assert win.mic_test_btn.isEnabled(), "the mic test never finished"
+    assert len(opened) == 1 and opened[0]["samplerate"] == 16000, opened
+    assert len(sleeps) == 5, (
+        f"a 3-second window on a half-second clock is five waits, got {len(sleeps)}")
+    text = win.status_label.text()
+    assert "mic peak 900" in text and "good signal" in text, text
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -5069,6 +5129,7 @@ SCENARIO_NAMES = [
     "float_spin_fields_keep_their_fractions",
     "a_bom_settings_file_is_read_by_the_window",
     "the_decision_log_viewer_survives_a_torn_last_line",
+    "the_mic_test_records_a_bounded_window_and_reports_the_peak",
 ]
 
 

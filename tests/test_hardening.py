@@ -659,6 +659,30 @@ class TestMissingBrainFallback:
             return list(q.queue)
 
         report["stream_said"] = speaking(ndjson("One. ", "Two more"))
+
+        # where a reply is cut into sentences must not depend on where the
+        # network cut the stream: the same reply, split at EVERY position, in
+        # this copy and in core, gives the sentences the reply gives whole
+        def split_at(brain, text, i):
+            q = queue.Queue()
+            brain.ollama_chat_stream(
+                [{"role": "user", "content": "hi"}], q, None, None,
+                base=BASE, model="gpt-oss:20b", num_ctx=8,
+                guard=lambda: None, logger=log,
+                urlopen=lambda req, timeout=None: StreamResp(
+                    ndjson(text[:i], text[i:])))
+            return list(q.queue)
+
+        REPLIES = ("It is 18.5 degrees and 3.2 inches of rain.",
+                   "Version 3.12.1 shipped. Visit example.com now.",
+                   "Really?! Yes... maybe. Okay!")
+        report["split_whole"] = [split_at(legacy, r, len(r)) for r in REPLIES]
+        report["split_independent"] = all(
+            split_at(legacy, r, i) == split_at(legacy, r, len(r))
+            for r in REPLIES for i in range(1, len(r)))
+        report["split_matches_core"] = all(
+            split_at(legacy, r, i) == split_at(real_brain, r, i)
+            for r in REPLIES for i in range(1, len(r)))
         # the leaked-token rule, both directions: a token glued to a
         # sentence costs only its own line, a bare one costs the line
         report["stream_leaked"] = speaking(
@@ -965,6 +989,15 @@ class TestMissingBrainFallback:
         # the queue: sentences, then exactly one terminator
         assert report["stream_said"] == ["One.", "Two more", None], \
             report["stream_said"]
+        # the splitter's boundaries do not depend on where the stream was cut:
+        # a decimal, a version, a domain and "?!" / "..." stay whole in this
+        # copy exactly as in core, at every cut position
+        assert report["split_whole"] == [
+            ["It is 18.5 degrees and 3.2 inches of rain.", None],
+            ["Version 3.12.1 shipped.", "Visit example.com now.", None],
+            ["Really?!", "Yes...", "maybe.", "Okay!", None]], report["split_whole"]
+        assert report["split_independent"] is True
+        assert report["split_matches_core"] is True
         # the leak rule, in the direction that lost a sentence until 2026-09-27
         assert report["stream_leaked"] == ["Here.", None], report["stream_leaked"]
         assert report["stream_bare_token"] == ["Here.", None], \
