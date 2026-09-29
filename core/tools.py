@@ -954,6 +954,45 @@ def setting_flag(key: str, default: bool = False) -> bool:
         return default
 
 
+_CLOCK_24H = re.compile(r'(\d{1,2}):(\d{2})(?::(\d{2}))?')
+_CLOCK_12H = re.compile(r'(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?')
+
+
+def parse_clock_time(text: str) -> "tuple[int, int, int] | None":
+    """(hour, minute, second) for a time of day, or None if `text` is not one.
+
+    "18:30" and "18:30:15" as before, and now the way a person says a time:
+    "6:30 pm", "6:30pm", "6 PM", "at 6.30 p.m.", "noon", "midnight". Whisper
+    writes "6.30 pm" and the model passes what it was given; the tool's
+    description asks for HH:MM, but a refusal ("could not understand when_due")
+    for the most ordinary way of saying a time is a turn spent on an answer the
+    model could not have known to give.
+    """
+    t = re.sub(r'^at\s+', '', str(text or '').strip().lower())
+    t = re.sub(r'^(\d{1,2})\.(\d{2})(?=\s*(?:[ap]\.?\s*m\.?)?$)', r'\1:\2', t)   # "6.30 pm"
+    if t in ('noon', 'midday'):
+        return (12, 0, 0)
+    if t == 'midnight':
+        return (0, 0, 0)
+    m = _CLOCK_24H.fullmatch(t)
+    if m:
+        h, mi, se = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+        return (h, mi, se) if h < 24 and mi < 60 and se < 60 else None
+    m = _CLOCK_12H.fullmatch(t)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if not (1 <= h <= 12 and mi < 60):
+            return None
+        return (h % 12 + (12 if m.group(3) == 'p' else 0), mi, 0)
+    m = re.fullmatch(_CLOCK_24H.pattern + r'\s*([ap])\.?\s*m\.?', t)
+    if m:                                    # "6:30:15 pm"
+        h, mi, se = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+        if not (1 <= h <= 12 and mi < 60 and se < 60):
+            return None
+        return (h % 12 + (12 if m.group(4) == 'p' else 0), mi, se)
+    return None
+
+
 def comm_matches(comm: str, wanted: str) -> bool:
     """Is the process `comm` the one the user named?
 
@@ -3905,11 +3944,8 @@ class ToolBelt:
         due: float | None = None
         if re.fullmatch('\\d+(\\.\\d+)?', arg):
             due = now + float(arg)
-        elif (m := re.fullmatch('(\\d{1,2}):(\\d{2})(:\\d{2})?', arg)):
-            h, mi = (int(m.group(1)), int(m.group(2)))
-            se = int(m.group(3)[1:]) if m.group(3) else 0
-            if h < 24 and mi < 60 and (se < 60):
-                due = _dep()._next_occurrence(h, mi, se, now)
+        elif (clock := parse_clock_time(arg)) is not None:
+            due = _dep()._next_occurrence(*clock, now)
         elif (m := re.fullmatch('(\\d{4})-(\\d{1,2})-(\\d{1,2})(?:[ T](\\d{1,2}):(\\d{2}))?', arg)):
             h = int(m.group(4)) if m.group(4) else 9
             mi = int(m.group(5)) if m.group(5) else 0

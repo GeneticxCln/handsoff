@@ -6145,6 +6145,31 @@ def _parse_duration(text: str) -> float | None:
     return total
 
 
+_SNOOZE_RE = re.compile(
+    r"(?:(?:hey|ok|okay|hi)[,\s]+(?:\w+[,\s]+)?)?(?:snooze|remind me again)"
+    r"(?:\s+(?:it|that|this))?"
+    r"(?:\s+(?:in|for|by|more)?\s*(?:(\d{1,3})\s*)?(?:more\s*)?(?:min(?:ute)?s?)?)?")
+
+
+def _snooze_minutes(text: str) -> "int | None":
+    """Minutes asked for by a bare spoken snooze ("Snooze." -> 10), else None.
+
+    The transcript is Whisper's, and Whisper punctuates: nearly every utterance
+    ends in a full stop ("Snooze.", "Snooze 10 minutes.") and numbers are as
+    often words as digits ("snooze for five minutes"). The pattern was matched
+    with `fullmatch` on the raw text, so a trailing "." — or "five" — meant no
+    match, and the fast path this exists for (a direct answer to a reminder the
+    bubble just announced, with no wake name and no brain turn) almost never
+    fired; the reply went to the model instead. Only the tests, which pass
+    "snooze 5 minutes", ever saw it work.
+    """
+    t = re.sub(r"[\s.,!?;:]+$", "", (text or "").strip().lower())
+    m = _SNOOZE_RE.fullmatch(_spelled_numbers_to_digits(t))
+    if not m:
+        return None
+    return int(m.group(1)) if m.group(1) else 10
+
+
 def _fmt_dur(seconds: float) -> str:
     """'2 hours', '5 minutes', '90 seconds' — shared human duration."""
     s = int(round(seconds))
@@ -8644,9 +8669,14 @@ class Assistant(QObject):
 
     # -- dictation (zero-LLM type-what-I-say) --------------------------------
 
+    # Matched against the transcript with its closing punctuation removed (see
+    # `_try_dictation`): Whisper writes "Stop dictation?" as readily as "Stop
+    # dictation.", and "Hey, start dictation" with the comma straight after
+    # "hey" — neither matched, so the words that were meant to END dictation were
+    # typed into the window instead.
     _DICTATION_RE = re.compile(
-        r"(?:hey\s+\w+[,\s]+)?"
-        r"(?:(start|begin|stop|end)\s+)?dictation(?:\s+mode)?[.!]?",
+        r"(?:(?:hey|ok|okay|hi)[,\s]+(?:\w+[,\s]+)?)?"
+        r"(?:(start|begin|stop|end|finish)\s+)?dictation(?:\s+mode)?",
         re.IGNORECASE)
 
     def _try_dictation(self, text: str, gen: int,
@@ -8656,11 +8686,12 @@ class Assistant(QObject):
         consumed (a toggle command, or transcribed speech to type)."""
         if not _setting_flag("dictation", True):
             return False
-        m = self._DICTATION_RE.fullmatch(text.strip())
+        m = self._DICTATION_RE.fullmatch(
+            re.sub(r"[\s.,!?;:]+$", "", text.strip()))
         if m:
             word = (m.group(1) or "").lower()
             on = ({"start": True, "begin": True, "stop": False,
-                   "end": False}).get(word, not self._dictation)
+                   "end": False, "finish": False}).get(word, not self._dictation)
             self._set_dictation(on, gen, cancel)
             return True
         if not getattr(self, "_dictation", False):   # bare/test instances
@@ -8756,7 +8787,15 @@ class Assistant(QObject):
         """True for a bare stop command: stop, quiet, shut up, be quiet,
         silence, cancel, nevermind/never mind, that's all, stop it.
         Deliberately narrow (whole utterance, small word set) so normal
-        sentences containing e.g. 'stop' are NOT swallowed."""
+        sentences containing e.g. 'stop' are NOT swallowed.
+
+        The wake name is taken off first: "Assistant, stop." is the most natural
+        way to stop a bubble that is talking, and it was not a stop — the words
+        were compared with the name still in front, so it went to the brain as an
+        ordinary turn ("stop"), which the system prompt promises never happens."""
+        rest = _voice.match_wake(text, _wake_words())
+        if rest is not None:
+            text = rest
         words = [w for w in _norm_words(text.lower()) if w]
         if not words:
             return False
@@ -8766,9 +8805,11 @@ class Assistant(QObject):
             return False
         joined = " ".join(words).strip(".,!?;:")
         return joined in {
-            "stop", "stop it", "stop stop", "quiet", "be quiet", "silence",
-            "shut up", "cancel", "nevermind", "never mind", "that's all",
-            "thats all", "that is all",
+            "stop", "stop it", "stop stop", "stop stop stop", "quiet", "be quiet",
+            "silence", "shut up", "cancel", "nevermind", "never mind",
+            "that's all", "thats all", "that is all", "stop talking",
+            "please stop", "stop please", "enough", "that's enough",
+            "thats enough", "that is enough", "hush",
         }
 
     def _maybe_instant_stop(self, audio: np.ndarray, gen: int) -> None:
@@ -9169,14 +9210,9 @@ class Assistant(QObject):
         offer, _expired = _snooze_offer.state()
         if offer is None:
             return False
-        m = re.fullmatch(
-            r"(?:hey\s+\w+[,\s]+)?(?:snooze|remind me again)"
-            r"(?:\s+(?:in|for|by|more)?\s*(?:(\d{1,3})\s*)?"
-            r"(?:more\s*)?(?:min(?:ute)?s?)?)?",
-            text.strip(), re.I)
-        if not m:
+        minutes = _snooze_minutes(text)
+        if minutes is None:
             return False
-        minutes = int(m.group(1)) if m.group(1) else 10
         # Do NOT clear the offer first: a fired one-off reminder is already
         # pruned from reminders.json, so snooze_reminder NEEDS the offer to
         # re-arm it. Clearing early made the spoken snooze fail with "no

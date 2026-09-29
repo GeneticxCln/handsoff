@@ -383,6 +383,40 @@ class TestRemindersAndCalendar:
             said = say(n)
             assert H._parse_duration(f"{said} minutes") == n * 60, (n, said)
 
+    @pytest.mark.parametrize("said,clock", [
+        ("18:30", (18, 30, 0)), ("18:30:15", (18, 30, 15)), ("0:30", (0, 30, 0)),
+        ("6:30 pm", (18, 30, 0)), ("6:30pm", (18, 30, 0)), ("6 PM", (18, 0, 0)),
+        ("6pm", (18, 0, 0)), ("at 6.30 p.m.", (18, 30, 0)), ("6.30 pm", (18, 30, 0)),
+        ("at 6:30 PM", (18, 30, 0)), ("9:05 a.m.", (9, 5, 0)),
+        ("12 am", (0, 0, 0)), ("12 pm", (12, 0, 0)), ("12:15 am", (0, 15, 0)),
+        ("noon", (12, 0, 0)), ("midnight", (0, 0, 0)), ("6:30:15 pm", (18, 30, 15)),
+        ("23:59", (23, 59, 0)), ("23:59:59", (23, 59, 59)), ("12:59 pm", (12, 59, 0)),
+        ("12:00 am", (0, 0, 0)), ("1:00 am", (1, 0, 0)), ("11:59 pm", (23, 59, 0))])
+    def test_a_time_of_day_is_read_the_way_it_is_said(self, said, clock):
+        """The tool asked for HH:MM and nothing else, so "6:30 pm" — Whisper
+        writes "6.30 pm" — was refused as not understood: a turn spent on an
+        answer the model could not have known to give."""
+        from core.tools import parse_clock_time
+        assert parse_clock_time(said) == clock, said
+
+    @pytest.mark.parametrize("said", [
+        "24:00", "24:01", "18:60", "18:30:60", "13 pm", "0 pm", "6:60 pm", "6:30:60 pm",
+        "13:00 pm", "18:30:61", "in 5 minutes", "7", "at 7",
+        "6:3 pm", "1.2.3", "6.5 pm", "", None])
+    def test_something_that_is_not_a_time_of_day_is_not_one(self, said):
+        from core.tools import parse_clock_time
+        assert parse_clock_time(said) is None, said
+
+    def test_set_reminder_accepts_a_twelve_hour_time(self, H, monkeypatch, tmp_path):
+        monkeypatch.setattr(H, "REMINDERS_FILE", tmp_path / "reminders.json")
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        for said, clock in (("6:30 pm", (18, 30, 0)), ("at 7 am", (7, 0, 0)),
+                            ("noon", (12, 0, 0))):
+            out, err = belt.execute("set_reminder", {"wake_name": "tea", "when_due": said})
+            assert not err and "set for" in out, (said, out)
+            rows = H.json.loads((tmp_path / "reminders.json").read_text())
+            assert abs(rows[-1]["due"] - H._next_occurrence(*clock, H.time.time())) < 5, said
+
     def test_a_spoken_duration_is_singular_at_one(self, H):
         """`_fmt_dur` is read aloud ("repeating every 1 seconds", "last measured
         1 seconds ago"), and it pluralised every count of seconds."""
@@ -728,6 +762,40 @@ class TestSnooze:
         a._speak = lambda *x, **k: None
         assert a._try_snooze("snooze 5 minutes", 1, H.threading.Event()) is True
         assert H._snooze_offer, "a refused snooze must leave the offer armed"
+
+    @pytest.mark.parametrize("said,minutes", [
+        ("snooze", 10), ("Snooze.", 10), ("Snooze!", 10), ("Snooze 10 minutes.", 10),
+        ("snooze for 5 minutes", 5), ("Snooze for five minutes.", 5),
+        ("Snooze twenty minutes.", 20), ("snooze ten minutes", 10),
+        ("Hey, snooze.", 10), ("Hey assistant, snooze 10 minutes.", 10),
+        ("Okay assistant, snooze for three minutes", 3),
+        ("Snooze it.", 10), ("Snooze that for 15 minutes.", 15),
+        ("remind me again in 10 minutes.", 10), ("Snooze for 10 min.", 10),
+        ("  SNOOZE  ", 10)])
+    def test_a_spoken_snooze_as_whisper_writes_it(self, H, said, minutes):
+        """Whisper punctuates nearly every utterance and spells numbers as often
+        as it digits them; the pattern was matched against the raw text, so
+        "Snooze." and "Snooze for five minutes." never took the fast path."""
+        assert H._snooze_minutes(said) == minutes, said
+
+    @pytest.mark.parametrize("said", [
+        "what's the weather", "snooze the lights", "snoozed", "Snooze the alarm.",
+        "don't snooze", "snooze 5 hours", "I want to snooze", "", None])
+    def test_other_speech_is_not_a_snooze(self, H, said):
+        assert H._snooze_minutes(said) is None, said
+
+    def test_try_snooze_takes_the_punctuated_utterance(self, H):
+        calls = {}
+        H._snooze_offer.arm(90, name="tea")
+        a = H.Assistant.__new__(H.Assistant)
+        a._tools = H.ToolBelt(on_restart_pending=lambda: None)
+        seen = []
+        a._tools.execute = lambda name, args: (seen.append((name, args)),
+                                               _core_tools.ToolResult("snoozed!"))[1]
+        a._set = lambda *x: None
+        a._speak = lambda *x, **k: calls.setdefault("spoken", True)
+        assert a._try_snooze("Snooze for five minutes.", 1, H.threading.Event()) is True
+        assert seen == [("snooze_reminder", {"name": "tea", "minutes": 5})], seen
 
     def test_try_snooze_ignores_normal_speech(self, H):
         H._snooze_offer.arm(90, name="tea")
