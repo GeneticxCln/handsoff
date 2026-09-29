@@ -4210,6 +4210,28 @@ class TestAudioFailurePaths:
             f"clipping is required: {int(np.max(sat))}/{int(np.min(sat))} — "
             "wrapping is loud noise, not a no-op")
 
+    def test_an_over_long_reply_is_cut_after_a_sentence_end_full_stop(self, H):
+        """The cut lands on a sentence end, and the full stop stays with it: the
+        engine gives the last sentence falling intonation only if it is there."""
+        mod = _load("core_audio_cut", HERE / "core" / "audio.py")
+        seen = []
+
+        class _Engine:
+            def generate(self, text):
+                seen.append(text)
+                return np.zeros(16, dtype=np.float32)
+
+        setattr(mod, "SETTINGS", {"tts_rate": 1.0, "tts_volume": 1.0})
+        sentence = "One sentence with a single full stop. "
+        long_reply = sentence * (mod.MAX_TTS_CHARS // len(sentence) + 3)
+        mod.synthesize(long_reply, model=_Engine())
+        assert len(seen[0]) <= mod.MAX_TTS_CHARS
+        assert seen[0].endswith("."), repr(seen[0][-20:])
+        # no sentence end anywhere in the first half: a hard cut at the cap
+        seen.clear()
+        mod.synthesize("x" * (mod.MAX_TTS_CHARS + 500), model=_Engine())
+        assert len(seen[0]) == mod.MAX_TTS_CHARS
+
     def test_a_short_reference_clip_is_named_before_the_engine_asserts(
             self, H, tmp_path):
         """The library asserts > 5 s and fires on EVERY turn, so a 2 s clip is

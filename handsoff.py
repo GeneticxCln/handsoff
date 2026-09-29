@@ -6061,7 +6061,9 @@ def _fmt_dur(seconds: float) -> str:
         return f"{s // 3600} hour" + ("s" if s > 3600 else "")
     if s >= 60 and s % 60 == 0:
         return f"{s // 60} minute" + ("s" if s > 60 else "")
-    return f"{s} seconds"
+    # One unit of each, singular — this is read ALOUD ("repeating every 1
+    # seconds", "last measured 1 seconds ago").
+    return f"{s} second" + ("" if abs(s) == 1 else "s")
 
 
 def _due_reminders(items: list[dict], now: float) -> tuple[list[dict], list[dict]]:

@@ -1065,7 +1065,12 @@ def synthesize(text: str, model=None) -> np.ndarray:
     if len(text) > MAX_TTS_CHARS:
         # Truncated at a sentence end below the cap when one exists — never
         # mid-word — and logged once, so the cut is visible in the journal.
-        cut = text.rfind(".", 0, MAX_TTS_CHARS)
+        # `rfind` returns the index OF the full stop, and `text[:cut]` stops
+        # before it: the "sentence end" this cuts at lost its own full stop, so
+        # the engine read the last sentence with rising, unfinished intonation.
+        # The cut is one past the stop (still within the cap: the search window
+        # ends at MAX_TTS_CHARS, so the stop's index is at most MAX - 1).
+        cut = text.rfind(".", 0, MAX_TTS_CHARS) + 1
         if cut < MAX_TTS_CHARS // 2:
             cut = MAX_TTS_CHARS
         log.warning("TTS input truncated %d -> %d chars", len(text), cut)

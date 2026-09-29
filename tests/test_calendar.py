@@ -296,6 +296,17 @@ class TestRemindersAndCalendar:
         out4, err = belt.execute("calendar_month", {"month": "2026-13"})
         assert err and "ERROR" in out4, out4
 
+    def test_a_spoken_duration_is_singular_at_one(self, H):
+        """`_fmt_dur` is read aloud ("repeating every 1 seconds", "last measured
+        1 seconds ago"), and it pluralised every count of seconds."""
+        assert H._fmt_dur(1) == "1 second"
+        assert H._fmt_dur(0) == "0 seconds"
+        assert H._fmt_dur(2) == "2 seconds"
+        assert H._fmt_dur(0.7) == "1 second"           # rounds to one
+        assert H._fmt_dur(60) == "1 minute"
+        assert H._fmt_dur(3600) == "1 hour"
+        assert H._fmt_dur(90) == "90 seconds"
+
     def test_parse_duration_variants(self, H):
         assert H._parse_duration("in 90 minutes") == 5400
         assert H._parse_duration("2 hours 5 minutes") == 2 * 3600 + 5 * 60

@@ -35,6 +35,38 @@ def test_pomodoro_start_status_stop():
     assert spoken and spoken[0].startswith("Pomodoro started")
 
 
+def test_pomodoro_speaks_its_minutes_as_a_person_would(monkeypatch):
+    """`{n:.0f} minutes` said "1 minutes", rounded a 2.5-minute phase to "2"
+    (round-half-even) and, in `status`, floored 59 s to "0 minutes remaining"."""
+    from core import assistant as A
+    assert A._minutes(1) == "1 minute"
+    assert A._minutes(25) == "25 minutes"
+    assert A._minutes(2.5) == "2.5 minutes"
+    assert A._minutes(1.0) == "1 minute"
+    one: list = []
+    pomo1, _ = _controller(one)
+    assert pomo1.command("start", 1, 1) == (
+        "pomodoro started: 1 minute work and 1 minute break")
+    assert one[0] == "Pomodoro started: 1 minute of work."
+    pomo1.command("stop", 0, 0)
+
+    spoken: list = []
+    pomo, _ = _controller(spoken)
+    assert pomo.command("start", 25, 5) == (
+        "pomodoro started: 25 minute work and 5 minute break")
+    assert spoken[0] == "Pomodoro started: 25 minutes of work."
+    until = pomo._state["until"]
+    # 59 s left is "less than a minute"; 61 s left is two minutes (rounded UP);
+    # exactly one minute left is singular
+    for left, said in ((59, "less than a minute"), (61, "2 minutes"),
+                       (60, "1 minute"), (1500, "25 minutes")):
+        monkeypatch.setattr(A.time, "monotonic", lambda left=left: until - left)
+        assert pomo.command("status", 1, 1) == (
+            f"pomodoro is in work phase with {said} remaining"), left
+    monkeypatch.undo()
+    pomo.command("stop", 0, 0)
+
+
 def test_pomodoro_loop_announces_transition():
     spoken: list = []
     pomo, started = _controller(spoken)

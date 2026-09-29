@@ -21,6 +21,16 @@ import time
 from core.registry import BoundedRegistry, Offer
 
 
+def _minutes(count: float) -> str:
+    """'1 minute', '25 minutes', '2.5 minutes' — a count of minutes as it is SAID.
+
+    The announcements were spoken with `{n:.0f} minutes`: "1 minutes", and a
+    half-minute phase rounded to "0 minutes" (`.0f` rounds half to even, so 2.5
+    said "2")."""
+    value = f"{count:g}"
+    return f"{value} minute" + ("" if value == "1" else "s")
+
+
 class PomodoroController:
     """Bounded pomodoro worker: work/break phases with spoken transitions.
 
@@ -78,9 +88,13 @@ class PomodoroController:
                 state = self._state
             if not state:
                 return "pomodoro is off"
-            remaining = max(0, int(state["until"] - time.monotonic()))
+            remaining = max(0.0, state["until"] - time.monotonic())
+            # Rounded UP: "0 minutes remaining" (floor of 59 s) read as a phase
+            # that had already ended, and a phase with 90 s left said "1".
+            left = ("less than a minute" if remaining < 60
+                    else _minutes(math.ceil(remaining / 60)))
             return (f"pomodoro is in {state['phase']} phase with "
-                    f"{remaining // 60} minutes remaining")
+                    f"{left} remaining")
         if action == "stop":
             self.shutdown()
             return "pomodoro stopped"
@@ -94,8 +108,8 @@ class PomodoroController:
             self._state = {"phase": "work", "until": time.monotonic() + work * 60,
                            "work": work, "break": break_minutes}
             self._thread = self._spawn(self._loop, args=(stop,), name="pomodoro")
-            self._announce(f"Pomodoro started: {work:.0f} minutes of work.")
-        return f"pomodoro started: {work:.0f} minute work and {break_minutes:.0f} minute break"
+            self._announce(f"Pomodoro started: {_minutes(work)} of work.")
+        return f"pomodoro started: {work:g} minute work and {break_minutes:g} minute break"
 
     def _loop(self, stop: threading.Event) -> None:
         phase = "work"
@@ -121,7 +135,7 @@ class PomodoroController:
                                "until": time.monotonic() + minutes * 60}
                 self._announce(
                     f"Pomodoro: {('break' if phase == 'break' else 'back to work')} "
-                    f"for {minutes:.0f} minutes.")
+                    f"for {_minutes(minutes)}.")
 
     def shutdown(self) -> None:
         """Signal stop and clear phase state, then join the worker.
