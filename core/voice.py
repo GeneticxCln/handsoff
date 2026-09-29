@@ -84,8 +84,26 @@ class SpeechGate:
 WAKE_FILLER = {"hey", "ok", "okay", "hi", "yo"}
 
 
+# Punctuation that separates or wraps words in a transcript without being part of
+# one: dashes and ellipses join two words with no space ("Assistant—what time"),
+# and quotes and brackets wrap a word ('"Assistant" stop', "(Assistant) stop").
+_WORD_SEPARATORS = re.compile("[\u2014\u2013\u2026]")
+_WORD_WRAPPERS = ".,!?;:\"'\u201c\u201d()[]{}"
+
+
 def norm_words(text: str) -> list[str]:
-    return [w.strip(".,!?;:") for w in (text or "").split()]
+    """The words of a transcript, as the wake and stop matchers compare them.
+
+    Whisper writes what a person would type: an em dash where a speaker paused,
+    typographic quotes and apostrophes, a name in quotation marks. Splitting on
+    whitespace alone made "Hey Assistant—what time is it" a single token that
+    matched nothing, and "That\u2019s all" a stop phrase that never equalled
+    "that's all". Dashes and ellipses now separate words, a typographic
+    apostrophe is a plain one, and quotes and brackets are stripped from a
+    word's ends the way sentence punctuation already was.
+    """
+    text = _WORD_SEPARATORS.sub(" ", (text or "").replace("\u2019", "'").replace("\u2018", "'"))
+    return [w.strip(_WORD_WRAPPERS) for w in text.split()]
 
 
 def wake_skeleton(word: str) -> str:

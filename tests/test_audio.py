@@ -1399,6 +1399,77 @@ class TestWakeWord:
         assert H._spotter_wakes_for() is True
 
 
+class TestATranscriptAsWhisperWritesIt:
+    """Whisper writes what a person would type: an em dash where the speaker
+    paused, typographic quotes and apostrophes, a name inside quotation marks.
+    The words of a transcript were split on whitespace alone, so "Hey
+    Assistant\u2014what time is it" was ONE token that matched nothing and
+    "That\u2019s all" never equalled the stop phrase "that's all". (The phrases
+    are the ones Whisper produced for a corpus synthesised with espeak-ng.)"""
+
+    @pytest.mark.parametrize("said,rest", [
+        ("Hey Assistant, what time is it?", "what time is it"),
+        ("Hey, Assistant\u2014what time is it", "what time is it"),
+        ("Hey assistant\u2014stop", "stop"),
+        ("Assistant\u2026stop", "stop"),
+        ("Assistant\u2013stop", "stop"),
+        ('"Assistant" stop', "stop"),
+        ("\u201cAssistant,\u201d stop", "stop"),
+        ("(Assistant) stop", "stop"),
+        ("'Assistant' stop", "stop"),
+        ("Okay, that's it. Stop.", None),
+    ])
+    def test_the_wake_name_is_found(self, H, monkeypatch, said, rest):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "assistant")
+        got = H._match_wake(said)
+        if rest is None:
+            assert got is None, said
+        else:
+            assert got == rest, (said, got)
+
+    @pytest.mark.parametrize("said", [
+        "hey assistants", "Hey Assistant\u2019s turn", "assistantship", "Assist ant stop"])
+    def test_a_different_word_is_still_a_different_word(self, H, monkeypatch, said):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "assistant")
+        assert H._match_wake(said) is None, said
+
+    @pytest.mark.parametrize("said", [
+        "That\u2019s all.", "That's all.", "\u201cStop.\u201d", "(Stop)", "Stop\u2026",
+        "Never mind.", "Nevermind.", "'Quiet'", "Hey, be quiet.", "Silence.",
+        "Okay\u2014stop"])
+    def test_a_bare_stop_is_a_stop(self, H, said):
+        a = H.Assistant.__new__(H.Assistant)
+        assert a._is_stop_utt(said) is True, said
+
+    @pytest.mark.parametrize("said", [
+        "Assistant, stop.", "Hey assistant, stop it.", "Hey Assistant\u2014stop!",
+        "Okay assistant, be quiet.", "Assistant: shut up", "Stop talking.",
+        "Please stop.", "Enough.", "That\u2019s enough.", "Hush.", "Stop, stop, stop."])
+    def test_the_stops_people_actually_say(self, H, monkeypatch, said):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "assistant")
+        a = H.Assistant.__new__(H.Assistant)
+        assert a._is_stop_utt(said) is True, said
+
+    def test_the_name_alone_or_a_question_is_not_a_stop(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "assistant")
+        a = H.Assistant.__new__(H.Assistant)
+        for said in ("Hey assistant.", "Assistant", "Hey assistant, what time is it?",
+                     "Assistant, don't stop the music.", "Assistant, stop the music."):
+            assert a._is_stop_utt(said) is False, said
+
+    def test_a_sentence_holding_stop_is_not(self, H):
+        a = H.Assistant.__new__(H.Assistant)
+        for said in ("Stop the music.", "Don't stop.", "I can't stop laughing.",
+                     "Never mind the weather, what time is it?"):
+            assert a._is_stop_utt(said) is False, said
+
+    def test_norm_words_itself(self):
+        from core import voice as V
+        assert V.norm_words('"A\u2014B" \u201cc,\u201d (d) e\u2026f') == ["A", "B", "c", "d", "e", "f"]
+        assert V.norm_words("That\u2019s O\u2018Brien") == ["That's", "O'Brien"]
+        assert V.norm_words("") == [] and V.norm_words(None) == []
+
+
 class TestWakeAnywhere:
     """A custom name has no audio-spotter model, so the transcript is the only
     door — and it has to open for a name whisper did not put FIRST (a split

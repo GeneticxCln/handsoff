@@ -951,6 +951,29 @@ class TestDictationMode:
             assert a._try_dictation(phrase, 1, threading.Event()) is True
             assert a._dictation == want, phrase
 
+    def test_the_toggle_as_whisper_writes_it(self, H, monkeypatch):
+        """Whisper punctuates: "Stop dictation?" as readily as "Stop
+        dictation.", and "Hey, start dictation" with the comma straight after
+        "hey". Neither matched, so the words meant to END dictation were typed
+        into the window instead."""
+        a = self._mk(H, monkeypatch)
+        for phrase, want in [("Start dictation.", True), ("Stop dictation?", False),
+                             ("Stop dictation!", False), ("Hey, start dictation.", True),
+                             ("Okay, stop dictation.", False), ("OK assistant, start dictation", True),
+                             ("Finish dictation.", False), ("Begin dictation mode.", True),
+                             ("End dictation...", False), ("Dictation.", True)]:
+            a._dictation = not want
+            assert a._try_dictation(phrase, 1, threading.Event()) is True, phrase
+            assert a._dictation == want, phrase
+
+    def test_a_sentence_about_dictation_is_not_the_toggle(self, H, monkeypatch):
+        a = self._mk(H, monkeypatch)
+        for phrase in ("I love dictation software.", "Start dictation of the letter.",
+                       "Can you stop dictation for me?", "dictation is fun"):
+            a._dictation = False
+            assert a._try_dictation(phrase, 1, threading.Event()) is False, phrase
+            assert a._dictation is False, phrase
+
     def test_dictated_text_is_typed_not_sent_to_brain(self, H, monkeypatch):
         a = self._mk(H, monkeypatch)
         a._try_dictation("start dictation", 1, threading.Event())
