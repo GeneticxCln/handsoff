@@ -294,7 +294,12 @@ def log_decision(tool: str, target: str, decision: str, result: str='dispatched'
                 # Size gate: the read-trim path runs only once past ~2x the
                 # line cap, not on every tool call in the hot path.
                 if decision_file.stat().st_size > 262144:
-                    with decision_file.open('r', encoding='utf-8') as fh:
+                    # errors='replace': a power cut can tear the last line
+                    # mid-character, and a strict read raised out of this trim
+                    # — which the OSError handler below does not catch — so a
+                    # torn tail meant the log was never pruned again and every
+                    # tool call re-read a file that only grew.
+                    with decision_file.open('r', encoding='utf-8', errors='replace') as fh:
                         lines = fh.readlines()
                     if len(lines) > _DECISIONS_MAX * 2:
                         _dep().atomic_private_write(decision_file, ''.join(lines[-_DECISIONS_MAX:]))
@@ -3163,8 +3168,15 @@ class ToolBelt:
                     return
                 # O_NOFOLLOW: a symlink swapped in for the final component
                 # fails the open instead of being followed.
-                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'r',
-                               encoding='utf-8', errors='replace') as fh:
+                # BYTES, not text: `position` is a byte offset (it came from
+                # st_size and is used to seek), and the cursor below advances by
+                # what was consumed. Read as text and counted in characters, one
+                # non-ASCII line (an accent, an emoji, any CJK) left the cursor
+                # short by the difference, so every later poll re-read the tail
+                # of that line — from the middle of a character — and announced
+                # the same match again as garbled fragments ('本語のエラー',
+                # '��エラー') until the lag happened to drain.
+                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as fh:
                     fh.seek(position)
                     chunk = fh.read(min(size - position, 128000))
                 # Bounded evaluation: the pattern is data we do not control, so
@@ -3175,8 +3187,9 @@ class ToolBelt:
                 # cap is deferred to the next poll instead of being skipped
                 # forever.
                 consumed = 0
-                for line in chunk.splitlines(keepends=True)[:WATCH_LINES_PER_POLL]:
-                    consumed += len(line)
+                for raw in chunk.splitlines(keepends=True)[:WATCH_LINES_PER_POLL]:
+                    consumed += len(raw)
+                    line = raw[:WATCH_LINE_MAX * 4].decode('utf-8', 'replace')
                     if pattern.search(line[:WATCH_LINE_MAX]):
                         emit(f'{path.name}: {line.strip()[:240]}')
                 position += consumed

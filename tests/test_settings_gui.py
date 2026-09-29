@@ -4904,6 +4904,36 @@ def a_schema_key_with_no_control_survives_a_save():
     assert win.cfg["command_policy"].get(orphan) == "DENY"
 
 
+@scenario
+def a_bom_settings_file_is_read_by_the_window():
+    # The bubble reads settings.json as utf-8-sig, so a file saved by an editor
+    # that writes a BOM is the user's real settings THERE. The window read it as
+    # plain utf-8: json.loads choked on the BOM, the fallback was {}, and the
+    # window showed defaults — a Save from it then replaced the real file with
+    # defaults plus the one edit made.
+    settings_file.write_bytes(b"\\xef\\xbb\\xbf" + json.dumps(
+        {"model": "bommodel:latest", "mic_threshold": 731}).encode("utf-8"))
+    win.reload_from_disk()
+    assert win.cfg["model"] == "bommodel:latest", win.cfg.get("model")
+    assert win.cfg["mic_threshold"] == 731, win.cfg.get("mic_threshold")
+
+
+@scenario
+def the_decision_log_viewer_survives_a_torn_last_line():
+    # A power cut can leave decisions.jsonl cut mid-character. The viewer read
+    # it as strict UTF-8 and caught only OSError, so the UnicodeDecodeError (a
+    # ValueError) escaped a Qt slot. It skips a line it cannot parse; a torn
+    # tail is one skipped row.
+    good = json.dumps({"id": "1", "ts": "2026-09-29T10:00:00", "tool": "run_command",
+                       "target": "echo", "decision": "ALLOW", "result": "ok"})
+    bubble.DECISIONS_FILE.write_bytes(
+        good.encode("utf-8") + b"\\n" + b'{"id": "2", "target": "caf\\xc3')
+    win._refresh_decisions()
+    text = win.decisions_view.toPlainText()
+    assert "1 decisions" in text, text
+    assert "run_command" in text, text
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -5037,6 +5067,8 @@ SCENARIO_NAMES = [
     "live_apply_persists_only_appearance_keys",
     "a_save_names_the_sticky_keys_that_wait",
     "float_spin_fields_keep_their_fractions",
+    "a_bom_settings_file_is_read_by_the_window",
+    "the_decision_log_viewer_survives_a_torn_last_line",
 ]
 
 

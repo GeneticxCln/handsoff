@@ -494,3 +494,27 @@ class TestAMalformedCommandIsARefusalNotABug:
     def test_ordinary_unicode_is_still_a_command(self, H):
         out, err = _belt(H).execute("run_command", {"command": "echo héllo 😀"})
         assert not err and "héllo 😀" in out, out
+
+
+class TestTheDecisionLogTrimSurvivesATornLine:
+    """`log_decision` trims decisions.jsonl by reading it back. A power cut can
+    leave the last line cut mid-character, and that read was strict UTF-8 inside
+    a handler that names only OSError: the torn tail raised out of the trim, the
+    outer handler swallowed it, and the log was never pruned again — every tool
+    call afterwards re-read a file that only grew."""
+
+    def test_the_log_is_still_pruned(self, H, monkeypatch, tmp_path):
+        import core.tools as _t
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(H, "DECISIONS_FILE", tmp_path / "decisions.jsonl")
+        f = tmp_path / "decisions.jsonl"
+        row = b'{"id": "%d", "tool": "run_command", "target": "' + b"x" * 200 + b'"}\n'
+        f.write_bytes(b"".join(row % i for i in range(1500))
+                      + b'{"id": "torn", "target": "caf\xc3')
+        assert f.stat().st_size > 262144
+        _t.log_decision("run_command", "echo hi", "ALLOW")
+        lines = f.read_bytes().splitlines()
+        assert len(lines) <= _t._DECISIONS_MAX + 1, (
+            f"{len(lines)} lines: a torn tail stopped the trim")
+        assert b'"decision": "ALLOW"' in lines[-1], "the newest decision was lost"
+        f.read_bytes().decode("utf-8")   # what it rewrote is text again

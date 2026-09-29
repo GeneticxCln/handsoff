@@ -249,6 +249,28 @@ class TestTheGrowthStore:
         path.write_text("{not json\n\n", encoding="utf-8")
         assert corpus.load_store(path) == {}
 
+    def test_a_torn_last_line_costs_one_row_not_the_whole_store(self, tmp_path):
+        """A power cut can leave the store's or the queue's last line cut
+        mid-character. Both were read as strict UTF-8 under a handler that names
+        only OSError, so the tool died with a UnicodeDecodeError instead of
+        skipping the one line it could not read."""
+        good = json.dumps({"text": "play some music", "family": "media",
+                           "source": "history:a"}).encode("utf-8")
+        torn = b'{"text": "caf\xc3'
+        store_path = tmp_path / "laya-corpus.jsonl"
+        store_path.write_bytes(good + b"\n" + torn)
+        rows = corpus.load_store(store_path)
+        assert [r["text"] for r in rows.values()] == ["play some music"]
+
+        queue = tmp_path / "laya-turns.jsonl"
+        queue.write_bytes(
+            json.dumps({"text": "play some jazz", "tools": ["media_play"]}
+                       ).encode("utf-8") + b"\n" + torn)
+        mined, info = corpus.mine_turns(queue)
+        assert info["present"] is True
+        assert info["recorded"] == 2
+        assert [r["text"] for r in mined] == ["play some jazz"]
+
 
 class TestTheCorpusNeverWritesIntoTheCheckout:
     def test_the_default_store_is_outside_the_tree(self):

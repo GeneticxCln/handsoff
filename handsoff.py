@@ -5116,8 +5116,11 @@ def _record_turn_for_corpus(text: str, messages: list) -> None:
             os.chmod(LAYA_TURNS_FILE, 0o600)
             try:
                 if LAYA_TURNS_FILE.stat().st_size > _LAYA_TURNS_BYTES:
+                    # errors="replace": a torn last line (power cut mid-write)
+                    # must not stop the trim for good — see log_decision.
                     lines = LAYA_TURNS_FILE.read_text(
-                        encoding="utf-8").splitlines(keepends=True)
+                        encoding="utf-8", errors="replace"
+                    ).splitlines(keepends=True)
                     if len(lines) > _LAYA_TURNS_MAX * 2:
                         _core_settings.atomic_private_write(
                             LAYA_TURNS_FILE, "".join(lines[-_LAYA_TURNS_MAX:]))

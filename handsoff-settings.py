@@ -2451,7 +2451,7 @@ drifting apart one forgotten key at a time.
             return
         try:
             on_disk = merge_settings(
-                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8")))
+                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8-sig")))
         except (OSError, ValueError):
             on_disk = {}
         if on_disk.get("model") == picked:
@@ -3110,7 +3110,12 @@ drifting apart one forgotten key at a time.
 
     def _refresh_decisions(self) -> None:
         try:
-            raw = H.DECISIONS_FILE.read_text(encoding="utf-8").splitlines()
+            # errors="replace": the viewer skips a line it cannot parse, so a
+            # torn last line (power cut mid-write) is one skipped row — not a
+            # UnicodeDecodeError, which is a ValueError this handler does not
+            # catch, escaping a Qt slot.
+            raw = H.DECISIONS_FILE.read_text(
+                encoding="utf-8", errors="replace").splitlines()
         except FileNotFoundError:
             self.decisions_view.setPlainText(
                 "(no decisions logged yet — the bubble writes one line per "
@@ -4865,7 +4870,7 @@ drifting apart one forgotten key at a time.
         # message describing an edit nobody made.
         try:
             on_disk = merge_settings(
-                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8")))
+                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8-sig")))
         except (OSError, ValueError):
             on_disk = {}
         changed = [k for k in self.APPEARANCE_KEYS
@@ -5080,7 +5085,7 @@ drifting apart one forgotten key at a time.
     def reload_from_disk(self) -> None:
         """Re-read settings.json; an open window must never clobber external writes."""
         try:
-            data = json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8"))
+            data = json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             data = {}
         self.cfg = merge_settings(data)

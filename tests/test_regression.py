@@ -2767,6 +2767,51 @@ class TestWatcherPatternSafety:
         assert len(seen) == total, len(seen)
         assert [int(s.split()[-1]) for s in seen] == list(range(total))
 
+    def test_the_cursor_counts_bytes_so_a_non_ascii_line_is_announced_once(
+            self, H, tmp_path):
+        """`position` is a byte offset (it is seeded from st_size and seeked
+        to), but the loop read the file as text and advanced by the CHARACTERS
+        it consumed. One line with an accent or CJK left the cursor short by the
+        difference, so every later poll re-read the tail of that line from the
+        middle of a character and announced the same match again as garbled
+        fragments ('本語のエラー', '\ufffd\ufffdエラー'). Driven synchronously: the
+        stop object's wait() IS the poll clock, so no test sleeps a second."""
+        class _Polls:
+            def __init__(self, steps):
+                self.steps = list(steps)
+
+            def wait(self, timeout=None):
+                if not self.steps:
+                    return True
+                self.steps.pop(0)()
+                return False
+
+        p = tmp_path / "app.log"
+        p.write_bytes(b"start\n")
+
+        def append(data: bytes):
+            def _do():
+                with open(p, "ab") as fh:
+                    fh.write(data)
+            return _do
+
+        seen: list = []
+        noop = lambda: None
+        stop = _Polls([
+            append("ERROR: café déjà vu — 日本語のエラー\n".encode()),
+            noop, noop, noop,                      # three quiet polls
+            append(b"bad \xff\xfe bytes \xe3\x81 \xe3\x82\xa8\xe3\x83\xa9\xe3\x83\xbc\n"),
+            noop, noop,
+            append("後 ERROR: エラー ascii tail\n".encode()),
+            noop, noop,
+        ])
+        H.ToolBelt._file_watch_loop(p, re.compile("エラー"), stop, seen.append)
+        assert seen == [
+            "app.log: ERROR: café déjà vu — 日本語のエラー",
+            "app.log: bad \ufffd\ufffd bytes \ufffd エラー",
+            "app.log: 後 ERROR: エラー ascii tail",
+        ], seen
+
 
 class _Source:
     """One parsed module for the closure rule: tree, parent map, and path.
