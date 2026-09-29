@@ -649,6 +649,15 @@ except ImportError:
                             chunk = json.loads(raw.strip().decode("utf-8"))
                         except (ValueError, UnicodeDecodeError):
                             continue
+                        # The same two rules as core.brain (this copy drifted
+                        # from it): a line that is not an object is noise, and
+                        # a `{"error": ...}` line — Ollama's way of failing
+                        # AFTER the 200 was sent — is a failure, not an empty
+                        # reply.
+                        if not isinstance(chunk, dict):
+                            continue
+                        if chunk.get("error"):
+                            raise RuntimeError(f"Ollama error: {chunk['error']}")
                         msg = chunk.get("message") or {}
                         calls.extend(msg.get("tool_calls") or [])
                         piece = msg.get("content") or ""
@@ -6021,6 +6030,58 @@ _DURATION_QUARTER_OF_AN = re.compile(r"\b(?:a\s+)?quarter\s+of\s+an?\s+([a-z]+)"
 _DURATION_THREE_QUARTERS = re.compile(r"\bthree\s+quarters?\s+of\s+an?\s+([a-z]+)")
 
 
+_NUMBER_UNITS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_NUMBER_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fourty": 40,
+                "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+                "ninety": 90}
+_NUMBER_WORDS = "|".join([*_NUMBER_UNITS, *_NUMBER_TENS, "hundred"])
+_NUMBER_RUN = re.compile(rf"\b(?:{_NUMBER_WORDS})(?:[\s-]+(?:{_NUMBER_WORDS}))*\b")
+
+
+def _spelled_numbers_to_digits(text: str) -> str:
+    """'twenty five' / 'twenty-five' / 'one hundred twenty' → '25' / '25' / '120'.
+
+    The duration reader knew only `a`, `an`, `one`, `two` and `three`, and a
+    number word it did not know was silently WALKED PAST: "in five minutes 30
+    seconds" was thirty seconds, "in two hours and thirty minutes" two hours,
+    "ten hr and 9 min" nine minutes — a reminder at the wrong time with nothing
+    said, the failure the digit check below was added for ("1:30 hours"). A run
+    that is not a number ("two three") is left as it is, and the caller refuses
+    a phrase that still holds a number word.
+    """
+    def convert(match: "re.Match") -> str:
+        total = current = 0
+        seen_hundred = False
+        tens_open = False               # a tens word may take one ones word
+        for word in re.split(r"[\s-]+", match.group(0)):
+            if word == "hundred":
+                if seen_hundred or tens_open or current == 0 or current > 9:
+                    if current == 0 and not seen_hundred and total == 0:
+                        current = 1     # a bare "hundred"
+                    else:
+                        return match.group(0)
+                total, current, seen_hundred, tens_open = current * 100, 0, True, False
+            elif word in _NUMBER_TENS:
+                if current or tens_open:
+                    return match.group(0)
+                current, tens_open = _NUMBER_TENS[word], True
+            else:
+                value = _NUMBER_UNITS[word]
+                if tens_open and 1 <= value <= 9:
+                    current += value
+                    tens_open = False
+                elif current or tens_open or value == 0 and (total or current):
+                    return match.group(0)
+                else:
+                    current = value
+        return str(total + current)
+    return _NUMBER_RUN.sub(convert, text)
+
+
 def _parse_duration(text: str) -> float | None:
     """'in 2 hours 5 minutes' / '45 min' / '3 days' / 'a week' → seconds, or None."""
     t = text.strip().lower()
@@ -6046,6 +6107,7 @@ def _parse_duration(text: str) -> float | None:
     t = _DURATION_HALF_OF_A.sub(r"0.5 \1", t)
     t = _DURATION_THREE_QUARTERS.sub(r"0.75 \1", t)
     t = _DURATION_QUARTER_OF_AN.sub(r"0.25 \1", t)
+    t = _spelled_numbers_to_digits(t)
     total = 0.0
     matched = False
     units_seen = 0
@@ -6077,7 +6139,8 @@ def _parse_duration(text: str) -> float | None:
     # says nothing about what it walked past, so the walked-past text is
     # checked for digits — a stray WORD is harmless ("in 5 minutes after the
     # film"), a stray NUMBER is not.
-    if re.search(r"\d", re.sub(_DURATION_RE, " ", t)):
+    leftover = re.sub(_DURATION_RE, " ", t)
+    if re.search(r"\d", leftover) or _NUMBER_RUN.search(leftover):
         return None
     return total
 

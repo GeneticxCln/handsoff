@@ -296,6 +296,93 @@ class TestRemindersAndCalendar:
         out4, err = belt.execute("calendar_month", {"month": "2026-13"})
         assert err and "ERROR" in out4, out4
 
+    def test_spelled_out_numbers_are_read_not_walked_past(self, H):
+        """The reader knew only a/an/one/two/three, and a number word it did not
+        know was silently skipped: "five minutes 30 seconds" was thirty seconds,
+        "two hours and thirty minutes" was two hours, "ten hr and 9 min" was nine
+        minutes — a reminder at the wrong time, with nothing said."""
+        cases = {
+            "in ten minutes": 600,
+            "five minutes 30 seconds": 330,
+            "in two hours and thirty minutes": 9000,
+            "ten hr, and 9 m, and 10 sec": 36550,
+            "in twenty five minutes": 1500,
+            "twenty-five minutes": 1500,
+            "in twenty-four hours": 86400,
+            "one hundred twenty minutes": 7200,
+            "three hundred sixty five days": 365 * 86400,
+            "an hour and thirty minutes": 5400,
+            "one and a half hours": 5400,
+            "half an hour": 1800,
+            "three quarters of an hour": 2700,
+            "in a hundred minutes": 6000,
+        }
+        for phrase, seconds in cases.items():
+            assert H._parse_duration(phrase) == seconds, phrase
+
+    def test_a_number_phrase_that_is_not_a_number_is_refused(self, H):
+        for phrase in ("two three minutes", "twenty ten minutes",
+                       "one hundred and twenty minutes", "twenty hundred minutes",
+                       "zero minutes", "in a couple of minutes", "five",
+                       "in five minutes 30"):
+            assert H._parse_duration(phrase) is None, phrase
+
+    def test_every_spoken_duration_round_trips_through_the_parser(self, H):
+        """A generated corpus, not hand-picked phrases: durations of one to three
+        units said as digits or as words ("twenty-five", "one hundred twenty"),
+        joined every way English joins them. The expected value is the one the
+        generator started from, so there is no second parser to agree with."""
+        import random
+        rnd = random.Random(2026)
+        ones = ["zero", "one", "two", "three", "four", "five", "six", "seven",
+                "eight", "nine", "ten", "eleven", "twelve", "thirteen",
+                "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+                "nineteen"]
+        tens = {2: "twenty", 3: "thirty", 4: "forty", 5: "fifty", 6: "sixty",
+                7: "seventy", 8: "eighty", 9: "ninety"}
+
+        def say(n):
+            if n < 20:
+                return ones[n]
+            if n < 100:
+                t, o = divmod(n, 10)
+                return tens[t] if o == 0 else tens[t] + rnd.choice([" ", "-"]) + ones[o]
+            h, rest = divmod(n, 100)
+            return ones[h] + " hundred" + ("" if rest == 0 else " " + say(rest))
+
+        units = [(1, ["s", "sec", "secs", "second", "seconds"]),
+                 (60, ["m", "min", "mins", "minute", "minutes"]),
+                 (3600, ["h", "hr", "hrs", "hour", "hours"]),
+                 (86400, ["d", "day", "days"]),
+                 (604800, ["w", "week", "weeks"])]
+        wrong = []
+        for _ in range(1500):
+            chosen = sorted(rnd.sample(units, rnd.randint(1, 3)), key=lambda u: -u[0])
+            parts, total = [], 0
+            for secs, forms in chosen:
+                n = rnd.choice([1, 2, 3, 4, 5, 9, 10, 12, 15, 19, 20, 21, 25,
+                                30, 45, 59, 90, 100, 120, 365])
+                form = rnd.choice(forms)
+                if len(form) == 1:
+                    parts.append(f"{n}{form}" if rnd.random() < .5 else f"{n} {form}")
+                else:
+                    if n == 1 and form.endswith("s") and rnd.random() < .5:
+                        form = form[:-1]
+                    parts.append(f"{say(n) if rnd.random() < .5 else n} {form}")
+                total += n * secs
+            phrase = rnd.choice([" ", ", ", " and ", ", and "]).join(parts)
+            if rnd.random() < .3:
+                phrase = "in " + phrase
+            got = H._parse_duration(phrase)
+            if got != total:
+                wrong.append((phrase, got, total))
+        assert not wrong, wrong[:5]
+        # and EVERY count from 1 to 999, so no single word of the number tables
+        # can be wrong: the corpus above picks its numbers, this one does not
+        for n in range(1, 1000):
+            said = say(n)
+            assert H._parse_duration(f"{said} minutes") == n * 60, (n, said)
+
     def test_a_spoken_duration_is_singular_at_one(self, H):
         """`_fmt_dur` is read aloud ("repeating every 1 seconds", "last measured
         1 seconds ago"), and it pluralised every count of seconds."""

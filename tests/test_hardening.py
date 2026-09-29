@@ -680,6 +680,30 @@ class TestMissingBrainFallback:
                 pass
             return list(q.queue)
 
+        # the two stream-content rules core.brain has and this copy had drifted
+        # from: an in-band {"error": ...} line is a failure (after the sentence
+        # that arrived is said), and a line that is not an object is ignored
+        def error_line(text):
+            return (json.dumps({"error": text}) + EOL).encode()
+
+        def speaking_or_raising(lines):
+            q = queue.Queue()
+            try:
+                legacy.ollama_chat_stream(
+                    [{"role": "user", "content": "hi"}], q, None, None,
+                    base=BASE, model="gpt-oss:20b", num_ctx=8,
+                    guard=lambda: None, logger=log,
+                    urlopen=lambda req, timeout=None: StreamResp(list(lines)))
+                raised = None
+            except Exception as exc:
+                raised = f"{type(exc).__name__}: {exc}"
+            return {"queue": list(q.queue), "raised": raised}
+
+        report["stream_inband_error"] = speaking_or_raising(
+            ndjson("Berlin is in Germany", ".") + [error_line("model runner has unexpectedly stopped")])
+        report["stream_non_object_lines"] = speaking_or_raising(
+            [b"[1, 2, 3]" + EOL.encode(), b"42" + EOL.encode(), b"null" + EOL.encode()]
+            + ndjson("Fine."))
         report["stream_dies_after_a_sentence"] = dying("Berlin is in Germany", ".")
         report["stream_dies_mid_sentence"] = dying("Berlin is in Germany. It has", " three")
 
@@ -1019,6 +1043,12 @@ class TestMissingBrainFallback:
             ["It is 18.5 degrees and 3.2 inches of rain.", None],
             ["Version 3.12.1 shipped.", "Visit example.com now.", None],
             ["Really?!", "Yes...", "maybe.", "Okay!", None]], report["split_whole"]
+        assert report["stream_inband_error"] == {
+            "queue": ["Berlin is in Germany.", None],
+            "raised": "RuntimeError: Ollama error: model runner has unexpectedly stopped"
+        }, report["stream_inband_error"]
+        assert report["stream_non_object_lines"] == {
+            "queue": ["Fine.", None], "raised": None}, report["stream_non_object_lines"]
         assert report["stream_dies_after_a_sentence"] == [
             "Berlin is in Germany.", None], report["stream_dies_after_a_sentence"]
         assert report["stream_dies_mid_sentence"] == [
