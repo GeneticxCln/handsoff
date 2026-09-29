@@ -857,9 +857,17 @@ class ReminderStore:
         """
         self.load_failed = False
         try:
-            raw = self.path.read_text()
+            raw = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return []              # first run: an absent queue is a real empty
+        except UnicodeDecodeError:
+            # Not text at all: as much evidence as a file that is not JSON, and
+            # it takes the same road. It used to escape `load`, so a reminders
+            # file with one bad byte broke every reminder tool and the worker
+            # tick — and `update()` never got the chance to refuse to save over it.
+            self.load_failed = True
+            self._quarantine(self.path)
+            return []
         except OSError:
             self.load_failed = True
             self._log.warning("reminders file %s could not be read", self.path,

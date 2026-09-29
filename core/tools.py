@@ -2459,13 +2459,91 @@ class ToolBelt:
             self._on_restart_pending()
         try:
             timeout = 240.0 if exe_base == 'cargo' else self.TIMEOUT
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            proc, stdout, stderr = self._run_capped(argv, timeout)
         except FileNotFoundError:
             return f'ERROR: program not found: {exe}'
         except subprocess.TimeoutExpired:
             return f'ERROR: command timed out after {timeout:.0f}s'
-        out = f'exit code {proc.returncode}\nstdout:\n{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}'
+        out = f'exit code {proc.returncode}\nstdout:\n{stdout.strip()}\nstderr:\n{stderr.strip()}'
         return out[:2000]
+
+    #: What one `run_command` may BUFFER, per stream. The reply is cut to 2000
+    #: characters, so only the head of the output is ever read; the ceiling
+    #: exists so a command that never stops writing costs this much and not the
+    #: machine's memory. `cat /dev/zero` is on the whitelist by way of `cat` and
+    #: is no credential path, and `subprocess.run(capture_output=True)` buffered
+    #: it whole before anything cut it to size: measured on this tree, a 4 s
+    #: timeout held 2.5 GiB and took 11 s to return, in the process that also
+    #: holds the speech models — so the production timeout (15 s) was a way to
+    #: get this process killed by the OOM killer.
+    OUTPUT_CAP = 65536
+
+    @classmethod
+    def _run_capped(cls, argv: list, timeout: float):
+        """`subprocess.run(argv)` whose captured output cannot grow without bound.
+
+        Returns ``(proc, stdout, stderr)`` as text. The child writes into pipes
+        this method drains in two reader threads, which keep the first
+        `OUTPUT_CAP` bytes of each stream and discard the rest (draining, so a
+        child that writes more than it can be read never blocks on a full pipe).
+        `subprocess.run` is still the call — it is the seam every test and every
+        host replacement reaches through — and a replacement that hands back its
+        own `stdout`/`stderr` is honoured over the pipes.
+
+        Bytes are decoded with ``errors="replace"``. `text=True` decoded
+        strictly, so `cat` of any binary file raised UnicodeDecodeError out of
+        the tool and the model was told "that is a bug in the tool".
+        """
+        kept: dict = {}
+
+        def drain(name: str, fd: int) -> None:
+            buf = bytearray()
+            try:
+                while True:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    room = cls.OUTPUT_CAP - len(buf)
+                    if room > 0:
+                        buf += chunk[:room]
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                kept[name] = bytes(buf)
+
+        r_out, w_out = os.pipe()
+        r_err, w_err = os.pipe()
+        readers = [threading.Thread(target=drain, args=('out', r_out), daemon=True,
+                                    name='run-command-out'),
+                   threading.Thread(target=drain, args=('err', r_err), daemon=True,
+                                    name='run-command-err')]
+        for reader in readers:
+            reader.start()
+        try:
+            proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=w_out,
+                                  stderr=w_err, timeout=timeout)
+        finally:
+            # Our copies of the write ends: the readers see EOF only once these
+            # AND the child's are closed. A grandchild that outlives the command
+            # can hold the child's open, hence the bounded join.
+            os.close(w_out)
+            os.close(w_err)
+            for reader in readers:
+                reader.join(2.0)
+
+        def text(given, name: str) -> str:
+            if isinstance(given, bytes):
+                return given.decode('utf-8', errors='replace')
+            if isinstance(given, str):
+                return given
+            return kept.get(name, b'').decode('utf-8', errors='replace')
+
+        return (proc, text(getattr(proc, 'stdout', None), 'out'),
+                text(getattr(proc, 'stderr', None), 'err'))
     YDOTOOL_SOCKET = '/tmp/.ydotool_socket'
     _YDOTOOL_SOCK_CACHE: list = []
 
@@ -2791,7 +2869,7 @@ class ToolBelt:
         """
         try:
             base = (_dep().HOME / '.config/niri').resolve()
-            texts: list[str] = [(base / 'config.kdl').read_text(encoding='utf-8').lower()]
+            texts: list[str] = [(base / 'config.kdl').read_text(encoding='utf-8', errors='replace').lower()]
         except OSError:
             return False
         try:
@@ -2809,7 +2887,7 @@ class ToolBelt:
                         continue
                     seen.add(str(inc))
                     if inc.is_file() and inc.stat().st_size < 500000:
-                        texts.append(inc.read_text(encoding='utf-8').lower())
+                        texts.append(inc.read_text(encoding='utf-8', errors='replace').lower())
                 except OSError:
                     continue
         except Exception:
@@ -3726,12 +3804,28 @@ class ToolBelt:
     @tool(description='Read the clipboard content (wayland). Use to check what the user copied or to inspect before pasting.')
     def paste_text(self) -> str:
         try:
-            r = subprocess.run(['wl-paste', '--no-newline'], capture_output=True, text=True, timeout=8)
+            # Bytes, not `text=True`: a clipboard is whatever the last program put
+            # there, and an image (the first thing most people copy that is not
+            # words) is not UTF-8 — strict decoding raised out of the tool and the
+            # model said "that is a bug in the tool" about a perfectly ordinary
+            # clipboard.
+            r = subprocess.run(['wl-paste', '--no-newline'], capture_output=True, timeout=8)
         except FileNotFoundError:
             return 'ERROR: wl-clipboard is not installed (pacman -S wl-clipboard)'
         except subprocess.TimeoutExpired:
             return 'ERROR: wl-paste timed out'
-        data = r.stdout or ''
+        raw = r.stdout or b''
+        if isinstance(raw, bytes):
+            try:
+                data = raw.decode('utf-8')
+            except UnicodeDecodeError:
+                return (f'clipboard holds {len(raw)} bytes of data that is not text '
+                        f'(an image or a file, not something to read aloud)')
+            if '\x00' in data[:4096]:
+                return (f'clipboard holds {len(raw)} bytes of data that is not text '
+                        f'(an image or a file, not something to read aloud)')
+        else:
+            data = raw
         if not data:
             return 'clipboard is empty'
         head = data[:120].replace('\n', ' ')

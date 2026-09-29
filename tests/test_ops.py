@@ -27,6 +27,22 @@ _core_tools = core_module("tools")
 HERE = ROOT   # the repo root
 
 
+class TestTheDoctorReadsAUnitWithAStrayByte:
+    """The doctor is what the user runs when something is already wrong, so it
+    must not be the thing that raises. A systemd unit that a hand edit left with
+    a Latin-1 character made `read_text(encoding="utf-8")` raise
+    UnicodeDecodeError — a ValueError, not the OSError the call sites caught."""
+
+    def test_run_doctor_and_its_json_survive_it(self, H, monkeypatch, tmp_path):
+        unit = tmp_path / "handsoff.service"
+        unit.write_bytes(b"[Unit]\nDescription=Jos\xe9's bubble\n"
+                         b"[Service]\nRestart=always\n")
+        monkeypatch.setattr(H, "SYSTEMD_UNIT_FILE", unit)
+        text = H.run_doctor()
+        assert "Traceback" not in text and "UnicodeDecodeError" not in text
+        assert H.doctor_json()["systemd_unit"]["auto_restart"] is True
+
+
 class TestTypingSelftestWiring:
     """--ptt selftest: the hardware typing checks as one local command.
 

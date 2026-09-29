@@ -295,3 +295,171 @@ class TestTheScreenshotPermissions:
         assert belt._take_screenshot() == ""
         # 0600: no group or other bits — owner-write is part of 0600 itself.
         assert (shot.stat().st_mode & 0o077) == 0, oct(shot.stat().st_mode)
+
+
+class TestRunCommandBuffersABoundedAmountOfOutput:
+    """`run_command` buffered a command's whole output before cutting the reply
+    to 2000 characters. `cat` is on the whitelist and `/dev/zero` is not a
+    credential path, so `cat /dev/zero` buffered without end: measured on this
+    tree, a 4 s timeout held 2.5 GiB and took 11 s to return — in the process
+    that also holds the speech models, which makes the production timeout (15 s)
+    a way to be killed by the OOM killer. The same call decoded strictly
+    (`text=True`), so `cat` of any binary file raised UnicodeDecodeError out of
+    the tool and the model was told "that is a bug in the tool".
+    """
+
+    def test_a_command_that_never_stops_writing_costs_the_cap_not_the_machine(
+            self, H, monkeypatch):
+        import tracemalloc
+        belt = _belt(H)
+        monkeypatch.setattr(H.ToolBelt, "OUTPUT_CAP", 4096)
+        monkeypatch.setattr(H.ToolBelt, "TIMEOUT", 2)
+        started = H.time.monotonic()
+        tracemalloc.start()
+        try:
+            out, err = belt.execute("run_command", {"command": "cat /dev/zero"})
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        elapsed = H.time.monotonic() - started
+        assert "timed out" in out, out
+        # Two seconds of `cat /dev/zero` buffered whole is hundreds of MiB (the
+        # old call: ~580 MiB); the capped reader holds the cap plus one chunk.
+        assert peak < 16 * 1024 * 1024, (
+            f"{peak / 2**20:.0f} MiB was held while a command wrote for 2 s")
+        assert elapsed < 8.0, (
+            f"returned after {elapsed:.1f}s for a 2 s timeout: the output was "
+            f"being buffered, and draining it after the kill took the difference")
+
+    def test_the_buffer_is_capped_and_keeps_the_head(self, H, monkeypatch,
+                                                     tmp_path):
+        big = tmp_path / "big.txt"
+        big.write_text("HEAD-" + "x" * 500_000, encoding="utf-8")
+        monkeypatch.setattr(H.ToolBelt, "OUTPUT_CAP", 1000)
+        proc, stdout, stderr = H.ToolBelt._run_capped(["cat", str(big)], 10)
+        assert proc.returncode == 0
+        assert len(stdout) == 1000 and stdout.startswith("HEAD-"), len(stdout)
+        assert stderr == ""
+
+    def test_stdout_and_stderr_stay_separate_streams(self, H, tmp_path):
+        proc, stdout, stderr = H.ToolBelt._run_capped(
+            ["ls", str(tmp_path / "does-not-exist")], 10)
+        assert proc.returncode != 0
+        assert stdout == "" and "does-not-exist" in stderr, (stdout, stderr)
+
+    def test_a_binary_file_is_text_with_replacements_not_an_exception(
+            self, H, tmp_path):
+        blob = tmp_path / "blob.bin"
+        blob.write_bytes(b"\x7fELF\xff\xfe\x00\xf0binary\x80" * 40)
+        out, err = _belt(H).execute("run_command", {"command": f"cat {blob}"})
+        assert not err and out.startswith("exit code 0"), out
+        assert "bug in the tool" not in out
+
+    def test_a_host_replacement_of_run_is_still_the_seam(self, H, monkeypatch):
+        """Every test and every embedder replaces `subprocess.run`; a fake that
+        hands back its own stdout/stderr must be honoured over the pipes."""
+        class Done:
+            returncode = 3
+            stdout = "fake out\n"
+            stderr = "fake err\n"
+
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"], seen["kwargs"] = argv, kwargs
+            return Done()
+
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        out, err = _belt(H).execute("run_command", {"command": "echo hi"})
+        assert out == "exit code 3\nstdout:\nfake out\nstderr:\nfake err", out
+        assert seen["argv"] == ["echo", "hi"]
+        assert seen["kwargs"]["timeout"] == H.ToolBelt.TIMEOUT
+        assert seen["kwargs"]["stdin"] is H.subprocess.DEVNULL, (
+            "a command must not inherit the bubble's own stdin")
+
+    def test_it_leaves_no_reader_thread_and_no_descriptor_behind(self, H):
+        before_threads = {t.name for t in threading.enumerate()}
+        before_fds = len(os.listdir("/proc/self/fd"))
+        for _ in range(20):
+            H.ToolBelt._run_capped(["echo", "x"], 10)
+        assert {t.name for t in threading.enumerate()} - before_threads == set()
+        assert len(os.listdir("/proc/self/fd")) <= before_fds + 1, (
+            "each call must close both pipes")
+
+    def test_a_timeout_still_raises_and_still_releases_the_pipes(self, H):
+        before_fds = len(os.listdir("/proc/self/fd"))
+        with pytest.raises(H.subprocess.TimeoutExpired):
+            H.ToolBelt._run_capped(["cat", "/dev/zero"], 0.5)
+        assert len(os.listdir("/proc/self/fd")) <= before_fds + 1
+
+
+class TestTheClipboardIsNotAlwaysText:
+    """`paste_text` decoded `wl-paste` strictly, so an image on the clipboard —
+    the first thing most people copy that is not words — raised
+    UnicodeDecodeError out of the tool, and the model said "that is a bug in the
+    tool" about a perfectly ordinary clipboard."""
+
+    def _fake_paste(self, H, monkeypatch, payload):
+        class Done:
+            returncode = 0
+            stdout = payload
+            stderr = b""
+        monkeypatch.setattr(H.subprocess, "run", lambda argv, **kw: Done())
+
+    def test_an_image_is_named_as_data_not_a_crash(self, H, monkeypatch):
+        self._fake_paste(H, monkeypatch, b"\x89PNG\r\n\x1a\n\xff\xfe\x00\x00IHDR")
+        out, err = _belt(H).execute("paste_text", {})
+        assert not err, out
+        assert "not text" in out and "bug in the tool" not in out, out
+
+    def test_bytes_that_are_valid_utf8_but_not_text_are_named_too(
+            self, H, monkeypatch):
+        self._fake_paste(H, monkeypatch, b"\x00\x01\x02 header \x00" + b"a" * 100)
+        out, err = _belt(H).execute("paste_text", {})
+        assert not err and "not text" in out, out
+
+    def test_ordinary_text_reads_exactly_as_before(self, H, monkeypatch):
+        self._fake_paste(H, monkeypatch, "héllo wörld — ünïcode".encode("utf-8"))
+        out, err = _belt(H).execute("paste_text", {})
+        assert not err and out == (
+            "clipboard holds 21 chars: 'héllo wörld — ünïcode'"), out
+
+    def test_a_long_clipboard_is_summarised_and_an_empty_one_is_named(
+            self, H, monkeypatch):
+        self._fake_paste(H, monkeypatch, b"x" * 300)
+        out, _ = _belt(H).execute("paste_text", {})
+        assert out.startswith("clipboard holds 300 chars: ") and "(+180 more chars)" in out
+        self._fake_paste(H, monkeypatch, b"")
+        assert _belt(H).execute("paste_text", {})[0] == "clipboard is empty"
+
+    def test_a_replacement_that_answers_in_text_still_works(self, H, monkeypatch):
+        """Existing fakes (and any embedder) hand back `str`."""
+        self._fake_paste(H, monkeypatch, "from a str fake")
+        out, err = _belt(H).execute("paste_text", {})
+        assert not err and out == "clipboard holds 15 chars: 'from a str fake'", out
+
+
+class TestAFileSomeoneElseWroteIsSearchedNotDecodedStrictly:
+    """The niri config, the systemd unit: files other programs (and the user's
+    editor) write, which this code only SEARCHES. Strict UTF-8 raised
+    UnicodeDecodeError — a ValueError, not the OSError those call sites caught —
+    out of the chord check and out of the doctor, the one tool that has to work
+    when something is already wrong."""
+
+    def test_the_super_chord_check_reads_a_latin1_niri_config(self, H, tmp_path,
+                                                              monkeypatch):
+        cfg = tmp_path / ".config" / "niri"
+        cfg.mkdir(parents=True)
+        (cfg / "config.kdl").write_bytes(
+            b'// caf\xe9 keybinds \xff\n'
+            b'binds {\n    Mod+V { spawn "handsoff.py" "--ptt" "toggle"; }\n}\n')
+        monkeypatch.setattr(H, "HOME", tmp_path)
+        belt = _belt(H)
+        assert belt._super_binding_known("Mod+V") is True
+
+    def test_the_hardware_probe_reads_a_unit_with_a_stray_byte(self, tmp_path):
+        import hardware
+        unit = tmp_path / "handsoff.service"
+        unit.write_bytes(b"[Unit]\nDescription=Jos\xe9's bubble\n[Service]\nRestart=always\n")
+        out = hardware._systemd({"systemd_unit_file": str(unit)})
+        assert out["ok"] is True and out["auto_restart"] is True, out

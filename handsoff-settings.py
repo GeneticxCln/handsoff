@@ -385,7 +385,8 @@ def http_json(url: str, payload: dict | None = None, timeout: int = 10):
 
 def autostart_enabled() -> bool:
     try:
-        return any(_autostart_hit(line) for line in NIRI_CONFIG.read_text().splitlines())
+        return any(_autostart_hit(line) for line in
+                   NIRI_CONFIG.read_text(encoding="utf-8", errors="replace").splitlines())
     except OSError:
         return False
 
@@ -433,7 +434,15 @@ def set_autostart(enable: bool) -> str:
                 return "no niri config found — nothing to change"
             NIRI_CONFIG.parent.mkdir(parents=True, exist_ok=True)
             NIRI_CONFIG.write_text("// niri config\n")
-        lines = NIRI_CONFIG.read_text().splitlines()
+        # Strict on purpose. This function WRITES the file back, and a lenient
+        # decode would put U+FFFD where the user's own bytes were — silently
+        # rewriting a config that is not UTF-8 as one that is. A file this
+        # cannot read exactly is a file it must not edit.
+        try:
+            lines = NIRI_CONFIG.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            return (f"error editing {NIRI_CONFIG}: it is not UTF-8 text, so "
+                    f"handsoff will not rewrite it — left untouched")
         has_new = any(AUTOSTART_LINE in line for line in lines)
         has = has_new or any(AUTOSTART_LINE_OLD in line for line in lines)
         bak = NIRI_CONFIG.with_name(NIRI_CONFIG.name + ".bak-handsoff")

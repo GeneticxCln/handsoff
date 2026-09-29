@@ -410,7 +410,7 @@ def _systemd(ctx: dict) -> dict:
     if not unit.exists():
         return {"ok": True, "present": False, "auto_restart": False}
     try:
-        txt = unit.read_text(encoding="utf-8")
+        txt = unit.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return _deg(e)
     import re as _re

@@ -215,6 +215,21 @@ def test_an_unparseable_file_is_quarantined_not_emptied(tmp_path):
     assert store.load() == [] and not store.load_failed
 
 
+def test_a_reminders_file_that_is_not_text_is_evidence_too(tmp_path):
+    """`read_text()` raised UnicodeDecodeError for a file with one bad byte, and
+    only OSError was caught, so it escaped `load` — every reminder tool and the
+    worker tick failed, and `update()` never got the chance to refuse to save
+    over it. It is quarantined and marked failed like a file that is not JSON."""
+    moved = []
+    store, saved, _ = _store(tmp_path, quarantine=lambda p: moved.append(p))
+    store.path.write_bytes(b'[{"name": "caf\xe9", "due": 5.0}]')
+    assert store.load() == []                        # no exception
+    assert moved == [store.path] and store.load_failed
+    # ...and a transaction refuses to save a fresh queue over it
+    assert store.update(lambda items: items + [{"name": "x", "due": 9.0}]) == []
+    assert saved == [], "a queue we could not read must not be overwritten"
+
+
 def test_update_never_saves_over_a_load_that_failed(tmp_path):
     """The data-loss reproduction: live queue + a corrupt file + one update()
     used to write a fresh queue over the corrupt file AND _backup()-first

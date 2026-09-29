@@ -682,13 +682,29 @@ def apply_env_overrides(s: dict) -> dict:
 def load_settings(settings_file: Path) -> dict:
     """Built-in defaults <- environment <- settings.json (the settings app wins)."""
     s = apply_env_overrides(json.loads(json.dumps(DEFAULT_SETTINGS)))
+    # `utf-8-sig`: a file saved by an editor that prepends a byte-order mark is
+    # otherwise valid JSON, and read as plain utf-8 it began with U+FEFF and was
+    # quarantined as "corrupt" — a working configuration moved aside for the
+    # sake of three invisible bytes. Identical to utf-8 for a file without one.
     try:
-        raw = settings_file.read_text(encoding="utf-8")
+        raw = settings_file.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         s = coerce_settings(s)
         s["version"] = SETTINGS_VERSION
         return s
     except OSError:
+        s = coerce_settings(s)
+        s["version"] = SETTINGS_VERSION
+        return s
+    except ValueError:
+        # UnicodeDecodeError: the file is not UTF-8 text at all (a Latin-1 edit,
+        # a UTF-16 save from a Windows editor, a torn write). It is exactly as
+        # corrupt as one that is not JSON and takes the same road — quarantined,
+        # defaults used. It used to escape this function: the app loads its
+        # settings at IMPORT, so one stray byte was a crash at start-up, and
+        # under `Restart=always` a crash loop, from the one file a user is
+        # told to edit by hand.
+        quarantine_file(settings_file)
         s = coerce_settings(s)
         s["version"] = SETTINGS_VERSION
         return s
@@ -799,7 +815,7 @@ def _read_settings_for_write(settings_file: Path) -> dict:
     must abort the write rather than persist a near-empty dict over good data.
     """
     try:
-        loaded = json.loads(settings_file.read_text(encoding="utf-8"))
+        loaded = json.loads(settings_file.read_text(encoding="utf-8-sig"))
         if isinstance(loaded, dict):
             return _drop_retired_settings(_migrate_settings(loaded))
     except FileNotFoundError:
@@ -822,7 +838,7 @@ def _disk_version(settings_file: Path) -> int:
     build cannot fully read.
     """
     try:
-        data = json.loads(settings_file.read_text(encoding="utf-8"))
+        data = json.loads(settings_file.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return 0
     if not isinstance(data, dict):

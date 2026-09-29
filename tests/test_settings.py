@@ -102,6 +102,25 @@ class TestSettingsApp:
         assert mod.apply_autostart(False) == "wrote False"
         assert called == [True, False]
 
+    def test_a_niri_config_that_is_not_utf8_is_never_rewritten(self, monkeypatch,
+                                                              tmp_path):
+        """`set_autostart` reads the user's niri config and WRITES it back, so a
+        lenient decode would put U+FFFD where their own bytes were and silently
+        turn a Latin-1 file into a UTF-8 one. It must refuse and leave the file
+        byte-for-byte alone — and the read-only autostart probe must not raise."""
+        mod = _load("handsoff_settings_7", HERE / "handsoff-settings.py")
+        cfg = tmp_path / "config.kdl"
+        original = b'// caf\xe9 \xff\nbinds {\n}\n'
+        cfg.write_bytes(original)
+        monkeypatch.setattr(mod, "NIRI_CONFIG", cfg)
+        monkeypatch.setattr(mod, "_reload_niri", lambda: None)
+        for enable in (True, False):
+            msg = mod.set_autostart(enable)
+            assert "not UTF-8" in msg and "untouched" in msg, msg
+            assert cfg.read_bytes() == original, "the file was rewritten"
+        assert not list(tmp_path.glob("*.bak-handsoff")), "no backup of a file left alone"
+        assert mod.autostart_enabled() is False          # reads, never raises
+
     def test_autostart_probe_fails_open_to_niri(self, monkeypatch):
         """systemctl unavailable (no systemd session) -> systemd does NOT own
         autostart, so the niri path stays usable."""
@@ -390,6 +409,40 @@ class TestSettingsCoercion:
         s = H._load_settings()
         assert s["mic_threshold"] == 500
         assert (f.with_suffix(".quarantined")).exists() is False
+
+    @pytest.mark.parametrize("label, raw", [
+        ("a Latin-1 edit", b'{"assistant_name": "caf\xe9"}'),
+        ("a UTF-16 save from a Windows editor", '{"model": "x"}'.encode("utf-16")),
+        ("binary garbage", bytes(range(128, 200)) * 3),
+        ("a write torn mid-character", '{"assistant_name": "caf\u00e9"}'.encode("utf-8")[:-4]),
+    ])
+    def test_a_settings_file_that_is_not_utf8_is_quarantined_not_a_crash(
+            self, H, tmp_path, monkeypatch, label, raw):
+        """`read_text(encoding="utf-8")` raises UnicodeDecodeError, which is a
+        ValueError and NOT an OSError, so it walked out of `load_settings` — and
+        the app loads its settings at IMPORT: one stray byte in the one file a
+        user is told to edit by hand was a crash at start-up, and under
+        `Restart=always` a crash loop. It is exactly as corrupt as a file that
+        is not JSON and takes the same road: moved aside, defaults used."""
+        f = tmp_path / "settings.json"
+        f.write_bytes(raw)
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        s = H._load_settings()                       # must not raise
+        assert s["model"] == H.DEFAULT_SETTINGS["model"], label
+        assert not f.exists(), f"{label}: the corrupt file must be moved aside"
+        assert list(tmp_path.glob("settings.json.bad-*")), (
+            f"{label}: ...to a name the user can find")
+
+    def test_a_byte_order_mark_is_not_corruption(self, H, tmp_path, monkeypatch):
+        """Editors that add a BOM produce otherwise valid JSON; read as plain
+        UTF-8 it began with U+FEFF and a working configuration was quarantined
+        for the sake of three invisible bytes."""
+        f = tmp_path / "settings.json"
+        f.write_bytes(b"\xef\xbb\xbf" + json.dumps({"mic_threshold": 812}).encode())
+        monkeypatch.setattr(H, "SETTINGS_FILE", f)
+        s = H._load_settings()
+        assert s["mic_threshold"] == 812
+        assert f.exists() and not list(tmp_path.glob("settings.json.bad-*"))
 
     def test_settings_migration_clears_version_zero(self, H, tmp_path, monkeypatch):
         """Old files without a version get one stamped (the migrate hook's
