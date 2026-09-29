@@ -66,13 +66,13 @@ matching the belt's own check at call time.
 | `start_command` | `run_command` | 4705 |
 | `job_status` | `run_command` | 4765 |
 | `handsoff_doctor` | — | 4813 |
-| `screen_elements` | `screen_access` | 4936 |
-| `click_element` | `operator` | 4958 |
-| `click_at` | `operator` | 4975 |
-| `scroll` | `operator` | 4980 |
-| `open_app` | `run_command` | 5013 |
-| `read_file` | `read_file` | 5108 |
-| `edit_file` | `edit_file` | 5165 |
+| `screen_elements` | `screen_access` | 4940 |
+| `click_element` | `operator` | 4962 |
+| `click_at` | `operator` | 4979 |
+| `scroll` | `operator` | 4984 |
+| `open_app` | `run_command` | 5017 |
+| `read_file` | `read_file` | 5112 |
+| `edit_file` | `edit_file` | 5169 |
 
 ## Result contract
 
