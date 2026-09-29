@@ -4853,6 +4853,10 @@ class ToolBelt:
             # numbered list did not read left to right.
             row_top = min(w[1] for w in words)
             runs: list[list] = [[words[0]]]
+            # The two iterables are unequal BY ONE WORD on purpose: this walks
+            # each neighbouring pair, so the last word has no successor. Said so,
+            # because a reader who expects equal lengths would "fix" it to
+            # strict=True and the walk would raise on the final pair.
             for prev, cur in zip(words, words[1:], strict=False):
                 gap = cur[0] - (prev[0] + prev[2])
                 if gap > max(prev[3], cur[3]):
