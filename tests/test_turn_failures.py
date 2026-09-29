@@ -174,7 +174,8 @@ class Turn:
 
 
 def drive(H, monkeypatch, opener, *, streaming=True, tts_exc=None,
-          play_exc=None, guard=None, cancel=None, cancel_after=None):
+          play_exc=None, guard=None, cancel=None, cancel_after=None,
+          tool_entry=None):
     """Run the real turn and capture what the speaker was handed.
 
     `cancel_after` fires `cancel` from inside the synthesiser, so a barge-in
@@ -211,6 +212,8 @@ def drive(H, monkeypatch, opener, *, streaming=True, tts_exc=None,
         {"role": "system", "content": "the system prompt"},
         {"role": "user", "content": text}]
     a._save_history = lambda: None
+    if tool_entry is not None:
+        a._tool_result_entry = tool_entry
     a._set = lambda gen, state: turn.states.append(state)
     a._is_closed = lambda: False
     os.makedirs(str(H.STATE_DIR), exist_ok=True)
@@ -502,7 +505,9 @@ class TestTheLineTheUserHears:
 
     def test_a_barge_in_stops_the_speaker_at_the_next_sentence(self, H, monkeypatch):
         """The working case, so the guards below are not bought by silence."""
-        turn = drive(H, monkeypatch, _reply("One.", "Two.", "Three."),
+        # tokens as a tokenizer emits them: the next sentence's first token
+        # carries its leading space
+        turn = drive(H, monkeypatch, _reply("One.", " Two.", " Three."),
                      cancel_after=2)
         assert turn.said == ["One.", "Two."], turn.said
         assert turn.played == ["One."], (
@@ -552,7 +557,7 @@ class TestTheTurnNobodyHeard:
             self, H, monkeypatch):
         """The counterweight: the guard above is one arm, not a new rule that
         silences every cancelled reply."""
-        turn = drive(H, monkeypatch, _reply("One.", "Two."), cancel_after=2)
+        turn = drive(H, monkeypatch, _reply("One.", " Two."), cancel_after=2)
         assert turn.said == ["One.", "Two."], turn.said
         assert turn.played == ["One."], turn.played
         assert turn.spoke is True
@@ -674,3 +679,95 @@ class TestTheStreamThatDiedHalfway:
         assert turn.history == [], (
             f"a turn that died half-way must not leave half of itself in the "
             f"prompt: {turn.history}")
+
+
+@pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning")
+class TestAnUnheardAnswerLeavesACoherentHistory:
+    """A turn whose answer could not be said keeps its question and drops the
+    answer. The answer was dropped by ROLE — every assistant message — so a turn
+    that used a tool lost the assistant message carrying `tool_calls` and kept
+    the `role:tool` reply to it: a result with no call before it, published into
+    every later request (the shape `_seal_tool_calls` exists to prevent)."""
+
+    CALLS = [{"function": {"name": "set_timer", "arguments": {}}}]
+
+    def _tool_turn(self, H, monkeypatch, **kw):
+        rounds = iter([_Response([_chunk(tools=self.CALLS)]),
+                       _Response([_chunk("Timer set.")])])
+        return drive(
+            H, monkeypatch, lambda req: next(rounds),
+            tool_entry=lambda tc: {"role": "tool", "tool_name": "set_timer",
+                                   "content": "timer set for 5 minutes"}, **kw)
+
+    def test_a_tool_result_keeps_the_call_it_answers(self, H, monkeypatch):
+        turn = self._tool_turn(H, monkeypatch, tts_exc=RuntimeError("no voice"))
+        assert [m["role"] for m in turn.history] == ["user", "assistant", "tool"], \
+            turn.history
+        call = turn.history[1]
+        assert call.get("tool_calls") == self.CALLS
+        assert call["content"] == "", "text that rode with the call was never heard"
+        # the invariant itself: no tool message without a call directly before it
+        for i, m in enumerate(turn.history):
+            if m["role"] == "tool":
+                j = i - 1
+                while j >= 0 and turn.history[j]["role"] == "tool":
+                    j -= 1
+                assert j >= 0 and turn.history[j].get("tool_calls"), (
+                    f"orphaned tool result at {i}: {turn.history}")
+
+    def test_the_spoken_answer_is_still_dropped(self, H, monkeypatch):
+        turn = self._tool_turn(H, monkeypatch, tts_exc=RuntimeError("no voice"))
+        assert not any(m["role"] == "assistant" and not m.get("tool_calls")
+                       for m in turn.history), turn.history
+
+    def test_a_turn_that_was_heard_publishes_everything(self, H, monkeypatch):
+        turn = self._tool_turn(H, monkeypatch)
+        assert [m["role"] for m in turn.history] == [
+            "user", "assistant", "tool", "assistant"], turn.history
+        assert turn.history[-1]["content"] == "Timer set."
+
+
+class TestAFailureIsReportedOncePerCause:
+    """`_report_once` notifies the person once per distinct cause. The cause was
+    the exception's whole text, so one that named a scratch path or a number made
+    every occurrence a NEW cause: a popup per reply, and a set of seen causes
+    that grew for the life of the process."""
+
+    def _assistant(self, H, monkeypatch):
+        a = H.Assistant.__new__(H.Assistant)
+        a._failures_reported = set()
+        a._is_closed = lambda: False
+        popups: list = []
+        monkeypatch.setattr(H, "notify", popups.append)
+        return a, popups
+
+    def test_a_scratch_path_that_changes_every_time_is_one_cause(self, H, monkeypatch):
+        a, popups = self._assistant(H, monkeypatch)
+        for name in ("tmpk3j2x9", "tmpq1w2e3r", "tmp8h7g6f5"):
+            a._report_speech_failure(FileNotFoundError(
+                2, "No such file or directory",
+                f"/home/u/.local/state/handsoff/{name}/tts.wav"))
+        assert len(popups) == 1, popups
+
+    def test_a_number_that_changes_every_time_is_one_cause(self, H, monkeypatch):
+        a, popups = self._assistant(H, monkeypatch)
+        for mib in (20, 24, 512):
+            a._report_speech_failure(RuntimeError(
+                f"CUDA out of memory. Tried to allocate {mib}.00 MiB"))
+        assert len(popups) == 1, popups
+
+    def test_different_causes_are_still_different(self, H, monkeypatch):
+        a, popups = self._assistant(H, monkeypatch)
+        a._report_speech_failure(FileNotFoundError(2, "No such file", "/a/b/c"))
+        a._report_speech_failure(PermissionError(13, "Permission denied", "/a/b/c"))
+        a._report_speech_failure(RuntimeError("device busy"))
+        a._report_speech_failure(RuntimeError("device gone"))
+        assert len(popups) == 4, popups
+
+    def test_the_set_of_seen_causes_is_bounded(self, H, monkeypatch):
+        a, popups = self._assistant(H, monkeypatch)
+        for i in range(H._FAILURES_REPORTED_MAX + 40):
+            a._report_once("k", RuntimeError(f"cause-{'x' * i}"), "m")
+        assert len(a._failures_reported) == H._FAILURES_REPORTED_MAX
+        assert len(popups) == H._FAILURES_REPORTED_MAX

@@ -660,6 +660,29 @@ class TestMissingBrainFallback:
 
         report["stream_said"] = speaking(ndjson("One. ", "Two more"))
 
+        # a stream that dies right after a finished sentence (which the splitter
+        # is still holding for its lookahead) still says it, in this copy as in
+        # core; half a sentence stays unsaid
+        class DyingResp(StreamResp):
+            def __iter__(self):
+                yield from self.lines
+                raise OSError("connection reset")
+
+        def dying(*pieces):
+            q = queue.Queue()
+            try:
+                legacy.ollama_chat_stream(
+                    [{"role": "user", "content": "hi"}], q, None, None,
+                    base=BASE, model="gpt-oss:20b", num_ctx=8,
+                    guard=lambda: None, logger=log,
+                    urlopen=lambda req, timeout=None: DyingResp(ndjson(*pieces)))
+            except OSError:
+                pass
+            return list(q.queue)
+
+        report["stream_dies_after_a_sentence"] = dying("Berlin is in Germany", ".")
+        report["stream_dies_mid_sentence"] = dying("Berlin is in Germany. It has", " three")
+
         # where a reply is cut into sentences must not depend on where the
         # network cut the stream: the same reply, split at EVERY position, in
         # this copy and in core, gives the sentences the reply gives whole
@@ -996,6 +1019,10 @@ class TestMissingBrainFallback:
             ["It is 18.5 degrees and 3.2 inches of rain.", None],
             ["Version 3.12.1 shipped.", "Visit example.com now.", None],
             ["Really?!", "Yes...", "maybe.", "Okay!", None]], report["split_whole"]
+        assert report["stream_dies_after_a_sentence"] == [
+            "Berlin is in Germany.", None], report["stream_dies_after_a_sentence"]
+        assert report["stream_dies_mid_sentence"] == [
+            "Berlin is in Germany.", None], report["stream_dies_mid_sentence"]
         assert report["split_independent"] is True
         assert report["split_matches_core"] is True
         # the leak rule, in the direction that lost a sentence until 2026-09-27

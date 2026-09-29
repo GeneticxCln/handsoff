@@ -72,6 +72,7 @@ _THINK_CLOSE = "</think>"
 # end of the stream flushes whatever is left. The property is chunking
 # independence — the same reply cut anywhere gives the same sentences.
 _SENTENCE_END = re.compile(r"[.!?…]+\s")
+_ENDS_A_SENTENCE = re.compile(r"[.!?…]\s*\Z")
 
 
 def _speech_fragment(fragment: str, in_think: bool) -> tuple[str, bool]:
@@ -626,6 +627,18 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
         ) from None
     except Exception:
         logger.exception("streaming chat failed")
+        # A stream that dies right after a sentence's closing full stop. That
+        # sentence is complete, but the splitter was holding it for the next
+        # token's leading space (see `_SENTENCE_END`), so it is still in `buf`
+        # — and the tail flush above is on the success path only. Without this
+        # the user heard "my brain is offline" in place of an answer the model
+        # had already finished. Only a buffer that ENDS in a terminator is said:
+        # half a sentence stays unsaid, as it always was.
+        if not (cancel is not None and cancel.is_set()):
+            tail, in_think = _speech_fragment(buf, in_think)
+            tail = sayable(strip_thinking(tail).strip())
+            if tail and _ENDS_A_SENTENCE.search(tail):
+                q.put(tail)
         raise
     finally:
         if not fallback:

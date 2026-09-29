@@ -698,6 +698,16 @@ except ImportError:
                 raise RuntimeError(
                     f"cannot reach Ollama at {base} ({error.reason}). "
                     "Start it with: systemctl start ollama") from None
+            except Exception:
+                # A stream that dies right after a sentence's closing full
+                # stop: the sentence is complete but still held for its
+                # lookahead (see core.brain._SENTENCE_END) — say it. Only a
+                # buffer that ends in a terminator; never after a barge-in.
+                if not (cancel is not None and cancel.is_set()):
+                    tail = _fallback_sayable(cls.strip_thinking(buf))
+                    if tail and re.search(r"[.!?…]\s*\Z", tail):
+                        q.put(tail)
+                raise
             finally:
                 if not fallback:
                     q.put(None)
@@ -4095,6 +4105,24 @@ def _guard_ollama_endpoint() -> None:
             "private conversation data. Set HANDSOFF_ALLOW_REMOTE_OLLAMA=1 "
             "to explicitly allow remote Ollama."
         )
+
+
+_FAILURES_REPORTED_MAX = 64
+
+
+def _cause_shape(exc: BaseException) -> str:
+    """An exception's message with the parts that vary per occurrence removed.
+
+    `_report_once` tells the person about a failure ONCE per cause, and the
+    cause used to be the exception's whole text. A path or a number in it made
+    every occurrence a new cause: a speech failure that names its scratch file
+    (`No such file or directory: '/…/state/tmpk3j2x9/tts.wav'`, the directory
+    being new for every sentence) raised a desktop popup per reply, and grew the
+    set of seen causes without bound — the spam the function exists to prevent.
+    """
+    text = str(exc)
+    text = re.sub(r"[\w.~-]*(?:/[\w.~@+=%-]+)+/?", "<path>", text)
+    return re.sub(r"\d+", "#", text)
 
 
 class _PrivateRotatingFileHandler(RotatingFileHandler):
@@ -9657,7 +9685,20 @@ class Assistant(QObject):
                 # was never made and could ask about it. A barge-in that cut
                 # the reply short is not this case: nothing failed, the user
                 # simply stopped listening. Measured 2026-09-27.
-                kept = [m for m in fresh if m.get("role") != "assistant"]
+                #
+                # Only the ANSWER goes: an assistant message that carries
+                # `tool_calls` is plumbing that the tool results after it
+                # answer, and dropping it while keeping the results left a
+                # `role:tool` message with no call before it — the orphan shape
+                # `_seal_tool_calls` exists to prevent, published into every
+                # later request. Whatever text rode along with the call went
+                # unheard too, so it is blanked rather than kept.
+                kept = []
+                for m in fresh:
+                    if m.get("role") != "assistant":
+                        kept.append(m)
+                    elif m.get("tool_calls"):
+                        kept.append({**m, "content": ""})
                 log.info("the reply could not be spoken; published the "
                          "question without its answer")
             _strip_images(kept)   # screenshots: this turn's model call only
@@ -9857,11 +9898,16 @@ class Assistant(QObject):
         so a notification per occurrence would be worse than the silence it
         replaces.
         """
-        key = f"{kind}: {type(exc).__name__}: {exc}"[:200]
+        key = f"{kind}: {type(exc).__name__}: {_cause_shape(exc)}"[:200]
         seen = getattr(self, "_failures_reported", None)
         if seen is None:
             seen = self._failures_reported = set()
         if key in seen:
+            return False
+        if len(seen) >= _FAILURES_REPORTED_MAX:
+            # Bounded: past this many DISTINCT causes the person has been told
+            # plenty and the journal has every occurrence; the set is state
+            # for the life of the process and must not grow with it.
             return False
         seen.add(key)
         try:

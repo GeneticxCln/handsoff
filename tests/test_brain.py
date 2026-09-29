@@ -457,6 +457,47 @@ class TestTheSentenceSplitter:
             _chunk(p) for p in ("It's 18", ".", "5 degrees today", ".")]))
         assert _spoken(q) == ["It's 18.5 degrees today."], _spoken(q)
 
+    @staticmethod
+    def _dies_after(*pieces, cancel=None):
+        class _Dies:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(self):
+                for piece in pieces:
+                    yield _chunk(piece)
+                if cancel is not None:
+                    cancel.set()          # the barge-in lands as the socket dies
+                raise OSError(104, "Connection reset by peer")
+        return lambda req, timeout=None: _Dies()
+
+    def test_a_stream_that_dies_after_a_finished_sentence_still_says_it(self, brain):
+        """The splitter holds a full stop that is the last thing in the buffer
+        until the next token's leading space settles it — so a stream that dies
+        right there used to lose a sentence the model had finished, and the
+        user heard the apology instead of the answer."""
+        q: queue.Queue = queue.Queue()
+        with pytest.raises(OSError):
+            _stream(brain, q, self._dies_after("Berlin is in Germany", "."))
+        assert list(q.queue) == ["Berlin is in Germany.", None], list(q.queue)
+
+    def test_a_stream_that_dies_mid_sentence_says_no_fragment(self, brain):
+        q: queue.Queue = queue.Queue()
+        with pytest.raises(OSError):
+            _stream(brain, q, self._dies_after("Berlin is in Germany. It has", " three"))
+        assert list(q.queue) == ["Berlin is in Germany.", None], list(q.queue)
+
+    def test_a_barge_in_then_a_dying_stream_says_nothing_more(self, brain):
+        q: queue.Queue = queue.Queue()
+        cancel = threading.Event()
+        with pytest.raises(OSError):
+            _stream(brain, q, self._dies_after("Berlin is in Germany", ".",
+                                               cancel=cancel), cancel=cancel)
+        assert list(q.queue) == [None], list(q.queue)
+
     def test_a_reply_that_ends_on_a_full_stop_is_still_spoken(self, brain):
         """The terminator that ends the stream has no whitespace after it; the
         end-of-stream flush is what says it."""

@@ -9,7 +9,7 @@ copy a size out of it into prose.
 
 | Module | Lines | Owns | Must not import |
 |---|---|---|---|
-| `handsoff.py` | 11081 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
+| `handsoff.py` | 11127 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
 | `core/__init__.py` | 306 | `APP_MODULE_NAME="handsoff_core"`, `claim_app_instance`, `load_module`, origin rule, stdlib-shadow guard | app globals |
 | `core/tools.py` | 5132 | 52 `@tool`s, `ToolBelt`, `set_dependencies` (the host installs its runtime with this), `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
 | `core/bubble.py` | 4107 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |
@@ -21,7 +21,7 @@ copy a size out of it into prose.
 | `core/assistant.py` | 990 | `PomodoroController`, `NotificationReader`, `ReminderStore`, mute/parse helpers | `handsoff` |
 | `core/doctor.py` | 830 | `run_doctor`/`doctor_json` via `DoctorDeps` — text lines and one structured dict per host dep (appearance, web, the card's story: `gpu_lines` renders as the section and `gpu_headroom` is the same dict), so both surfaces describe one reading | `handsoff` (deps injected) |
 | `core/registry.py` | 446 | `BoundedRegistry` (admission under lock), `Offer` (arm/read/consume) | — |
-| `core/brain.py` | 636 | `ollama_chat`/`ollama_chat_stream`, `ollama_unload` (`keep_alive: 0` on the same knob every turn sets the other way), `ollama_resident` (`/api/ps`: what is loaded and how much of it is on the card), `ollama_model_size_mb` (`/api/tags`: what a model that is NOT loaded yet would cost the card — the claim side of the mirror below), `ollama_release_verdict` (keep the LLM when the measured reload costs more than the memory it frees), `TurnStream`, markup filter | — |
+| `core/brain.py` | 649 | `ollama_chat`/`ollama_chat_stream`, `ollama_unload` (`keep_alive: 0` on the same knob every turn sets the other way), `ollama_resident` (`/api/ps`: what is loaded and how much of it is on the card), `ollama_model_size_mb` (`/api/tags`: what a model that is NOT loaded yet would cost the card — the claim side of the mirror below), `ollama_release_verdict` (keep the LLM when the measured reload costs more than the memory it frees), `TurnStream`, markup filter | — |
 | `core/theme.py` | 337 | `hex_to_rgb`, luminance, wallpaper match retune (Qt-free) | Qt |
 | `core/lifecycle.py` | 127 | `TurnState`, `GenerationCounter`/`new_counter`, `next_turn` — the program's only turn-generation increment, under its own lock; `Assistant._bump_gen` claims through the counter | Qt/Assistant |
 | `core/selfwatch.py` | 297 | the SELF-WATCH sampler (the push half of health): `SelfWatch.tick` inventories the long-lived named threads (`LONG_LIVED_PREFIXES`, one-shots deliberately unmatched) and reports a component *dead* once seen and gone — the first tick learns the baseline instead of alarming on startup order — or *wedged* when its host probe (`sync_fns`, a value that changes while the component works: beat counters) freezes for `WEDGED_AFTER_S`; findings re-arm their spoken announcement per cooldown and `announcement_text` keeps the two sentences distinct (not running / stuck); every entry point swallows to an error field, because a sampler that could kill its host loop would be the failure it exists to catch | anything (stdlib only) |
