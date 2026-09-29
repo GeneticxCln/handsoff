@@ -1753,6 +1753,7 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
     CORPORA = {
         "read": (
             # -- read_file's own refusals, in the order it checks them
+            ("read_of_an_unrepresentable_path", "a\x00b", None),
             ("read_refuses_a_secret_path", "~/.ssh/id_rsa", None),
             ("read_of_a_missing_file", "@missing", "_a_missing_file"),
             ("read_of_a_directory", "@dir", "_a_directory"),

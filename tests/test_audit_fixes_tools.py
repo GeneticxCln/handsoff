@@ -518,3 +518,44 @@ class TestTheDecisionLogTrimSurvivesATornLine:
             f"{len(lines)} lines: a torn tail stopped the trim")
         assert b'"decision": "ALLOW"' in lines[-1], "the newest decision was lost"
         f.read_bytes().decode("utf-8")   # what it rewrote is text again
+
+
+class TestAnOutOfRangeNumberIsAnArgumentProblem:
+    """`int(float("inf"))` and `float(10**400)` raise OverflowError, which is an
+    ArithmeticError and not the ValueError the binding step catches. It escaped
+    to the belt's catch-all, so the model was told the ASSISTANT's own check had
+    failed and not to retry — for an argument it could simply have fixed."""
+
+    @pytest.mark.parametrize("tool,arg,extra", [
+        ("world_events", "count", {}), ("read_calendar", "days", {}),
+        ("read_page", "max_chars", {"url": "https://example.com/"}),
+        ("wait", "seconds", {}), ("pomodoro", "work_minutes", {"action": "start"}),
+        ("wait_for_window", "timeout", {"name": "x"})])
+    @pytest.mark.parametrize("value", [float("inf"), "9" * 5000])
+    def test_it_is_refused_as_bad_arguments(self, H, tool, arg, extra, value):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute(tool, {arg: value, **extra})
+        assert err, out
+        assert "could not be evaluated" not in out, (
+            "an argument problem was reported as the assistant's own failure: "
+            f"{out}")
+
+    @pytest.mark.parametrize("tool,arg,extra", [
+        ("wait", "seconds", {}), ("pomodoro", "work_minutes", {"action": "start"}),
+        ("wait_for_window", "timeout", {"name": "x"})])
+    def test_a_float_argument_too_large_for_a_float_is_too(self, H, tool, arg, extra):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute(tool, {arg: 10 ** 400, **extra})
+        assert err and "could not be evaluated" not in out, out
+
+
+class TestReadFileRefusesAPathNoFilesystemCanHold:
+    """A NUL byte or a lone surrogate raised ValueError/UnicodeEncodeError out of
+    resolve() and exists(), and the model was told "that is a bug in the tool"."""
+
+    @pytest.mark.parametrize("path", ["a\x00b", "\x00", "~\x00", "\ud800", "x/\ud800/y"])
+    def test_it_is_a_refusal_not_a_bug_report(self, H, path):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute("read_file", {"path": path})
+        assert "cannot exist" in out, out
+        assert "bug in the tool" not in out and "failed with" not in out, out

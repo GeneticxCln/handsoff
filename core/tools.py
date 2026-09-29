@@ -971,7 +971,11 @@ def coerce_number_arg(raw, kind) -> "int | float":
         raise ValueError(f"expected a number, got {raw!r}")
     try:
         value = kind(raw)
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, OverflowError) as e:
+        # OverflowError is what int(float("inf")) and float(10**400) raise; it is
+        # an ArithmeticError, not a ValueError, so it escaped to the belt's
+        # catch-all and the model was told the ASSISTANT's own check had failed
+        # and not to retry — when the argument was simply not a usable number.
         raise ValueError(f"expected {kind.__name__}, got {raw!r}") from e
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"expected a finite number, got {raw!r}")
@@ -4057,15 +4061,26 @@ class ToolBelt:
         except RuntimeError as e:
             return f'ERROR: {e}'
 
-    @tool(gates='media', description="Set the music player's volume (0-100). This is the music output volume, not the whole system volume.")
+    @tool(gates='media', description="Set the music player's volume (0-100), or change it by a signed step ('+10', '-10'). Not the system volume.")
     def media_volume(self, level: str) -> str:
-        s = str(level or '').strip().rstrip('%')
-        if not re.fullmatch('[+-]?\\d+', s):
-            return 'ERROR: level must be a number 0-100'
-        level = max(0, min(100, int(s)))
+        s = str(level or '').strip().rstrip('%').strip()
+        # A sign is a CHANGE, as it is for `mpc volume +10`. It was accepted by
+        # the pattern and then clamped as an absolute level, so "+10" set the
+        # volume TO 10 and "-10" set it to 0 — "turn it down a bit" muted the
+        # music. A decimal ("50.0", which models send) is read, not refused, and
+        # the digit count is bounded so a huge string is a refusal rather than
+        # int()'s own ValueError.
+        m = re.fullmatch('([+-]?)(\\d{1,6}(?:\\.\\d+)?)', s)
+        if not m:
+            return 'ERROR: level must be a number 0-100, or +N / -N to change it'
+        sign = m.group(1)
+        amount = max(0, min(100, int(round(float(m.group(2))))))
         try:
-            _dep()._mpc('volume', str(level))
-            return f'music volume set to {level}%'
+            if sign:
+                _dep()._mpc('volume', f'{sign}{amount}')
+                return f"music volume {('up' if sign == '+' else 'down')} {amount}%"
+            _dep()._mpc('volume', str(amount))
+            return f'music volume set to {amount}%'
         except RuntimeError as e:
             return f'ERROR: {e}'
 
@@ -4992,7 +5007,20 @@ class ToolBelt:
 
         path: File path, ~ expanded.
         """
-        p = Path(path).expanduser()
+        try:
+            p = Path(path).expanduser()
+            # A NUL byte or a lone surrogate names nothing any filesystem can
+            # hold. Left to the syscalls they raised ValueError/UnicodeEncodeError
+            # out of resolve() and exists(), which the model was told was "a bug
+            # in the tool" (found by driving every string argument with hostile
+            # values; the same class `_validate_command` already refuses).
+            os.fsencode(p)
+            if '\x00' in str(p):
+                raise ValueError('embedded null byte')
+        except (ValueError, UnicodeError):
+            # refusal: read_of_an_unrepresentable_path
+            return ("ERROR: that path cannot exist — it holds a NUL byte or a "
+                    "character no file name can hold")
         try:
             p = p.resolve()
         except OSError:

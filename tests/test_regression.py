@@ -911,6 +911,30 @@ class TestMedia:
         out, err = belt.execute("media_volume", {"level": "banana"})
         assert err and "number" in out, out
 
+    def test_a_signed_volume_is_a_change_and_a_decimal_is_read(self, H, monkeypatch):
+        """A sign was accepted by the pattern and clamped as an absolute level:
+        "+10" set the volume TO 10 and "-10" to 0 — "turn it down a bit" muted
+        the music. It is `mpc volume +10` now. A decimal is read, and a huge
+        string is a refusal rather than int()'s own ValueError."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        seen = []
+        monkeypatch.setattr(H, "_mpc", lambda *a, **k: seen.append(a) or "")
+        cases = [("+10", ("volume", "+10"), "music volume up 10%"),
+                 ("-10", ("volume", "-10"), "music volume down 10%"),
+                 ("-250", ("volume", "-100"), "music volume down 100%"),
+                 ("50.0", ("volume", "50"), "music volume set to 50%"),
+                 ("49.6", ("volume", "50"), "music volume set to 50%"),
+                 ("30%", ("volume", "30"), "music volume set to 30%"),
+                 (" 0 ", ("volume", "0"), "music volume set to 0%")]
+        for level, call, said in cases:
+            seen.clear()
+            out, err = belt.execute("media_volume", {"level": level})
+            assert not err and out == said and seen == [call], (level, out, seen)
+        for bad in ("9" * 5000, "loud", "", "--5", "1e3"):
+            seen.clear()
+            out, err = belt.execute("media_volume", {"level": bad})
+            assert err and "number" in out and not seen, (bad[:10], out, seen)
+
     def test_now_playing_parses_status(self, H, monkeypatch):
         belt = H.ToolBelt(on_restart_pending=lambda: None)
         def fake(*args, timeout=8.0):
