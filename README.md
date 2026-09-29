@@ -253,7 +253,7 @@ switch auto-restores); a bad self-edit has a `.bak` beside it; `./install.sh
 ```bash
 bash ci/gates.sh                     # every gate, in CI's order (~10 min)
 bash ci/gates.sh compile lint links shell    # the fast ones (seconds)
-python -m pytest tests/ -q           # 2936 tests
+python -m pytest tests/ -q           # 2938 tests
 git config core.hooksPath githooks   # then every commit runs the suite too
 ```
 
@@ -269,7 +269,7 @@ suite reads ~60% and "fails" the floor for no reason:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70   # 2936 tests, ~86% measured
+  --cov-report=term-missing --cov-fail-under=70   # 2938 tests, ~86% measured
 ```
 
 CI (GitHub, mirrored gate-for-gate in `.gitlab-ci.yml`) runs the suite on

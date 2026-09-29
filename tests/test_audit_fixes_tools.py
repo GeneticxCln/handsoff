@@ -588,3 +588,33 @@ class TestAProcessWithALongNameCanBeStopped:
         tb = self._belt(H, monkeypatch, [(1, "gnome-text-edit"), (2, "gnome-text-edit")])
         out, err = tb.execute("kill_process", {"target": "gnome-text-editor"})
         assert err and "2 processes match" in out, out
+
+
+class TestAWatcherSeesAProcessWithALongName:
+    def test_its_exit_is_announced(self, H, monkeypatch):
+        """`watch_process` compared the name exactly with `comm`, which is cut at
+        15 characters, so a long name was never seen to START and its exit was
+        never announced — the watcher ran for 24 hours and said nothing."""
+        seen = [[(7, "gnome-text-edit")], [(7, "gnome-text-edit")], []]
+        monkeypatch.setattr(H.ToolBelt, "_same_user_procs",
+                            staticmethod(lambda: seen.pop(0) if seen else []))
+        emitted: list = []
+
+        class _Polls:
+            def __init__(self):
+                self.n = 0
+
+            def wait(self, timeout=None):
+                self.n += 1
+                return self.n > 6
+
+        H.ToolBelt._process_watch_loop("gnome-text-editor", _Polls(), emitted.append)
+        assert emitted == ["process gnome-text-editor exited"], emitted
+
+    def test_the_matcher(self):
+        from core.tools import comm_matches
+        assert comm_matches("bash", "BASH")
+        assert comm_matches("gnome-text-edit", "gnome-text-editor")
+        assert not comm_matches("gnome-text-edit", "gnome-text-edi")
+        assert not comm_matches("gnome-text-edit", "gnome-text-other")
+        assert not comm_matches("gnome", "gnome-text-editor")

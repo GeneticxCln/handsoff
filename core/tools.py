@@ -954,6 +954,22 @@ def setting_flag(key: str, default: bool = False) -> bool:
         return default
 
 
+def comm_matches(comm: str, wanted: str) -> bool:
+    """Is the process `comm` the one the user named?
+
+    `Name:` in /proc/PID/status is the kernel's `comm`, cut at 15 characters, so
+    a process called `gnome-text-editor` is only ever visible as
+    `gnome-text-edit`: an exact comparison with the name the user said found
+    nothing, for every name longer than 15 characters — `kill_process` refused
+    them, and `watch_process` never saw one start, so it never announced its
+    exit. A longer name is compared by the prefix the kernel keeps; more than one
+    match is still refused as ambiguous, and the offer names what will actually
+    be stopped.
+    """
+    comm, wanted = comm.lower(), wanted.lower()
+    return comm == wanted or (len(wanted) > 15 and comm == wanted[:15])
+
+
 def coerce_number_arg(raw, kind) -> "int | float":
     """int/float for model-supplied args; raises instead of guessing 0.
 
@@ -3209,7 +3225,7 @@ class ToolBelt:
         seen = False
         deadline = time.monotonic() + 24 * 3600
         while not stop.wait(1.0) and time.monotonic() < deadline:
-            present = any((n.lower() == name.lower() for _, n in ToolBelt._same_user_procs()))
+            present = any((comm_matches(n, name) for _, n in ToolBelt._same_user_procs()))
             if seen and (not present):
                 emit(f'process {name} exited')
                 return
@@ -4483,17 +4499,8 @@ class ToolBelt:
                 name = next((n for p, n in self._same_user_procs() if p == pid), str(pid))
                 cands.append((pid, name))
         else:
-            low = target.lower()
-            # `Name:` in /proc/PID/status is the kernel's `comm`, cut at 15
-            # characters, so a process called `gnome-text-editor` is only ever
-            # visible as `gnome-text-edit`: an exact comparison with the name the
-            # user said found nothing, for every name longer than 15 characters.
-            # A longer name is compared by the prefix the kernel keeps; more than
-            # one match is still refused as ambiguous, and the offer names what
-            # will actually be stopped.
-            low15 = low[:15]
             cands = [(p, n) for p, n in self._same_user_procs()
-                     if n.lower() == low or (len(low) > 15 and n.lower() == low15)]
+                     if comm_matches(n, target)]
         if not cands:
             # refusal: kill_no_such_process
             return f"ERROR: no process of yours matches {target!r} (exact name or listening port; other users' processes are invisible)"
