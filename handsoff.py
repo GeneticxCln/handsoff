@@ -6740,6 +6740,21 @@ class ContinuousListener:
             except Exception:
                 # log.exception below reports it; binding the error here would
                 # only add a name ruff then flags as unused
+                #
+                # A stream that OPENED but failed to start (the device vanished
+                # between the two) is still held in `self._stream`; the next
+                # pass overwrote it, so every retry of a flapping device leaked
+                # one open PortAudio stream (sounddevice has no finalizer).
+                # Released here, bounded and under the same mic lock as every
+                # other teardown, before backing off. The Settings live probe
+                # has always done this; the listener that matters had not.
+                failed, self._stream = self._stream, None
+                if failed is not None:
+                    try:
+                        _stop_stream_owned(failed)
+                    except Exception:
+                        log.debug("could not release the stream that failed "
+                                  "to start", exc_info=True)
                 open_failures += 1
                 self._health_opens_failed += 1
                 if self._health_failing_since is None:

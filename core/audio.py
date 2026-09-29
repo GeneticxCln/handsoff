@@ -1363,11 +1363,13 @@ def play_wav(path: Path, cancel: threading.Event) -> None:
             monitor.join(_WATCHDOG_POLL_S * 3)
         _emit_level(0.0)
         if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
+            # Separate guards: a stop() that raises (the device is gone) used to
+            # skip the close() behind it, leaving the output stream open.
+            for release in (stream.stop, stream.close):
+                try:
+                    release()
+                except Exception:
+                    pass
 
 
 __all__ = [

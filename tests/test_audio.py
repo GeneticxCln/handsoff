@@ -769,6 +769,46 @@ def test_play_wav_holds_the_portaudio_mark(H, tmp_path):
     assert mod.portaudio_busy() is False, "the mark must be released afterwards"
 
 
+def test_play_wav_closes_its_output_stream_when_stop_raises(H, tmp_path):
+    """A device that vanished mid-playback raises from stop(); the close()
+    behind it sat in the same try and was skipped, leaving the output stream
+    open (sounddevice has no finalizer)."""
+    import threading, wave as _wave
+    mod = _load("core_audio_stop_raises", HERE / "core" / "audio.py")
+    calls = []
+    real = mod.sd.OutputStream
+
+    class _Stream:
+        def __init__(self, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def write(self, data):
+            pass
+
+        def stop(self):
+            calls.append("stop")
+            raise OSError("device unplugged")
+
+        def close(self):
+            calls.append("close")
+
+    mod.sd.OutputStream = _Stream
+    try:
+        path = tmp_path / "tone.wav"
+        with _wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 512)
+        mod.play_wav(path, threading.Event())
+    finally:
+        mod.sd.OutputStream = real
+    assert calls == ["stop", "close"], calls
+
+
 def test_play_wav_reports_a_level_that_follows_the_audio(H, tmp_path):
     """A voice-reactive bubble needs a level WHILE it is speaking.
 
@@ -4544,6 +4584,48 @@ class TestWatchdogReopenLoop:
 
 
         return state["ticks"]
+
+    def test_a_stream_that_fails_to_start_is_released_before_the_retry(
+            self, H, monkeypatch):
+        """The device can vanish between the open and the start. The stream that
+        was opened was still held in `self._stream`, the retry overwrote it, and
+        every attempt of a flapping device leaked one open PortAudio stream —
+        sounddevice has no finalizer. It is stopped and closed (bounded, under
+        the mic lock) before the listener backs off."""
+        ln = self._listener(H)
+        logs: list = []
+
+        def make(fail):
+            log_: list = []
+            logs.append(log_)
+
+            class _S:
+                def start(self_):
+                    log_.append("start")
+                    if fail:
+                        raise RuntimeError("device vanished")
+
+                def stop(self_):
+                    log_.append("stop")
+
+                def close(self_):
+                    log_.append("close")
+            return _S()
+
+        outcomes = iter([True, False])         # the first start fails
+        monkeypatch.setattr(
+            H, "_open_input",
+            lambda dev, rate, bs, cb: (make(next(outcomes)), 16000))
+
+        def tick(s):
+            if s == 0.5 and len(logs) >= 2 and "start" in logs[1]:
+                ln._running = False            # the second stream is up: done
+        self._run_capped(H, monkeypatch, ln, tick)
+        assert len(logs) == 2, logs
+        assert logs[0] == ["start", "stop", "close"], (
+            f"the stream that failed to start was dropped open: {logs[0]}")
+        assert logs[1][0] == "start"
+        assert ln._health_opens_failed == 1
 
     # ---- stalled: frames stop arriving → REOPEN_S later the stream reopens
 

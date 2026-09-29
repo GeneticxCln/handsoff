@@ -519,8 +519,15 @@ def stop_stream_owned(stream, mic_lock, timeout_s: float = MIC_LOCK_TIMEOUT_S) -
             timeout_s)
         return
     try:
-        stream.stop()
-        stream.close()
+        # `close` runs whether or not `stop` did: a stream the device already
+        # dropped raises from stop(), and skipping the close() behind it left
+        # the PortAudio stream open for the life of the process (sounddevice has
+        # no finalizer). The stop's own error still propagates for the caller
+        # to log.
+        try:
+            stream.stop()
+        finally:
+            stream.close()
     finally:
         mic_lock.release()
 

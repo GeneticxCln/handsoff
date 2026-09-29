@@ -438,6 +438,32 @@ class TestTheMicLockIsBounded:
         voice.start_stream_owned(stream, lock, timeout_s=0.2)
         assert stream.calls == ["stop", "close", "start"]
 
+    def test_a_stop_that_raises_still_closes_the_stream(self):
+        """A stream the device already dropped raises from stop(); the close()
+        behind it was skipped, so the PortAudio stream stayed open for the life
+        of the process (sounddevice has no finalizer). The error still reaches
+        the caller to log, and the lock is released."""
+        voice = _load("audit_media_voice_stop_raises", ROOT / "core" / "voice.py")
+        lock = threading.Lock()
+
+        class _Dropped:
+            def __init__(self):
+                self.calls = []
+
+            def stop(self):
+                self.calls.append("stop")
+                raise OSError("device unplugged")
+
+            def close(self):
+                self.calls.append("close")
+
+        stream = _Dropped()
+        with pytest.raises(OSError, match="device unplugged"):
+            voice.stop_stream_owned(stream, lock, timeout_s=0.2)
+        assert stream.calls == ["stop", "close"], stream.calls
+        assert lock.acquire(timeout=1), "the mic lock was not released"
+        lock.release()
+
     def test_bounded_stop_gives_up_when_the_lock_is_stuck(self, caplog):
         mod = _load("audit_media_audio_stuck", ROOT / "core" / "audio.py")
         monkey_release = threading.Event()

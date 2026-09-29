@@ -5048,6 +5048,27 @@ def quit_only_trusts_the_unit_when_it_is_the_one_running_the_bubble():
     assert timeouts == {"is-active": 10, "stop": 15, "pgrep": 10}, timeouts
 
 
+@scenario
+def the_live_mic_probe_closes_a_stream_whose_stop_raises():
+    # A stream the device already dropped raises from stop(). The close() sat in
+    # the same try and was skipped, so the PortAudio stream stayed open.
+    probe = settings_app._LiveMicProbe()
+    calls = []
+
+    class Stream:
+        def stop(self):
+            calls.append("stop")
+            raise RuntimeError("device unplugged")
+
+        def close(self):
+            calls.append("close")
+
+    probe._stream = Stream()
+    probe._close_stream()
+    assert calls == ["stop", "close"], calls
+    assert probe._stream is None
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -5185,6 +5206,7 @@ SCENARIO_NAMES = [
     "the_decision_log_viewer_survives_a_torn_last_line",
     "the_mic_test_records_a_bounded_window_and_reports_the_peak",
     "quit_only_trusts_the_unit_when_it_is_the_one_running_the_bubble",
+    "the_live_mic_probe_closes_a_stream_whose_stop_raises",
 ]
 
 

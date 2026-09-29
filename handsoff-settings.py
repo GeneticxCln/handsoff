@@ -1133,11 +1133,14 @@ class _LiveMicProbe:
         st = self._stream
         self._stream = None
         if st is not None:
-            try:
-                st.stop()
-                st.close()
-            except Exception:
-                pass
+            # Separate guards: a stop() that raises (the device is gone) used to
+            # skip the close() behind it — the stream stayed open, and PortAudio
+            # holds the device until the object is collected.
+            for release in (st.stop, st.close):
+                try:
+                    release()
+                except Exception:
+                    pass
 
     def _run(self, device: str | None, threshold: int) -> None:
         # one capture loop per (device, threshold) change; exits when a newer
