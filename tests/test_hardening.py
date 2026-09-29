@@ -1554,3 +1554,70 @@ class TestStateHygieneTrend:
         assert rows[0]["swept"] == 1                 # the sweep ran first
         assert rows[0]["scratch_left"] == 0
         assert not leaked.exists()
+
+
+class TestNoUnboundedBlockingCall:
+    """A voice assistant is a set of long-lived threads, and one call that can
+    wait forever holds its thread — and whatever the thread was doing for the
+    user — for the life of the process. Every `subprocess.run`, `urlopen` and
+    `create_connection` in the shipped sources therefore states its timeout.
+
+    Found by sweeping the tree for the shape, which turned up exactly one: the
+    self-test's clipboard restore ran `wl-copy` with its output captured and no
+    timeout, and wl-copy forks a server that keeps the inherited pipes open —
+    `copy_text` beside it already detached them and bounded the call.
+    """
+
+    SOURCES = ("handsoff.py", "hardware.py", "settings_schema.py",
+               "handsoff-settings.py")
+
+    @staticmethod
+    def _calls_without_a_timeout(path: Path) -> list:
+        import ast
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = (ast.unparse(fn) if isinstance(fn, (ast.Attribute, ast.Name))
+                    else "")
+            keywords = {k.arg for k in node.keywords}
+            if None in keywords:            # **kwargs: cannot be judged here
+                continue
+            if name in ("subprocess.run", "subprocess.check_output",
+                        "subprocess.check_call", "subprocess.call"):
+                bare = "timeout" not in keywords
+            elif name.endswith("urlopen"):
+                bare = "timeout" not in keywords and len(node.args) < 3
+            elif name == "socket.create_connection":
+                bare = "timeout" not in keywords and len(node.args) < 2
+            else:
+                continue
+            if bare:
+                found.append(f"{path.name}:{node.lineno}: {ast.unparse(node)[:90]}")
+        return found
+
+    def test_no_shipped_call_can_wait_forever(self):
+        paths = [ROOT / name for name in self.SOURCES]
+        paths += sorted((ROOT / "core").glob("*.py"))
+        offenders = [line for p in paths if p.is_file()
+                     for line in self._calls_without_a_timeout(p)]
+        assert not offenders, (
+            "these calls have no timeout, so a wedged far end holds the calling "
+            "thread for ever:\n  " + "\n  ".join(offenders))
+
+    def test_the_guard_does_catch_the_shape_it_guards(self, tmp_path):
+        """A sweep that finds nothing proves nothing until it is shown to find
+        something."""
+        sample = tmp_path / "sample.py"
+        sample.write_text(
+            "import subprocess, socket, urllib.request\n"
+            "subprocess.run(['a'])\n"
+            "subprocess.run(['a'], timeout=3)\n"
+            "urllib.request.urlopen('http://x')\n"
+            "urllib.request.urlopen('http://x', timeout=3)\n"
+            "socket.create_connection(('h', 1))\n"
+            "socket.create_connection(('h', 1), 5)\n", encoding="utf-8")
+        found = self._calls_without_a_timeout(sample)
+        assert [line.split(":")[1] for line in found] == ["2", "4", "6"], found

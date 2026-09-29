@@ -2168,8 +2168,15 @@ def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -
                 p.terminate()
         if clip_before is not None:
             try:
-                subprocess.run(["wl-copy"], input=clip_before,
-                               capture_output=True, text=True)
+                # The same shape `copy_text` uses: wl-copy forks a server that
+                # keeps serving the selection, and a server that inherited a
+                # CAPTURED stdout/stderr holds those pipes open, so
+                # `run(capture_output=True)` waits for it — with no timeout, the
+                # restore that ends the self-test could block until something
+                # else replaced the clipboard.
+                subprocess.run(["wl-copy"], input=clip_before, text=True,
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=8)
             except Exception:
                 pass
     return _selftest_report(results)
