@@ -9,7 +9,7 @@ copy a size out of it into prose.
 
 | Module | Lines | Owns | Must not import |
 |---|---|---|---|
-| `handsoff.py` | 10961 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
+| `handsoff.py` | 10971 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
 | `core/__init__.py` | 306 | `APP_MODULE_NAME="handsoff_core"`, `claim_app_instance`, `load_module`, origin rule, stdlib-shadow guard | app globals |
 | `core/tools.py` | 4921 | 52 `@tool`s, `ToolBelt`, `set_dependencies` (the host installs its runtime with this), `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
 | `core/bubble.py` | 4107 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |
@@ -28,7 +28,7 @@ copy a size out of it into prose.
 | `settings_schema.py` | 1087 | 65 defaults, `DEFAULT_SETTINGS`/`SETTINGS_VERSION`, `Field` rows (`SETTINGS_FIELDS`), `POLICY_RULES`, vocabularies, looks catalogue, `look_matching` | — |
 | `hardware.py` | 607 | 13-section `snapshot()`, TTLs, injectable probers, `--preflight` | SETTINGS/Qt/audio |
 | `handsoff-settings.py` | 5554 | `SettingsWindow` — 6-tab GUI, offscreen-capable, loads schema without the bubble | bubble module |
-| `core/voice.py` | 471 | the STATELESS voice primitives the host binds with thin aliases: `SpeechGate` (energy VAD, adaptive floor), the wake vocabulary and matching rules (`norm_words`, `is_wake_utt`, `match_wake`, `skeleton_match`/`wake_skeleton`, `wake_anywhere` + `WAKE_FILLER`/`WAKE_ANYWHERE_WORDS`), `is_echo` + stopwords (the mic-from-speaker filter), `WakeSpotter` (openWakeWord pre-roll detector; model, clock and chunk size arrive as constructor params so the model cache and its test seams stay with the host), and the mic open/device primitives (`available_input_devices`, `device_is_available`, `open_input_unlocked`, `mic_device_to_open`, `stop_stream_owned`, `start_stream_owned` — sd, logger, mic lock and last-open record are parameters). ContinuousListener, Recorder and the host's `_speak` stay in `handsoff.py`: assistant/UI lifecycle state and health hooks | anything (stdlib + numpy locally; sd/logger/lock as parameters) |
+| `core/voice.py` | 545 | the STATELESS voice primitives the host binds with thin aliases: `SpeechGate` (energy VAD, adaptive floor), the wake vocabulary and matching rules (`norm_words`, `is_wake_utt`, `match_wake`, `skeleton_match`/`wake_skeleton`, `wake_anywhere` + `WAKE_FILLER`/`WAKE_ANYWHERE_WORDS`), `is_echo` + stopwords (the mic-from-speaker filter), `WakeSpotter` (openWakeWord pre-roll detector; model, clock and chunk size arrive as constructor params so the model cache and its test seams stay with the host), and the mic open/device primitives (`available_input_devices`, `device_is_available`, `open_input_unlocked`, `mic_device_to_open`, `stop_stream_owned`, `start_stream_owned` — sd, logger, mic lock and last-open record are parameters). ContinuousListener, Recorder and the host's `_speak` stay in `handsoff.py`: assistant/UI lifecycle state and health hooks | anything (stdlib + numpy locally; sd/logger/lock as parameters) |
 
 Dependency direction: `handsoff.py` → `core.*` via `_load_module` handles
 (`_core_tools`, `_core_bubble`, `_core_settings`, `_brain`, `_audio`,

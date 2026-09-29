@@ -318,6 +318,42 @@ def available_input_devices(sd, log) -> list[dict]:
     return result
 
 
+def can_capture_channels(info) -> int:
+    """How many input channels this device entry actually offers.
+
+    Zero means the entry exists in PortAudio's list but is OUTPUT-only — an
+    HDMI output, a playback-only USB endpoint — so it can never carry a
+    microphone. Such an entry is a GHOST of a mic: it answers every
+    `query_devices` and opens nothing.
+
+    Returns -1 for "not stated" (the key is absent), which is NOT a ghost.
+
+    Measured 2026-09-29 on this machine, and the reason this is a predicate
+    rather than a comment: `query_devices(name, kind="input")` RAISES
+    ValueError for those names, so the name-keyed check the self-heal already
+    does catches them. The unfiltered `query_devices()` list is where they show
+    up with `max_input_channels == 0`, and that list is what the candidate
+    sweep below walks — so a sweep over it must skip them or it will try to
+    open a speaker as a microphone.
+    """
+    if not isinstance(info, dict):
+        return 0
+    # ABSENT is not ZERO. PortAudio reports `max_input_channels` on a real
+    # entry, but a stub — and sounddevice's own `default`/`pulse` proxies in
+    # some builds — can hand back a dict without the key at all. Reading a
+    # missing key as 0 invents a ghost: the two tests that pin the
+    # present-but-busy contract failed the moment this did it, because their
+    # entries carry no channel count and were reported as output-only. So an
+    # absent key means "unspecified" and is NOT evidence of a ghost; only an
+    # explicit 0 is.
+    if "max_input_channels" not in info:
+        return -1
+    try:
+        return max(0, int(info.get("max_input_channels") or 0))
+    except (TypeError, ValueError):
+        return -1
+
+
 def device_is_available(device, devices: list[dict]) -> bool:
     want = str(device).strip().casefold()
     for info in devices:
@@ -336,14 +372,39 @@ def open_input_unlocked(device, rate: int, blocksize: int, cb, *,
     owner — and `last_open` is the threading.local where the actually-opened
     device is recorded for health reporting."""
     configured = device is not None and str(device).strip()
-    devices = available_input_devices(sd, log) if configured else []
+    # `device is None` means "the system default", NOT "nothing to choose" —
+    # and those differ exactly when the default is broken. Measured 2026-09-29
+    # on the deployed copy: a stale pin self-healed to `None`, the recorder
+    # opened the bare default, and a push-to-talk turn ended `wedged=1
+    # frames=0` with the utterance discarded while two working microphones sat
+    # in the device list — because with nothing configured there was no
+    # `candidates` sweep to reach them. So the list is always gathered, and
+    # `None` becomes the LAST candidate rather than the only one.
+    devices = available_input_devices(sd, log)
     candidates = [device]
+    if not configured and devices:
+        # no pin: still prefer a real input over an unverified default, and
+        # keep the default as the final fallback
+        names = [str(info.get("name", "")) for info in devices
+                 if str(info.get("name", ""))]
+        if device is None:
+            candidates = names + [None]
+        else:
+            candidates = [device] + names
     if configured and not device_is_available(device, devices):
         log.warning("configured microphone %r is unavailable; falling back to "
                     "system default", device)
-        candidates = [None]
-        candidates.extend(str(info.get("name", "")) for info in devices
-                          if str(info.get("name", "")))
+        # Named input-capable devices first, the bare default (`None`) LAST.
+        # Measured 2026-09-29: a stale PulseAudio default can name a device
+        # that is present but dead, and opening it first is how a turn ends
+        # with `wedged=1 frames=0` — the utterance discarded — while two
+        # working microphones sat in the list behind it. No ghost filter is
+        # repeated here on purpose: `available_input_devices` above already
+        # drops the 0-channel entries, and a second, untested copy of that
+        # rule is the kind of thing that silently rots.
+        candidates = [str(info.get("name", "")) for info in devices
+                      if str(info.get("name", ""))]
+        candidates.append(None)
 
     last_error = None
     for candidate in candidates:
@@ -406,7 +467,20 @@ def mic_device_to_open(configured, audio, log) -> tuple:
     if device is None or audio is None:
         return device, False
     try:
-        audio.sd.query_devices(device, kind="input")
+        info = audio.sd.query_devices(device, kind="input")
+        # A device can be PRESENT and still be a ghost of a microphone: it
+        # enumerates, answers every query, and offers no input channels to
+        # capture with. The name-keyed ValueError below cannot see that shape,
+        # because the query SUCCEEDS — so it is checked here, on the entry the
+        # query handed back, and a zero-channel entry is treated as the
+        # absence it is. Measured 2026-09-29: pinning a mic to a playback-only
+        # endpoint passed the old check and then failed at every open.
+        if (isinstance(info, dict)
+                and can_capture_channels(info) == 0):
+            log.warning("configured microphone %r enumerates but offers no "
+                        "input channels (output-only device) — using the "
+                        "system default instead", device)
+            return None, True
     except ValueError as e:
         # ValueError is sounddevice's own "No input device matching '<name>'" —
         # a CONFIRMED absence, and the only answer that justifies standing in

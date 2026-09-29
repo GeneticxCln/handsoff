@@ -1142,6 +1142,55 @@ class TestSpeechPlaybackSerialization:
         asst._vad_speech(True)
         assert asst.state == "listening"
 
+    def test_streamed_sentence_is_played_before_its_temp_dir_is_deleted(
+            self, H, monkeypatch, tmp_path):
+        """A streamed reply must PLAY, not compute and then die.
+
+        The streaming arm of the turn synthesised each sentence into a
+        `TemporaryDirectory` and called `play_wav` one `with` block OUTSIDE it,
+        so the directory — and the wav in it — was deleted before playback
+        opened it. Measured on 2026-09-29: two sentences synthesised ("I am
+        here and ready to assist you…") and both raised FileNotFoundError, so
+        the turn answered and said nothing at all.
+
+        The fake `play_wav` below opens the path exactly as the real one does
+        (`wave.open`). A test that only asserted "play_wav was called" would
+        pass on the broken code — the call DID happen — which is why this one
+        checks the file is still there. Reverting the fix fails it with
+        FileNotFoundError rather than a syntax error.
+        """
+        import wave
+
+        a = H.Assistant.__new__(H.Assistant)
+        a._models_ready = threading.Event()
+        a._models_ready.set()
+        a._last_spoken = ""
+        a._turn_spoke = False
+        a._recently_spoken = []
+        a._handsfree = False
+        a._followup_until = 0.0
+        a._set = lambda *_args: None
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path)
+
+        def fake_tts(text, wav):
+            # a real, readable wav — the point is that it EXISTED at play time
+            with wave.open(str(wav), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(24000)
+                w.writeframes(b"\x00\x00" * 2400)
+
+        def fake_play(wav, _cancel):
+            # the real play_wav opens the file; a deleted one raises here
+            with wave.open(str(wav), "rb") as w:
+                assert w.getnframes() > 0
+
+        monkeypatch.setattr(H, "tts_to_wav", fake_tts)
+        monkeypatch.setattr(_core_audio, "play_wav", fake_play)
+
+        a._speak("hello there", 0, threading.Event())
+        assert a._turn_spoke, "the turn claimed to speak but played nothing"
+
     def test_synthesis_can_overlap_but_playback_cannot_and_cancel_skips_stale(
             self, H, monkeypatch, tmp_path):
         a = H.Assistant.__new__(H.Assistant)
@@ -3229,10 +3278,49 @@ class TestPttReleaseNonBlocking:
                 "Blue Microphones: USB Audio (hw:4,0)", 16000, 1024, lambda *_: None)
         assert isinstance(stream, _Stream)
         assert rate == 16000
-        assert opened[-1] is None, "stale configured mic should use system default"
+        # A stale pin now lands on a REAL input rather than the bare default.
+        # The default is a last resort precisely because it can name a device
+        # that is present but dead — measured 2026-09-29, where taking it
+        # first ended a turn with `wedged=1 frames=0` and the utterance thrown
+        # away while two working microphones sat in the list behind it. This
+        # test asserted the old order; the order is what changed.
+        assert opened[-1] == "SB Omni", \
+            f"a working microphone must be preferred to the default; tried {opened}"
+        assert None not in opened, \
+            "the default is not touched once a real input answers"
         assert any("Blue Microphones: USB Audio (hw:4,0)" in r.getMessage()
                    and "falling back" in r.getMessage().lower()
                    for r in caplog.records)
+
+    def test_stale_configured_mic_still_reaches_the_default_as_a_last_resort(
+            self, H, monkeypatch):
+        """Reordering must not strand a machine whose default is the only mic.
+
+        The companion to the test above: with every named input failing to
+        open, the sweep has to reach `None`, or a host whose only working
+        capture device IS the system default loses the voice entirely.
+        """
+        opened = []
+
+        class _Stream:
+            pass
+
+        def _open(**kwargs):
+            opened.append(kwargs.get("device"))
+            if kwargs.get("device") is not None:
+                raise ValueError("Cannot get card index")
+            return _Stream()
+
+        devices = [{"name": "SB Omni", "max_input_channels": 1,
+                    "default_samplerate": 48000}]
+        monkeypatch.setattr(H.sd, "InputStream", _open)
+        monkeypatch.setattr(H.sd, "query_devices", lambda *a, **k: devices)
+        stream, rate = H._open_input(
+            "Blue Microphones: USB Audio (hw:4,0)", 16000, 1024,
+            lambda *_: None)
+        assert isinstance(stream, _Stream)
+        assert opened[-1] is None, \
+            f"the default must still be reached; tried {opened}"
 
 
 class TestPttStopWorkerEdges:
@@ -4475,6 +4563,237 @@ class TestAMicrophoneThatIsNotOnTheMachine:
                 raise ValueError(f"Cannot get card index for {dev!r}")
 
         return _SD
+
+    def test_a_device_that_enumerates_with_no_input_channels_is_a_ghost(
+            self, H, monkeypatch, caplog):
+        """Present is not the same as usable: an output-only endpoint is a
+        microphone that does not exist.
+
+        PortAudio lists playback-only hardware — HDMI outputs, a USB speaker's
+        output endpoint — in the same device table as microphones. A pin to one
+        of those answers `query_devices` without raising, so the name-keyed
+        ValueError the self-heal relies on never fires, and every open then
+        fails. Measured 2026-09-29: the check had no way to see this shape, so
+        an explicit zero is now read as the absence it is.
+        """
+        class _SD:
+            @staticmethod
+            def query_devices(dev, kind=None):
+                if dev == "Speakers":        # a playback-only endpoint
+                    return {"name": dev, "max_input_channels": 0,
+                            "default_samplerate": 48000.0}
+                raise ValueError(f"Cannot get card index for {dev!r}")
+
+        monkeypatch.setattr(H._audio, "sd", _SD)
+        with caplog.at_level("WARNING", logger="handsoff"):
+            device, fell_back = H._mic_device_to_open("Speakers")
+        assert (device, fell_back) == (None, True), \
+            "a zero-channel device must be stood in for, not opened"
+        assert any("no input channels" in r.getMessage()
+                   for r in caplog.records), "and it must say why"
+
+    def test_an_absent_channel_count_is_not_treated_as_a_ghost(
+            self, H, monkeypatch):
+        """Unstated is not zero.
+
+        A dict with no `max_input_channels` key at all — which is what the
+        stubs above return, and what sounddevice's own `default`/`pulse`
+        proxies can return — says nothing about capture. Reading it as zero
+        invents a ghost and breaks the present-but-busy contract this module
+        deliberately preserves; the first version of that check did exactly
+        that and failed the two tests that pin it.
+        """
+        monkeypatch.setattr(H._audio, "sd", self._sd({"Yeti"}))
+        assert H._mic_device_to_open("Yeti") == ("Yeti", False)
+
+    def test_the_fallback_tries_a_working_microphone_before_the_bare_default(
+            self, H, monkeypatch):
+        """The stale-default wedge, and the order that fixes it.
+
+        Measured 2026-09-29: a push-to-talk turn ended `wedged=1 frames=0` —
+        the utterance thrown away — because the fallback opened the system
+        default FIRST and that default resolved to a dead device, while two
+        working microphones sat in the list behind it. Named input-capable
+        devices are therefore tried first and the bare default is the LAST
+        resort, not the first.
+        """
+        opened = []
+
+        class _SD:
+            @staticmethod
+            def query_devices(dev=None, kind=None):
+                # sounddevice's own shapes, which the stub must match: the
+                # NO-ARGUMENT call is the device LIST, `kind="input"` with no
+                # device is the DEFAULT entry, and a name/index is that one
+                # entry. Getting this wrong is what made the first run of this
+                # test open "default" first and prove nothing.
+                table = {
+                    "Yeti": {"name": "Yeti", "max_input_channels": 2,
+                             "default_samplerate": 48000.0},
+                    "HDMI": {"name": "HDMI", "max_input_channels": 0,
+                             "default_samplerate": 48000.0},
+                }
+                if dev is None and kind is None:
+                    # the real device LIST, ghosts included: filtering them is
+                    # available_input_devices' job, and this asserts the sweep
+                    # inherits that rather than opening a speaker
+                    return [table["Yeti"], table["HDMI"],
+                            {"name": "Speakers", "max_input_channels": 0,
+                             "default_samplerate": 48000.0}]
+                if dev is None:
+                    return {"name": "default", "max_input_channels": 128,
+                            "default_samplerate": 44100.0}
+                if dev in table:
+                    return table[dev]
+                raise ValueError(f"Cannot get card index for {dev!r}")
+
+            @staticmethod
+            def InputStream(**kwargs):
+                device = kwargs.get("device")
+                opened.append(device)
+                if device is None:          # the bare default is the dead one
+                    raise RuntimeError("Invalid sample rate")
+                return object()
+
+        monkeypatch.setattr(H, "sd", _SD)
+        stream, rate = H._open_input_unlocked(
+            "Pinned Mic", 16000, 1600, lambda *_a: None)
+        # The point is the ORDER, and the fact that a success stops the sweep:
+        # the working mic is reached first, so the dead default is never
+        # touched at all. Asserting the default was *tried* would be asserting
+        # a failure.
+        assert opened[0] == "Yeti", \
+            f"a working mic must be tried before the default; tried {opened}"
+        assert opened == ["Yeti"], \
+            "the bare default must not be opened once a real mic answered"
+        assert "HDMI" not in opened, \
+            "an output-only device is never opened as a microphone"
+        assert "Speakers" not in opened, \
+            "nor is another one hiding in the same list"
+        # health reads the last-opened device off the host's own record
+        assert H._MIC_LAST_OPEN_DEVICE.value == "Yeti", \
+            "the device that actually opened must be the one health reports"
+
+    def test_no_pin_still_prefers_a_real_mic_over_a_dead_default(
+            self, H, monkeypatch):
+        """`device=None` is "the system default", not "there is nothing else".
+
+        This is the shape the deployed bubble actually took on 2026-09-29: a
+        stale pin self-healed to `None`, the recorder opened the bare default,
+        and the turn ended `wedged=1 frames=0` — the utterance thrown away —
+        with two working microphones in the list. The old code read
+        "nothing configured" as "no candidates but the default", so the sweep
+        that would have found a real mic never ran.
+        """
+        opened = []
+
+        class _SD:
+            @staticmethod
+            def query_devices(dev=None, kind=None):
+                if dev is None and kind is None:
+                    return [{"name": "Yeti", "max_input_channels": 2,
+                             "default_samplerate": 48000.0},
+                            {"name": "HDMI", "max_input_channels": 0,
+                             "default_samplerate": 48000.0}]
+                if dev is None:
+                    return {"name": "default", "max_input_channels": 128,
+                            "default_samplerate": 44100.0}
+                return {"name": dev, "max_input_channels": 2,
+                        "default_samplerate": 48000.0}
+
+            @staticmethod
+            def InputStream(**kwargs):
+                device = kwargs.get("device")
+                opened.append(device)
+                if device is None:      # the default is the dead one
+                    raise RuntimeError("Invalid sample rate")
+                return object()
+
+        monkeypatch.setattr(H, "sd", _SD)
+        stream, rate = H._open_input_unlocked(None, 16000, 1600,
+                                              lambda *_a: None)
+        assert opened[0] == "Yeti", \
+            f"a real mic must win over the default even with no pin; tried {opened}"
+        assert opened == ["Yeti"], "and the dead default is never reached"
+        assert H._MIC_LAST_OPEN_DEVICE.value == "Yeti"
+
+    def test_a_device_list_of_only_ghosts_yields_no_microphone_to_open(
+            self, H, monkeypatch):
+        """The ghost filter, observed where it is the ONLY thing in play.
+
+        In the ordering test a real mic answers first and ends the sweep, so
+        the sweep never reaches a ghost and the test cannot see whether ghosts
+        were filtered or merely not visited yet — mutating the filter away
+        there still passed. Here the list holds nothing but output-only
+        hardware: if the filter does not run, `open_input_unlocked` tries to
+        open a speaker and returns it as the microphone.
+        """
+        opened = []
+
+        class _SD:
+            @staticmethod
+            def query_devices(dev=None, kind=None):
+                ghosts = [{"name": "HDMI", "max_input_channels": 0,
+                           "default_samplerate": 48000.0},
+                          {"name": "Speakers", "max_input_channels": 0,
+                           "default_samplerate": 48000.0}]
+                if dev is None and kind is None:
+                    return ghosts
+                if dev is None:
+                    raise ValueError("no default input")
+                if dev == "Pinned Mic":
+                    raise ValueError(f"Cannot get card index for {dev!r}")
+                return {"name": dev, "max_input_channels": 2,
+                        "default_samplerate": 48000.0}
+
+            @staticmethod
+            def InputStream(**kwargs):
+                opened.append(kwargs.get("device"))
+                # even the default is refused here, so the ONLY way this test
+                # can pass is if the ghosts were filtered before any open
+                raise RuntimeError("nothing opens on this machine")
+
+        monkeypatch.setattr(H, "sd", _SD)
+        with pytest.raises(Exception):
+            H._open_input_unlocked("Pinned Mic", 16000, 1600,
+                                   lambda *_a: None)
+        assert opened == [None], \
+            (f"only the bare default may be attempted; a ghost was opened "
+             f"as a microphone: {opened}")
+
+    def test_the_bare_default_is_still_the_last_resort(
+            self, H, monkeypatch):
+        """Ordering the real devices first must not REMOVE the default.
+
+        If every named candidate fails, `None` is the last thing tried, so a
+        machine whose only working input is the system default still records.
+        Dropping it would trade one dead-mic failure for a worse one.
+        """
+        opened = []
+
+        class _SD:
+            @staticmethod
+            def query_devices(dev=None, kind=None):
+                if dev is None and kind is None:
+                    return [{"name": "Ghost", "max_input_channels": 0,
+                             "default_samplerate": 48000.0}]
+                if dev is None:
+                    return {"name": "default", "max_input_channels": 128,
+                            "default_samplerate": 44100.0}
+                raise ValueError(f"Cannot get card index for {dev!r}")
+
+            @staticmethod
+            def InputStream(**kwargs):
+                opened.append(kwargs.get("device"))
+                if kwargs.get("device") is None:
+                    return object()          # the default is the only one that works
+                raise RuntimeError("Invalid sample rate")
+
+        monkeypatch.setattr(H, "sd", _SD)
+        stream, rate = H._open_input_unlocked(
+            "Pinned Mic", 16000, 1600, lambda *_a: None)
+        assert opened[-1] is None, \
+            f"the default must be the final candidate; tried {opened}"
 
     def test_a_pinned_device_that_is_gone_opens_the_system_default(
             self, H, monkeypatch):

@@ -9713,19 +9713,29 @@ class Assistant(QObject):
                 with tempfile.TemporaryDirectory(dir=str(STATE_DIR)) as td:
                     wav = Path(td) / "tts.wav"
                     tts_to_wav(sentence, wav)
-                with _ANNOUNCE_LOCK:
-                    if cancel.is_set():
-                        # Withdraw rather than leave armed: this sentence was
-                        # queued for the echo filter before synthesis (the mic
-                        # hears our own voice while it plays), so returning
-                        # without unarming it leaves the user's NEXT words
-                        # dropped as a repeat of something never said. The
-                        # non-streaming arm above has the same withdraw on its
-                        # own cancel path; measured 2026-09-27.
-                        self._unarm_speech(sentence)
-                        return
-                    log.info("saying: %s", sentence)
-                    _audio.play_wav(wav, cancel)
+                    # The playback MUST happen INSIDE this `with`. The
+                    # TemporaryDirectory deletes its tree on exit, so a
+                    # `play_wav` one level out opens a wav that no longer
+                    # exists and every streamed sentence dies with
+                    # FileNotFoundError -- the assistant computes a reply and
+                    # then says NOTHING. Measured 2026-09-29: two sentences
+                    # synthesised ("I am here to help you…") and both failed to
+                    # play, in the same shape the non-streaming arm above
+                    # already gets right by keeping _ANNOUNCE_LOCK nested.
+                    with _ANNOUNCE_LOCK:
+                        if cancel.is_set():
+                            # Withdraw rather than leave armed: this sentence
+                            # was queued for the echo filter before synthesis
+                            # (the mic hears our own voice while it plays), so
+                            # returning without unarming it leaves the user's
+                            # NEXT words dropped as a repeat of something never
+                            # said. The non-streaming arm above has the same
+                            # withdraw on its own cancel path; measured
+                            # 2026-09-27.
+                            self._unarm_speech(sentence)
+                            return
+                        log.info("saying: %s", sentence)
+                        _audio.play_wav(wav, cancel)
             except Exception as exc:
                 log.exception("TTS failed (streaming)")
                 if not announcing:
