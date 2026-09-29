@@ -1805,6 +1805,260 @@ class TestOffscreenLaunch:
                     proc.kill()
 
 
+def _offscreen_bubble_env(home: Path, state: Path) -> dict:
+    """The environment a headless launch of the real bubble needs (the same
+    switches as `test_bubble_starts_and_opens_control_socket`)."""
+    env = sandbox_env(home)
+    env.update({
+        "XDG_STATE_HOME": str(state),
+        "QT_QPA_PLATFORM": "offscreen",
+        "QT_QPA_PLATFORMTHEME": "",
+        "NO_AT_BRIDGE": "1",
+        "QT_ACCESSIBILITY": "0",
+        "OLLAMA_HOST": "http://127.0.0.1:9",
+        "HF_HUB_OFFLINE": "1",
+    })
+    for var in ("NIRI_CONFIG", "DISPLAY", "WAYLAND_DISPLAY"):
+        env.pop(var, None)
+    return env
+
+
+def _start_bubble(home: Path, state: Path):
+    """Launch the real bubble headless; wait for its control socket. Returns
+    (process, socket path, environment). The caller owns terminating it."""
+    env = _offscreen_bubble_env(home, state)
+    proc = subprocess.Popen([sys.executable, str(ROOT / "handsoff.py")], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sock = state / "handsoff" / "control.sock"
+    deadline = time.time() + 20
+    while not sock.exists() and proc.poll() is None and time.time() < deadline:
+        time.sleep(0.1)
+    log = state / "handsoff" / "handsoff.log"
+    tail = log.read_text(errors="replace")[-1500:] if log.exists() else "(no log)"
+    assert sock.exists(), f"bubble has no control socket (rc={proc.poll()}):\n{tail}"
+    return proc, sock, env
+
+
+class TestUnixAddress:
+    """`sockaddr_un.sun_path` is 108 bytes; the control socket lives under
+    STATE_DIR, so a deep HOME or XDG_STATE_HOME made `bind()` raise "AF_UNIX
+    path too long" and the bubble ran WITHOUT a control socket — no push-to-talk,
+    no live settings. Measured on the real bubble with a 130-byte state path."""
+
+    @staticmethod
+    def _deep(tmp_path: Path) -> Path:
+        deep = tmp_path / ("a" * 50) / ("b" * 50)
+        deep.mkdir(parents=True)
+        sock = deep / "control.sock"
+        assert len(os.fsencode(sock)) > 107        # the premise
+        return sock
+
+    def test_a_path_that_fits_is_passed_through_untouched(self, tmp_path):
+        import core
+        short = tmp_path / "s.sock"
+        assert len(os.fsencode(short)) <= 107
+        with core.unix_address(short) as address:
+            assert address == str(short)
+
+    def test_the_limit_is_exactly_107_bytes(self, tmp_path):
+        import core
+        pad = 107 - len(os.fsencode(tmp_path / "x"))
+        fits = tmp_path / ("x" * (pad + 1))
+        over = tmp_path / ("x" * (pad + 2))
+        assert len(os.fsencode(fits)) == 107 and len(os.fsencode(over)) == 108
+        with core.unix_address(fits) as address:
+            assert address == str(fits)
+        with core.unix_address(over) as address:
+            assert address.startswith("/proc/self/fd/")
+
+    def test_a_long_path_binds_and_connects_at_its_real_location(self, tmp_path):
+        import core
+        sock_path = self._deep(tmp_path)
+        plain = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with pytest.raises(OSError):                 # the failure being fixed
+            plain.bind(str(sock_path))
+        plain.close()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with core.unix_address(sock_path) as address:
+            server.bind(address)
+        os.chmod(sock_path, 0o600)
+        server.listen(1)
+        server.settimeout(5.0)
+        import stat as _stat
+        assert _stat.S_ISSOCK(sock_path.lstat().st_mode)   # the file is HERE
+        got = []
+        worker = threading.Thread(
+            target=lambda: got.append(server.accept()[0].recv(16)), daemon=True)
+        worker.start()
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with core.unix_address(sock_path) as address:
+            client.connect(address)
+        client.sendall(b"hello")
+        worker.join(5)
+        client.close()
+        server.close()
+        assert got == [b"hello"]
+
+    def test_the_directory_descriptor_does_not_leak(self, tmp_path):
+        import core
+        sock_path = self._deep(tmp_path)
+        before = set(os.listdir("/proc/self/fd"))
+        for _ in range(20):
+            with core.unix_address(sock_path):
+                pass
+        assert set(os.listdir("/proc/self/fd")) == before
+
+    def test_a_missing_directory_is_an_oserror_not_a_wrong_address(self, tmp_path):
+        import core
+        gone = tmp_path / ("m" * 60) / ("n" * 60) / "control.sock"
+        with pytest.raises(OSError):
+            with core.unix_address(gone):
+                pass
+
+    def test_the_settings_app_reaches_a_bubble_on_a_long_path(self, tmp_path,
+                                                              monkeypatch):
+        """Both of its call sites: the generic round trip and the "reload
+        settings" notification that Save relies on."""
+        import core
+        mod = _load("handsoff_settings_longpath", ROOT / "handsoff-settings.py")
+        sock_path = self._deep(tmp_path)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with core.unix_address(sock_path) as address:
+            server.bind(address)
+        server.listen(4)
+        server.settimeout(5.0)        # a failing run must not leave a thread hung
+        seen = []
+
+        def serve():
+            try:
+                for _ in range(2):
+                    conn, _addr = server.accept()
+                    seen.append(conn.recv(4096))
+                    conn.sendall(b"ok\n")
+                    conn.close()
+            except OSError:
+                pass
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        try:
+            monkeypatch.setattr(mod.H, "CONTROL_SOCK", sock_path)
+            assert mod._socket_command(sock_path, "level", timeout=3.0) == "ok\n"
+            assert mod.SettingsWindow._notify_bubble_reloaded() is True
+        finally:
+            worker.join(5)
+            server.close()
+        assert len(seen) == 2 and seen[0] == b"level", seen
+        assert b"reload-settings" in seen[1], seen
+
+
+class TestALongStatePathOnTheRealBubble:
+    def test_push_to_talk_reaches_a_bubble_whose_state_path_is_over_107_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="handsoff-test-") as tmp:
+            home = Path(tmp)
+            state = home / ("deep-" + "d" * 40) / ("nested-" + "n" * 40)
+            state.mkdir(parents=True)
+            assert len(os.fsencode(state / "handsoff" / "control.sock")) > 107
+            proc, sock, env = _start_bubble(home, state)
+            try:
+                out = run_driver([str(ROOT / "handsoff.py"), "--ptt", "status"],
+                                 home=home, env_extra=env,
+                                 capture_output=True, text=True, timeout=15)
+                assert out.returncode == 0, out.stderr
+                assert out.stdout.startswith("state=idle"), out.stdout
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+
+class TestStopSignalsEndTheBubbleInOrder:
+    """`systemctl stop` sends SIGTERM, whose default action ended the process on
+    the spot: `aboutToQuit`, `ControlServer.stop` and `Assistant.shutdown` never
+    ran. Ctrl-C was IGNORED outright (Python runs a handler only when the
+    interpreter gets control, and Qt's loop sits in C++). Measured against the
+    real bubble: TERM -> exit 143 with no shutdown, INT -> still running."""
+
+    @pytest.mark.parametrize("name", ["SIGTERM", "SIGINT", "SIGHUP"])
+    def test_the_bubble_exits_cleanly_and_removes_its_socket(self, name):
+        import signal as _signal
+        with tempfile.TemporaryDirectory(prefix="handsoff-test-") as tmp:
+            home = Path(tmp)
+            state = home / "state"
+            proc, sock, _env = _start_bubble(home, state)
+            log = state / "handsoff" / "handsoff.log"
+            try:
+                time.sleep(0.5)             # the handler goes in before the loop
+                proc.send_signal(getattr(_signal, name))
+                try:
+                    rc = proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    pytest.fail(f"{name} did not end the bubble within 20s")
+                text = log.read_text(errors="replace")
+                assert rc == 0, f"{name}: exit status {rc}\n{text[-1500:]}"
+                assert not sock.exists(), f"{name}: control socket left behind"
+                assert f"received {name} — shutting down" in text, text[-1500:]
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+
+
+class TestTheSignalGuardItself:
+    DRIVER = """
+import importlib.util, json, os, signal, sys
+spec = importlib.util.spec_from_file_location(
+    "handsoff_signal_driver", os.path.join(sys.argv[1], "handsoff.py"))
+mod = importlib.util.module_from_spec(spec)
+sys.modules["handsoff_signal_driver"] = mod
+spec.loader.exec_module(mod)
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+app = QApplication([])
+before_fd = signal.set_wakeup_fd(-1)
+signal.set_wakeup_fd(before_fd)
+guard = mod._SignalShutdown(app)
+QTimer.singleShot(50, lambda: os.kill(os.getpid(), signal.SIGTERM))
+rc = app.exec()
+report = {
+    "exec_rc": rc,
+    "term_is_default_again": signal.getsignal(signal.SIGTERM) == signal.SIG_DFL,
+    "hup_still_handled": callable(signal.getsignal(signal.SIGHUP)),
+    "int_still_handled": callable(signal.getsignal(signal.SIGINT)),
+}
+guard.close()
+report["wakeup_fd_restored"] = signal.set_wakeup_fd(-1) == before_fd
+print(json.dumps(report), flush=True)
+if sys.argv[2] == "again":
+    os.kill(os.getpid(), signal.SIGTERM)      # the SECOND one: must not be swallowed
+    import time; time.sleep(5)
+    print("SURVIVED", flush=True)
+"""
+
+    def _run(self, mode: str, tmp_path):
+        return run_driver(
+            ["-c", self.DRIVER, str(ROOT), mode], home=tmp_path,
+            env_extra={"QT_QPA_PLATFORM": "offscreen", "QT_QPA_PLATFORMTHEME": ""},
+            capture_output=True, text=True, timeout=60)
+
+    def test_one_signal_quits_the_loop_and_restores_what_it_took(self, tmp_path):
+        out = self._run("once", tmp_path)
+        assert out.returncode == 0, out.stderr[-1500:]
+        report = json.loads(out.stdout.strip().splitlines()[-1])
+        assert report == {
+            "exec_rc": 0, "term_is_default_again": True,
+            "hup_still_handled": True, "int_still_handled": True,
+            "wakeup_fd_restored": True}, report
+
+    def test_a_second_signal_is_not_swallowed_by_a_hung_shutdown(self, tmp_path):
+        import signal as _signal
+        out = self._run("again", tmp_path)
+        assert out.returncode == -_signal.SIGTERM, (out.returncode, out.stdout, out.stderr[-800:])
+        assert "SURVIVED" not in out.stdout
+
+
 # ------------------------------------------------------------------ settings app
 
 
