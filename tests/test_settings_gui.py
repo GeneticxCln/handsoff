@@ -4521,7 +4521,10 @@ def settings_window_fits_a_screen_and_every_tab_scrolls():
         win.tabs.setCurrentIndex(i)
         app.processEvents()
         # 1. the bar that saves is INSIDE the window on every tab
-        for label in ("Save", "Save & restart bubble", "Quit bubble"):
+        # `&&` is Qt's spelling of a literal ampersand in a button's text; a
+        # single one would be a mnemonic that eats it (see the accidental-
+        # mnemonic scenario below)
+        for label in ("Save", "Save && restart bubble", "Quit bubble"):
             btn = next(b for b in win.findChildren(QPushButton)
                        if b.text() == label)
             top = btn.mapTo(win, btn.rect().topLeft())
@@ -5069,6 +5072,64 @@ def the_live_mic_probe_closes_a_stream_whose_stop_raises():
     assert probe._stream is None
 
 
+@scenario
+def no_widget_text_carries_an_accidental_mnemonic():
+    # Qt reads `&x` in a QCheckBox, QPushButton, QGroupBox title and a
+    # QFormLayout row label as "underline x, Alt+x activates it" and DROPS the
+    # ampersand. "screenshots & schemas", "desktop & self-modify" and "Save &
+    # restart bubble" rendered as "screenshots _schemas" (seen in a screenshot of
+    # the real window under a real compositor): the ampersand the sentence needed
+    # was gone. Every such widget must spell a literal one `&&`. Nothing in this
+    # window uses a real mnemonic, so any single `&` is an accident.
+    import re as _re
+    from PySide6.QtWidgets import QAbstractButton, QGroupBox, QLabel
+    win.show()
+    app.processEvents()
+    accidental = _re.compile(r"(?<!&)&(?!&)")
+    offenders = []
+    for cls in (QAbstractButton, QGroupBox):
+        for widget in win.findChildren(cls):
+            text = widget.text() if cls is QAbstractButton else widget.title()
+            if accidental.search(text):
+                offenders.append((cls.__name__, text[:70]))
+    for label in win.findChildren(QLabel):
+        if label.buddy() is not None and accidental.search(label.text()):
+            offenders.append(("QLabel+buddy", label.text()[:70]))
+    assert not offenders, offenders
+    # and the three known titles really do carry the doubled marker (so a
+    # future edit cannot pass this by deleting the ampersand from the English)
+    texts = ([b.text() for b in win.findChildren(QAbstractButton)]
+             + [l.text() for l in win.findChildren(QLabel)])
+    for needle in ("Save && restart bubble", "desktop && self-modify",
+                   "screenshots && schemas"):
+        assert any(needle in t for t in texts), (needle, [t for t in texts if "&" in t])
+
+
+@scenario
+def every_permission_says_what_it_does_and_wraps_its_explanation():
+    # "title — description" was ONE QCheckBox text, and a QCheckBox does not
+    # wrap: the two longest — what leaves the machine when Internet knowledge or
+    # the third-party reader is switched on — ran off the right edge, so the
+    # sentence that says what is disclosed was the part clipped. The description
+    # is its own wrapped label now. Two permissions had no wording at all and
+    # showed the fallback "no description yet".
+    from PySide6.QtWidgets import QLabel
+    win.show()
+    app.processEvents()
+    assert win.perm_checks
+    for key, chk in win.perm_checks.items():
+        notes = chk.parentWidget().findChildren(QLabel)
+        assert len(notes) == 1, (key, len(notes))
+        note = notes[0]
+        assert note.wordWrap(), (key, "the explanation does not wrap")
+        assert note.text().strip() and "no description yet" not in note.text(), (
+            key, note.text())
+        assert note.text() not in chk.text(), (key, "the explanation is still in the box's label")
+    for key in ("web_access", "hosted_reader"):
+        text = win.perm_checks[key].parentWidget().findChildren(QLabel)[0].text()
+        assert "sent to" in text or "disclose" in text, (key, text)
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -5207,6 +5268,8 @@ SCENARIO_NAMES = [
     "the_mic_test_records_a_bounded_window_and_reports_the_peak",
     "quit_only_trusts_the_unit_when_it_is_the_one_running_the_bubble",
     "the_live_mic_probe_closes_a_stream_whose_stop_raises",
+    "no_widget_text_carries_an_accidental_mnemonic",
+    "every_permission_says_what_it_does_and_wraps_its_explanation",
 ]
 
 
