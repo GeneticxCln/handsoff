@@ -64,15 +64,15 @@ matching the belt's own check at call time.
 | `confirm_kill` | `run_command` | 4464 |
 | `confirm_action` | — | 4509 |
 | `start_command` | `run_command` | 4597 |
-| `job_status` | `run_command` | 4650 |
-| `handsoff_doctor` | — | 4698 |
-| `screen_elements` | `screen_access` | 4798 |
-| `click_element` | `operator` | 4820 |
-| `click_at` | `operator` | 4837 |
-| `scroll` | `operator` | 4842 |
-| `open_app` | `run_command` | 4875 |
-| `read_file` | `read_file` | 4970 |
-| `edit_file` | `edit_file` | 5014 |
+| `job_status` | `run_command` | 4657 |
+| `handsoff_doctor` | — | 4705 |
+| `screen_elements` | `screen_access` | 4805 |
+| `click_element` | `operator` | 4827 |
+| `click_at` | `operator` | 4844 |
+| `scroll` | `operator` | 4849 |
+| `open_app` | `run_command` | 4882 |
+| `read_file` | `read_file` | 4977 |
+| `edit_file` | `edit_file` | 5021 |
 
 ## Result contract
 

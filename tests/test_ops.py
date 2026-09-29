@@ -124,7 +124,7 @@ class TestTypingSelftestWiring:
         monkeypatch.setattr(H.ToolBelt, "execute",
                             lambda self, name, args: next(outs))
         monkeypatch.setattr(H.subprocess, "run",
-                            lambda *a, **k: types.SimpleNamespace(stdout=""))
+                            lambda *a, **k: types.SimpleNamespace(stdout=b""))
         monkeypatch.setattr(H.subprocess, "Popen", fake_popen)
         text = H.run_typing_selftest(belt=belt, timeout=5)
         assert "[PASS] terminal refusal" in text
@@ -173,7 +173,7 @@ class TestTypingSelftestWiring:
                             lambda self: foot_win)
         monkeypatch.setattr(H.ToolBelt, "execute", fake_execute)
         monkeypatch.setattr(H.subprocess, "run",
-                            lambda *a, **k: types.SimpleNamespace(stdout=""))
+                            lambda *a, **k: types.SimpleNamespace(stdout=b""))
         monkeypatch.setattr(H.subprocess, "Popen",
                             lambda *a, **k: types.SimpleNamespace(
                                 poll=lambda: None, terminate=lambda: None))
@@ -183,6 +183,79 @@ class TestTypingSelftestWiring:
         assert reason in row, (
             f"the FAIL row must name what refused the typing, got: {row}")
         assert "error" in row, "the result's KIND is part of the diagnosis"
+
+    def test_selftest_restores_a_clipboard_that_is_not_text(self, H, monkeypatch):
+        """The round-trip overwrites the clipboard with its token and puts the
+        old contents back. It read them as strict text, so an image (or any
+        non-UTF-8 bytes) raised, `clip_before` became None and the restore was
+        skipped — the person's clipboard ended up holding "handsoff selftest …".
+        The contents are bytes both ways now."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        editor_win = {"id": 11, "app_id": "org.gnome.TextEditor",
+                      "title": "scratch", "is_focused": True}
+        foot_win = {"id": 7, "app_id": "foot", "title": "foot",
+                    "is_focused": True}
+        image = b"\x89PNG\r\n\x1a\n\xff\xfe\x00binary"
+
+        class FakeMsg:
+            returncode = 0
+            stdout = json.dumps([foot_win, editor_win])
+
+        typed = []
+
+        def fake_execute(self, name, args):
+            if name == "type_text" and str(args.get("text", "")).startswith(
+                    "handsoff selftest"):
+                typed.append(str(args["text"]))
+                return _core_tools.ToolResult("typed 24 chars", "ok")
+            if name == "press_keys":
+                return _core_tools.ToolResult("pressed", "ok")
+            return _core_tools.ToolResult("REFUSED: terminal (foot)", "refused")
+
+        first = [True]
+        restored = []
+        timeouts = []
+
+        def fake_run(argv, **kw):
+            if argv[0] in ("wl-paste", "wl-copy"):
+                timeouts.append(kw.get("timeout"))
+            if argv[0] == "wl-paste":
+                assert not kw.get("text"), "the clipboard was read as text"
+                if first[0]:                  # what the person had copied
+                    first[0] = False
+                    return types.SimpleNamespace(stdout=image)
+                # what ctrl+a / ctrl+c put there: the token, UTF-8
+                return types.SimpleNamespace(stdout=typed[-1].encode())
+            if argv[0] == "wl-copy":
+                restored.append(kw.get("input"))
+            return types.SimpleNamespace(stdout=b"")
+
+        monkeypatch.setattr(H.ToolBelt, "_niri_msg",
+                            staticmethod(lambda *a, **k: FakeMsg()))
+        monkeypatch.setattr(H.shutil, "which",
+                            lambda n: f"/usr/bin/{n}"
+                            if n in ("foot", "gnome-text-editor") else None)
+        monkeypatch.setattr(H.ToolBelt, "_ydotool_socket",
+                            staticmethod(lambda: "/tmp/fake-ydotool.sock"))
+        monkeypatch.setattr(H.ToolBelt, "_socket_connectable",
+                            staticmethod(lambda p: True))
+        monkeypatch.setattr(H.ToolBelt, "_terminal_marker",
+                            classmethod(lambda cls, w: "foot"))
+        monkeypatch.setattr(H.ToolBelt, "_typing_guard", lambda self: foot_win)
+        monkeypatch.setattr(H.ToolBelt, "execute", fake_execute)
+        monkeypatch.setattr(H.time, "sleep", lambda s: None)
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        monkeypatch.setattr(H.subprocess, "Popen",
+                            lambda *a, **k: types.SimpleNamespace(
+                                poll=lambda: None, terminate=lambda: None))
+        text = H.run_typing_selftest(belt=belt, timeout=5)
+        assert restored == [image], (
+            "the clipboard the person had before the self-test was not put "
+            f"back byte-for-byte: {restored!r}")
+        assert "[PASS] clipboard round-trip" in text, text
+        assert timeouts == [8, 8, 8], (
+            "every clipboard call of the self-test is bounded (a wedged "
+            f"wl-paste/wl-copy must not hang it): {timeouts}")
 
     def test_ptt_selftest_runs_locally_without_bubble(self, H, monkeypatch, capsys):
         """The CLI action works when the bubble is dead (local execution,
@@ -1785,6 +1858,21 @@ class TestJournalPoweroffClassification:
                                 returncode=0, stdout="poweroff requested"))
         assert H._journalctl(["--since", "x"]) == "poweroff requested"
 
+    def test_the_journal_runner_survives_a_byte_that_is_not_utf8(
+            self, H, monkeypatch, tmp_path):
+        """The REAL runner against a real `journalctl` on PATH that prints one
+        invalid byte: a strict text decode raised UnicodeDecodeError (a
+        ValueError, not the OSError/SubprocessError the handler names) out of a
+        doctor render."""
+        fake = tmp_path / "journalctl"
+        fake.write_text(
+            "#!/bin/sh\nprintf 'Sep 22 21:39:24 host systemd[1]: Powering off "
+            "\\377 now\\n'\n")
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+        out = H._journalctl(["--since", "x"])
+        assert "Powering off" in out and out.startswith("Sep 22 21:39:24")
+
     def test_the_runner_uses_a_bounded_real_argv(self, H, monkeypatch):
         """The seam's real shape: journalctl with a since/until window and
         --no-pager — and a nonzero exit or a timeout is empty, not truth."""
@@ -1948,6 +2036,33 @@ class TestBoundedJobs:
         assert "exit code 0" in out
         assert "hello-jobs" in out
         assert announced and "exit code 0" in announced[0]
+
+    def test_a_job_that_prints_a_byte_that_is_not_utf8_still_finishes(
+            self, H, monkeypatch, tmp_path):
+        """The drainer read the job's pipe as strict UTF-8 text and took the
+        first UnicodeDecodeError for end-of-output, so it stopped reading: the
+        child then filled the 64 KB pipe and blocked in write() for the whole
+        lifetime cap. `ls` in a directory with a latin-1 filename, or `cat` of a
+        binary, is enough. The job must finish, keep the lines on either side of
+        the bad byte, and report the replacement rather than nothing."""
+        tb, announced = self._belt(H, monkeypatch)
+        blob = tmp_path / "out.txt"
+        blob.write_bytes(b"BEFORE\n\xff\xfe stray\n" + b"x" * 300_000
+                         + b"\nAFTER-THE-BAD-BYTE\n")
+        out, err = tb.execute("start_command", {"command": f"cat {blob}"})
+        assert not err, out
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            out, err = tb.execute("job_status", {})
+            assert not err, out
+            if "exit code" in out:
+                break
+            time.sleep(0.05)
+        assert "exit code 0" in out, (
+            "the job never finished — its output pipe stopped being drained "
+            f"at the first non-UTF-8 byte: {out[-300:]!r}")
+        assert "AFTER-THE-BAD-BYTE" in out, (
+            "output after the stray byte was lost")
 
     def test_completion_is_announced_exactly_once_under_concurrent_polls(
             self, H, monkeypatch):

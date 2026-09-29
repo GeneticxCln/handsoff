@@ -2132,18 +2132,22 @@ def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -
                                  f"{str(out).strip()[:160]}")
 
             # 5. ctrl+a/ctrl+c round-trip proves what landed, byte-for-byte
+            # BYTES both ways: the clipboard is whatever the person last copied
+            # — an image, a file's bytes — and a strict text decode of it raised
+            # here, leaving `clip_before` None, so the run ended by REPLACING
+            # their clipboard with the test token and never restoring it.
             try:
                 clip_before = subprocess.run(
                     ["wl-paste", "--no-newline"], capture_output=True,
-                    text=True, timeout=8).stdout or ""
+                    timeout=8).stdout or b""
             except Exception:
                 clip_before = None
             o1, e1 = belt.execute("press_keys", {"combo": "ctrl+a"})
             o2, e2 = belt.execute("press_keys", {"combo": "ctrl+c"})
             time.sleep(0.8)
             clip = subprocess.run(["wl-paste", "--no-newline"],
-                                  capture_output=True, text=True,
-                                  timeout=8).stdout
+                                  capture_output=True,
+                                  timeout=8).stdout.decode("utf-8", "replace")
             match = not e1 and not e2 and clip == token
             _selftest_check(results, "clipboard round-trip",
                             "PASS" if match else "FAIL",
@@ -2174,7 +2178,7 @@ def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -
                 # `run(capture_output=True)` waits for it — with no timeout, the
                 # restore that ends the self-test could block until something
                 # else replaced the clipboard.
-                subprocess.run(["wl-copy"], input=clip_before, text=True,
+                subprocess.run(["wl-copy"], input=clip_before,
                                stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=8)
             except Exception:
@@ -5213,8 +5217,13 @@ def _journalctl(argv: list) -> str:
     they must not die on the tool that classifies it. Bounded: a wedged
     journalctl must not hold a doctor render or a boot check."""
     try:
+        # errors="replace": the text is only ever matched for timestamps and a
+        # unit's name, and a strict decode of a journal window that holds one
+        # non-UTF-8 message raised UnicodeDecodeError — a ValueError, which the
+        # handler below does not catch — out of a doctor render.
         proc = subprocess.run(
-            ["journalctl", *argv], capture_output=True, text=True, timeout=10)
+            ["journalctl", *argv], capture_output=True, text=True,
+            errors="replace", timeout=10)
     except (OSError, subprocess.SubprocessError):
         return ""
     return proc.stdout or "" if proc.returncode == 0 else ""

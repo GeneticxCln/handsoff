@@ -4637,7 +4637,14 @@ class ToolBelt:
                 self._on_restart_pending()
             _dep().log.info('start_command: %s', _dep()._log_metadata(command, 'command'))
             try:
-                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                # errors='replace': the drainer reads this pipe as TEXT, and a strict decoder
+                # raises on the first byte that is not UTF-8 (`ls` in a directory with
+                # a latin-1 filename, `cat` of a binary, a compiler quoting mojibake).
+                # `_drain` treated that ValueError as end-of-output and STOPPED READING,
+                # so the child filled the 64 KB pipe and blocked in write() until the
+                # 30-minute lifetime cap killed it — the job never finished, and the
+                # tail (even the lines BEFORE the bad byte) came back empty.
+                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', start_new_session=True)
             except OSError as e:
                 return f'ERROR: launch failed: {e}'
             # The key is minted inside the same lock that inserts, so two
