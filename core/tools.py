@@ -1826,7 +1826,10 @@ class ToolBelt:
         if not argv:
             # refusal: no_argv_after_parse
             return (None, '', 'REFUSED: empty command', False)
-        argv[0] = os.path.expanduser(argv[0])
+        try:
+            argv[0] = os.path.expanduser(argv[0])
+        except (ValueError, UnicodeError):
+            pass          # a NUL or a lone surrogate: refused below, by name
         # `cat` is on the whitelist, so validating only the executable would
         # leave run_command a way to read exactly what read_file refuses.
         # Every argument is checked against the same secret-path predicate.
@@ -1841,6 +1844,20 @@ class ToolBelt:
                     # refusal: secret_path_read
                     return (None, '', f"REFUSED: '{part}' — {denied}. run_command "
                             f"cannot read credential stores into the conversation", False)
+        # AFTER the secret-name checks above, so a NUL-carrying `.pem` is still
+        # refused for what it names. A NUL cannot be part of any argument the
+        # kernel will take and a lone surrogate cannot be encoded into one; both
+        # made `os.path.expanduser` (`~x\x00`, `~\ud800`) or the exec itself
+        # raise ValueError/UnicodeEncodeError out of the validator, which the
+        # tool loop reported as "that is a bug in the tool" about what is a
+        # malformed command from the model (found by fuzzing the validator).
+        try:
+            cmd.encode('utf-8')
+            if '\x00' in cmd:
+                raise ValueError('NUL')
+        except (UnicodeEncodeError, ValueError):
+            # refusal: command_not_encodable
+            return (None, '', 'REFUSED: the command contains a byte that cannot be part of a program name or an argument (a NUL, or text that is not valid Unicode)', False)
         exe_base = Path(argv[0]).name
         _unblocked = ''
         if exe_base in ('git', 'cargo'):

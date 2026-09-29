@@ -220,12 +220,22 @@ class TestDryRunCoversStateChangers:
 
 
 class TestConfirmKill:
-    def test_a_recycled_pid_is_refused(self, H):
+    def test_a_recycled_pid_is_refused(self, H, monkeypatch):
         """The offer named hsoff-victim; the pid is this test's own process.
         SIGTERMing whatever recycles the number inside the 60 s window was a
-        misfire waiting for a coincidence."""
-        H._kill_offer.arm(H.ToolBelt.KILL_CONFIRM_S,
-                          pid=os.getpid(), name="hsoff-victim")
+        misfire waiting for a coincidence.
+
+        The offer is PINNED onto every path the tool reaches it by
+        (`conftest.pin_offer`). Arming `H._kill_offer` directly worked only while
+        one app module existed: once a driver test had imported a second one, the
+        tool's `_dep()` resolved to THAT module's own offer, this one was never
+        consulted, and the tool answered "the kill offer expired" — an ordering
+        dependence that the CI ordering probe (seeded by the commit SHA) hits on
+        some commits and not others, and that the previous commit's message
+        recorded as "the one remaining suite failure"."""
+        from conftest import pin_offer
+        pin_offer(H, monkeypatch, "kill").arm(
+            H.ToolBelt.KILL_CONFIRM_S, pid=os.getpid(), name="hsoff-victim")
         belt = _belt(H)
         out, err = belt.execute("confirm_kill", {"answer": "yes"})
         assert err and "recycled" in out, out
@@ -463,3 +473,24 @@ class TestAFileSomeoneElseWroteIsSearchedNotDecodedStrictly:
         unit.write_bytes(b"[Unit]\nDescription=Jos\xe9's bubble\n[Service]\nRestart=always\n")
         out = hardware._systemd({"systemd_unit_file": str(unit)})
         assert out["ok"] is True and out["auto_restart"] is True, out
+
+
+class TestAMalformedCommandIsARefusalNotABug:
+    """Fuzzing the validator (30,000 strings) found exactly one class of input
+    that made it RAISE: a NUL byte or a lone surrogate, which reached
+    `os.path.expanduser` (`~x\\x00` -> ValueError, `~\\ud800` -> UnicodeEncodeError)
+    and came back to the model as "that is a bug in the tool" about what is a
+    malformed command."""
+
+    @pytest.mark.parametrize("command", [
+        "echo a\x00b", "~nosuchuser\x00", "~root\ud800", "ls \ud800",
+        "cat /tmp/\x00", "\x00", "ls \udc80",
+    ])
+    def test_it_is_refused_by_name(self, H, command):
+        out, err = _belt(H).execute("run_command", {"command": command})
+        assert err and out.startswith("REFUSED"), (command, out)
+        assert "bug in the tool" not in out, out
+
+    def test_ordinary_unicode_is_still_a_command(self, H):
+        out, err = _belt(H).execute("run_command", {"command": "echo héllo 😀"})
+        assert not err and "héllo 😀" in out, out

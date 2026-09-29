@@ -2596,6 +2596,7 @@ class TestCommandPolicyRefusalReachability(_ReachabilityWalk):
         ("git_branch_delete", "git branch -d main", None),
         ("git_output_writes_a_file", "git log --output=/tmp/x", None),
         ("git_branch_writes", "git branch newbranch", None),
+        ("command_not_encodable", "echo a\x00b", None),
         # -- restart: the three refusals that share one identity rule
         ("self_restart_disabled", "handsoff-restart", "_restart_disabled"),
         ("restart_script_missing", "@missing", "_restart_missing"),
