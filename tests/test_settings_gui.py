@@ -4072,8 +4072,15 @@ def the_live_probe_gate_captures_and_transcribes_a_utterance():
     # fake installed afterwards races the real whisper — which is what made this
     # scenario assert against a transcript the real model had produced.
     results = {"n": 0}
+    # The fake HOLDS its answer until the main thread has looked at the event the
+    # capture itself wrote. It used to return at once, and the worker it starts
+    # then raced the assertion below: when the worker won, "speech captured" had
+    # already been overwritten by "transcribed" and the scenario failed with
+    # `AssertionError: transcribed` (2 runs in 20, alone, on an idle machine).
+    answer_may_land = _th.Event()
 
     def fake_transcribe(audio):
+        answer_may_land.wait(30)
         results["n"] += 1
         return f"heard {results['n']}"
 
@@ -4092,6 +4099,7 @@ def the_live_probe_gate_captures_and_transcribes_a_utterance():
     for _ in range(16):                     # hangover elapses → captured
         probe._on_frames(quiet, object(), 234)
     assert "speech captured" in probe._last_event, probe._last_event
+    answer_may_land.set()
 
     # the whisper worker: success, then failure, then supersession. Each wait
     # JOINS the worker instead of polling a wall clock: a 5-second deadline

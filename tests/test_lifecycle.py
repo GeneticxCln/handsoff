@@ -1805,11 +1805,10 @@ class TestOffscreenLaunch:
                     proc.kill()
 
 
-def _offscreen_bubble_env(home: Path, state: Path) -> dict:
-    """The environment a headless launch of the real bubble needs (the same
-    switches as `test_bubble_starts_and_opens_control_socket`)."""
-    env = sandbox_env(home)
-    env.update({
+def _offscreen_bubble_switches(state: Path) -> dict:
+    """What a headless launch of the real bubble needs ON TOP of the sandbox
+    (the same switches as `test_bubble_starts_and_opens_control_socket`)."""
+    return {
         "XDG_STATE_HOME": str(state),
         "QT_QPA_PLATFORM": "offscreen",
         "QT_QPA_PLATFORMTHEME": "",
@@ -1817,16 +1816,21 @@ def _offscreen_bubble_env(home: Path, state: Path) -> dict:
         "QT_ACCESSIBILITY": "0",
         "OLLAMA_HOST": "http://127.0.0.1:9",
         "HF_HUB_OFFLINE": "1",
-    })
-    for var in ("NIRI_CONFIG", "DISPLAY", "WAYLAND_DISPLAY"):
-        env.pop(var, None)
-    return env
+    }
 
 
 def _start_bubble(home: Path, state: Path):
     """Launch the real bubble headless; wait for its control socket. Returns
-    (process, socket path, environment). The caller owns terminating it."""
-    env = _offscreen_bubble_env(home, state)
+    (process, socket path, environment). The caller owns terminating it.
+
+    The sandbox is applied HERE, at the launch, because the guard in
+    test_sandbox.py wants every function that builds a python child to reach
+    `sandbox_env`/`run_driver` itself — a child whose HOME is the developer's
+    reads and writes their real config."""
+    env = sandbox_env(home)
+    env.update(_offscreen_bubble_switches(state))
+    for var in ("NIRI_CONFIG", "DISPLAY", "WAYLAND_DISPLAY"):
+        env.pop(var, None)
     proc = subprocess.Popen([sys.executable, str(ROOT / "handsoff.py")], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     sock = state / "handsoff" / "control.sock"
