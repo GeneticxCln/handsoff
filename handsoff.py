@@ -3355,29 +3355,33 @@ def _start_stream_owned(stream) -> None:
 
 
 class Recorder(_audio.Recorder):
-    """Recorder using the application-wide PortAudio ownership guard."""
+    """Recorder using the application-wide PortAudio ownership guard.
 
-    def start(self) -> None:
-        self._frames = []
-        self._samples = 0
-        self._stream, self._native_rate = _open_input(
-            self._device, SAMPLE_RATE, 1024, self._cb)
+    It binds the three seams `core.audio.Recorder` exposes and NOTHING ELSE:
+    `start()` and `stop()` are the base class's, so what the base is tested for
+    (a superseded stream is closed, a stream whose start failed is closed, the
+    buffer is reset and drained under its lock) is what production runs. This
+    class used to override both methods whole, and every one of those guards
+    was missing from the copy that actually ran.
+    """
+
+    def _open_stream(self) -> tuple:
+        stream, rate = _open_input(self._device, SAMPLE_RATE, 1024, self._cb)
+        # Remember the device that ACTUALLY opened (a self-healed pin), so the
+        # next open of this recorder starts from what worked.
         selected = getattr(_MIC_LAST_OPEN_DEVICE, "value", self._device)
         if selected is not None:
             self._device = selected
-        _start_stream_owned(self._stream)
+        return stream, rate
 
-    def stop(self):
-        stream, self._stream = self._stream, None
-        if stream is not None:
-            try:
-                _stop_stream_owned(stream)
-            except Exception:
-                log.exception("failed to close input stream")
-        if not self._frames:
-            return None
-        audio = np.concatenate(self._frames).reshape(-1)
-        return _audio._resample_to_16k(audio, getattr(self, "_native_rate", SAMPLE_RATE))
+    def _start_stream(self, stream) -> None:
+        _start_stream_owned(stream)
+
+    def _teardown_stream(self, stream) -> None:
+        try:
+            _stop_stream_owned(stream)
+        except Exception:
+            log.exception("failed to close input stream")
 
 
 def _stop_recorder_bounded(rec, timeout: float = 3.0):

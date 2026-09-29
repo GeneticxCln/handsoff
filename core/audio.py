@@ -150,18 +150,32 @@ class Recorder:
             self._frames = []
             self._samples = 0
             self._level = 0.0
-        self._stream, self._native_rate = _open_input(
-            self._device, SAMPLE_RATE, 1024, self._cb)
+        self._stream, self._native_rate = self._open_stream()
         try:
-            self._stream.start()
+            self._start_stream(self._stream)
         except BaseException:
             self._close_stream()
             raise
 
-    def _close_stream(self) -> None:
-        stream, self._stream = self._stream, None
-        if stream is None:
-            return
+    # The three seams a host binds. The host owns process-wide PortAudio (one
+    # lock serialises every construction and teardown, and it decides which
+    # device to try), so it overrides HOW a stream is opened, started and torn
+    # down — and nothing else. It used to override `start` and `stop` WHOLE,
+    # which silently discarded everything this class had been hardened with:
+    # closing a superseded stream, closing a stream whose start failed (a
+    # device that vanishes between open and start left the PortAudio stream open
+    # for the life of the process — sounddevice has no finalizer), the locked
+    # buffer reset and the drained snapshot. The tests drove THIS class, so all
+    # of that passed while the production subclass ran none of it.
+    def _open_stream(self) -> tuple:
+        """`(stream, native_rate)` for this recorder's device."""
+        return _open_input(self._device, SAMPLE_RATE, 1024, self._cb)
+
+    def _start_stream(self, stream) -> None:
+        stream.start()
+
+    def _teardown_stream(self, stream) -> None:
+        """Stop and release one stream, each step guarded on its own."""
         # Separate guards: stop() can fail on a stream the device already
         # dropped, and the close() that releases it used to sit in the SAME
         # try — skipped when stop() raised, leaking the PortAudio stream the
@@ -174,6 +188,12 @@ class Recorder:
             stream.close()
         except Exception:
             log.exception("failed to close input stream")
+
+    def _close_stream(self) -> None:
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
+        self._teardown_stream(stream)
 
     def _cb(self, indata, frames, time_info, status) -> None:
         if status:

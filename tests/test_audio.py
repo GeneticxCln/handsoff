@@ -4284,6 +4284,38 @@ class TestAudioFailurePaths:
         assert first in closed, "the superseded stream was dropped, not closed"
         assert closed.count(first) == 1
 
+    def test_recorder_default_seams_open_at_the_capture_blocksize_and_start_the_stream(self, H):
+        # The base class's own seams (what a host that binds none of them gets):
+        # the device and 16 kHz are asked for, at the 1024-frame block the
+        # level meter and the 16 kHz resampler are sized for, and the stream
+        # that was opened is the one that is started.
+        mod = _load("core_audio_recorder_seams", HERE / "core" / "audio.py")
+        opened, started = [], []
+
+        class _Stream:
+            def start(self):
+                started.append(self)
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        def _open(device, rate, blocksize, cb):
+            opened.append((device, rate, blocksize, cb))
+            return _Stream(), 44100
+
+        mod._open_input = _open
+        rec = mod.Recorder(device="USB Mic", on_level=lambda v: None)
+        rec.start()
+        assert len(opened) == 1
+        device, rate, blocksize, cb = opened[0]
+        assert (device, rate, blocksize) == ("USB Mic", mod.SAMPLE_RATE, 1024)
+        assert cb == rec._cb
+        assert started == [rec._stream], "the opened stream was never started"
+        assert rec._native_rate == 44100
+
     def test_open_input_chains_the_original_error(self, H):
         mod = _load("core_audio_open_fail", HERE / "core" / "audio.py")
         first = OSError("device busy")
@@ -4303,6 +4335,119 @@ class TestAudioFailurePaths:
             mod._open_input(None, 16000, 1024, lambda *a: None)
         assert ei.value is second
         assert ei.value.__cause__ is first, "the real cause was discarded"
+
+
+class TestTheHostRecorderRunsTheHardenedLifecycle:
+    """`handsoff.Recorder` is the class production records with, and it used to
+    override `start()` and `stop()` WHOLE — dropping every guard the base class
+    (`core.audio.Recorder`) was tested for. The base-class tests passed while
+    the subclass that actually ran had none of it. It now binds the three
+    stream seams and inherits the lifecycle, so these drive the HOST class."""
+
+    class _Stream:
+        def __init__(self, start_raises=None):
+            self.calls = []
+            self._start_raises = start_raises
+
+        def start(self):
+            self.calls.append("start")
+            if self._start_raises is not None:
+                raise self._start_raises
+
+        def stop(self):
+            self.calls.append("stop")
+
+        def close(self):
+            self.calls.append("close")
+
+    def _rec(self, H, monkeypatch, streams):
+        it = iter(streams)
+        monkeypatch.setattr(H, "_open_input",
+                            lambda device, rate, bs, cb: (next(it), rate))
+        return H.Recorder(on_level=lambda v: None)
+
+    def test_the_host_recorder_no_longer_overrides_start_or_stop(self, H):
+        # The structural pin: the two methods the base hardened are the base's.
+        import core.audio as A
+        assert "start" not in vars(H.Recorder) and "stop" not in vars(H.Recorder), (
+            "the host Recorder overrides start()/stop() again — the base "
+            "class's guards (close a superseded/failed stream, locked buffer "
+            "reset, drained snapshot) stop applying to the class that runs")
+        assert H.Recorder.start is A.Recorder.start
+        assert H.Recorder.stop is A.Recorder.stop
+
+    def test_a_second_start_closes_the_stream_it_supersedes(self, H, monkeypatch):
+        first, second = self._Stream(), self._Stream()
+        rec = self._rec(H, monkeypatch, [first, second])
+        rec.start()
+        rec.start()                       # a press with no stop between
+        assert "close" in first.calls, (
+            "the superseded PortAudio stream was dropped, not closed — "
+            "sounddevice has no finalizer, so the device stays open")
+        assert first.calls.count("close") == 1
+        assert rec._stream is second
+
+    def test_a_start_that_fails_closes_the_stream_it_opened(self, H, monkeypatch):
+        # A device that vanishes between open and start: the stream exists,
+        # start() raises, and nobody held the reference to close it.
+        broken = self._Stream(start_raises=OSError("device vanished"))
+        rec = self._rec(H, monkeypatch, [broken])
+        with pytest.raises(OSError, match="device vanished"):
+            rec.start()
+        assert "close" in broken.calls, (
+            "a stream whose start failed was left open for the life of the process")
+        assert rec._stream is None
+
+    def test_start_resets_the_buffer_and_stop_drains_it(self, H, monkeypatch):
+        rec = self._rec(H, monkeypatch, [self._Stream(), self._Stream()])
+        rec._frames = [np.ones(16, dtype=np.float32)]     # left by an earlier take
+        rec._samples = 16
+        rec._level = 0.9
+        rec.start()
+        assert rec._frames == [] and rec._samples == 0 and rec._level == 0.0
+        rec._frames.append(np.zeros(160, dtype=np.float32))
+        rec._samples = 160
+        assert rec.stop() is not None
+        assert rec._frames == [] and rec._samples == 0, (
+            "stop() left the take in the buffer, so the next press would have "
+            "prefixed it to a fresh recording")
+        assert rec.stop() is None
+
+    def test_a_pinned_device_that_healed_is_remembered(self, H, monkeypatch):
+        rec = self._rec(H, monkeypatch, [self._Stream()])
+        rec._device = "stale (hw:4,0)"
+        H._MIC_LAST_OPEN_DEVICE.value = "USB Mic (hw:3,0)"
+        try:
+            rec.start()
+        finally:
+            H._MIC_LAST_OPEN_DEVICE.value = None
+        assert rec._device == "USB Mic (hw:3,0)"
+
+    def test_teardown_still_goes_through_the_process_wide_mic_lock(self, H, monkeypatch):
+        import core.audio as A
+        seen = []
+
+        def _held_by_someone_else() -> bool:
+            # An RLock has no locked(); a second thread failing a non-blocking
+            # acquire is the observable form of "the caller holds it".
+            got = []
+            t = threading.Thread(target=lambda: got.append(
+                A.MIC_OPERATION_LOCK.acquire(blocking=False)))
+            t.start()
+            t.join(2)
+            if got and got[0]:
+                A.MIC_OPERATION_LOCK.release()
+            return not got[0]
+
+        s = self._Stream()
+        real = s.stop
+        s.stop = lambda: (seen.append(_held_by_someone_else()), real())[1]
+        rec = self._rec(H, monkeypatch, [s])
+        rec.start()
+        rec.stop()
+        assert seen == [True], (
+            "the host must tear a stream down while holding the mic-operation "
+            "lock — that is its whole reason to subclass")
 
 
 class TestWatchdogReopenLoop:
