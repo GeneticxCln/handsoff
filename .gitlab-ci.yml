@@ -394,7 +394,15 @@ mutation:
     PY_VERSION: "3.12"
   script:
     - *desk_python
-    - pip install pytest
+    - *qt_deps
+    # The full manifest, not just pytest: the gate's first act is to run the
+    # shipped tests on the committed tree and refuse to score when that baseline
+    # is red, and with no numpy it dies at conftest.py:25. This job only ever
+    # passed because the desk's warm per-version venv already held what the
+    # suite jobs had installed (the GitHub mirror, on a fresh runner, could not
+    # get away with it). A no-op when the environment is already satisfied.
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt -c requirements-lock.txt
     - python ci/mutation_gate.py --base HEAD~1
 
 # The docs link gate (ci/gates.sh `links`, ci/link_check.py). A heading link

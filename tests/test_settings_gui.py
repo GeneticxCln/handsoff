@@ -4521,7 +4521,10 @@ def settings_window_fits_a_screen_and_every_tab_scrolls():
         win.tabs.setCurrentIndex(i)
         app.processEvents()
         # 1. the bar that saves is INSIDE the window on every tab
-        for label in ("Save", "Save & restart bubble", "Quit bubble"):
+        # `&&` is Qt's spelling of a literal ampersand in a button's text; a
+        # single one would be a mnemonic that eats it (see the accidental-
+        # mnemonic scenario below)
+        for label in ("Save", "Save && restart bubble", "Quit bubble"):
             btn = next(b for b in win.findChildren(QPushButton)
                        if b.text() == label)
             top = btn.mapTo(win, btn.rect().topLeft())
@@ -4904,6 +4907,229 @@ def a_schema_key_with_no_control_survives_a_save():
     assert win.cfg["command_policy"].get(orphan) == "DENY"
 
 
+@scenario
+def a_bom_settings_file_is_read_by_the_window():
+    # The bubble reads settings.json as utf-8-sig, so a file saved by an editor
+    # that writes a BOM is the user's real settings THERE. The window read it as
+    # plain utf-8: json.loads choked on the BOM, the fallback was {}, and the
+    # window showed defaults — a Save from it then replaced the real file with
+    # defaults plus the one edit made.
+    settings_file.write_bytes(b"\\xef\\xbb\\xbf" + json.dumps(
+        {"model": "bommodel:latest", "mic_threshold": 731}).encode("utf-8"))
+    win.reload_from_disk()
+    assert win.cfg["model"] == "bommodel:latest", win.cfg.get("model")
+    assert win.cfg["mic_threshold"] == 731, win.cfg.get("mic_threshold")
+
+
+@scenario
+def the_decision_log_viewer_survives_a_torn_last_line():
+    # A power cut can leave decisions.jsonl cut mid-character. The viewer read
+    # it as strict UTF-8 and caught only OSError, so the UnicodeDecodeError (a
+    # ValueError) escaped a Qt slot. It skips a line it cannot parse; a torn
+    # tail is one skipped row.
+    good = json.dumps({"id": "1", "ts": "2026-09-29T10:00:00", "tool": "run_command",
+                       "target": "echo", "decision": "ALLOW", "result": "ok"})
+    bubble.DECISIONS_FILE.write_bytes(
+        good.encode("utf-8") + b"\\n" + b'{"id": "2", "target": "caf\\xc3')
+    win._refresh_decisions()
+    text = win.decisions_view.toPlainText()
+    assert "1 decisions" in text, text
+    assert "run_command" in text, text
+
+
+@scenario
+def the_mic_test_records_a_bounded_window_and_reports_the_peak():
+    # The Test-microphone button holds a stream open for a fixed window and
+    # reports the loudest block. The window is timed on the MONOTONIC clock (a
+    # wall-clock step during it would end the test early or hold the stream open
+    # for hours), and the fake clock here advances half a second per reading so
+    # the count of waits is exact: three seconds is five sleeps, and a loop that
+    # runs one more or one fewer is a window of the wrong length.
+    import types as _types
+    import numpy as _np
+    readings = {"n": 0}
+    sleeps = []
+
+    class _Clock:
+        @staticmethod
+        def monotonic():
+            value = readings["n"] * 0.5
+            readings["n"] += 1
+            return value
+
+        @staticmethod
+        def sleep(seconds):
+            sleeps.append(seconds)
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    opened = []
+
+    class _Stream:
+        def __init__(self, **kw):
+            opened.append(kw)
+            self._cb = kw["callback"]
+
+        def __enter__(self):
+            self._cb(_np.full((1024, 1), 100, dtype=_np.int16), 1024, None, None)
+            self._cb(_np.full((1024, 1), 900, dtype=_np.int16), 1024, None, None)
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    settings_app.time = _Clock()
+    settings_app.sd = _types.SimpleNamespace(InputStream=_Stream)
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    win.mic_threshold.setValue(700)
+    win.test_mic()
+    deadline = time.time() + 10
+    while not win.mic_test_btn.isEnabled() and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    assert win.mic_test_btn.isEnabled(), "the mic test never finished"
+    assert len(opened) == 1 and opened[0]["samplerate"] == 16000, opened
+    assert len(sleeps) == 5, (
+        f"a 3-second window on a half-second clock is five waits, got {len(sleeps)}")
+    text = win.status_label.text()
+    assert "mic peak 900" in text and "good signal" in text, text
+
+
+@scenario
+def quit_only_trusts_the_unit_when_it_is_the_one_running_the_bubble():
+    # `systemctl stop` on a loaded but INACTIVE unit exits 0, and the installer
+    # always writes the unit. A bubble started by hand (or by niri's
+    # spawn-at-startup) therefore "stopped" through the unit — the message said
+    # so — and kept running. The unit is stopped only when it is active; every
+    # other case sweeps the processes.
+    calls = []
+    state = {"active": False}
+
+    class _R:
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    timeouts = {}
+
+    def fake_run(argv, **kw):
+        calls.append(list(argv))
+        timeouts[argv[2] if argv[0] == "systemctl" else argv[0]] = kw.get("timeout")
+        if argv[:3] == ["systemctl", "--user", "is-active"]:
+            return _R(0 if state["active"] else 3)
+        if argv[:3] == ["systemctl", "--user", "stop"]:
+            return _R(0)               # succeeds on an inactive unit too
+        if argv[0] == "pgrep":
+            return _R(1, "")
+        return _R(1)
+
+    settings_app.subprocess.run = fake_run
+
+    def quit_and_read():
+        win._status("")
+        win._on_quit_bubble()
+        deadline = time.time() + 10
+        while not win.status_label.text() and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.02)
+        return win.status_label.text()
+
+    def stops():
+        return [c for c in calls if c[:3] == ["systemctl", "--user", "stop"]]
+
+    msg = quit_and_read()                       # started by hand: unit inactive
+    assert msg == "stopped 0 bubble process(es)", msg
+    assert not stops(), calls
+    assert any(c[0] == "pgrep" for c in calls), calls
+    calls.clear()
+    state["active"] = True                      # the unit is running the bubble
+    msg = quit_and_read()
+    assert msg == "bubble stopped (systemd unit)", msg
+    assert len(stops()) == 1 and not any(c[0] == "pgrep" for c in calls), calls
+    # every call is bounded (a wedged systemctl must not park the worker)
+    assert timeouts == {"is-active": 10, "stop": 15, "pgrep": 10}, timeouts
+
+
+@scenario
+def the_live_mic_probe_closes_a_stream_whose_stop_raises():
+    # A stream the device already dropped raises from stop(). The close() sat in
+    # the same try and was skipped, so the PortAudio stream stayed open.
+    probe = settings_app._LiveMicProbe()
+    calls = []
+
+    class Stream:
+        def stop(self):
+            calls.append("stop")
+            raise RuntimeError("device unplugged")
+
+        def close(self):
+            calls.append("close")
+
+    probe._stream = Stream()
+    probe._close_stream()
+    assert calls == ["stop", "close"], calls
+    assert probe._stream is None
+
+
+@scenario
+def no_widget_text_carries_an_accidental_mnemonic():
+    # Qt reads `&x` in a QCheckBox, QPushButton, QGroupBox title and a
+    # QFormLayout row label as "underline x, Alt+x activates it" and DROPS the
+    # ampersand. "screenshots & schemas", "desktop & self-modify" and "Save &
+    # restart bubble" rendered as "screenshots _schemas" (seen in a screenshot of
+    # the real window under a real compositor): the ampersand the sentence needed
+    # was gone. Every such widget must spell a literal one `&&`. Nothing in this
+    # window uses a real mnemonic, so any single `&` is an accident.
+    import re as _re
+    from PySide6.QtWidgets import QAbstractButton, QGroupBox, QLabel
+    win.show()
+    app.processEvents()
+    accidental = _re.compile(r"(?<!&)&(?!&)")
+    offenders = []
+    for cls in (QAbstractButton, QGroupBox):
+        for widget in win.findChildren(cls):
+            text = widget.text() if cls is QAbstractButton else widget.title()
+            if accidental.search(text):
+                offenders.append((cls.__name__, text[:70]))
+    for label in win.findChildren(QLabel):
+        if label.buddy() is not None and accidental.search(label.text()):
+            offenders.append(("QLabel+buddy", label.text()[:70]))
+    assert not offenders, offenders
+    # and the three known titles really do carry the doubled marker (so a
+    # future edit cannot pass this by deleting the ampersand from the English)
+    texts = ([b.text() for b in win.findChildren(QAbstractButton)]
+             + [l.text() for l in win.findChildren(QLabel)])
+    for needle in ("Save && restart bubble", "desktop && self-modify",
+                   "screenshots && schemas"):
+        assert any(needle in t for t in texts), (needle, [t for t in texts if "&" in t])
+
+
+@scenario
+def every_permission_says_what_it_does_and_wraps_its_explanation():
+    # "title — description" was ONE QCheckBox text, and a QCheckBox does not
+    # wrap: the two longest — what leaves the machine when Internet knowledge or
+    # the third-party reader is switched on — ran off the right edge, so the
+    # sentence that says what is disclosed was the part clipped. The description
+    # is its own wrapped label now. Two permissions had no wording at all and
+    # showed the fallback "no description yet".
+    from PySide6.QtWidgets import QLabel
+    win.show()
+    app.processEvents()
+    assert win.perm_checks
+    for key, chk in win.perm_checks.items():
+        notes = chk.parentWidget().findChildren(QLabel)
+        assert len(notes) == 1, (key, len(notes))
+        note = notes[0]
+        assert note.wordWrap(), (key, "the explanation does not wrap")
+        assert note.text().strip() and "no description yet" not in note.text(), (
+            key, note.text())
+        assert note.text() not in chk.text(), (key, "the explanation is still in the box's label")
+    for key in ("web_access", "hosted_reader"):
+        text = win.perm_checks[key].parentWidget().findChildren(QLabel)[0].text()
+        assert "sent to" in text or "disclose" in text, (key, text)
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -5037,6 +5263,13 @@ SCENARIO_NAMES = [
     "live_apply_persists_only_appearance_keys",
     "a_save_names_the_sticky_keys_that_wait",
     "float_spin_fields_keep_their_fractions",
+    "a_bom_settings_file_is_read_by_the_window",
+    "the_decision_log_viewer_survives_a_torn_last_line",
+    "the_mic_test_records_a_bounded_window_and_reports_the_peak",
+    "quit_only_trusts_the_unit_when_it_is_the_one_running_the_bubble",
+    "the_live_mic_probe_closes_a_stream_whose_stop_raises",
+    "no_widget_text_carries_an_accidental_mnemonic",
+    "every_permission_says_what_it_does_and_wraps_its_explanation",
 ]
 
 

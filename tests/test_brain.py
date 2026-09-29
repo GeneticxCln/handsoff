@@ -415,6 +415,96 @@ class TestTheSentenceSplitter:
             f"{result['content']!r} vs {reply!r}")
         assert list(q.queue)[-1] is None
 
+    _CHUNKING_CORPUS = _LOSSLESS_CORPUS + (
+        "It's 18.5 degrees and 3.2 inches of rain.",
+        "Visit example.com or a.b.c now.",
+        "Really?! Yes... maybe. Okay!",
+        "Price is $4.99. Tax is 0.5%.",
+    )
+
+    @pytest.mark.parametrize("reply", _CHUNKING_CORPUS)
+    def test_the_sentences_do_not_depend_on_where_the_stream_was_cut(
+            self, brain, reply):
+        """The same reply, cut at EVERY position, is the same sentences.
+
+        The stream arrives a token at a time and a tokenizer emits "." on its
+        own ("It's 18", ".", "5 degrees"), so a full stop that is the last thing
+        in the buffer cannot be told from a decimal point, a version number, a
+        domain or the first half of "?!" / "...". The splitter used to take the
+        end of the buffer as a boundary: the reply "It's 18.5 degrees" was
+        spoken as "It's 18." and then "5 degrees", and which reply the user heard
+        depended on the network. The word-conservation test above cannot see it
+        (the words are all there); the SENTENCES are what differ.
+        """
+        def sentences(pieces):
+            q: queue.Queue = queue.Queue()
+            _stream(brain, q, _ok_stream(*[_chunk(p) for p in pieces]))
+            return _spoken(q)
+
+        whole = sentences([reply])
+        diverged = [
+            (i, sentences([reply[:i], reply[i:]]))
+            for i in range(1, len(reply))
+            if sentences([reply[:i], reply[i:]]) != whole]
+        assert not diverged, (
+            f"{reply!r} is {whole} whole, but cut in two it is {diverged[:3]}")
+        # and one character at a time, the worst case a token stream can be
+        assert sentences(list(reply)) == whole
+
+    def test_a_decimal_split_across_tokens_is_spoken_whole(self, brain):
+        q: queue.Queue = queue.Queue()
+        _stream(brain, q, _ok_stream(*[
+            _chunk(p) for p in ("It's 18", ".", "5 degrees today", ".")]))
+        assert _spoken(q) == ["It's 18.5 degrees today."], _spoken(q)
+
+    @staticmethod
+    def _dies_after(*pieces, cancel=None):
+        class _Dies:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(self):
+                for piece in pieces:
+                    yield _chunk(piece)
+                if cancel is not None:
+                    cancel.set()          # the barge-in lands as the socket dies
+                raise OSError(104, "Connection reset by peer")
+        return lambda req, timeout=None: _Dies()
+
+    def test_a_stream_that_dies_after_a_finished_sentence_still_says_it(self, brain):
+        """The splitter holds a full stop that is the last thing in the buffer
+        until the next token's leading space settles it — so a stream that dies
+        right there used to lose a sentence the model had finished, and the
+        user heard the apology instead of the answer."""
+        q: queue.Queue = queue.Queue()
+        with pytest.raises(OSError):
+            _stream(brain, q, self._dies_after("Berlin is in Germany", "."))
+        assert list(q.queue) == ["Berlin is in Germany.", None], list(q.queue)
+
+    def test_a_stream_that_dies_mid_sentence_says_no_fragment(self, brain):
+        q: queue.Queue = queue.Queue()
+        with pytest.raises(OSError):
+            _stream(brain, q, self._dies_after("Berlin is in Germany. It has", " three"))
+        assert list(q.queue) == ["Berlin is in Germany.", None], list(q.queue)
+
+    def test_a_barge_in_then_a_dying_stream_says_nothing_more(self, brain):
+        q: queue.Queue = queue.Queue()
+        cancel = threading.Event()
+        with pytest.raises(OSError):
+            _stream(brain, q, self._dies_after("Berlin is in Germany", ".",
+                                               cancel=cancel), cancel=cancel)
+        assert list(q.queue) == [None], list(q.queue)
+
+    def test_a_reply_that_ends_on_a_full_stop_is_still_spoken(self, brain):
+        """The terminator that ends the stream has no whitespace after it; the
+        end-of-stream flush is what says it."""
+        q: queue.Queue = queue.Queue()
+        _stream(brain, q, _ok_stream(_chunk("Done"), _chunk(".")))
+        assert list(q.queue) == ["Done.", None], list(q.queue)
+
     def test_a_sentence_holding_several_chunks_is_spoken_once_it_is_whole(
             self, brain):
         q: queue.Queue = queue.Queue()
@@ -967,6 +1057,52 @@ class TestTheFailureSpeaks:
             "the failure was logged without a traceback: %s"
             % [(r.getMessage(), r.exc_info) for r in caplog.records])
         assert list(q.queue)[-1] is None
+
+
+class TestAnErrorInsideTheStream:
+    """Ollama reports a failure that happens AFTER it sent the 200 (the runner
+    died, the model ran out of memory) as a line of the stream — `{"error":
+    "..."}` — not as an HTTP status. Nothing looked for it: the line has no
+    `message`, so it was skipped, the reply ended as if the model had finished,
+    and the turn was recorded and spoken as complete (measured 2026-09-29: a
+    reply cut at "And then" was said and kept; an error before the first word
+    came back as an empty answer with its cause discarded)."""
+
+    ERROR = b'{"error": "llama runner process has terminated: exit status 2"}\n'
+
+    def test_an_error_after_some_words_is_raised_not_swallowed(self, brain):
+        q: queue.Queue = queue.Queue()
+        with pytest.raises(RuntimeError) as ei:
+            _stream(brain, q, _ok_stream(_chunk("The answer is 42. And then "),
+                                         self.ERROR))
+        assert "llama runner process has terminated" in str(ei.value)
+        assert _spoken(q) == ["The answer is 42."], (
+            "what arrived before the failure has been heard already, and the "
+            "half sentence after it must not be spoken as if it were finished")
+        assert list(q.queue)[-1] is None, "exactly one terminator, still"
+
+    def test_an_error_before_the_first_word_names_its_cause(self, brain):
+        q: queue.Queue = queue.Queue()
+        with pytest.raises(RuntimeError) as ei:
+            _stream(brain, q, _ok_stream(
+                b'{"error": "model requires more system memory than is '
+                b'available"}\n'))
+        assert "more system memory" in str(ei.value)
+        assert list(q.queue) == [None]
+
+    def test_lines_that_are_not_objects_are_noise_not_a_crash(self, brain):
+        q: queue.Queue = queue.Queue()
+        out = _stream(brain, q, _ok_stream(b"null\n", b"[1, 2]\n", b'"text"\n',
+                                           b"7\n", _chunk("Fine. ")))
+        assert _spoken(q) == ["Fine."]
+        assert out["content"] == "Fine."
+
+    def test_an_empty_error_field_is_not_an_error(self, brain):
+        """A chunk that carries `"error": ""` or null alongside a message."""
+        q: queue.Queue = queue.Queue()
+        line = (json.dumps({"message": {"role": "assistant", "content": "Ok. "},
+                            "error": ""}) + "\n").encode("utf-8")
+        assert _stream(brain, q, _ok_stream(line))["content"] == "Ok."
 
 
 class TestTheRequestItSends:

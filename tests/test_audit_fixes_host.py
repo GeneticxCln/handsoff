@@ -42,6 +42,26 @@ class TestTheLayaTurnsStore:
             encoding="utf-8"))
         assert cursor.get("lines") == 0, cursor
 
+    def test_a_torn_last_line_does_not_stop_the_trim(self, H, monkeypatch, tmp_path):
+        """A power cut can leave the last line cut mid-character. The trim read
+        the file as strict UTF-8 inside a handler that names only OSError, so
+        the torn tail raised out of it — swallowed by the outer handler — and
+        the store was never pruned again."""
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(H, "LAYA_TURNS_FILE", tmp_path / "laya-turns.jsonl")
+        monkeypatch.setattr(H, "LAYA_TURNS_CURSOR", tmp_path / "laya-turns.cursor")
+        monkeypatch.setattr(H, "_LAYA_TURNS_BYTES", 256)
+        monkeypatch.setattr(H, "_LAYA_TURNS_MAX", 10)
+        f = tmp_path / "laya-turns.jsonl"
+        f.write_bytes(b"".join(b'{"text": "utterance %d padding padding"}\n' % i
+                               for i in range(60)) + b'{"text": "caf\xc3')
+        H._record_turn_for_corpus("the turn after the crash", [])
+        data = f.read_bytes()
+        assert len(data.splitlines()) <= H._LAYA_TURNS_MAX * 2 + 1, (
+            "a torn last line left the turn queue growing without bound")
+        assert b"the turn after the crash" in data.splitlines()[-1]
+        data.decode("utf-8")           # and the file it rewrote is text again
+
     def test_a_small_store_is_not_trimmed(self, H, monkeypatch, tmp_path):
         monkeypatch.setattr(H, "STATE_DIR", tmp_path)
         monkeypatch.setattr(H, "LAYA_TURNS_FILE", tmp_path / "laya-turns.jsonl")

@@ -220,12 +220,22 @@ class TestDryRunCoversStateChangers:
 
 
 class TestConfirmKill:
-    def test_a_recycled_pid_is_refused(self, H):
+    def test_a_recycled_pid_is_refused(self, H, monkeypatch):
         """The offer named hsoff-victim; the pid is this test's own process.
         SIGTERMing whatever recycles the number inside the 60 s window was a
-        misfire waiting for a coincidence."""
-        H._kill_offer.arm(H.ToolBelt.KILL_CONFIRM_S,
-                          pid=os.getpid(), name="hsoff-victim")
+        misfire waiting for a coincidence.
+
+        The offer is PINNED onto every path the tool reaches it by
+        (`conftest.pin_offer`). Arming `H._kill_offer` directly worked only while
+        one app module existed: once a driver test had imported a second one, the
+        tool's `_dep()` resolved to THAT module's own offer, this one was never
+        consulted, and the tool answered "the kill offer expired" — an ordering
+        dependence that the CI ordering probe (seeded by the commit SHA) hits on
+        some commits and not others, and that the previous commit's message
+        recorded as "the one remaining suite failure"."""
+        from conftest import pin_offer
+        pin_offer(H, monkeypatch, "kill").arm(
+            H.ToolBelt.KILL_CONFIRM_S, pid=os.getpid(), name="hsoff-victim")
         belt = _belt(H)
         out, err = belt.execute("confirm_kill", {"answer": "yes"})
         assert err and "recycled" in out, out
@@ -295,3 +305,364 @@ class TestTheScreenshotPermissions:
         assert belt._take_screenshot() == ""
         # 0600: no group or other bits — owner-write is part of 0600 itself.
         assert (shot.stat().st_mode & 0o077) == 0, oct(shot.stat().st_mode)
+
+
+class TestRunCommandBuffersABoundedAmountOfOutput:
+    """`run_command` buffered a command's whole output before cutting the reply
+    to 2000 characters. `cat` is on the whitelist and `/dev/zero` is not a
+    credential path, so `cat /dev/zero` buffered without end: measured on this
+    tree, a 4 s timeout held 2.5 GiB and took 11 s to return — in the process
+    that also holds the speech models, which makes the production timeout (15 s)
+    a way to be killed by the OOM killer. The same call decoded strictly
+    (`text=True`), so `cat` of any binary file raised UnicodeDecodeError out of
+    the tool and the model was told "that is a bug in the tool".
+    """
+
+    def test_a_command_that_never_stops_writing_costs_the_cap_not_the_machine(
+            self, H, monkeypatch):
+        import tracemalloc
+        belt = _belt(H)
+        monkeypatch.setattr(H.ToolBelt, "OUTPUT_CAP", 4096)
+        monkeypatch.setattr(H.ToolBelt, "TIMEOUT", 2)
+        started = H.time.monotonic()
+        tracemalloc.start()
+        try:
+            out, err = belt.execute("run_command", {"command": "cat /dev/zero"})
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        elapsed = H.time.monotonic() - started
+        assert "timed out" in out, out
+        # Two seconds of `cat /dev/zero` buffered whole is hundreds of MiB (the
+        # old call: ~580 MiB); the capped reader holds the cap plus one chunk.
+        assert peak < 16 * 1024 * 1024, (
+            f"{peak / 2**20:.0f} MiB was held while a command wrote for 2 s")
+        assert elapsed < 8.0, (
+            f"returned after {elapsed:.1f}s for a 2 s timeout: the output was "
+            f"being buffered, and draining it after the kill took the difference")
+
+    def test_the_buffer_is_capped_and_keeps_the_head(self, H, monkeypatch,
+                                                     tmp_path):
+        big = tmp_path / "big.txt"
+        big.write_text("HEAD-" + "x" * 500_000, encoding="utf-8")
+        monkeypatch.setattr(H.ToolBelt, "OUTPUT_CAP", 1000)
+        proc, stdout, stderr = H.ToolBelt._run_capped(["cat", str(big)], 10)
+        assert proc.returncode == 0
+        assert len(stdout) == 1000 and stdout.startswith("HEAD-"), len(stdout)
+        assert stderr == ""
+
+    def test_stdout_and_stderr_stay_separate_streams(self, H, tmp_path):
+        proc, stdout, stderr = H.ToolBelt._run_capped(
+            ["ls", str(tmp_path / "does-not-exist")], 10)
+        assert proc.returncode != 0
+        assert stdout == "" and "does-not-exist" in stderr, (stdout, stderr)
+
+    def test_a_binary_file_is_text_with_replacements_not_an_exception(
+            self, H, tmp_path):
+        blob = tmp_path / "blob.bin"
+        blob.write_bytes(b"\x7fELF\xff\xfe\x00\xf0binary\x80" * 40)
+        out, err = _belt(H).execute("run_command", {"command": f"cat {blob}"})
+        assert not err and out.startswith("exit code 0"), out
+        assert "bug in the tool" not in out
+
+    def test_a_host_replacement_of_run_is_still_the_seam(self, H, monkeypatch):
+        """Every test and every embedder replaces `subprocess.run`; a fake that
+        hands back its own stdout/stderr must be honoured over the pipes."""
+        class Done:
+            returncode = 3
+            stdout = "fake out\n"
+            stderr = "fake err\n"
+
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"], seen["kwargs"] = argv, kwargs
+            return Done()
+
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        out, err = _belt(H).execute("run_command", {"command": "echo hi"})
+        assert out == "exit code 3\nstdout:\nfake out\nstderr:\nfake err", out
+        assert seen["argv"] == ["echo", "hi"]
+        assert seen["kwargs"]["timeout"] == H.ToolBelt.TIMEOUT
+        assert seen["kwargs"]["stdin"] is H.subprocess.DEVNULL, (
+            "a command must not inherit the bubble's own stdin")
+
+    def test_it_leaves_no_reader_thread_and_no_descriptor_behind(self, H):
+        before_threads = {t.name for t in threading.enumerate()}
+        before_fds = len(os.listdir("/proc/self/fd"))
+        for _ in range(20):
+            H.ToolBelt._run_capped(["echo", "x"], 10)
+        assert {t.name for t in threading.enumerate()} - before_threads == set()
+        assert len(os.listdir("/proc/self/fd")) <= before_fds + 1, (
+            "each call must close both pipes")
+
+    def test_a_timeout_still_raises_and_still_releases_the_pipes(self, H):
+        before_fds = len(os.listdir("/proc/self/fd"))
+        with pytest.raises(H.subprocess.TimeoutExpired):
+            H.ToolBelt._run_capped(["cat", "/dev/zero"], 0.5)
+        assert len(os.listdir("/proc/self/fd")) <= before_fds + 1
+
+
+class TestTheClipboardIsNotAlwaysText:
+    """`paste_text` decoded `wl-paste` strictly, so an image on the clipboard —
+    the first thing most people copy that is not words — raised
+    UnicodeDecodeError out of the tool, and the model said "that is a bug in the
+    tool" about a perfectly ordinary clipboard."""
+
+    def _fake_paste(self, H, monkeypatch, payload):
+        class Done:
+            returncode = 0
+            stdout = payload
+            stderr = b""
+        monkeypatch.setattr(H.subprocess, "run", lambda argv, **kw: Done())
+
+    def test_an_image_is_named_as_data_not_a_crash(self, H, monkeypatch):
+        self._fake_paste(H, monkeypatch, b"\x89PNG\r\n\x1a\n\xff\xfe\x00\x00IHDR")
+        out, err = _belt(H).execute("paste_text", {})
+        assert not err, out
+        assert "not text" in out and "bug in the tool" not in out, out
+
+    def test_bytes_that_are_valid_utf8_but_not_text_are_named_too(
+            self, H, monkeypatch):
+        self._fake_paste(H, monkeypatch, b"\x00\x01\x02 header \x00" + b"a" * 100)
+        out, err = _belt(H).execute("paste_text", {})
+        assert not err and "not text" in out, out
+
+    def test_ordinary_text_reads_exactly_as_before(self, H, monkeypatch):
+        self._fake_paste(H, monkeypatch, "héllo wörld — ünïcode".encode("utf-8"))
+        out, err = _belt(H).execute("paste_text", {})
+        assert not err and out == (
+            "clipboard holds 21 chars: 'héllo wörld — ünïcode'"), out
+
+    def test_a_long_clipboard_is_summarised_and_an_empty_one_is_named(
+            self, H, monkeypatch):
+        self._fake_paste(H, monkeypatch, b"x" * 300)
+        out, _ = _belt(H).execute("paste_text", {})
+        assert out.startswith("clipboard holds 300 chars: ") and "(+180 more chars)" in out
+        self._fake_paste(H, monkeypatch, b"")
+        assert _belt(H).execute("paste_text", {})[0] == "clipboard is empty"
+
+    def test_a_replacement_that_answers_in_text_still_works(self, H, monkeypatch):
+        """Existing fakes (and any embedder) hand back `str`."""
+        self._fake_paste(H, monkeypatch, "from a str fake")
+        out, err = _belt(H).execute("paste_text", {})
+        assert not err and out == "clipboard holds 15 chars: 'from a str fake'", out
+
+
+class TestAFileSomeoneElseWroteIsSearchedNotDecodedStrictly:
+    """The niri config, the systemd unit: files other programs (and the user's
+    editor) write, which this code only SEARCHES. Strict UTF-8 raised
+    UnicodeDecodeError — a ValueError, not the OSError those call sites caught —
+    out of the chord check and out of the doctor, the one tool that has to work
+    when something is already wrong."""
+
+    def test_the_super_chord_check_reads_a_latin1_niri_config(self, H, tmp_path,
+                                                              monkeypatch):
+        cfg = tmp_path / ".config" / "niri"
+        cfg.mkdir(parents=True)
+        (cfg / "config.kdl").write_bytes(
+            b'// caf\xe9 keybinds \xff\n'
+            b'binds {\n    Mod+V { spawn "handsoff.py" "--ptt" "toggle"; }\n}\n')
+        monkeypatch.setattr(H, "HOME", tmp_path)
+        belt = _belt(H)
+        assert belt._super_binding_known("Mod+V") is True
+
+    def test_the_hardware_probe_reads_a_unit_with_a_stray_byte(self, tmp_path):
+        import hardware
+        unit = tmp_path / "handsoff.service"
+        unit.write_bytes(b"[Unit]\nDescription=Jos\xe9's bubble\n[Service]\nRestart=always\n")
+        out = hardware._systemd({"systemd_unit_file": str(unit)})
+        assert out["ok"] is True and out["auto_restart"] is True, out
+
+
+class TestAMalformedCommandIsARefusalNotABug:
+    """Fuzzing the validator (30,000 strings) found exactly one class of input
+    that made it RAISE: a NUL byte or a lone surrogate, which reached
+    `os.path.expanduser` (`~x\\x00` -> ValueError, `~\\ud800` -> UnicodeEncodeError)
+    and came back to the model as "that is a bug in the tool" about what is a
+    malformed command."""
+
+    @pytest.mark.parametrize("command", [
+        "echo a\x00b", "~nosuchuser\x00", "~root\ud800", "ls \ud800",
+        "cat /tmp/\x00", "\x00", "ls \udc80",
+    ])
+    def test_it_is_refused_by_name(self, H, command):
+        out, err = _belt(H).execute("run_command", {"command": command})
+        assert err and out.startswith("REFUSED"), (command, out)
+        assert "bug in the tool" not in out, out
+
+    def test_ordinary_unicode_is_still_a_command(self, H):
+        out, err = _belt(H).execute("run_command", {"command": "echo héllo 😀"})
+        assert not err and "héllo 😀" in out, out
+
+
+class TestTheDecisionLogTrimSurvivesATornLine:
+    """`log_decision` trims decisions.jsonl by reading it back. A power cut can
+    leave the last line cut mid-character, and that read was strict UTF-8 inside
+    a handler that names only OSError: the torn tail raised out of the trim, the
+    outer handler swallowed it, and the log was never pruned again — every tool
+    call afterwards re-read a file that only grew."""
+
+    def test_the_log_is_still_pruned(self, H, monkeypatch, tmp_path):
+        import core.tools as _t
+        monkeypatch.setattr(H, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(H, "DECISIONS_FILE", tmp_path / "decisions.jsonl")
+        f = tmp_path / "decisions.jsonl"
+        row = b'{"id": "%d", "tool": "run_command", "target": "' + b"x" * 200 + b'"}\n'
+        f.write_bytes(b"".join(row % i for i in range(1500))
+                      + b'{"id": "torn", "target": "caf\xc3')
+        assert f.stat().st_size > 262144
+        _t.log_decision("run_command", "echo hi", "ALLOW")
+        lines = f.read_bytes().splitlines()
+        assert len(lines) <= _t._DECISIONS_MAX + 1, (
+            f"{len(lines)} lines: a torn tail stopped the trim")
+        assert b'"decision": "ALLOW"' in lines[-1], "the newest decision was lost"
+        f.read_bytes().decode("utf-8")   # what it rewrote is text again
+
+
+class TestAnOutOfRangeNumberIsAnArgumentProblem:
+    """`int(float("inf"))` and `float(10**400)` raise OverflowError, which is an
+    ArithmeticError and not the ValueError the binding step catches. It escaped
+    to the belt's catch-all, so the model was told the ASSISTANT's own check had
+    failed and not to retry — for an argument it could simply have fixed."""
+
+    @pytest.mark.parametrize("tool,arg,extra", [
+        ("world_events", "count", {}), ("read_calendar", "days", {}),
+        ("read_page", "max_chars", {"url": "https://example.com/"}),
+        ("wait", "seconds", {}), ("pomodoro", "work_minutes", {"action": "start"}),
+        ("wait_for_window", "timeout", {"name": "x"})])
+    @pytest.mark.parametrize("value", [float("inf"), "9" * 5000])
+    def test_it_is_refused_as_bad_arguments(self, H, tool, arg, extra, value):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute(tool, {arg: value, **extra})
+        assert err, out
+        assert "could not be evaluated" not in out, (
+            "an argument problem was reported as the assistant's own failure: "
+            f"{out}")
+
+    @pytest.mark.parametrize("tool,arg,extra", [
+        ("wait", "seconds", {}), ("pomodoro", "work_minutes", {"action": "start"}),
+        ("wait_for_window", "timeout", {"name": "x"})])
+    def test_a_float_argument_too_large_for_a_float_is_too(self, H, tool, arg, extra):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute(tool, {arg: 10 ** 400, **extra})
+        assert err and "could not be evaluated" not in out, out
+
+
+class TestReadFileRefusesAPathNoFilesystemCanHold:
+    """A NUL byte or a lone surrogate raised ValueError/UnicodeEncodeError out of
+    resolve() and exists(), and the model was told "that is a bug in the tool"."""
+
+    @pytest.mark.parametrize("path", ["a\x00b", "\x00", "~\x00", "\ud800", "x/\ud800/y"])
+    def test_it_is_a_refusal_not_a_bug_report(self, H, path):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute("read_file", {"path": path})
+        assert "cannot exist" in out, out
+        assert "bug in the tool" not in out and "failed with" not in out, out
+
+
+class TestAProcessWithALongNameCanBeStopped:
+    """`Name:` in /proc/PID/status is `comm`, cut at 15 characters by the kernel:
+    a process called `gnome-text-editor` is only ever visible as
+    `gnome-text-edit`. An exact comparison with the name the user said matched
+    nothing, for every name longer than 15 characters."""
+
+    def _belt(self, H, monkeypatch, procs):
+        tb = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(tb, "_same_user_procs", lambda: list(procs))
+        return tb
+
+    def test_the_full_name_finds_the_truncated_comm(self, H, monkeypatch):
+        tb = self._belt(H, monkeypatch, [(4242, "gnome-text-edit"), (4243, "bash")])
+        out, err = tb.execute("kill_process", {"target": "gnome-text-editor"})
+        assert "About to stop gnome-text-edit (pid 4242)" in out, out
+
+    def test_a_short_name_is_still_exact(self, H, monkeypatch):
+        tb = self._belt(H, monkeypatch, [(1, "gnome-text-edit"), (2, "gnome")])
+        out, err = tb.execute("kill_process", {"target": "gnome"})
+        assert "About to stop gnome (pid 2)" in out, out
+        out, err = tb.execute("kill_process", {"target": "gnome-tex"})
+        assert err and "no process of yours matches" in out, out
+
+    def test_two_processes_with_one_prefix_are_ambiguous(self, H, monkeypatch):
+        tb = self._belt(H, monkeypatch, [(1, "gnome-text-edit"), (2, "gnome-text-edit")])
+        out, err = tb.execute("kill_process", {"target": "gnome-text-editor"})
+        assert err and "2 processes match" in out, out
+
+
+class TestAWatcherSeesAProcessWithALongName:
+    def test_its_exit_is_announced(self, H, monkeypatch):
+        """`watch_process` compared the name exactly with `comm`, which is cut at
+        15 characters, so a long name was never seen to START and its exit was
+        never announced — the watcher ran for 24 hours and said nothing."""
+        seen = [[(7, "gnome-text-edit")], [(7, "gnome-text-edit")], []]
+        monkeypatch.setattr(H.ToolBelt, "_same_user_procs",
+                            staticmethod(lambda: seen.pop(0) if seen else []))
+        emitted: list = []
+
+        class _Polls:
+            def __init__(self):
+                self.n = 0
+
+            def wait(self, timeout=None):
+                self.n += 1
+                return self.n > 6
+
+        H.ToolBelt._process_watch_loop("gnome-text-editor", _Polls(), emitted.append)
+        assert emitted == ["process gnome-text-editor exited"], emitted
+
+    def test_the_matcher(self):
+        from core.tools import comm_matches
+        assert comm_matches("bash", "BASH")
+        assert comm_matches("gnome-text-edit", "gnome-text-editor")
+        assert not comm_matches("gnome-text-edit", "gnome-text-edi")
+        assert not comm_matches("gnome-text-edit", "gnome-text-other")
+        assert not comm_matches("gnome", "gnome-text-editor")
+
+
+class TestCopyTextKeepsTheTextOffTheCommandLine:
+    """Found by driving the tool against a real wl-copy under a headless sway.
+    The text was an ARGUMENT: above ~128 KiB it failed with E2BIG (reported as
+    "a bug in the tool"), a NUL byte or a lone surrogate failed the same way, and
+    it sat in /proc/PID/cmdline — readable by every local user — while wl-copy
+    ran, so a password the user asked to have copied was in `ps`. And a wl-copy
+    that could not reach a compositor still got "copied N chars"."""
+
+    def _run(self, H, monkeypatch, returncode=0):
+        calls = []
+
+        import types
+
+        def fake_run(argv, **kw):
+            calls.append((list(argv), kw))
+            return types.SimpleNamespace(returncode=returncode, stdout=b"", stderr=b"")
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        return calls
+
+    def test_the_text_is_stdin_not_argv(self, H, monkeypatch):
+        calls = self._run(H, monkeypatch)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        secret = "correct horse battery staple"
+        out, err = belt.execute("copy_text", {"text": secret})
+        assert not err and out == f"copied {len(secret)} chars to the clipboard", out
+        argv, kw = calls[0]
+        assert argv == ["wl-copy"], argv
+        assert not any(secret in a for a in argv), "the text is on the command line"
+        assert kw["input"] == secret.encode("utf-8")
+        assert kw["timeout"] == 8
+
+    def test_a_huge_nul_or_surrogate_text_is_copied_not_a_tool_bug(self, H, monkeypatch):
+        calls = self._run(H, monkeypatch)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        for text in ("x" * 300_000, "a\x00b", "a\ud800b"):
+            out, err = belt.execute("copy_text", {"text": text})
+            assert not err and out.startswith("copied "), (text[:8], out)
+        assert calls[0][1]["input"] == b"x" * 300_000
+        assert calls[1][1]["input"] == b"a\x00b"
+        assert calls[2][1]["input"] == "a\ud800b".encode("utf-8", errors="replace")
+
+    def test_a_failed_wl_copy_is_not_reported_as_a_copy(self, H, monkeypatch):
+        self._run(H, monkeypatch, returncode=1)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute("copy_text", {"text": "hello"})
+        assert "copied" not in out and "wl-copy failed (exit 1)" in out, out

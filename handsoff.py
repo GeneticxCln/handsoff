@@ -649,13 +649,25 @@ except ImportError:
                             chunk = json.loads(raw.strip().decode("utf-8"))
                         except (ValueError, UnicodeDecodeError):
                             continue
+                        # The same two rules as core.brain (this copy drifted
+                        # from it): a line that is not an object is noise, and
+                        # a `{"error": ...}` line — Ollama's way of failing
+                        # AFTER the 200 was sent — is a failure, not an empty
+                        # reply.
+                        if not isinstance(chunk, dict):
+                            continue
+                        if chunk.get("error"):
+                            raise RuntimeError(f"Ollama error: {chunk['error']}")
                         msg = chunk.get("message") or {}
                         calls.extend(msg.get("tool_calls") or [])
                         piece = msg.get("content") or ""
                         buf += piece
                         full += piece
                         while True:
-                            match = re.search(r"[.!?…](\s|$)", buf)
+                            # a terminator run followed by whitespace: see
+                            # core.brain._SENTENCE_END (this is the bundle
+                            # copy for a checkout with no core/brain.py)
+                            match = re.search(r"[.!?…]+\s", buf)
                             if not match:
                                 break
                             sentence, buf = buf[:match.end()], buf[match.end():]
@@ -695,6 +707,16 @@ except ImportError:
                 raise RuntimeError(
                     f"cannot reach Ollama at {base} ({error.reason}). "
                     "Start it with: systemctl start ollama") from None
+            except Exception:
+                # A stream that dies right after a sentence's closing full
+                # stop: the sentence is complete but still held for its
+                # lookahead (see core.brain._SENTENCE_END) — say it. Only a
+                # buffer that ends in a terminator; never after a barge-in.
+                if not (cancel is not None and cancel.is_set()):
+                    tail = _fallback_sayable(cls.strip_thinking(buf))
+                    if tail and re.search(r"[.!?…]\s*\Z", tail):
+                        q.put(tail)
+                raise
             finally:
                 if not fallback:
                     q.put(None)
@@ -2132,18 +2154,22 @@ def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -
                                  f"{str(out).strip()[:160]}")
 
             # 5. ctrl+a/ctrl+c round-trip proves what landed, byte-for-byte
+            # BYTES both ways: the clipboard is whatever the person last copied
+            # — an image, a file's bytes — and a strict text decode of it raised
+            # here, leaving `clip_before` None, so the run ended by REPLACING
+            # their clipboard with the test token and never restoring it.
             try:
                 clip_before = subprocess.run(
                     ["wl-paste", "--no-newline"], capture_output=True,
-                    text=True, timeout=8).stdout or ""
+                    timeout=8).stdout or b""
             except Exception:
                 clip_before = None
             o1, e1 = belt.execute("press_keys", {"combo": "ctrl+a"})
             o2, e2 = belt.execute("press_keys", {"combo": "ctrl+c"})
             time.sleep(0.8)
             clip = subprocess.run(["wl-paste", "--no-newline"],
-                                  capture_output=True, text=True,
-                                  timeout=8).stdout
+                                  capture_output=True,
+                                  timeout=8).stdout.decode("utf-8", "replace")
             match = not e1 and not e2 and clip == token
             _selftest_check(results, "clipboard round-trip",
                             "PASS" if match else "FAIL",
@@ -2168,8 +2194,15 @@ def run_typing_selftest(timeout: float = 45.0, belt: "ToolBelt | None" = None) -
                 p.terminate()
         if clip_before is not None:
             try:
+                # The same shape `copy_text` uses: wl-copy forks a server that
+                # keeps serving the selection, and a server that inherited a
+                # CAPTURED stdout/stderr holds those pipes open, so
+                # `run(capture_output=True)` waits for it — with no timeout, the
+                # restore that ends the self-test could block until something
+                # else replaced the clipboard.
                 subprocess.run(["wl-copy"], input=clip_before,
-                               capture_output=True, text=True)
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=8)
             except Exception:
                 pass
     return _selftest_report(results)
@@ -3054,6 +3087,23 @@ def _wake_name() -> str:
     return str(SETTINGS.get("assistant_name", "assistant")).strip().lower() or "assistant"
 
 
+def _wake_words() -> list[str]:
+    """The wake name as the WORDS a transcript is matched against.
+
+    A transcript is punctuation-stripped word by word (`norm_words`) before it
+    is compared, and the name was only `.split()`: "Dr. Watson" became
+    `['dr.', 'watson']` against a transcript of `['dr', 'watson']`, and
+    "Jarvis!" or "cypher," never matched anything the user could say — the
+    wake word silently dead, with nothing on screen to say why (measured
+    2026-09-29). Both sides are now normalized by the same function. A name
+    that is nothing BUT punctuation ("...") has no words at all, and an empty
+    name matches EVERY utterance (`[] == []`), so it falls back to the default
+    exactly as a blank name does.
+    """
+    words = [w for w in _voice.norm_words(_wake_name()) if w]
+    return words or ["assistant"]
+
+
 # Phase 4f: core/voice.py owns the wake vocabulary and the matching rules;
 # these keep the historical H.* names as delegations (the tests and the
 # pipeline both use them) with the wake name read LIVE at every call, so a
@@ -3064,7 +3114,7 @@ def _norm_words(text: str) -> list[str]:
 
 def _is_wake_utt(text: str) -> bool:
     """True when the whole utterance is just the wake name ('hey assistant')."""
-    return _voice.is_wake_utt(text, _wake_name().split())
+    return _voice.is_wake_utt(text, _wake_words())
 
 
 def _match_wake(text: str) -> str | None:
@@ -3073,7 +3123,7 @@ def _match_wake(text: str) -> str | None:
     Word-token based, name tried before the filler skip (so a custom name
     that itself starts with 'hey' still works). Falls back to a fuzzy
     pronunciation-skeleton match for misheard names (Siphon~cypher)."""
-    return _voice.match_wake(text, _wake_name().split())
+    return _voice.match_wake(text, _wake_words())
 
 
 def _wake_anywhere(text: str) -> str | None:
@@ -3082,7 +3132,7 @@ def _wake_anywhere(text: str) -> str | None:
     transcript is the only way in). Same word matching and same fuzzy skeleton
     as `_match_wake`, any position, bounded to a short utterance. Returns the
     text with the name removed (possibly '') or None when it is not there."""
-    return _voice.wake_anywhere(text, _wake_name().split())
+    return _voice.wake_anywhere(text, _wake_words())
 
 
 def _tick_now() -> float:
@@ -3331,29 +3381,33 @@ def _start_stream_owned(stream) -> None:
 
 
 class Recorder(_audio.Recorder):
-    """Recorder using the application-wide PortAudio ownership guard."""
+    """Recorder using the application-wide PortAudio ownership guard.
 
-    def start(self) -> None:
-        self._frames = []
-        self._samples = 0
-        self._stream, self._native_rate = _open_input(
-            self._device, SAMPLE_RATE, 1024, self._cb)
+    It binds the three seams `core.audio.Recorder` exposes and NOTHING ELSE:
+    `start()` and `stop()` are the base class's, so what the base is tested for
+    (a superseded stream is closed, a stream whose start failed is closed, the
+    buffer is reset and drained under its lock) is what production runs. This
+    class used to override both methods whole, and every one of those guards
+    was missing from the copy that actually ran.
+    """
+
+    def _open_stream(self) -> tuple:
+        stream, rate = _open_input(self._device, SAMPLE_RATE, 1024, self._cb)
+        # Remember the device that ACTUALLY opened (a self-healed pin), so the
+        # next open of this recorder starts from what worked.
         selected = getattr(_MIC_LAST_OPEN_DEVICE, "value", self._device)
         if selected is not None:
             self._device = selected
-        _start_stream_owned(self._stream)
+        return stream, rate
 
-    def stop(self):
-        stream, self._stream = self._stream, None
-        if stream is not None:
-            try:
-                _stop_stream_owned(stream)
-            except Exception:
-                log.exception("failed to close input stream")
-        if not self._frames:
-            return None
-        audio = np.concatenate(self._frames).reshape(-1)
-        return _audio._resample_to_16k(audio, getattr(self, "_native_rate", SAMPLE_RATE))
+    def _start_stream(self, stream) -> None:
+        _start_stream_owned(stream)
+
+    def _teardown_stream(self, stream) -> None:
+        try:
+            _stop_stream_owned(stream)
+        except Exception:
+            log.exception("failed to close input stream")
 
 
 def _stop_recorder_bounded(rec, timeout: float = 3.0):
@@ -4060,6 +4114,24 @@ def _guard_ollama_endpoint() -> None:
             "private conversation data. Set HANDSOFF_ALLOW_REMOTE_OLLAMA=1 "
             "to explicitly allow remote Ollama."
         )
+
+
+_FAILURES_REPORTED_MAX = 64
+
+
+def _cause_shape(exc: BaseException) -> str:
+    """An exception's message with the parts that vary per occurrence removed.
+
+    `_report_once` tells the person about a failure ONCE per cause, and the
+    cause used to be the exception's whole text. A path or a number in it made
+    every occurrence a new cause: a speech failure that names its scratch file
+    (`No such file or directory: '/…/state/tmpk3j2x9/tts.wav'`, the directory
+    being new for every sentence) raised a desktop popup per reply, and grew the
+    set of seen causes without bound — the spam the function exists to prevent.
+    """
+    text = str(exc)
+    text = re.sub(r"[\w.~-]*(?:/[\w.~@+=%-]+)+/?", "<path>", text)
+    return re.sub(r"\d+", "#", text)
 
 
 class _PrivateRotatingFileHandler(RotatingFileHandler):
@@ -4984,7 +5056,7 @@ def _spotter_wakes_for(name: str | None = None) -> bool | None:
     """
     if not _SPOTTER_MODEL_NAMES:
         return None
-    want = _wake_name().split()
+    want = _wake_words()
     for model in _SPOTTER_MODEL_NAMES:
         got = [w for w in re.split(r"[^a-z0-9]+", str(model).lower()) if w]
         if _voice.skeleton_match(got, want):
@@ -5084,8 +5156,11 @@ def _record_turn_for_corpus(text: str, messages: list) -> None:
             os.chmod(LAYA_TURNS_FILE, 0o600)
             try:
                 if LAYA_TURNS_FILE.stat().st_size > _LAYA_TURNS_BYTES:
+                    # errors="replace": a torn last line (power cut mid-write)
+                    # must not stop the trim for good — see log_decision.
                     lines = LAYA_TURNS_FILE.read_text(
-                        encoding="utf-8").splitlines(keepends=True)
+                        encoding="utf-8", errors="replace"
+                    ).splitlines(keepends=True)
                     if len(lines) > _LAYA_TURNS_MAX * 2:
                         _core_settings.atomic_private_write(
                             LAYA_TURNS_FILE, "".join(lines[-_LAYA_TURNS_MAX:]))
@@ -5185,8 +5260,13 @@ def _journalctl(argv: list) -> str:
     they must not die on the tool that classifies it. Bounded: a wedged
     journalctl must not hold a doctor render or a boot check."""
     try:
+        # errors="replace": the text is only ever matched for timestamps and a
+        # unit's name, and a strict decode of a journal window that holds one
+        # non-UTF-8 message raised UnicodeDecodeError — a ValueError, which the
+        # handler below does not catch — out of a doctor render.
         proc = subprocess.run(
-            ["journalctl", *argv], capture_output=True, text=True, timeout=10)
+            ["journalctl", *argv], capture_output=True, text=True,
+            errors="replace", timeout=10)
     except (OSError, subprocess.SubprocessError):
         return ""
     return proc.stdout or "" if proc.returncode == 0 else ""
@@ -5221,13 +5301,25 @@ def _stop_was_poweroff(ts: str, journal_text: str | None = None) -> bool:
         stamp = _JOURNAL_STAMP.match(line)
         if stamp is None or stamp.group(1) not in _JOURNAL_MONTHS:
             continue          # not a journal line (blank, banner, continuation)
-        try:
-            stamped = datetime.datetime(
-                when.year, _JOURNAL_MONTHS[stamp.group(1)],
-                int(stamp.group(2)), int(stamp.group(3)),
-                int(stamp.group(4)), int(stamp.group(5)))
-        except ValueError:
-            continue          # an impossible date (Feb 30) is not evidence
+        # A journal stamp has no YEAR, so it is placed in whichever neighbouring
+        # year lands it nearest the stop. Borrowing the stop's own year read a
+        # poweroff at 23:59:59 on 31 December logged as "Jan  1 00:00:00" as
+        # eleven months and thirty days away — the one night of the year when
+        # the ±2 s window straddles two years — and the classification then
+        # accused a clean shutdown of being the invisible killer.
+        stamped = None
+        for year in (when.year, when.year - 1, when.year + 1):
+            try:
+                candidate = datetime.datetime(
+                    year, _JOURNAL_MONTHS[stamp.group(1)],
+                    int(stamp.group(2)), int(stamp.group(3)),
+                    int(stamp.group(4)), int(stamp.group(5)))
+            except ValueError:
+                continue      # an impossible date (Feb 30) is not evidence
+            if stamped is None or abs(candidate - when) < abs(stamped - when):
+                stamped = candidate
+        if stamped is None:
+            continue
         if abs((stamped - when).total_seconds()) <= _STOP_POWEROFF_WINDOW_S \
                 and "poweroff requested" in line:
             return True
@@ -5926,6 +6018,69 @@ _DURATION_NUMBERS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}
 _DURATION_TRAILING_HALF = re.compile(r"\band\s+(?:a\s+|one\s+)?half\b")
 _DURATION_LEADING_HALF = re.compile(r"\ba\s+half\s+([a-z]+)")
 
+#: The other ways English fractions a unit, each a QUANTITY that names the unit
+#: after it: "half an hour", "half a day", "a quarter of an hour", "three
+#: quarters of an hour". None of them was known, so `an hour` was read on its
+#: own and the fraction dropped: "in half an hour" set a reminder for ONE HOUR,
+#: "half a day" for 24 hours, "quarter of an hour" for an hour — each silently
+#: twice to four times too late, on the most ordinary way to ask (measured
+#: 2026-09-29). Lifted into "0.5 hour" form before the number pattern runs.
+_DURATION_HALF_OF_A = re.compile(r"\bhalf\s+an?\s+([a-z]+)")
+_DURATION_QUARTER_OF_AN = re.compile(r"\b(?:a\s+)?quarter\s+of\s+an?\s+([a-z]+)")
+_DURATION_THREE_QUARTERS = re.compile(r"\bthree\s+quarters?\s+of\s+an?\s+([a-z]+)")
+
+
+_NUMBER_UNITS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_NUMBER_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fourty": 40,
+                "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+                "ninety": 90}
+_NUMBER_WORDS = "|".join([*_NUMBER_UNITS, *_NUMBER_TENS, "hundred"])
+_NUMBER_RUN = re.compile(rf"\b(?:{_NUMBER_WORDS})(?:[\s-]+(?:{_NUMBER_WORDS}))*\b")
+
+
+def _spelled_numbers_to_digits(text: str) -> str:
+    """'twenty five' / 'twenty-five' / 'one hundred twenty' → '25' / '25' / '120'.
+
+    The duration reader knew only `a`, `an`, `one`, `two` and `three`, and a
+    number word it did not know was silently WALKED PAST: "in five minutes 30
+    seconds" was thirty seconds, "in two hours and thirty minutes" two hours,
+    "ten hr and 9 min" nine minutes — a reminder at the wrong time with nothing
+    said, the failure the digit check below was added for ("1:30 hours"). A run
+    that is not a number ("two three") is left as it is, and the caller refuses
+    a phrase that still holds a number word.
+    """
+    def convert(match: "re.Match") -> str:
+        total = current = 0
+        seen_hundred = False
+        tens_open = False               # a tens word may take one ones word
+        for word in re.split(r"[\s-]+", match.group(0)):
+            if word == "hundred":
+                if seen_hundred or tens_open or current == 0 or current > 9:
+                    if current == 0 and not seen_hundred and total == 0:
+                        current = 1     # a bare "hundred"
+                    else:
+                        return match.group(0)
+                total, current, seen_hundred, tens_open = current * 100, 0, True, False
+            elif word in _NUMBER_TENS:
+                if current or tens_open:
+                    return match.group(0)
+                current, tens_open = _NUMBER_TENS[word], True
+            else:
+                value = _NUMBER_UNITS[word]
+                if tens_open and 1 <= value <= 9:
+                    current += value
+                    tens_open = False
+                elif current or tens_open or value == 0 and (total or current):
+                    return match.group(0)
+                else:
+                    current = value
+        return str(total + current)
+    return _NUMBER_RUN.sub(convert, text)
+
 
 def _parse_duration(text: str) -> float | None:
     """'in 2 hours 5 minutes' / '45 min' / '3 days' / 'a week' → seconds, or None."""
@@ -5949,6 +6104,10 @@ def _parse_duration(text: str) -> float | None:
     trailing_half = bool(_DURATION_TRAILING_HALF.search(t))
     t = _DURATION_TRAILING_HALF.sub(" ", t)
     t = _DURATION_LEADING_HALF.sub(r"0.5 \1", t)
+    t = _DURATION_HALF_OF_A.sub(r"0.5 \1", t)
+    t = _DURATION_THREE_QUARTERS.sub(r"0.75 \1", t)
+    t = _DURATION_QUARTER_OF_AN.sub(r"0.25 \1", t)
+    t = _spelled_numbers_to_digits(t)
     total = 0.0
     matched = False
     units_seen = 0
@@ -5973,6 +6132,16 @@ def _parse_duration(text: str) -> float | None:
         total += 0.5 * last_unit
     if not matched or total <= 0:
         return None
+    # A digit that no unit claimed is a number this function did NOT read, and
+    # answering anyway is a reminder at the wrong time: "in 1:30 hours" was
+    # thirty hours (the `1:` never matched a unit and was skipped), "in 1 hour
+    # 30" one hour, "in 2 hours at 5" two. `findall` reports what it found and
+    # says nothing about what it walked past, so the walked-past text is
+    # checked for digits — a stray WORD is harmless ("in 5 minutes after the
+    # film"), a stray NUMBER is not.
+    leftover = re.sub(_DURATION_RE, " ", t)
+    if re.search(r"\d", leftover) or _NUMBER_RUN.search(leftover):
+        return None
     return total
 
 
@@ -5983,7 +6152,9 @@ def _fmt_dur(seconds: float) -> str:
         return f"{s // 3600} hour" + ("s" if s > 3600 else "")
     if s >= 60 and s % 60 == 0:
         return f"{s // 60} minute" + ("s" if s > 60 else "")
-    return f"{s} seconds"
+    # One unit of each, singular — this is read ALOUD ("repeating every 1
+    # seconds", "last measured 1 seconds ago").
+    return f"{s} second" + ("" if abs(s) == 1 else "s")
 
 
 def _due_reminders(items: list[dict], now: float) -> tuple[list[dict], list[dict]]:
@@ -6632,6 +6803,21 @@ class ContinuousListener:
             except Exception:
                 # log.exception below reports it; binding the error here would
                 # only add a name ruff then flags as unused
+                #
+                # A stream that OPENED but failed to start (the device vanished
+                # between the two) is still held in `self._stream`; the next
+                # pass overwrote it, so every retry of a flapping device leaked
+                # one open PortAudio stream (sounddevice has no finalizer).
+                # Released here, bounded and under the same mic lock as every
+                # other teardown, before backing off. The Settings live probe
+                # has always done this; the listener that matters had not.
+                failed, self._stream = self._stream, None
+                if failed is not None:
+                    try:
+                        _stop_stream_owned(failed)
+                    except Exception:
+                        log.debug("could not release the stream that failed "
+                                  "to start", exc_info=True)
                 open_failures += 1
                 self._health_opens_failed += 1
                 if self._health_failing_since is None:
@@ -8063,12 +8249,15 @@ class Assistant(QObject):
         garbage duration — an unmeasured reload releases, and should.
         """
         try:
-            t0 = time.time()
+            # monotonic: this is a DURATION, and the idle release weighs its
+            # decision on it — a wall-clock step (NTP, resume from suspend)
+            # inside the warm would record a negative or hours-long "load".
+            t0 = time.monotonic()
             warm_msgs = ([{"role": "system", "content": SYSTEM_PROMPT}]
                          + list(self._history)
                          + [{"role": "user", "content": "hi"}])
             ollama_chat(warm_msgs, TOOLS)
-            elapsed = time.time() - t0
+            elapsed = time.monotonic() - t0
             _note_llm_load(OLLAMA_MODEL, elapsed)
             log.info("LLM warmed in %.1fs (prompt prefix cached)", elapsed)
         except Exception:
@@ -9574,7 +9763,20 @@ class Assistant(QObject):
                 # was never made and could ask about it. A barge-in that cut
                 # the reply short is not this case: nothing failed, the user
                 # simply stopped listening. Measured 2026-09-27.
-                kept = [m for m in fresh if m.get("role") != "assistant"]
+                #
+                # Only the ANSWER goes: an assistant message that carries
+                # `tool_calls` is plumbing that the tool results after it
+                # answer, and dropping it while keeping the results left a
+                # `role:tool` message with no call before it — the orphan shape
+                # `_seal_tool_calls` exists to prevent, published into every
+                # later request. Whatever text rode along with the call went
+                # unheard too, so it is blanked rather than kept.
+                kept = []
+                for m in fresh:
+                    if m.get("role") != "assistant":
+                        kept.append(m)
+                    elif m.get("tool_calls"):
+                        kept.append({**m, "content": ""})
                 log.info("the reply could not be spoken; published the "
                          "question without its answer")
             _strip_images(kept)   # screenshots: this turn's model call only
@@ -9774,11 +9976,16 @@ class Assistant(QObject):
         so a notification per occurrence would be worse than the silence it
         replaces.
         """
-        key = f"{kind}: {type(exc).__name__}: {exc}"[:200]
+        key = f"{kind}: {type(exc).__name__}: {_cause_shape(exc)}"[:200]
         seen = getattr(self, "_failures_reported", None)
         if seen is None:
             seen = self._failures_reported = set()
         if key in seen:
+            return False
+        if len(seen) >= _FAILURES_REPORTED_MAX:
+            # Bounded: past this many DISTINCT causes the person has been told
+            # plenty and the journal has every occurrence; the set is state
+            # for the life of the process and must not grow with it.
             return False
         seen.add(key)
         try:
@@ -10384,6 +10591,7 @@ class ControlServer:
                     if not self._stop.is_set():
                         log.exception("control socket accept failed")
                     return
+                action = ""            # for the failure reply, if we get that far
                 try:
                     conn.settimeout(5.0)
                     # Read the request BEFORE the credential check: closing a
@@ -10559,6 +10767,24 @@ class ControlServer:
                     conn.sendall((reply + "\n").encode("utf-8"))
                 except OSError:
                     pass
+                except Exception as exc:  # noqa: BLE001 -- see below
+                    # ONE request must cost that request and not the server.
+                    # Only OSError was caught here, so any other exception from
+                    # a verb (a bug, a value nobody expected) left this `while`
+                    # and ended the accept thread: the bubble carried on with no
+                    # control socket — `--ptt` says "not running", the keybinds
+                    # do nothing, settings cannot reach it — which is the zombie
+                    # this project's health machinery exists to prevent. Named
+                    # in the journal with its traceback, and the client is told
+                    # instead of being left reading a closed socket.
+                    log.exception("control socket: %r failed", action)
+                    try:
+                        conn.sendall(
+                            (f"error: {action or 'request'} failed "
+                             f"({type(exc).__name__}) — see the journal\n"
+                             ).encode("utf-8"))
+                    except OSError:
+                        pass
                 finally:
                     conn.close()
         finally:
@@ -10904,7 +11130,15 @@ def main() -> int:
     setup_logging()
     _log_swept_scratch()   # the sweep ran before the journal existed
     sys.excepthook = lambda *a: log.exception("uncaught exception", exc_info=a)
-    threading.excepthook = lambda a: log.exception("uncaught thread exception", exc_info=a.exc_type)
+    # The traceback is passed as the (type, value, traceback) tuple the hook
+    # was handed. It was `exc_info=a.exc_type` — a CLASS, which logging does not
+    # accept and silently replaces with `sys.exc_info()`; that happens to be the
+    # live exception, because CPython calls this hook from inside the thread's
+    # own `except`, so the traceback appeared by accident. Named for the thread
+    # too: a dead worker's name is the first thing a reader looks for.
+    threading.excepthook = lambda a: log.error(
+        "uncaught thread exception in %s", getattr(a.thread, "name", "?"),
+        exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
     crash_fh = open(CRASH_LOG, "a", buffering=1)
     os.chmod(CRASH_LOG, 0o600)
     faulthandler.enable(crash_fh)  # native aborts (CUDA, Qt)

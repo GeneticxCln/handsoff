@@ -21,6 +21,16 @@ import time
 from core.registry import BoundedRegistry, Offer
 
 
+def _minutes(count: float) -> str:
+    """'1 minute', '25 minutes', '2.5 minutes' — a count of minutes as it is SAID.
+
+    The announcements were spoken with `{n:.0f} minutes`: "1 minutes", and a
+    half-minute phase rounded to "0 minutes" (`.0f` rounds half to even, so 2.5
+    said "2")."""
+    value = f"{count:g}"
+    return f"{value} minute" + ("" if value == "1" else "s")
+
+
 class PomodoroController:
     """Bounded pomodoro worker: work/break phases with spoken transitions.
 
@@ -78,9 +88,13 @@ class PomodoroController:
                 state = self._state
             if not state:
                 return "pomodoro is off"
-            remaining = max(0, int(state["until"] - time.monotonic()))
+            remaining = max(0.0, state["until"] - time.monotonic())
+            # Rounded UP: "0 minutes remaining" (floor of 59 s) read as a phase
+            # that had already ended, and a phase with 90 s left said "1".
+            left = ("less than a minute" if remaining < 60
+                    else _minutes(math.ceil(remaining / 60)))
             return (f"pomodoro is in {state['phase']} phase with "
-                    f"{remaining // 60} minutes remaining")
+                    f"{left} remaining")
         if action == "stop":
             self.shutdown()
             return "pomodoro stopped"
@@ -94,8 +108,8 @@ class PomodoroController:
             self._state = {"phase": "work", "until": time.monotonic() + work * 60,
                            "work": work, "break": break_minutes}
             self._thread = self._spawn(self._loop, args=(stop,), name="pomodoro")
-            self._announce(f"Pomodoro started: {work:.0f} minutes of work.")
-        return f"pomodoro started: {work:.0f} minute work and {break_minutes:.0f} minute break"
+            self._announce(f"Pomodoro started: {_minutes(work)} of work.")
+        return f"pomodoro started: {work:g} minute work and {break_minutes:g} minute break"
 
     def _loop(self, stop: threading.Event) -> None:
         phase = "work"
@@ -121,7 +135,7 @@ class PomodoroController:
                                "until": time.monotonic() + minutes * 60}
                 self._announce(
                     f"Pomodoro: {('break' if phase == 'break' else 'back to work')} "
-                    f"for {minutes:.0f} minutes.")
+                    f"for {_minutes(minutes)}.")
 
     def shutdown(self) -> None:
         """Signal stop and clear phase state, then join the worker.
@@ -173,6 +187,28 @@ def _join_worker(thread, what: str, timeout: float = 2.0) -> None:
 def dbus_strings(line: str) -> list[str]:
     """Extract ordinary quoted D-Bus string values from monitor output."""
     return re.findall(r'(?<!\\)"((?:\\.|[^"\\])*)"', line)
+
+
+# dbus-monitor prints a string argument RAW: no escaping of the quotes it holds
+# and no escaping of a newline, so a body of `She said "hi" and\nleft` arrives as
+#     string "She said "hi" and
+#     left"
+# The regex above cannot read that (it stops at the first inner quote, and the
+# continuation line has no `string` at all), so the reader spoke "She said" for
+# the first and, for the second, the NEXT string of the message — the action
+# name `default` — as the body. A string value therefore runs until the line
+# that begins the next element of the message, which is what this recognises.
+_DBUS_STRING_START = re.compile(r'^\s*string "(.*)$')
+_DBUS_ELEMENT = re.compile(
+    r'^\s*(?:string "|array \[|dict entry\(|variant\b|struct \{|unix fd\b'
+    r'|(?:u?int(?:16|32|64)|byte|boolean|double)\b|object path\b|signature\b'
+    r'|[\])}]\s*$|(?:method call|method return|signal|error) time=)')
+
+
+def dbus_string_value(lines: list[str]) -> str:
+    """The value of one dbus-monitor string argument, from the lines it spans."""
+    value = "\n".join(lines)
+    return value[:-1] if value.endswith('"') else value
 
 
 def _mute_word(needle: str, haystack: str) -> bool:
@@ -603,8 +639,42 @@ class NotificationReader:
         """Stop the monitor; safe on a never-started reader."""
         self.set_enabled(False)
 
+    def _deliver(self, app: str, summary: str, body: str) -> None:
+        """One complete Notify message: filter it, and speak it if it passes."""
+        # Observed, not spoken: this counts what the monitor handed us, so a
+        # reader whose mute list swallowed everything is distinguishable from a
+        # monitor that printed nothing.
+        self._health_bump("notifications")
+        try:
+            if self._muted(app, summary, body):
+                log.info("notification muted from %s", app)
+                return
+        except Exception:
+            log.exception("notification mute check failed for %s", app)
+        now = time.monotonic()
+        with self._cooldown_lock:
+            last = self._app_last.get(app.lower())
+            if last is not None and now - last < self.APP_COOLDOWN:
+                log.info("notification cooldown suppresses %s", app)
+                return
+            self._app_last[app.lower()] = now
+        # One line of speech: a body that spans lines (a chat preview, an
+        # e-mail) is read as a sentence, not as a paragraph with breaks.
+        text = f"Notification from {' '.join(app.split())}: {' '.join(summary.split())}"
+        body = " ".join(body.split())
+        if body:
+            text += f". {body}"
+        try:
+            self._announce(text[:500])
+        except Exception:
+            log.exception("notification announcement failed")
+
     def loop(self, proc, stop: threading.Event) -> None:
         values: list[str] | None = None  # None: between messages, ignore trailers
+        # The string argument being read: its lines so far. A value ends at the
+        # line that starts the next element (see `_DBUS_ELEMENT`), so it can
+        # only be closed by the line AFTER it — or by the end of the stream.
+        pending: list[str] | None = None
         self._health_bump("passes")
         self._health_update(pass_started_at=time.monotonic())
         try:
@@ -615,48 +685,38 @@ class NotificationReader:
                 # monitor that stopped emitting (wedged pipe) freezes this.
                 with self._beat_lock:
                     self._beat += 1
+                text = line.rstrip("\r\n")
+                if pending is not None and values is not None:
+                    if not _DBUS_ELEMENT.match(text):
+                        pending.append(text)      # the value continues
+                        continue
+                    values.append(dbus_string_value(pending))
+                    pending = None
+                if values is not None and len(values) >= 4:
+                    # Notify's signature is (app, replaces-id, icon, summary,
+                    # body, actions, hints, expire-time). dbus-monitor prints
+                    # the uint32/arrays separately, so the four strings we need
+                    # are app, icon, summary, body — consume once per message
+                    # and ignore the actions/hints trailers (sender-pid,
+                    # urgency…), which must never fire their own announcements.
+                    app, _icon, summary, body = values[:4]
+                    values = None  # consumed: one utterance per message
+                    self._deliver(app, summary, body)
                 if "member=Notify" in line and (
                         line.startswith("signal ") or line.startswith("method call ")):
-                    values = []
+                    values, pending = [], None
                     continue
                 if values is None:
                     continue
-                if not values and not line.lstrip().startswith("string"):
-                    continue
-                values.extend(dbus_strings(line))
-                # Notify's signature is (app, replaces-id, icon, summary,
-                # body, actions, hints, expire-time). dbus-monitor prints the
-                # uint32/arrays separately, so the four strings we need are
-                # app, icon, summary, body — consume once per message and
-                # ignore the actions/hints trailers (sender-pid, urgency…),
-                # which must never fire their own announcements.
+                start = _DBUS_STRING_START.match(text)
+                if start:
+                    pending = [start.group(1)]
+            # A message whose last string is the stream's last line: the line
+            # that would have closed it never came.
+            if pending is not None and values is not None:
+                values.append(dbus_string_value(pending))
                 if len(values) >= 4:
-                    app, _icon, summary, body = values[:4]
-                    values = None  # consumed: one utterance per message
-                    # Observed, not spoken: this counts what the monitor handed
-                    # us, so a reader whose mute list swallowed everything is
-                    # distinguishable from a monitor that printed nothing.
-                    self._health_bump("notifications")
-                    try:
-                        if self._muted(app, summary, body):
-                            log.info("notification muted from %s", app)
-                            continue
-                    except Exception:
-                        log.exception("notification mute check failed for %s", app)
-                    now = time.monotonic()
-                    with self._cooldown_lock:
-                        last = self._app_last.get(app.lower())
-                        if last is not None and now - last < self.APP_COOLDOWN:
-                            log.info("notification cooldown suppresses %s", app)
-                            continue
-                        self._app_last[app.lower()] = now
-                    text = f"Notification from {app}: {summary}"
-                    if body.strip():
-                        text += f". {body.strip()}"
-                    try:
-                        self._announce(text[:500])
-                    except Exception:
-                        log.exception("notification announcement failed")
+                    self._deliver(values[0], values[2], values[3])
             # stdout exhaustion (dbus-monitor died/restarted): log it so a
             # silent reader is visible; the reconnect wrapper respawns with
             # bounded backoff. Direct loop() callers simply return here.
@@ -857,9 +917,17 @@ class ReminderStore:
         """
         self.load_failed = False
         try:
-            raw = self.path.read_text()
+            raw = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return []              # first run: an absent queue is a real empty
+        except UnicodeDecodeError:
+            # Not text at all: as much evidence as a file that is not JSON, and
+            # it takes the same road. It used to escape `load`, so a reminders
+            # file with one bad byte broke every reminder tool and the worker
+            # tick — and `update()` never got the chance to refuse to save over it.
+            self.load_failed = True
+            self._quarantine(self.path)
+            return []
         except OSError:
             self.load_failed = True
             self._log.warning("reminders file %s could not be read", self.path,

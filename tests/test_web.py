@@ -490,6 +490,11 @@ class TestReader:
         ("http://10.0.0.5/x", "private network"),
         ("http://169.254.169.254/latest/meta-data/", "private network"),
         ("http://192.168.1.1/", "private network"),
+        # Ranges `ipaddress`' own flags leave public on every supported Python
+        # (measured 3.12/3.13/3.14, 2026-09-29): IPv6's deprecated site-local
+        # block, which some LAN stacks still route.
+        ("http://[fec0::1]/x", "private network"),
+        ("http://[feff::1234]/x", "private network"),
         ("http://router/", "not a public host"),
         ("http://printer.local/", "not a public host"),
         ("file:///etc/passwd", "not an http(s) address"),
@@ -1278,3 +1283,47 @@ class TestTheHostedReaderIsGated:
         serve(web, Fetch(**{"example.com": self.JS_SHELL}))
         web.read_page("https://example.com/app")
         assert "local fetch FAILED" in web.reader_note()
+
+
+class TestAMalformedPageIsAShortOneNotAnError:
+    """`html_to_text` promises that a page its parser chokes on is "just a short
+    one". The branch that keeps the promise logged with `exc_info=True`, and the
+    module's `_warn` wrapper took no keyword arguments, so that branch raised a
+    TypeError of its own — out of `read_page`, into the model's tool result.
+    HTMLParser is lenient enough today that no real page reaches it, so the
+    parser is made to fail: the promise is about the handler, not about which
+    markup happens to trip it.
+    """
+
+    def _dying_parser(self, web, monkeypatch):
+        def die(self, data):
+            raise RuntimeError("parser died mid-page")
+        monkeypatch.setattr(web._Text, "feed", die)
+
+    def test_a_parser_that_raises_yields_text_not_an_exception(self, web,
+                                                               monkeypatch):
+        self._dying_parser(web, monkeypatch)
+        assert web.html_to_text("<p>hello</p>") == ""
+
+    def test_the_failure_is_still_logged_with_its_traceback(self, web,
+                                                            monkeypatch):
+        records = []
+
+        class Log:
+            def warning(self, msg, *args, **kwargs):
+                records.append((msg, kwargs))
+
+        monkeypatch.setattr(web, "_LOG", Log())
+        self._dying_parser(web, monkeypatch)
+        web.html_to_text("<p>hello</p>")
+        assert records == [("html parse failed", {"exc_info": True})]
+
+    def test_a_logger_that_itself_fails_never_breaks_a_lookup(self, web,
+                                                              monkeypatch):
+        class Broken:
+            def warning(self, *args, **kwargs):
+                raise ValueError("handler blew up")
+
+        monkeypatch.setattr(web, "_LOG", Broken())
+        self._dying_parser(web, monkeypatch)
+        assert web.html_to_text("<p>hello</p>") == ""

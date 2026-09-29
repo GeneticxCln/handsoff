@@ -769,6 +769,46 @@ def test_play_wav_holds_the_portaudio_mark(H, tmp_path):
     assert mod.portaudio_busy() is False, "the mark must be released afterwards"
 
 
+def test_play_wav_closes_its_output_stream_when_stop_raises(H, tmp_path):
+    """A device that vanished mid-playback raises from stop(); the close()
+    behind it sat in the same try and was skipped, leaving the output stream
+    open (sounddevice has no finalizer)."""
+    import threading, wave as _wave
+    mod = _load("core_audio_stop_raises", HERE / "core" / "audio.py")
+    calls = []
+    real = mod.sd.OutputStream
+
+    class _Stream:
+        def __init__(self, **kw):
+            pass
+
+        def start(self):
+            pass
+
+        def write(self, data):
+            pass
+
+        def stop(self):
+            calls.append("stop")
+            raise OSError("device unplugged")
+
+        def close(self):
+            calls.append("close")
+
+    mod.sd.OutputStream = _Stream
+    try:
+        path = tmp_path / "tone.wav"
+        with _wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * 512)
+        mod.play_wav(path, threading.Event())
+    finally:
+        mod.sd.OutputStream = real
+    assert calls == ["stop", "close"], calls
+
+
 def test_play_wav_reports_a_level_that_follows_the_audio(H, tmp_path):
     """A voice-reactive bubble needs a level WHILE it is speaking.
 
@@ -1320,6 +1360,43 @@ class TestWakeWord:
         monkeypatch.setitem(H.SETTINGS, "assistant_name", "hey bubble")
         assert H._match_wake("hey bubble what time") == "what time"
         assert H._is_wake_utt("hey bubble")
+
+
+    @pytest.mark.parametrize("name, said, rest", [
+        ("Dr. Watson", "Dr. Watson, what time is it", "what time is it"),
+        ("Jarvis!", "jarvis what time is it", "what time is it"),
+        ("cypher,", "Cypher, open firefox", "open firefox"),
+        ("Hey Jarvis.", "hey jarvis play jazz", "play jazz"),
+        ("  Computer  ", "computer, volume down", "volume down"),
+    ])
+    def test_a_name_typed_with_punctuation_still_wakes(self, H, monkeypatch,
+                                                       name, said, rest):
+        """The transcript is stripped of punctuation word by word before it is
+        compared and the NAME was only `.split()`, so "Dr. Watson" was
+        `['dr.', 'watson']` against a transcript of `['dr', 'watson']` and
+        "Jarvis!" or "cypher," could never match anything the user says — the
+        wake word dead, and nothing anywhere to say why (measured 2026-09-29)."""
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", name)
+        assert H._match_wake(said) == rest
+        assert H._wake_anywhere("so " + said) is not None
+
+    def test_a_name_with_no_words_in_it_does_not_match_everything(self, H,
+                                                                  monkeypatch):
+        """`[] == []`: a name that is only punctuation normalizes to NO words,
+        and an empty name is a prefix of every utterance — the assistant would
+        engage on all speech. It falls back to the default name, as a blank
+        one always did."""
+        for name in ("...", "!?", " , ", ""):
+            monkeypatch.setitem(H.SETTINGS, "assistant_name", name)
+            assert H._wake_words() == ["assistant"], name
+            assert H._match_wake("what's the weather") is None, name
+            assert H._match_wake("hello there") is None, name
+            assert H._match_wake("assistant what time") == "what time", name
+
+    def test_the_spotter_coverage_check_reads_the_same_words(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "Hey Jarvis!")
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", ["hey_jarvis"])
+        assert H._spotter_wakes_for() is True
 
 
 class TestWakeAnywhere:
@@ -4173,6 +4250,28 @@ class TestAudioFailurePaths:
             f"clipping is required: {int(np.max(sat))}/{int(np.min(sat))} — "
             "wrapping is loud noise, not a no-op")
 
+    def test_an_over_long_reply_is_cut_after_a_sentence_end_full_stop(self, H):
+        """The cut lands on a sentence end, and the full stop stays with it: the
+        engine gives the last sentence falling intonation only if it is there."""
+        mod = _load("core_audio_cut", HERE / "core" / "audio.py")
+        seen = []
+
+        class _Engine:
+            def generate(self, text):
+                seen.append(text)
+                return np.zeros(16, dtype=np.float32)
+
+        setattr(mod, "SETTINGS", {"tts_rate": 1.0, "tts_volume": 1.0})
+        sentence = "One sentence with a single full stop. "
+        long_reply = sentence * (mod.MAX_TTS_CHARS // len(sentence) + 3)
+        mod.synthesize(long_reply, model=_Engine())
+        assert len(seen[0]) <= mod.MAX_TTS_CHARS
+        assert seen[0].endswith("."), repr(seen[0][-20:])
+        # no sentence end anywhere in the first half: a hard cut at the cap
+        seen.clear()
+        mod.synthesize("x" * (mod.MAX_TTS_CHARS + 500), model=_Engine())
+        assert len(seen[0]) == mod.MAX_TTS_CHARS
+
     def test_a_short_reference_clip_is_named_before_the_engine_asserts(
             self, H, tmp_path):
         """The library asserts > 5 s and fires on EVERY turn, so a 2 s clip is
@@ -4247,6 +4346,38 @@ class TestAudioFailurePaths:
         assert first in closed, "the superseded stream was dropped, not closed"
         assert closed.count(first) == 1
 
+    def test_recorder_default_seams_open_at_the_capture_blocksize_and_start_the_stream(self, H):
+        # The base class's own seams (what a host that binds none of them gets):
+        # the device and 16 kHz are asked for, at the 1024-frame block the
+        # level meter and the 16 kHz resampler are sized for, and the stream
+        # that was opened is the one that is started.
+        mod = _load("core_audio_recorder_seams", HERE / "core" / "audio.py")
+        opened, started = [], []
+
+        class _Stream:
+            def start(self):
+                started.append(self)
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        def _open(device, rate, blocksize, cb):
+            opened.append((device, rate, blocksize, cb))
+            return _Stream(), 44100
+
+        mod._open_input = _open
+        rec = mod.Recorder(device="USB Mic", on_level=lambda v: None)
+        rec.start()
+        assert len(opened) == 1
+        device, rate, blocksize, cb = opened[0]
+        assert (device, rate, blocksize) == ("USB Mic", mod.SAMPLE_RATE, 1024)
+        assert cb == rec._cb
+        assert started == [rec._stream], "the opened stream was never started"
+        assert rec._native_rate == 44100
+
     def test_open_input_chains_the_original_error(self, H):
         mod = _load("core_audio_open_fail", HERE / "core" / "audio.py")
         first = OSError("device busy")
@@ -4266,6 +4397,119 @@ class TestAudioFailurePaths:
             mod._open_input(None, 16000, 1024, lambda *a: None)
         assert ei.value is second
         assert ei.value.__cause__ is first, "the real cause was discarded"
+
+
+class TestTheHostRecorderRunsTheHardenedLifecycle:
+    """`handsoff.Recorder` is the class production records with, and it used to
+    override `start()` and `stop()` WHOLE — dropping every guard the base class
+    (`core.audio.Recorder`) was tested for. The base-class tests passed while
+    the subclass that actually ran had none of it. It now binds the three
+    stream seams and inherits the lifecycle, so these drive the HOST class."""
+
+    class _Stream:
+        def __init__(self, start_raises=None):
+            self.calls = []
+            self._start_raises = start_raises
+
+        def start(self):
+            self.calls.append("start")
+            if self._start_raises is not None:
+                raise self._start_raises
+
+        def stop(self):
+            self.calls.append("stop")
+
+        def close(self):
+            self.calls.append("close")
+
+    def _rec(self, H, monkeypatch, streams):
+        it = iter(streams)
+        monkeypatch.setattr(H, "_open_input",
+                            lambda device, rate, bs, cb: (next(it), rate))
+        return H.Recorder(on_level=lambda v: None)
+
+    def test_the_host_recorder_no_longer_overrides_start_or_stop(self, H):
+        # The structural pin: the two methods the base hardened are the base's.
+        import core.audio as A
+        assert "start" not in vars(H.Recorder) and "stop" not in vars(H.Recorder), (
+            "the host Recorder overrides start()/stop() again — the base "
+            "class's guards (close a superseded/failed stream, locked buffer "
+            "reset, drained snapshot) stop applying to the class that runs")
+        assert H.Recorder.start is A.Recorder.start
+        assert H.Recorder.stop is A.Recorder.stop
+
+    def test_a_second_start_closes_the_stream_it_supersedes(self, H, monkeypatch):
+        first, second = self._Stream(), self._Stream()
+        rec = self._rec(H, monkeypatch, [first, second])
+        rec.start()
+        rec.start()                       # a press with no stop between
+        assert "close" in first.calls, (
+            "the superseded PortAudio stream was dropped, not closed — "
+            "sounddevice has no finalizer, so the device stays open")
+        assert first.calls.count("close") == 1
+        assert rec._stream is second
+
+    def test_a_start_that_fails_closes_the_stream_it_opened(self, H, monkeypatch):
+        # A device that vanishes between open and start: the stream exists,
+        # start() raises, and nobody held the reference to close it.
+        broken = self._Stream(start_raises=OSError("device vanished"))
+        rec = self._rec(H, monkeypatch, [broken])
+        with pytest.raises(OSError, match="device vanished"):
+            rec.start()
+        assert "close" in broken.calls, (
+            "a stream whose start failed was left open for the life of the process")
+        assert rec._stream is None
+
+    def test_start_resets_the_buffer_and_stop_drains_it(self, H, monkeypatch):
+        rec = self._rec(H, monkeypatch, [self._Stream(), self._Stream()])
+        rec._frames = [np.ones(16, dtype=np.float32)]     # left by an earlier take
+        rec._samples = 16
+        rec._level = 0.9
+        rec.start()
+        assert rec._frames == [] and rec._samples == 0 and rec._level == 0.0
+        rec._frames.append(np.zeros(160, dtype=np.float32))
+        rec._samples = 160
+        assert rec.stop() is not None
+        assert rec._frames == [] and rec._samples == 0, (
+            "stop() left the take in the buffer, so the next press would have "
+            "prefixed it to a fresh recording")
+        assert rec.stop() is None
+
+    def test_a_pinned_device_that_healed_is_remembered(self, H, monkeypatch):
+        rec = self._rec(H, monkeypatch, [self._Stream()])
+        rec._device = "stale (hw:4,0)"
+        H._MIC_LAST_OPEN_DEVICE.value = "USB Mic (hw:3,0)"
+        try:
+            rec.start()
+        finally:
+            H._MIC_LAST_OPEN_DEVICE.value = None
+        assert rec._device == "USB Mic (hw:3,0)"
+
+    def test_teardown_still_goes_through_the_process_wide_mic_lock(self, H, monkeypatch):
+        import core.audio as A
+        seen = []
+
+        def _held_by_someone_else() -> bool:
+            # An RLock has no locked(); a second thread failing a non-blocking
+            # acquire is the observable form of "the caller holds it".
+            got = []
+            t = threading.Thread(target=lambda: got.append(
+                A.MIC_OPERATION_LOCK.acquire(blocking=False)))
+            t.start()
+            t.join(2)
+            if got and got[0]:
+                A.MIC_OPERATION_LOCK.release()
+            return not got[0]
+
+        s = self._Stream()
+        real = s.stop
+        s.stop = lambda: (seen.append(_held_by_someone_else()), real())[1]
+        rec = self._rec(H, monkeypatch, [s])
+        rec.start()
+        rec.stop()
+        assert seen == [True], (
+            "the host must tear a stream down while holding the mic-operation "
+            "lock — that is its whole reason to subclass")
 
 
 class TestWatchdogReopenLoop:
@@ -4340,6 +4584,48 @@ class TestWatchdogReopenLoop:
 
 
         return state["ticks"]
+
+    def test_a_stream_that_fails_to_start_is_released_before_the_retry(
+            self, H, monkeypatch):
+        """The device can vanish between the open and the start. The stream that
+        was opened was still held in `self._stream`, the retry overwrote it, and
+        every attempt of a flapping device leaked one open PortAudio stream —
+        sounddevice has no finalizer. It is stopped and closed (bounded, under
+        the mic lock) before the listener backs off."""
+        ln = self._listener(H)
+        logs: list = []
+
+        def make(fail):
+            log_: list = []
+            logs.append(log_)
+
+            class _S:
+                def start(self_):
+                    log_.append("start")
+                    if fail:
+                        raise RuntimeError("device vanished")
+
+                def stop(self_):
+                    log_.append("stop")
+
+                def close(self_):
+                    log_.append("close")
+            return _S()
+
+        outcomes = iter([True, False])         # the first start fails
+        monkeypatch.setattr(
+            H, "_open_input",
+            lambda dev, rate, bs, cb: (make(next(outcomes)), 16000))
+
+        def tick(s):
+            if s == 0.5 and len(logs) >= 2 and "start" in logs[1]:
+                ln._running = False            # the second stream is up: done
+        self._run_capped(H, monkeypatch, ln, tick)
+        assert len(logs) == 2, logs
+        assert logs[0] == ["start", "stop", "close"], (
+            f"the stream that failed to start was dropped open: {logs[0]}")
+        assert logs[1][0] == "start"
+        assert ln._health_opens_failed == 1
 
     # ---- stalled: frames stop arriving → REOPEN_S later the stream reopens
 
@@ -4563,6 +4849,35 @@ class TestAMicrophoneThatIsNotOnTheMachine:
                 raise ValueError(f"Cannot get card index for {dev!r}")
 
         return _SD
+
+    @pytest.mark.parametrize("info, want", [
+        # an EXPLICIT count is what the device says
+        ({"max_input_channels": 2}, 2),
+        ({"max_input_channels": 128}, 128),
+        ({"max_input_channels": "2"}, 2),
+        # explicit zero is the ghost, and a nonsense negative is no better
+        ({"max_input_channels": 0}, 0),
+        ({"max_input_channels": -3}, 0),
+        ({"max_input_channels": None}, 0),
+        # ABSENT is not zero: "not stated", which is NOT evidence of a ghost
+        ({}, -1),
+        ({"name": "stub", "default_samplerate": 44100.0}, -1),
+        # a value that is not a number is unstated too, not a ghost
+        ({"max_input_channels": "many"}, -1),
+        ({"max_input_channels": [2]}, -1),
+        # something that is not a device entry at all offers nothing
+        (None, 0),
+        ("Yeti", 0),
+        (2, 0),
+        ([("max_input_channels", 2)], 0),
+    ])
+    def test_can_capture_channels_answers_each_shape_of_entry(self, info, want):
+        """The predicate is three answers — a count, "no channels" (0) and "not
+        stated" (-1) — and its callers distinguish them: only an explicit 0 is a
+        ghost. Each return was unpinned (the mutation gate dropped each of them
+        and every test still passed), so each shape is asserted directly."""
+        from core import voice
+        assert voice.can_capture_channels(info) == want, info
 
     def test_a_device_that_enumerates_with_no_input_channels_is_a_ghost(
             self, H, monkeypatch, caplog):

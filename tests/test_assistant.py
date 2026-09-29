@@ -35,6 +35,38 @@ def test_pomodoro_start_status_stop():
     assert spoken and spoken[0].startswith("Pomodoro started")
 
 
+def test_pomodoro_speaks_its_minutes_as_a_person_would(monkeypatch):
+    """`{n:.0f} minutes` said "1 minutes", rounded a 2.5-minute phase to "2"
+    (round-half-even) and, in `status`, floored 59 s to "0 minutes remaining"."""
+    from core import assistant as A
+    assert A._minutes(1) == "1 minute"
+    assert A._minutes(25) == "25 minutes"
+    assert A._minutes(2.5) == "2.5 minutes"
+    assert A._minutes(1.0) == "1 minute"
+    one: list = []
+    pomo1, _ = _controller(one)
+    assert pomo1.command("start", 1, 1) == (
+        "pomodoro started: 1 minute work and 1 minute break")
+    assert one[0] == "Pomodoro started: 1 minute of work."
+    pomo1.command("stop", 0, 0)
+
+    spoken: list = []
+    pomo, _ = _controller(spoken)
+    assert pomo.command("start", 25, 5) == (
+        "pomodoro started: 25 minute work and 5 minute break")
+    assert spoken[0] == "Pomodoro started: 25 minutes of work."
+    until = pomo._state["until"]
+    # 59 s left is "less than a minute"; 61 s left is two minutes (rounded UP);
+    # exactly one minute left is singular
+    for left, said in ((59, "less than a minute"), (61, "2 minutes"),
+                       (60, "1 minute"), (1500, "25 minutes")):
+        monkeypatch.setattr(A.time, "monotonic", lambda left=left: until - left)
+        assert pomo.command("status", 1, 1) == (
+            f"pomodoro is in work phase with {said} remaining"), left
+    monkeypatch.undo()
+    pomo.command("stop", 0, 0)
+
+
 def test_pomodoro_loop_announces_transition():
     spoken: list = []
     pomo, started = _controller(spoken)
@@ -213,6 +245,21 @@ def test_an_unparseable_file_is_quarantined_not_emptied(tmp_path):
     # A missing file is NOT a failure: first run, a real empty.
     store.path.unlink()
     assert store.load() == [] and not store.load_failed
+
+
+def test_a_reminders_file_that_is_not_text_is_evidence_too(tmp_path):
+    """`read_text()` raised UnicodeDecodeError for a file with one bad byte, and
+    only OSError was caught, so it escaped `load` — every reminder tool and the
+    worker tick failed, and `update()` never got the chance to refuse to save
+    over it. It is quarantined and marked failed like a file that is not JSON."""
+    moved = []
+    store, saved, _ = _store(tmp_path, quarantine=lambda p: moved.append(p))
+    store.path.write_bytes(b'[{"name": "caf\xe9", "due": 5.0}]')
+    assert store.load() == []                        # no exception
+    assert moved == [store.path] and store.load_failed
+    # ...and a transaction refuses to save a fresh queue over it
+    assert store.update(lambda items: items + [{"name": "x", "due": 9.0}]) == []
+    assert saved == [], "a queue we could not read must not be overwritten"
 
 
 def test_update_never_saves_over_a_load_that_failed(tmp_path):
@@ -628,6 +675,183 @@ def _one_notify_lines(app="Firefox", summary="hi", body="there"):
         f'   string "{summary}"',
         f'   string "{body}"',
     ]
+
+
+# -------------------------------------------------------- raw dbus-monitor text
+# dbus-monitor prints a string argument RAW: the quotes it holds are not escaped
+# and neither is a newline. Captured from a real `dbus-monitor` (dbus 1.14) for
+# Notify("Signal", 0, "", "Alice", 'She said "hi there" and\nsecond line', ...):
+_REAL_CAPTURE = [
+    "method call time=1790686292.505645 sender=:1.1 -> "
+    "destination=org.freedesktop.Notifications serial=3 "
+    "path=/org/freedesktop/Notifications; "
+    "interface=org.freedesktop.Notifications; member=Notify",
+    '   string "Signal"',
+    "   uint32 0",
+    '   string ""',
+    '   string "Alice"',
+    '   string "She said "hi there" and',
+    'second line"',
+    "   array [",
+    '      string "default"',
+    '      string "Open"',
+    "   ]",
+    "   array [",
+    "      dict entry(",
+    '         string "urgency"',
+    "         variant             byte 1",
+    "      )",
+    "   ]",
+    "   int32 5000",
+]
+
+
+def _spoken_from(lines):
+    spoken: list = []
+    reader = _reader(spoken)
+    proc = types.SimpleNamespace(stdout=iter([l + "\n" for l in lines]),
+                                 poll=lambda: 0)
+    reader.loop(proc, threading.Event())
+    return spoken
+
+
+def _notify(app, summary, body_lines, trailers=True):
+    head = _one_notify_lines(app, summary, "")[:5]      # header .. summary
+    tail = _REAL_CAPTURE[7:] if trailers else []
+    return head + body_lines + tail
+
+
+def test_a_body_with_quotes_and_a_newline_is_spoken_whole():
+    """The real capture above. The regex stopped at the first inner quote and the
+    continuation line had no `string` at all, so the body was spoken as "She
+    said" — and for a body that only spans lines, as the NEXT string of the
+    message: the action name `default`."""
+    assert _spoken_from(_REAL_CAPTURE) == [
+        'Notification from Signal: Alice. She said "hi there" and second line']
+
+
+def test_a_multi_line_body_is_not_replaced_by_the_action_name():
+    assert _spoken_from(_notify("Mail", "Inbox", ['   string "first line',
+                                                  'second line"'])) == [
+        "Notification from Mail: Inbox. first line second line"]
+
+
+def test_a_body_that_ends_in_a_quote_character_keeps_it():
+    assert _spoken_from(_notify("Chat", "Bob", ['   string "he said "no""'])) == [
+        'Notification from Chat: Bob. he said "no"']
+
+
+def test_a_plain_body_and_an_empty_body_still_read_as_before():
+    assert _spoken_from(_notify("Firefox", "hi", ['   string "there"'])) == [
+        "Notification from Firefox: hi. there"]
+    assert _spoken_from(_notify("Firefox", "hi", ['   string ""'])) == [
+        "Notification from Firefox: hi"]
+
+
+def test_two_messages_in_a_row_are_each_delivered_once():
+    lines = (_notify("A", "s1", ['   string "b1"'])
+             + _notify("B", "s2", ['   string "multi', 'line"']))
+    assert _spoken_from(lines) == ["Notification from A: s1. b1",
+                                   "Notification from B: s2. multi line"]
+
+
+def test_a_message_cut_off_after_its_body_is_still_delivered():
+    """The body is the stream's last line: the line that would close it never
+    comes, so the end of the stream does."""
+    assert _spoken_from(_notify("Signal", "Alice", ['   string "last line"'],
+                                trailers=False)) == [
+        "Notification from Signal: Alice. last line"]
+
+
+def test_a_muted_notification_is_counted_but_not_spoken(caplog):
+    import logging
+    spoken: list = []
+    reader = _reader(spoken, muted=lambda a, s, b: a == "Spammy")
+    proc = types.SimpleNamespace(
+        stdout=iter([l + "\n" for l in _notify("Spammy", "buy", ['   string "now"'])
+                     + _notify("Real", "hi", ['   string "there"'])]),
+        poll=lambda: 0)
+    with caplog.at_level(logging.INFO):
+        reader.loop(proc, threading.Event())
+    assert spoken == ["Notification from Real: hi. there"], spoken
+    assert "notification muted from Spammy" in caplog.text, caplog.text
+    assert reader.health(enabled=True)["notifications"] == 2, \
+        "a muted message is still observed"
+
+
+def test_a_mute_check_that_raises_does_not_swallow_the_notification(caplog):
+    import logging
+
+    def boom(a, s, b):
+        raise RuntimeError("bad mute list")
+    spoken: list = []
+    reader = _reader(spoken, muted=boom)
+    with caplog.at_level(logging.ERROR):
+        reader.loop(types.SimpleNamespace(
+            stdout=iter([l + "\n" for l in _notify("A", "s", ['   string "b"'])]),
+            poll=lambda: 0), threading.Event())
+    assert spoken == ["Notification from A: s. b"], spoken
+    assert "notification mute check failed for A" in caplog.text, caplog.text
+
+
+def test_one_spoken_digest_per_app_per_cooldown(monkeypatch, caplog):
+    import logging
+    from core import assistant as A
+    spoken: list = []
+    reader = _reader(spoken)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(A.time, "monotonic", lambda: clock["t"])
+
+    def arrive(body):
+        reader.loop(types.SimpleNamespace(
+            stdout=iter([l + "\n" for l in _notify("Chat", "Bob", [f'   string "{body}"'])]),
+            poll=lambda: 0), threading.Event())
+
+    with caplog.at_level(logging.INFO):
+        arrive("one")
+        clock["t"] += reader.APP_COOLDOWN - 1
+        arrive("two")                      # inside the window: suppressed
+        clock["t"] += 1
+        arrive("three")                    # exactly a window after the first: spoken
+    assert spoken == ["Notification from Chat: Bob. one",
+                      "Notification from Chat: Bob. three"], spoken
+    assert "notification cooldown suppresses Chat" in caplog.text, caplog.text
+
+
+def test_an_announce_that_raises_is_logged_not_propagated(caplog):
+    import logging
+
+    def boom(text):
+        raise RuntimeError("no speaker")
+    reader = _reader([], announce=boom)
+    with caplog.at_level(logging.ERROR):
+        reader.loop(types.SimpleNamespace(
+            stdout=iter([l + "\n" for l in _notify("A", "s", ['   string "b"'])]),
+            poll=lambda: 0), threading.Event())
+    assert "notification announcement failed" in caplog.text, caplog.text
+
+
+def test_speech_is_one_line_and_bounded():
+    spoken: list = []
+    reader = _reader(spoken)
+    long_body = "word " * 400
+    lines = (_one_notify_lines("A  B", "two", "")[:4]     # header .. icon
+             + ['   string "two', 'lines"']              # a multi-line SUMMARY
+             + ['   string "' + long_body.strip() + '"'] + _REAL_CAPTURE[7:])
+    reader.loop(types.SimpleNamespace(
+        stdout=iter([l + "\n" for l in lines]), poll=lambda: 0),
+        threading.Event())
+    assert len(spoken) == 1 and len(spoken[0]) == 500, len(spoken[0])
+    assert spoken[0].startswith("Notification from A B: two lines. word word"), spoken[0][:60]
+    assert "\n" not in spoken[0]
+
+
+def test_dbus_string_value_drops_only_the_closing_quote():
+    from core.assistant import dbus_string_value
+    assert dbus_string_value(['abc"']) == "abc"
+    assert dbus_string_value(['a "b" c', 'd"']) == 'a "b" c\nd'
+    assert dbus_string_value(['no closing quote']) == "no closing quote"
+    assert dbus_string_value(['"']) == ""
 
 
 def test_reader_health_has_one_shape_before_it_ever_runs():

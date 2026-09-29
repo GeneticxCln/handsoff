@@ -659,6 +659,77 @@ class TestMissingBrainFallback:
             return list(q.queue)
 
         report["stream_said"] = speaking(ndjson("One. ", "Two more"))
+
+        # a stream that dies right after a finished sentence (which the splitter
+        # is still holding for its lookahead) still says it, in this copy as in
+        # core; half a sentence stays unsaid
+        class DyingResp(StreamResp):
+            def __iter__(self):
+                yield from self.lines
+                raise OSError("connection reset")
+
+        def dying(*pieces):
+            q = queue.Queue()
+            try:
+                legacy.ollama_chat_stream(
+                    [{"role": "user", "content": "hi"}], q, None, None,
+                    base=BASE, model="gpt-oss:20b", num_ctx=8,
+                    guard=lambda: None, logger=log,
+                    urlopen=lambda req, timeout=None: DyingResp(ndjson(*pieces)))
+            except OSError:
+                pass
+            return list(q.queue)
+
+        # the two stream-content rules core.brain has and this copy had drifted
+        # from: an in-band {"error": ...} line is a failure (after the sentence
+        # that arrived is said), and a line that is not an object is ignored
+        def error_line(text):
+            return (json.dumps({"error": text}) + EOL).encode()
+
+        def speaking_or_raising(lines):
+            q = queue.Queue()
+            try:
+                legacy.ollama_chat_stream(
+                    [{"role": "user", "content": "hi"}], q, None, None,
+                    base=BASE, model="gpt-oss:20b", num_ctx=8,
+                    guard=lambda: None, logger=log,
+                    urlopen=lambda req, timeout=None: StreamResp(list(lines)))
+                raised = None
+            except Exception as exc:
+                raised = f"{type(exc).__name__}: {exc}"
+            return {"queue": list(q.queue), "raised": raised}
+
+        report["stream_inband_error"] = speaking_or_raising(
+            ndjson("Berlin is in Germany", ".") + [error_line("model runner has unexpectedly stopped")])
+        report["stream_non_object_lines"] = speaking_or_raising(
+            [b"[1, 2, 3]" + EOL.encode(), b"42" + EOL.encode(), b"null" + EOL.encode()]
+            + ndjson("Fine."))
+        report["stream_dies_after_a_sentence"] = dying("Berlin is in Germany", ".")
+        report["stream_dies_mid_sentence"] = dying("Berlin is in Germany. It has", " three")
+
+        # where a reply is cut into sentences must not depend on where the
+        # network cut the stream: the same reply, split at EVERY position, in
+        # this copy and in core, gives the sentences the reply gives whole
+        def split_at(brain, text, i):
+            q = queue.Queue()
+            brain.ollama_chat_stream(
+                [{"role": "user", "content": "hi"}], q, None, None,
+                base=BASE, model="gpt-oss:20b", num_ctx=8,
+                guard=lambda: None, logger=log,
+                urlopen=lambda req, timeout=None: StreamResp(
+                    ndjson(text[:i], text[i:])))
+            return list(q.queue)
+
+        REPLIES = ("It is 18.5 degrees and 3.2 inches of rain.",
+                   "Version 3.12.1 shipped. Visit example.com now.",
+                   "Really?! Yes... maybe. Okay!")
+        report["split_whole"] = [split_at(legacy, r, len(r)) for r in REPLIES]
+        report["split_independent"] = all(
+            split_at(legacy, r, i) == split_at(legacy, r, len(r))
+            for r in REPLIES for i in range(1, len(r)))
+        report["split_matches_core"] = all(
+            split_at(legacy, r, i) == split_at(real_brain, r, i)
+            for r in REPLIES for i in range(1, len(r)))
         # the leaked-token rule, both directions: a token glued to a
         # sentence costs only its own line, a bare one costs the line
         report["stream_leaked"] = speaking(
@@ -965,6 +1036,25 @@ class TestMissingBrainFallback:
         # the queue: sentences, then exactly one terminator
         assert report["stream_said"] == ["One.", "Two more", None], \
             report["stream_said"]
+        # the splitter's boundaries do not depend on where the stream was cut:
+        # a decimal, a version, a domain and "?!" / "..." stay whole in this
+        # copy exactly as in core, at every cut position
+        assert report["split_whole"] == [
+            ["It is 18.5 degrees and 3.2 inches of rain.", None],
+            ["Version 3.12.1 shipped.", "Visit example.com now.", None],
+            ["Really?!", "Yes...", "maybe.", "Okay!", None]], report["split_whole"]
+        assert report["stream_inband_error"] == {
+            "queue": ["Berlin is in Germany.", None],
+            "raised": "RuntimeError: Ollama error: model runner has unexpectedly stopped"
+        }, report["stream_inband_error"]
+        assert report["stream_non_object_lines"] == {
+            "queue": ["Fine.", None], "raised": None}, report["stream_non_object_lines"]
+        assert report["stream_dies_after_a_sentence"] == [
+            "Berlin is in Germany.", None], report["stream_dies_after_a_sentence"]
+        assert report["stream_dies_mid_sentence"] == [
+            "Berlin is in Germany.", None], report["stream_dies_mid_sentence"]
+        assert report["split_independent"] is True
+        assert report["split_matches_core"] is True
         # the leak rule, in the direction that lost a sentence until 2026-09-27
         assert report["stream_leaked"] == ["Here.", None], report["stream_leaked"]
         assert report["stream_bare_token"] == ["Here.", None], \
@@ -1554,3 +1644,70 @@ class TestStateHygieneTrend:
         assert rows[0]["swept"] == 1                 # the sweep ran first
         assert rows[0]["scratch_left"] == 0
         assert not leaked.exists()
+
+
+class TestNoUnboundedBlockingCall:
+    """A voice assistant is a set of long-lived threads, and one call that can
+    wait forever holds its thread — and whatever the thread was doing for the
+    user — for the life of the process. Every `subprocess.run`, `urlopen` and
+    `create_connection` in the shipped sources therefore states its timeout.
+
+    Found by sweeping the tree for the shape, which turned up exactly one: the
+    self-test's clipboard restore ran `wl-copy` with its output captured and no
+    timeout, and wl-copy forks a server that keeps the inherited pipes open —
+    `copy_text` beside it already detached them and bounded the call.
+    """
+
+    SOURCES = ("handsoff.py", "hardware.py", "settings_schema.py",
+               "handsoff-settings.py")
+
+    @staticmethod
+    def _calls_without_a_timeout(path: Path) -> list:
+        import ast
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = (ast.unparse(fn) if isinstance(fn, (ast.Attribute, ast.Name))
+                    else "")
+            keywords = {k.arg for k in node.keywords}
+            if None in keywords:            # **kwargs: cannot be judged here
+                continue
+            if name in ("subprocess.run", "subprocess.check_output",
+                        "subprocess.check_call", "subprocess.call"):
+                bare = "timeout" not in keywords
+            elif name.endswith("urlopen"):
+                bare = "timeout" not in keywords and len(node.args) < 3
+            elif name == "socket.create_connection":
+                bare = "timeout" not in keywords and len(node.args) < 2
+            else:
+                continue
+            if bare:
+                found.append(f"{path.name}:{node.lineno}: {ast.unparse(node)[:90]}")
+        return found
+
+    def test_no_shipped_call_can_wait_forever(self):
+        paths = [ROOT / name for name in self.SOURCES]
+        paths += sorted((ROOT / "core").glob("*.py"))
+        offenders = [line for p in paths if p.is_file()
+                     for line in self._calls_without_a_timeout(p)]
+        assert not offenders, (
+            "these calls have no timeout, so a wedged far end holds the calling "
+            "thread for ever:\n  " + "\n  ".join(offenders))
+
+    def test_the_guard_does_catch_the_shape_it_guards(self, tmp_path):
+        """A sweep that finds nothing proves nothing until it is shown to find
+        something."""
+        sample = tmp_path / "sample.py"
+        sample.write_text(
+            "import subprocess, socket, urllib.request\n"
+            "subprocess.run(['a'])\n"
+            "subprocess.run(['a'], timeout=3)\n"
+            "urllib.request.urlopen('http://x')\n"
+            "urllib.request.urlopen('http://x', timeout=3)\n"
+            "socket.create_connection(('h', 1))\n"
+            "socket.create_connection(('h', 1), 5)\n", encoding="utf-8")
+        found = self._calls_without_a_timeout(sample)
+        assert [line.split(":")[1] for line in found] == ["2", "4", "6"], found

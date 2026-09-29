@@ -170,7 +170,7 @@ def load_store(path: pathlib.Path) -> dict:
     if not path.exists():
         return rows
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return rows
     for line in lines:
@@ -295,7 +295,7 @@ def mine_turns(turn_log: pathlib.Path,
                   "cursor_hash": "", "unusable": {}, "unreadable": 0,
                   "replaced": False, "present": False}
     try:
-        lines = turn_log.read_text(encoding="utf-8").splitlines()
+        lines = turn_log.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return [], info
     info["present"] = True

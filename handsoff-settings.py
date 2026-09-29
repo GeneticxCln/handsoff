@@ -238,7 +238,7 @@ class _Rows:
                 self.window._field(control.title, control.row))
         else:
             self.target.addRow(
-                "" if control.labelled else control.title, control.row)
+                "" if control.labelled else _mn(control.title), control.row)
 
     def widget(self, widget) -> None:
         """Place a bare widget (a note, a progress bar, a button row)."""
@@ -265,7 +265,7 @@ class _Rows:
         if self.style == "card":
             self.target.addLayout(self.window._field(label, widget))
         else:
-            self.target.addRow(label, widget)
+            self.target.addRow(_mn(label), widget)
 
 
 def _state_image_keys() -> tuple:
@@ -385,7 +385,8 @@ def http_json(url: str, payload: dict | None = None, timeout: int = 10):
 
 def autostart_enabled() -> bool:
     try:
-        return any(_autostart_hit(line) for line in NIRI_CONFIG.read_text().splitlines())
+        return any(_autostart_hit(line) for line in
+                   NIRI_CONFIG.read_text(encoding="utf-8", errors="replace").splitlines())
     except OSError:
         return False
 
@@ -433,7 +434,15 @@ def set_autostart(enable: bool) -> str:
                 return "no niri config found — nothing to change"
             NIRI_CONFIG.parent.mkdir(parents=True, exist_ok=True)
             NIRI_CONFIG.write_text("// niri config\n")
-        lines = NIRI_CONFIG.read_text().splitlines()
+        # Strict on purpose. This function WRITES the file back, and a lenient
+        # decode would put U+FFFD where the user's own bytes were — silently
+        # rewriting a config that is not UTF-8 as one that is. A file this
+        # cannot read exactly is a file it must not edit.
+        try:
+            lines = NIRI_CONFIG.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            return (f"error editing {NIRI_CONFIG}: it is not UTF-8 text, so "
+                    f"handsoff will not rewrite it — left untouched")
         has_new = any(AUTOSTART_LINE in line for line in lines)
         has = has_new or any(AUTOSTART_LINE_OLD in line for line in lines)
         bak = NIRI_CONFIG.with_name(NIRI_CONFIG.name + ".bak-handsoff")
@@ -1124,11 +1133,14 @@ class _LiveMicProbe:
         st = self._stream
         self._stream = None
         if st is not None:
-            try:
-                st.stop()
-                st.close()
-            except Exception:
-                pass
+            # Separate guards: a stop() that raises (the device is gone) used to
+            # skip the close() behind it — the stream stayed open, and PortAudio
+            # holds the device until the object is collected.
+            for release in (st.stop, st.close):
+                try:
+                    release()
+                except Exception:
+                    pass
 
     def _run(self, device: str | None, threshold: int) -> None:
         # one capture loop per (device, threshold) change; exits when a newer
@@ -1593,6 +1605,21 @@ def _slider_text(value: float, field) -> str:
     return f"{shown:.{field.decimals}f}{sep}{unit}"
 
 
+def _mn(text: str) -> str:
+    """`text` for a Qt widget that reads `&` as a keyboard-mnemonic marker.
+
+    A QCheckBox, QPushButton, QGroupBox title and the label a QFormLayout makes
+    for `addRow("text", widget)` all treat `&x` as "underline x, and Alt+x
+    activates it" — and DROP the ampersand. Titles written as ordinary English
+    ("screenshots & schemas", "desktop & self-modify", "Save & restart bubble")
+    rendered as "screenshots _schemas": the word the ampersand joined was
+    underlined and the ampersand itself was gone (seen in a screenshot of the
+    real window under a real compositor). `&&` is Qt's spelling of a literal one.
+    A plain QLabel does not read mnemonics, so it is given the text as it is.
+    """
+    return text.replace("&", "&&")
+
+
 def _control_title(field: "object") -> str:
     """The label a generated row draws: the row's title, else its key in words.
 
@@ -1604,7 +1631,7 @@ def _control_title(field: "object") -> str:
 
 
 def _build_checkbox(win, field: "object") -> _Control:
-    box = QCheckBox(_control_title(field), win)
+    box = QCheckBox(_mn(_control_title(field)), win)
     box.setToolTip(field.tip)
     box.toggled.connect(lambda *_: win._control_changed(field.key))
     return _Control(field.key, box, box.isChecked,
@@ -2001,7 +2028,7 @@ class SettingsWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         save = QPushButton("Save", self)
         save.clicked.connect(self._on_save)
-        apply_btn = QPushButton("Save & restart bubble", self)
+        apply_btn = QPushButton(_mn("Save & restart bubble"), self)
         apply_btn.clicked.connect(self._on_apply)
         quit_btn = QPushButton("Quit bubble", self)
         quit_btn.clicked.connect(self._on_quit_bubble)
@@ -2364,7 +2391,7 @@ drifting apart one forgotten key at a time.
         # everything else is the table's, including the tool-call limit, which
         # this window never drew before this pass.
         for group in _page_groups("brain"):
-            card = QGroupBox(_group_title("brain", group), w)
+            card = QGroupBox(_mn(_group_title("brain", group)), w)
             form = QFormLayout(card)
             self._draw_group("brain", group, _Rows(self, form, "form"))
             lay.addWidget(card)
@@ -2394,7 +2421,7 @@ drifting apart one forgotten key at a time.
         # is a picker whose choice only takes effect if someone presses a button
         # somewhere else.
         self.model_list.currentItemChanged.connect(self._on_model_picked)
-        form.addRow("Models (\U0001f527 tools = can control the desktop & self-modify)",
+        form.addRow(_mn("Models (\U0001f527 tools = can control the desktop & self-modify)"),
                     self.model_list)
         self.model_in_use = QLabel("In use now: \u2026", self)
         self.model_in_use.setWordWrap(True)
@@ -2442,7 +2469,7 @@ drifting apart one forgotten key at a time.
             return
         try:
             on_disk = merge_settings(
-                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8")))
+                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8-sig")))
         except (OSError, ValueError):
             on_disk = {}
         if on_disk.get("model") == picked:
@@ -2572,14 +2599,14 @@ drifting apart one forgotten key at a time.
         self._status(f"testing {model} …")
 
         def fetch():
-            t0 = time.time()
+            t0 = time.monotonic()
             reply = http_json(base + "/api/chat", {
                 "model": model, "stream": False, "think": False,
                 "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
                 "options": {"num_ctx": 2048},
             }, timeout=120)
             text = (reply.get("message") or {}).get("content", "").strip()
-            return f"{model} replied “{text[:60]}” in {time.time() - t0:.1f}s"
+            return f"{model} replied “{text[:60]}” in {time.monotonic() - t0:.1f}s"
 
         def done(ok, result):
             self.test_btn.setEnabled(True)
@@ -2607,7 +2634,7 @@ drifting apart one forgotten key at a time.
         for group in _page_groups("voice"):
             if self._group_panel("voice", group, lay):
                 continue
-            card = QGroupBox(_group_title("voice", group), w)
+            card = QGroupBox(_mn(_group_title("voice", group)), w)
             card_lay = QVBoxLayout(card)
             form = QFormLayout()
             card_lay.addLayout(form)
@@ -2625,7 +2652,7 @@ drifting apart one forgotten key at a time.
         refresh.clicked.connect(self.refresh_mics)
         row.addWidget(self.mic_combo, 1)
         row.addWidget(refresh)
-        rows.target.addRow(field.title, row)
+        rows.target.addRow(_mn(field.title), row)
         # Reopening the live test is what makes a device switch observable, so
         # the handler is wired here, beside the widget it belongs to.
         self.mic_combo.currentIndexChanged.connect(
@@ -2704,7 +2731,7 @@ drifting apart one forgotten key at a time.
         clear.clicked.connect(self._clear_reference)
         ref_row.addWidget(browse)
         ref_row.addWidget(clear)
-        rows.target.addRow(field.title, ref_row)
+        rows.target.addRow(_mn(field.title), ref_row)
 
         self.tts_ref_status = QLabel("", self)
         self.tts_ref_status.setWordWrap(True)
@@ -2734,7 +2761,7 @@ drifting apart one forgotten key at a time.
         different failure and was previously invisible from here. No table row
         belongs here — the card has none, which is what makes it a panel.
         """
-        group = QGroupBox(_group_title("voice", "level"), self)
+        group = QGroupBox(_mn(_group_title("voice", "level")), self)
         lvl = QVBoxLayout(group)
         self.level_meter = LevelMeter(group)
         lvl.addWidget(self.level_meter)
@@ -2834,8 +2861,8 @@ drifting apart one forgotten key at a time.
 
                 with sd.InputStream(samplerate=16000, channels=1, dtype="int16",
                                     blocksize=1024, callback=cb, device=device):
-                    deadline = time.time() + 3.0
-                    while time.time() < deadline:
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
                         time.sleep(0.05)
             except Exception as e:  # noqa: BLE001
                 box["err"] = e
@@ -3101,7 +3128,12 @@ drifting apart one forgotten key at a time.
 
     def _refresh_decisions(self) -> None:
         try:
-            raw = H.DECISIONS_FILE.read_text(encoding="utf-8").splitlines()
+            # errors="replace": the viewer skips a line it cannot parse, so a
+            # torn last line (power cut mid-write) is one skipped row — not a
+            # UnicodeDecodeError, which is a ValueError this handler does not
+            # catch, escaping a Qt slot.
+            raw = H.DECISIONS_FILE.read_text(
+                encoding="utf-8", errors="replace").splitlines()
         except FileNotFoundError:
             self.decisions_view.setPlainText(
                 "(no decisions logged yet — the bubble writes one line per "
@@ -3222,7 +3254,7 @@ drifting apart one forgotten key at a time.
         for group in _page_groups("permissions"):
             if self._group_panel("permissions", group, lay):
                 continue
-            card = QGroupBox(_group_title("permissions", group), w)
+            card = QGroupBox(_mn(_group_title("permissions", group)), w)
             form = QFormLayout(card)
             self._draw_group("permissions", group, _Rows(self, form, "form"))
             self._group_tail("permissions", group, form)
@@ -3299,13 +3331,35 @@ drifting apart one forgotten key at a time.
             "pomodoro": ("Pomodoro timer", "work/break timer with spoken transitions"),
             "watchers": ("File/process watchers", "bounded monitors that announce matching "
                          "lines or process exits"),
+            "get_datetime": ("Current date and time", "say today's date, the weekday "
+                             "and the local time"),
+            "quant_space": ("Quantum Space desk", "read-only: list the sessions open "
+                            "in Quantum Space and read the recent output of one"),
         }
         for key in (DEFAULT_SETTINGS.get("permissions") or {}):
             title, desc = labels.get(key, (key.replace("_", " ").capitalize(),
                                            "no description yet"))
-            chk = QCheckBox(f"{title} — {desc}", self)
+            # The description is its OWN wrapped label under the checkbox. A
+            # QCheckBox does not wrap: "title — description" ran off the right
+            # edge, and the two entries that matter most — what leaves the
+            # machine when Internet knowledge or the third-party reader is
+            # switched on — were the longest, so the sentence that says what is
+            # disclosed was the part clipped (seen in a screenshot of the real
+            # window; the default 780 px window clips more).
+            holder = QWidget(self)
+            column = QVBoxLayout(holder)
+            column.setContentsMargins(0, 0, 0, 4)
+            column.setSpacing(0)
+            chk = QCheckBox(_mn(title), holder)
+            chk.setToolTip(f"{title} — {desc}")
+            note = QLabel(desc, holder)
+            note.setWordWrap(True)
+            note.setObjectName("muted")
+            note.setContentsMargins(24, 0, 0, 0)     # under the label, not the box
+            column.addWidget(chk)
+            column.addWidget(note)
             self.perm_checks[key] = chk
-            rows.target.addRow(chk)
+            rows.target.addRow(holder)
 
     def _blocked_note(self, form: QFormLayout) -> None:
         """What the whitelist can never include, under the box it applies to."""
@@ -4856,7 +4910,7 @@ drifting apart one forgotten key at a time.
         # message describing an edit nobody made.
         try:
             on_disk = merge_settings(
-                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8")))
+                json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8-sig")))
         except (OSError, ValueError):
             on_disk = {}
         changed = [k for k in self.APPEARANCE_KEYS
@@ -4908,7 +4962,7 @@ drifting apart one forgotten key at a time.
         # what the machine will do — a row showing the stored value would
         # describe something that may not be true.
         for group in _page_groups("startup"):
-            card = QGroupBox(_group_title("startup", group), w)
+            card = QGroupBox(_mn(_group_title("startup", group)), w)
             card_lay = QVBoxLayout(card)
             form = QFormLayout()
             card_lay.addLayout(form)
@@ -5005,12 +5059,25 @@ drifting apart one forgotten key at a time.
         def worker():
             # systemd owns the bubble: a bare SIGTERM is a "clean exit" and
             # Restart=always resurrects it — stop the unit instead
+            #
+            # Only when the unit is RUNNING the bubble. `systemctl stop` on a
+            # loaded but inactive unit exits 0, and the installer always writes
+            # and enables the unit — so for a bubble started by hand
+            # (`python ~/.local/bin/handsoff.py`, or niri's spawn-at-startup)
+            # the stop "succeeded", this said "bubble stopped (systemd unit)",
+            # and the bubble kept running. handsoff-restart asks `is-active`
+            # first for the same reason.
             try:
-                r = subprocess.run(
-                    ["systemctl", "--user", "stop", "handsoff.service"],
-                    capture_output=True, text=True, timeout=15)
-                if r.returncode == 0:
-                    return "bubble stopped (systemd unit)"
+                active = subprocess.run(
+                    ["systemctl", "--user", "is-active", "--quiet",
+                     "handsoff.service"],
+                    capture_output=True, text=True, timeout=10).returncode == 0
+                if active:
+                    r = subprocess.run(
+                        ["systemctl", "--user", "stop", "handsoff.service"],
+                        capture_output=True, text=True, timeout=15)
+                    if r.returncode == 0:
+                        return "bubble stopped (systemd unit)"
             except (OSError, subprocess.TimeoutExpired):
                 pass
             killed = 0
@@ -5071,7 +5138,7 @@ drifting apart one forgotten key at a time.
     def reload_from_disk(self) -> None:
         """Re-read settings.json; an open window must never clobber external writes."""
         try:
-            data = json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8"))
+            data = json.loads(H.SETTINGS_FILE.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             data = {}
         self.cfg = merge_settings(data)

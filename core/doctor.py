@@ -554,7 +554,7 @@ def _lines(deps: DoctorDeps) -> list[str]:
     if unit.exists():
         txt = ""
         try:
-            txt = unit.read_text(encoding="utf-8")
+            txt = unit.read_text(encoding="utf-8", errors="replace")
         except OSError:
             pass
         # Line-anchored: the unit's own COMMENT mentions Restart=always, and
@@ -773,7 +773,7 @@ def doctor_json() -> dict:
     }
     if deps.systemd_unit_file.exists():
         try:
-            txt = deps.systemd_unit_file.read_text(encoding="utf-8")
+            txt = deps.systemd_unit_file.read_text(encoding="utf-8", errors="replace")
             out["systemd_unit"]["auto_restart"] = bool(
                 re.search(r"^Restart=(always|on-failure|on-abnormal)$", txt, re.M))
         except OSError:

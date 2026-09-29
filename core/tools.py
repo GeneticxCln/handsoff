@@ -294,7 +294,12 @@ def log_decision(tool: str, target: str, decision: str, result: str='dispatched'
                 # Size gate: the read-trim path runs only once past ~2x the
                 # line cap, not on every tool call in the hot path.
                 if decision_file.stat().st_size > 262144:
-                    with decision_file.open('r', encoding='utf-8') as fh:
+                    # errors='replace': a power cut can tear the last line
+                    # mid-character, and a strict read raised out of this trim
+                    # — which the OSError handler below does not catch — so a
+                    # torn tail meant the log was never pruned again and every
+                    # tool call re-read a file that only grew.
+                    with decision_file.open('r', encoding='utf-8', errors='replace') as fh:
                         lines = fh.readlines()
                     if len(lines) > _DECISIONS_MAX * 2:
                         _dep().atomic_private_write(decision_file, ''.join(lines[-_DECISIONS_MAX:]))
@@ -949,6 +954,22 @@ def setting_flag(key: str, default: bool = False) -> bool:
         return default
 
 
+def comm_matches(comm: str, wanted: str) -> bool:
+    """Is the process `comm` the one the user named?
+
+    `Name:` in /proc/PID/status is the kernel's `comm`, cut at 15 characters, so
+    a process called `gnome-text-editor` is only ever visible as
+    `gnome-text-edit`: an exact comparison with the name the user said found
+    nothing, for every name longer than 15 characters — `kill_process` refused
+    them, and `watch_process` never saw one start, so it never announced its
+    exit. A longer name is compared by the prefix the kernel keeps; more than one
+    match is still refused as ambiguous, and the offer names what will actually
+    be stopped.
+    """
+    comm, wanted = comm.lower(), wanted.lower()
+    return comm == wanted or (len(wanted) > 15 and comm == wanted[:15])
+
+
 def coerce_number_arg(raw, kind) -> "int | float":
     """int/float for model-supplied args; raises instead of guessing 0.
 
@@ -966,7 +987,11 @@ def coerce_number_arg(raw, kind) -> "int | float":
         raise ValueError(f"expected a number, got {raw!r}")
     try:
         value = kind(raw)
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, OverflowError) as e:
+        # OverflowError is what int(float("inf")) and float(10**400) raise; it is
+        # an ArithmeticError, not a ValueError, so it escaped to the belt's
+        # catch-all and the model was told the ASSISTANT's own check had failed
+        # and not to retry — when the argument was simply not a usable number.
         raise ValueError(f"expected {kind.__name__}, got {raw!r}") from e
     if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"expected a finite number, got {raw!r}")
@@ -1191,6 +1216,32 @@ class ToolBelt:
     # clippy form `cargo clippy -- -Aclippy::pedantic`, whose split cluster
     # letters happen to include a c.
     _CARGO_EXEC_FLAGS = {'config'}
+    # `git branch` is the one "read" verb that WRITES BY DEFAULT: given a name and
+    # no listing flag it CREATES a branch, and it also renames (-m/-M), copies
+    # (-c/-C), force-moves (-f), rewrites .git/config (-u, -t, --set-upstream-to,
+    # --unset-upstream, --edit-description) and deletes. The gate refused only
+    # `-d`/`-D`/`--delete` by EXACT name, and git accepts any unique prefix of a
+    # long option — measured on git 2.43.0: `git branch --dele x` deleted the
+    # branch the gate exists to protect and `--mov` renamed one. A deny-list
+    # cannot win that race, so this is an ALLOW-list of the display flags, for
+    # the reason `_GIT_READ` and `_PACTL_OK` are lists of what is allowed.
+    _GIT_BRANCH_READ_LONG = frozenset({
+        'all', 'remotes', 'list', 'verbose', 'show-current', 'contains',
+        'no-contains', 'merged', 'no-merged', 'points-at', 'sort', 'format',
+        'ignore-case', 'column', 'no-column', 'color', 'no-color', 'abbrev',
+        'no-abbrev'})
+    _GIT_BRANCH_READ_SHORT = frozenset('arlvi')
+    # The flags that take the NEXT token as their value (`--contains HEAD`,
+    # `--sort committerdate`): that token is a value, not a branch name.
+    _GIT_BRANCH_VALUE_LONG = frozenset({
+        'contains', 'no-contains', 'merged', 'no-merged', 'points-at', 'sort',
+        'format'})
+    # What turns a bare argument from "create this branch" into "list branches
+    # matching this pattern". Measured, not assumed: `-v`, `-i`, `--sort=`,
+    # `--format=`, `--column`, `--color` and `--abbrev=` do NOT — `git branch -v
+    # x` creates `x` — so they are display flags and never enable a name.
+    _GIT_BRANCH_PATTERN_LONG = frozenset({'list', 'all', 'remotes'})
+    _GIT_BRANCH_PATTERN_SHORT = frozenset('lar')
     BLOCKED = ('sudo', 'rm', 'pacman', 'yay', 'paru', 'shutdown', 'poweroff', 'reboot', 'halt', 'mkfs', 'dd', 'kill', 'chmod', 'chown', 'mount', 'umount', 'curl', 'wget', 'bash', 'sh', 'zsh', 'fish', 'python', 'python3', 'pip', 'mv', 'cp', 'tar', 'zip', '7z', 'make', 'gcc', 'systemctl', 'journalctl', 'tee', 'xargs', 'env', 'eval', 'exec')
     # The bubble's own runtime stores. They are not source and not the user's
     # notes: `history.json` and `memory.json` are injected into EVERY future
@@ -1800,7 +1851,10 @@ class ToolBelt:
         if not argv:
             # refusal: no_argv_after_parse
             return (None, '', 'REFUSED: empty command', False)
-        argv[0] = os.path.expanduser(argv[0])
+        try:
+            argv[0] = os.path.expanduser(argv[0])
+        except (ValueError, UnicodeError):
+            pass          # a NUL or a lone surrogate: refused below, by name
         # `cat` is on the whitelist, so validating only the executable would
         # leave run_command a way to read exactly what read_file refuses.
         # Every argument is checked against the same secret-path predicate.
@@ -1815,6 +1869,20 @@ class ToolBelt:
                     # refusal: secret_path_read
                     return (None, '', f"REFUSED: '{part}' — {denied}. run_command "
                             f"cannot read credential stores into the conversation", False)
+        # AFTER the secret-name checks above, so a NUL-carrying `.pem` is still
+        # refused for what it names. A NUL cannot be part of any argument the
+        # kernel will take and a lone surrogate cannot be encoded into one; both
+        # made `os.path.expanduser` (`~x\x00`, `~\ud800`) or the exec itself
+        # raise ValueError/UnicodeEncodeError out of the validator, which the
+        # tool loop reported as "that is a bug in the tool" about what is a
+        # malformed command from the model (found by fuzzing the validator).
+        try:
+            cmd.encode('utf-8')
+            if '\x00' in cmd:
+                raise ValueError('NUL')
+        except (UnicodeEncodeError, ValueError):
+            # refusal: command_not_encodable
+            return (None, '', 'REFUSED: the command contains a byte that cannot be part of a program name or an argument (a NUL, or text that is not valid Unicode)', False)
         exe_base = Path(argv[0]).name
         _unblocked = ''
         if exe_base in ('git', 'cargo'):
@@ -1938,6 +2006,16 @@ class ToolBelt:
             # refusal: git_output_writes_a_file
             return (None, '', 'REFUSED: git is read-only here, and --output '
                     'writes a file wherever it is pointed', False)
+        if _unblocked == 'git' and verb == 'branch':
+            _bpos = next((i for i, _a in enumerate(argv[1:], 1)
+                          if not _a.startswith('-')), len(argv))
+            _why = self._git_branch_write(argv[_bpos + 1:])
+            if _why:
+                # refusal: git_branch_writes
+                return (None, '', f"REFUSED: git is read-only here, and {_why}. "
+                        "`git branch` only LISTS: git branch, -a, -r, -v, "
+                        "--show-current, --contains/--merged <commit>, and "
+                        "--list <pattern> for a name", False)
         # The blocked-word scan runs over EXECUTION positions only — the exe,
         # a launcher's program slot (`spawn curl`), and `=`-attached flag
         # values (`nvidia-smi --foo=sudo`) — never over the whole line.
@@ -2054,6 +2132,43 @@ class ToolBelt:
         if err:
             return (None, '', err, False)
         return (argv, exe_base, None, is_restart)
+
+    @classmethod
+    def _git_branch_write(cls, rest: list) -> str | None:
+        """Why these `git branch` arguments would CHANGE the repository, or None.
+
+        Every flag has to be a display flag, and a bare argument is a branch to
+        CREATE unless a listing flag (`-l`/`--list`, `-a`, `-r`) made it a
+        pattern or a flag before it consumed it as its value. Long flags are
+        matched by their whole name: git also accepts a unique PREFIX
+        (`--dele`, `--mov`), so an exact-name deny-list is one keystroke short
+        of a bypass, and a prefix simply is not on this list.
+        """
+        pattern_mode = False
+        want_value = False
+        names = 0
+        for tok in rest:
+            if want_value:
+                want_value = False
+                continue
+            if tok.startswith('--'):
+                name = tok[2:].split('=', 1)[0]
+                if name not in cls._GIT_BRANCH_READ_LONG:
+                    return f"'git branch --{name}' is not a listing flag"
+                pattern_mode = pattern_mode or name in cls._GIT_BRANCH_PATTERN_LONG
+                want_value = name in cls._GIT_BRANCH_VALUE_LONG and '=' not in tok
+            elif tok.startswith('-') and len(tok) > 1:
+                for letter in tok[1:]:
+                    if letter not in cls._GIT_BRANCH_READ_SHORT:
+                        return f"'git branch -{letter}' is not a listing flag"
+                    pattern_mode = (pattern_mode
+                                    or letter in cls._GIT_BRANCH_PATTERN_SHORT)
+            else:
+                names += 1
+        if names and not pattern_mode:
+            return ("'git branch <name>' CREATES a branch (a name is only a "
+                    "pattern after --list, -a or -r)")
+        return None
 
     def _validate_write_verb(self, argv: list, exe_base: str) -> str | None:
         """Why this whitelisted PROGRAM's arguments are a WRITE, or None.
@@ -2386,13 +2501,91 @@ class ToolBelt:
             self._on_restart_pending()
         try:
             timeout = 240.0 if exe_base == 'cargo' else self.TIMEOUT
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            proc, stdout, stderr = self._run_capped(argv, timeout)
         except FileNotFoundError:
             return f'ERROR: program not found: {exe}'
         except subprocess.TimeoutExpired:
             return f'ERROR: command timed out after {timeout:.0f}s'
-        out = f'exit code {proc.returncode}\nstdout:\n{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}'
+        out = f'exit code {proc.returncode}\nstdout:\n{stdout.strip()}\nstderr:\n{stderr.strip()}'
         return out[:2000]
+
+    #: What one `run_command` may BUFFER, per stream. The reply is cut to 2000
+    #: characters, so only the head of the output is ever read; the ceiling
+    #: exists so a command that never stops writing costs this much and not the
+    #: machine's memory. `cat /dev/zero` is on the whitelist by way of `cat` and
+    #: is no credential path, and `subprocess.run(capture_output=True)` buffered
+    #: it whole before anything cut it to size: measured on this tree, a 4 s
+    #: timeout held 2.5 GiB and took 11 s to return, in the process that also
+    #: holds the speech models — so the production timeout (15 s) was a way to
+    #: get this process killed by the OOM killer.
+    OUTPUT_CAP = 65536
+
+    @classmethod
+    def _run_capped(cls, argv: list, timeout: float):
+        """`subprocess.run(argv)` whose captured output cannot grow without bound.
+
+        Returns ``(proc, stdout, stderr)`` as text. The child writes into pipes
+        this method drains in two reader threads, which keep the first
+        `OUTPUT_CAP` bytes of each stream and discard the rest (draining, so a
+        child that writes more than it can be read never blocks on a full pipe).
+        `subprocess.run` is still the call — it is the seam every test and every
+        host replacement reaches through — and a replacement that hands back its
+        own `stdout`/`stderr` is honoured over the pipes.
+
+        Bytes are decoded with ``errors="replace"``. `text=True` decoded
+        strictly, so `cat` of any binary file raised UnicodeDecodeError out of
+        the tool and the model was told "that is a bug in the tool".
+        """
+        kept: dict = {}
+
+        def drain(name: str, fd: int) -> None:
+            buf = bytearray()
+            try:
+                while True:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    room = cls.OUTPUT_CAP - len(buf)
+                    if room > 0:
+                        buf += chunk[:room]
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                kept[name] = bytes(buf)
+
+        r_out, w_out = os.pipe()
+        r_err, w_err = os.pipe()
+        readers = [threading.Thread(target=drain, args=('out', r_out), daemon=True,
+                                    name='run-command-out'),
+                   threading.Thread(target=drain, args=('err', r_err), daemon=True,
+                                    name='run-command-err')]
+        for reader in readers:
+            reader.start()
+        try:
+            proc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=w_out,
+                                  stderr=w_err, timeout=timeout)
+        finally:
+            # Our copies of the write ends: the readers see EOF only once these
+            # AND the child's are closed. A grandchild that outlives the command
+            # can hold the child's open, hence the bounded join.
+            os.close(w_out)
+            os.close(w_err)
+            for reader in readers:
+                reader.join(2.0)
+
+        def text(given, name: str) -> str:
+            if isinstance(given, bytes):
+                return given.decode('utf-8', errors='replace')
+            if isinstance(given, str):
+                return given
+            return kept.get(name, b'').decode('utf-8', errors='replace')
+
+        return (proc, text(getattr(proc, 'stdout', None), 'out'),
+                text(getattr(proc, 'stderr', None), 'err'))
     YDOTOOL_SOCKET = '/tmp/.ydotool_socket'
     _YDOTOOL_SOCK_CACHE: list = []
 
@@ -2718,7 +2911,7 @@ class ToolBelt:
         """
         try:
             base = (_dep().HOME / '.config/niri').resolve()
-            texts: list[str] = [(base / 'config.kdl').read_text(encoding='utf-8').lower()]
+            texts: list[str] = [(base / 'config.kdl').read_text(encoding='utf-8', errors='replace').lower()]
         except OSError:
             return False
         try:
@@ -2736,7 +2929,7 @@ class ToolBelt:
                         continue
                     seen.add(str(inc))
                     if inc.is_file() and inc.stat().st_size < 500000:
-                        texts.append(inc.read_text(encoding='utf-8').lower())
+                        texts.append(inc.read_text(encoding='utf-8', errors='replace').lower())
                 except OSError:
                     continue
         except Exception:
@@ -2945,6 +3138,13 @@ class ToolBelt:
         callback = self._on_pomodoro
         if callback is None:
             return 'ERROR: pomodoro controller is unavailable'
+        if action != 'start':
+            # `stop` and `status` take no durations, and a model fills the
+            # unused fields with whatever it likes (0 is common). Range-checking
+            # them anyway refused "stop the pomodoro" with a complaint about
+            # minutes the stop never reads — so the one command that ends the
+            # timer was the one a sloppy call could not reach.
+            return callback(action, 25.0, 5.0)
         try:
             work_minutes = float(work_minutes)
             break_minutes = float(break_minutes)
@@ -2988,8 +3188,15 @@ class ToolBelt:
                     return
                 # O_NOFOLLOW: a symlink swapped in for the final component
                 # fails the open instead of being followed.
-                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'r',
-                               encoding='utf-8', errors='replace') as fh:
+                # BYTES, not text: `position` is a byte offset (it came from
+                # st_size and is used to seek), and the cursor below advances by
+                # what was consumed. Read as text and counted in characters, one
+                # non-ASCII line (an accent, an emoji, any CJK) left the cursor
+                # short by the difference, so every later poll re-read the tail
+                # of that line — from the middle of a character — and announced
+                # the same match again as garbled fragments ('本語のエラー',
+                # '��エラー') until the lag happened to drain.
+                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as fh:
                     fh.seek(position)
                     chunk = fh.read(min(size - position, 128000))
                 # Bounded evaluation: the pattern is data we do not control, so
@@ -3000,8 +3207,9 @@ class ToolBelt:
                 # cap is deferred to the next poll instead of being skipped
                 # forever.
                 consumed = 0
-                for line in chunk.splitlines(keepends=True)[:WATCH_LINES_PER_POLL]:
-                    consumed += len(line)
+                for raw in chunk.splitlines(keepends=True)[:WATCH_LINES_PER_POLL]:
+                    consumed += len(raw)
+                    line = raw[:WATCH_LINE_MAX * 4].decode('utf-8', 'replace')
                     if pattern.search(line[:WATCH_LINE_MAX]):
                         emit(f'{path.name}: {line.strip()[:240]}')
                 position += consumed
@@ -3017,7 +3225,7 @@ class ToolBelt:
         seen = False
         deadline = time.monotonic() + 24 * 3600
         while not stop.wait(1.0) and time.monotonic() < deadline:
-            present = any((n.lower() == name.lower() for _, n in ToolBelt._same_user_procs()))
+            present = any((comm_matches(n, name) for _, n in ToolBelt._same_user_procs()))
             if seen and (not present):
                 emit(f'process {name} exited')
                 return
@@ -3635,23 +3843,52 @@ class ToolBelt:
     def copy_text(self, text: str) -> str:
         if not text:
             return 'REFUSED: nothing to copy'
+        # The text goes on STDIN. As an argument it (1) failed with E2BIG above
+        # ~128 KiB — reported to the model as "a bug in the tool" — and a NUL
+        # byte or a lone surrogate failed the same way, and (2) sat in
+        # /proc/PID/cmdline, which any local user can read, for as long as
+        # wl-copy ran: a password the user asked to have copied was in `ps`.
+        # (Found driving the tool against a real wl-copy under a headless sway.)
+        data = str(text).encode('utf-8', errors='replace')
         try:
-            subprocess.run(['wl-copy', '--', text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            proc = subprocess.run(['wl-copy'], input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
         except FileNotFoundError:
             return 'ERROR: wl-clipboard is not installed (pacman -S wl-clipboard)'
         except subprocess.TimeoutExpired:
             return 'ERROR: wl-copy timed out'
+        # A wl-copy that could not reach a compositor exits non-zero (no
+        # WAYLAND_DISPLAY, a dead socket) and its output is discarded above, so
+        # this used to report "copied N chars" for a clipboard nothing was put on.
+        if proc.returncode != 0:
+            return (f'ERROR: wl-copy failed (exit {proc.returncode}) — is a '
+                    f'Wayland session running?')
         return f'copied {len(text)} chars to the clipboard'
 
     @tool(description='Read the clipboard content (wayland). Use to check what the user copied or to inspect before pasting.')
     def paste_text(self) -> str:
         try:
-            r = subprocess.run(['wl-paste', '--no-newline'], capture_output=True, text=True, timeout=8)
+            # Bytes, not `text=True`: a clipboard is whatever the last program put
+            # there, and an image (the first thing most people copy that is not
+            # words) is not UTF-8 — strict decoding raised out of the tool and the
+            # model said "that is a bug in the tool" about a perfectly ordinary
+            # clipboard.
+            r = subprocess.run(['wl-paste', '--no-newline'], capture_output=True, timeout=8)
         except FileNotFoundError:
             return 'ERROR: wl-clipboard is not installed (pacman -S wl-clipboard)'
         except subprocess.TimeoutExpired:
             return 'ERROR: wl-paste timed out'
-        data = r.stdout or ''
+        raw = r.stdout or b''
+        if isinstance(raw, bytes):
+            try:
+                data = raw.decode('utf-8')
+            except UnicodeDecodeError:
+                return (f'clipboard holds {len(raw)} bytes of data that is not text '
+                        f'(an image or a file, not something to read aloud)')
+            if '\x00' in data[:4096]:
+                return (f'clipboard holds {len(raw)} bytes of data that is not text '
+                        f'(an image or a file, not something to read aloud)')
+        else:
+            data = raw
         if not data:
             return 'clipboard is empty'
         head = data[:120].replace('\n', ' ')
@@ -3806,7 +4043,7 @@ class ToolBelt:
                 queue = _dep()._mpc('playlist').splitlines()
                 if queue:
                     _dep()._mpc('play')
-                    return f'playing (queue had {len(queue)} songs)'
+                    return f"playing (queue had {len(queue)} song{('' if len(queue) == 1 else 's')})"
                 paths = _dep()._mpc('search', 'filename', '').splitlines()
                 if not paths:
                     return 'ERROR: the MPD library is empty — nothing to play'
@@ -3840,9 +4077,13 @@ class ToolBelt:
         mapped = {'play': ['play'], 'pause': ['pause'], 'stop': ['stop'], 'next': ['next'], 'skip': ['next'], 'previous': ['prev'], 'prev': ['prev'], 'back': ['prev']}
         if a == 'toggle':
             try:
-                paused = '[paused]' in _dep()._mpc('status')
-                _dep()._mpc('play' if paused else 'pause')
-                return f"music player: {('play' if paused else 'pause')}"
+                # Only a PLAYING player is paused. It read `[paused]` instead,
+                # so a STOPPED player (which prints no `[state]` line at all —
+                # checked against a real mpd) was "toggled" with `pause`, which
+                # does nothing, and the answer said it had.
+                playing = '[playing]' in _dep()._mpc('status')
+                _dep()._mpc('pause' if playing else 'play')
+                return f"music player: {('pause' if playing else 'play')}"
             except RuntimeError as e:
                 return f'ERROR: {e}'
         if a not in mapped:
@@ -3853,15 +4094,26 @@ class ToolBelt:
         except RuntimeError as e:
             return f'ERROR: {e}'
 
-    @tool(gates='media', description="Set the music player's volume (0-100). This is the music output volume, not the whole system volume.")
+    @tool(gates='media', description="Set the music player's volume (0-100), or change it by a signed step ('+10', '-10'). Not the system volume.")
     def media_volume(self, level: str) -> str:
-        s = str(level or '').strip().rstrip('%')
-        if not re.fullmatch('[+-]?\\d+', s):
-            return 'ERROR: level must be a number 0-100'
-        level = max(0, min(100, int(s)))
+        s = str(level or '').strip().rstrip('%').strip()
+        # A sign is a CHANGE, as it is for `mpc volume +10`. It was accepted by
+        # the pattern and then clamped as an absolute level, so "+10" set the
+        # volume TO 10 and "-10" set it to 0 — "turn it down a bit" muted the
+        # music. A decimal ("50.0", which models send) is read, not refused, and
+        # the digit count is bounded so a huge string is a refusal rather than
+        # int()'s own ValueError.
+        m = re.fullmatch('([+-]?)(\\d{1,6}(?:\\.\\d+)?)', s)
+        if not m:
+            return 'ERROR: level must be a number 0-100, or +N / -N to change it'
+        sign = m.group(1)
+        amount = max(0, min(100, int(round(float(m.group(2))))))
         try:
-            _dep()._mpc('volume', str(level))
-            return f'music volume set to {level}%'
+            if sign:
+                _dep()._mpc('volume', f'{sign}{amount}')
+                return f"music volume {('up' if sign == '+' else 'down')} {amount}%"
+            _dep()._mpc('volume', str(amount))
+            return f'music volume set to {amount}%'
         except RuntimeError as e:
             return f'ERROR: {e}'
 
@@ -3873,6 +4125,17 @@ class ToolBelt:
         except RuntimeError as e:
             return f'ERROR: {e}'
         if not cur:
+            # `current` is empty for a STOPPED player too, and a stopped player
+            # keeps its queue (checked against a real mpd): saying the queue is
+            # empty was untrue, and it is what the user needs to know before
+            # asking to play.
+            try:
+                queued = len(_dep()._mpc('playlist').splitlines())
+            except RuntimeError:
+                queued = 0
+            if queued:
+                return (f"the music player is stopped ({queued} "
+                        f"song{('' if queued == 1 else 's')} in the queue)")
             return 'nothing is playing (the music queue is empty)'
         state = 'playing' if '[playing]' in status else 'paused'
         vol = re.search('volume:\\s*(\\d+)%', status)
@@ -4249,8 +4512,8 @@ class ToolBelt:
                 name = next((n for p, n in self._same_user_procs() if p == pid), str(pid))
                 cands.append((pid, name))
         else:
-            low = target.lower()
-            cands = [(p, n) for p, n in self._same_user_procs() if n.lower() == low]
+            cands = [(p, n) for p, n in self._same_user_procs()
+                     if comm_matches(n, target)]
         if not cands:
             # refusal: kill_no_such_process
             return f"ERROR: no process of yours matches {target!r} (exact name or listening port; other users' processes are invisible)"
@@ -4446,7 +4709,14 @@ class ToolBelt:
                 self._on_restart_pending()
             _dep().log.info('start_command: %s', _dep()._log_metadata(command, 'command'))
             try:
-                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                # errors='replace': the drainer reads this pipe as TEXT, and a strict decoder
+                # raises on the first byte that is not UTF-8 (`ls` in a directory with
+                # a latin-1 filename, `cat` of a binary, a compiler quoting mojibake).
+                # `_drain` treated that ValueError as end-of-output and STOPPED READING,
+                # so the child filled the 64 KB pipe and blocked in write() until the
+                # 30-minute lifetime cap killed it — the job never finished, and the
+                # tail (even the lines BEFORE the bad byte) came back empty.
+                proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', start_new_session=True)
             except OSError as e:
                 return f'ERROR: launch failed: {e}'
             # The key is minted inside the same lock that inserts, so two
@@ -4514,7 +4784,15 @@ class ToolBelt:
 
         Rows: level page block par line word left top width height conf text.
         Words are grouped by (block, par, line) into one element per visual
-        line, keeping the union bounding box and the mean confidence."""
+        line, keeping the union bounding box and the mean confidence — and a
+        line is CUT wherever two neighbouring words are further apart than a
+        word is tall. Tesseract's "line" is a row of text, not a row of
+        controls: a menu bar (File Edit View Help), a tab strip or a dialog's
+        buttons (Cancel … OK) come back as ONE line, and one element per line
+        put its click point in the middle of the row — the empty space between
+        two of the controls. A real OCR of exactly that image is the fixture
+        in tests/test_desktop.py; ordinary running text has word gaps of about
+        a third of a word's height, so a sentence stays whole."""
         rows: dict[tuple, list] = {}
         for line in tsv.splitlines()[1:]:
             parts = line.split('\t')
@@ -4530,14 +4808,29 @@ class ToolBelt:
                 continue
             rows.setdefault((blk, par, ln), []).append((x, y, w, h, word))
         out = []
+        order: dict[int, tuple] = {}
         for words in rows.values():
             words.sort(key=lambda t: t[0])
-            x0 = min((w[0] for w in words))
-            y0 = min((w[1] for w in words))
-            x1 = max((w[0] + w[2] for w in words))
-            y1 = max((w[1] + w[3] for w in words))
-            out.append({'text': ' '.join((w[4] for w in words)), 'x': (x0 + x1) // 2, 'y': (y0 + y1) // 2, 'w': x1 - x0, 'h': y1 - y0})
-        out.sort(key=lambda e: (e['y'], e['x']))
+            # Reading order is (the row's top, then left to right). Sorting by
+            # each element's own centre put a taller word (an "Edit" with a
+            # descender box) after a shorter neighbour on the SAME row, so the
+            # numbered list did not read left to right.
+            row_top = min(w[1] for w in words)
+            runs: list[list] = [[words[0]]]
+            for prev, cur in zip(words, words[1:]):
+                gap = cur[0] - (prev[0] + prev[2])
+                if gap > max(prev[3], cur[3]):
+                    runs.append([])
+                runs[-1].append(cur)
+            for run in runs:
+                x0 = min((w[0] for w in run))
+                y0 = min((w[1] for w in run))
+                x1 = max((w[0] + w[2] for w in run))
+                y1 = max((w[1] + w[3] for w in run))
+                element = {'text': ' '.join((w[4] for w in run)), 'x': (x0 + x1) // 2, 'y': (y0 + y1) // 2, 'w': x1 - x0, 'h': y1 - y0}
+                order[id(element)] = (row_top, x0)
+                out.append(element)
+        out.sort(key=lambda e: order[id(e)])
         return out[:80]
 
     def _screen_elements_fmt(self) -> str:
@@ -4781,7 +5074,20 @@ class ToolBelt:
 
         path: File path, ~ expanded.
         """
-        p = Path(path).expanduser()
+        try:
+            p = Path(path).expanduser()
+            # A NUL byte or a lone surrogate names nothing any filesystem can
+            # hold. Left to the syscalls they raised ValueError/UnicodeEncodeError
+            # out of resolve() and exists(), which the model was told was "a bug
+            # in the tool" (found by driving every string argument with hostile
+            # values; the same class `_validate_command` already refuses).
+            os.fsencode(p)
+            if '\x00' in str(p):
+                raise ValueError('embedded null byte')
+        except (ValueError, UnicodeError):
+            # refusal: read_of_an_unrepresentable_path
+            return ("ERROR: that path cannot exist — it holds a NUL byte or a "
+                    "character no file name can hold")
         try:
             p = p.resolve()
         except OSError:

@@ -234,6 +234,26 @@ class TestTheHarnessEnvironment:
         assert env.get("PATH"), (
             "and the guard must not be vacuous: the child still needs its PATH")
 
+    def test_the_numbered_config_pairs_and_the_transport_settings_are_dropped(
+            self, monkeypatch):
+        """`GIT_CONFIG_COUNT` alone was on the list, so the `KEY_<n>`/`VALUE_<n>`
+        pairs it indexes travelled to the child, as did a proxied runner's
+        `GIT_SSL_CAINFO`. Named by prefix because the suffix is a number."""
+        planted = ("GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_17",
+                   "GIT_CONFIG_VALUE_17", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY")
+        for name in planted:
+            monkeypatch.setenv(name, "planted")
+        env = sandbox_env()
+        left = sorted(name for name in planted if name in env)
+        assert not left, f"the harness hands git's config pairs on: {left}"
+        # ...and it drops by PREFIX, so a name nobody listed is covered too, while
+        # a git variable that is not one of these families is left alone.
+        monkeypatch.setenv("GIT_CONFIG_KEY_9999", "planted")
+        monkeypatch.setenv("GIT_EXEC_PATH", "/usr/lib/git-core")
+        env = sandbox_env()
+        assert "GIT_CONFIG_KEY_9999" not in env
+        assert env.get("GIT_EXEC_PATH") == "/usr/lib/git-core"
+
     # Git names its own exec path so a hook can find git's programs. Harmless and
     # deliberately kept: it says where git is, not which repository.
     HARMLESS = ("GIT_EXEC_PATH",)

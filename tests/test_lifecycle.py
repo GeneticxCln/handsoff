@@ -718,6 +718,29 @@ class TestControlSocket:
         assert self._roundtrip(H.CONTROL_SOCK, "bogus").startswith(
             "error: unknown command 'bogus'")
 
+    def test_a_verb_that_raises_does_not_take_the_accept_loop_down(
+            self, server, monkeypatch):
+        """One request whose handler raises must cost that request, not the
+        server. The per-connection block caught only `OSError`, so any other
+        exception — a bug in a verb, a value it never expected — left the
+        `while` loop and ended the accept thread: the bubble kept running with
+        no control socket at all (`--ptt` says "not running", the keybinds do
+        nothing, and the settings window cannot reach it), which is the zombie
+        this project's health machinery exists to prevent. The client is told
+        what happened rather than left reading a closed socket."""
+        H, _delivered, _app = server
+        srv_thread = lambda: [t for t in __import__("threading").enumerate()
+                              if t.name == "control"]
+        monkeypatch.setattr(H.Assistant, "clear_history",
+                            lambda self: (_ for _ in ()).throw(
+                                ValueError("a value no verb expected")))
+        reply = self._roundtrip(H.CONTROL_SOCK, "clear-history")
+        assert reply.startswith("error:") and "clear-history" in reply, reply
+        # ...and the very next request is still answered by the same server
+        assert self._roundtrip(H.CONTROL_SOCK, "status").startswith("state="), (
+            "the accept loop died with the request that raised")
+        assert srv_thread(), "the control thread is gone"
+
     def test_control_socket_refuses_a_foreign_uid(self, server, monkeypatch):
         """Defence in depth: a peer that is not us is refused and logged.
 

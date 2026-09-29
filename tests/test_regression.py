@@ -911,6 +911,78 @@ class TestMedia:
         out, err = belt.execute("media_volume", {"level": "banana"})
         assert err and "number" in out, out
 
+    def test_a_stopped_player_is_toggled_with_play_and_keeps_its_queue(self, H, monkeypatch):
+        """Checked against a real mpd: a STOPPED player prints no `[state]` line
+        in `status`, keeps its queue, and `current` is empty. Toggle read
+        `[paused]`, so it "paused" a stopped player (a no-op) and said so, and
+        now_playing called the queue empty."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        stopped = "volume: n/a   repeat: off   random: off   single: off   consume: off"
+        calls = []
+
+        def fake(*args, timeout=8.0):
+            calls.append(tuple(args))
+            if args == ("status",):
+                return stopped
+            if args == ("current",):
+                return ""
+            if args == ("playlist",):
+                return "Alice - Blue Sky.wav\nBob - Red Rain.wav\n"
+            return ""
+        monkeypatch.setattr(H, "_mpc", fake)
+        out, err = belt.execute("media_control", {"action": "toggle"})
+        assert not err and out == "music player: play" and calls[-1] == ("play",), (out, calls)
+        out, err = belt.execute("now_playing", {})
+        assert out == "the music player is stopped (2 songs in the queue)", out
+
+        def one(*args, timeout=8.0):
+            return "Only.wav" if args == ("playlist",) else ""
+        monkeypatch.setattr(H, "_mpc", one)
+        out, err = belt.execute("now_playing", {})
+        assert out == "the music player is stopped (1 song in the queue)", out
+
+        monkeypatch.setattr(H, "_mpc", lambda *a, **k: "")
+        out, err = belt.execute("now_playing", {})
+        assert out == "nothing is playing (the music queue is empty)", out
+
+        def broken(*args, timeout=8.0):
+            if args == ("playlist",):
+                raise RuntimeError("mpc timed out")
+            return ""
+        monkeypatch.setattr(H, "_mpc", broken)
+        out, err = belt.execute("now_playing", {})
+        assert out == "nothing is playing (the music queue is empty)", out
+
+    def test_a_one_song_queue_is_not_plural(self, H, monkeypatch):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(H, "_mpc", lambda *a, **k: "Only.wav" if a == ("playlist",) else "")
+        out, err = belt.execute("media_play", {})
+        assert out == "playing (queue had 1 song)", out
+
+    def test_a_signed_volume_is_a_change_and_a_decimal_is_read(self, H, monkeypatch):
+        """A sign was accepted by the pattern and clamped as an absolute level:
+        "+10" set the volume TO 10 and "-10" to 0 — "turn it down a bit" muted
+        the music. It is `mpc volume +10` now. A decimal is read, and a huge
+        string is a refusal rather than int()'s own ValueError."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        seen = []
+        monkeypatch.setattr(H, "_mpc", lambda *a, **k: seen.append(a) or "")
+        cases = [("+10", ("volume", "+10"), "music volume up 10%"),
+                 ("-10", ("volume", "-10"), "music volume down 10%"),
+                 ("-250", ("volume", "-100"), "music volume down 100%"),
+                 ("50.0", ("volume", "50"), "music volume set to 50%"),
+                 ("49.6", ("volume", "50"), "music volume set to 50%"),
+                 ("30%", ("volume", "30"), "music volume set to 30%"),
+                 (" 0 ", ("volume", "0"), "music volume set to 0%")]
+        for level, call, said in cases:
+            seen.clear()
+            out, err = belt.execute("media_volume", {"level": level})
+            assert not err and out == said and seen == [call], (level, out, seen)
+        for bad in ("9" * 5000, "loud", "", "--5", "1e3"):
+            seen.clear()
+            out, err = belt.execute("media_volume", {"level": bad})
+            assert err and "number" in out and not seen, (bad[:10], out, seen)
+
     def test_now_playing_parses_status(self, H, monkeypatch):
         belt = H.ToolBelt(on_restart_pending=lambda: None)
         def fake(*args, timeout=8.0):
@@ -1943,6 +2015,21 @@ class TestAmbientCapabilities:
         assert calls == [("start", 25.0, 5.0)]
         assert tb.pomodoro("start", 0, 5).startswith("ERROR")
 
+    def test_stop_and_status_do_not_read_the_durations(self, H):
+        """A model fills the fields a call does not need — 0 is a common pick —
+        and range-checking them for `stop` refused the one command that ends the
+        timer, with a complaint about minutes the stop never reads."""
+        calls = []
+        tb = self._tb(H, on_notification=lambda enabled: None,
+                      on_pomodoro=lambda *args: calls.append(args) or "ok")
+        for action in ("stop", "status"):
+            for junk in ((0, 0), (-5, 999), ("x", None), (float("nan"), 1)):
+                assert tb.pomodoro(action, *junk) == "ok", (action, junk)
+        assert [c[0] for c in calls] == ["stop"] * 4 + ["status"] * 4
+        # ...and starting still validates, whatever else changed
+        assert tb.pomodoro("start", 500, 5).startswith("ERROR")
+        assert tb.pomodoro("start", "x", 5).startswith("ERROR")
+
     def test_watch_file_starts_and_stops(self, H, tmp_path):
         p = tmp_path / "x.log"
         p.write_text("old\n")
@@ -2751,6 +2838,51 @@ class TestWatcherPatternSafety:
         # …and the rest was deferred to the next poll, not skipped
         assert len(seen) == total, len(seen)
         assert [int(s.split()[-1]) for s in seen] == list(range(total))
+
+    def test_the_cursor_counts_bytes_so_a_non_ascii_line_is_announced_once(
+            self, H, tmp_path):
+        """`position` is a byte offset (it is seeded from st_size and seeked
+        to), but the loop read the file as text and advanced by the CHARACTERS
+        it consumed. One line with an accent or CJK left the cursor short by the
+        difference, so every later poll re-read the tail of that line from the
+        middle of a character and announced the same match again as garbled
+        fragments ('本語のエラー', '\ufffd\ufffdエラー'). Driven synchronously: the
+        stop object's wait() IS the poll clock, so no test sleeps a second."""
+        class _Polls:
+            def __init__(self, steps):
+                self.steps = list(steps)
+
+            def wait(self, timeout=None):
+                if not self.steps:
+                    return True
+                self.steps.pop(0)()
+                return False
+
+        p = tmp_path / "app.log"
+        p.write_bytes(b"start\n")
+
+        def append(data: bytes):
+            def _do():
+                with open(p, "ab") as fh:
+                    fh.write(data)
+            return _do
+
+        seen: list = []
+        noop = lambda: None
+        stop = _Polls([
+            append("ERROR: café déjà vu — 日本語のエラー\n".encode()),
+            noop, noop, noop,                      # three quiet polls
+            append(b"bad \xff\xfe bytes \xe3\x81 \xe3\x82\xa8\xe3\x83\xa9\xe3\x83\xbc\n"),
+            noop, noop,
+            append("後 ERROR: エラー ascii tail\n".encode()),
+            noop, noop,
+        ])
+        H.ToolBelt._file_watch_loop(p, re.compile("エラー"), stop, seen.append)
+        assert seen == [
+            "app.log: ERROR: café déjà vu — 日本語のエラー",
+            "app.log: bad \ufffd\ufffd bytes \ufffd エラー",
+            "app.log: 後 ERROR: エラー ascii tail",
+        ], seen
 
 
 class _Source:

@@ -109,11 +109,14 @@ _HOSTED_READER = None
 _WORLD_GATE = None
 
 
-def _warn(msg: str, *args) -> None:
+def _warn(msg: str, *args, **kwargs) -> None:
+    # `**kwargs` is the logger's own (`exc_info=True`): html_to_text asked for a
+    # traceback and this wrapper took no keywords, so the one branch that exists
+    # to make a malformed page "just a short one" raised a TypeError of its own.
     if _LOG is None:
         return
     try:
-        _LOG.warning(msg, *args)
+        _LOG.warning(msg, *args, **kwargs)
     except Exception:       # a logger must never break a lookup
         pass
 
@@ -899,6 +902,11 @@ def _is_private_ip(host: str) -> bool:
         return False
     if (ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        return True
+    # fec0::/10 is IPv6's deprecated SITE-LOCAL range (RFC 3879): the address
+    # class every "is it private" flag on 3.12, 3.13 and 3.14 leaves as public,
+    # and the one some older LAN stacks still route inside the house.
+    if ip.version == 6 and ip.is_site_local:
         return True
     return ip.version == 4 and (ip in _CGNAT or ip in _IETF_PROTOCOL)
 

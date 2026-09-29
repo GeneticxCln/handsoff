@@ -49,6 +49,23 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install the runtime libraries the suite loads
+        # Not optional on a hosted runner: `sounddevice` wheels do not bundle
+        # PortAudio on Linux (`import sounddevice` raises OSError, which the
+        # app's ImportError guard does not catch), and offscreen Qt wants the
+        # GL/EGL/xkbcommon set. ci/apt_deps.sh is the ONE place that list
+        # lives — the GitLab mirror runs it too — and it installs each package
+        # on its own and verifies the SONAMEs by file, so a gap fails HERE by
+        # name instead of as hundreds of identical import errors. The
+        # interpreter is passed through because `sudo` resets PATH and the
+        # script's `find_library('portaudio')` check must run under the same
+        # python the suite will.
+        run: |
+          if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" != 0 ]; then
+            sudo -n env "PYTHON=$(command -v python)" bash ci/apt_deps.sh
+          else
+            PYTHON="$(command -v python)" bash ci/apt_deps.sh
+          fi
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -70,6 +87,23 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Install the runtime libraries the suite loads
+        # Not optional on a hosted runner: `sounddevice` wheels do not bundle
+        # PortAudio on Linux (`import sounddevice` raises OSError, which the
+        # app's ImportError guard does not catch), and offscreen Qt wants the
+        # GL/EGL/xkbcommon set. ci/apt_deps.sh is the ONE place that list
+        # lives — the GitLab mirror runs it too — and it installs each package
+        # on its own and verifies the SONAMEs by file, so a gap fails HERE by
+        # name instead of as hundreds of identical import errors. The
+        # interpreter is passed through because `sudo` resets PATH and the
+        # script's `find_library('portaudio')` check must run under the same
+        # python the suite will.
+        run: |
+          if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" != 0 ]; then
+            sudo -n env "PYTHON=$(command -v python)" bash ci/apt_deps.sh
+          else
+            PYTHON="$(command -v python)" bash ci/apt_deps.sh
+          fi
       - name: Install test dependencies + pytest-cov
         run: |
           python -m pip install --upgrade pip
@@ -107,6 +141,23 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Install the runtime libraries the suite loads
+        # Not optional on a hosted runner: `sounddevice` wheels do not bundle
+        # PortAudio on Linux (`import sounddevice` raises OSError, which the
+        # app's ImportError guard does not catch), and offscreen Qt wants the
+        # GL/EGL/xkbcommon set. ci/apt_deps.sh is the ONE place that list
+        # lives — the GitLab mirror runs it too — and it installs each package
+        # on its own and verifies the SONAMEs by file, so a gap fails HERE by
+        # name instead of as hundreds of identical import errors. The
+        # interpreter is passed through because `sudo` resets PATH and the
+        # script's `find_library('portaudio')` check must run under the same
+        # python the suite will.
+        run: |
+          if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" != 0 ]; then
+            sudo -n env "PYTHON=$(command -v python)" bash ci/apt_deps.sh
+          else
+            PYTHON="$(command -v python)" bash ci/apt_deps.sh
+          fi
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
@@ -177,6 +228,9 @@ jobs:
     name: Mutation (are a new test's guards load-bearing?)
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      # The gate runs the shipped tests, and some of them spawn the real bubble.
+      QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -186,8 +240,34 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Install the test runner
-        run: pip install pytest
+      - name: Install the runtime libraries the suite loads
+        # Not optional on a hosted runner: `sounddevice` wheels do not bundle
+        # PortAudio on Linux (`import sounddevice` raises OSError, which the
+        # app's ImportError guard does not catch), and offscreen Qt wants the
+        # GL/EGL/xkbcommon set. ci/apt_deps.sh is the ONE place that list
+        # lives — the GitLab mirror runs it too — and it installs each package
+        # on its own and verifies the SONAMEs by file, so a gap fails HERE by
+        # name instead of as hundreds of identical import errors. The
+        # interpreter is passed through because `sudo` resets PATH and the
+        # script's `find_library('portaudio')` check must run under the same
+        # python the suite will.
+        run: |
+          if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" != 0 ]; then
+            sudo -n env "PYTHON=$(command -v python)" bash ci/apt_deps.sh
+          else
+            PYTHON="$(command -v python)" bash ci/apt_deps.sh
+          fi
+      - name: Install the test dependencies
+        # The full manifest, not just `pytest`. The gate's first act is to run
+        # the tests this change ships on the COMMITTED tree and to refuse to
+        # score anything if that baseline is red — and with only pytest
+        # installed the baseline died at `import numpy` (conftest.py:25), so on
+        # a fresh runner the gate could never pass. (The GitLab mirror only
+        # gets away with `pip install pytest` because the desk's warm venv
+        # already holds everything the suite jobs installed.)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -c requirements-lock.txt
       - name: Every mutant of the touched lines is caught
         run: python ci/mutation_gate.py --base HEAD~1
 

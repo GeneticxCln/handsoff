@@ -59,6 +59,21 @@ def strip_thinking(text: str) -> str:
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
+# Where the streamed reply is cut into sentences: a run of terminators FOLLOWED
+# BY WHITESPACE. The lookahead is the point. The stream arrives one token at a
+# time and a tokenizer emits "." on its own — "It's 18", ".", "5 degrees" — so
+# a terminator at the END of the buffer cannot be told from a decimal point, a
+# version ("3.12"), a domain ("example.com") or the first half of "?!" / "...".
+# The old pattern took the end of the buffer as a boundary (`(\s|$)`), and the
+# sentence boundaries then depended on where the network happened to cut the
+# stream: "It's 18." was spoken, then "5 degrees today." — a different reply
+# from the one the model wrote. A terminator that is still the last thing in the
+# buffer is simply undecided: the next token's leading space settles it, and the
+# end of the stream flushes whatever is left. The property is chunking
+# independence — the same reply cut anywhere gives the same sentences.
+_SENTENCE_END = re.compile(r"[.!?…]+\s")
+_ENDS_A_SENTENCE = re.compile(r"[.!?…]\s*\Z")
+
 
 def _speech_fragment(fragment: str, in_think: bool) -> tuple[str, bool]:
     """(speech, still-in-think) for one fragment of a streamed reply.
@@ -535,6 +550,19 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                     chunk = json.loads(line.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
                     continue
+                if not isinstance(chunk, dict):
+                    continue            # a line that is not an object is noise
+                # Ollama reports a failure AFTER the 200 was sent (the runner
+                # died, the model ran out of memory) as a line of the stream,
+                # `{"error": "..."}`, not as an HTTP status — so no HTTPError
+                # can carry it. Read as a chunk with no `message` it was
+                # skipped: the reply simply ended, a half sentence was spoken
+                # and recorded as the whole answer, and a failure before the
+                # first word came back as an "empty answer" that hid the cause.
+                # Raised, it takes the path every other failure takes (the
+                # terminator, the journal, the spoken apology naming it).
+                if chunk.get("error"):
+                    raise RuntimeError(f"Ollama error: {chunk['error']}")
                 message = chunk.get("message") or {}
                 if message.get("tool_calls"):
                     tool_calls.extend(message["tool_calls"])
@@ -544,7 +572,7 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                 buf += piece
                 full_parts.append(piece)
                 while True:
-                    match = re.search(r"[.!?…](\s|$)", buf)
+                    match = _SENTENCE_END.search(buf)
                     if not match:
                         break
                     sentence, buf = buf[:match.end()], buf[match.end():]
@@ -599,6 +627,18 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
         ) from None
     except Exception:
         logger.exception("streaming chat failed")
+        # A stream that dies right after a sentence's closing full stop. That
+        # sentence is complete, but the splitter was holding it for the next
+        # token's leading space (see `_SENTENCE_END`), so it is still in `buf`
+        # — and the tail flush above is on the success path only. Without this
+        # the user heard "my brain is offline" in place of an answer the model
+        # had already finished. Only a buffer that ENDS in a terminator is said:
+        # half a sentence stays unsaid, as it always was.
+        if not (cancel is not None and cancel.is_set()):
+            tail, in_think = _speech_fragment(buf, in_think)
+            tail = sayable(strip_thinking(tail).strip())
+            if tail and _ENDS_A_SENTENCE.search(tail):
+                q.put(tail)
         raise
     finally:
         if not fallback:
