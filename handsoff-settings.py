@@ -5019,12 +5019,25 @@ drifting apart one forgotten key at a time.
         def worker():
             # systemd owns the bubble: a bare SIGTERM is a "clean exit" and
             # Restart=always resurrects it — stop the unit instead
+            #
+            # Only when the unit is RUNNING the bubble. `systemctl stop` on a
+            # loaded but inactive unit exits 0, and the installer always writes
+            # and enables the unit — so for a bubble started by hand
+            # (`python ~/.local/bin/handsoff.py`, or niri's spawn-at-startup)
+            # the stop "succeeded", this said "bubble stopped (systemd unit)",
+            # and the bubble kept running. handsoff-restart asks `is-active`
+            # first for the same reason.
             try:
-                r = subprocess.run(
-                    ["systemctl", "--user", "stop", "handsoff.service"],
-                    capture_output=True, text=True, timeout=15)
-                if r.returncode == 0:
-                    return "bubble stopped (systemd unit)"
+                active = subprocess.run(
+                    ["systemctl", "--user", "is-active", "--quiet",
+                     "handsoff.service"],
+                    capture_output=True, text=True, timeout=10).returncode == 0
+                if active:
+                    r = subprocess.run(
+                        ["systemctl", "--user", "stop", "handsoff.service"],
+                        capture_output=True, text=True, timeout=15)
+                    if r.returncode == 0:
+                        return "bubble stopped (systemd unit)"
             except (OSError, subprocess.TimeoutExpired):
                 pass
             killed = 0

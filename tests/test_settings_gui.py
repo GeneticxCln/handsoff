@@ -4994,6 +4994,60 @@ def the_mic_test_records_a_bounded_window_and_reports_the_peak():
     assert "mic peak 900" in text and "good signal" in text, text
 
 
+@scenario
+def quit_only_trusts_the_unit_when_it_is_the_one_running_the_bubble():
+    # `systemctl stop` on a loaded but INACTIVE unit exits 0, and the installer
+    # always writes the unit. A bubble started by hand (or by niri's
+    # spawn-at-startup) therefore "stopped" through the unit — the message said
+    # so — and kept running. The unit is stopped only when it is active; every
+    # other case sweeps the processes.
+    calls = []
+    state = {"active": False}
+
+    class _R:
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    timeouts = {}
+
+    def fake_run(argv, **kw):
+        calls.append(list(argv))
+        timeouts[argv[2] if argv[0] == "systemctl" else argv[0]] = kw.get("timeout")
+        if argv[:3] == ["systemctl", "--user", "is-active"]:
+            return _R(0 if state["active"] else 3)
+        if argv[:3] == ["systemctl", "--user", "stop"]:
+            return _R(0)               # succeeds on an inactive unit too
+        if argv[0] == "pgrep":
+            return _R(1, "")
+        return _R(1)
+
+    settings_app.subprocess.run = fake_run
+
+    def quit_and_read():
+        win._status("")
+        win._on_quit_bubble()
+        deadline = time.time() + 10
+        while not win.status_label.text() and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.02)
+        return win.status_label.text()
+
+    def stops():
+        return [c for c in calls if c[:3] == ["systemctl", "--user", "stop"]]
+
+    msg = quit_and_read()                       # started by hand: unit inactive
+    assert msg == "stopped 0 bubble process(es)", msg
+    assert not stops(), calls
+    assert any(c[0] == "pgrep" for c in calls), calls
+    calls.clear()
+    state["active"] = True                      # the unit is running the bubble
+    msg = quit_and_read()
+    assert msg == "bubble stopped (systemd unit)", msg
+    assert len(stops()) == 1 and not any(c[0] == "pgrep" for c in calls), calls
+    # every call is bounded (a wedged systemctl must not park the worker)
+    assert timeouts == {"is-active": 10, "stop": 15, "pgrep": 10}, timeouts
+
+
 SCENARIO_NAME = sys.argv[1]
 if SCENARIO_NAME not in SCENARIOS:
     print(f"unknown scenario {SCENARIO_NAME!r}: {len(SCENARIOS)} registered",
@@ -5130,6 +5184,7 @@ SCENARIO_NAMES = [
     "a_bom_settings_file_is_read_by_the_window",
     "the_decision_log_viewer_survives_a_torn_last_line",
     "the_mic_test_records_a_bounded_window_and_reports_the_peak",
+    "quit_only_trusts_the_unit_when_it_is_the_one_running_the_bubble",
 ]
 
 
