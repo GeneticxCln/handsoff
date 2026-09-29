@@ -3843,12 +3843,25 @@ class ToolBelt:
     def copy_text(self, text: str) -> str:
         if not text:
             return 'REFUSED: nothing to copy'
+        # The text goes on STDIN. As an argument it (1) failed with E2BIG above
+        # ~128 KiB — reported to the model as "a bug in the tool" — and a NUL
+        # byte or a lone surrogate failed the same way, and (2) sat in
+        # /proc/PID/cmdline, which any local user can read, for as long as
+        # wl-copy ran: a password the user asked to have copied was in `ps`.
+        # (Found driving the tool against a real wl-copy under a headless sway.)
+        data = str(text).encode('utf-8', errors='replace')
         try:
-            subprocess.run(['wl-copy', '--', text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            proc = subprocess.run(['wl-copy'], input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
         except FileNotFoundError:
             return 'ERROR: wl-clipboard is not installed (pacman -S wl-clipboard)'
         except subprocess.TimeoutExpired:
             return 'ERROR: wl-copy timed out'
+        # A wl-copy that could not reach a compositor exits non-zero (no
+        # WAYLAND_DISPLAY, a dead socket) and its output is discarded above, so
+        # this used to report "copied N chars" for a clipboard nothing was put on.
+        if proc.returncode != 0:
+            return (f'ERROR: wl-copy failed (exit {proc.returncode}) — is a '
+                    f'Wayland session running?')
         return f'copied {len(text)} chars to the clipboard'
 
     @tool(description='Read the clipboard content (wayland). Use to check what the user copied or to inspect before pasting.')

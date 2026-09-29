@@ -618,3 +618,51 @@ class TestAWatcherSeesAProcessWithALongName:
         assert not comm_matches("gnome-text-edit", "gnome-text-edi")
         assert not comm_matches("gnome-text-edit", "gnome-text-other")
         assert not comm_matches("gnome", "gnome-text-editor")
+
+
+class TestCopyTextKeepsTheTextOffTheCommandLine:
+    """Found by driving the tool against a real wl-copy under a headless sway.
+    The text was an ARGUMENT: above ~128 KiB it failed with E2BIG (reported as
+    "a bug in the tool"), a NUL byte or a lone surrogate failed the same way, and
+    it sat in /proc/PID/cmdline — readable by every local user — while wl-copy
+    ran, so a password the user asked to have copied was in `ps`. And a wl-copy
+    that could not reach a compositor still got "copied N chars"."""
+
+    def _run(self, H, monkeypatch, returncode=0):
+        calls = []
+
+        import types
+
+        def fake_run(argv, **kw):
+            calls.append((list(argv), kw))
+            return types.SimpleNamespace(returncode=returncode, stdout=b"", stderr=b"")
+        monkeypatch.setattr(H.subprocess, "run", fake_run)
+        return calls
+
+    def test_the_text_is_stdin_not_argv(self, H, monkeypatch):
+        calls = self._run(H, monkeypatch)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        secret = "correct horse battery staple"
+        out, err = belt.execute("copy_text", {"text": secret})
+        assert not err and out == f"copied {len(secret)} chars to the clipboard", out
+        argv, kw = calls[0]
+        assert argv == ["wl-copy"], argv
+        assert not any(secret in a for a in argv), "the text is on the command line"
+        assert kw["input"] == secret.encode("utf-8")
+        assert kw["timeout"] == 8
+
+    def test_a_huge_nul_or_surrogate_text_is_copied_not_a_tool_bug(self, H, monkeypatch):
+        calls = self._run(H, monkeypatch)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        for text in ("x" * 300_000, "a\x00b", "a\ud800b"):
+            out, err = belt.execute("copy_text", {"text": text})
+            assert not err and out.startswith("copied "), (text[:8], out)
+        assert calls[0][1]["input"] == b"x" * 300_000
+        assert calls[1][1]["input"] == b"a\x00b"
+        assert calls[2][1]["input"] == "a\ud800b".encode("utf-8", errors="replace")
+
+    def test_a_failed_wl_copy_is_not_reported_as_a_copy(self, H, monkeypatch):
+        self._run(H, monkeypatch, returncode=1)
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        out, err = belt.execute("copy_text", {"text": "hello"})
+        assert "copied" not in out and "wl-copy failed (exit 1)" in out, out
