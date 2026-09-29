@@ -3054,6 +3054,23 @@ def _wake_name() -> str:
     return str(SETTINGS.get("assistant_name", "assistant")).strip().lower() or "assistant"
 
 
+def _wake_words() -> list[str]:
+    """The wake name as the WORDS a transcript is matched against.
+
+    A transcript is punctuation-stripped word by word (`norm_words`) before it
+    is compared, and the name was only `.split()`: "Dr. Watson" became
+    `['dr.', 'watson']` against a transcript of `['dr', 'watson']`, and
+    "Jarvis!" or "cypher," never matched anything the user could say — the
+    wake word silently dead, with nothing on screen to say why (measured
+    2026-09-29). Both sides are now normalized by the same function. A name
+    that is nothing BUT punctuation ("...") has no words at all, and an empty
+    name matches EVERY utterance (`[] == []`), so it falls back to the default
+    exactly as a blank name does.
+    """
+    words = [w for w in _voice.norm_words(_wake_name()) if w]
+    return words or ["assistant"]
+
+
 # Phase 4f: core/voice.py owns the wake vocabulary and the matching rules;
 # these keep the historical H.* names as delegations (the tests and the
 # pipeline both use them) with the wake name read LIVE at every call, so a
@@ -3064,7 +3081,7 @@ def _norm_words(text: str) -> list[str]:
 
 def _is_wake_utt(text: str) -> bool:
     """True when the whole utterance is just the wake name ('hey assistant')."""
-    return _voice.is_wake_utt(text, _wake_name().split())
+    return _voice.is_wake_utt(text, _wake_words())
 
 
 def _match_wake(text: str) -> str | None:
@@ -3073,7 +3090,7 @@ def _match_wake(text: str) -> str | None:
     Word-token based, name tried before the filler skip (so a custom name
     that itself starts with 'hey' still works). Falls back to a fuzzy
     pronunciation-skeleton match for misheard names (Siphon~cypher)."""
-    return _voice.match_wake(text, _wake_name().split())
+    return _voice.match_wake(text, _wake_words())
 
 
 def _wake_anywhere(text: str) -> str | None:
@@ -3082,7 +3099,7 @@ def _wake_anywhere(text: str) -> str | None:
     transcript is the only way in). Same word matching and same fuzzy skeleton
     as `_match_wake`, any position, bounded to a short utterance. Returns the
     text with the name removed (possibly '') or None when it is not there."""
-    return _voice.wake_anywhere(text, _wake_name().split())
+    return _voice.wake_anywhere(text, _wake_words())
 
 
 def _tick_now() -> float:
@@ -4984,7 +5001,7 @@ def _spotter_wakes_for(name: str | None = None) -> bool | None:
     """
     if not _SPOTTER_MODEL_NAMES:
         return None
-    want = _wake_name().split()
+    want = _wake_words()
     for model in _SPOTTER_MODEL_NAMES:
         got = [w for w in re.split(r"[^a-z0-9]+", str(model).lower()) if w]
         if _voice.skeleton_match(got, want):
@@ -5221,13 +5238,25 @@ def _stop_was_poweroff(ts: str, journal_text: str | None = None) -> bool:
         stamp = _JOURNAL_STAMP.match(line)
         if stamp is None or stamp.group(1) not in _JOURNAL_MONTHS:
             continue          # not a journal line (blank, banner, continuation)
-        try:
-            stamped = datetime.datetime(
-                when.year, _JOURNAL_MONTHS[stamp.group(1)],
-                int(stamp.group(2)), int(stamp.group(3)),
-                int(stamp.group(4)), int(stamp.group(5)))
-        except ValueError:
-            continue          # an impossible date (Feb 30) is not evidence
+        # A journal stamp has no YEAR, so it is placed in whichever neighbouring
+        # year lands it nearest the stop. Borrowing the stop's own year read a
+        # poweroff at 23:59:59 on 31 December logged as "Jan  1 00:00:00" as
+        # eleven months and thirty days away — the one night of the year when
+        # the ±2 s window straddles two years — and the classification then
+        # accused a clean shutdown of being the invisible killer.
+        stamped = None
+        for year in (when.year, when.year - 1, when.year + 1):
+            try:
+                candidate = datetime.datetime(
+                    year, _JOURNAL_MONTHS[stamp.group(1)],
+                    int(stamp.group(2)), int(stamp.group(3)),
+                    int(stamp.group(4)), int(stamp.group(5)))
+            except ValueError:
+                continue      # an impossible date (Feb 30) is not evidence
+            if stamped is None or abs(candidate - when) < abs(stamped - when):
+                stamped = candidate
+        if stamped is None:
+            continue
         if abs((stamped - when).total_seconds()) <= _STOP_POWEROFF_WINDOW_S \
                 and "poweroff requested" in line:
             return True
@@ -5926,6 +5955,17 @@ _DURATION_NUMBERS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}
 _DURATION_TRAILING_HALF = re.compile(r"\band\s+(?:a\s+|one\s+)?half\b")
 _DURATION_LEADING_HALF = re.compile(r"\ba\s+half\s+([a-z]+)")
 
+#: The other ways English fractions a unit, each a QUANTITY that names the unit
+#: after it: "half an hour", "half a day", "a quarter of an hour", "three
+#: quarters of an hour". None of them was known, so `an hour` was read on its
+#: own and the fraction dropped: "in half an hour" set a reminder for ONE HOUR,
+#: "half a day" for 24 hours, "quarter of an hour" for an hour — each silently
+#: twice to four times too late, on the most ordinary way to ask (measured
+#: 2026-09-29). Lifted into "0.5 hour" form before the number pattern runs.
+_DURATION_HALF_OF_A = re.compile(r"\bhalf\s+an?\s+([a-z]+)")
+_DURATION_QUARTER_OF_AN = re.compile(r"\b(?:a\s+)?quarter\s+of\s+an?\s+([a-z]+)")
+_DURATION_THREE_QUARTERS = re.compile(r"\bthree\s+quarters?\s+of\s+an?\s+([a-z]+)")
+
 
 def _parse_duration(text: str) -> float | None:
     """'in 2 hours 5 minutes' / '45 min' / '3 days' / 'a week' → seconds, or None."""
@@ -5949,6 +5989,9 @@ def _parse_duration(text: str) -> float | None:
     trailing_half = bool(_DURATION_TRAILING_HALF.search(t))
     t = _DURATION_TRAILING_HALF.sub(" ", t)
     t = _DURATION_LEADING_HALF.sub(r"0.5 \1", t)
+    t = _DURATION_HALF_OF_A.sub(r"0.5 \1", t)
+    t = _DURATION_THREE_QUARTERS.sub(r"0.75 \1", t)
+    t = _DURATION_QUARTER_OF_AN.sub(r"0.25 \1", t)
     total = 0.0
     matched = False
     units_seen = 0
@@ -5972,6 +6015,15 @@ def _parse_duration(text: str) -> float | None:
             return None
         total += 0.5 * last_unit
     if not matched or total <= 0:
+        return None
+    # A digit that no unit claimed is a number this function did NOT read, and
+    # answering anyway is a reminder at the wrong time: "in 1:30 hours" was
+    # thirty hours (the `1:` never matched a unit and was skipped), "in 1 hour
+    # 30" one hour, "in 2 hours at 5" two. `findall` reports what it found and
+    # says nothing about what it walked past, so the walked-past text is
+    # checked for digits — a stray WORD is harmless ("in 5 minutes after the
+    # film"), a stray NUMBER is not.
+    if re.search(r"\d", re.sub(_DURATION_RE, " ", t)):
         return None
     return total
 
@@ -10384,6 +10436,7 @@ class ControlServer:
                     if not self._stop.is_set():
                         log.exception("control socket accept failed")
                     return
+                action = ""            # for the failure reply, if we get that far
                 try:
                     conn.settimeout(5.0)
                     # Read the request BEFORE the credential check: closing a
@@ -10559,6 +10612,24 @@ class ControlServer:
                     conn.sendall((reply + "\n").encode("utf-8"))
                 except OSError:
                     pass
+                except Exception as exc:  # noqa: BLE001 -- see below
+                    # ONE request must cost that request and not the server.
+                    # Only OSError was caught here, so any other exception from
+                    # a verb (a bug, a value nobody expected) left this `while`
+                    # and ended the accept thread: the bubble carried on with no
+                    # control socket — `--ptt` says "not running", the keybinds
+                    # do nothing, settings cannot reach it — which is the zombie
+                    # this project's health machinery exists to prevent. Named
+                    # in the journal with its traceback, and the client is told
+                    # instead of being left reading a closed socket.
+                    log.exception("control socket: %r failed", action)
+                    try:
+                        conn.sendall(
+                            (f"error: {action or 'request'} failed "
+                             f"({type(exc).__name__}) — see the journal\n"
+                             ).encode("utf-8"))
+                    except OSError:
+                        pass
                 finally:
                     conn.close()
         finally:
@@ -10904,7 +10975,15 @@ def main() -> int:
     setup_logging()
     _log_swept_scratch()   # the sweep ran before the journal existed
     sys.excepthook = lambda *a: log.exception("uncaught exception", exc_info=a)
-    threading.excepthook = lambda a: log.exception("uncaught thread exception", exc_info=a.exc_type)
+    # The traceback is passed as the (type, value, traceback) tuple the hook
+    # was handed. It was `exc_info=a.exc_type` — a CLASS, which logging does not
+    # accept and silently replaces with `sys.exc_info()`; that happens to be the
+    # live exception, because CPython calls this hook from inside the thread's
+    # own `except`, so the traceback appeared by accident. Named for the thread
+    # too: a dead worker's name is the first thing a reader looks for.
+    threading.excepthook = lambda a: log.error(
+        "uncaught thread exception in %s", getattr(a.thread, "name", "?"),
+        exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
     crash_fh = open(CRASH_LOG, "a", buffering=1)
     os.chmod(CRASH_LOG, 0o600)
     faulthandler.enable(crash_fh)  # native aborts (CUDA, Qt)

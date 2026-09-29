@@ -98,6 +98,49 @@ def _ics_unfold(text: str) -> list[str]:
     return lines
 
 
+class _SystemLocal(datetime.tzinfo):
+    """The machine's own zone, as a ZONE rather than as the offset it has today.
+
+    A floating time ("09:00", no zone) and an all-day date both mean "on the
+    wall clock of wherever the reader is", and both used to be given
+    `naive.astimezone()`. That returns a FIXED-OFFSET tzinfo: the machine's UTC
+    offset on that one date, frozen. Recurrence is wall-clock arithmetic in the
+    zone the datetime carries, so a weekly all-day event first entered in
+    summer (`+02:00`) was expanded at `00:00+02:00` for ever — and after the
+    clocks changed that instant is 23:00 on the PREVIOUS day. The assistant
+    then announced Thursday's event on Wednesday (and not on Thursday), and a
+    floating 21:45 meeting read as 20:45, for every event that crossed a DST
+    change (found by differential fuzzing against `recurring-ical-events`,
+    2026-09-29). Zones named by TZID never had this: they carry a ZoneInfo.
+
+    This class carries the SYSTEM's zone the same way. It asks the platform for
+    the offset at each wall time it is asked about, so `dtstart + 7 days` lands
+    on the same local clock time whatever the offset did in between.
+    """
+
+    def utcoffset(self, dt):
+        return dt.replace(tzinfo=None).astimezone().utcoffset()
+
+    def tzname(self, dt):
+        return dt.replace(tzinfo=None).astimezone().tzname()
+
+    def dst(self, dt):
+        return None                 # not known separately from the offset
+
+    def fromutc(self, dt):
+        # `dt` carries this tzinfo and holds UTC wall fields (the tzinfo
+        # protocol); the answer is the same instant on the local wall clock,
+        # keeping the fold flag the platform sets for the repeated hour.
+        local = dt.replace(tzinfo=datetime.timezone.utc).astimezone()
+        return local.replace(tzinfo=self)
+
+    def __repr__(self) -> str:
+        return "<system local zone>"
+
+
+_LOCAL = _SystemLocal()
+
+
 def _ics_tzid(tzid: str) -> "zoneinfo.ZoneInfo | None":
     """The zone a TZID names, or None when no tzdata on this system matches it.
 
@@ -143,7 +186,10 @@ def _ics_parse_dt_checked(prop: str) -> "tuple[datetime.datetime | None, bool]":
     params = dict(p.split("=", 1) for p in head.split(";")[1:] if "=" in p)
     try:
         if params.get("VALUE") == "DATE" or re.fullmatch(r"\d{8}", value):
-            return datetime.datetime.strptime(value[:8], "%Y%m%d").astimezone(), False
+            day = datetime.datetime.strptime(value[:8], "%Y%m%d")
+            day = day.replace(tzinfo=_LOCAL)
+            day.utcoffset()      # a date the platform cannot place is garbage
+            return day, False
         dt = datetime.datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
         if value.endswith("Z"):
             dt = dt.replace(tzinfo=datetime.timezone.utc)
@@ -155,10 +201,12 @@ def _ics_parse_dt_checked(prop: str) -> "tuple[datetime.datetime | None, bool]":
         elif dt.tzinfo is None:
             # A floating time names no zone, so it keeps the system's own —
             # the interpretation it always had (aware comparisons below
-            # refuse a naive datetime outright).
-            dt = dt.astimezone()
+            # refuse a naive datetime outright). As a ZONE (`_SystemLocal`),
+            # not a snapshot of today's offset: see that class.
+            dt = dt.replace(tzinfo=_LOCAL)
+            dt.utcoffset()       # a time the platform cannot place is garbage
         return dt, False
-    except (ValueError, zoneinfo.ZoneInfoNotFoundError):
+    except (ValueError, OverflowError, OSError, zoneinfo.ZoneInfoNotFoundError):
         return None, False
 
 
@@ -298,7 +346,15 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
             gap = (win_start - dur) - dtstart
             if gap > datetime.timedelta(0):
                 step = datetime.timedelta(days=interval)
-                first_index = gap // step + 1
+                # One instance EARLIER than the strict answer, like the other
+                # three frequencies' jumps. `gap` is elapsed time, but instance
+                # i sits at DTSTART plus i WALL-CLOCK days, and across a DST
+                # change those differ by the hour the clocks moved — so a
+                # window opening exactly on an instance, after the change, was
+                # jumped PAST it (a Sydney 08:00 daily event vanished from the
+                # window that begins at 08:00). An instance short of the window
+                # costs one `want()` and is skipped.
+                first_index = gap // step
         i = first_index
         while i < count:
             t = dtstart + datetime.timedelta(days=i * interval)
@@ -316,8 +372,13 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
             i += 1
     elif freq == "WEEKLY":
         wd = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
-        days = [wd[d] for d in parts.get("BYDAY", "").split(",")
-                if d in wd] or [dtstart.weekday()]
+        # SORTED and de-duplicated: COUNT is spent in the order instances fall
+        # in the calendar, so `BYDAY=FR,MO;COUNT=3` has to reach Monday before
+        # Friday within a week. Walked as written it spent the count on the
+        # Friday first and ended the rule on the wrong day (a differential run
+        # against dateutil, 2026-09-29), and `BYDAY=MO,MO` counted one day twice.
+        days = sorted({wd[d] for d in parts.get("BYDAY", "").split(",")
+                       if d in wd}) or [dtstart.weekday()]
         # Midnight-aligned on purpose. Subtracting whole DAYS from DTSTART
         # cannot change its clock time, so a week0 built the obvious way still
         # carried it — and adding `hours=dtstart.hour` on top of that doubled
@@ -425,7 +486,11 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                 t = _ics_month_day(year, month, dtstart.day, dtstart)
                 if t:
                     cands.append(t)
-            return cands
+            # A date the rule names twice is ONE instance (RFC 5545: duplicates
+            # are ignored): BYMONTHDAY=26,-3 is the same day in February, and
+            # `1FR,1FR` is one Friday. Left in, the meeting was listed twice
+            # and COUNT was spent on both.
+            return sorted(set(cands))
 
         m = 0
         # Jump straight to the window — the DAILY/WEEKLY family: stepping from
@@ -449,7 +514,13 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                 # meaning (total instances since DTSTART, incl. DTSTART).
                 for step in range(m):
                     skipped = _ics_add_months(dtstart, step * interval)
-                    k += len(month_candidates(skipped.year, skipped.month))
+                    # Only candidates ON or AFTER DTSTART are instances: the
+                    # first month's earlier days ("the 1st" for a rule whose
+                    # DTSTART is the 15th) do not exist, so crediting them
+                    # spent COUNT on days that never happened.
+                    k += sum(1 for c in month_candidates(skipped.year,
+                                                         skipped.month)
+                             if c >= dtstart)
         # Caps the WORK, not the distance from DTSTART (the jump put the
         # window in reach): every interval step the window itself spans, plus
         # the step the jump may have landed early and the one the window's
@@ -460,9 +531,20 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
         m_cap = m + max(1, min(span // interval + 3, 240))
         while m < m_cap and k < count:
             base = _ics_add_months(dtstart, m * interval)
-            if base > win_end:
+            # The MONTH's first instant is the bound, not `base`. `base` is
+            # DTSTART's own day-of-month carried into this month, and a rule's
+            # days are not DTSTART's day: "the last Friday" first met on the
+            # 30th has its February instance on the 27th, "the 1st and 15th"
+            # started on the 15th has its March instance on the 1st — both
+            # BEFORE `base`, so `base > win_end` ended the search a day short
+            # and the meeting read as "no events" on the very day it happens.
+            month_start = base.replace(day=1, hour=0, minute=0, second=0,
+                                       microsecond=0)
+            if month_start >= win_end:
                 break
-            for t in sorted(month_candidates(base.year, base.month)):
+            for t in month_candidates(base.year, base.month):
+                if t < dtstart:
+                    continue        # before DTSTART is not an instance
                 if k >= count:      # same mid-batch cap as WEEKLY's days
                     break
                 k += 1
@@ -506,7 +588,7 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                         cands.append(dtstart.replace(year=year, month=mo))
                     except ValueError:
                         pass   # Feb 29 in a non-leap year: no occurrence
-            return cands
+            return sorted(set(cands))     # a date named twice is one instance
 
         y = 0
         # Jump straight to the window — the same family as DAILY/WEEKLY/
@@ -522,7 +604,11 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                 # later year than DTSTART's, so the loop below would have
                 # counted each one.
                 for step in range(y):
-                    k += len(year_candidates(dtstart.year + step * interval))
+                    # Instances only: candidates before DTSTART (BYMONTH=4,11
+                    # with a December DTSTART names two of them in DTSTART's
+                    # own year) never happened and are not counted.
+                    k += sum(1 for c in year_candidates(
+                        dtstart.year + step * interval) if c >= dtstart)
         # Caps the WORK, not the distance from DTSTART: the years the window
         # itself spans, plus slack — the old 20 kept as the absolute backstop.
         span = win_end.year - anchor.year
@@ -531,7 +617,9 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
             year = dtstart.year + y * interval
             if year > win_end.year:
                 break
-            for t in sorted(year_candidates(year)):
+            for t in year_candidates(year):
+                if t < dtstart:
+                    continue        # before DTSTART is not an instance
                 if k >= count:      # same mid-batch cap as WEEKLY's days
                     break
                 k += 1

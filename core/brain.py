@@ -535,6 +535,19 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                     chunk = json.loads(line.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
                     continue
+                if not isinstance(chunk, dict):
+                    continue            # a line that is not an object is noise
+                # Ollama reports a failure AFTER the 200 was sent (the runner
+                # died, the model ran out of memory) as a line of the stream,
+                # `{"error": "..."}`, not as an HTTP status — so no HTTPError
+                # can carry it. Read as a chunk with no `message` it was
+                # skipped: the reply simply ended, a half sentence was spoken
+                # and recorded as the whole answer, and a failure before the
+                # first word came back as an "empty answer" that hid the cause.
+                # Raised, it takes the path every other failure takes (the
+                # terminator, the journal, the spoken apology naming it).
+                if chunk.get("error"):
+                    raise RuntimeError(f"Ollama error: {chunk['error']}")
                 message = chunk.get("message") or {}
                 if message.get("tool_calls"):
                     tool_calls.extend(message["tool_calls"])

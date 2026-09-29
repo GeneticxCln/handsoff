@@ -1322,6 +1322,43 @@ class TestWakeWord:
         assert H._is_wake_utt("hey bubble")
 
 
+    @pytest.mark.parametrize("name, said, rest", [
+        ("Dr. Watson", "Dr. Watson, what time is it", "what time is it"),
+        ("Jarvis!", "jarvis what time is it", "what time is it"),
+        ("cypher,", "Cypher, open firefox", "open firefox"),
+        ("Hey Jarvis.", "hey jarvis play jazz", "play jazz"),
+        ("  Computer  ", "computer, volume down", "volume down"),
+    ])
+    def test_a_name_typed_with_punctuation_still_wakes(self, H, monkeypatch,
+                                                       name, said, rest):
+        """The transcript is stripped of punctuation word by word before it is
+        compared and the NAME was only `.split()`, so "Dr. Watson" was
+        `['dr.', 'watson']` against a transcript of `['dr', 'watson']` and
+        "Jarvis!" or "cypher," could never match anything the user says — the
+        wake word dead, and nothing anywhere to say why (measured 2026-09-29)."""
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", name)
+        assert H._match_wake(said) == rest
+        assert H._wake_anywhere("so " + said) is not None
+
+    def test_a_name_with_no_words_in_it_does_not_match_everything(self, H,
+                                                                  monkeypatch):
+        """`[] == []`: a name that is only punctuation normalizes to NO words,
+        and an empty name is a prefix of every utterance — the assistant would
+        engage on all speech. It falls back to the default name, as a blank
+        one always did."""
+        for name in ("...", "!?", " , ", ""):
+            monkeypatch.setitem(H.SETTINGS, "assistant_name", name)
+            assert H._wake_words() == ["assistant"], name
+            assert H._match_wake("what's the weather") is None, name
+            assert H._match_wake("hello there") is None, name
+            assert H._match_wake("assistant what time") == "what time", name
+
+    def test_the_spotter_coverage_check_reads_the_same_words(self, H, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "assistant_name", "Hey Jarvis!")
+        monkeypatch.setattr(H, "_SPOTTER_MODEL_NAMES", ["hey_jarvis"])
+        assert H._spotter_wakes_for() is True
+
+
 class TestWakeAnywhere:
     """A custom name has no audio-spotter model, so the transcript is the only
     door — and it has to open for a name whisper did not put FIRST (a split
@@ -4563,6 +4600,35 @@ class TestAMicrophoneThatIsNotOnTheMachine:
                 raise ValueError(f"Cannot get card index for {dev!r}")
 
         return _SD
+
+    @pytest.mark.parametrize("info, want", [
+        # an EXPLICIT count is what the device says
+        ({"max_input_channels": 2}, 2),
+        ({"max_input_channels": 128}, 128),
+        ({"max_input_channels": "2"}, 2),
+        # explicit zero is the ghost, and a nonsense negative is no better
+        ({"max_input_channels": 0}, 0),
+        ({"max_input_channels": -3}, 0),
+        ({"max_input_channels": None}, 0),
+        # ABSENT is not zero: "not stated", which is NOT evidence of a ghost
+        ({}, -1),
+        ({"name": "stub", "default_samplerate": 44100.0}, -1),
+        # a value that is not a number is unstated too, not a ghost
+        ({"max_input_channels": "many"}, -1),
+        ({"max_input_channels": [2]}, -1),
+        # something that is not a device entry at all offers nothing
+        (None, 0),
+        ("Yeti", 0),
+        (2, 0),
+        ([("max_input_channels", 2)], 0),
+    ])
+    def test_can_capture_channels_answers_each_shape_of_entry(self, info, want):
+        """The predicate is three answers — a count, "no channels" (0) and "not
+        stated" (-1) — and its callers distinguish them: only an explicit 0 is a
+        ghost. Each return was unpinned (the mutation gate dropped each of them
+        and every test still passed), so each shape is asserted directly."""
+        from core import voice
+        assert voice.can_capture_channels(info) == want, info
 
     def test_a_device_that_enumerates_with_no_input_channels_is_a_ghost(
             self, H, monkeypatch, caplog):

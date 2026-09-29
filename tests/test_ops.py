@@ -1593,6 +1593,17 @@ class TestJournalPoweroffClassification:
     ANCHOR = "2026-09-23T20:39:26+02:00"   # 60 min before GHOST: in-window
     GHOST = "2026-09-23T21:39:26+02:00"      # the real measured poweroff ghost
 
+    @pytest.fixture(autouse=True)
+    def _the_machine_is_on_the_desk_clock(self, desk_zone):
+        """The journal prints LOCAL wall-clock stamps, and `_stop_was_poweroff`
+        converts the ledger's offset-carrying timestamp to the machine's own
+        zone before comparing. The stamps below were written the way the desk's
+        journal prints them (CEST, +02:00), so the rows only line up when the
+        machine is on that clock — which is the property under test, not an
+        assumption about the runner: on a UTC runner (GitHub's) the same
+        ledger row reads 19:39:26 against a journal that says 21:39:26, and all
+        five poweroff tests failed for want of a timezone."""
+
     @staticmethod
     def _rows(ghost_ts):
         return [TestDoctor._attr_row(TestJournalPoweroffClassification.ANCHOR),
@@ -1688,6 +1699,39 @@ class TestJournalPoweroffClassification:
                             lambda argv: self._journal_text("21:39:26"))
         block = H._unexplained_stops_health()
         assert block["superseded_by"] == ""
+
+    @staticmethod
+    def _poweroff_line(stamp: str) -> str:
+        return (f"{stamp} cachyos-x8664 systemd-logind[742]: poweroff "
+                "requested from client PID 1 ('systemctl')\n")
+
+    def test_a_poweroff_across_new_year_is_still_a_poweroff(self, H):
+        """A journal stamp carries no year, so the stop's own year was borrowed
+        for it: a stop at 23:59:59 on 31 December whose poweroff line reads
+        "Jan  1 00:00:00" was placed eleven months and thirty days away, and
+        the mirror case (a stop just after midnight, the line just before) the
+        same. The window is ±2 s, so this is the one night a year it straddles
+        two years — and it is the night a machine left on over the holidays is
+        most likely to be powered down at the stroke of midnight."""
+        winter = "+01:00"                      # CET; the fixture's zone in winter
+        assert H._stop_was_poweroff(f"2026-12-31T23:59:59{winter}",
+                                    self._poweroff_line("Jan  1 00:00:00"))
+        assert H._stop_was_poweroff(f"2027-01-01T00:00:00{winter}",
+                                    self._poweroff_line("Dec 31 23:59:59"))
+
+    def test_the_new_year_window_is_still_two_seconds(self, H):
+        """Reading a stamp in the nearest year must not widen the window: a
+        line three seconds past midnight is still too far from 23:59:59."""
+        assert not H._stop_was_poweroff("2026-12-31T23:59:59+01:00",
+                                        self._poweroff_line("Jan  1 00:00:03"))
+        assert not H._stop_was_poweroff("2027-01-01T00:00:00+01:00",
+                                        self._poweroff_line("Dec 31 23:59:57"))
+
+    def test_a_line_from_another_time_of_year_is_still_no_evidence(self, H):
+        """Nearest-year placement is for the boundary, not a licence to match a
+        poweroff from another month because SOME year lines up."""
+        assert not H._stop_was_poweroff("2026-12-31T23:59:59+01:00",
+                                        self._poweroff_line("Jun 15 12:00:00"))
 
     def test_unparseable_timestamp_stays_an_accusation_candidate(self, H,
                                                                   monkeypatch,

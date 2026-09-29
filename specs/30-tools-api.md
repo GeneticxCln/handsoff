@@ -21,58 +21,58 @@ matching the belt's own check at call time.
 
 | Tool | Gate | L |
 |---|---|---|
-| `run_command` | `run_command` | 2362 |
-| `type_text` | `type_text` | 2600 |
-| `press_keys` | `press_keys` | 2663 |
-| `press_hotkey` | `press_keys` | 2768 |
-| `notification_reader` | `notifications` | 2827 |
-| `pomodoro` | `pomodoro` | 2941 |
-| `watch_file` | `watchers` | 3027 |
-| `watch_process` | `watchers` | 3076 |
-| `quant_space_status` | `quant_space` | 3172 |
-| `quant_space_sessions` | `quant_space` | 3187 |
-| `quant_space_read` | `quant_space` | 3199 |
-| `quant_space_check` | `quant_space` | 3234 |
-| `workspace` | `run_command` | 3258 |
-| `focus_window` | `focus_window` | 3376 |
-| `wait_for_window` | `focus_window` | 3422 |
-| `wait` | — | 3444 |
-| `niri_capabilities` | — | 3545 |
-| `close_window` | `run_command` | 3575 |
-| `copy_text` | `copy_text` | 3635 |
-| `paste_text` | `paste_text` | 3647 |
-| `set_reminder` | `reminders` | 3662 |
-| `list_reminders` | `reminders` | 3729 |
-| `cancel_reminder` | `reminders` | 3745 |
-| `snooze_reminder` | `reminders` | 3764 |
-| `media_play` | `media` | 3802 |
-| `media_control` | `media` | 3838 |
-| `media_volume` | `media` | 3857 |
-| `now_playing` | `media` | 3869 |
-| `search_library` | `media` | 3886 |
-| `calendar_month` | `calendar` | 3905 |
-| `read_calendar` | `calendar` | 3935 |
-| `get_weather` | `web_access` | 3979 |
-| `web_search` | `web_access` | 4008 |
-| `read_page` | `web_access` | 4034 |
-| `world_events` | `web_access` | 4047 |
-| `lookup_fact` | `web_access` | 4071 |
-| `get_datetime` | `get_datetime` | 4088 |
-| `see_screen` | `screen_access` | 4135 |
-| `read_screen_text` | `screen_access` | 4153 |
-| `kill_process` | `run_command` | 4240 |
-| `confirm_kill` | `run_command` | 4273 |
-| `confirm_action` | — | 4318 |
-| `start_command` | `run_command` | 4406 |
-| `job_status` | `run_command` | 4459 |
-| `handsoff_doctor` | — | 4507 |
-| `screen_elements` | `screen_access` | 4607 |
-| `click_element` | `operator` | 4629 |
-| `click_at` | `operator` | 4646 |
-| `scroll` | `operator` | 4651 |
-| `open_app` | `run_command` | 4684 |
-| `read_file` | `read_file` | 4779 |
-| `edit_file` | `edit_file` | 4823 |
+| `run_command` | `run_command` | 2435 |
+| `type_text` | `type_text` | 2673 |
+| `press_keys` | `press_keys` | 2736 |
+| `press_hotkey` | `press_keys` | 2841 |
+| `notification_reader` | `notifications` | 2900 |
+| `pomodoro` | `pomodoro` | 3014 |
+| `watch_file` | `watchers` | 3107 |
+| `watch_process` | `watchers` | 3156 |
+| `quant_space_status` | `quant_space` | 3252 |
+| `quant_space_sessions` | `quant_space` | 3267 |
+| `quant_space_read` | `quant_space` | 3279 |
+| `quant_space_check` | `quant_space` | 3314 |
+| `workspace` | `run_command` | 3338 |
+| `focus_window` | `focus_window` | 3456 |
+| `wait_for_window` | `focus_window` | 3502 |
+| `wait` | — | 3524 |
+| `niri_capabilities` | — | 3625 |
+| `close_window` | `run_command` | 3655 |
+| `copy_text` | `copy_text` | 3715 |
+| `paste_text` | `paste_text` | 3727 |
+| `set_reminder` | `reminders` | 3742 |
+| `list_reminders` | `reminders` | 3809 |
+| `cancel_reminder` | `reminders` | 3825 |
+| `snooze_reminder` | `reminders` | 3844 |
+| `media_play` | `media` | 3882 |
+| `media_control` | `media` | 3918 |
+| `media_volume` | `media` | 3937 |
+| `now_playing` | `media` | 3949 |
+| `search_library` | `media` | 3966 |
+| `calendar_month` | `calendar` | 3985 |
+| `read_calendar` | `calendar` | 4015 |
+| `get_weather` | `web_access` | 4059 |
+| `web_search` | `web_access` | 4088 |
+| `read_page` | `web_access` | 4114 |
+| `world_events` | `web_access` | 4127 |
+| `lookup_fact` | `web_access` | 4151 |
+| `get_datetime` | `get_datetime` | 4168 |
+| `see_screen` | `screen_access` | 4215 |
+| `read_screen_text` | `screen_access` | 4233 |
+| `kill_process` | `run_command` | 4320 |
+| `confirm_kill` | `run_command` | 4353 |
+| `confirm_action` | — | 4398 |
+| `start_command` | `run_command` | 4486 |
+| `job_status` | `run_command` | 4539 |
+| `handsoff_doctor` | — | 4587 |
+| `screen_elements` | `screen_access` | 4687 |
+| `click_element` | `operator` | 4709 |
+| `click_at` | `operator` | 4726 |
+| `scroll` | `operator` | 4731 |
+| `open_app` | `run_command` | 4764 |
+| `read_file` | `read_file` | 4859 |
+| `edit_file` | `edit_file` | 4903 |
 
 ## Result contract
 
@@ -152,7 +152,9 @@ report-instead-of-act.
 
 Allowed base: `pactl playerctl brightnessctl niri spawn echo cat ls pwd
 notify-send ps free uptime df ss nvidia-smi` + `extra_allowed_commands` +
-restart script + `git {status,diff,log,show,branch,remote}` (no `-d/-D`) +
+restart script + `git {status,diff,log,show,branch,remote}` (`branch` is an
+allow-list of LISTING flags — a bare name creates a branch, and git accepts a
+unique prefix like `--dele`, so nothing else passes: `_git_branch_write`) +
 `cargo {build,check,test,clippy}`. Blocked (substring, word-boundaried):
 `sudo rm pacman yay paru shutdown poweroff reboot halt mkfs dd kill chmod
 chown mount umount curl wget bash sh zsh fish python python3 pip mv cp tar

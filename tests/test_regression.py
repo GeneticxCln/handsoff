@@ -1943,6 +1943,21 @@ class TestAmbientCapabilities:
         assert calls == [("start", 25.0, 5.0)]
         assert tb.pomodoro("start", 0, 5).startswith("ERROR")
 
+    def test_stop_and_status_do_not_read_the_durations(self, H):
+        """A model fills the fields a call does not need — 0 is a common pick —
+        and range-checking them for `stop` refused the one command that ends the
+        timer, with a complaint about minutes the stop never reads."""
+        calls = []
+        tb = self._tb(H, on_notification=lambda enabled: None,
+                      on_pomodoro=lambda *args: calls.append(args) or "ok")
+        for action in ("stop", "status"):
+            for junk in ((0, 0), (-5, 999), ("x", None), (float("nan"), 1)):
+                assert tb.pomodoro(action, *junk) == "ok", (action, junk)
+        assert [c[0] for c in calls] == ["stop"] * 4 + ["status"] * 4
+        # ...and starting still validates, whatever else changed
+        assert tb.pomodoro("start", 500, 5).startswith("ERROR")
+        assert tb.pomodoro("start", "x", 5).startswith("ERROR")
+
     def test_watch_file_starts_and_stops(self, H, tmp_path):
         p = tmp_path / "x.log"
         p.write_text("old\n")

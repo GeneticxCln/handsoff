@@ -969,6 +969,52 @@ class TestTheFailureSpeaks:
         assert list(q.queue)[-1] is None
 
 
+class TestAnErrorInsideTheStream:
+    """Ollama reports a failure that happens AFTER it sent the 200 (the runner
+    died, the model ran out of memory) as a line of the stream — `{"error":
+    "..."}` — not as an HTTP status. Nothing looked for it: the line has no
+    `message`, so it was skipped, the reply ended as if the model had finished,
+    and the turn was recorded and spoken as complete (measured 2026-09-29: a
+    reply cut at "And then" was said and kept; an error before the first word
+    came back as an empty answer with its cause discarded)."""
+
+    ERROR = b'{"error": "llama runner process has terminated: exit status 2"}\n'
+
+    def test_an_error_after_some_words_is_raised_not_swallowed(self, brain):
+        q: queue.Queue = queue.Queue()
+        with pytest.raises(RuntimeError) as ei:
+            _stream(brain, q, _ok_stream(_chunk("The answer is 42. And then "),
+                                         self.ERROR))
+        assert "llama runner process has terminated" in str(ei.value)
+        assert _spoken(q) == ["The answer is 42."], (
+            "what arrived before the failure has been heard already, and the "
+            "half sentence after it must not be spoken as if it were finished")
+        assert list(q.queue)[-1] is None, "exactly one terminator, still"
+
+    def test_an_error_before_the_first_word_names_its_cause(self, brain):
+        q: queue.Queue = queue.Queue()
+        with pytest.raises(RuntimeError) as ei:
+            _stream(brain, q, _ok_stream(
+                b'{"error": "model requires more system memory than is '
+                b'available"}\n'))
+        assert "more system memory" in str(ei.value)
+        assert list(q.queue) == [None]
+
+    def test_lines_that_are_not_objects_are_noise_not_a_crash(self, brain):
+        q: queue.Queue = queue.Queue()
+        out = _stream(brain, q, _ok_stream(b"null\n", b"[1, 2]\n", b'"text"\n',
+                                           b"7\n", _chunk("Fine. ")))
+        assert _spoken(q) == ["Fine."]
+        assert out["content"] == "Fine."
+
+    def test_an_empty_error_field_is_not_an_error(self, brain):
+        """A chunk that carries `"error": ""` or null alongside a message."""
+        q: queue.Queue = queue.Queue()
+        line = (json.dumps({"message": {"role": "assistant", "content": "Ok. "},
+                            "error": ""}) + "\n").encode("utf-8")
+        assert _stream(brain, q, _ok_stream(line))["content"] == "Ok."
+
+
 class TestTheRequestItSends:
     """What goes on the wire. A `stream` flag flipped, or a tools key that
     appears when there are no tools, changes the answer without changing

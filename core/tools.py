@@ -1191,6 +1191,32 @@ class ToolBelt:
     # clippy form `cargo clippy -- -Aclippy::pedantic`, whose split cluster
     # letters happen to include a c.
     _CARGO_EXEC_FLAGS = {'config'}
+    # `git branch` is the one "read" verb that WRITES BY DEFAULT: given a name and
+    # no listing flag it CREATES a branch, and it also renames (-m/-M), copies
+    # (-c/-C), force-moves (-f), rewrites .git/config (-u, -t, --set-upstream-to,
+    # --unset-upstream, --edit-description) and deletes. The gate refused only
+    # `-d`/`-D`/`--delete` by EXACT name, and git accepts any unique prefix of a
+    # long option — measured on git 2.43.0: `git branch --dele x` deleted the
+    # branch the gate exists to protect and `--mov` renamed one. A deny-list
+    # cannot win that race, so this is an ALLOW-list of the display flags, for
+    # the reason `_GIT_READ` and `_PACTL_OK` are lists of what is allowed.
+    _GIT_BRANCH_READ_LONG = frozenset({
+        'all', 'remotes', 'list', 'verbose', 'show-current', 'contains',
+        'no-contains', 'merged', 'no-merged', 'points-at', 'sort', 'format',
+        'ignore-case', 'column', 'no-column', 'color', 'no-color', 'abbrev',
+        'no-abbrev'})
+    _GIT_BRANCH_READ_SHORT = frozenset('arlvi')
+    # The flags that take the NEXT token as their value (`--contains HEAD`,
+    # `--sort committerdate`): that token is a value, not a branch name.
+    _GIT_BRANCH_VALUE_LONG = frozenset({
+        'contains', 'no-contains', 'merged', 'no-merged', 'points-at', 'sort',
+        'format'})
+    # What turns a bare argument from "create this branch" into "list branches
+    # matching this pattern". Measured, not assumed: `-v`, `-i`, `--sort=`,
+    # `--format=`, `--column`, `--color` and `--abbrev=` do NOT — `git branch -v
+    # x` creates `x` — so they are display flags and never enable a name.
+    _GIT_BRANCH_PATTERN_LONG = frozenset({'list', 'all', 'remotes'})
+    _GIT_BRANCH_PATTERN_SHORT = frozenset('lar')
     BLOCKED = ('sudo', 'rm', 'pacman', 'yay', 'paru', 'shutdown', 'poweroff', 'reboot', 'halt', 'mkfs', 'dd', 'kill', 'chmod', 'chown', 'mount', 'umount', 'curl', 'wget', 'bash', 'sh', 'zsh', 'fish', 'python', 'python3', 'pip', 'mv', 'cp', 'tar', 'zip', '7z', 'make', 'gcc', 'systemctl', 'journalctl', 'tee', 'xargs', 'env', 'eval', 'exec')
     # The bubble's own runtime stores. They are not source and not the user's
     # notes: `history.json` and `memory.json` are injected into EVERY future
@@ -1938,6 +1964,16 @@ class ToolBelt:
             # refusal: git_output_writes_a_file
             return (None, '', 'REFUSED: git is read-only here, and --output '
                     'writes a file wherever it is pointed', False)
+        if _unblocked == 'git' and verb == 'branch':
+            _bpos = next((i for i, _a in enumerate(argv[1:], 1)
+                          if not _a.startswith('-')), len(argv))
+            _why = self._git_branch_write(argv[_bpos + 1:])
+            if _why:
+                # refusal: git_branch_writes
+                return (None, '', f"REFUSED: git is read-only here, and {_why}. "
+                        "`git branch` only LISTS: git branch, -a, -r, -v, "
+                        "--show-current, --contains/--merged <commit>, and "
+                        "--list <pattern> for a name", False)
         # The blocked-word scan runs over EXECUTION positions only — the exe,
         # a launcher's program slot (`spawn curl`), and `=`-attached flag
         # values (`nvidia-smi --foo=sudo`) — never over the whole line.
@@ -2054,6 +2090,43 @@ class ToolBelt:
         if err:
             return (None, '', err, False)
         return (argv, exe_base, None, is_restart)
+
+    @classmethod
+    def _git_branch_write(cls, rest: list) -> str | None:
+        """Why these `git branch` arguments would CHANGE the repository, or None.
+
+        Every flag has to be a display flag, and a bare argument is a branch to
+        CREATE unless a listing flag (`-l`/`--list`, `-a`, `-r`) made it a
+        pattern or a flag before it consumed it as its value. Long flags are
+        matched by their whole name: git also accepts a unique PREFIX
+        (`--dele`, `--mov`), so an exact-name deny-list is one keystroke short
+        of a bypass, and a prefix simply is not on this list.
+        """
+        pattern_mode = False
+        want_value = False
+        names = 0
+        for tok in rest:
+            if want_value:
+                want_value = False
+                continue
+            if tok.startswith('--'):
+                name = tok[2:].split('=', 1)[0]
+                if name not in cls._GIT_BRANCH_READ_LONG:
+                    return f"'git branch --{name}' is not a listing flag"
+                pattern_mode = pattern_mode or name in cls._GIT_BRANCH_PATTERN_LONG
+                want_value = name in cls._GIT_BRANCH_VALUE_LONG and '=' not in tok
+            elif tok.startswith('-') and len(tok) > 1:
+                for letter in tok[1:]:
+                    if letter not in cls._GIT_BRANCH_READ_SHORT:
+                        return f"'git branch -{letter}' is not a listing flag"
+                    pattern_mode = (pattern_mode
+                                    or letter in cls._GIT_BRANCH_PATTERN_SHORT)
+            else:
+                names += 1
+        if names and not pattern_mode:
+            return ("'git branch <name>' CREATES a branch (a name is only a "
+                    "pattern after --list, -a or -r)")
+        return None
 
     def _validate_write_verb(self, argv: list, exe_base: str) -> str | None:
         """Why this whitelisted PROGRAM's arguments are a WRITE, or None.
@@ -2945,6 +3018,13 @@ class ToolBelt:
         callback = self._on_pomodoro
         if callback is None:
             return 'ERROR: pomodoro controller is unavailable'
+        if action != 'start':
+            # `stop` and `status` take no durations, and a model fills the
+            # unused fields with whatever it likes (0 is common). Range-checking
+            # them anyway refused "stop the pomodoro" with a complaint about
+            # minutes the stop never reads — so the one command that ends the
+            # timer was the one a sloppy call could not reach.
+            return callback(action, 25.0, 5.0)
         try:
             work_minutes = float(work_minutes)
             break_minutes = float(break_minutes)

@@ -348,6 +348,39 @@ class TestRemindersAndCalendar:
         for phrase in ("half", "in half", "in a half"):
             assert H._parse_duration(phrase) is None, phrase
 
+    def test_half_an_hour_is_thirty_minutes(self, H):
+        """"in half an hour" set a reminder for ONE hour: `an hour` was read on
+        its own and the fraction in front of it dropped. Same for "half a day"
+        (24 hours) and "quarter of an hour" (an hour) — each silently late by
+        two to four times, measured 2026-09-29."""
+        for phrase, want in [("in half an hour", 1800),
+                             ("half an hour", 1800),
+                             ("in half a day", 43200),
+                             ("in half a minute", 30),
+                             ("in half a week", 302400),
+                             ("in a quarter of an hour", 900),
+                             ("in quarter of an hour", 900),
+                             ("in three quarters of an hour", 2700),
+                             ("in half an hour and 10 minutes", 2400),
+                             # the idioms that already worked must not move
+                             ("in a half hour", 1800),
+                             ("in an hour and a half", 5400),
+                             ("in an hour", 3600)]:
+            assert H._parse_duration(phrase) == want, phrase
+
+    def test_a_number_no_unit_claimed_refuses_the_phrase(self, H):
+        """`findall` reports what it found and is silent about what it walked
+        past, so a phrase with a number left over was answered with the part
+        that parsed: "in 1:30 hours" came back as THIRTY hours, "in 1 hour 30"
+        as one hour. A wrong due time is worse than "could not understand"."""
+        for phrase in ("in 1:30 hours", "in 1 hour 30", "in 2 hours at 5",
+                       "in 2 days 09:30", "in 1.5.2 hours", "in 3 3 minutes"):
+            assert H._parse_duration(phrase) is None, phrase
+        # a stray WORD is harmless, and units still parse in every shape
+        assert H._parse_duration("in 5 minutes after the film") == 300
+        assert H._parse_duration("in 2 hours 5 minutes") == 7500
+        assert H._parse_duration("in 1h30m") == 5400
+
     def test_an_unattributable_half_is_refused_rather_than_guessed(self, H):
         """"an hour and a half and 20 minutes" names two units, and the half
         belongs to one of them. Charging it against the trailing 20 minutes
@@ -370,6 +403,11 @@ class TestCalendarICS:
         today = H.datetime.date.today()
         tmr = today + H.datetime.timedelta(days=1)
         d = lambda dt: dt.strftime("%Y%m%d")
+        tmr_noon_utc = H.datetime.datetime.combine(
+            tmr, H.datetime.time(12, 0)).astimezone(H.datetime.timezone.utc)
+        berlin_noon = H.datetime.datetime.combine(
+            today, H.datetime.time(12, 0)).astimezone().astimezone(
+                __import__("zoneinfo").ZoneInfo("Europe/Berlin"))
         return "\r\n".join([
             "BEGIN:VCALENDAR", "VERSION:2.0",
             # floating local 09:00 today, daily recurrence
@@ -385,16 +423,24 @@ class TestCalendarICS:
             f"DTEND:{d(today)}T143000",
             "SUMMARY:Folded long\r\n  title here",
             "END:VEVENT",
-            # TZID event today (time may shift if run outside Berlin; presence-only)
+            # TZID event today: LOCAL noon, spelled as the Berlin wall clock that
+            # instant has. A fixed 08:00 Berlin was yesterday for every machine
+            # west of about UTC-1 (the whole of the Americas), so the "presence
+            # only" claim this comment used to make held only where the author
+            # lives. What is under test is the TZID path, not the hour.
             "BEGIN:VEVENT",
-            f"DTSTART;TZID=Europe/Berlin:{d(today)}T080000",
-            f"DTEND;TZID=Europe/Berlin:{d(today)}T083000",
+            f"DTSTART;TZID=Europe/Berlin:{berlin_noon:%Y%m%dT%H%M%S}",
+            f"DTEND;TZID=Europe/Berlin:{berlin_noon + H.datetime.timedelta(minutes=30):%Y%m%dT%H%M%S}",
             "SUMMARY:TZ event",
             "END:VEVENT",
-            # tomorrow 18:30 UTC (Z form)
+            # tomorrow at LOCAL noon, written in the Z form. It used to be a
+            # fixed 18:30 UTC, which is the day after tomorrow for any machine
+            # east of about UTC+5:30 (India, China, Japan, Australia, New
+            # Zealand), so the multi-day test failed there for want of a
+            # timezone — the fixture's subject is the Z spelling, not the hour.
             "BEGIN:VEVENT",
-            f"DTSTART:{d(tmr)}T183000Z",
-            f"DTEND:{d(tmr)}T193000Z",
+            f"DTSTART:{tmr_noon_utc:%Y%m%dT%H%M%SZ}",
+            f"DTEND:{tmr_noon_utc + H.datetime.timedelta(hours=1):%Y%m%dT%H%M%SZ}",
             "SUMMARY:Gym with Max",
             "END:VEVENT",
             # all-day tomorrow
@@ -805,6 +851,224 @@ class TestICSMonthlyYearly:
                           "FREQ=DAILY;UNTIL=20260103T100000",
                           (2026, 1, 1), (2026, 1, 10))
         assert [e["start"].day for e in ev] == [1, 2, 3]
+
+
+class TestMonthlyAndYearlyRulesFollowTheRFC:
+    """Recurrence found by differential fuzzing against `dateutil.rrule`
+    (2026-09-29, 4000 random rules: 86 disagreements, none of them a rule the
+    suite above had a case for).
+
+    Every test here uses UTC ('Z') times and UTC windows, so the answer cannot
+    depend on the machine's zone — the rule's own semantics are the subject.
+    """
+
+    UTC = __import__("datetime").timezone.utc
+
+    def _text(self, dtstart, rrule):
+        return "\r\n".join([
+            "BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:rfc@test",
+            f"DTSTART:{dtstart}", f"DTEND:{dtstart[:8]}T235900Z",
+            "SUMMARY:Sync", f"RRULE:{rrule}", "END:VEVENT", "END:VCALENDAR"])
+
+    def _on(self, dtstart, rrule, y, m, d, days=1):
+        import datetime as dt
+        ws = dt.datetime(y, m, d, tzinfo=self.UTC)
+        ev = _core_calendar.ics_events_from_text(
+            self._text(dtstart, rrule), ws, ws + dt.timedelta(days=days))
+        return sorted(e["start"].astimezone(self.UTC).date().isoformat()
+                      for e in ev)
+
+    # -- the window ended before DTSTART's own day-of-month -------------------
+
+    def test_the_last_friday_is_found_on_the_last_friday(self):
+        """DTSTART is the first instance (Fri 30 Jan). February's instance is
+        the 27th — before the 30th that the loop used as its stand-in for the
+        month — so a window ending that day ended the search first and the
+        meeting read as "no events" on the day it happens."""
+        for day in ((2026, 2, 27), (2026, 3, 27), (2026, 4, 24), (2026, 5, 29)):
+            got = self._on("20260130T100000Z", "FREQ=MONTHLY;BYDAY=-1FR", *day)
+            assert got == ["%04d-%02d-%02d" % day], (day, got)
+
+    def test_a_first_and_fifteenth_rule_started_on_the_fifteenth(self):
+        assert self._on("20260115T090000Z", "FREQ=MONTHLY;BYMONTHDAY=1,15",
+                        2026, 3, 1) == ["2026-03-01"]
+        assert self._on("20260115T090000Z", "FREQ=MONTHLY;BYMONTHDAY=1,15",
+                        2026, 3, 2) == []
+
+    def test_every_single_day_window_agrees_with_a_day_by_day_oracle(self):
+        """The shape that hid this: ONE-day windows, at every distance from
+        DTSTART, for rules whose days are not DTSTART's day. DTSTART is the
+        rule's first instance, as producers write it."""
+        import calendar as _c
+        import datetime as dt
+
+        def last_day(d):
+            return _c.monthrange(d.year, d.month)[1]
+
+        rules = {
+            "BYMONTHDAY=1": lambda d: d.day == 1,
+            "BYMONTHDAY=1,15": lambda d: d.day in (1, 15),
+            "BYMONTHDAY=-1": lambda d: d.day == last_day(d),
+            "BYMONTHDAY=31": lambda d: d.day == 31,
+            "BYDAY=-1FR": lambda d: d.weekday() == 4 and d.day + 7 > last_day(d),
+            "BYDAY=1MO": lambda d: d.weekday() == 0 and d.day <= 7,
+            "BYDAY=2SA,4SA": lambda d: (d.weekday() == 5
+                                        and (d.day - 1) // 7 in (1, 3)),
+        }
+        span = 200
+        for earliest in (dt.date(2026, 1, 30), dt.date(2026, 1, 15)):
+            for rule, matches in rules.items():
+                first = next(d for d in (earliest + dt.timedelta(n)
+                                         for n in range(62)) if matches(d))
+                start = first.strftime("%Y%m%dT100000Z")
+                days = [first - dt.timedelta(days=2) + dt.timedelta(n)
+                        for n in range(span)]
+                got = {d for d in days
+                       if self._on(start, f"FREQ=MONTHLY;{rule}",
+                                   d.year, d.month, d.day)}
+                want = {d for d in days if d >= first and matches(d)}
+                assert got == want, (rule, first, sorted(got ^ want)[:6])
+
+    # -- COUNT counts instances, and instances start at DTSTART ---------------
+
+    def test_count_does_not_spend_itself_on_days_before_dtstart(self):
+        """DTSTART the 10th, BYMONTHDAY=1,15: January's 1st precedes DTSTART, so
+        it is not an instance and must not be counted — COUNT=3 is Jan 15,
+        Feb 1, Feb 15, not two."""
+        got = self._on("20260110T100000Z", "FREQ=MONTHLY;BYMONTHDAY=1,15;COUNT=3",
+                       2026, 1, 1, days=120)
+        assert got == ["2026-01-15", "2026-02-01", "2026-02-15"]
+
+    def test_count_survives_the_window_jump_over_the_first_month(self):
+        """The credit for months the window jump skips counted the first
+        month's pre-DTSTART candidates too, so a window far from DTSTART saw
+        the rule end early (or never) depending on the day of DTSTART."""
+        got = self._on("20260110T100000Z", "FREQ=MONTHLY;BYMONTHDAY=1,15;COUNT=6",
+                       2026, 3, 1, days=90)
+        # Jan 15, Feb 1, Feb 15, Mar 1, Mar 15, Apr 1 — six instances, so the
+        # window sees the last three (verified against dateutil.rrule).
+        assert got == ["2026-03-01", "2026-03-15", "2026-04-01"]
+
+    def test_yearly_count_ignores_the_months_before_dtstart(self):
+        got = self._on("20231202T040000Z", "FREQ=YEARLY;BYMONTH=4,11;COUNT=2",
+                       2023, 1, 1, days=1500)
+        assert got == ["2024-04-02", "2024-11-02"]
+
+    # -- a date the rule names twice is one instance --------------------------
+
+    def test_bymonthday_naming_one_day_twice_lists_it_once(self):
+        """February 2025 has 28 days, so -3 IS the 26th."""
+        got = self._on("20250126T100000Z", "FREQ=MONTHLY;BYMONTHDAY=26,-3",
+                       2025, 2, 1, days=28)
+        assert got == ["2025-02-26"]
+
+    def test_the_same_nth_weekday_twice_lists_it_once(self):
+        got = self._on("20260102T100000Z", "FREQ=MONTHLY;BYDAY=1FR,1FR",
+                       2026, 1, 1, days=31)
+        assert got == ["2026-01-02"]
+
+    def test_duplicates_do_not_eat_the_count(self):
+        got = self._on("20260102T100000Z", "FREQ=MONTHLY;BYDAY=1FR,1FR;COUNT=2",
+                       2026, 1, 1, days=90)
+        assert got == ["2026-01-02", "2026-02-06"]
+
+    # -- WEEKLY walks its days in calendar order ------------------------------
+
+    def test_weekly_count_is_spent_in_calendar_order(self):
+        """`BYDAY=FR,MO;COUNT=3` from a Monday is Mon, Fri, Mon — written order
+        spent the count on Friday first and ended on the wrong day."""
+        got = self._on("20260105T090000Z", "FREQ=WEEKLY;BYDAY=FR,MO;COUNT=3",
+                       2026, 1, 1, days=60)
+        assert got == ["2026-01-05", "2026-01-09", "2026-01-12"]
+
+    def test_weekly_bydays_named_twice_count_once(self):
+        got = self._on("20260105T090000Z", "FREQ=WEEKLY;BYDAY=MO,MO;COUNT=2",
+                       2026, 1, 1, days=60)
+        assert got == ["2026-01-05", "2026-01-12"]
+
+
+class TestRecurrenceKeepsTheWallClockAcrossDST:
+    """A floating time and an all-day date mean "on the reader's own wall
+    clock", and were expanded at the reader's UTC offset ON THAT DATE, frozen:
+    `naive.astimezone()` returns a fixed-offset tzinfo, not the machine's zone.
+    A weekly all-day event first entered in summer (`+02:00`) then sat at
+    `00:00+02:00` for ever, which after the clocks change is 23:00 on the
+    PREVIOUS day — Thursday's event announced on Wednesday, and not on Thursday.
+    A floating 21:45 meeting read 20:45. Found by differential fuzzing against
+    `recurring-ical-events` (2026-09-29; 16 of 800 random single-event files).
+
+    Every test pins the machine to the desk's zone (CET/CEST, DST ends
+    2026-10-25), because "the clocks changed" is the subject.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _on_the_desk_clock(self, desk_zone):
+        yield
+
+    @staticmethod
+    def _ics(*body):
+        return "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT",
+                            "UID:dst@test", "SUMMARY:Ev", *body,
+                            "END:VEVENT", "END:VCALENDAR"])
+
+    @staticmethod
+    def _local_day(text, y, m, d):
+        """The events `read_calendar` would find for ONE local day: it builds a
+        naive local-midnight window exactly like this."""
+        import datetime as dt
+        ws = dt.datetime(y, m, d)
+        return [(e["start"].strftime("%a %d %b %H:%M"), e["allday"])
+                for e in _core_calendar.ics_events_from_text(
+                    text, ws, ws + dt.timedelta(days=1))]
+
+    def test_a_weekly_all_day_event_stays_on_its_day_after_the_clocks_change(self):
+        weekly = self._ics("DTSTART;VALUE=DATE:20260604",       # a Thursday, CEST
+                           "DTEND;VALUE=DATE:20260605", "RRULE:FREQ=WEEKLY")
+        assert self._local_day(weekly, 2026, 12, 3) == [("Thu 03 Dec 00:00", True)]
+        assert self._local_day(weekly, 2026, 12, 2) == [], (
+            "announced the day BEFORE it happens")
+
+    def test_a_floating_time_keeps_its_clock_time_across_the_change(self):
+        floating = self._ics("DTSTART:20260604T214500", "DTEND:20260604T224500",
+                             "RRULE:FREQ=WEEKLY")
+        assert self._local_day(floating, 2026, 12, 3) == [("Thu 03 Dec 21:45", False)]
+
+    def test_it_holds_the_other_way_round_into_summer(self):
+        winter = self._ics("DTSTART:20260115T094500", "DTEND:20260115T104500",
+                           "RRULE:FREQ=DAILY;INTERVAL=3")
+        # 2026-07-01 is 167 days after 2026-01-15, and 167 = 3 * 55 + 2: not an
+        # instance; 2026-07-02 (168 = 3 * 56) is.
+        assert self._local_day(winter, 2026, 7, 1) == []
+        assert self._local_day(winter, 2026, 7, 2) == [("Thu 02 Jul 09:45", False)]
+
+    def test_a_monthly_all_day_event_crosses_the_change(self):
+        monthly = self._ics("DTSTART;VALUE=DATE:20260615",
+                            "DTEND;VALUE=DATE:20260616", "RRULE:FREQ=MONTHLY")
+        assert self._local_day(monthly, 2026, 12, 15) == [("Tue 15 Dec 00:00", True)]
+        assert self._local_day(monthly, 2026, 12, 14) == []
+
+    def test_a_date_the_platform_cannot_place_is_garbage_not_a_crash(self):
+        """The zone is asked for its offset lazily, so an unplaceable date has
+        to be refused where it is parsed, exactly as the fixed-offset version
+        refused it there."""
+        for value in ("DTSTART:00010101T000000", "DTSTART;VALUE=DATE:00010101",
+                      "DTSTART:99991231T235959", "DTSTART;VALUE=DATE:99991231"):
+            assert _core_calendar._ics_parse_dt(value) is None, value
+
+    def test_a_daily_window_opening_on_an_instance_after_dst_still_has_it(self):
+        """The DAILY jump was the one frequency without a step of slack. It is
+        computed from ELAPSED time while instance i is i WALL-CLOCK days after
+        DTSTART, and after Sydney's clocks went back the two differ by an hour:
+        a window opening exactly on the 08:00 instance was jumped past it."""
+        import datetime as dt
+        text = self._ics("DTSTART;TZID=Australia/Sydney:20251124T080000",
+                         "DTEND;TZID=Australia/Sydney:20251124T083000",
+                         "RRULE:FREQ=DAILY")
+        ws = dt.datetime(2026, 5, 5, 22, 0, tzinfo=dt.timezone.utc)   # 08:00 AEST
+        ev = _core_calendar.ics_events_from_text(text, ws,
+                                                 ws + dt.timedelta(hours=1))
+        assert [e["start"].astimezone(dt.timezone.utc).isoformat()
+                for e in ev] == ["2026-05-05T22:00:00+00:00"]
 
 
 class TestICSDailyOldEvent:

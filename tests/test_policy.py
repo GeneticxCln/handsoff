@@ -2595,6 +2595,7 @@ class TestCommandPolicyRefusalReachability(_ReachabilityWalk):
         ("ps_environment_modifier", "ps e -p 1", None),
         ("git_branch_delete", "git branch -d main", None),
         ("git_output_writes_a_file", "git log --output=/tmp/x", None),
+        ("git_branch_writes", "git branch newbranch", None),
         # -- restart: the three refusals that share one identity rule
         ("self_restart_disabled", "handsoff-restart", "_restart_disabled"),
         ("restart_script_missing", "@missing", "_restart_missing"),
@@ -4153,6 +4154,125 @@ class TestSecretPathGuard:
                         "git diff", "git status"):
             argv, _, err, _ = belt._validate_command(command)
             assert err is None and argv, (command, err)
+
+
+    # `git branch` writes by default: a bare name CREATES a branch, and the
+    # gate's only branch rule was an exact-name refusal of -d/-D/--delete, so
+    # everything below was accepted (verified against git 2.43.0 on 2026-09-29,
+    # in a scratch repository, not by reading the man page).
+    BRANCH_WRITES = (
+        "git branch newbranch", "git branch -v newbranch", "git branch -vv x",
+        "git branch -i x", "git branch --sort=-committerdate x",
+        "git branch --format=%(refname) x", "git branch --column x",
+        "git branch --color x", "git branch --abbrev=7 x",
+        "git branch -m main renamed", "git branch -M main renamed",
+        "git branch --move a b", "git branch -c a b", "git branch -C a b",
+        "git branch --copy a b", "git branch -f other HEAD~1",
+        "git branch --force other HEAD~1", "git branch -u origin/main",
+        "git branch --set-upstream-to=origin/evil", "git branch --unset-upstream",
+        "git branch --edit-description", "git branch -t x origin/y",
+        "git branch --track x origin/y", "git branch --no-track x",
+        "git branch --create-reflog x", "git branch -q x",
+        "git branch --contains HEAD x", "git branch -- x",
+    )
+
+    def test_git_branch_cannot_create_rename_copy_or_reconfigure(self, tb):
+        belt, _ = tb
+        for command in self.BRANCH_WRITES:
+            argv, _, err, _ = belt._validate_command(command)
+            assert argv is None and "REFUSED" in err, (command, err)
+            assert "read-only" in err, (command, err)
+
+    def test_git_accepts_a_unique_prefix_of_a_long_flag_so_prefixes_are_refused(
+            self, tb):
+        """`git branch --dele x` DELETES branch x, and `--mov` renames one: git
+        matches any unique prefix of a long option. The delete refusal compared
+        whole names, so the prefix walked past the very guard
+        `test_git_branch_delete_refused` pins. A prefix is not on the allow-list
+        of listing flags, whatever it abbreviates."""
+        belt, _ = tb
+        for command in ("git branch --dele x", "git branch --del x",
+                        "git branch --d x", "git branch --mov a b",
+                        "git branch --forc x", "git branch --cop a b",
+                        "git branch --set-up x", "git branch --edit x"):
+            argv, _, err, _ = belt._validate_command(command)
+            assert argv is None and "REFUSED" in err, (command, err)
+
+    def test_the_listing_forms_of_git_branch_stay_allowed(self, tb):
+        belt, _ = tb
+        for command in ("git branch", "git branch -a", "git branch -r",
+                        "git branch -l", "git branch -vv", "git branch -avv",
+                        "git branch --list", "git branch --list 'feat*'",
+                        "git branch -a --list 'origin/*'", "git branch -l a b",
+                        "git branch --show-current", "git branch --contains HEAD",
+                        "git branch --contains", "git branch --merged main",
+                        "git branch --no-merged main", "git branch --points-at HEAD",
+                        "git branch --sort=-committerdate",
+                        "git branch --sort committerdate",
+                        "git branch --format=%(refname)", "git branch -vv --contains HEAD",
+                        "git branch --color=always", "git branch --abbrev=7 -v",
+                        "git --no-pager branch -a"):
+            argv, _, err, _ = belt._validate_command(command)
+            assert err is None and argv, (command, err)
+
+    @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+    def test_whatever_git_branch_the_gate_accepts_leaves_the_repository_alone(
+            self, tb, tmp_path):
+        """The gate's claim is about git, so git is the judge: every shape the
+        validator accepts is RUN in a scratch repository, and the refs, HEAD and
+        config must be byte-identical afterwards. The shapes are the writes
+        above, their abbreviations, and the listing forms, so a listing flag
+        that quietly stops being one (a name after `-v` looks like a filter and
+        is a create) fails here rather than in a user's repository."""
+        belt, _ = tb
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null",
+               "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_AUTHOR_NAME": "a",
+               "GIT_AUTHOR_EMAIL": "a@example.invalid", "GIT_COMMITTER_NAME": "a",
+               "GIT_COMMITTER_EMAIL": "a@example.invalid", "GIT_EDITOR": "true",
+               "GIT_TERMINAL_PROMPT": "0"}
+        for name in [n for n in env if n.startswith(("GIT_CONFIG_KEY_",
+                                                     "GIT_CONFIG_VALUE_"))]:
+            del env[name]
+        env.pop("GIT_CONFIG_COUNT", None)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(repo), *args], env=env,
+                                  capture_output=True, text=True, timeout=30,
+                                  stdin=subprocess.DEVNULL, check=False)
+
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "one")
+        git("commit", "-q", "--allow-empty", "-m", "two")
+        git("branch", "other")
+
+        def state():
+            return (git("for-each-ref", "--format=%(refname) %(objectname)").stdout,
+                    (repo / ".git" / "config").read_text(),
+                    (repo / ".git" / "HEAD").read_text())
+
+        shapes = (list(self.BRANCH_WRITES)
+                  + ["git branch --dele other", "git branch --mov other x",
+                     "git branch --del other", "git branch", "git branch -a",
+                     "git branch -v", "git branch -vv", "git branch --list o*",
+                     "git branch -l other", "git branch -a other",
+                     "git branch -r x", "git branch --show-current",
+                     "git branch --contains HEAD", "git branch --contains other",
+                     "git branch --merged other", "git branch --no-merged other",
+                     "git branch --points-at HEAD", "git branch --sort=refname",
+                     "git branch --sort refname", "git branch --format=%(refname)",
+                     "git branch --column", "git branch --color=never"])
+        accepted = 0
+        for command in shapes:
+            argv, _, err, _ = belt._validate_command(command)
+            if argv is None:
+                continue
+            accepted += 1
+            before = state()
+            git(*argv[1:])
+            assert state() == before, f"the gate accepted a WRITE: {command}"
+        assert accepted >= 10, "the guard must not pass by accepting nothing"
 
 
 class TestProcEnvLeakVectors:
