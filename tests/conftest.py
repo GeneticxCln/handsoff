@@ -373,6 +373,17 @@ GIT_PLUMBING = ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_PREFIX",
                 "GIT_TERMINAL_PROMPT", "GIT_EXTERNAL_DIFF", "GIT_NAMESPACE",
                 "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
 
+#: The families git names by PREFIX, because the rest of the name is a number or
+#: a transport knob no list can enumerate. `GIT_CONFIG_COUNT` is in the list
+#: above and is what makes git read `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`
+#: at all, but dropping the count and keeping the pairs leaves a config
+#: injection one stray export from live again — and a proxied runner exports
+#: exactly these (the pairs, plus `GIT_SSL_CAINFO` for its TLS trust root).
+#: A scratch repository the harness builds talks to no server, so none of the
+#: transport settings can be for it. Found by the probe-hook guard in
+#: `test_ci_clean_checkout`, which failed on such a machine.
+GIT_PLUMBING_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_SSL_")
+
 
 def sandbox_env(home=None) -> dict:
     """A child-process environment whose user dirs are a throw-away directory.
@@ -394,6 +405,8 @@ def sandbox_env(home=None) -> dict:
     # rather than passed on (found by committing, not by reading).
     for name in GIT_PLUMBING:
         env.pop(name, None)
+    for name in [n for n in env if n.startswith(GIT_PLUMBING_PREFIXES)]:
+        del env[name]
     if home is None:
         # Auto-created homes are registered for the process-exit sweep like
         # isolated_user_dirs() does — an unregistered mkdtemp leaked a /tmp
@@ -885,6 +898,37 @@ def _restore_state(H, snap: dict) -> None:
             obj[:] = value
         else:
             setattr(H, name, value)
+
+
+#: The zone the suite's timestamps were written in, as a POSIX rule: glibc reads
+#: it with no tzdata installed (a slim CI image has none), where an unknown zone
+#: NAME silently means UTC — which is precisely the failure being prevented.
+DESK_ZONE = "CET-1CEST,M3.5.0,M10.5.0/3"
+
+
+@pytest.fixture()
+def desk_zone():
+    """Put the machine on the desk's clock (CET/CEST) for one test.
+
+    Several tests carry wall-clock stamps and offsets written where the author
+    lives, and pass only on a machine in the same zone — the five journal tests
+    failed on every UTC runner (GitHub's) for exactly that. A test that means
+    "the clocks change" or "the journal prints local time" pins the zone it is
+    about instead of inheriting the runner's. The machine's own zone is put
+    back afterwards, `time.tzset` last (it re-reads the environment).
+    """
+    sentinel = object()
+    old = os.environ.get("TZ", sentinel)
+    os.environ["TZ"] = DESK_ZONE
+    time.tzset()
+    try:
+        yield DESK_ZONE
+    finally:
+        if old is sentinel:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
 
 
 @pytest.fixture(autouse=True)
