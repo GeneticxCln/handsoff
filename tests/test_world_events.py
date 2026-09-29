@@ -20,6 +20,17 @@ _core_tools = core_module("tools")
 HERE = ROOT   # the repo root
 
 
+@pytest.fixture(autouse=True)
+def _web_access_on(H, monkeypatch):
+    """The world feature fetches by design, and the shipped default for the
+    web_access permission is OFF (correctly — the direct-call gate tests below
+    pin that). Every test in this file that is not about the gate grants the
+    permission explicitly, the way a user who enabled world warnings has."""
+    perms = dict(H.SETTINGS.get("permissions") or {})
+    perms["web_access"] = True
+    monkeypatch.setitem(H.SETTINGS, "permissions", perms)
+
+
 def _ddg_page(items):
     """Fake lite-DDG HTML: [(title, snippet)] with HTML junk to strip."""
     rows = []
@@ -215,6 +226,7 @@ def _ticker(H, monkeypatch, state="idle"):
     monkeypatch.setitem(H.SETTINGS, "home_place", "")
     a = H.Assistant.__new__(H.Assistant)
     a._world_last_announce = 0.0
+    a._world_last_poll = 0.0            # never polled: the first tick may fetch
     a._state = state
     said, popped = [], []
     a._announce_now = said.append
@@ -255,6 +267,7 @@ class TestProactive:
         monkeypatch.setitem(H.SETTINGS, "world_warnings", False)
         a = H.Assistant.__new__(H.Assistant)
         a._world_last_announce = 0.0
+        a._world_last_poll = 0.0
         a._state = "idle"
         a._announce_now = lambda t: (_ for _ in ()).throw(AssertionError())
         a._world_tick()  # must return before any fetch/announce
@@ -286,8 +299,10 @@ class TestProactive:
         assert "earthquake" in said[0]
         assert H._world_seen(H._world_norm_key(
             "Major earthquake strikes coast")) is True
-        # repeat tick: seen store suppresses the second announcement
+        # repeat tick: seen store suppresses the second announcement (the
+        # poll cadence is reset too — the point here is the seen store)
         a._world_last_announce = 0.0
+        a._world_last_poll = 0.0
         a._world_tick()
         assert len(said) == 1 and len(popped) == 1
 
@@ -313,3 +328,46 @@ class TestTool:
         out, _ = belt.execute("world_events", {"count": 0})
         assert len([ln for ln in out.splitlines()
                     if ln.startswith("- ")]) == 1
+
+
+class TestThePollCadenceAndTheGate:
+    """Two 2026-09-28 audit fixes: the poll has its own cadence (the announce
+    cooldown cools the ANNOUNCEMENT, and keying the fetch on it alone sent
+    the fixed queries out on every ten-second health tick), and the direct
+    _world_events call — briefing and tick, not the tool — rides the same
+    web_access permission the belt checks."""
+
+    def test_the_poll_does_not_repeat_inside_its_window(
+            self, H, net, seenfile, monkeypatch):
+        a, said, popped = _ticker(H, monkeypatch)
+        calls = []
+        orig = H._http_get
+        monkeypatch.setattr(
+            H, "_http_get",
+            lambda *a_, **k: calls.append(1) or orig(*a_, **k))
+        a._world_tick()          # first tick: fetches
+        assert calls, "the first poll must fetch"
+        for _ in range(5):
+            a._world_tick()      # still inside WORLD_POLL_S: quiet
+        assert len(calls) == 1, calls
+
+    def test_a_poll_makes_no_request_when_web_access_is_off(
+            self, H, net, seenfile, monkeypatch):
+        monkeypatch.setitem(H.SETTINGS, "world_warnings", True)
+        monkeypatch.setitem(
+            H.SETTINGS, "permissions", {"web_access": False})
+        calls = []
+        monkeypatch.setattr(
+            H, "_http_get", lambda *a_, **k: calls.append(1) or (_ for _ in ()).throw(AssertionError()))
+        a, said, popped = _ticker(H, monkeypatch)
+        monkeypatch.setitem(H.SETTINGS, "world_warnings", True)
+        monkeypatch.setitem(H.SETTINGS, "permissions", {"web_access": False})
+        a._world_tick()
+        assert calls == [] and said == [] and popped == []
+
+    def test_the_briefing_path_respects_the_same_gate(self, H, net, seenfile, monkeypatch):
+        monkeypatch.setitem(
+            H.SETTINGS, "permissions", {"web_access": False})
+        events, degraded = H._world_events("all", 5)
+        assert (events, degraded) == ([], False), \
+            "permission off is quiet-and-healthy, not a degraded backend"

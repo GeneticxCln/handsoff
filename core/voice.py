@@ -15,7 +15,21 @@ hooks, and the host documents why they stay with it.
 """
 from __future__ import annotations
 
+import logging
 import re
+
+# Same logger name as the other core modules: a mic teardown that gave up on
+# the lock has to land in handsoff.log beside everything else.
+log = logging.getLogger("handsoff")
+
+#: How long a stream start/stop may wait for the mic-operation lock before it
+#: gives up with a named failure instead of blocking forever. The lock's owner
+#: thread keeps it for as long as its native PortAudio call takes, and a
+#: permanently wedged stream.stop() used to hold it FOREVER — every later PTT
+#: press then leaked a thread blocked on acquire, and the hands-free silence
+#: watchdog blocked its own capture thread. One bounded wait turns "wedged
+#: forever" into one warning and a live caller.
+MIC_LOCK_TIMEOUT_S = 3.0
 
 
 # ---------------------------------------------------------------- speech gate
@@ -224,7 +238,11 @@ class WakeSpotter:
         self._get_model = model      # host's loader (late-read, test-patchable)
         self._log = log
         self._buf: list = []         # pre-roll ring as a list of frames
-        self._max_pre = int(self.PREROLL_S * sample_rate // frame)
+        # At least one frame: a degenerate window (a frame longer than the
+        # whole pre-roll) computes to 0, and `del self._buf[:-0]` deletes
+        # NOTHING — the ring would grow one frame per feed for as long as the
+        # process listens.
+        self._max_pre = max(1, int(self.PREROLL_S * sample_rate // frame))
         self._speech: list = []      # chunks collected after a hit
         self._armed = False          # a hit is pending collection
         self._collected = 0.0        # seconds of audio since the hit
@@ -408,11 +426,24 @@ def mic_device_to_open(configured, audio, log) -> tuple:
     return device, False
 
 
-def stop_stream_owned(stream, mic_lock) -> None:
-    """Run stream teardown under the same owner as InputStream construction."""
+def stop_stream_owned(stream, mic_lock, timeout_s: float = MIC_LOCK_TIMEOUT_S) -> None:
+    """Run stream teardown under the same owner as InputStream construction.
+
+    Bounded: the lock's owner may be wedged INSIDE a native stream.stop() (the
+    exact case the bounded PTT stop exists for), and waiting forever for it
+    leaks a thread per press and stalls the hands-free watchdog. On timeout
+    the stream is left untouched — PortAudio is process-global and this thread
+    is not the owner — the caller drops its reference, and the wedge is named
+    in the journal rather than hung on."""
     if stream is None:
         return
-    mic_lock.acquire()
+    if not mic_lock.acquire(timeout=timeout_s):
+        log.warning(
+            "mic operation lock still held after %.1fs — a stream stop is "
+            "wedged; abandoning this teardown without touching the stream "
+            "(the owner thread keeps the lock until its native call returns)",
+            timeout_s)
+        return
     try:
         stream.stop()
         stream.close()
@@ -420,8 +451,20 @@ def stop_stream_owned(stream, mic_lock) -> None:
         mic_lock.release()
 
 
-def start_stream_owned(stream, mic_lock) -> None:
-    mic_lock.acquire()
+def start_stream_owned(stream, mic_lock,
+                       timeout_s: float = MIC_LOCK_TIMEOUT_S) -> None:
+    """Start a stream under the same owner, bounded like `stop_stream_owned`.
+
+    A wedged teardown holding the lock used to block the hands-free reopen
+    forever — its own capture thread hung on this acquire. On timeout the
+    stream is left NOT started: the listener's stall watchdog reopens it on
+    its own schedule, and the wedge is named in the journal."""
+    if not mic_lock.acquire(timeout=timeout_s):
+        log.warning(
+            "mic operation lock still held after %.1fs — a stream stop is "
+            "wedged; refusing to start another stream on top of it",
+            timeout_s)
+        return
     try:
         stream.start()
     finally:

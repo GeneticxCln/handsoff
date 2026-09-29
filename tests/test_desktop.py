@@ -278,13 +278,32 @@ class TestYdotooldSocket:
         assert calls == [("key", "125:1", "20:1", "20:0", "125:0")]
 
     def test_press_hotkey_no_terminal_guard_for_super(self, belt, monkeypatch):
-        """Super-chords are intercepted by the compositor, never seen by the
-        app — so they stay allowed even when a terminal is focused."""
+        """Super-chords the COMPOSITOR intercepts stay allowed in a terminal.
+
+        The gate is skipped only on evidence: niri's own config binds this
+        chord, so it never reaches the app. Without that evidence the guard
+        holds — an unreadable config cannot be read as "niri will intercept
+        it" (see TestSuperBindingKnown::test_unreadable_config_refuses), so
+        the chord is treated as one that WOULD reach the shell.
+        """
         monkeypatch.setattr(belt.__class__, "_focused_window_info",
                             lambda self: {"app_id": "foot", "title": "foot"})
         monkeypatch.setattr(belt.__class__, "_ydotool", lambda self, *a: "ok")
+        monkeypatch.setattr(belt.__class__, "_super_binding_known",
+                            staticmethod(lambda combo: True))
         out, err = belt.execute("press_hotkey", {"combo": "Mod+E"})
         assert not err and out == "ok"
+
+    def test_press_hotkey_terminal_guard_when_the_chord_is_not_bound(
+            self, belt, monkeypatch):
+        """No evidence niri swallows it: the guard holds, in a terminal."""
+        monkeypatch.setattr(belt.__class__, "_focused_window_info",
+                            lambda self: {"app_id": "foot", "title": "foot"})
+        monkeypatch.setattr(belt.__class__, "_ydotool", lambda self, *a: "ok")
+        monkeypatch.setattr(belt.__class__, "_super_binding_known",
+                            staticmethod(lambda combo: False))
+        out, err = belt.execute("press_hotkey", {"combo": "Mod+E"})
+        assert err and "terminal" in out, out
 
     def test_press_hotkey_terminal_guard_without_super(self, belt, monkeypatch):
         """No-Super chords reach the focused app: blocked in terminals."""
@@ -1550,15 +1569,28 @@ class TestSuperBindingKnown:
         self._write_cfg(niri_home, '// binds { Mod+T { spawn "x"; } }\n')
         assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
 
-    def test_unreadable_config_allows(self, monkeypatch, tmp_path):
-        """Legacy allow: no config (or unreadable) must NOT block hotkeys."""
+    def test_unreadable_config_refuses(self, monkeypatch, tmp_path):
+        """No config is UNREADABLE, and unreadable is FAIL-CLOSED.
+
+        The old legacy allow answered True for a missing config.kdl, and the
+        caller reads True as "niri intercepts this chord, skip the terminal
+        gate". An unreadable config is precisely the case where we cannot show
+        the compositor intercepts anything — so the guard has to stay on. A
+        chord niri does not intercept reaches the focused app, and a shell
+        under a Super+E is the exact thing the gate exists to prevent.
+        """
         base = tmp_path / ".config" / "niri"
         base.mkdir(parents=True)                      # dir exists, no config.kdl
         var = contextvars.ContextVar("tools_deps_test")
         var.set(None)                    # mimic "no host": _dep() → _DEFAULT_DEPS
         monkeypatch.setattr(_core_tools, "_CURRENT", var)
         monkeypatch.setattr(_core_tools._DEFAULT_DEPS, "HOME", tmp_path)
-        assert _core_tools.ToolBelt._super_binding_known("mod+t") is True
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
+        # A config that EXISTS but is not readable (a directory where the file
+        # belongs) reads the same way: unreadable is not "bound".
+        bad = base / "config.kdl"
+        bad.mkdir()
+        assert _core_tools.ToolBelt._super_binding_known("mod+t") is False
 
     def test_a_prefix_of_a_bound_chord_is_not_the_binding(self, niri_home):
         """Substring matching made `mod+e` "known" whenever any longer chord

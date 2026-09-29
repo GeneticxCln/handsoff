@@ -10,6 +10,7 @@ import io
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -1645,7 +1646,11 @@ class TestBubbleMenuHoldGuard:
 
         class Event:
             def button(self):
-                return H.Qt.RightButton
+                # From PySide6 directly: the app module no longer re-exports
+                # Qt (the F401 waiver's premise was measured false), and a
+                # test must not be the one thing keeping a dead import alive.
+                from PySide6.QtCore import Qt
+                return Qt.RightButton
 
             def globalPosition(self):
                 return types.SimpleNamespace(toPoint=lambda: None)
@@ -1900,8 +1905,17 @@ class TestStreamingChat:
                     if text:
                         said.append(text)
                     return
+                # queue.Empty is TERMINAL here, not retried: the producer
+                # (the real stream thread) is done by the time this consumer
+                # runs, so a bounded drain — never an unbounded wait — is the
+                # contract. The flaky 2s-timeout retry used to surface as a
+                # spurious failure whenever the machine hiccupped between the
+                # producer's last put and this consumer's first get.
                 while True:
-                    item = sentence_q.get(timeout=2)
+                    try:
+                        item = sentence_q.get(timeout=2)
+                    except queue.Empty:
+                        return          # producer ended; drain complete
                     if item is None:
                         return
                     said.append(item)
@@ -1916,7 +1930,13 @@ class TestStreamingChat:
             assert said == ["One.", "Two.", "Three."], said
             assert asst._hardware_note == ""      # consumed once, not persisted
             users = [m for m in asst._history if m.get("role") == "user"]
-            assert users and users[-1]["content"] == "what is my name", users
+            assert users, users
+            # The utterance rides a `[local time HH:MM] ` prefix: a clock in
+            # message 0 invalidated the whole KV-cached prefix every minute.
+            # Matched by shape rather than equality so the test cannot fail
+            # when the minute rolls over between the turn and this assertion.
+            assert re.fullmatch(r"\[local time \d{2}:\d{2}\] what is my name",
+                                users[-1]["content"]), users[-1]["content"]
             assert "Facts you remember" not in users[-1]["content"]
             assert not any("hardware note" in str(m.get("content", ""))
                            for m in asst._history)

@@ -561,6 +561,14 @@ class TestShellDiscovery:
         (tree / "ci").mkdir(parents=True)
         shutil.copy2(HERE / "ci" / "gates.sh", tree / "ci" / "gates.sh")
         shutil.copy2(HERE / "install.sh", tree / "install.sh")
+        # The pin checks REFUSE to run against a missing workflow file (a
+        # guard over nothing is how the pin checks used to evaporate), so the
+        # fixture carries the real ones: without them the gate now fails
+        # before the bash -n loop this test is about is even reached.
+        (tree / ".github" / "workflows").mkdir(parents=True)
+        shutil.copy2(HERE / ".github" / "workflows" / "ci.yml",
+                     tree / ".github" / "workflows" / "ci.yml")
+        shutil.copy2(HERE / ".gitlab-ci.yml", tree / ".gitlab-ci.yml")
         venv = tree / ".venv"
         (venv / "bin").mkdir(parents=True)
         (venv / "bin" / "evil.sh").write_text("#!/usr/bin/env bash\n",

@@ -196,6 +196,8 @@ def drive(H, monkeypatch, opener, *, streaming=True, tts_exc=None,
     a._tools = Belt()
     a._gen = 1
     a._history = []
+    a._history_lock = threading.Lock()
+    a._history_epoch = 0
     a._turn_spoke = False
     a._turn_injected = ""
     a._models_ready = threading.Event()

@@ -23,17 +23,20 @@
 # Each of those three was a larger diff than the defects it would have found.
 # Revisit them when the tree is smaller, not before.
 #
-# F401 on handsoff.py: it re-exposes PySide6's painting classes so
-# `core/bubble.py`, `core/theme.py` and the tests reach them through the app
-# module (78+ references). Ruff cannot see that indirection; deleting the
-# imports would break the app rather than tidy it.
-#
 # E402 on the two files that import late ON PURPOSE, and it is architecture
 # rather than untidiness: the app module is assembled in stages (constants, then
 # the dependency-injection defaults, then the core package loaded by name so a
 # missing module is a loud ImportError), and `core/tools.py` installs its
 # subprocess seam after the imports it proxies. Hoisting any of these changes
 # what exists when the next line runs.
+#
+# F401 once carried a per-file waiver for handsoff.py, minted on the claim that
+# core/bubble.py, core/theme.py and the tests reached Qt "through the app module
+# (78+ references)". Measured 2026-09-28: ZERO such references — bubble imports
+# PySide6 directly, theme is Qt-free by design, no test reads a Qt name off the
+# app module, and 17 of the 21 PySide6 imports were used by nothing but their
+# own import line. The waiver was deleted along with the dead imports; F401 now
+# runs on the whole production tree.
 
 target-version = "py312"
 
@@ -41,5 +44,5 @@ target-version = "py312"
 select = ["E4", "E7", "E9", "F", "B", "PLE"]
 
 [lint.per-file-ignores]
-"handsoff.py" = ["E402", "F401"]
+"handsoff.py" = ["E402"]
 "core/tools.py" = ["E402"]

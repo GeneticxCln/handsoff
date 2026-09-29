@@ -15,6 +15,11 @@
 # What is mirrored is what the gates CHECK — same suites, same python versions,
 # same order seed, same coverage floor, same junit report and same failure digest
 # — while the runner underneath is the desk's instead of a frozen Debian image.
+# Local-only BY DESIGN, absent here and in GH: `clean-checkout` (it lays HEAD
+# down in a scratch tree to test the committed tree — on a CI checkout that is
+# the tree already, so it would test nothing) and `two-writer` (it needs the
+# developer's real desktop to race two processes against). The suite itself
+# still runs both gate's test files as part of `tests/`.
 # `suite:hosted` is the frozen-image reference for when the question is whether
 # the desk and the image agree: manual, because it spends minutes; allowed to
 # fail, because it never gates a merge; and defined ONLY for pipelines started
@@ -502,3 +507,60 @@ smoke:
     - out=$(bash install.sh --help)
     - echo "$out" | grep -q "Options:"
     - echo "$out" | grep -q -- "--uninstall"
+
+# --- Fresh-checkout freshness guard (ci/gates.sh `clean-checkout`) ----------
+# The freshness guard reads the plan, the key census and the spec citations out
+# of FILES. In this shared checkout it can see work that is not committed, so
+# the one tree nobody ever looks at — the COMMITTED one — is the one this job
+# looks at: a worktree of HEAD runs tests/test_specs_freshness.py alone. Found
+# live: bd9cf5a was green here and had THREE red guards in a clean checkout.
+clean-checkout:
+  stage: static
+  tags:
+    - desk
+  variables:
+    PY_VERSION: "3.12"
+  # The guard imports the app module (it builds the census from the real
+  # collector), so it needs the same runtime libraries every suite job gets.
+  <<: *shared
+  script:
+    - *desk_python
+    - *qt_deps
+    - pip install pytest
+    - |
+      dir=$(mktemp -d -t handsoff-clean-XXXXXX)
+      tree="$dir/tree"
+      git worktree add --detach --quiet "$tree" HEAD
+      rc=0
+      (cd "$tree" && QT_QPA_PLATFORM=offscreen python -m pytest \
+        tests/test_specs_freshness.py -q) || rc=1
+      git worktree remove --force "$tree" || true
+      rm -rf "$dir"
+      git worktree prune
+      [ "$rc" = 0 ] || exit 1
+
+# --- Concurrent-writer probe (ci/gates.sh `two-writer`) ---------------------
+# Compares this tree's fingerprint against the baseline the suite legs laid
+# down (`ci/worktree_stamp.py`), so a write that landed DURING a pipeline —
+# after the tests graded one tree and before the artifacts were uploaded — is
+# named instead of silently folded into a green verdict. The local gate runs
+# it with --since for placement; a pipeline has no checkpoint chain, so the
+# comparison is against the run's own start: GitLab supplies it as an env
+# default the shell expands before python sees it.
+two-writer:
+  stage: smoke
+  tags:
+    - desk
+  variables:
+    PY_VERSION: "3.12"
+  script:
+    - *desk_python
+    - python ci/worktree_stamp.py --root "$CI_PROJECT_DIR" \
+        --compare "$CI_PROJECT_DIR/.two-writer-baseline.json"
+  # The baseline is captured by a before_script in the SAME job rather than
+  # trusted from the suite legs: the pipeline is the writer window, not any
+  # one job.
+  before_script:
+    - *desk_python
+    - python ci/worktree_stamp.py --root "$CI_PROJECT_DIR" \
+        --save "$CI_PROJECT_DIR/.two-writer-baseline.json"

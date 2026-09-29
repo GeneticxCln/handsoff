@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Callable, MutableMapping
@@ -53,6 +54,56 @@ def strip_thinking(text: str) -> str:
     value = re.sub(r"^\s*\[TOOL_CALLS\][^\n]*(?:\n|$)", "", value,
                    flags=re.MULTILINE)
     return value.strip()
+
+
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _speech_fragment(fragment: str, in_think: bool) -> tuple[str, bool]:
+    """(speech, still-in-think) for one fragment of a streamed reply.
+
+    `strip_thinking` is stateless, and a STREAM arrives as fragments that have
+    nothing to do with think blocks: the opener and its closer land in
+    DIFFERENT fragments (the splitter cuts at sentence ends, and the reasoning
+    between them holds several), so the per-fragment strip saw no markup at
+    all in the later ones and let the reasoning through — 'so the answer is
+    5</think>The answer is 5.' was spoken verbatim (measured 2026-09-28). The
+    state crosses fragments instead: a fragment carrying '<think>' without
+    '</think>' opens thinking, everything through the fragment holding
+    '</think>' is dropped, and only the words after that closer are speech.
+    The whole reply's own `strip_thinking` (blocking output, the turn's
+    recorded content) is unchanged.
+
+    A fragment boundary sits just after a sentence terminator, and neither tag
+    holds one, so a tag can never be split ACROSS two fragments — a partial
+    tag is still inside the splitter's buffer, and the tail flush runs through
+    this same function, where an unclosed opener drops its tail exactly as
+    `strip_thinking` drops an unclosed block in a whole reply.
+    """
+    speech: list[str] = []
+    while True:
+        if in_think:
+            end = fragment.find(_THINK_CLOSE)
+            if end < 0:
+                return "".join(speech), True
+            fragment = fragment[end + len(_THINK_CLOSE):]
+            in_think = False
+            continue
+        start = fragment.find(_THINK_OPEN)
+        if start < 0:
+            return "".join(speech) + fragment, False
+        speech.append(fragment[:start])
+        fragment = fragment[start + len(_THINK_OPEN):]
+        in_think = True
+
+
+#: The streamed reply's whole wall-clock budget. Every socket read waits at
+#: most 300s, and a server that drips one byte per read never trips that:
+#: the TOTAL is what has to be bounded, or a wedged server holds the turn's
+#: thread (and the queue the speaker blocks on) for the life of the process.
+#: Generous by design — a wedge guard, not a deadline.
+STREAM_DEADLINE_S = 600.0
 
 
 class TurnStream:
@@ -458,6 +509,7 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
     full_parts: list[str] = []
     tool_calls: list[dict] = []
     fallback = False
+    in_think = False
     try:
         guard()
         payload = _defaults(base, model, num_ctx, tools, True, keep_alive)
@@ -466,10 +518,16 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
         req = urllib.request.Request(
             base + "/api/chat", data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"})
+        started = time.monotonic()
         with urlopen(req, timeout=300) as response:
             for raw in response:
                 if cancel is not None and cancel.is_set():
                     break
+                if time.monotonic() - started > STREAM_DEADLINE_S:
+                    raise RuntimeError(
+                        f"the streamed reply from {base} exceeded "
+                        f"{STREAM_DEADLINE_S:.0f}s — gave up rather than "
+                        "waited for more")
                 line = raw.strip()
                 if not line:
                     continue
@@ -490,13 +548,15 @@ def ollama_chat_stream(messages: list[dict], q: "queue.Queue[str | None]",
                     if not match:
                         break
                     sentence, buf = buf[:match.end()], buf[match.end():]
-                    sentence = sayable(strip_thinking(sentence).strip())
+                    speech, in_think = _speech_fragment(sentence, in_think)
+                    sentence = sayable(strip_thinking(speech).strip())
                     if sentence:
                         q.put(sentence)
         # Only flush what is still pending if the turn was NOT cancelled:
         # after a barge-in the tail was queued anyway and spoken over the user.
         if not (cancel is not None and cancel.is_set()):
-            tail = sayable(strip_thinking(buf).strip())
+            tail, in_think = _speech_fragment(buf, in_think)
+            tail = sayable(strip_thinking(tail).strip())
             if tail:
                 q.put(tail)
     except urllib.error.HTTPError as error:

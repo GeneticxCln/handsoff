@@ -101,7 +101,13 @@ class Fetch:
 
 
 def serve(web, handler, searxng=""):
-    web.configure(http_get=handler, searxng_url=searxng)
+    # The hop seam is injected too, because the reader now REFUSES to read
+    # without it (audit 2026-09-28: the plain fetch follows the whole redirect
+    # chain unchecked, so no test may read through it by accident). One
+    # request, redirects never followed — which is the production contract.
+    def hop(url, timeout=10.0, connect_to=None):
+        return handler(url, timeout), ""
+    web.configure(http_get=handler, http_get_hop=hop, searxng_url=searxng)
     web.cache_clear()
     return handler
 
@@ -763,50 +769,42 @@ class TestTheCheckedAddressIsTheOneFetched:
         assert any("cannot be pinned" in w for w in warnings), warnings
         assert any("rebinding" in w for w in warnings), warnings
 
-    def test_a_reader_with_no_hop_seam_says_both_things_it_gives_up(
+    def test_a_reader_with_no_hop_seam_is_refused_not_fetched_unchecked(
             self, web, monkeypatch):
-        """A partial install still reads, but the journal must not report a
-        closed hole: the one-shot path follows redirects unchecked AND
-        resolves the name a second time."""
-        warnings = []
-
-        class _Log:
-            @staticmethod
-            def warning(msg, *args):
-                warnings.append(msg % args if args else msg)
-            debug = exception = warning
-
-        monkeypatch.setattr(web, "_LOG", _Log)
+        """Audit fix (2026-09-28): the one-shot fallback this test used to pin
+        is GONE, and the test now pins its absence. Falling back to the plain
+        fetch followed the whole redirect chain unchecked AND resolved the name
+        a second time — exactly the hole the hop seam exists to close — so a
+        partial install reads nothing rather than reads unsafely, with the
+        reason named. (Updated from pinning the fallback to pinning the
+        refusal; the fallback was the bug.)"""
         monkeypatch.setattr(web, "_HTTP_HOP", None)
         monkeypatch.setattr(web, "_HTTP_GET",
                             lambda url, timeout=10.0: b"<html>x</html>")
-        web.read_page("https://example.com/x")
-        said = " ".join(warnings)
-        assert "redirects are followed unchecked" in said, warnings
-        assert "resolved a second time" in said, warnings
+        text, _via, problem = web.read_page("https://example.com/x")
+        assert text == "" and "refused" in problem, (text, problem)
+        assert "redirect" in problem, problem
 
-    def test_a_seam_that_vanishes_mid_walk_is_not_a_silent_unpin(
+    def test_a_seam_that_vanishes_mid_walk_is_a_refusal_not_a_one_shot(
             self, web, monkeypatch):
         """`_hop` returning None means the seam went away while the chain was
-        being walked. Falling back is right; falling back SILENTLY would look
-        like a pinned read in the journal, which is the whole accounting."""
-        warnings = []
+        being walked. The old answer — a one-shot unchecked fetch — is gone
+        with the other fallback (same audit fix): the read ends with a named
+        refusal, and nothing the reader did not check reaches the transcript.
+        (Updated from pinning the fallback to pinning the refusal.)"""
+        fetched = []
 
-        class _Log:
-            @staticmethod
-            def warning(msg, *args):
-                warnings.append(msg % args if args else msg)
-            debug = exception = warning
+        def plain(url, timeout=10.0):
+            fetched.append(url)
+            return b"<html>x</html>"
 
-        monkeypatch.setattr(web, "_LOG", _Log)
         monkeypatch.setattr(web, "_HTTP_HOP_IS_FN", False)
         monkeypatch.setattr(web, "_HTTP_HOP", lambda: None)     # resolver
-        monkeypatch.setattr(web, "_HTTP_GET",
-                            lambda url, timeout=10.0: b"<html>x</html>")
-        web.read_page("https://example.com/x")
-        said = " ".join(warnings)
-        assert "vanished mid-walk" in said, warnings
-        assert "resolved" in said, warnings
+        monkeypatch.setattr(web, "_HTTP_GET", plain)
+        text, _via, problem = web.read_page("https://example.com/x")
+        assert text == "" and "vanished mid-walk" in problem, (text, problem)
+        assert fetched == [], (
+            "the vanished seam must not fall back to the unchecked fetch")
 
     def test_a_name_that_never_answers_does_not_hold_the_turn(self, web,
                                                              monkeypatch):
@@ -1085,7 +1083,14 @@ class TestHandsoffWiring:
             H._http_get = original
             H.SETTINGS["searxng_url"] = original_settings
 
-    def test_world_events_and_lookup_still_use_the_delegations(self, H, monkeypatch):
+    def test_world_events_and_lookup_still_use_the_delegations(
+            self, H, monkeypatch):
+        # web_access is granted: the direct world-events call now rides the
+        # same permission the belt checks, and this test is about the
+        # delegation, not the gate (see test_world_events.py for that).
+        monkeypatch.setitem(
+            H.SETTINGS, "permissions",
+            {**(H.SETTINGS.get("permissions") or {}), "web_access": True})
         # The Wikipedia REST summary is deliberately NOT a standard article, so
         # `lookup_fact` has to reach its fallback — which is the delegated
         # `_wiki_search`. A fake that answered the summary endpoint instead would

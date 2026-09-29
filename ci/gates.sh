@@ -453,8 +453,23 @@ gate_links() {
 
 gate_shell() {
     local rc=0
+    # A pin check over a MISSING file passes silently — grep errors into the
+    # false branch and the check evaporates. In THIS repo both files must
+    # exist (deleting a workflow must delete the skip, not the gate); the
+    # scratch trees the two-writer gate builds carry neither workflow, and
+    # there the checks are out of scope — so the requirement rides on the
+    # repo marker, not on the files themselves.
+    if [ -f install.sh ]; then
+        for f in .github/workflows/ci.yml .gitlab-ci.yml; do
+            if [ ! -f "$f" ]; then
+                echo "ERROR: $f is missing — the pin checks cannot run against nothing."
+                rc=1
+            fi
+        done
+    fi
     # GitHub side: action refs must stay immutable SHAs.
-    if grep -nE 'uses: [^ ]+@v[0-9]+' .github/workflows/ci.yml; then
+    if [ -f .github/workflows/ci.yml ] \
+        && grep -nE 'uses: [^ ]+@v[0-9]+' .github/workflows/ci.yml; then
         echo "ERROR: GH action refs must be pinned to immutable SHAs."
         rc=1
     fi

@@ -739,11 +739,18 @@ class TestICSDurationAndUntil:
             f"DTSTART:{start.strftime('%Y%m%d')}T090000",
             f"RRULE:FREQ=DAILY;UNTIL={d(start + H.datetime.timedelta(days=2))}",
             "SUMMARY:Standup"], days=4)
-        days_seen = sorted(e["start"].day for e in ev)
+        # DATES, not day-of-month ints: `sorted(... .day)` reorders
+        # 29, 30, 1 when the window crosses a month boundary, so this test
+        # failed on the 29th and 30th of every month no matter what the
+        # parser did. `.date()` also sidesteps comparing an aware event start
+        # with the naive `start` above.
+        days_seen = sorted(e["start"].date() for e in ev)
         assert len(ev) == 3, [e["start"] for e in ev]
-        assert days_seen[-1] == (start + H.datetime.timedelta(days=2)).day
+        assert days_seen[-1] == (start + H.datetime.timedelta(days=2)).date(), \
+            days_seen
         # the day AFTER the UNTIL date must still be excluded
-        assert (start + H.datetime.timedelta(days=3)).day not in days_seen
+        assert (start + H.datetime.timedelta(days=3)).date() not in days_seen, \
+            days_seen
 
     def test_a_plain_timed_until_is_unchanged(self, H):
         """The fix must not widen a DATE-TIME UNTIL, which was already exact."""

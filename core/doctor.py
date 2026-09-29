@@ -557,7 +557,13 @@ def _lines(deps: DoctorDeps) -> list[str]:
             txt = unit.read_text(encoding="utf-8")
         except OSError:
             pass
-        if "Restart=always" in txt or "Restart=on-failure" in txt:
+        # Line-anchored: the unit's own COMMENT mentions Restart=always, and
+        # an unanchored substring match reported "auto-restart configured"
+        # for a unit whose real directive had been hand-removed — a false
+        # PASS the JSON surface (anchored) did not share.
+        unit_restart = any(line.strip() in ("Restart=always", "Restart=on-failure")
+                           for line in txt.splitlines())
+        if unit_restart:
             lines.append("systemd unit: present, auto-restart configured")
         else:
             lines.append("systemd unit: present but has NO Restart= — crashes stay dead")

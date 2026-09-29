@@ -144,6 +144,8 @@ class TestTheTurnTailRecordsIt:
         a._conversation_for = lambda text: [{"role": "user", "content": text}]
         a._gen = 1
         a._history = []
+        a._history_lock = threading.Lock()
+        a._history_epoch = 0
         a._turn_spoke = False
         a._save_history = lambda: None
         a._speak = lambda text, gen, cancel, sentence_q=None: None

@@ -40,7 +40,6 @@ Files:
 """
 from __future__ import annotations
 
-import base64
 import faulthandler
 import fcntl
 import hashlib
@@ -51,9 +50,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import math
 import os
-import signal
 import queue
-import random
 import re
 import secrets
 import shlex
@@ -66,15 +63,10 @@ import sys
 import tempfile
 import threading
 import time
-import inspect
-from collections import deque
 import datetime
-import html as _html_mod
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-import wave
 from pathlib import Path
 
 
@@ -99,30 +91,9 @@ except ImportError:
     _missing("sounddevice", "sounddevice", "python-sounddevice")
 
 try:
-    from PySide6.QtCore import (
-        QElapsedTimer,
-        QObject,
-        QPointF,
-        QRect,
-        Qt,
-        QTimer,
-        Signal,
-    )
-    from PySide6.QtGui import (
-        QBrush,
-        QColor,
-        QConicalGradient,
-        QGuiApplication,
-        QLinearGradient,
-        QPainter,
-        QPainterPath,
-        QPainterPathStroker,
-        QPen,
-        QPolygonF,
-        QRadialGradient,
-        QRegion,
-    )
-    from PySide6.QtWidgets import QApplication, QMenu, QWidget
+    from PySide6.QtCore import QObject, Signal
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication
 except ImportError:
     _missing("PySide6", "pyside6", "python-pyside6")
 
@@ -239,6 +210,8 @@ _CAP_LABELS = {"job": "background-job", "watch-file": "file-watcher",
 # (the store keeps what was folded; the cursor notices a replaced queue and
 # refolds the whole thing).
 LAYA_TURNS_FILE = STATE_DIR / "laya-turns.jsonl"
+_LAYA_TURNS_MAX = 2000                    # lines kept after a trim
+_LAYA_TURNS_BYTES = 1 << 21               # trim check runs only past ~2 MiB
 LAYA_CORPUS_FILE = STATE_DIR / "laya-corpus.jsonl"   # written by ci/laya_corpus.py
 LAYA_TURNS_CURSOR = STATE_DIR / "laya-turns.cursor"  # how much of it was folded
 LAYA_UTTERANCE_MAX = 400              # one spoken turn; anything longer is not one
@@ -849,6 +822,7 @@ _DEPLOY_FILES = (
     "core/theme.py",
     "core/qs_desk.py",
     "core/selfwatch.py",
+    "core/voice.py",
     "handsoff-restart",
     "handsoff-stop-probe",
 )
@@ -4611,6 +4585,11 @@ _web.configure(
     # "false" must read as OFF here, not as the third party being on because a
     # non-empty string is truthy.
     hosted_reader=lambda: (SETTINGS.get("permissions") or {}).get("hosted_reader") is True,
+    # The proactive world-events fetch (briefing, _world_tick) rides the same
+    # web_access permission the tools check; core.web gates the direct call,
+    # so the switch the user turned off cannot be bypassed by a caller that
+    # never went through the belt.
+    world_gate=lambda: (SETTINGS.get("permissions") or {}).get("web_access", True),
     logger=log,
 )
 
@@ -4809,9 +4788,19 @@ def _world_watch_health() -> dict:
     return w
 
 
+# The proactive world-warning poll's own cadence. The 10-second health tick
+# drives the caller; without this floor the fixed queries went to DuckDuckGo
+# (and the home place to open-meteo) on every tick — ~8,600 requests a day.
+WORLD_POLL_S = 900.0
+
+
 def _world_events(kind: str = "all", limit: int = 5) -> tuple:
     """(events, degraded): fixed-query world headlines. Shared by briefing,
     proactive warnings and the world_events tool. Never raises."""
+    if not _web.world_allowed():
+        # Permission off is quiet-and-healthy, not wedged: the tick and the
+        # briefing must not read an empty answer as a degraded backend.
+        return [], False
     try:
         limit = max(1, min(int(limit or 5), 5))
     except (TypeError, ValueError):
@@ -5082,10 +5071,32 @@ def _record_turn_for_corpus(text: str, messages: list) -> None:
     try:
         with _LAYA_TURNS_LOCK:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
-            with LAYA_TURNS_FILE.open("a", encoding="utf-8") as fh:
+            # 0600 at creation (the decisions.log rule), and a bounded store:
+            # nothing pruned this file, so verbatim utterances grew it forever
+            # on any machine whose user never runs --report. The cursor
+            # counts folded rows, so a trim that keeps the LAST lines keeps
+            # the cursor's meaning intact.
+            fd = os.open(LAYA_TURNS_FILE,
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as fh:
                 fh.write(entry + "\n")
                 fh.flush()
             os.chmod(LAYA_TURNS_FILE, 0o600)
+            try:
+                if LAYA_TURNS_FILE.stat().st_size > _LAYA_TURNS_BYTES:
+                    lines = LAYA_TURNS_FILE.read_text(
+                        encoding="utf-8").splitlines(keepends=True)
+                    if len(lines) > _LAYA_TURNS_MAX * 2:
+                        _core_settings.atomic_private_write(
+                            LAYA_TURNS_FILE, "".join(lines[-_LAYA_TURNS_MAX:]))
+                        # The cursor counts lines folded from the START of the
+                        # file; a tail trim invalidates it. The corpus dedupes
+                        # by content, so re-folding the kept rows is harmless
+                        # — an understated cursor is, an overstated one is not.
+                        _core_settings.atomic_private_write(
+                            LAYA_TURNS_CURSOR, json.dumps({"lines": 0}))
+            except OSError:
+                pass
     except Exception:
         log.debug("laya turns write failed", exc_info=True)
 
@@ -5251,6 +5262,10 @@ def _ghost_stop_pattern(records: list) -> dict:
     pairs = 0
     after_attr: datetime.datetime | None = None
     last_ghost: dict | None = None
+    # One journal fetch for the whole walk, not one subprocess per row: this
+    # reader backs health checks (and boots), where 50 caller-less rows used
+    # to mean up to 50 x 10 s of journalctl on the Qt main thread.
+    journal_text = _poweroff_journal_text(records)
     for rec in records:
         t = _t(rec)
         if rec.get("callers"):
@@ -5259,7 +5274,7 @@ def _ghost_stop_pattern(records: list) -> dict:
             continue
         if rec.get("shutdown"):
             continue        # the session's own sweep — exempt, never a pattern
-        if _stop_was_poweroff(str(rec.get("ts") or "")):
+        if _stop_was_poweroff(str(rec.get("ts") or ""), journal_text):
             continue        # the annotation race's poweroff — same exemption
         if t is None or after_attr is None:
             continue
@@ -5363,24 +5378,30 @@ def _unexplained_stops_health() -> dict:
     ghost_seen = False
     superseded_by = ""
     try:
+        rows = []
         with STOP_ATTRIBUTION_FILE.open("r", encoding="utf-8") as fh:
             for ln in fh:
                 try:
-                    rec = json.loads(ln)
+                    rows.append(json.loads(ln))
                 except ValueError:
                     continue          # torn line, same rule as health
-                t = _t(str(rec.get("ts") or ""))
-                if t is None or anchor is None or t <= anchor:
-                    continue
-                if rec.get("shutdown"):
-                    continue
-                if not rec.get("callers"):
-                    if _stop_was_poweroff(str(rec.get("ts") or "")):
-                        continue    # a poweroff ghost is not the recurrence
-                    ghost_seen = True
-                elif ghost_seen:
-                    superseded_by = str(rec.get("ts"))
-                    break
+        # One journal fetch over the whole ledger, like the sweep: a
+        # per-row journalctl here made every health check and boot pay up
+        # to 50 x 10 s for rows the journal cannot excuse anyway.
+        journal_text = _poweroff_journal_text(rows)
+        for rec in rows:
+            t = _t(str(rec.get("ts") or ""))
+            if t is None or anchor is None or t <= anchor:
+                continue
+            if rec.get("shutdown"):
+                continue
+            if not rec.get("callers"):
+                if _stop_was_poweroff(str(rec.get("ts") or ""), journal_text):
+                    continue    # a poweroff ghost is not the recurrence
+                ghost_seen = True
+            elif ghost_seen:
+                superseded_by = str(rec.get("ts"))
+                break
     except OSError:
         pass
     return {"open": items, "superseded_by": superseded_by}
@@ -6086,7 +6107,6 @@ _voice = _load_module("voice")
 # name in this namespace. The pre-4c ImportError fallback went with the
 # re-exports: the installer's manifest requires core/tools.py, so a missing one
 # is a loud ImportError instead of a stub belt answering "reinstall handsoff".
-from types import SimpleNamespace as _SimpleNamespace
 _core_tools = _load_module("tools")
 
 
@@ -6772,10 +6792,20 @@ class Assistant(QObject):
         self._memory = _load_memory()
         self._turn_spoke = False
         self._last_spoken = ""
+        # Serializes history mutation between the turn worker (publish) and
+        # the control socket (clear_history); _history_epoch is the clear
+        # counter a mid-turn publish checks before it appends.
+        self._history_lock = threading.Lock()
+        self._history_epoch = 0
         # Set per TURN by `_brain_turn`; declared here so a `_speak` from a
         # timer, a snooze or a crash report — none of which is a turn — can
         # still record a failed utterance without an AttributeError.
         self._turn_speech_failed = False
+        # True for the duration of an ANNOUNCEMENT's playback (_announce_now):
+        # an announcement is not the turn's reply, and recording it as one
+        # let a mid-turn hardware warning satisfy the publish guard and turn
+        # a failed reply's honest retry into silence.
+        self._announcing = False
         self._recently_spoken: list[str] = []   # last TTS lines, for echo rejection
         self._handsfree = _setting_flag("handsfree", False, repair=True)
         # True while a missing pinned microphone is being stood in for by the
@@ -6851,6 +6881,7 @@ class Assistant(QObject):
         # per-INSTANCE so it cannot outlive the bubble that did the refusing.
         self._cap_spoken: dict[str, tuple[float, int]] = {}
         self._world_last_announce = 0.0  # monotonic: last proactive warning
+        self._world_last_poll = 0.0      # monotonic: last world fetch (WORLD_POLL_S)
         self._hardware_note = ""       # 1-2 line change note for the next turn
         self._hardware_last = {}       # change-detection state (in-memory only)
         self._hardware_last_urgent = 0.0  # monotonic: last hardware urgent
@@ -7028,10 +7059,12 @@ class Assistant(QObject):
         # only ever written to the model's reply). One block each, the same
         # mirror-signal shape the notification reader uses.
         snap["world_watch"] = _world_watch_health()
+        # The permissions dict read DIRECTLY: _setting_flag is the strict
+        # boolean reader, and a dict fails its coercion, so this used to warn
+        # once per start and then report quant_space as always-enabled.
         snap["quant_space"] = {
-            "enabled": _setting_flag("permissions", {}).get(
-                "quant_space", True)
-            if isinstance(SETTINGS.get("permissions"), dict) else True,
+            "enabled": bool((SETTINGS.get("permissions") or {})
+                            .get("quant_space", True)),
             "calls": _core_tools.qs_stats_snapshot(),
         }
         snap["stop_attribution"] = _stop_attribution_health()
@@ -7349,10 +7382,15 @@ class Assistant(QObject):
         if not _ANNOUNCE_LOCK.acquire(blocking=False):
             return                       # something is playing; try again later
         try:
+            # The lock protects LOCAL playback from a LOCAL model drop, so
+            # only the speech-model release runs under it. The LLM unload is
+            # an HTTP round-trip to Ollama (up to its 10 s timeout); holding
+            # _ANNOUNCE_LOCK across it queued every announcement behind a
+            # network call for ten seconds.
             dropped = _release_models()
-            verdict = _release_llm()
         finally:
             _ANNOUNCE_LOCK.release()
+        verdict = _release_llm()
         # One release per quiet spell, not one per tick: without this the tick
         # would re-send the unload every second for as long as the bubble sat
         # idle, which is a request per second to say nothing changed. A model
@@ -7373,11 +7411,14 @@ class Assistant(QObject):
     def _world_tick(self) -> None:
         """Proactive severe-world-event warnings; mirrors _resource_tick.
 
-        Opt-in: poll (cheap on cooldown), per-event seen-store, one global
-        cooldown, popup always + spoken unless already speaking. When the
-        setting is off the tick returns WITHOUT recording — a poller that is
-        opted out is not "wedged", it is off, and health must not read the
-        difference the same way.
+        Opt-in: poll (its own cadence, WORLD_POLL_S — the announce cooldown
+        cools the ANNOUNCEMENT, and nothing else stamps it, so keying the
+        fetch on it alone sent the query out on every ten-second health
+        tick), per-event seen-store, one global cooldown, popup always +
+        spoken unless already speaking. When the setting is off the tick
+        returns WITHOUT recording — a poller that is opted out is not
+        "wedged", it is off, and health must not read the difference the
+        same way.
         """
         if not _setting_flag("world_warnings", False):
             return
@@ -7387,6 +7428,13 @@ class Assistant(QObject):
             cooldown_s = 3600.0
         if not _announce_ok(self._world_last_announce, cooldown_s):
             return
+        # 0.0 is "never polled" (monotonic is uptime-based, so a raw 0.0
+        # sentinel must not read as a poll from before boot), and instances
+        # built without __init__ may not carry the attribute at all.
+        last_poll = getattr(self, "_world_last_poll", 0.0)
+        if last_poll and time.monotonic() - last_poll < WORLD_POLL_S:
+            return
+        self._world_last_poll = time.monotonic()
         events, _degraded = _world_events("all", 5)
         _world_watch_record_tick(_degraded)
         fresh = [e for e in events
@@ -8105,6 +8153,15 @@ class Assistant(QObject):
                 self._listener.stop()
             except Exception:
                 log.exception("push-to-talk: could not park hands-free listening")
+            # stop() only sets the flag; the capture thread closes its OWN
+            # stream within its 0.5 s poll (the same contract restart()'s join
+            # relies on). Join it bounded, or the recorder below can open a
+            # second InputStream on a device that still has one — two on one
+            # device is what wedges this mic.
+            _parked_thread = getattr(self._listener, "_thread", None)
+            if _parked_thread is not None \
+                    and _parked_thread is not threading.current_thread():
+                _parked_thread.join(timeout=2.0)
         lock = self._ptt_ensure()
         # press#2 during a wedged stop: wait briefly for the in-flight
         # stop worker, else refuse cleanly instead of a doomed second open.
@@ -8887,7 +8944,11 @@ class Assistant(QObject):
             _ANNOUNCE_CANCEL = cancel
 
         def _run(t=text, g=gen, c=cancel):
-            self._speak(t, g, c)
+            self._announcing = True
+            try:
+                self._speak(t, g, c)
+            finally:
+                self._announcing = False
             if not c.is_set() and g == self._gen and not self._is_closed():
                 self._set(g, IDLE)
 
@@ -9156,13 +9217,17 @@ class Assistant(QObject):
 
         The prefix — main system prompt + history — still stays byte-identical
         across turns, so Ollama's KV cache keeps hitting on it and only the
-        small per-turn delta and the new utterance are evaluated."""
+        small per-turn delta and the new utterance are evaluated. That is why
+        the system message carries the DATE (stable for the day) and the
+        time of day rides in the per-turn user message: a minute-resolution
+        clock in message 0 invalidated the whole cached prefix every minute,
+        and every turn re-prefilled system + tools + history."""
         _now = datetime.datetime.now()
-        now = (f"{_core_calendar.DAY_NAMES[_now.weekday()]}, {_now.day:02d} "
-               f"{_core_calendar.MONTH_NAMES[_now.month - 1]} {_now.year}, "
-               f"{_now.hour:02d}:{_now.minute:02d}")
+        today = (f"{_core_calendar.DAY_NAMES[_now.weekday()]}, {_now.day:02d} "
+                 f"{_core_calendar.MONTH_NAMES[_now.month - 1]} {_now.year}")
+        clock = f"{_now.hour:02d}:{_now.minute:02d}"
         off_families = _switched_off_families()
-        system = (f"{SYSTEM_PROMPT}\n\nCurrent local date and time: {now}. "
+        system = (f"{SYSTEM_PROMPT}\n\nCurrent local date: {today}. "
                   "If the user asks about anything that depends on the current "
                   "date (weather today, 'tomorrow', news), use your tools."
                   + (f" Switched off in settings, so not offered: "
@@ -9170,7 +9235,9 @@ class Assistant(QObject):
                      "name the settings switch instead of guessing."
                      if off_families else ""))
         briefing = self._maybe_briefing_prefix(text)
-        user_content = (briefing + "\n\nThe user just said: " + text) if briefing else text
+        user_content = (f"[local time {clock}] "
+                        + ((briefing + "\n\nThe user just said: " + text)
+                           if briefing else text))
         tail: list[str] = []
         if self._memory:
             facts = "\n".join(f"- {m['v']}" for m in self._memory)
@@ -9248,6 +9315,10 @@ class Assistant(QObject):
         # so this is what keeps a late turn from rewriting history it does not
         # own.
         hist_at_entry = len(getattr(self, "_history", None) or [])
+        # clear_history bumps this under the same lock the publish uses: a
+        # clear issued while THIS turn runs must not be undone by the turn's
+        # own exchange reappearing afterwards.
+        history_epoch_at_entry = getattr(self, "_history_epoch", 0)
         self._turn_spoke = False
         # "A reply this turn was supposed to say could not be said" — kept
         # apart from `_turn_spoke` on purpose. "Nothing was spoken" is also
@@ -9508,7 +9579,16 @@ class Assistant(QObject):
                          "question without its answer")
             _strip_images(kept)   # screenshots: this turn's model call only
             _seal_tool_calls(kept)  # no unanswered call may enter the prefix
-            self._history = _trim_history(self._history + kept)
+            with self._history_guard():
+                if getattr(self, "_history_epoch", 0) == history_epoch_at_entry:
+                    self._history = _trim_history(self._history + kept)
+                else:
+                    # A clear-history landed while this turn ran. The exchange
+                    # is dropped, not appended: the user asked to forget, and
+                    # an exchange that began before the clear must not
+                    # reappear after it.
+                    log.info("history cleared mid-turn; dropped this turn's "
+                             "%d message(s)", len(kept))
             self._save_history()
             if gen != self._gen:
                 log.info("turn superseded at history-write; kept its %d "
@@ -9532,6 +9612,10 @@ class Assistant(QObject):
         around playback so two OutputStreams can never overlap. Synthesis is
         intentionally outside the lock so slow TTS does not block other speech
         from reaching its cancellation/playback check."""
+        # Read through getattr: timers and tests exercise _speak on instances
+        # built without __init__ (the same reason _mic_fallback is read
+        # defensively), and a missing flag means "this is not an announcement".
+        announcing = getattr(self, "_announcing", False)
         if _tts_model is None and not self._models_ready.is_set():
             self._models_ready.wait(30)
         if sentence_q is None:
@@ -9569,19 +9653,26 @@ class Assistant(QObject):
                 # bubble believing it had replied — the follow-up window
                 # opened on nothing and the user's next utterance was
                 # echo-filtered against a line that was never spoken.
-                self._turn_speech_failed = True
+                if not announcing:
+                    self._turn_speech_failed = True
                 self._unarm_speech(text)
                 self._report_speech_failure(exc)
             else:
-                self._last_spoken = text
-                self._turn_spoke = True
+                # Announcements are not the turn's reply (see _announcing):
+                # they must not satisfy the publish guard for a turn whose
+                # own reply failed.
+                if not announcing:
+                    self._last_spoken = text
+                    self._turn_spoke = True
             # announce-and-listen: a full spoken reply opens a short window in
             # which the NEXT utterance is taken without the wake word. Only
             # after natural completion — an interrupted (barged-in) reply
             # opens nothing, or the barge-in speech would arm its own window.
+            # An announcement opens it too: "snooze 10 minutes" after a
+            # reminder IS the answer the announcement expects.
             window = _followup_seconds()
-            if self._turn_spoke and not cancel.is_set() and self._handsfree \
-                    and window > 0.0:
+            if (self._turn_spoke or announcing) and not cancel.is_set() \
+                    and self._handsfree and window > 0.0:
                 self._followup_until = _tick_now() + window
                 log.info("follow-up window open for %ss", window)
             return
@@ -9637,18 +9728,21 @@ class Assistant(QObject):
                     _audio.play_wav(wav, cancel)
             except Exception as exc:
                 log.exception("TTS failed (streaming)")
-                self._turn_speech_failed = True
+                if not announcing:
+                    self._turn_speech_failed = True
                 self._unarm_speech(sentence)
                 self._report_speech_failure(exc)
                 continue
             said.append(sentence)
-            self._last_spoken = sentence
-            self._turn_spoke = True
+            if not announcing:
+                self._last_spoken = sentence
+                self._turn_spoke = True
         self._last_spoken = " ".join(said)
-        # announce-and-listen (streaming path): same arming as above
+        # announce-and-listen (streaming path): same arming as above — and the
+        # same announcement carve-out, for the same snooze reason.
         window = _followup_seconds()
-        if self._turn_spoke and not cancel.is_set() and self._handsfree \
-                and window > 0.0:
+        if (self._turn_spoke or announcing) and not cancel.is_set() \
+                and self._handsfree and window > 0.0:
             self._followup_until = _tick_now() + window
             log.info("follow-up window open for %ss", window)
 
@@ -9705,7 +9799,10 @@ class Assistant(QObject):
     @staticmethod
     def _load_history() -> list[dict]:
         try:
-            data = json.loads(HISTORY_FILE.read_text())
+            # Explicit utf-8, matching atomic_private_write's writer: under a
+            # non-UTF-8 locale the locale default turned every restart into a
+            # UnicodeDecodeError and the quarantine wiped the conversation.
+            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return []
         except ValueError:
@@ -9735,6 +9832,26 @@ class Assistant(QObject):
         except OSError:
             log.exception("cannot save history")
 
+    def _history_guard(self) -> threading.Lock:
+        """The history lock, created on demand.
+
+        `__init__` owns it, but tests drive `_brain_turn` and `clear_history` on
+        an `Assistant` built without one — and a bare `self._history_lock`
+        raises AttributeError inside the TURN WORKER THREAD, where it surfaces
+        as an unhandled thread exception attributed to whichever test happened
+        to be running, long after the one that caused it. Created lazily rather
+        than degraded to a no-op context manager, so a clear still excludes a
+        publish even on such an instance: the bug this lock fixes is a RACE,
+        and a lock that vanishes under half-built objects is the same bug with
+        a comment attached.
+        """
+        lock = getattr(self, "_history_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._history_lock = lock
+            self._history_epoch = 0
+        return lock
+
     def clear_history(self) -> int:
         """Drop the conversation memory and persist the empty history.
 
@@ -9742,10 +9859,14 @@ class Assistant(QObject):
         history is held in `self._history` and `_save_history` rewrites the
         whole file: another process truncating HISTORY_FILE alone would be
         undone on the bubble's next turn, which is why a model switch in
-        Settings has to ask the RUNNING bubble to forget as well.
+        Settings has to ask the RUNNING bubble to forget as well. The epoch
+        (under the publish's lock) stops an in-flight turn from appending its
+        exchange right back after the clear.
         """
-        dropped = len(self._history)
-        self._history = []
+        with self._history_guard():
+            dropped = len(self._history)
+            self._history = []
+            self._history_epoch = getattr(self, "_history_epoch", 0) + 1
         self._save_history()
         log.info("conversation history cleared (%d message(s) dropped)", dropped)
         return dropped
@@ -9863,7 +9984,8 @@ def _merge_memories(current: list[dict], new: list[tuple[str, str]]) -> list[dic
 
 def _load_memory() -> list[dict]:
     try:
-        data = json.loads(MEMORY_FILE.read_text())
+        # Same contract as the writer and _load_history: utf-8 explicitly.
+        data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
     except ValueError:
@@ -9886,10 +10008,14 @@ def _load_memory() -> list[dict]:
 
 
 def _save_memory(items: list[dict]) -> None:
+    # The settings app's Forget pane writes memory.json under this lock; a
+    # fact forgotten there while a turn re-persists its own list is the
+    # classic lost update, and the "forgotten" fact came straight back.
     try:
-        _backup_runtime_json(MEMORY_FILE)
-        _core_settings.atomic_private_write(
-            MEMORY_FILE, json.dumps(items, ensure_ascii=False, indent=1))
+        with _core_settings.cross_process_lock()(CONFIG_DIR, "memory.json.lock"):
+            _backup_runtime_json(MEMORY_FILE)
+            _core_settings.atomic_private_write(
+                MEMORY_FILE, json.dumps(items, ensure_ascii=False, indent=1))
     except OSError:
         log.exception("cannot save memory")
 

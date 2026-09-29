@@ -86,6 +86,14 @@ MAX_LINES = 2000
 #: a document, and the model is going to have to talk about it.
 MAX_TEXT_CHARS = 8000
 
+#: What one ANSWER may weigh on the wire. Nothing on the desk's side stops a
+#: buggy (or hostile) endpoint from streaming gigabytes into ``response.read()``
+#: — a loopback call, but a call this process still blocks on and buffers whole.
+#: One read takes at most this many bytes plus the single byte that says "there
+#: was more", and an over-cap answer becomes the same kind of named refusal as
+#: an answer that was not JSON.
+MAX_BODY_BYTES = 4 * 1024 * 1024
+
 #: How much of a session's own name may be spoken. The desk names a `run` tile
 #: with the WHOLE command line it was started with — measured live, a 171-char
 #: sentence — and a name is something this app says out loud ("two sessions:
@@ -435,7 +443,9 @@ class Desk:
         try:
             conn.request("POST", "/", body=body, headers=_headers(endpoint.token))
             response = conn.getresponse()
-            status, raw = response.status, response.read()
+            # One byte past the cap is what distinguishes "over the cap" from
+            # "exactly at it" without ever buffering more than cap + 1.
+            status, raw = response.status, response.read(MAX_BODY_BYTES + 1)
         except (OSError, http.client.HTTPException) as e:
             # refusal: nothing_answered_on_the_port
             raise DeskError(
@@ -456,6 +466,13 @@ class Desk:
                             ("Quantum Space refused the control token (401) — "
                              "handsoff read it a moment too late. Try again."
                              if status == 401 else _status_sentence(status)))
+        if len(raw) > MAX_BODY_BYTES:
+            # refusal: the_answer_was_over_the_read_cap
+            raise DeskError(
+                "error",
+                f"Quantum Space's answer to {method!r} was over the "
+                f"{MAX_BODY_BYTES // (1 << 20)} MiB this client reads — "
+                f"nothing from it reached the conversation.")
         try:
             doc = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):

@@ -33,6 +33,7 @@ from PySide6.QtGui import (
     QColor,
     QConicalGradient,
     QImage,
+    QImageReader,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -220,6 +221,16 @@ _FEATHER_MASKS: dict = {}
 # the memory and the per-frame work at a constant.
 _IMAGE_WORK = 384
 
+# The widest raster a decode may ask for, as a backstop for the formats whose
+# reader ignores a scaled decode (Qt checks the DECLARED size against this
+# before touching the file). Qt's own default was 1024 MB — the ONLY ceiling an
+# image bomb met, and a few hundred bytes of PNG can declare a raster that
+# size. Half of that is far above any real photograph (a 50 MP frame is
+# ~200 MB of ARGB32) and still halves the worst case.
+_IMAGE_DECODE_LIMIT_MB = 512
+if hasattr(QImageReader, "setAllocationLimit"):
+    QImageReader.setAllocationLimit(_IMAGE_DECODE_LIMIT_MB)
+
 
 def _decoded_image(path):
     """The file as a bounded ARGB32 image, or None when it will not decode.
@@ -228,6 +239,16 @@ def _decoded_image(path):
     what makes an enormous photo cost the same as a small one at every frame
     after the first, and what keeps the memory ceiling a constant instead of a
     function of whatever file someone points at (see `_IMAGE_WORK`).
+
+    The decode itself is bounded, not just its result: `QImage(str(path))`
+    materialised the file at its OWN dimensions first — so a few hundred bytes
+    of PNG declaring a 30000x30000 raster was a ~3.6 GB ask, with Qt's
+    allocation ceiling the only thing that said no — and the 20-slot cache
+    re-decoded a pack's four states through that path. QImageReader scales at
+    the source (where the format allows it) straight to `_IMAGE_WORK`, the
+    largest canvas the widget ever paints, so a bomb decodes to the size it is
+    drawn at and normal art is pixel-for-pixel the same shape it always was —
+    only reached without the full-size intermediate.
     """
     try:
         p = Path(str(path)).expanduser()
@@ -235,11 +256,20 @@ def _decoded_image(path):
             return None
     except (OSError, ValueError, TypeError):
         return None
-    img = QImage(str(p))
+    reader = QImageReader(str(p))
+    reader.setAutoTransform(True)   # the EXIF orientation QImage() applied
+    full = reader.size()            # header read, where the format allows one
+    if full.isValid() and max(full.width(), full.height()) > _IMAGE_WORK:
+        reader.setScaledSize(full.scaled(_IMAGE_WORK, _IMAGE_WORK,
+                                         Qt.KeepAspectRatio))
+    img = reader.read()
     if img.isNull():
         return None
     img = img.convertToFormat(QImage.Format_ARGB32)
     if max(img.width(), img.height()) > _IMAGE_WORK:
+        # A format whose reader ignored ScaledSize: the old downscale at the
+        # source is still the answer, and the allocation limit above is what
+        # kept its decode from eating the machine.
         img = img.scaled(_IMAGE_WORK, _IMAGE_WORK, Qt.KeepAspectRatio,
                          Qt.SmoothTransformation)
         img = img.convertToFormat(QImage.Format_ARGB32)

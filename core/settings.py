@@ -35,14 +35,16 @@ DEFAULT_SETTINGS = _schema.DEFAULT_SETTINGS
 __all__ = [
     # the lifecycle, in the order a caller meets it: load owns read -> migrate ->
     # coerce -> quarantine; write_settings owns lock -> backup -> drop-retired ->
-    # stamp -> atomic replace; persist_setting owns read-merge-write of one key.
+    # stamp -> atomic replace; persist_settings (and its one-key form,
+    # persist_setting) owns a locked read-merge-write of the requested keys.
     "load_settings", "write_settings", "persist_setting", "coerce_setting",
     "coerce_settings", "Settings", "settings_object", "SettingsConflictError",
+    "apply_env_overrides", "persist_settings",
     # shared with the rest of the runtime rather than with settings: a private
     # 0600 writer, a 0600 hardening pass, a corrupt-file quarantine, a
     # sidecar-flock guard (settings.json AND reminders.json use it) and a
     # one-generation backup.
-    "atomic_private_write", "secure_file", "quarantine_file",
+    "atomic_private_write", "fsync_directory", "secure_file", "quarantine_file",
     "cross_process_lock", "backup_runtime_json",
     # looks catalogue readers the settings window and the bubble both use
     "look_label", "look_matching", "SETTINGS_VERSION",
@@ -127,6 +129,21 @@ def secure_file(path: Path) -> bool:
         return False
 
 
+def fsync_directory(path: Path) -> None:
+    """Best-effort fsync of a directory, so a just-completed rename survives
+    power loss. Some filesystems refuse directory fsync — ignored."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def atomic_private_write(path: Path, text: str) -> None:
     """Write a sensitive text file with mode 0600 and an atomic replacement.
 
@@ -134,6 +151,10 @@ def atomic_private_write(path: Path, text: str) -> None:
     ``.tmp`` file, while the mode is set before the file becomes visible at
     its final path. The caller still owns any higher-level read/modify/write
     lock needed for its data structure.
+
+    The temp file is fsynced before the replace and the directory after it:
+    without both, power loss can leave a torn store at `path` whose recovery
+    resets the configuration — which defeats the point of writing atomically.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.",
@@ -142,8 +163,11 @@ def atomic_private_write(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        fsync_directory(path.parent)
         if not secure_file(path):
             raise OSError(f"refusing insecure runtime file: {path}")
     except Exception:
@@ -183,7 +207,8 @@ def backup_runtime_json(path: Path) -> None:
     restore from, damaged by the very failure it exists for. Mode 0600 is set
     before it becomes visible (copy2 preserves the SOURCE's mode, so a runtime
     file that was still 0644 when copied left a 0644 backup holding the same
-    transcript).
+    transcript). The temp file is fsynced before the replace and the directory
+    after it, for the same reason `atomic_private_write` does.
     """
     try:
         if path.exists():
@@ -194,8 +219,11 @@ def backup_runtime_json(path: Path) -> None:
             try:
                 with os.fdopen(fd, "wb") as out, path.open("rb") as src:
                     shutil.copyfileobj(src, out)
+                    out.flush()
+                    os.fsync(out.fileno())
                 os.chmod(tmp, 0o600)
                 os.replace(tmp, dst)
+                fsync_directory(dst.parent)
             except BaseException:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -625,17 +653,35 @@ def cross_process_lock():
 
 # -------------------------------------------------------------- load + writers
 
-def load_settings(settings_file: Path) -> dict:
-    """Built-in defaults <- environment <- settings.json (the settings app wins)."""
-    s = json.loads(json.dumps(DEFAULT_SETTINGS))
-    env_map = {
-        "ollama_host": "OLLAMA_HOST", "model": "HANDSOFF_MODEL",
-        "num_ctx": "HANDSOFF_NUM_CTX", "whisper_size": "HANDSOFF_WHISPER",
-        "tts_reference": "HANDSOFF_VOICE",
-    }
-    for key, var in env_map.items():
+# The environment fallbacks, applied between the defaults and the file:
+# defaults <- environment <- settings.json. ONE table and ONE applier, because
+# two readers resolve them: `load_settings` (the bubble) and the settings app's
+# `merge_settings` — the GUI used to skip this step entirely, so its "expected"
+# snapshot disagreed with the bubble's env-resolved "current" and a save either
+# declared a bogus conflict on a key nobody else touched or showed (and would
+# have written) the schema default over an env-configured value.
+ENV_SETTINGS_OVERRIDES = {
+    "ollama_host": "OLLAMA_HOST", "model": "HANDSOFF_MODEL",
+    "num_ctx": "HANDSOFF_NUM_CTX", "whisper_size": "HANDSOFF_WHISPER",
+    "tts_reference": "HANDSOFF_VOICE",
+}
+
+
+def apply_env_overrides(s: dict) -> dict:
+    """Apply the env fallbacks to a settings dict, in place and returned.
+
+    The one application both readers share, so the settings window sees the
+    same env-resolved values the bubble runs with.
+    """
+    for key, var in ENV_SETTINGS_OVERRIDES.items():
         if os.environ.get(var):
             s[key] = os.environ[var]
+    return s
+
+
+def load_settings(settings_file: Path) -> dict:
+    """Built-in defaults <- environment <- settings.json (the settings app wins)."""
+    s = apply_env_overrides(json.loads(json.dumps(DEFAULT_SETTINGS)))
     try:
         raw = settings_file.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -663,10 +709,16 @@ def load_settings(settings_file: Path) -> dict:
     for k, v in data.items():
         if k == "version":
             continue   # schema meta key, not a setting
+        if k in RETIRED_SETTINGS:
+            continue   # dropped on load AND write (see _drop_retired_settings)
         if k not in s:
-            # ponytail: silent drops hide typos ("models:" never applies) —
-            # warn so the user knows the key was ignored.
-            _slog.warning("unknown settings key %r — ignored", k)
+            # A key this build has never heard of belongs to a newer build's
+            # settings.json. Kept, not dropped — a read-merge-write must not
+            # erase configuration it merely fails to understand — and warned
+            # about, which is how the user learns who wrote it.
+            _slog.warning("unknown settings key %r — kept (from a newer "
+                          "build?)", k)
+            s[k] = v
             continue
         if isinstance(s[k], dict) and isinstance(v, dict):
             s[k].update(v)
@@ -742,6 +794,9 @@ def _read_settings_for_write(settings_file: Path) -> dict:
     Migrating here is what makes a migration durable; dropping retired keys
     here is what makes it stick even when the file claims a version it does not
     fully honour. This is the one place that decides what a write may contain.
+
+    OSError (permissions, transient I/O) propagates from the read: the caller
+    must abort the write rather than persist a near-empty dict over good data.
     """
     try:
         loaded = json.loads(settings_file.read_text(encoding="utf-8"))
@@ -752,12 +807,40 @@ def _read_settings_for_write(settings_file: Path) -> dict:
     except ValueError:
         quarantine_file(settings_file)
         return {}
-    if not isinstance(loaded, dict):
-        quarantine_file(settings_file)  # valid JSON, wrong shape: never wipe blind
-        return {}
-    # OSError (permissions, transient I/O) propagates: the caller must abort
-    # the write rather than persist a near-empty dict over good data.
+    # valid JSON, wrong shape: never wipe blind
+    quarantine_file(settings_file)
     return {}
+
+
+def _disk_version(settings_file: Path) -> int:
+    """The version stamped on the file itself; 0 when there is none to read.
+
+    The writers consult this before stamping so a NEWER build's version is
+    never written down: the stamp used to be unconditional, so one save from
+    this build re-labelled a newer file with the older version while its
+    unknown keys rode along — a file claiming to be fully understood that this
+    build cannot fully read.
+    """
+    try:
+        data = json.loads(settings_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    try:
+        return int(data.get("version", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stamp_settings_version(data: dict, disk_version: int) -> None:
+    """Version-stamp `data` without writing a newer file's version down.
+
+    Every on-disk write is stamped, but only UP: `max` keeps the version a
+    newer build stamped, exactly like the writers keep the keys this build
+    does not understand.
+    """
+    data["version"] = max(SETTINGS_VERSION, disk_version)
 
 
 def write_settings(data: dict, settings_file: Path, config_dir: Path,
@@ -767,6 +850,7 @@ def write_settings(data: dict, settings_file: Path, config_dir: Path,
     backed up one generation, atomic. The single writer both the bubble and
     the settings app use, so every settings.json on disk carries a version."""
     with _SETTINGS_WRITE_LOCK, cross_process_lock()(config_dir):
+        disk_version = _disk_version(settings_file)
         if expected_data is not None:
             # Compare normalized snapshots so an old sparse settings file is
             # compatible with the full dict held by the GUI.
@@ -783,7 +867,7 @@ def write_settings(data: dict, settings_file: Path, config_dir: Path,
         else:
             data = dict(data)
         if stamp_version:
-            data["version"] = SETTINGS_VERSION
+            _stamp_settings_version(data, disk_version)
         # Same rule as the single-key writer: a full save must not be able to
         # reintroduce a key this build retired (the GUI's edit dict is built
         # through merge_settings, which can carry one along).
@@ -819,23 +903,27 @@ def coerce_setting(key: str, value):
     return probe[key]
 
 
-def persist_setting(key: str, value, settings_file: Path,
+def persist_settings(values: dict, settings_file: Path,
                      config_dir: Path) -> bool:
-    """Persist one runtime setting without overwriting unrelated settings.
+    """Read-merge-write SEVERAL settings in one locked pass.
 
-    Returns False when nothing reached the disk. Report it rather than
-    returning silently: callers used to update their in-memory copy anyway, so
-    a failed write left the runtime using (and believing) a value the next
-    start would not read back.
+    `persist_setting` is this with a one-key dict; the batch exists so the
+    settings app's live apply can persist a whole page of keys as ONE atomic
+    write under the cross-process lock instead of one write per key (or a
+    full-form save). Returns False when nothing reached the disk — report it,
+    for the same reason `persist_setting` does.
     """
+    if not values:
+        return True
     with _SETTINGS_WRITE_LOCK, cross_process_lock()(config_dir):
         try:
             data = _read_settings_for_write(settings_file)
         except OSError:
             logging.getLogger("handsoff").warning(
-                "persist_setting %r aborted: settings file unreadable", key)
+                "persist_settings %r aborted: settings file unreadable",
+                sorted(values))
             return False
-        data[key] = value
+        data.update(values)
         # Coerce what we are about to write, not just what we read: this is the
         # path a TOOL takes (`set_setting`), and it used to store the model's
         # raw argument verbatim. A string where a number belongs then persisted,
@@ -846,8 +934,8 @@ def persist_setting(key: str, value, settings_file: Path,
         # `probe` is only there to validate: `coerce_settings` assumes every key
         # is present (it indexes `s[key]`), while `data` is whatever the file
         # happens to hold. So it is completed from the defaults, coerced, and
-        # only THIS key's coerced value is written back — the rest of the file
-        # is left byte-for-byte as the user had it.
+        # only the REQUESTED keys' coerced values are written back — the rest
+        # of the file is left byte-for-byte as the user had it.
         #
         # `data` is deep-copied so that last sentence is structural rather than
         # a property of how today's coercers happen to be written. MEASURED
@@ -862,8 +950,9 @@ def persist_setting(key: str, value, settings_file: Path,
         # tests/test_settings.py installs exactly such a coercer.
         probe = {**copy.deepcopy(DEFAULT_SETTINGS), **copy.deepcopy(data)}
         coerce_settings(probe)
-        data[key] = probe[key]
-        data["version"] = SETTINGS_VERSION   # every on-disk write is stamped
+        for key in values:
+            data[key] = probe[key]
+        _stamp_settings_version(data, _disk_version(settings_file))
         # NOTE: atomic_private_write creates its own uniquely-named temp
         # file; a pre-computed ".json.tmp" path here would reintroduce the
         # predictable-name race that helper exists to prevent.
@@ -878,10 +967,23 @@ def persist_setting(key: str, value, settings_file: Path,
             # `is False` would instead crash the tool call with a traceback.
             # The old file is intact either way — the write is atomic.
             logging.getLogger("handsoff").warning(
-                "persist_setting %r failed (%s: %s) — keeping the old value",
-                key, type(e).__name__, e)
+                "persist_settings %r failed (%s: %s) — keeping the old value",
+                sorted(values), type(e).__name__, e)
             return False
         return True
+
+
+def persist_setting(key: str, value, settings_file: Path,
+                     config_dir: Path) -> bool:
+    """Persist one runtime setting without overwriting unrelated settings.
+
+    The one-key form of `persist_settings` (which carries the coercion and
+    failure-mode story). Returns False when nothing reached the disk. Report
+    it rather than returning silently: callers used to update their in-memory
+    copy anyway, so a failed write left the runtime using (and believing) a
+    value the next start would not read back.
+    """
+    return persist_settings({key: value}, settings_file, config_dir)
 
 
 class Settings:

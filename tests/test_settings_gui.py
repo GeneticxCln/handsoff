@@ -1961,9 +1961,202 @@ def history_tab_renders_and_truncates():
     text = win.history_view.toPlainText()
     assert "1 messages" in text
     assert len(text) < 400          # per-message truncation
+    # Updated by the audit fix (was: asserted "history is empty" here): a
+    # corrupt file is a READ FAILURE, not an empty history — claiming a fresh
+    # start hid a file the bubble quarantines on its next start.
     history_file.write_text("not json at all", encoding="utf-8")
     win._refresh_history()
+    assert "corrupt" in win.history_view.toPlainText(), \
+        win.history_view.toPlainText()
+    assert "history is empty" not in win.history_view.toPlainText()
+    # a genuinely missing file still IS a fresh start
+    history_file.unlink(missing_ok=True)
+    win._refresh_history()
     assert "history is empty" in win.history_view.toPlainText()
+
+
+@scenario
+def a_full_save_keeps_a_future_builds_keys_and_version():
+    # Audit fix: a GUI save used to drop every key it did not know and re-stamp
+    # the file's version DOWN to this build's — erasing a newer build's
+    # settings on a plain Save. A future_key and version=N+1 must survive both
+    # the window's load and its full save.
+    future_version = settings_app.SETTINGS_VERSION + 1
+    seed({"version": future_version, "future_key": {"a": 1},
+          "model": "testmodel:latest"})
+    win.reload_from_disk()
+    win.mic_threshold.setValue(win.mic_threshold.value() + 1)
+    assert win.save() is True
+    on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+    assert on_disk["future_key"] == {"a": 1}, "a full save erased a key it does not know"
+    assert on_disk["version"] == future_version, (
+        f"a save from this older build re-stamped v{future_version} down to "
+        f"{on_disk['version']}")
+    assert on_disk["mic_threshold"] == win.mic_threshold.value()
+
+
+@scenario
+def model_switch_save_failure_keeps_the_history():
+    # Audit fix: the model-switch wipe ran BEFORE the settings write, so a
+    # conflict or a full disk cleared the conversation while the new model
+    # never reached settings.json. The save is attempted first now; the wipe
+    # only follows a save that landed.
+    seed({"model": "oldmodel:latest"},
+         history=[{"role": "user", "content": "keep me"}])
+    win.reload_from_disk()
+    win.cfg["model"] = "newmodel:latest"
+    cleared = []
+    real_clear = win._clear_history_for_model_switch
+    win._clear_history_for_model_switch = (
+        lambda: (cleared.append(1), real_clear())[1])
+    real_write = bubble._SETTINGS_OBJ.write_all
+
+    def disk_full(data, **k):
+        raise OSError("disk full")
+
+    bubble._SETTINGS_OBJ.write_all = disk_full
+    try:
+        assert win.save() is False
+    finally:
+        bubble._SETTINGS_OBJ.write_all = real_write
+    assert not cleared, "a failed save cleared the conversation anyway"
+    assert json.loads(history_file.read_text(encoding="utf-8")) == [
+        {"role": "user", "content": "keep me"}]
+    assert "cannot save settings" in win.status_label.text()
+
+    # ...and a save that DOES land still clears (the reorder kept the feature)
+    assert win.save() is True
+    assert cleared, "the wipe must follow a successful save"
+    assert json.loads(history_file.read_text(encoding="utf-8")) == []
+    assert "Memory cleared" in win.status_label.text()
+    del win._clear_history_for_model_switch
+
+
+@scenario
+def forget_fact_takes_the_memory_lock_and_says_so():
+    # Audit fix: the GUI's memory.json rewrite ran with no lock while the
+    # bubble's writer is also unlocked, so a forgotten fact came back when the
+    # bubble's stale list was persisted over the forget. The forget now takes
+    # the same sidecar flock the settings writes use — and the status line
+    # admits the bubble may re-learn and re-persist until it reloads, instead
+    # of promising the fact stays gone "until it restarts".
+    from PySide6.QtWidgets import QMessageBox
+    import core.settings as core_settings
+
+    memory_file.write_text(json.dumps(
+        [{"k": "name", "v": "the user's name is Alice"}]), encoding="utf-8")
+    win._refresh_facts()
+    win.facts_list.setCurrentRow(0)
+
+    taken = []
+    real_factory = core_settings.cross_process_lock
+
+    def spy_factory():
+        lock = real_factory()
+
+        def spy_lock(path, name="settings.json.lock"):
+            taken.append(name)
+            return lock(path, name)
+
+        return spy_lock
+
+    core_settings.cross_process_lock = spy_factory
+
+    class _Yes(QMessageBox):
+        @staticmethod
+        def question(*a, **k):
+            return QMessageBox.Yes
+
+    saved_box = settings_app.QMessageBox
+    settings_app.QMessageBox = _Yes
+    try:
+        win._forget_fact()
+    finally:
+        settings_app.QMessageBox = saved_box
+        core_settings.cross_process_lock = real_factory
+    assert "memory.json.lock" in taken, taken
+    assert json.loads(memory_file.read_text(encoding="utf-8")) == []
+    status = win.status_label.text()
+    assert "re-learn" in status and "re-persist" in status, status
+    assert "keeps its in-memory copy" not in status, status
+
+
+@scenario
+def live_apply_persists_only_appearance_keys():
+    # Audit fix: the debounced live apply ran the WHOLE-form collect and a full
+    # save, so a half-typed Brain field committed on a slider drag and
+    # apply_autostart re-ran on every tick. It now collects and persists only
+    # the Appearance page's keys.
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    win.assistant_name.setText("SENTINEL half-typed brain field")
+    autostart_calls = []
+    real_apply_autostart = settings_app.apply_autostart
+    settings_app.apply_autostart = (
+        lambda enable: autostart_calls.append(enable) or "stub")
+    notified = []
+    win._notify_bubble_reloaded = lambda: (notified.append(1), True)[1]
+    try:
+        win.animation_energy.setValue(150)
+        win._apply_appearance_live()
+        on_disk = json.loads(settings_file.read_text(encoding="utf-8"))
+        assert on_disk["animation_energy"] == 1.5
+        assert "SENTINEL" not in json.dumps(on_disk), (
+            "a half-typed Brain field must not ride along on a slider tick")
+        assert "assistant_name" not in on_disk, (
+            "the live apply must not materialize keys outside its page")
+        assert autostart_calls == [], (
+            "live apply must not re-apply autostart")
+        assert notified, "the live apply must still tell the bubble"
+    finally:
+        del win._notify_bubble_reloaded
+        settings_app.apply_autostart = real_apply_autostart
+    assert "Applied live" in win.status_label.text()
+
+
+@scenario
+def a_save_names_the_sticky_keys_that_wait():
+    # Audit fix: the save status said "Applied live." no matter what, but the
+    # bubble's reload provably does not reset a sticky-failed wake spotter nor
+    # reopen a changed mic device. A save that moves a sticky key now says
+    # which keys wait for the next start or a hands-free toggle.
+    seed({"model": "testmodel:latest"})
+    win.reload_from_disk()
+    win.wake_spotter.setChecked(True)
+    assert win.save() is True
+    status = win.status_label.text()
+    assert "wake spotter" in status, status
+    assert "hands-free toggle" in status, status
+
+    # a save that moves nothing sticky keeps the plain note
+    assert win.save() is True
+    assert "hands-free toggle" not in win.status_label.text(), \
+        win.status_label.text()
+
+
+@scenario
+def float_spin_fields_keep_their_fractions():
+    # Audit fix: float rows were built as integer QSpinBoxes, so
+    # hardware_disk_gb's declared 0.5 floor was displayed as 1 and a stored
+    # confirm_seconds of 7.5 came back as 7. A float row now builds a
+    # QDoubleSpinBox; integer rows keep the plain spin box.
+    from PySide6.QtWidgets import QDoubleSpinBox, QSpinBox
+
+    fields = settings_app.SCHEMA.fields_by_key()
+    disk = settings_app._build_spin(win, fields["hardware_disk_gb"])
+    assert isinstance(disk.widget, QDoubleSpinBox)
+    assert disk.widget.minimum() == 0.5, (
+        "the declared fractional floor must not be floored to an integer")
+    disk.widget.setValue(0.5)
+    assert disk.read() == 0.5
+    secs = settings_app._build_spin(win, fields["confirm_seconds"])
+    assert isinstance(secs.widget, QDoubleSpinBox)
+    secs.write(7.5)
+    assert secs.read() == 7.5, "a float value must survive a write/read cycle"
+    threshold = settings_app._build_spin(win, fields["mic_threshold"])
+    assert isinstance(threshold.widget, QSpinBox)
+    threshold.write(640)
+    assert threshold.read() == 640
 
 
 @scenario
@@ -4838,6 +5031,12 @@ SCENARIO_NAMES = [
     "a_table_row_alone_becomes_a_working_control",
     "the_pages_are_the_tables_cards_in_the_tables_order",
     "a_table_row_alone_can_ask_for_a_note_and_a_companion_line",
+    "a_full_save_keeps_a_future_builds_keys_and_version",
+    "model_switch_save_failure_keeps_the_history",
+    "forget_fact_takes_the_memory_lock_and_says_so",
+    "live_apply_persists_only_appearance_keys",
+    "a_save_names_the_sticky_keys_that_wait",
+    "float_spin_fields_keep_their_fractions",
 ]
 
 

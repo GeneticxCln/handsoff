@@ -315,6 +315,13 @@ def _hf_hub_cache() -> Path:
     return base / "hub"
 
 
+# huggingface_hub's partial-download names: a `.incomplete` blob is a fetch in
+# progress (or one that died mid-flight), not a usable model. Either helper
+# counting one as "cached" made the installer skip the download and every
+# status surface swear the model was provisioned.
+_HF_PARTIAL_SUFFIXES = (".incomplete", ".lock")
+
+
 def _snapshot_cached(root: Path) -> bool:
     """True when a Hugging Face model directory holds a usable snapshot.
 
@@ -338,7 +345,9 @@ def _snapshot_cached(root: Path) -> bool:
         if not snap.is_dir():
             continue
         try:
-            if any(p.is_file() and p.stat().st_size > 0 for p in snap.rglob("*")):
+            if any(p.is_file() and p.stat().st_size > 0
+                   and not p.name.endswith(_HF_PARTIAL_SUFFIXES)
+                   for p in snap.rglob("*")):
                 return True
         except OSError:
             continue
@@ -358,7 +367,8 @@ def _has_nonempty_file(root: Path) -> bool:
     """
     for entry in root.iterdir():
         try:
-            if entry.is_file() and entry.stat().st_size > 0:
+            if entry.is_file() and entry.stat().st_size > 0 \
+                    and not entry.name.endswith(_HF_PARTIAL_SUFFIXES):
                 return True
         except OSError:
             continue

@@ -283,9 +283,13 @@ def log_decision(tool: str, target: str, decision: str, result: str='dispatched'
         with _DECISIONS_LOCK:
             _dep().STATE_DIR.mkdir(parents=True, exist_ok=True)
             decision_file = _dep().DECISIONS_FILE
-            with decision_file.open('a', encoding='utf-8') as fh:
+            # 0600 at CREATION, not appended afterwards: the append-then-chmod
+            # order left a world-readable window on the first write, the same
+            # one the cross_process_lock fix closed for the lock file.
+            fd = os.open(decision_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, 'a', encoding='utf-8') as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + '\n')
-            os.chmod(decision_file, 384)
+            os.chmod(decision_file, 0o600)
             try:
                 # Size gate: the read-trim path runs only once past ~2x the
                 # line cap, not on every tool call in the hot path.
@@ -345,6 +349,15 @@ class DecisionPolicy:
         """Tools that change the desktop (or spawn work) and thus honour
         dry-run mode."""
         return tool in ('run_command', 'start_command', 'open_app', 'close_window', 'focus_window', 'workspace', 'type_text', 'press_keys', 'press_hotkey', 'scroll', 'click_element', 'click_at', 'copy_text', 'paste_text')
+
+    # Not desktop actions, but they PERSIST state — files written, reminders
+    # stored, a watcher started, a setting flipped. dry_run exists so a
+    # scripted sequence can be rehearsed, and a rehearsal that leaves a file
+    # or an alarm behind is not one. Media control stays live: MPD state is
+    # ephemeral and reversible, not a record the user has to clean up.
+    DRY_RUN_STATE_CHANGERS = frozenset(
+        {'edit_file', 'watch_file', 'set_reminder', 'snooze_reminder',
+         'notification_reader'})
 
 class BoundedJob:
     """A long-running whitelisted command with a hard cap and bounded output.
@@ -557,6 +570,7 @@ _SECRET_DIRS = (
     ".config/gh", ".config/gcloud", ".config/heroku",
     ".config/google-chrome", ".config/chromium", ".config/BraveSoftware",
     ".local/share/keyrings", ".local/share/kwalletd",
+    ".config/filezilla", ".config/evolution/sources",
 )
 _SECRET_FILES = (
     ".netrc", ".git-credentials", ".npmrc", ".pypirc", ".authinfo",
@@ -564,6 +578,7 @@ _SECRET_FILES = (
     ".bash_history", ".zsh_history", ".fish_history", ".python_history",
     ".node_repl_history", ".mysql_history", ".psql_history",
     ".sqlite_history", ".lesshst", ".viminfo", ".irb_history",
+    ".pgpass", ".my.cnf", ".wgetrc", ".s3cfg", "rclone.conf",
     # exact OpenSSH private-key names: a plain `id_rsa` inside ~/.ssh is
     # already caught by the directory rule, these catch copies elsewhere.
     # Deliberately NOT a glob — `id_rsa_notes.md` is a note, not a key.
@@ -643,6 +658,23 @@ def _flag_values(tok: str) -> tuple[str, ...]:
     return (tok.split('=', 1)[1],)
 
 
+def _lead_exe(command: str) -> str:
+    """The basename of the program a command line would exec, or ''.
+
+    Judged the way `_validate_command` judges it — stripped, then shlex-parsed
+    — because the RAW first whitespace token answers a different question: the
+    CONFIRM floor in `_execute_decision` must decide cargo-ness about the argv
+    that will actually run, and cargo only ever runs after the strip+parse. An
+    unparseable command returns '': it is refused before any exec, so there is
+    nothing to confirm.
+    """
+    try:
+        argv = shlex.split(str(command or '').strip())
+    except ValueError:
+        return ''
+    return Path(argv[0]).name if argv else ''
+
+
 #: `/proc` is the one filesystem where the interesting content is GENERATED
 #: rather than stored, so a rule about file NAMES has nothing to match. The name
 #: `environ` is a kernel interface that answers with a copy of a process's
@@ -671,7 +703,34 @@ def _secret_reason(p: Path) -> str | None:
         if rel == d or rel.startswith(d + "/"):
             # refusal: secret_by_home_prefix
             return f"~/{d}/ holds credentials or key material"
+    # Flatpak sandboxes keep the SAME browser profile stores under the per-app
+    # root: ~/.var/app/<app-id>/config/<browser>/. The home-prefix rule above
+    # cannot see it — it only matches paths whose home-relative spelling
+    # STARTS with the denied dir, and this starts with .var/app/ — and the
+    # ancestor-NAME rule cannot either, because the store's directory is
+    # called `google-chrome`, not `.config/google-chrome`. (.mozilla under
+    # ~/.var/app/ IS caught by the ancestor-NAME rule, which is why it is not
+    # spelled here.)
+    parts = rel.split('/')
+    if (len(parts) >= 5 and parts[0] == '.var' and parts[1] == 'app'
+            and parts[2] and parts[3] == 'config'
+            and parts[4] in ('google-chrome', 'chromium', 'firefox')):
+        # refusal: secret_flatpak_browser_profile
+        return (f"~/.var/app/*/config/{parts[4]}/ holds browser profile "
+                f"credentials or key material")
     name = p.name.lower()
+    # The app's own settings.json holds the calendar's bearer-token URLs, so
+    # it is a credential store like the rest — denied under the app config
+    # dir at either spelling of it (the caller judges expanded AND resolved).
+    if name == 'settings.json':
+        for base in (_dep().CONFIG_DIR, CONFIG_DIR):
+            try:
+                if p.is_relative_to(Path(base).expanduser()):
+                    # refusal: secret_app_settings
+                    return ("handsoff's own settings.json — it holds the "
+                            "calendar's bearer-token URLs")
+            except (OSError, RuntimeError, ValueError):
+                continue
     if (len(p.parts) >= 3 and p.parts[0] == p.anchor and p.parts[1] == "proc"
             and name in _PROC_GENERATED_SECRETS):
         # refusal: secret_generated_by_the_kernel
@@ -1531,6 +1590,7 @@ class ToolBelt:
                 self._tool_times.append(now)
         fn = self._tool_methods().get(name)
         if fn is None:
+            log_decision(name, _log_target(args, 120), 'DENY', 'refused: unknown tool name')
             return ToolResult(f'unknown tool: {name}', 'error')
         gate = fn._tool_gates
         if gate and (not self._perm.get(gate, True)):
@@ -1540,7 +1600,12 @@ class ToolBelt:
             verdict = 'ALLOW'
         else:
             verdict = self._policy.classify(name)
-        if name in ('run_command', 'start_command') and Path(str(args.get('command', '')).split(' ', 1)[0]).name == 'cargo' and (verdict != 'DENY'):
+        # Cargo-ness is judged the way the exec will judge it — stripped,
+        # shlex-parsed argv[0] — not the raw string: ' cargo build' and
+        # 'cargo\tbuild' both reach cargo, while neither has 'cargo' as the
+        # first raw whitespace token, so the CONFIRM floor keyed on the raw
+        # token let a build.rs (arbitrary code) run unconfirmed.
+        if name in ('run_command', 'start_command') and _lead_exe(args.get('command', '')) == 'cargo' and (verdict != 'DENY'):
             verdict = 'CONFIRM'
         if name == 'edit_file' and verdict != 'DENY' and (getattr(self, '_confirm_running', None) != name) and self._self_edit_needs_confirm(args):
             verdict = 'CONFIRM'
@@ -1561,6 +1626,16 @@ class ToolBelt:
                               and live.get('turn') == marker),
                 self._policy.confirm_seconds(),
                 tool=name, args=dict(args), turn=marker)
+            if not armed:
+                # The offer must describe the call 'yes' will actually run —
+                # the ARMED payload, not this invocation: a second call in the
+                # same turn does not re-arm, so rendering the offer (and the
+                # self-edit diff) from `args` could show the user content B
+                # while their yes writes content A.
+                live, _expired = self._pending_confirm.state()
+                if live and isinstance(live.get('args'), dict):
+                    args = dict(live['args'])
+                    target = _log_target(args) if args else ''
             log_decision(name, target, 'CONFIRM',
                          'offered; awaiting confirm_action' if armed
                          else 'still awaiting confirm_action')
@@ -1575,10 +1650,23 @@ class ToolBelt:
                     _split_name = 'split module'
                 extra = f'\nDIFF PREVIEW (proposed change to {_split_name}):\n' + self._split_edit_preview(args)
             return ToolResult(f"CONFIRM REQUIRED: about to call '{name}' with {target or 'no arguments'}. Nothing happened yet. The user must hear this offer and reply; call confirm_action(answer='yes') in the NEXT turn to run it, or confirm_action(answer='no') to cancel." + extra, 'confirm')
-        dry_run = setting_flag('dry_run') and DecisionPolicy.is_desktop_action(name)
+        dry_run = setting_flag('dry_run') and (
+            DecisionPolicy.is_desktop_action(name)
+            or name in DecisionPolicy.DRY_RUN_STATE_CHANGERS)
         if dry_run:
             log_decision(name, target, 'DRY-RUN', 'reported; nothing executed')
-            return ToolResult(f"DRY-RUN: {name} would run with {target or 'no arguments'}. Nothing was executed (dry_run is enabled in settings). Describe the plan to the user and stop.", 'dry-run')
+            extra = ''
+            if name == 'edit_file' and self._is_self_edit(args):
+                extra = ('\nDIFF PREVIEW (proposed change to handsoff.py, '
+                         'not applied):\n' + self._self_edit_preview(args))
+            elif name == 'edit_file' and self._edit_confirm_kind(args) == 'split':
+                try:
+                    _split_name = Path(str(args.get('path') or '')).expanduser().name
+                except (OSError, RuntimeError, ValueError):
+                    _split_name = 'split module'
+                extra = (f'\nDIFF PREVIEW (proposed change to {_split_name}, '
+                         'not applied):\n' + self._split_edit_preview(args))
+            return ToolResult(f"DRY-RUN: {name} would run with {target or 'no arguments'}. Nothing was executed (dry_run is enabled in settings). Describe the plan to the user and stop." + extra, 'dry-run')
         log_decision(name, target, verdict if verdict != 'CONFIRM' else 'ALLOW', 'dispatched')
         alias_map = fn._tool_aliases
         sig = inspect.signature(fn)
@@ -2278,6 +2366,10 @@ class ToolBelt:
         """
         argv, exe_base, err, is_restart = self._validate_command(command)
         if err:
+            # The dispatch above already logged ALLOW: say the refusal too, or
+            # the ledger shows a command that ran.
+            log_decision('run_command', _log_target({'command': str(command)}, 120),
+                         'DENY', f'refused: {str(err)[:120]}')
             return err
         exe = argv[0]
         if is_restart:
@@ -2456,7 +2548,11 @@ class ToolBelt:
         except Exception:
             pass
         return None
-    _TERMINAL_MARKERS = ('terminal', 'konsole', 'alacritty', 'kitty', 'foot', 'xterm', 'urxvt', 'wezterm', 'warp', 'ghostty', 'stterm', 'st-', 'tilix', 'terminator', 'qterminal', 'gnome-terminal', 'xfce4-terminal', 'ptyxis', 'console')
+    _TERMINAL_MARKERS = ('terminal', 'konsole', 'alacritty', 'kitty', 'foot', 'xterm', 'urxvt', 'wezterm', 'warp', 'ghostty', 'stterm', 'st-', 'tilix', 'terminator', 'qterminal', 'gnome-terminal', 'xfce4-terminal', 'ptyxis', 'console', 'guake', 'yakuake', 'com.raggesilver.blackbox')
+    # 'st' is matched EXACTLY, never as a substring: 'weston', 'steam' and
+    # 'gnome-settings' all contain the letters, and a substring hit would
+    # refuse typing into every app whose id merely carries them.
+    _TERMINAL_EXACT = frozenset({'st'})
     _TERMINAL_PANEL_MARKERS = ('terminal', 'output', 'repl')
     # Chars injected between focus re-verifications: the window in which focus
     # could change mid-type. A safety knob, not an implementation detail.
@@ -2487,7 +2583,8 @@ class ToolBelt:
         """App-id/title of window `w` if it looks like a terminal, else None."""
         app_id = str(w.get('app_id', '') or '').lower()
         title = str(w.get('title', '') or '').lower()
-        if any((t in app_id for t in cls._TERMINAL_MARKERS)):
+        if any((t in app_id for t in cls._TERMINAL_MARKERS)) \
+                or app_id.strip() in cls._TERMINAL_EXACT:
             return app_id or title
         if any((t in title for t in cls._TERMINAL_PANEL_MARKERS)):
             return (app_id or title or 'unknown-window') + ' (terminal panel)'
@@ -2613,15 +2710,17 @@ class ToolBelt:
         """Best-effort check that a Super chord is bound in niri config.
 
         Follows `include "..."` lines from config.kdl (binds live in
-        cfg/keybinds.kdl). True when found OR the config is unreadable
-        (legacy allow). False only when readable config lacks the chord
-        (it would reach the focused app).
+        cfg/keybinds.kdl). True when found. False when the config is
+        unreadable OR readable config lacks the chord: the caller then keeps
+        the terminal gate active, because a chord niri does not intercept
+        reaches the focused app — and an unreadable config is exactly the
+        case where we cannot claim niri will intercept it.
         """
         try:
             base = (_dep().HOME / '.config/niri').resolve()
             texts: list[str] = [(base / 'config.kdl').read_text(encoding='utf-8').lower()]
         except OSError:
-            return True
+            return False
         try:
             seen: set[str] = set()
             for m in re.findall('include\\s+"([^"]+)"', texts[0]):
@@ -2880,7 +2979,17 @@ class ToolBelt:
                     position = 0
                 if size == position:
                     continue
-                with path.open('r', encoding='utf-8', errors='replace') as fh:
+                # Re-judge the denylist and refuse a symlink swap EVERY poll:
+                # the check at start time cannot see a racer who replaces the
+                # watched file with a link into a secret store between polls.
+                denied = denied_secret_path(path)
+                if denied:
+                    emit(f'file watcher stopped: {path.name} — {denied}')
+                    return
+                # O_NOFOLLOW: a symlink swapped in for the final component
+                # fails the open instead of being followed.
+                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'r',
+                               encoding='utf-8', errors='replace') as fh:
                     fh.seek(position)
                     chunk = fh.read(min(size - position, 128000))
                 # Bounded evaluation: the pattern is data we do not control, so
@@ -4012,6 +4121,10 @@ class ToolBelt:
             proc = subprocess.run(argv + tail + [str(path)], capture_output=True, text=True, timeout=15)
             if proc.returncode != 0 or not path.exists():
                 return 'ERROR: screenshot failed: ' + (proc.stderr or 'unknown').strip()[:200]
+            # The most recent image of the user's screen skips
+            # atomic_private_write (grim writes the path itself), so it is
+            # tightened here instead of landing 0644 in a 0755 directory.
+            os.chmod(path, 0o600)
         except FileNotFoundError:
             return 'ERROR: grim is not installed (pacman -S grim)'
         except subprocess.TimeoutExpired:
@@ -4182,6 +4295,16 @@ class ToolBelt:
             return 'Cancelled — nothing was stopped.'
         pid, name = (claimed['pid'], claimed['name'])
         try:
+            live = Path(f'/proc/{pid}/comm').read_text(
+                encoding='utf-8', errors='replace').strip()
+        except OSError:
+            live = ''
+        if live and live.lower() != str(name).lower():
+            # refusal: confirm_kill_pid_reused
+            return (f'ERROR: pid {pid} now runs {live!r}, not the offered '
+                    f'{name!r} — the pid was recycled in the confirmation '
+                    f'window; run kill_process again')
+        try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             return f'{name} (pid {pid}) already exited.'
@@ -4307,6 +4430,10 @@ class ToolBelt:
         with slot:
             argv, _exe, err, is_restart = self._validate_command(command)
             if err:
+                # Same ledger duty as run_command: the dispatch line said
+                # ALLOW, so the refusal has to be on the record too.
+                log_decision('start_command', _log_target({'command': str(command)}, 120),
+                             'DENY', f'refused: {str(err)[:120]}')
                 return err
             if is_restart:
                 # Same reason as run_command: the job is DETACHED from the
@@ -4563,7 +4690,12 @@ class ToolBelt:
         chosen = a
         for cand in candidates:
             cand = re.sub('[^a-z0-9._-]', '', cand)
-            if not cand or cand in ('sudo', 'bash', 'sh', 'python', 'python3', 'xterm'):
+            # The same company the niri-spawn route keeps: every interpreter
+            # and every blocklisted name, plus xterm as before — open_app can
+            # carry no arguments, but launching an interpreter unprompted is
+            # still not the tool's job.
+            if not cand or cand in self._INTERPRETERS or cand in self.BLOCKED \
+                    or cand == 'xterm':
                 return f"REFUSED: won't open '{app}'"
             resolved = shutil.which(cand)
             if resolved:
@@ -4666,7 +4798,16 @@ class ToolBelt:
             # refusal: read_of_a_directory
             return 'ERROR: path is a directory, not a file'
         try:
-            data = p.read_bytes()
+            st = p.stat()
+            if not stat.S_ISREG(st.st_mode):
+                # refusal: read_refuses_a_special_file
+                return (f'ERROR: {p} is not a regular file — FIFOs and devices '
+                        f'have no end, and reading one would hang this turn forever')
+            # Bounded read: a char is at most 4 UTF-8 bytes, so this always
+            # fills the MAX_READ truncation below without ever loading a
+            # multi-GB file (or /dev/zero) whole.
+            with p.open('rb') as fh:
+                data = fh.read(self.MAX_READ * 4 + 16)
         except OSError as e:
             # refusal: read_error_is_reported
             return f'ERROR: cannot read {p}: {e}'

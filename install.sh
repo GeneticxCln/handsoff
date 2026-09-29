@@ -436,9 +436,14 @@ for rel in sorted(files):
     print(rel)
 PY_EOF
 )"
-        for rel in $_manifest_files; do
-            rm -f "$BIN_DIR/$rel" && _deployed=1
-        done
+        # -r + one name per line: a manifest path with a space must arrive as
+        # ONE name, not be word-split and rm'd as fragments.
+        while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            rm -f -- "$BIN_DIR/$rel" && _deployed=1
+        done <<EOF_MANIFEST
+$_manifest_files
+EOF_MANIFEST
     fi
     if [ "$_deployed" = "0" ]; then
         # No manifest (an older install, or it was removed): fall back to the
@@ -730,15 +735,18 @@ STAGED_PY+=("$STAGE_DIR"/core/*.py)
 # --- save the currently-deployed set as the rollback target
 HAD_PREV=0
 if [ -f "$BIN_DIR/handsoff.py" ]; then
-    rm -rf "$PREV_DIR.staging" "$PREV_DIR"
-    mkdir -p "$PREV_DIR.staging/core"
+    # mktemp, not a fixed .staging path: the stage dir above is unique
+    # precisely because two installs can run at once, and a fixed staging
+    # name let them corrupt each other's rollback target.
+    PREV_STAGING="$(mktemp -d "$RELEASES_DIR/.prev-staging.XXXXXX")"
+    mkdir -p "$PREV_STAGING/core"
     # Save the deployed copy of every file we ship — taken from the stage's own
     # list, so an unrelated .py a user keeps in ~/.local/bin is never swept into
     # prev and then restored over something later.
     for f in "$STAGE_DIR"/*.py "$STAGE_DIR/handsoff-restart" \
              "$STAGE_DIR/handsoff-stop-probe"; do
         base="$(basename "$f")"
-        [ -f "$BIN_DIR/$base" ] && cp -p "$BIN_DIR/$base" "$PREV_DIR.staging/$base"
+        [ -f "$BIN_DIR/$base" ] && cp -p "$BIN_DIR/$base" "$PREV_STAGING/$base"
     done
     # Driven by the STAGED set, not by a sweep of $BIN_DIR/core: the same
     # reason the switch above is built from the stage. A glob over the
@@ -748,9 +756,12 @@ if [ -f "$BIN_DIR/handsoff.py" ]; then
     for f in "$STAGE_DIR"/core/*.py; do
         base="$(basename "$f")"
         [ -f "$BIN_DIR/core/$base" ] \
-            && cp -p "$BIN_DIR/core/$base" "$PREV_DIR.staging/core/$base"
+            && cp -p "$BIN_DIR/core/$base" "$PREV_STAGING/core/$base"
     done
-    mv "$PREV_DIR.staging" "$PREV_DIR"
+    rm -rf "${PREV_DIR}.old"
+    [ -e "$PREV_DIR" ] && mv "$PREV_DIR" "${PREV_DIR}.old"
+    mv "$PREV_STAGING" "$PREV_DIR"
+    rm -rf "${PREV_DIR}.old"
     HAD_PREV=1
 fi
 # --- the switch: install staged files; any failure restores the previous set
@@ -807,6 +818,11 @@ if [ "$REHEARSAL" = "1" ]; then
     printf 'rehearsal placeholder\n' > "$CONF_DIR/whisper-model/rehearsal.txt"
     WHISPER_RESOLVED_REVISION="$WHISPER_REVISION"
 else
+    # A failure here used to kill the script under set -e — AFTER the switch
+    # in [4/8] — leaving the new code live, deployment.json stale and the
+    # unit unwritten, with exit 1 claiming the install failed. The install
+    # IS done at this point; provisioning is what failed: warn and continue
+    # (the bubble downloads on first use; re-run install.sh to retry now).
     WHISPER_RESOLVED_REVISION="$(${PYBIN} - "$WHISPER_SIZE" "$CONF_DIR/whisper-model" "$WHISPER_REVISION" <<'PY_EOF'
 import sys
 from faster_whisper import utils
@@ -824,18 +840,25 @@ except Exception:
     pass
 print(resolved)
 PY_EOF
-)"
+)" || WHISPER_RESOLVED_REVISION=""
     if [ -z "$WHISPER_RESOLVED_REVISION" ]; then
         WHISPER_RESOLVED_REVISION="$WHISPER_REVISION"
+        echo "    WARN: whisper download failed — the bubble downloads it on" >&2
+        echo "    first use; re-run install.sh to retry now" >&2
     fi
 fi
 echo "whisper model ready"
 # faster-whisper fetches via huggingface_hub (content-hashed blobs, verified
 # on download) — like the speech weights, there is no separate sha256 to check.
-# Fail loudly on an empty cache instead of booting deaf on a partial fetch.
-if [ -z "$(ls -A "$CONF_DIR/whisper-model" 2>/dev/null)" ]; then
-    echo "    FATAL: whisper model download produced no files in $CONF_DIR/whisper-model" >&2
-    exit 1
+# A cache holding NOTHING — or `.incomplete` blobs only, huggingface_hub's
+# mid-flight names — must not read as ready: counting them skipped a 3.8 GB
+# download while doctor swore the model was provisioned. A missing snapshot
+# warns rather than FATALs: the switch already happened, and exit 1 here
+# would claim the INSTALL failed when only the provisioning did.
+if [ "$REHEARSAL" != "1" ] \
+    && ! ls "$CONF_DIR/whisper-model"/snapshots/*/* 2>/dev/null | grep -qv '\.incomplete$'; then
+    echo "    WARN: no usable whisper snapshot in $CONF_DIR/whisper-model —" >&2
+    echo "    the bubble downloads it on first use; re-run install.sh to retry now" >&2
 fi
 
 # Deployment manifest: which checkout state produced the installed copy, per
@@ -845,6 +868,16 @@ mkdir -p "$CONF_DIR"
 sha_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}' || echo null; }
 atomic_write() {
     local dest="$1" mode="$2" tmp
+    # rename(2) replaces the SYMLINK itself, not its target: a config managed
+    # by stow/chezmoi would silently stop receiving writes, and the next
+    # `stow`/`git pull` would wipe the installed file for a standalone one.
+    # Follow the link to the real target before staging.
+    if [ -L "$dest" ]; then
+        dest="$(readlink -f "$dest")" || {
+            echo "FATAL: could not resolve $dest" >&2
+            return 1
+        }
+    fi
     tmp="$(mktemp "${dest}.tmp.XXXXXX")" || {
         echo "FATAL: could not stage $dest" >&2
         return 1
@@ -968,7 +1001,12 @@ echo "==> [6/8] Speech weights ($TTS_REPO)"
 if [ "$REHEARSAL" = "1" ]; then
     echo "    skipping speech weights (rehearsal)"
 else
-    "${PYBIN}" - "$TTS_REPO" <<'PY_EOF'
+    # The fetch's FATALs are caught and downgraded: a failed download used
+    # to kill the script under set -e AFTER the switch, claiming the install
+    # failed while the new code was already live. The bubble downloads the
+    # weights on first use; re-running install.sh retries now.
+    TTS_FETCH_FAILED=0
+    "${PYBIN}" - "$TTS_REPO" <<'PY_EOF' || TTS_FETCH_FAILED=1
 import os
 import sys
 from pathlib import Path
@@ -1033,10 +1071,30 @@ if not snapshot_ok(root):
         f"network or proxy, then re-run install.sh.")
 print(f"    speech weights ready: {root}")
 PY_EOF
+    if [ "$TTS_FETCH_FAILED" = "1" ]; then
+        echo "    WARN: speech weights not provisioned — the bubble downloads" >&2
+        echo "    them on first use; re-run install.sh to retry now" >&2
+    fi
 fi
 
 echo "==> [7/8] systemd user service (auto-restart if the bubble dies)"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
+# Validate what the unit is about to bake in: systemd refuses a RELATIVE
+# ExecStart outright (the unit then churns under Restart=always into a
+# start-limit failure), and a HOME with whitespace splits the ExecStart word.
+case "$PYBIN" in
+    /*) ;;
+    *)
+        echo "    WARN: HANDSOFF_PYTHON='$PYBIN' is relative — systemd refuses a" >&2
+        echo "    relative ExecStart. Set an absolute interpreter and re-run." >&2
+        ;;
+esac
+case "$HOME" in
+    *[[:space:]]*)
+        echo "    WARN: HOME ('$HOME') contains whitespace — the generated" >&2
+        echo "    ExecStart line will split; the unit may fail to start" >&2
+        ;;
+esac
 mkdir -p "$SYSTEMD_DIR"
 atomic_write "$SYSTEMD_DIR/handsoff.service" 644 <<UNIT_EOF
 [Unit]
@@ -1314,6 +1372,14 @@ niri_strip_blocks() {
         legacy && /^\}/     { legacy = 0; next }
         legacy               { next }
                             { print }
+        END {
+            # A begin marker with no end marker means the file ends INSIDE
+            # our block — truncated, or half-edited by hand. Everything after
+            # the begin marker is user content we cannot see the end of:
+            # failing (rc 3) is the only safe answer, or the merge silently
+            # deletes all of it.
+            if (skip) exit 3
+        }
     ' "$1"
 }
 # Whether anything of ours is still in the file OUTSIDE the marked block — i.e.
@@ -1412,6 +1478,12 @@ niri_merge_rule() {
     # for an empty result the presence of a begin marker is what explains it.
     strip_rc=0
     kept="$(niri_strip_blocks "$target")" || strip_rc=$?
+    if [ "$strip_rc" -eq 3 ]; then
+        echo "     WARN: $target has a handsoff begin marker with no end marker." >&2
+        echo "     The file may be truncated or half-edited; not touching it." >&2
+        echo "     Fix the block by hand or restore $bak, then re-run install.sh." >&2
+        return 1
+    fi
     if [ "$strip_rc" -ne 0 ]; then
         echo "     WARN: could not read the block structure of $target; not touching the config" >&2
         return 1

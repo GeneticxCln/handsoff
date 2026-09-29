@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import calendar
 import datetime
+import logging
 import re
 import urllib.parse
 import urllib.request
 import zoneinfo
 from pathlib import Path
+
+# Same logger name as every other core module, so a calendar whose events are
+# dropped lands in handsoff.log beside everything else.
+log = logging.getLogger("handsoff")
 
 _HTTP_UA = "handsoff/1.0 (local voice assistant)"
 
@@ -93,27 +98,80 @@ def _ics_unfold(text: str) -> list[str]:
     return lines
 
 
-def _ics_parse_dt(prop: str) -> "datetime.datetime | None":
-    """Parse a DTSTART/DTEND property → local datetime (None on garbage).
+def _ics_tzid(tzid: str) -> "zoneinfo.ZoneInfo | None":
+    """The zone a TZID names, or None when no tzdata on this system matches it.
 
-    Handles 'YYYYMMDDTHHMMSSZ' (UTC), ';TZID=…' (zoneinfo), floating local
-    time, and all-day 'VALUE=DATE' / 8-digit dates (local midnight)."""
-    if ":" not in prop:
+    Two real-world spellings beyond a plain IANA name land here, and both used
+    to drop their whole event: the QUOTED form Outlook emits
+    (``DTSTART;TZID="America/New_York":…``) and Mozilla's globally-unique form
+    (``/mozilla.org/20070129_1/America/New_York`` — every Thunderbird export),
+    whose ``/<vendor>/<version>/`` prefix RFC 5545 allows and whose zone is
+    everything after the SECOND slash. A name no zoneinfo matches still returns
+    None: the caller decides what a skip costs.
+    """
+    name = str(tzid or "").strip().strip('"').strip()
+    if name.startswith("/"):
+        parts = name.split("/")
+        if len(parts) >= 4:      # '', vendor, version, the zone (may hold /)
+            name = "/".join(parts[3:])
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (ValueError, zoneinfo.ZoneInfoNotFoundError):
         return None
+
+
+def _ics_parse_dt_checked(prop: str) -> "tuple[datetime.datetime | None, bool]":
+    """(datetime, zone_failed) for a DTSTART/DTEND/… property value.
+
+    `zone_failed` is True only when the value is a well-formed datetime that
+    fails for the ONE reason a correct producer can still produce: its TZID
+    names a zone this system has no tzdata for. That is the skip
+    `ics_events_from_text` counts and reports — a lost meeting must be
+    distinguishable in the journal from a garbage line.
+
+    The datetime comes back in the frame the property itself names — UTC for
+    the Z form, its TZID zone otherwise, the system's local zone only for a
+    floating time. Recurrence arithmetic happens IN that frame (RFC 5545's
+    recurring wall time), and every comparison against another aware datetime
+    is instant-based, so the frame costs nothing at a boundary and keeps the
+    event's own wall clock across DST and across zones.
+    """
+    if ":" not in prop:
+        return None, False
     head, _, value = prop.partition(":")
     value = value.strip()
     params = dict(p.split("=", 1) for p in head.split(";")[1:] if "=" in p)
     try:
         if params.get("VALUE") == "DATE" or re.fullmatch(r"\d{8}", value):
-            return datetime.datetime.strptime(value[:8], "%Y%m%d").astimezone()
+            return datetime.datetime.strptime(value[:8], "%Y%m%d").astimezone(), False
         dt = datetime.datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
         if value.endswith("Z"):
             dt = dt.replace(tzinfo=datetime.timezone.utc)
         elif (tzid := params.get("TZID")):
-            dt = dt.replace(tzinfo=zoneinfo.ZoneInfo(tzid))
-        return dt.astimezone()
+            zone = _ics_tzid(tzid)
+            if zone is None:
+                return None, True
+            dt = dt.replace(tzinfo=zone)
+        elif dt.tzinfo is None:
+            # A floating time names no zone, so it keeps the system's own —
+            # the interpretation it always had (aware comparisons below
+            # refuse a naive datetime outright).
+            dt = dt.astimezone()
+        return dt, False
     except (ValueError, zoneinfo.ZoneInfoNotFoundError):
-        return None
+        return None, False
+
+
+def _ics_parse_dt(prop: str) -> "datetime.datetime | None":
+    """Parse a DTSTART/DTEND property → aware datetime (None on garbage).
+
+    Handles 'YYYYMMDDTHHMMSSZ' (UTC), ';TZID=…' (zoneinfo — including the
+    quoted and Mozilla-prefixed spellings real producers emit), floating local
+    time, and all-day 'VALUE=DATE' / 8-digit dates (local midnight). The
+    datetime keeps the frame the property named; see
+    `_ics_parse_dt_checked` for the why and for the zone-failure signal."""
+    dt, _ = _ics_parse_dt_checked(prop)
+    return dt
 
 
 def _ics_allday(prop: str) -> bool:
@@ -176,6 +234,14 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
     instance count including DTSTART; instances before DTSTART do not
     exist. BYSETPOS and friends remain an honest single-occurrence
     fallback, not silent data loss.
+
+    The arithmetic runs in DTSTART'S OWN FRAME (UTC for the Z form, its
+    TZID zone otherwise): an aware datetime plus a timedelta is wall-clock
+    arithmetic in the zone it carries, which is what a recurring wall time
+    means — so a Z-encoded DAILY rule holds its UTC instant across DST and
+    a TZID rule holds its local wall time even when the system's zone (and
+    therefore the window's) differs. Every boundary check below compares
+    aware datetimes, which is instant-based and frame-independent.
     """
     one = [dtstart] if dtstart < win_end and dtstart + dur > win_start else []
     if not rrule:
@@ -328,34 +394,75 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                 if not m_ or m_.group(2) not in wd:
                     return one   # ordinal-less BYDAY in MONTHLY: fallback
                 nth_days.append((int(m_.group(1)), wd[m_.group(2)]))
-        m = 0
-        while m < 240 and k < count:
-            base = _ics_add_months(dtstart, m * interval)
-            if base > win_end:
-                break
+        # BYMONTHDAY parsed ONCE, before the jump: the not-a-number refusal
+        # used to live inside the month loop and fires on the same first bad
+        # value either way, but the candidates helper below wants numbers.
+        month_numbers: "list[int] | None" = None
+        if not nth_days and monthday:
+            month_numbers = []
+            for s_ in monthday.split(","):
+                try:
+                    month_numbers.append(int(s_))
+                except ValueError:
+                    return one
+
+        def month_candidates(year: int, month: int) -> list:
+            """The rule's occurrences inside one month, at DTSTART's time."""
             cands: list = []
             if nth_days:
                 for nth, day in nth_days:
-                    t = _ics_nth_weekday(base.year, base.month, nth, day,
-                                         dtstart)
+                    t = _ics_nth_weekday(year, month, nth, day, dtstart)
                     if t:
                         cands.append(t)
-            elif monthday:
-                for s_ in monthday.split(","):
-                    try:
-                        n = int(s_)
-                    except ValueError:
-                        return one
-                    t = _ics_month_day(base.year, base.month, n, dtstart)
+            elif month_numbers is not None:
+                for n in month_numbers:
+                    t = _ics_month_day(year, month, n, dtstart)
                     if t:
                         cands.append(t)
             else:
                 # RFC: no BY* -> repeat DTSTART's day-of-month; months
                 # lacking that day (31st in February) have no occurrence.
-                t = _ics_month_day(base.year, base.month, dtstart.day, dtstart)
+                t = _ics_month_day(year, month, dtstart.day, dtstart)
                 if t:
                     cands.append(t)
-            for t in sorted(cands):
+            return cands
+
+        m = 0
+        # Jump straight to the window — the DAILY/WEEKLY family: stepping from
+        # DTSTART one interval at a time burned the 240-month cap on months
+        # nobody asked about, so a monthly event created in 2000 and queried in
+        # 2026 enumerated 20 years and returned no events at all for a meeting
+        # that still happens every month. The first interval step that could
+        # still overlap the window is derived arithmetically (one step early,
+        # because a month's candidates can sit anywhere inside it).
+        anchor = win_start - dur
+        if anchor > dtstart:
+            months_ahead = (anchor.year - dtstart.year) * 12 \
+                + (anchor.month - dtstart.month)
+            if months_ahead > 0:
+                m = max(0, months_ahead // interval - 1)
+                # COUNT IS COUNTED FROM DTSTART, INCLUDING THE SKIPPED MONTHS —
+                # the same correction the WEEKLY jump makes in weeks. Every
+                # candidate in a skipped month is after DTSTART (they all sit
+                # in a later month), so the loop below would have incremented
+                # `k` for each; crediting the same count keeps COUNT's RFC
+                # meaning (total instances since DTSTART, incl. DTSTART).
+                for step in range(m):
+                    skipped = _ics_add_months(dtstart, step * interval)
+                    k += len(month_candidates(skipped.year, skipped.month))
+        # Caps the WORK, not the distance from DTSTART (the jump put the
+        # window in reach): every interval step the window itself spans, plus
+        # the step the jump may have landed early and the one the window's
+        # own first candidate can sit past — with the old 240 kept as the
+        # absolute backstop a pathological rule can never exceed.
+        span = ((win_end.year - anchor.year) * 12
+                + (win_end.month - anchor.month))
+        m_cap = m + max(1, min(span // interval + 3, 240))
+        while m < m_cap and k < count:
+            base = _ics_add_months(dtstart, m * interval)
+            if base > win_end:
+                break
+            for t in sorted(month_candidates(base.year, base.month)):
                 if k >= count:      # same mid-batch cap as WEEKLY's days
                     break
                 k += 1
@@ -372,21 +479,25 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                 return one
             months.append(int(x))
         monthday = parts.get("BYMONTHDAY", "").strip()
-        y = 0
-        while y < 20 and k < count:
-            year = dtstart.year + y * interval
-            if year > win_end.year:
-                break
+        # Parsed once, before the jump (see the MONTHLY branch): a value that
+        # is not a number is the same refusal it always was.
+        month_numbers: "list[int] | None" = None
+        if monthday:
+            month_numbers = []
+            for s_ in monthday.split(","):
+                try:
+                    month_numbers.append(int(s_))
+                except ValueError:
+                    return one
+
+        def year_candidates(year: int) -> list:
+            """The rule's occurrences inside one year, at DTSTART's time."""
             cands: list = []
             for mo in months or [dtstart.month]:
                 if not 1 <= mo <= 12:
                     continue
-                if monthday:
-                    for s_ in monthday.split(","):
-                        try:
-                            n = int(s_)
-                        except ValueError:
-                            return one
+                if month_numbers is not None:
+                    for n in month_numbers:
                         t = _ics_month_day(year, mo, n, dtstart)
                         if t:
                             cands.append(t)
@@ -395,7 +506,32 @@ def _ics_expand(dtstart: "datetime.datetime", rrule: str,
                         cands.append(dtstart.replace(year=year, month=mo))
                     except ValueError:
                         pass   # Feb 29 in a non-leap year: no occurrence
-            for t in sorted(cands):
+            return cands
+
+        y = 0
+        # Jump straight to the window — the same family as DAILY/WEEKLY/
+        # MONTHLY: a yearly event created in 1990 enumerated its 20-year cap
+        # on years nobody asked about and returned no events at all.
+        anchor = win_start - dur
+        if anchor > dtstart:
+            years_ahead = anchor.year - dtstart.year
+            if years_ahead > 0:
+                y = max(0, years_ahead // interval - 1)
+                # COUNT IS COUNTED FROM DTSTART (the WEEKLY/MONTHLY
+                # correction): every candidate in a skipped year is in a
+                # later year than DTSTART's, so the loop below would have
+                # counted each one.
+                for step in range(y):
+                    k += len(year_candidates(dtstart.year + step * interval))
+        # Caps the WORK, not the distance from DTSTART: the years the window
+        # itself spans, plus slack — the old 20 kept as the absolute backstop.
+        span = win_end.year - anchor.year
+        y_cap = y + max(1, min(span // interval + 2, 20))
+        while y < y_cap and k < count:
+            year = dtstart.year + y * interval
+            if year > win_end.year:
+                break
+            for t in sorted(year_candidates(year)):
                 if k >= count:      # same mid-batch cap as WEEKLY's days
                     break
                 k += 1
@@ -503,9 +639,12 @@ def ics_events_from_text(text: str, win_start: "datetime.datetime",
     raws: list[dict] = []          # every VEVENT in file order
     cur: dict | None = None
     for ln in _ics_unfold(text):
-        if ln.strip() == "BEGIN:VEVENT":
+        # Case-insensitive on purpose: RFC 5545 names are case-insensitive and
+        # real producers emit lowercase ("begin:vevent") — the old exact match
+        # read such a whole file as containing no events at all.
+        if ln.strip().upper() == "BEGIN:VEVENT":
             cur = {"EXDATE": []}
-        elif ln.strip() == "END:VEVENT":
+        elif ln.strip().upper() == "END:VEVENT":
             if cur:
                 raws.append(cur)
             cur = None
@@ -552,9 +691,12 @@ def ics_events_from_text(text: str, win_start: "datetime.datetime",
             moved.setdefault(uid, {})[when] = e
 
     events: list[dict] = []
+    zone_skips = 0
     for e in masters:
-        ds = _ics_parse_dt(e.get("DTSTART", ""))
+        ds, zone_failed = _ics_parse_dt_checked(e.get("DTSTART", ""))
         if ds is None:
+            if zone_failed:
+                zone_skips += 1
             continue
         de = _ics_parse_dt(e.get("DTEND", ""))
         dur = (de - ds) if de is not None else \
@@ -581,7 +723,11 @@ def ics_events_from_text(text: str, win_start: "datetime.datetime",
             if start in skip:
                 continue
             events.append({
-                "start": start, "dur": dur,
+                # Back to the SYSTEM frame for the answer: the recurrence was
+                # expanded in the event's own zone (the arithmetic above), and
+                # what a person asked about is their own clock — the frame
+                # this function always returned.
+                "start": start.astimezone(), "dur": dur,
                 "summary": e.get("SUMMARY") or "(no title)",
                 "location": e.get("LOCATION", ""),
                 "allday": _ics_allday(e.get("DTSTART", "")),
@@ -590,8 +736,12 @@ def ics_events_from_text(text: str, win_start: "datetime.datetime",
     # moved overrides surface at their NEW time (if inside the window)
     for bywhen in moved.values():
         for ov in bywhen.values():
-            ods = _ics_parse_dt(ov.get("DTSTART", ""))
-            if ods is None or not (win_start <= ods < win_end):
+            ods, ov_zone_failed = _ics_parse_dt_checked(ov.get("DTSTART", ""))
+            if ods is None:
+                if ov_zone_failed:
+                    zone_skips += 1
+                continue
+            if not (win_start <= ods < win_end):
                 continue
             ode = _ics_parse_dt(ov.get("DTEND", ""))
             odur = (ode - ods) if ode is not None else \
@@ -599,11 +749,19 @@ def ics_events_from_text(text: str, win_start: "datetime.datetime",
             if odur <= datetime.timedelta(0):
                 odur = datetime.timedelta(hours=1)
             events.append({
-                "start": ods, "dur": odur,
+                "start": ods.astimezone(), "dur": odur,
                 "summary": ov.get("SUMMARY") or "(no title)",
                 "location": ov.get("LOCATION", ""),
                 "allday": _ics_allday(ov.get("DTSTART", "")),
             })
+    if zone_skips:
+        # An event dropped here used to vanish without a trace: the line was
+        # valid, its zone just is not in this system's tzdata (a thin
+        # container, a moved install). One warning naming the count is the
+        # honest signal — silent loss read as "no events today".
+        log.warning(
+            "calendar: %d event(s) skipped — their TZID names a zone this "
+            "system has no tzdata for", zone_skips)
     return events
 
 

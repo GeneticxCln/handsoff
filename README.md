@@ -179,17 +179,22 @@ only while it is up. Measured against the routing in `core/web.py`:
 
 | tool | where it goes | what it sends |
 |---|---|---|
-| `web_search`, general or news | SearXNG → `lite.duckduckgo.com` → `en.wikipedia.org` | your query text |
-| `web_search`, a question containing "error", "api", "pip", "docker", "python"… | `api.stackexchange.com` **first** — SearXNG is the 4th fallback | your query text |
-| `web_search`, a question containing "repo", "github", "changelog"… | `api.github.com` **first** | your query text |
+| `web_search`, general | SearXNG → `lite.duckduckgo.com` → `en.wikipedia.org` | your query text |
+| `web_search`, news-shaped ("news", "today", "price"…) | SearXNG → `lite.duckduckgo.com` → `hn.algolia.com` → `en.wikipedia.org` | your query text |
+| `web_search`, a question containing "error", "api", "pip", "docker", "python"… (checked before the repo rule) | `api.stackexchange.com` → `hn.algolia.com` → `api.github.com` — SearXNG is the 4th fallback | your query text |
+| `web_search`, a question containing "repo", "github", "changelog"… and no tech word | `api.github.com` **first** | your query text |
 | `get_weather` | `geocoding-api.open-meteo.com`, then `api.open-meteo.com` | your `home_place`, then its coordinates |
 | `lookup_fact` | `en.wikipedia.org` | the thing you asked about |
 | `world_events` | `lite.duckduckgo.com` — never SearXNG | fixed queries, plus the last part of `home_place` |
 | `read_page` | the site itself | the URL, and it sees your IP. The r.jina.ai fallback is its own switch, off by default |
 
+The proactive senders — the morning briefing and the `world_warnings` poll —
+ride the same `web_access` permission the tools check, so with the knowledge
+switch off they fetch nothing at all.
+
 So a local SearXNG is worth running and is not a wall: two of the three search
 routes do not start there, every route falls through to DuckDuckGo when it is
-down, and weather, facts and world warnings always go out. It is not a complete
+down, and weather and facts go out. It is not a complete
 answer either — SearXNG queries the engines it is configured with, so an engine
 still sees the text. What it removes is *handsoff* sending it.
 
@@ -248,7 +253,7 @@ switch auto-restores); a bad self-edit has a `.bak` beside it; `./install.sh
 ```bash
 bash ci/gates.sh                     # every gate, in CI's order (~10 min)
 bash ci/gates.sh compile lint links shell    # the fast ones (seconds)
-python -m pytest tests/ -q           # 2607 tests
+python -m pytest tests/ -q           # 2740 tests
 git config core.hooksPath githooks   # then every commit runs the suite too
 ```
 
@@ -264,7 +269,7 @@ suite reads ~60% and "fails" the floor for no reason:
 ```bash
 COVERAGE_PROCESS_START="$PWD/.coveragerc" COVERAGE_FILE="$PWD/.coverage" \
   python -m pytest tests/ -q --cov=. --cov-config=.coveragerc \
-  --cov-report=term-missing --cov-fail-under=70   # 2607 tests, 86.10% measured
+  --cov-report=term-missing --cov-fail-under=70   # 2740 tests, ~86% measured
 ```
 
 CI (GitHub, mirrored gate-for-gate in `.gitlab-ci.yml`) runs the suite on

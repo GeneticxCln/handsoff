@@ -288,7 +288,10 @@ class TestDeploymentReporting:
         three of them core modules, while install.sh declared thirteen — so an
         install with no manifest compared eight files and reported `in-sync`
         while half the modules differed. Driven from the checkout, every
-        module the tree ships is compared.
+        module the tree ships is compared. (The floor now covers every core
+        module — core/voice.py included since 2026-09-28 — so this test
+        narrows the floor for its own arrangement, to keep exercising the
+        checkout-ceiling path with a module the deployment never got.)
         """
         checkout = tmp_path / "checkout"
         installed = tmp_path / "home" / ".local" / "bin"
@@ -297,6 +300,9 @@ class TestDeploymentReporting:
         installed.mkdir(parents=True)
         (checkout / ".git").mkdir()
         (checkout / "handsoff.py").write_text("# checkout\n")
+        monkeypatch.setattr(
+            H, "_DEPLOY_FILES",
+            tuple(rel for rel in H._DEPLOY_FILES if rel != "core/voice.py"))
         for rel in H._DEPLOY_FILES:
             src = checkout / rel
             src.parent.mkdir(parents=True, exist_ok=True)

@@ -43,6 +43,11 @@ log = logging.getLogger("handsoff")
 # _handsoff_stop_done finalizer (never abort a live native call from a second
 # thread).
 MIC_OPERATION_LOCK = threading.RLock()
+# How long the bounded stop's OWNER THREAD may wait for the lock before it
+# gives up. Strictly less than the default outer join (3.0 s) so the thread
+# finishes BEFORE the caller stops waiting and the turn reads as "stop
+# completed, no audio" with the wedge named, rather than as an abandonment.
+_MIC_STOP_LOCK_WAIT_S = 2.5
 _MIC_OPERATION_STATE_LOCK = threading.Lock()
 _MIC_OPERATION_OWNER = None
 
@@ -214,7 +219,17 @@ def _stop_recorder_bounded(rec, timeout: float = 3.0):
 
     def _call() -> None:
         global _MIC_OPERATION_OWNER
-        MIC_OPERATION_LOCK.acquire()
+        # The lock may be held FOREVER by a previous stop's owner wedged
+        # inside a native call — the exact case this bounded stop exists to
+        # survive. Blocking here would leak one thread per later press, so
+        # the wait is bounded and a give-up is named rather than hung.
+        if not MIC_OPERATION_LOCK.acquire(timeout=_MIC_STOP_LOCK_WAIT_S):
+            log.warning(
+                "mic operation lock still held after %.1fs — a stream stop "
+                "is wedged; this stop gives up and returns no capture",
+                _MIC_STOP_LOCK_WAIT_S)
+            box["audio"] = None
+            return
         with _MIC_OPERATION_STATE_LOCK:
             _MIC_OPERATION_OWNER = threading.current_thread()
             try:
@@ -1010,6 +1025,15 @@ def _clamp_setting(key: str, low: float, high: float, default: float) -> float:
     return min(max(value, low), high)
 
 
+#: The longest text one synthesis may be asked to speak. A cap is not style:
+#: a model loop (or a tool result) that answers with megabytes is SYNTHESIZED
+#: in full here — minutes of GPU time, a wav of hundreds of MB, and a playback
+#: the user cannot interrupt meaningfully. Spoken prose that matters fits well
+#: under this; anything longer is truncated at the boundary, the same rule the
+#: reply's other consumers (transcript, bubble) already apply to it.
+MAX_TTS_CHARS = 4000
+
+
 def synthesize(text: str, model=None) -> np.ndarray:
     """One utterance as flat int16 samples at TTS_SR, with both knobs applied.
 
@@ -1017,6 +1041,15 @@ def synthesize(text: str, model=None) -> np.ndarray:
     conditionals as mutable state, and a spoken reply can overlap the settings
     app's preview.
     """
+    text = str(text or "")
+    if len(text) > MAX_TTS_CHARS:
+        # Truncated at a sentence end below the cap when one exists — never
+        # mid-word — and logged once, so the cut is visible in the journal.
+        cut = text.rfind(".", 0, MAX_TTS_CHARS)
+        if cut < MAX_TTS_CHARS // 2:
+            cut = MAX_TTS_CHARS
+        log.warning("TTS input truncated %d -> %d chars", len(text), cut)
+        text = text[:cut]
     engine = model if model is not None else get_tts()
     with _TTS_RUN_LOCK:
         raw = engine.generate(text)
@@ -1165,6 +1198,20 @@ _level_hook_lock = threading.Lock()
 # block. The stream's own blocksize is 1024, so this adds no buffering latency.
 _PLAY_BLOCK = 1024
 
+# The INPUT has a silence watchdog and auto-recovery; the output had nothing.
+# stream.write() blocks unboundedly on a wedged output device (a USB DAC that
+# died mid-sentence, a suspended PipeWire), and _speak holds _ANNOUNCE_LOCK
+# while blocked — so one wedged write pinned the bubble in SPEAKING forever
+# and every later announce queued behind it. This is how long a write may go
+# unanswered before the monitor aborts the stream, which makes the blocked
+# write raise and the normal cleanup path run. Generous on purpose: a healthy
+# device absorbs a whole block in milliseconds, and a busy one (a laptop
+# resuming from sleep) may stall briefly without a false trip.
+OUTPUT_WATCHDOG_S = 10.0
+# The monitor's wake granularity — also the bound on how long play_wav will
+# wait for the monitor to notice `done` before joining it.
+_WATCHDOG_POLL_S = 0.1
+
 
 def set_level_hook(fn) -> None:
     """Register a callable receiving a 0..1 playback level, or None to clear."""
@@ -1189,6 +1236,13 @@ def play_wav(path: Path, cancel: threading.Event) -> None:
 
     Also feeds the playback level to the level hook so a voice-reactive bubble
     can follow what it is saying, and reports a final 0 when it stops.
+
+    Playback carries its own OUTPUT watchdog (the input has a silence one): a
+    monitor thread feeds a deadline from every SUCCESSFUL write and, when a
+    write stays unanswered for OUTPUT_WATCHDOG_S, aborts the stream so the
+    blocked write raises and the normal cleanup path runs. play_wav then
+    RETURNS with the wedge named in the journal instead of pinning the bubble
+    in SPEAKING forever — and with _ANNOUNCE_LOCK held by its caller.
     """
     with wave.open(str(path), "rb") as w:
         sr, ch = w.getframerate(), w.getnchannels()
@@ -1209,22 +1263,79 @@ def play_wav(path: Path, cancel: threading.Event) -> None:
     # at the last playback level with no more audio coming to release them) and
     # leaked the stream when start() raised after a successful construction.
     stream = None
+    # The watchdog's three signals: a successful write (kick), the monitor's
+    # verdict (wedged), and playback being over for any reason (done).
+    kick = threading.Event()
+    wedged = threading.Event()
+    done = threading.Event()
+
+    def _monitor() -> None:
+        """Feed the deadline per successful write; abort on a wedged one.
+
+        Wakes in small slices so `done` ends it promptly and the owner is
+        joined, not leaked. Cannot fire while playback advances: `idle` is
+        reset by every kick, and only a stretch with NO successful write for
+        OUTPUT_WATCHDOG_S reaches the abort."""
+        idle = 0.0
+        while True:
+            if kick.wait(_WATCHDOG_POLL_S):
+                kick.clear()
+                idle = 0.0
+            else:
+                idle += _WATCHDOG_POLL_S
+            if done.is_set():
+                return
+            if idle >= OUTPUT_WATCHDOG_S:
+                wedged.set()
+                log.warning(
+                    "audio output wedged — nothing written for %.0fs; "
+                    "aborting playback of %s", OUTPUT_WATCHDOG_S, path)
+                # abort() is what unblocks the write; close() is the belt to
+                # its braces. Either failing must not out-shout the warning.
+                for op in (getattr(stream, "abort", None),
+                           getattr(stream, "close", None)):
+                    if op is None:
+                        continue
+                    try:
+                        op()
+                    except Exception:
+                        log.exception("audio output abort failed")
+                return
+
+    monitor = threading.Thread(target=_monitor, name="output-watchdog",
+                               daemon=True)
     try:
         with portaudio_in_use():
             stream = sd.OutputStream(samplerate=sr, channels=1, dtype="int16",
                                      blocksize=1024)
             stream.start()
+            monitor.start()
             for i in range(0, len(data), _PLAY_BLOCK):
-                if cancel.is_set():
+                if cancel.is_set() or wedged.is_set():
                     break
                 block = data[i: i + _PLAY_BLOCK]
-                stream.write(block.reshape(-1, 1))
+                try:
+                    stream.write(block.reshape(-1, 1))
+                except Exception:
+                    if wedged.is_set():
+                        # The monitor already named the device wedge; the
+                        # cleanup below releases the stream. Any OTHER write
+                        # failure keeps its old, loud behaviour.
+                        break
+                    raise
+                kick.set()
                 try:
                     rms = float(np.sqrt(np.mean(block.astype(np.float32) ** 2)))
                 except Exception:
                     rms = 0.0
                 _emit_level(min(1.0, rms / scale))
     finally:
+        done.set()
+        if monitor.is_alive():
+            # Bounded: the monitor wakes in _WATCHDOG_POLL_S slices, so a
+            # healthy run joins at once; a daemon left behind would hold
+            # nothing but the (already-abandoned) stream reference.
+            monitor.join(_WATCHDOG_POLL_S * 3)
         _emit_level(0.0)
         if stream is not None:
             try:

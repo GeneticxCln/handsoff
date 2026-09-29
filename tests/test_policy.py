@@ -1766,6 +1766,11 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
             ("secret_generated_by_the_kernel", "/proc/self/environ", None),
             ("secret_by_file_name", "~/.netrc", None),
             ("secret_by_credential_pattern", "@pattern", "_a_credential_pattern"),
+            ("secret_flatpak_browser_profile",
+             "~/.var/app/com.google.Chrome/config/google-chrome/Local State", None),
+            ("secret_app_settings", "~/.config/handsoff/settings.json",
+             "_the_apps_own_settings"),
+            ("read_refuses_a_special_file", "/dev/null", None),
         ),
         # -- the SSRF guard, every entry through read_page, so the verdict the
         # model reads is the one the guard's reason became
@@ -1789,6 +1794,10 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
              "_a_redirect_to_a_refused_address"),
             ("too_many_redirects", "http://example.com/",
              "_an_endless_redirect"),
+            ("read_no_hop_seam", "http://example.com/", "_no_hop_seam_wired"),
+            ("read_hop_seam_vanished", "http://example.com/", "_the_hop_seam_vanishes"),
+            ("read_timed_out", "http://example.com/", "_the_read_is_out_of_time"),
+            ("redirect_downgrades_to_http", "https://example.com/", "_a_downgrade_to_http"),
             ("read_page_reader_hop_refused", "http://example.com/",
              "_the_reader_hop_is_refused"),
             ("read_page_nothing_readable", "http://example.com/",
@@ -1833,6 +1842,8 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
              "_an_offer_someone_else_took"),
             ("kill_permission_denied", ("confirm_kill", "yes"),
              "_the_signal_is_refused"),
+            ("confirm_kill_pid_reused", ("confirm_kill", "yes"),
+             "_a_recycled_pid"),
         ),
         # -- the desk client, every entry against a Desk built over a real
         # discovery file. The wire is scripted rather than a socket, because
@@ -1898,6 +1909,8 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
             ("a_notification_answer_is_not_a_silent_success", ("status",),
              "_a_notification_answer"),
             ("the_answer_was_not_json", ("status",), "_a_page_instead_of_json"),
+            ("the_answer_was_over_the_read_cap", ("status",),
+             "_an_answer_over_the_read_cap"),
             ("the_answer_was_not_a_json_object", ("status",),
              "_a_list_instead_of_an_object"),
             ("the_answer_had_no_result", ("status",), "_an_answer_with_no_result"),
@@ -1937,7 +1950,9 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
         def deny(self, *a, **k):
             raise OSError(13, "Permission denied")
 
-        monkeypatch.setattr(Path, "read_bytes", deny)
+        # read_file now reads through Path.open (bounded), so the seam this
+        # setup patches moved from read_bytes to open.
+        monkeypatch.setattr(Path, "open", deny)
         return str(f)
 
     def _a_binary_file(self, H, monkeypatch, tmp_path, tb):
@@ -2005,6 +2020,43 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
     def _an_endless_redirect(self, H, monkeypatch, tmp_path, subject):
         self._hop_seam(H, monkeypatch,
                        lambda n: (b"<html>ok</html>", "http://example.com/"))
+
+    def _no_hop_seam_wired(self, H, monkeypatch, tmp_path, subject):
+        web = _core_module("web")
+        monkeypatch.setattr(web, "_HTTP_HOP", None)
+        monkeypatch.setattr(web, "_HTTP_HOP_IS_FN", True)
+
+    def _the_hop_seam_vanishes(self, H, monkeypatch, tmp_path, subject):
+        web = _core_module("web")
+        monkeypatch.setattr(web, "_HTTP_HOP_IS_FN", False)
+        monkeypatch.setattr(web, "_HTTP_HOP", lambda: None)
+
+    def _the_read_is_out_of_time(self, H, monkeypatch, tmp_path, subject):
+        web = _core_module("web")
+        monkeypatch.setattr(web, "READ_DEADLINE_S", -1.0)
+        monkeypatch.setattr(web, "_resolve_host",
+                            lambda host, port: ([(4, 1, 6, "", ("93.184.216.34", 80))], ""))
+
+    def _a_downgrade_to_http(self, H, monkeypatch, tmp_path, subject):
+        web = _core_module("web")
+        monkeypatch.setattr(web, "_resolve_host",
+                            lambda host, port: ([(4, 1, 6, "", ("93.184.216.34", 80))], ""))
+        self._hop_seam(H, monkeypatch,
+                       lambda n: (b"<html>ok</html>", "http://example.com/d"))
+
+    def _a_recycled_pid(self, H, monkeypatch, tmp_path, tb):
+        """The offer names hsoff-victim, but the pid is THIS test's: its comm
+        is the interpreter, so the confirm-time re-check must refuse instead
+        of SIGTERMing an innocent process that recycled the number."""
+        import os as _os
+        H._kill_offer.arm(H.ToolBelt.KILL_CONFIRM_S,
+                          pid=_os.getpid(), name="hsoff-victim")
+
+    def _the_apps_own_settings(self, H, monkeypatch, tmp_path, subject):
+        """expanduser() follows the RUNTIME HOME; point it at the sandbox so
+        the corpus path lands inside the sandboxed CONFIG_DIR the rule
+        compares against."""
+        monkeypatch.setenv("HOME", str(H.HOME))
 
     def _the_reader_hop_is_refused(self, H, monkeypatch, tmp_path, subject):
         """Local fetch readable, reader's fetch refused.
@@ -2188,9 +2240,13 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
 
         `os.kill` is patched rather than aimed at a real root-owned pid,
         which is the version of this that would be dangerous on a machine
-        where the suite happens to run as root.
+        where the suite happens to run as root. The offered pid is THIS
+        process and the offered name its own comm, so the confirm-time
+        pid-recycling re-check (which must not fire here) passes and the
+        PermissionError is what the corpus reaches.
         """
-        self._an_armed_offer(H, monkeypatch, tmp_path, tb)
+        comm = Path(f"/proc/{os.getpid()}/comm").read_text(encoding="utf-8").strip()
+        H._kill_offer.arm(H.ToolBelt.KILL_CONFIRM_S, pid=os.getpid(), name=comm)
 
         def refused(pid, sig):
             raise PermissionError(1, "Operation not permitted")
@@ -2226,8 +2282,15 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
             def __init__(self, status, body):
                 self.status, self._body = status, body
 
-            def read(self):
-                return self._body
+            def read(self, amt=None):
+                # http.client's read(amt) returns AT MOST amt bytes — the
+                # client's `read(MAX_BODY_BYTES + 1)` relies on that to weigh
+                # an answer without buffering it whole. Honouring amt here is
+                # what lets the over-cap corpus entry reach its refusal
+                # through a fake that still shapes like the real response.
+                if amt is None:
+                    return self._body
+                return self._body[:amt]
 
         class _Conn:
             def __init__(self, host, port, timeout=None):
@@ -2381,6 +2444,15 @@ class TestToolBoundaryRefusalReachability(_ReachabilityWalk):
 
     def _a_page_instead_of_json(self, H, monkeypatch, tmp_path, desk):
         desk.wire["raw"] = b"<html>a proxy's idea of a JSON-RPC answer</html>"
+
+    def _an_answer_over_the_read_cap(self, H, monkeypatch, tmp_path, desk):
+        # One byte PAST the cap, not around it: `read(MAX_BODY_BYTES + 1)`
+        # answers cap+1 bytes for an over-cap answer, and that single extra
+        # byte is the whole distinction the refusal is built on. An exactly-
+        # at-cap answer must parse instead — that is entry
+        # `the_answer_was_not_json`'s neighbour, not this one.
+        desk_mod = _core_module("qs_desk")
+        desk.wire["raw"] = b"x" * (desk_mod.MAX_BODY_BYTES + 8)
 
     def _a_list_instead_of_an_object(self, H, monkeypatch, tmp_path, desk):
         desk.wire["raw"] = b"[1, 2, 3]"
@@ -3912,9 +3984,17 @@ class TestSecretPathGuard:
         from core.tools import denied_secret_path
         for path in ("~/handsoff.py", "/tmp/notes.txt", "/tmp/tokenizer.py",
                      "~/Documents/id_rsa_notes.md",  # a note, not a key
-                     "~/.config/handsoff/settings.json",
                      "~/.sshx/notes.txt"):            # prefix, not the dir
             assert denied_secret_path(Path(path).expanduser()) is None, path
+
+    def test_predicate_denies_the_apps_own_settings(self, H):
+        """The app's own settings.json moved to the DENIED side (audit
+        2026-09-28): it holds the calendar's bearer-token URLs, which the
+        calendar tool already treats as secrets everywhere else. It used to
+        sit in the allowed list above, which is how the hole stayed open."""
+        from core.tools import denied_secret_path
+        assert denied_secret_path(Path(H.CONFIG_DIR) / "settings.json"), \
+            "the app's own settings.json must be refused"
 
     def test_predicate_denies_a_secret_symlinked_away(self, tmp_path):
         """Resolving must not erase the name the user asked to READ.

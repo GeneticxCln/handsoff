@@ -64,7 +64,7 @@ from core import registry as _registry
 __all__ = [
     "BACKENDS", "Result", "cache_clear", "configure", "doctor_lines",
     "last_problem", "read_page", "read_results", "reader_note", "search",
-    "search_note",
+    "search_note", "world_allowed",
 ]
 
 # ----------------------------------------------------------------- limits
@@ -98,6 +98,15 @@ _HTTP_HOP_IS_FN = True
 # sends the user's target address to a third party, so the safe reading of an
 # absent seam is "off". Set by `configure(hosted_reader=...)`.
 _HOSTED_READER = None
+# The proactive world-events fetch (the host's morning briefing and world
+# warning tick) is called by the host DIRECTLY, not through the tool belt, so
+# the `web_access` permission the tools check never saw it. The gate is a
+# RESOLVER like every other seam — read per use, so a live settings save takes
+# effect on the next poll — and ABSENT means ALLOW, because the feature
+# predates the seam and a host that never wired it must keep behaving. A WIRED
+# gate that raises or answers anything but a bool is the opposite polarity: a
+# permission check that blew up must not open the door. See `world_allowed`.
+_WORLD_GATE = None
 
 
 def _warn(msg: str, *args) -> None:
@@ -132,13 +141,15 @@ def _takes_a_url(fn) -> bool:
 
 
 def configure(http_get=None, searxng_url=None, logger=None,
-              http_get_hop=None, hosted_reader=None) -> None:
+              http_get_hop=None, hosted_reader=None, world_gate=None) -> None:
     """Inject the host's seams. See the module docstring: pass resolvers.
 
     `http_get_hop` is the READER's seam: one request that does NOT follow
     redirects, returning `(body, Location or "")`. It exists because
     `http_get` follows them inside the host's urlopen, and a redirect is a new
-    address that was never checked — see `_read_fetch`.
+    address that was never checked — see `_read_fetch`. The reader refuses to
+    read through `http_get` alone: a one-shot fetch follows the whole redirect
+    chain unchecked, which is the hole the seam exists to close.
 
     `hosted_reader` is a RESOLVER for the `hosted_reader` setting: True when the
     user has switched the third-party reader on. It gates the `r.jina.ai`
@@ -148,9 +159,14 @@ def configure(http_get=None, searxng_url=None, logger=None,
     switch the user has since turned off. Absent (None) means the fallback is
     REFUSED, because the shipped default is off and a host that never wired the
     seam must not silently inherit an on-switch.
+
+    `world_gate` is a RESOLVER answering True when the PROACTIVE world-events
+    fetch (briefing, world warnings) holds the same permission the tools check;
+    the host wires the `web_access` permission here so a direct call cannot
+    bypass it. Absent means allowed — see `_WORLD_GATE` for the polarity.
     """
     global _HTTP_GET, _HTTP_IS_FN, _SEARXNG_URL, _LOG, _HTTP_HOP, _HTTP_HOP_IS_FN
-    global _HOSTED_READER
+    global _HOSTED_READER, _WORLD_GATE
     if http_get is not None:
         _HTTP_GET = http_get
         _HTTP_IS_FN = _takes_a_url(http_get)
@@ -161,8 +177,34 @@ def configure(http_get=None, searxng_url=None, logger=None,
         _SEARXNG_URL = searxng_url
     if hosted_reader is not None:
         _HOSTED_READER = hosted_reader
+    if world_gate is not None:
+        _WORLD_GATE = world_gate
     if logger is not None:
         _LOG = logger
+
+
+def world_allowed() -> bool:
+    """True when the proactive world-events fetch may ask the network.
+
+    The call the host makes outside the tool belt — `_world_events`, feeding
+    the morning briefing and the world-warning tick — checks here before any
+    network I/O, so it holds the same `web_access` permission the tools do.
+    Three readings, all of which mean "no" unless the gate answers an exact
+    True: no seam wired is ALLOW (the feature predates the seam, and a host
+    that never wired it must not lose it — that is the one reading that goes
+    the other way), a resolver answering anything that is not True, and a
+    resolver that raises. The last two matter because this is a permission: a
+    settings dict mid-reload must not be the difference between the user's
+    machine asking the news and staying quiet, and anything uncertain is OFF.
+    """
+    if _WORLD_GATE is None:
+        return True
+    try:
+        return _resolve(_WORLD_GATE) is True
+    except Exception:
+        _warn("the world gate could not be read; refusing the world-events "
+              "fetch")
+        return False
 
 
 def _http(url: str, timeout: float = SEARCH_TIMEOUT) -> bytes:
@@ -179,6 +221,11 @@ def _http(url: str, timeout: float = SEARCH_TIMEOUT) -> bytes:
 
 
 MAX_REDIRECTS = 5           # a chain longer than this is refused, not followed
+#: The read's WHOLE walk — every hop's fetch and DNS — on one wall clock.
+#: Each socket waits at most READ_TIMEOUT, and six hops of eight seconds each
+#: plus a resolver apiece is a minute the user waits through per page, times
+#: `read_top` pages: the total is what needs the bound, not the single read.
+READ_DEADLINE_S = 30.0
 
 
 def _accepts_connect_to(fn) -> bool:
@@ -238,30 +285,41 @@ def _read_fetch(url: str, timeout: float, connect_to=None) -> tuple:
     sent them, which is what a browser does and what a server means.
 
     The second hole is the one no check on the NAME can close: the checked
-    address and the fetched address used to be two separate resolutions of the
-    same name, and a name server is free to answer them differently (DNS
+    address and the fetched address used to be two separate resolutions of
+    the same name, and a name server is free to answer them differently (DNS
     rebinding — public for the policy, 127.0.0.1 for the socket). So every hop
     carries the addresses `_public_target` approved for it into the fetch.
 
-    A host without the hop seam (a partial install, or a test that patched only
-    the plain fetch) gets the one-shot fetch and a warning, because the honest
-    alternative — reading nothing — would take the feature away from every
-    caller rather than one. `connect_to` is the address list the caller already
-    checked for the FIRST hop; every later hop is checked here, as before.
+    A host without the hop seam gets a REFUSAL, not a fetch. The old fallback —
+    one shot through `http_get` — followed the whole chain unchecked and
+    resolved the name a second time, which is exactly the hole the seam closes,
+    so the fallback was the hole wearing a warning and is gone (audit
+    2026-09-28). `connect_to` is the address list the caller already checked
+    for the FIRST hop; every later hop is checked here, as before. The walk
+    keeps two further rules a one-shot fetch cannot express: a read that
+    STARTS as https is never downgraded to http on the way, and the whole walk
+    runs on one wall-clock budget (`READ_DEADLINE_S`).
     """
     if _HTTP_HOP is None:
-        _warn("no redirect-checking fetch injected: reading %s in one shot "
-              "— redirects are followed unchecked AND the checked address "
-              "cannot be pinned, so the name is resolved a second time", url)
-        return _http(url, timeout), url, ""
+        # refusal: read_no_hop_seam
+        return b"", url, ("no redirect-checking fetch is wired, so redirects "
+                          f"cannot be checked for {url} — refused rather "
+                          "than followed unchecked")
+    started_https = urllib.parse.urlsplit(url).scheme.casefold() == "https"
     current, pins = url, connect_to
+    started = time.monotonic()
     for _ in range(MAX_REDIRECTS + 1):
+        if time.monotonic() - started > READ_DEADLINE_S:
+            # refusal: read_timed_out
+            return b"", current, (f"{url} was still following redirects after "
+                                  f"{READ_DEADLINE_S:.0f}s — the read is "
+                                  "abandoned rather than continued")
         body, location = _hop(current, timeout, connect_to=pins)
-        if body is None:                     # seam disappeared mid-walk
-            _warn("the hop fetch vanished mid-walk for %s: reading %s in one "
-                  "shot — unchecked redirects, and the name is resolved "
-                  "again rather than pinned", url, current)
-            return _http(current, timeout), current, ""
+        if body is None:                     # the seam vanished mid-walk
+            # refusal: read_hop_seam_vanished
+            return b"", current, ("the redirect-checking fetch vanished "
+                                  f"mid-walk for {url} — refused rather "
+                                  "than read unchecked")
         if not location:
             return body, current, ""
         try:
@@ -270,11 +328,23 @@ def _read_fetch(url: str, timeout: float, connect_to=None) -> tuple:
             # refusal: redirect_to_an_unusable_address
             return b"", current, (f"{current} redirected to {location!r}, which "
                                   f"is not a usable address")
+        try:
+            downgraded = (urllib.parse.urlsplit(target).scheme.casefold()
+                          == "http")
+        except ValueError:
+            downgraded = False               # `_public_target` names it instead
         clean, pins, problem = _public_target(target)
         if problem:
             # refusal: redirect_to_a_refused_address
             return b"", current, (f"{current} redirected to {target}, which is "
                                   f"not fetched: {problem}")
+        # Checked AFTER the address policy on purpose: a hop that is both a
+        # downgrade and a private address is refused for the ADDRESS, which is
+        # the older rule and the one the tests name.
+        if started_https and downgraded:
+            # refusal: redirect_downgrades_to_http
+            return b"", current, (f"{current} redirected to the unencrypted "
+                                  f"{target} — refused rather than downgraded")
         current = clean
     # refusal: too_many_redirects
     return b"", current, (f"{url} redirected more than {MAX_REDIRECTS} times — "
@@ -366,6 +436,12 @@ _RESULT_SNIPPET = re.compile(r"class=[\"']result-snippet[\"'][^>]*>(.*?)</td>", 
 # `cc=botnet`. Named here rather than folded into the generic signatures so the
 # failure says which engine turned us away and why.
 _DDG_CHALLENGE = re.compile(r"anomaly\.js|challenge-form|cc=botnet", re.I)
+# DuckDuckGo answers a query with no matches in a HEADING of its own
+# ("<h2>No results.</h2>" — the shape the honest-empty fixture in
+# `tests/test_web.py` is taken from). Matching the phrase anywhere in the page
+# read a reshaped page whose SNIPPET text mentioned "no results" as an honest
+# empty and hid the reshape; the marker is matched where the page puts it.
+_DDG_EMPTY = re.compile(r"<h\d\b[^>]*>[^<]*\bno results\b", re.I)
 
 
 def _result_hrefs(html_text: str) -> list:
@@ -398,7 +474,7 @@ def ddg_search(query: str, limit: int = SEARCH_LIMIT) -> list:
                            + " — try again later or run a local SearXNG")
     titles = _RESULT_TITLE.findall(text)
     if not titles:
-        if "no results" in text.casefold():
+        if _DDG_EMPTY.search(text):
             return []          # the site answering "nothing matched" — honest
         if "result-link" not in text:
             raise RuntimeError(
@@ -806,13 +882,25 @@ def _antibot(text: str) -> tuple:
     return ()
 
 
+# Two ranges Python 3.14's flags no longer cover (measured 2026-09-28:
+# `ip_address('100.64.0.1').is_private` is False and `'192.0.0.9'.is_global`
+# is True there), so they are checked explicitly: CGNAT / overlay-VPN space
+# (Tailscale and every carrier-grade NAT hands out 100.64.0.0/10) and the
+# IETF protocol-assignments block, which a name server can point a fetch at
+# just as usefully as 169.254.169.254.
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_IETF_PROTOCOL = ipaddress.ip_network("192.0.0.0/24")
+
+
 def _is_private_ip(host: str) -> bool:
     try:
         ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         return False
-    return (ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        return True
+    return ip.version == 4 and (ip in _CGNAT or ip in _IETF_PROTOCOL)
 
 
 #: How long a name may take to resolve before the reader gives up on it.
@@ -820,6 +908,14 @@ def _is_private_ip(host: str) -> bool:
 #: the user is waiting on, so a name server that never answers must not hold the
 #: reply hostage.
 _DNS_TIMEOUT_S = 5.0
+
+#: A wedged resolver leaves its worker thread behind per attempt (the C call
+#: owns the thread and cannot be cancelled), so the in-flight count is CAPPED:
+#: past `_DNS_THREADS_MAX` the name is failed immediately rather than piling
+#: one more daemon thread onto the same wedge. No pool, no reuse — only a lid.
+_DNS_THREADS_MAX = 8
+_DNS_THREADS = 0
+_DNS_THREADS_LOCK = threading.Lock()
 
 
 def _resolve_host(host: str, port) -> tuple:
@@ -833,8 +929,16 @@ def _resolve_host(host: str, port) -> tuple:
     The wait is bounded by a worker thread the C call owns and cannot cancel,
     so a wedged resolver leaves one daemon thread behind per attempt; the
     timeout is reported rather than hidden, because "this name never answered"
-    is a different fact from "this name has no address".
+    is a different fact from "this name has no address". Those threads are
+    capped (`_DNS_THREADS_MAX`): a resolver wedged past the lid answers as a
+    resolution failure immediately, instead of leaking a thread per fresh
+    attempt until the process drowns in them.
     """
+    global _DNS_THREADS
+    with _DNS_THREADS_LOCK:
+        if _DNS_THREADS >= _DNS_THREADS_MAX:
+            return [], f"{host} could not be resolved (resolver busy)"
+        _DNS_THREADS += 1
     box: dict = {}
 
     def _call() -> None:
@@ -843,9 +947,13 @@ def _resolve_host(host: str, port) -> tuple:
         except Exception as exc:
             box["error"] = exc
 
-    th = threading.Thread(target=_call, name="dns-resolve", daemon=True)
-    th.start()
-    th.join(_DNS_TIMEOUT_S)
+    try:
+        th = threading.Thread(target=_call, name="dns-resolve", daemon=True)
+        th.start()
+        th.join(_DNS_TIMEOUT_S)
+    finally:
+        with _DNS_THREADS_LOCK:
+            _DNS_THREADS -= 1
     if th.is_alive():
         return [], f"{host} could not be resolved within {_DNS_TIMEOUT_S:.0f}s"
     if "error" in box:

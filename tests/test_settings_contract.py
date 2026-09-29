@@ -233,25 +233,39 @@ class TestTheAppearanceTabReadsTheSameTable:
 
         Parsed with `ast`: the mapping is one `self.cfg["key"] = ...` per
         control, and a text sweep would also match the comments explaining it.
-        The literal writes that remain are the keys a bespoke panel owns — the
-        generated ones are read in a single loop, which is the next guard.
+        The literal writes that remain in `_collect` are the keys a bespoke
+        panel owns — the generated ones are read in a single loop, which is the
+        next guard. The Appearance panel's literal writes live in
+        `_collect_appearance` since the audit fix made the live apply share
+        them (a whole-form collect committed a half-typed Brain field on every
+        slider tick), so the guard walks BOTH bodies: a key nothing declares
+        still fails here.
         """
         schema = _schema()
         mod = _load("handsoff_settings_collect", HERE / "handsoff-settings.py")
         # `dedent`, not `cleandoc`: getsource returns the method at its class
         # indentation, and cleandoc leaves the `def` where the first line was
         # while pulling the body out to column 0.
-        src = textwrap.dedent(inspect.getsource(mod.SettingsWindow._collect))
+        bodies = [textwrap.dedent(inspect.getsource(mod.SettingsWindow._collect)),
+                  textwrap.dedent(
+                      inspect.getsource(mod.SettingsWindow._collect_appearance))]
         written = set()
-        for node in ast.walk(ast.parse(src)):
-            if not isinstance(node, ast.Subscript):
-                continue
-            target = node.value
-            if not (isinstance(target, ast.Attribute) and target.attr == "cfg"):
-                continue
-            key = node.slice
-            if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                written.add(key.value)
+        for body in bodies:
+            for node in ast.walk(ast.parse(body)):
+                if not isinstance(node, ast.Subscript):
+                    continue
+                target = node.value
+                # `self.cfg[...]` in _collect; the local `values[...]` dict the
+                # shared appearance reader builds.
+                is_cfg = (isinstance(target, ast.Attribute)
+                          and target.attr == "cfg")
+                is_local = (isinstance(target, ast.Name)
+                            and target.id == "values")
+                if not (is_cfg or is_local):
+                    continue
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    written.add(key.value)
         assert len(written) >= 8, written          # never vacuous
         undeclared = sorted(written - set(schema.DEFAULT_SETTINGS))
         assert undeclared == [], (

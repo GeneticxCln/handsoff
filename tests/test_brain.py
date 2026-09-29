@@ -32,6 +32,7 @@ import json
 import logging
 import queue
 import threading
+import time
 import urllib.error
 
 import pytest
@@ -582,6 +583,105 @@ class TestTheSentenceSplitter:
             b'{"done": true}\n', b'{"message": null}\n', _chunk("Still here.")))
         assert _spoken(q) == ["Still here."], _spoken(q)
         assert result["content"] == "Still here."
+
+
+class TestTheStreamingThinkFilter:
+    """The streaming strip is STATEFUL where `strip_thinking` is not: the
+    opener and closer of a think block land in different fragments, so the
+    per-sentence strip saw plain text in every fragment between them and spoke
+    the reasoning. `core.brain._speech_fragment` carries the in-think state
+    across fragments; these tests pin the state machine at its edges."""
+
+    def test_a_multisentence_think_block_is_dropped_across_fragments(
+            self, brain):
+        """The leak, exactly as it streamed: the opener arrives with the first
+        reasoning sentence and the closer lands mid-sentence several fragments
+        later, so the stateless per-fragment strip let the reasoning's tail
+        through glued to the answer — 'so the answer is 5</think>The answer
+        is 5.' was spoken. Measured 2026-09-28."""
+        q: queue.Queue = queue.Queue()
+        result = _stream(brain, q, _ok_stream(
+            _chunk("<think>Let me work this out. First, 2 + 2. "),
+            _chunk("so the answer is 5</think>The answer is 5. "),
+            _chunk("Anything else?")))
+        assert _spoken(q) == ["The answer is 5.", "Anything else?"], _spoken(q)
+        # the turn's own content goes through the whole-reply strip, which
+        # still removes the (complete) block: speech and record agree
+        assert result["content"] == "The answer is 5. Anything else?"
+
+    def test_a_single_sentence_think_block_is_still_dropped(self, brain):
+        """Opener and closer in ONE fragment — the case the old per-sentence
+        strip handled, and the state machine must not regress."""
+        q: queue.Queue = queue.Queue()
+        result = _stream(brain, q, _ok_stream(_chunk("<think>hmm</think>So: 5.")))
+        assert _spoken(q) == ["So: 5."], _spoken(q)
+        assert result["content"] == "So: 5."
+
+    def test_a_reply_without_think_blocks_is_untouched(self, brain):
+        q: queue.Queue = queue.Queue()
+        result = _stream(brain, q, _ok_stream(_chunk("Plain. "),
+                                              _chunk("Answer.")))
+        assert _spoken(q) == ["Plain.", "Answer."], _spoken(q)
+        assert result["content"] == "Plain. Answer."
+
+    def test_a_stray_closer_without_an_opener_opens_and_closes_nothing(
+            self, brain):
+        """A '</think>' with no opener in sight is the model misbehaving, not
+        a signal: nothing after it may be dropped (the state must not OPEN),
+        and no sentence after it may be lost either. The words kept are the
+        ones `strip_thinking` leaves on the blocking path — the two arms do
+        not disagree about a reply neither of them can interpret."""
+        q: queue.Queue = queue.Queue()
+        result = _stream(brain, q, _ok_stream(
+            _chunk("so the answer is 5</think>The answer is 5. "),
+            _chunk("Next.")))
+        assert _spoken(q) == ["so the answer is 5</think>The answer is 5.",
+                              "Next."], _spoken(q)
+        assert result["content"] == \
+            "so the answer is 5</think>The answer is 5. Next."
+
+    def test_a_stream_ending_inside_a_think_block_says_nothing_of_it(
+            self, brain):
+        """The tail flush is the leak's second door: the opener was dropped
+        with an earlier fragment, so the stateless strip saw a tail with no
+        markup in it and queued the reasoning as speech. Under the state
+        machine the tail is still inside the block, and inside the block
+        nothing is speakable."""
+        q: queue.Queue = queue.Queue()
+        result = _stream(brain, q, _ok_stream(
+            _chunk("<think>Still deciding. "),
+            _chunk("nearly there. "),
+            _chunk("almost")))
+        assert _spoken(q) == [], _spoken(q)
+        assert result["content"] == ""
+
+
+class TestTheStreamDeadline:
+    """Finding 8 of the 2026-09-28 audit: every socket read waits at most
+    300s, but a server that never finishes never trips a per-read bound —
+    the reply as a whole now has a wall-clock budget (STREAM_DEADLINE_S),
+    checked between chunks."""
+
+    def test_a_stream_past_the_deadline_is_given_up_with_a_named_error(
+            self, brain, monkeypatch):
+        monkeypatch.setattr(brain, "STREAM_DEADLINE_S", 0.05)
+        q: queue.Queue = queue.Queue()
+
+        def drip(index):
+            time.sleep(0.08)
+
+        with pytest.raises(RuntimeError) as ei:
+            _stream(brain, q, _ok_stream(_chunk("One. "), _chunk("Two. "),
+                                         before=drip))
+        assert "exceeded" in str(ei.value), str(ei.value)
+        assert list(q.queue) == [None], (
+            f"the abandoned turn must still end the queue: {list(q.queue)}")
+
+    def test_a_fast_stream_is_not_touched_by_the_budget(self, brain):
+        q: queue.Queue = queue.Queue()
+        result = _stream(brain, q, _ok_stream(_chunk("One. Two. ")))
+        assert _spoken(q) == ["One.", "Two."], _spoken(q)
+        assert result["content"] == "One. Two."
 
 
 class TestTheToolCalls:

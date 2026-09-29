@@ -148,15 +148,34 @@ DEFAULT_SETTINGS = SCHEMA.DEFAULT_SETTINGS
 SETTINGS_VERSION = SCHEMA.SETTINGS_VERSION
 
 
-def _page_fields(tab: str) -> tuple:
-    """Every row the table puts on one page, in the table's own order.
+def merge_settings(data: dict) -> dict:
+    """defaults <- environment <- settings.json values (dicts merge key-wise,
+    like the bubble does), then run the SHARED coercion from core.settings: a
+    hand-edited settings.json with garbage values ("1,5", "32k", "abc") must
+    produce a working UI, not a crashed recovery tool.
 
-    A page is a list of rows and nothing else: that is what makes adding a
-    setting one line in settings_schema.py rather than a widget here plus a load
-    line plus a collect line.
+    Two rules make this the same read the bubble's loader performs: the env
+    fallbacks are applied through the loader's own helper (a GUI that never
+    saw OLLAMA_HOST saved the schema default over an env-configured value and
+    declared bogus conflicts on keys nobody else touched), and keys this build
+    does not know ride along instead of being dropped (dropping them here is
+    how a full save erased a newer build's settings; retired keys are still
+    dropped, and `version` stays the meta key the coercion does not touch).
     """
-    return tuple(field for field in getattr(SCHEMA, "SETTINGS_FIELDS", ())
-                 if getattr(field, "tab", "") == tab)
+    if not isinstance(data, dict):
+        data = {}
+    merged = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy of defaults
+    _core_module("settings").apply_env_overrides(merged)
+    for k, v in data.items():
+        if k == "version":
+            continue                  # schema meta key, not a setting
+        if k in getattr(SCHEMA, "RETIRED_SETTINGS", ()):
+            continue                  # dropped on load AND write
+        if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+            merged[k].update(v)
+        else:
+            merged[k] = copy.deepcopy(v)
+    return _core_module("settings").coerce_settings(merged)
 
 
 def _page_groups(page: str) -> tuple:
@@ -328,7 +347,8 @@ import sounddevice as sd  # noqa: E402
 from PySide6.QtCore import QElapsedTimer, QEvent, QPointF, QRectF, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPalette, QPolygonF, QRadialGradient, QBrush, QPen  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFrame,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox,
+    QFileDialog, QFrame,
     QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -354,26 +374,6 @@ def _autostart_hit(line: str) -> bool:
     """Either dialect counts: old `spawn "python" ...` installs are
     recognized (and migrated on enable) but only the new form is written."""
     return AUTOSTART_LINE in line or AUTOSTART_LINE_OLD in line
-
-
-def merge_settings(data: dict) -> dict:
-    """defaults <- settings.json values (dicts merge key-wise, like the bubble
-    does), then run the SHARED coercion from handsoff.py: a hand-edited
-    settings.json with garbage values ("1,5", "32k", "abc") must produce a
-    working UI, not a crashed recovery tool."""
-    merged = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy of defaults
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k not in merged:
-                continue
-            if isinstance(merged[k], dict) and isinstance(v, dict):
-                merged[k].update(v)
-            else:
-                merged[k] = v
-    # Shared coercion without exec'ing the whole bubble: core.settings owns it,
-    # and it is the same function the bubble calls (the bubble stopped
-    # re-exporting core's names, so there is nothing to fall back TO).
-    return _core_module("settings").coerce_settings(merged)
 
 
 def http_json(url: str, payload: dict | None = None, timeout: int = 10):
@@ -474,7 +474,9 @@ def _atomic_text_write(path: Path, text: str) -> None:
     "Kept" is now true: `mkstemp` creates the temp 0600 and `os.replace` would
     carry that mode onto the destination, silently tightening (or loosening) a
     file the user had chmod'ed. The destination's own mode is copied onto the
-    temp BEFORE the replace.
+    temp BEFORE the replace. The temp file is fsynced before the replace and
+    the directory after it — the same durability rule core.settings' atomic
+    writes follow, since a torn file here is a lost niri config either way.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -486,9 +488,12 @@ def _atomic_text_write(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
         if mode is not None:
             os.chmod(tmp_name, mode)
         os.replace(tmp_name, path)
+        _core_module("settings").fsync_directory(path.parent)
     except Exception:
         try:
             Path(tmp_name).unlink(missing_ok=True)
@@ -500,19 +505,28 @@ def _atomic_text_write(path: Path, text: str) -> None:
 def _backup_keep_n(path: Path, tag: str, keep: int = 5) -> None:
     """Copy `path` to a unique timestamped `path.<tag>.<stamp>` backup,
     pruning older ones (by mtime) so at most `keep` remain. The pid+counter
-    suffix keeps concurrent writers from sharing a name — no lock needed."""
+    suffix keeps concurrent writers from sharing a name — no lock needed.
+
+    The copy lands on a mkstemp temp (created 0600) that is only then renamed
+    into place: copy2 used to create the backup at the SOURCE's mode and
+    tighten it afterwards, a short window in which a permissive file's private
+    data sat readable under the backup's name."""
     _backup_keep_n.seq += 1
     stamp = _dt.now().strftime("%Y%m%d-%H%M%S")
     bak = path.with_name(
         f"{path.name}.{tag}.{stamp}-p{os.getpid()}-{_backup_keep_n.seq}")
-    shutil.copy2(path, bak)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{bak.name}.", suffix=".tmp",
+                                    dir=str(path.parent))
     try:
-        # copy2 preserves the SOURCE mode, so backing up a file that was still
-        # group/world-readable produced a readable copy of the same transcript.
-        # These backups hold conversations and settings: always owner-only.
-        os.chmod(bak, 0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "wb") as out, path.open("rb") as src:
+            shutil.copyfileobj(src, out)
+        os.replace(tmp_name, bak)    # mkstemp created the temp 0600
+    except BaseException:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     try:
         olds = sorted(path.parent.glob(f"{path.name}.{tag}.*"),
                       key=lambda p: p.stat().st_mtime_ns)
@@ -1599,10 +1613,30 @@ def _build_checkbox(win, field: "object") -> _Control:
 
 
 def _build_spin(win, field: "object") -> _Control:
+    if field.kind == "float":
+        # A float row edits as a float: the loader clamps into [lo, hi] and
+        # keeps fractions (hardware_disk_gb's floor is 0.5, confirm_seconds
+        # legitimately holds 7.5), which an integer QSpinBox silently floored.
+        # Integer fields keep the plain spin box below.
+        spin = QDoubleSpinBox(win)
+        spin.setDecimals(max(2, int(field.decimals or 0)))
+        spin.setRange(field.lo if field.lo is not None else 0.0,
+                      field.hi if field.hi is not None else 100.0)
+        if field.step:
+            spin.setSingleStep(field.step)
+        if field.suffix:
+            spin.setSuffix(field.suffix)
+        if field.zero:
+            spin.setSpecialValueText(field.zero)
+        if field.tip:
+            spin.setToolTip(field.tip)
+        spin.valueChanged.connect(lambda *_: win._control_changed(field.key))
+        return _Control(field.key, spin, spin.value,
+                        lambda value: spin.setValue(float(value or 0)),
+                        title=_control_title(field))
     spin = QSpinBox(win)
-    # A float row keeps integer steps: the browser UI never offered a fraction,
-    # and ceil/floor of the bounds is what stops `hardware_disk_gb` offering a
-    # "warn when free disk drops below 0 GiB" row (its bound is 0.5).
+    # Integer bounds keep their ceil/floor, which is what stops an `int` row
+    # offering a "0 GiB" bound a coercion would have to repair.
     spin.setRange(int(math.ceil(field.lo if field.lo is not None else 0)),
                   int(math.floor(field.hi if field.hi is not None else 100)))
     if field.step:
@@ -1614,9 +1648,7 @@ def _build_spin(win, field: "object") -> _Control:
     if field.tip:
         spin.setToolTip(field.tip)
     spin.valueChanged.connect(lambda *_: win._control_changed(field.key))
-    as_float = field.kind == "float"
-    return _Control(field.key, spin,
-                    (lambda: float(spin.value())) if as_float else spin.value,
+    return _Control(field.key, spin, spin.value,
                     lambda value: spin.setValue(int(float(value or 0))),
                     title=_control_title(field))
 
@@ -1772,6 +1804,16 @@ _CONTROL_BUILDERS = {
 
 
 class SettingsWindow(QMainWindow):
+    # The keys the bubble's reload provably does not re-apply: the wake spotter
+    # and its models are built once (a sticky failure is never reset), and the
+    # microphone is opened when hands-free starts. A save that moves one says
+    # so, instead of a blanket "applied live".
+    STICKY_KEYS = {
+        "mic_device": "microphone",
+        "wake_spotter": "wake spotter",
+        "spotter_models": "wake words",
+    }
+
     # EVERY value the Appearance tab owns; a change to any of them applies live.
     # `colors` and `bubble_size` belong here too: the live-apply only writes when
     # one of these actually differs from disk, so leaving them out meant a
@@ -3010,22 +3052,30 @@ drifting apart one forgotten key at a time.
             return
         fact = item.data(Qt.UserRole)
         try:
-            data = json.loads(H.MEMORY_FILE.read_text(encoding="utf-8"))
-        except Exception as e:
+            from core.settings import atomic_private_write, cross_process_lock
+            # The bubble's own memory writer must take this same sidecar flock
+            # (see the report note on handsoff.py): read, filter and replace
+            # under one lock, so a fact the bubble persists mid-forget cannot
+            # be resurrected by a last-writer-wins race.
+            with cross_process_lock()(H.CONFIG_DIR, "memory.json.lock"):
+                data = json.loads(H.MEMORY_FILE.read_text(encoding="utf-8"))
+                kept = [m for m in data if isinstance(m, dict)
+                        and str(m.get("v", "")) != fact]
+                _backup_keep_n(H.MEMORY_FILE, "bak-facts")
+                atomic_private_write(
+                    H.MEMORY_FILE, json.dumps(kept, ensure_ascii=False, indent=1))
+        except ValueError as e:
             self._status(f"cannot read memory.json: {e}")
             return
-        kept = [m for m in data if isinstance(m, dict)
-                and str(m.get("v", "")) != fact]
-        try:
-            from core.settings import atomic_private_write
-            _backup_keep_n(H.MEMORY_FILE, "bak-facts")
-            atomic_private_write(
-                H.MEMORY_FILE, json.dumps(kept, ensure_ascii=False, indent=1))
         except OSError as e:
             self._status(f"cannot update memory.json: {e}")
             return
-        self._status("fact forgotten. The running bubble keeps its in-memory "
-                     "copy until it restarts.")
+        # Honest about the window: the bubble holds its own in-memory copy and
+        # re-persists it on a fact-bearing turn, so the fact can come back
+        # until the bubble reloads — "kept until it restarts" was the promise
+        # the bubble's next utterance quietly broke.
+        self._status("fact forgotten. The running bubble may re-learn and "
+                     "re-persist it from its own copy until its next reload.")
         self._refresh_facts()
 
     def _decisions_pane(self) -> QWidget:
@@ -3085,10 +3135,25 @@ drifting apart one forgotten key at a time.
 
     def _refresh_history(self) -> None:
         try:
-            data = json.loads(H.HISTORY_FILE.read_text(encoding="utf-8"))
+            raw = H.HISTORY_FILE.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            self.history_view.setPlainText("(history is empty — fresh start)")
+            return
+        except OSError as e:
+            self.history_view.setPlainText(
+                f"(history could not be read: {e})")
+            return
+        try:
+            data = json.loads(raw)
             msgs = [m for m in data if isinstance(m, dict) and m.get("role")]
-        except Exception:
-            msgs = []
+        except ValueError:
+            # Not the same fact as an empty history, and saying "fresh start"
+            # here was the lie: the bubble quarantines a corrupt file on its
+            # next start, which is what actually happens to it.
+            self.history_view.setPlainText(
+                "(history file is corrupt — the bubble quarantines it on its "
+                "next start)")
+            return
         if not msgs:
             self.history_view.setPlainText("(history is empty — fresh start)")
             return
@@ -4770,13 +4835,19 @@ drifting apart one forgotten key at a time.
         Skips the write when the disk already holds these values, which is how
         a plain window load (where _load_values sets the widgets from disk) is
         told apart from a real edit — no separate 'loading' flag to get stuck.
+
+        Only this tab's keys are collected and persisted: the debounced timer
+        fires mid-edit on other tabs, and a full `_collect` committed a
+        half-typed Brain field on every slider tick. The write goes through
+        the batched single-writer machinery — one locked read-merge-write that
+        leaves the rest of the file alone — and `apply_autostart` stays with
+        the Save button.
         """
         try:
-            self._collect()
+            wanted = self._collect_appearance()
         except Exception:            # a half-built form must not raise here
             log.exception("live appearance apply: could not collect settings")
             return
-        wanted = {k: self.cfg.get(k) for k in self.APPEARANCE_KEYS}
         # Compared against the disk through the SAME defaults-and-coercion path a
         # load uses, not against the raw JSON. A settings.json written before a
         # key existed has no entry for it, and `raw.get(k)` then differs from the
@@ -4792,25 +4863,39 @@ drifting apart one forgotten key at a time.
                    if on_disk.get(k) != wanted.get(k)]
         if not changed:
             return                   # nothing changed: this was a load, not an edit
-        if self._save_reported():
-            # name what moved instead of always reporting the shape: the old
-            # message made a colour or size change look like it had not been
-            # taken (and hid the fact that it never was). A change that lands
-            # exactly on a catalogue look says WHICH look, derived from the
-            # saved values rather than remembered from the click — so a hand
-            # tuned set that happens to match also reports itself as that look.
-            # Named by the contract too: each row carries the words a live
-            # apply uses, including one per state ("idle picture" says what
-            # moved; "design_image_idle" does not).
-            labeller = getattr(SCHEMA, "field_label", None)
-            pretty = {k: (labeller(k) if labeller else k) for k in changed}
-            name = self._current_look()
-            entry = (SCHEMA.look(name) if name and hasattr(SCHEMA, "look")
-                     else None)
-            head = f"Applied look {entry['label']}" if entry else "Applied live"
-            self._status(head + ": "
-                         + ", ".join(pretty.get(k, k) for k in changed)
-                         + ". No restart needed.")
+        if not _core_module("settings").persist_settings(
+                wanted, H.SETTINGS_FILE, H.CONFIG_DIR):
+            self._status("could not apply live — settings.json did not "
+                         "take the change")
+            return
+        # Disk and form now agree on these keys; the loaded snapshot follows,
+        # so a later Save's three-way merge sees no phantom edit, and the
+        # disk-poll does not announce the change this window just made.
+        self.cfg.update(copy.deepcopy(wanted))
+        self._loaded_cfg.update(copy.deepcopy(wanted))
+        self._disk_mtime = self._settings_mtime()
+        live = self._notify_bubble_reloaded()
+        # name what moved instead of always reporting the shape: the old
+        # message made a colour or size change look like it had not been
+        # taken (and hid the fact that it never was). A change that lands
+        # exactly on a catalogue look says WHICH look, derived from the
+        # saved values rather than remembered from the click — so a hand
+        # tuned set that happens to match also reports itself as that look.
+        # Named by the contract too: each row carries the words a live
+        # apply uses, including one per state ("idle picture" says what
+        # moved; "design_image_idle" does not).
+        labeller = getattr(SCHEMA, "field_label", None)
+        pretty = {k: (labeller(k) if labeller else k) for k in changed}
+        name = self._current_look()
+        entry = (SCHEMA.look(name) if name and hasattr(SCHEMA, "look")
+                 else None)
+        head = f"Applied look {entry['label']}" if entry else "Applied live"
+        self._status(head + ": "
+                     + ", ".join(pretty.get(k, k) for k in changed)
+                     + ". No restart needed."
+                     + ("" if live else
+                        " (the bubble is not running — it picks this up at "
+                        "its next start)"))
 
     # ----------------------------------------------------------------- startup
 
@@ -5172,6 +5257,50 @@ drifting apart one forgotten key at a time.
         self.preview.update()
         self._schedule_appearance_live()
 
+    def _collect_appearance(self) -> dict:
+        """The Appearance page's keys ONLY, read from their controls.
+
+        The live apply used to run the whole-form `_collect`, so its debounced
+        timer committed a half-typed Brain field on every slider tick. The
+        generated rows are read through the same `_controls` readers and
+        `coerce_setting` rule a save uses; the bespoke reads below are the
+        ones `_collect` always did, kept in one place so the two paths cannot
+        drift apart about what a control is currently saying.
+        """
+        values: dict = {}
+        for key in self.APPEARANCE_KEYS:
+            control = self._controls.get(key)
+            # A control that could not be built (and every bespoke row, until
+            # the reads below reach it) keeps the loaded value, so the compare
+            # against disk reads "no edit" instead of rewriting every tick.
+            values[key] = (
+                _core_module("settings").coerce_setting(key, control.read())
+                if control is not None
+                else self.cfg.get(key, DEFAULT_SETTINGS.get(key)))
+        values["bubble_design"] = self.design_combo.currentData() or "orb"
+        values["design_image_path"] = str(self._design_image or "")
+        for state, key in STATE_IMAGE_KEYS:
+            values[key] = str(self._design_images.get(state) or "")
+        values["design_pack"] = str(self._design_pack or "")
+        values["avatar_ring"] = str(
+            self.deco_combo.currentData() or "ring-light")
+        # One key, three shapes: the two words, or the literal hex when the row
+        # says the colour is the user's own. `custom` itself is never stored —
+        # the schema holds what the bubble can READ, and what it reads is the
+        # hex.
+        _mode = str(self.deco_colour_combo.currentData() or "state")
+        values["avatar_deco_color"] = (
+            self._deco_colour if _mode == self.DECO_COLOUR_CUSTOM else _mode)
+        # Filled FROM the loaded dict before the swatches are applied, for the
+        # same reason `permissions` is: a colour this row has no swatch for must
+        # keep the value it had. A key missing from the candidate is a DELETE to
+        # the merge, and `_coerce_colors` then fills it from the defaults — the
+        # silent re-default this file has already been bitten by once.
+        colors = {str(k): str(v) for k, v in (self.cfg.get("colors") or {}).items()}
+        colors.update(self._colors)
+        values["colors"] = colors
+        return values
+
     def _collect(self) -> list[str]:
         problems: list[str] = []
         # Every generated control, in one loop — the whole save path for a
@@ -5201,28 +5330,9 @@ drifting apart one forgotten key at a time.
             if k and v:
                 alias_map[k] = v
         self.cfg["workspace_aliases"] = alias_map
-        self.cfg["bubble_design"] = self.design_combo.currentData() or "orb"
-        self.cfg["design_image_path"] = str(self._design_image or "")
-        for state, key in STATE_IMAGE_KEYS:
-            self.cfg[key] = str(self._design_images.get(state) or "")
-        self.cfg["design_pack"] = str(self._design_pack or "")
-        self.cfg["avatar_ring"] = str(
-            self.deco_combo.currentData() or "ring-light")
-        # One key, three shapes: the two words, or the literal hex when the row
-        # says the colour is the user's own. `custom` itself is never stored —
-        # the schema holds what the bubble can READ, and what it reads is the
-        # hex.
-        _mode = str(self.deco_colour_combo.currentData() or "state")
-        self.cfg["avatar_deco_color"] = (
-            self._deco_colour if _mode == self.DECO_COLOUR_CUSTOM else _mode)
-        # Filled FROM the loaded dict before the swatches are applied, for the
-        # same reason `permissions` is: a colour this row has no swatch for must
-        # keep the value it had. A key missing from the candidate is a DELETE to
-        # the merge, and `_coerce_colors` then fills it from the defaults — the
-        # silent re-default this file has already been bitten by once.
-        colors = {str(k): str(v) for k, v in (self.cfg.get("colors") or {}).items()}
-        colors.update(self._colors)
-        self.cfg["colors"] = colors
+        # The Appearance keys, through the reader the live apply shares, so
+        # the two paths cannot disagree about what the controls are saying.
+        self.cfg.update(self._collect_appearance())
         # Filled FROM the loaded dict, so a key this tab has no widget for keeps
         # the value it had instead of disappearing — a dropped key is a
         # permission silently re-defaulted (see `_permissions_tab`).
@@ -5273,12 +5383,6 @@ drifting apart one forgotten key at a time.
                 c for c in self.cfg["extra_allowed_commands"] if c not in blocked_chosen]
             problems.append("not saved, always blocked: " + ", ".join(blocked_chosen))
         new_model = str(self.cfg["model"])
-        cleared_note = ""
-        if new_model != self._model_at_open:
-            # a new model must not inherit a conversation tuned for the old one:
-            # the old history is the #1 cause of parroting after a model switch
-            cleared_note = self._clear_history_for_model_switch()
-            self._model_at_open = new_model
         try:
             # shared writer: version-stamps settings.json and keeps a one-
             # generation backup, so the bubble can migrate layouts safely
@@ -5290,6 +5394,18 @@ drifting apart one forgotten key at a time.
         except OSError as e:
             self._status(f"cannot save settings: {e}")
             return False
+        # The model-switch wipe runs only once the save HAS landed: it used to
+        # run first, so a conflict or a full disk cleared the conversation for
+        # a new model that never reached settings.json.
+        cleared_note = ""
+        if new_model != self._model_at_open:
+            cleared_note = self._clear_history_for_model_switch()
+            self._model_at_open = new_model
+        # Which sticky keys this save moved, computed before cfg/_loaded_cfg
+        # are replaced by the written dict (see STICKY_KEYS for why the
+        # reload does not cover them).
+        sticky = sorted(label for key, label in self.STICKY_KEYS.items()
+                        if self.cfg.get(key) != self._loaded_cfg.get(key))
         self.cfg = written
         self._loaded_cfg = copy.deepcopy(written)
         self._disk_mtime = self._settings_mtime()
@@ -5300,6 +5416,12 @@ drifting apart one forgotten key at a time.
         warn = f"  WARNINGS: {'; '.join(problems)}" if problems else ""
         live = self._notify_bubble_reloaded()
         live_note = " Applied live." if live else " Bubble unreachable — restart to apply."
+        if sticky:
+            # The reload does not reset a sticky-failed wake spotter nor
+            # reopen a changed mic device, so a blanket "applied live" would
+            # promise more than the bubble can do.
+            live_note += (" Takes effect on the next start or a hands-free "
+                          "toggle: " + ", ".join(sticky) + ".")
         self._status(f"Saved to {H.SETTINGS_FILE}. {msg}{cleared_note}{warn}{live_note}")
         return True
 
