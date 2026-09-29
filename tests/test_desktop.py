@@ -1102,6 +1102,63 @@ class TestOperator:
         assert els[0]["x"] == 160 and els[0]["y"] == 210
         assert els[1]["x"] == 140 and els[1]["y"] == 310
 
+    # The REAL output of `tesseract menu.png stdout tsv` (tesseract 5.3.4) for an
+    # image with "File  Edit  View  Help" spread across a menu bar and
+    # "Cancel  ...  OK" spread across a dialog's button row.
+    REAL_MENU_TSV = (
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+        "1\t1\t0\t0\t0\t0\t0\t0\t900\t200\t-1\t\n"
+        "2\t1\t1\t0\t0\t0\t23\t21\t739\t35\t-1\t\n"
+        "3\t1\t1\t1\t0\t0\t23\t21\t739\t35\t-1\t\n"
+        "4\t1\t1\t1\t1\t0\t23\t21\t739\t35\t-1\t\n"
+        "5\t1\t1\t1\t1\t1\t23\t25\t43\t21\t96.872093\tFile\n"
+        "5\t1\t1\t1\t1\t2\t183\t21\t50\t35\t95.812920\tEdit\n"
+        "5\t1\t1\t1\t1\t3\t420\t25\t66\t21\t96.301659\tView\n"
+        "5\t1\t1\t1\t1\t4\t703\t25\t59\t27\t96.136894\tHelp\n"
+        "2\t1\t2\t0\t0\t0\t22\t111\t618\t35\t-1\t\n"
+        "3\t1\t2\t1\t0\t0\t22\t111\t618\t35\t-1\t\n"
+        "4\t1\t2\t1\t1\t0\t22\t111\t618\t35\t-1\t\n"
+        "5\t1\t2\t1\t1\t1\t22\t111\t90\t35\t96.586853\tCancel\n"
+        "5\t1\t2\t1\t1\t2\t602\t116\t38\t20\t96.315880\tOK\n")
+
+    def test_a_row_of_controls_is_one_element_per_control(self, H):
+        """Tesseract calls a menu bar ONE line. One element per line put the
+        click point in the middle of the row — for "File Edit View Help" at
+        x=392, the empty space between Edit and View — so `click_element("Help")`
+        clicked nothing, and so did "OK" in a dialog's "Cancel … OK" row."""
+        els = H.ToolBelt._parse_tsv(self.REAL_MENU_TSV)
+        assert [e["text"] for e in els] == [
+            "File", "Edit", "View", "Help", "Cancel", "OK"], els
+        by = {e["text"]: e for e in els}
+        # each click point is inside its own word's box
+        for word, (left, width) in {"File": (23, 43), "Edit": (183, 50),
+                                    "View": (420, 66), "Help": (703, 59),
+                                    "Cancel": (22, 90), "OK": (602, 38)}.items():
+            assert left <= by[word]["x"] <= left + width, (word, by[word])
+
+    def test_a_click_by_name_lands_on_that_control(self, H):
+        tb = H.ToolBelt.__new__(H.ToolBelt)
+        tb._perm = {**H.DEFAULT_SETTINGS["permissions"], "operator": True}
+        tb._elements = H.ToolBelt._parse_tsv(self.REAL_MENU_TSV)
+        calls = []
+        tb._ydotool = lambda *args: calls.append(args) or "ok"
+        assert "clicked" in tb.click_element("OK")
+        assert calls[0][:2] == ("mousemove", "-a") and int(calls[0][3]) == 621, calls[0]
+        calls.clear()
+        tb.click_element("help")
+        assert int(calls[0][3]) == 732, calls[0]
+
+    def test_running_text_stays_one_element(self, H):
+        """The other side of the cut: a sentence's word gaps are about a third
+        of a word's height, so it is not split into words."""
+        tsv = ("level\tpage\tblock\tpar\tline\tword\tleft\ttop\twidth\theight\tconf\ttext\n"
+               "5\t1\t1\t1\t1\t1\t100\t200\t60\t20\t95\tOpen\n"
+               "5\t1\t1\t1\t1\t2\t168\t200\t30\t20\t95\tthe\n"
+               "5\t1\t1\t1\t1\t3\t206\t200\t70\t20\t95\tsettings\n"
+               "5\t1\t1\t1\t1\t4\t284\t200\t60\t20\t95\tpanel\n")
+        els = H.ToolBelt._parse_tsv(tsv)
+        assert [e["text"] for e in els] == ["Open the settings panel"], els
+
     def test_parse_tsv_drops_junk_and_low_conf(self, H):
         tsv = self.TSV + "5\t1\t2\t1\t1\t1\t0\t0\t0\t0\t-1\t~\n"
         els = H.ToolBelt._parse_tsv(tsv)

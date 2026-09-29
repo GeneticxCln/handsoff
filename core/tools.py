@@ -4014,7 +4014,7 @@ class ToolBelt:
                 queue = _dep()._mpc('playlist').splitlines()
                 if queue:
                     _dep()._mpc('play')
-                    return f'playing (queue had {len(queue)} songs)'
+                    return f"playing (queue had {len(queue)} song{('' if len(queue) == 1 else 's')})"
                 paths = _dep()._mpc('search', 'filename', '').splitlines()
                 if not paths:
                     return 'ERROR: the MPD library is empty — nothing to play'
@@ -4048,9 +4048,13 @@ class ToolBelt:
         mapped = {'play': ['play'], 'pause': ['pause'], 'stop': ['stop'], 'next': ['next'], 'skip': ['next'], 'previous': ['prev'], 'prev': ['prev'], 'back': ['prev']}
         if a == 'toggle':
             try:
-                paused = '[paused]' in _dep()._mpc('status')
-                _dep()._mpc('play' if paused else 'pause')
-                return f"music player: {('play' if paused else 'pause')}"
+                # Only a PLAYING player is paused. It read `[paused]` instead,
+                # so a STOPPED player (which prints no `[state]` line at all —
+                # checked against a real mpd) was "toggled" with `pause`, which
+                # does nothing, and the answer said it had.
+                playing = '[playing]' in _dep()._mpc('status')
+                _dep()._mpc('pause' if playing else 'play')
+                return f"music player: {('pause' if playing else 'play')}"
             except RuntimeError as e:
                 return f'ERROR: {e}'
         if a not in mapped:
@@ -4092,6 +4096,17 @@ class ToolBelt:
         except RuntimeError as e:
             return f'ERROR: {e}'
         if not cur:
+            # `current` is empty for a STOPPED player too, and a stopped player
+            # keeps its queue (checked against a real mpd): saying the queue is
+            # empty was untrue, and it is what the user needs to know before
+            # asking to play.
+            try:
+                queued = len(_dep()._mpc('playlist').splitlines())
+            except RuntimeError:
+                queued = 0
+            if queued:
+                return (f"the music player is stopped ({queued} "
+                        f"song{('' if queued == 1 else 's')} in the queue)")
             return 'nothing is playing (the music queue is empty)'
         state = 'playing' if '[playing]' in status else 'paused'
         vol = re.search('volume:\\s*(\\d+)%', status)
@@ -4469,7 +4484,16 @@ class ToolBelt:
                 cands.append((pid, name))
         else:
             low = target.lower()
-            cands = [(p, n) for p, n in self._same_user_procs() if n.lower() == low]
+            # `Name:` in /proc/PID/status is the kernel's `comm`, cut at 15
+            # characters, so a process called `gnome-text-editor` is only ever
+            # visible as `gnome-text-edit`: an exact comparison with the name the
+            # user said found nothing, for every name longer than 15 characters.
+            # A longer name is compared by the prefix the kernel keeps; more than
+            # one match is still refused as ambiguous, and the offer names what
+            # will actually be stopped.
+            low15 = low[:15]
+            cands = [(p, n) for p, n in self._same_user_procs()
+                     if n.lower() == low or (len(low) > 15 and n.lower() == low15)]
         if not cands:
             # refusal: kill_no_such_process
             return f"ERROR: no process of yours matches {target!r} (exact name or listening port; other users' processes are invisible)"
@@ -4740,7 +4764,15 @@ class ToolBelt:
 
         Rows: level page block par line word left top width height conf text.
         Words are grouped by (block, par, line) into one element per visual
-        line, keeping the union bounding box and the mean confidence."""
+        line, keeping the union bounding box and the mean confidence — and a
+        line is CUT wherever two neighbouring words are further apart than a
+        word is tall. Tesseract's "line" is a row of text, not a row of
+        controls: a menu bar (File Edit View Help), a tab strip or a dialog's
+        buttons (Cancel … OK) come back as ONE line, and one element per line
+        put its click point in the middle of the row — the empty space between
+        two of the controls. A real OCR of exactly that image is the fixture
+        in tests/test_desktop.py; ordinary running text has word gaps of about
+        a third of a word's height, so a sentence stays whole."""
         rows: dict[tuple, list] = {}
         for line in tsv.splitlines()[1:]:
             parts = line.split('\t')
@@ -4756,14 +4788,29 @@ class ToolBelt:
                 continue
             rows.setdefault((blk, par, ln), []).append((x, y, w, h, word))
         out = []
+        order: dict[int, tuple] = {}
         for words in rows.values():
             words.sort(key=lambda t: t[0])
-            x0 = min((w[0] for w in words))
-            y0 = min((w[1] for w in words))
-            x1 = max((w[0] + w[2] for w in words))
-            y1 = max((w[1] + w[3] for w in words))
-            out.append({'text': ' '.join((w[4] for w in words)), 'x': (x0 + x1) // 2, 'y': (y0 + y1) // 2, 'w': x1 - x0, 'h': y1 - y0})
-        out.sort(key=lambda e: (e['y'], e['x']))
+            # Reading order is (the row's top, then left to right). Sorting by
+            # each element's own centre put a taller word (an "Edit" with a
+            # descender box) after a shorter neighbour on the SAME row, so the
+            # numbered list did not read left to right.
+            row_top = min(w[1] for w in words)
+            runs: list[list] = [[words[0]]]
+            for prev, cur in zip(words, words[1:]):
+                gap = cur[0] - (prev[0] + prev[2])
+                if gap > max(prev[3], cur[3]):
+                    runs.append([])
+                runs[-1].append(cur)
+            for run in runs:
+                x0 = min((w[0] for w in run))
+                y0 = min((w[1] for w in run))
+                x1 = max((w[0] + w[2] for w in run))
+                y1 = max((w[1] + w[3] for w in run))
+                element = {'text': ' '.join((w[4] for w in run)), 'x': (x0 + x1) // 2, 'y': (y0 + y1) // 2, 'w': x1 - x0, 'h': y1 - y0}
+                order[id(element)] = (row_top, x0)
+                out.append(element)
+        out.sort(key=lambda e: order[id(e)])
         return out[:80]
 
     def _screen_elements_fmt(self) -> str:

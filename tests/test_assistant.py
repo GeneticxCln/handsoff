@@ -763,6 +763,89 @@ def test_a_message_cut_off_after_its_body_is_still_delivered():
         "Notification from Signal: Alice. last line"]
 
 
+def test_a_muted_notification_is_counted_but_not_spoken(caplog):
+    import logging
+    spoken: list = []
+    reader = _reader(spoken, muted=lambda a, s, b: a == "Spammy")
+    proc = types.SimpleNamespace(
+        stdout=iter([l + "\n" for l in _notify("Spammy", "buy", ['   string "now"'])
+                     + _notify("Real", "hi", ['   string "there"'])]),
+        poll=lambda: 0)
+    with caplog.at_level(logging.INFO):
+        reader.loop(proc, threading.Event())
+    assert spoken == ["Notification from Real: hi. there"], spoken
+    assert "notification muted from Spammy" in caplog.text, caplog.text
+    assert reader.health(enabled=True)["notifications"] == 2, \
+        "a muted message is still observed"
+
+
+def test_a_mute_check_that_raises_does_not_swallow_the_notification(caplog):
+    import logging
+
+    def boom(a, s, b):
+        raise RuntimeError("bad mute list")
+    spoken: list = []
+    reader = _reader(spoken, muted=boom)
+    with caplog.at_level(logging.ERROR):
+        reader.loop(types.SimpleNamespace(
+            stdout=iter([l + "\n" for l in _notify("A", "s", ['   string "b"'])]),
+            poll=lambda: 0), threading.Event())
+    assert spoken == ["Notification from A: s. b"], spoken
+    assert "notification mute check failed for A" in caplog.text, caplog.text
+
+
+def test_one_spoken_digest_per_app_per_cooldown(monkeypatch, caplog):
+    import logging
+    from core import assistant as A
+    spoken: list = []
+    reader = _reader(spoken)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(A.time, "monotonic", lambda: clock["t"])
+
+    def arrive(body):
+        reader.loop(types.SimpleNamespace(
+            stdout=iter([l + "\n" for l in _notify("Chat", "Bob", [f'   string "{body}"'])]),
+            poll=lambda: 0), threading.Event())
+
+    with caplog.at_level(logging.INFO):
+        arrive("one")
+        clock["t"] += reader.APP_COOLDOWN - 1
+        arrive("two")                      # inside the window: suppressed
+        clock["t"] += 1
+        arrive("three")                    # exactly a window after the first: spoken
+    assert spoken == ["Notification from Chat: Bob. one",
+                      "Notification from Chat: Bob. three"], spoken
+    assert "notification cooldown suppresses Chat" in caplog.text, caplog.text
+
+
+def test_an_announce_that_raises_is_logged_not_propagated(caplog):
+    import logging
+
+    def boom(text):
+        raise RuntimeError("no speaker")
+    reader = _reader([], announce=boom)
+    with caplog.at_level(logging.ERROR):
+        reader.loop(types.SimpleNamespace(
+            stdout=iter([l + "\n" for l in _notify("A", "s", ['   string "b"'])]),
+            poll=lambda: 0), threading.Event())
+    assert "notification announcement failed" in caplog.text, caplog.text
+
+
+def test_speech_is_one_line_and_bounded():
+    spoken: list = []
+    reader = _reader(spoken)
+    long_body = "word " * 400
+    lines = (_one_notify_lines("A  B", "two", "")[:4]     # header .. icon
+             + ['   string "two', 'lines"']              # a multi-line SUMMARY
+             + ['   string "' + long_body.strip() + '"'] + _REAL_CAPTURE[7:])
+    reader.loop(types.SimpleNamespace(
+        stdout=iter([l + "\n" for l in lines]), poll=lambda: 0),
+        threading.Event())
+    assert len(spoken) == 1 and len(spoken[0]) == 500, len(spoken[0])
+    assert spoken[0].startswith("Notification from A B: two lines. word word"), spoken[0][:60]
+    assert "\n" not in spoken[0]
+
+
 def test_dbus_string_value_drops_only_the_closing_quote():
     from core.assistant import dbus_string_value
     assert dbus_string_value(['abc"']) == "abc"

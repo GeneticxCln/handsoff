@@ -559,3 +559,32 @@ class TestReadFileRefusesAPathNoFilesystemCanHold:
         out, err = belt.execute("read_file", {"path": path})
         assert "cannot exist" in out, out
         assert "bug in the tool" not in out and "failed with" not in out, out
+
+
+class TestAProcessWithALongNameCanBeStopped:
+    """`Name:` in /proc/PID/status is `comm`, cut at 15 characters by the kernel:
+    a process called `gnome-text-editor` is only ever visible as
+    `gnome-text-edit`. An exact comparison with the name the user said matched
+    nothing, for every name longer than 15 characters."""
+
+    def _belt(self, H, monkeypatch, procs):
+        tb = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(tb, "_same_user_procs", lambda: list(procs))
+        return tb
+
+    def test_the_full_name_finds_the_truncated_comm(self, H, monkeypatch):
+        tb = self._belt(H, monkeypatch, [(4242, "gnome-text-edit"), (4243, "bash")])
+        out, err = tb.execute("kill_process", {"target": "gnome-text-editor"})
+        assert "About to stop gnome-text-edit (pid 4242)" in out, out
+
+    def test_a_short_name_is_still_exact(self, H, monkeypatch):
+        tb = self._belt(H, monkeypatch, [(1, "gnome-text-edit"), (2, "gnome")])
+        out, err = tb.execute("kill_process", {"target": "gnome"})
+        assert "About to stop gnome (pid 2)" in out, out
+        out, err = tb.execute("kill_process", {"target": "gnome-tex"})
+        assert err and "no process of yours matches" in out, out
+
+    def test_two_processes_with_one_prefix_are_ambiguous(self, H, monkeypatch):
+        tb = self._belt(H, monkeypatch, [(1, "gnome-text-edit"), (2, "gnome-text-edit")])
+        out, err = tb.execute("kill_process", {"target": "gnome-text-editor"})
+        assert err and "2 processes match" in out, out

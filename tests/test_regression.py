@@ -911,6 +911,54 @@ class TestMedia:
         out, err = belt.execute("media_volume", {"level": "banana"})
         assert err and "number" in out, out
 
+    def test_a_stopped_player_is_toggled_with_play_and_keeps_its_queue(self, H, monkeypatch):
+        """Checked against a real mpd: a STOPPED player prints no `[state]` line
+        in `status`, keeps its queue, and `current` is empty. Toggle read
+        `[paused]`, so it "paused" a stopped player (a no-op) and said so, and
+        now_playing called the queue empty."""
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        stopped = "volume: n/a   repeat: off   random: off   single: off   consume: off"
+        calls = []
+
+        def fake(*args, timeout=8.0):
+            calls.append(tuple(args))
+            if args == ("status",):
+                return stopped
+            if args == ("current",):
+                return ""
+            if args == ("playlist",):
+                return "Alice - Blue Sky.wav\nBob - Red Rain.wav\n"
+            return ""
+        monkeypatch.setattr(H, "_mpc", fake)
+        out, err = belt.execute("media_control", {"action": "toggle"})
+        assert not err and out == "music player: play" and calls[-1] == ("play",), (out, calls)
+        out, err = belt.execute("now_playing", {})
+        assert out == "the music player is stopped (2 songs in the queue)", out
+
+        def one(*args, timeout=8.0):
+            return "Only.wav" if args == ("playlist",) else ""
+        monkeypatch.setattr(H, "_mpc", one)
+        out, err = belt.execute("now_playing", {})
+        assert out == "the music player is stopped (1 song in the queue)", out
+
+        monkeypatch.setattr(H, "_mpc", lambda *a, **k: "")
+        out, err = belt.execute("now_playing", {})
+        assert out == "nothing is playing (the music queue is empty)", out
+
+        def broken(*args, timeout=8.0):
+            if args == ("playlist",):
+                raise RuntimeError("mpc timed out")
+            return ""
+        monkeypatch.setattr(H, "_mpc", broken)
+        out, err = belt.execute("now_playing", {})
+        assert out == "nothing is playing (the music queue is empty)", out
+
+    def test_a_one_song_queue_is_not_plural(self, H, monkeypatch):
+        belt = H.ToolBelt(on_restart_pending=lambda: None)
+        monkeypatch.setattr(H, "_mpc", lambda *a, **k: "Only.wav" if a == ("playlist",) else "")
+        out, err = belt.execute("media_play", {})
+        assert out == "playing (queue had 1 song)", out
+
     def test_a_signed_volume_is_a_change_and_a_decimal_is_read(self, H, monkeypatch):
         """A sign was accepted by the pattern and clamped as an absolute level:
         "+10" set the volume TO 10 and "-10" to 0 — "turn it down a bit" muted
