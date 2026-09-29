@@ -4853,7 +4853,7 @@ class ToolBelt:
             # numbered list did not read left to right.
             row_top = min(w[1] for w in words)
             runs: list[list] = [[words[0]]]
-            for prev, cur in zip(words, words[1:]):
+            for prev, cur in zip(words, words[1:], strict=False):
                 gap = cur[0] - (prev[0] + prev[2])
                 if gap > max(prev[3], cur[3]):
                     runs.append([])

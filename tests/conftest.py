@@ -1087,6 +1087,25 @@ def _microphones_are_put_down(H, _bubbles_built):
 _DI_CONTEXTVARS = (("_core_tools", "_CURRENT"), ("_core_doctor", "_CURRENT"))
 
 
+def drop_shadowed_host_attrs(host) -> None:
+    """Remove every instance attribute from the tool-host proxy.
+
+    `_ToolDependencies` holds no state of its own: `__getattr__` resolves each
+    name LIVE from the app's globals, which is what lets `monkeypatch.setattr(H,
+    "HOME", tmp)` reach `_dep().HOME`. But `monkeypatch.setattr(host, "HOME", x)`
+    reads the old value THROUGH that proxy and, on undo, writes it back as a
+    real instance attribute — a frozen copy of the developer's HOME that then
+    shadows the live lookup for every later test. Measured: with
+    `HANDSOFF_TEST_ORDER_SEED=6b61c0d` test_desktop's two niri-config tests ran
+    before test_audit_fixes_tools' latin-1 config test, which then read the real
+    ~/.config/niri and answered False — green in collection order, red shuffled.
+    """
+    try:
+        vars(host).clear()
+    except TypeError:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _di_host_is_restored(H):
     """Hand every test THIS monolith as the tool DI host, then restore.
@@ -1120,6 +1139,8 @@ def _di_host_is_restored(H):
     yield
     for var, value in saved:
         var.set(value)
+    if host is not None:
+        drop_shadowed_host_attrs(host)
     if tools is not None and prior_default is not None:
         tools._DEFAULT_DEPS = prior_default
 

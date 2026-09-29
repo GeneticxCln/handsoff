@@ -1487,6 +1487,31 @@ class TestAuditNineFindings:
         assert seen["context"] is None, seen       # a fresh thread has no context
         assert seen["resolved"] is marker, seen    # so only the default can answer
 
+    def test_a_patched_host_attribute_does_not_outlive_its_test(self, H, monkeypatch,
+                                                                 tmp_path):
+        """`monkeypatch.setattr(host, "HOME", x)` freezes the developer's HOME.
+
+        The host proxy resolves every name live from the app's globals. pytest
+        reads the OLD value through it and, on undo, stores that value as a real
+        instance attribute — after which patching `H.HOME` no longer reaches
+        `_dep().HOME`. Two test_desktop tests did exactly that, and any later
+        test that patched `H.HOME` read the real ~/.config/niri (green in file
+        order, red under HANDSOFF_TEST_ORDER_SEED=6b61c0d). The autouse fixture
+        drops such attributes after every test; this pins the mechanism and the
+        cure in one place so it cannot rot into two unrelated-looking facts.
+        """
+        from conftest import drop_shadowed_host_attrs
+        host = H._tool_dependencies
+        with monkeypatch.context() as scoped:
+            scoped.setattr(host, "HOME", tmp_path / "patched")
+        assert "HOME" in vars(host), (
+            "pytest no longer leaves the frozen copy behind — the mechanism this "
+            "guard exists for has changed; re-measure before keeping it")
+        drop_shadowed_host_attrs(host)
+        assert "HOME" not in vars(host)
+        monkeypatch.setattr(H, "HOME", tmp_path / "live")
+        assert host.HOME == tmp_path / "live"
+
     def test_9_set_survives_deleted_qt_object(self, H):
         """A late emit after Qt teardown must not raise (background threads
         outliving the widget raised 'Signal source has been deleted')."""
