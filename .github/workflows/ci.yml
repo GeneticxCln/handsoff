@@ -269,7 +269,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt -c requirements-lock.txt
       - name: Every mutant of the touched lines is caught
-        run: python ci/mutation_gate.py --base HEAD~1
+        run: python ci/mutation_gate.py --base HEAD~1 --ci
 
   # Every markdown anchor link resolves to a real heading (ci/gates.sh
   # `links`, ci/link_check.py). A heading link is the one link that fails

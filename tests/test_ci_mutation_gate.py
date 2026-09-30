@@ -226,6 +226,52 @@ class TestTheGateIsWired:
 # ------------------------------------------------- the skip/refuse contract
 
 
+class TestThePipelineFlag:
+    """The GitHub workflow and the GitLab mirror ran the gate bare, so exit 2 —
+    "nothing here for me to break" — failed the job. The first real GitHub run of
+    a tests-only change went red for exactly that (`mutation: SKIP — no Python
+    source in the diff ... Process completed with exit code 2`). `--ci` makes the
+    three skips that are about the DIFF a pass and leaves every skip about the
+    ENVIRONMENT failing: a gate that could not run is still not a pass."""
+
+    def test_a_diff_with_no_production_python_passes_and_still_says_so(
+            self, gate, docs_only_repo, capsys):
+        assert gate.main(["--root", str(docs_only_repo), "--ci"]) == 0
+        assert "mutation: SKIP" in capsys.readouterr().out
+
+    def test_a_tests_only_diff_passes(self, gate, test_only_repo):
+        assert gate.main(["--root", str(test_only_repo), "--ci"]) == 0
+
+    def test_a_diff_with_no_mutant_site_or_no_changed_test_passes(
+            self, gate, rename_repo):
+        assert gate.main(["--root", str(rename_repo), "--ci"]) == 0
+
+    def test_without_the_flag_the_same_diffs_still_skip(
+            self, gate, docs_only_repo, test_only_repo, rename_repo):
+        for root in (docs_only_repo, test_only_repo, rename_repo):
+            assert gate.main(["--root", str(root)]) == 2, root
+
+    def test_a_directory_that_is_not_a_git_tree_still_fails(self, gate, tmp_path):
+        assert gate.main(["--root", str(tmp_path), "--ci"]) == 2
+
+    def test_a_base_that_is_not_a_commit_still_fails(self, gate, repo):
+        assert gate.main(["--root", str(repo), "--base", "no-such-ref", "--ci"]) == 2
+
+    def test_a_dirty_checkout_still_fails(self, gate, repo):
+        (repo / "widget.py").write_text("BROKEN = 1\n", encoding="utf-8")
+        assert gate.main(["--root", str(repo), "--ci"]) == 2
+
+    def test_a_cap_of_zero_is_still_not_a_pass(self, gate, repo):
+        """`--max 0` measures nothing; that is about the ENVIRONMENT of the run,
+        not about the diff, so `--ci` must not launder it into a green build."""
+        code = gate.main(["--root", str(repo), "--max", "0", "--ci"])
+        assert code != 0
+
+    def test_the_flag_is_in_the_usage_and_the_exit_contract(self, gate):
+        assert "--ci" in gate.__doc__
+        assert "a skip about the environment stays 2" in gate.__doc__
+
+
 class TestItRefusesRatherThanGuesses:
     """A gate that cannot run says so. It must never exit 0 having run nothing."""
 
