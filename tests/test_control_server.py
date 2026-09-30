@@ -594,6 +594,22 @@ class TestTheDiagnosticWorker:
             server._diagnostic_call(boom, 3.0)
 
 
+class TestStartAndRestart:
+    def test_a_stopped_server_can_be_started_again(self, running):
+        server, host, _assistant = running()
+        server.stop()
+        assert not host.CONTROL_SOCK.exists()
+        server.start()                       # the stop flag must not outlive the stop
+        assert _eventually(lambda: _accepting(server, host))
+        assert _ask(host, "status").startswith("state=idle")
+
+    def test_a_refused_start_does_not_re_arm_a_server_that_is_shutting_down(self, running):
+        server, host, _assistant = running()
+        server._stop.set()                   # a shutdown has begun; the loop is still alive
+        server.start()                       # refused: the slot is occupied
+        assert server._stop.is_set(), "a refused start cleared the shutdown flag"
+
+
 class TestHowARequestIsRead:
     def test_the_request_is_cut_at_the_size_ceiling(self, running):
         server, host, assistant = running(_CONTROL_REQUEST_MAX=64, **_ALL_VERBS)
