@@ -403,7 +403,7 @@ mutation:
     # get away with it). A no-op when the environment is already satisfied.
     - python -m pip install --upgrade pip
     - pip install -r requirements.txt -c requirements-lock.txt
-    - python ci/mutation_gate.py --base HEAD~1
+    - python ci/mutation_gate.py --base HEAD~1 --ci
 
 # The docs link gate (ci/gates.sh `links`, ci/link_check.py). A heading link
 # fails silently — rename a heading and markdown does not complain, the reader

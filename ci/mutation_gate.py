@@ -43,9 +43,11 @@ survivors are refusals rather than failures.
 
 Usage:
   mutation_gate.py [--root .] [--base REF] [--max N] [--tests FILE ...]
-                   [--report FILE] [--keep-worktree DIR]
+                   [--report FILE] [--keep-worktree DIR] [--ci]
 
 Exit status: 0 pass, 1 fail, 2 skip (a gate that could not run says so).
+`--ci` turns the three skips that are about the DIFF (nothing to break, no test
+changed, no mutant site) into 0; a skip about the environment stays 2.
 """
 from __future__ import annotations
 
@@ -521,7 +523,23 @@ def main(argv: list[str] | None = None) -> int:
                         help="write the result table as JSON here")
     parser.add_argument("--keep-worktree", default=None,
                         help="lay the worktree down here and keep it")
+    parser.add_argument("--ci", action="store_true",
+                        help="for a pipeline: a diff with NOTHING this gate can "
+                             "measure (no Python it can break, no test changed, "
+                             "no mutant site) exits 0 instead of 2, because "
+                             "there the diff is the whole input and a docs-only "
+                             "or tests-only change is not a failure. A skip "
+                             "about the ENVIRONMENT (not a git worktree, no "
+                             "HEAD, a dirty checkout, an unresolvable base, a "
+                             "worktree that cannot be laid down, a cap of zero) "
+                             "still exits 2: a gate that could not run is not "
+                             "a pass")
     args = parser.parse_args(argv)
+    # The three skips that are about the DIFF, not about whether the gate could
+    # run. Locally they stay 2 (a skip is said out loud, and `ci/gates.sh` shows
+    # it as SKIP); a pipeline passes `--ci` and a change with nothing to break
+    # does not turn the build red.
+    nothing_to_measure = 0 if args.ci else 2
 
     repo = pathlib.Path(args.root).resolve()
     if git(repo, "rev-parse", "--is-inside-work-tree")[0] != 0:
@@ -572,7 +590,7 @@ def main(argv: list[str] | None = None) -> int:
                                 if phase_one else ""))
         _log(f"mutation: SKIP — {report['skipped']}")
         _write_report(args.report, report)
-        return 2
+        return nothing_to_measure
     if not changed_tests and not args.tests:
         # Not a skip to be quiet about: this is the case where the first run
         # of this gate produced a FALSE RED. `hardware.py::_gib` was renamed
@@ -591,7 +609,7 @@ def main(argv: list[str] | None = None) -> int:
         _log("mutation: run it by hand with: --tests <file> ...")
         report["skipped"] = "no test changed; holders named above"
         _write_report(args.report, report)
-        return 2
+        return nothing_to_measure
     if not phase_one:
         report["skipped"] = "no test file to run against the mutants"
         _log(f"mutation: SKIP — {report['skipped']}")
@@ -646,7 +664,7 @@ def main(argv: list[str] | None = None) -> int:
             _log("mutation: no load-bearing mutant site in the lines this "
                  "diff touched — nothing to measure")
             report["skipped"] = "no mutant site in the touched lines"
-            return 2
+            return nothing_to_measure
 
         available = len(candidates)
         chosen = candidates[:args.cap]
