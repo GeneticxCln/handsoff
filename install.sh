@@ -101,7 +101,7 @@ TOP_EXECUTABLE="handsoff.py handsoff-settings.py handsoff-restart handsoff-stop-
 # but never installed, and because the deployment manifest enumerated files the
 # same way, doctor reported in-sync while the feature was simply absent (the
 # settings GUI quietly fell back to "no wallpaper matching").
-CORE_REQUIRED="__init__ registry settings audio brain tools doctor lifecycle calendar assistant bubble web theme qs_desk selfwatch voice"
+CORE_REQUIRED="__init__ registry settings audio brain tools doctor lifecycle calendar assistant bubble web theme qs_desk selfwatch voice control_server"
 is_exec() {   # 0 when the basename is an entry point (installed 0755)
     case " $TOP_EXECUTABLE " in
         *" $1 "*) return 0 ;;
