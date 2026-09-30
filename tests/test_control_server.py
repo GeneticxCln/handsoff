@@ -566,6 +566,50 @@ class TestEveryVerbTheSocketCarries:
         assert _ask(host, "status").startswith("state=idle")     # still serving
 
 
+class TestTheDiagnosticWorker:
+    def test_a_slow_diagnostic_is_waited_for_within_its_timeout(self, running):
+        """Without the join, a diagnostic that has not finished the instant the
+        worker starts reads as timed out; a FAST one hides that, which is how the
+        mutation gate found it unpinned."""
+        server, host, _assistant = running()
+        result = server._diagnostic_call(lambda: (time.sleep(0.3), "slow ok")[1], 3.0)
+        assert result == "slow ok"
+
+    def test_a_diagnostic_that_outlives_its_timeout_is_reported_by_name(self, running):
+        server, host, _assistant = running()
+        release = threading.Event()
+        try:
+            with pytest.raises(TimeoutError, match=r"timed out after 0\.1s"):
+                server._diagnostic_call(lambda: release.wait(10), 0.1)
+        finally:
+            release.set()
+
+    def test_a_diagnostic_that_raises_re_raises_the_original_error(self, running):
+        server, host, _assistant = running()
+
+        def boom():
+            raise KeyError("the original")
+
+        with pytest.raises(KeyError, match="the original"):
+            server._diagnostic_call(boom, 3.0)
+
+
+class TestStartAndRestart:
+    def test_a_stopped_server_can_be_started_again(self, running):
+        server, host, _assistant = running()
+        server.stop()
+        assert not host.CONTROL_SOCK.exists()
+        server.start()                       # the stop flag must not outlive the stop
+        assert _eventually(lambda: _accepting(server, host))
+        assert _ask(host, "status").startswith("state=idle")
+
+    def test_a_refused_start_does_not_re_arm_a_server_that_is_shutting_down(self, running):
+        server, host, _assistant = running()
+        server._stop.set()                   # a shutdown has begun; the loop is still alive
+        server.start()                       # refused: the slot is occupied
+        assert server._stop.is_set(), "a refused start cleared the shutdown flag"
+
+
 class TestHowARequestIsRead:
     def test_the_request_is_cut_at_the_size_ceiling(self, running):
         server, host, assistant = running(_CONTROL_REQUEST_MAX=64, **_ALL_VERBS)
