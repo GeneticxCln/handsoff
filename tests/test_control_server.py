@@ -23,6 +23,8 @@ import ast
 import logging
 import os
 import socket
+import stat
+import threading
 import time
 import types
 from pathlib import Path
@@ -34,7 +36,33 @@ from conftest import HERE as ROOT
 from core import control_server, unix_address
 
 
-def _host(tmp_path: Path, name: str = "a", *, model: str = "test-model"):
+class _Log:
+    """The host's logger, recording what the server says and at which level."""
+
+    def __init__(self):
+        self.lines: list[tuple[str, str]] = []
+
+    def _add(self, level, msg, *args, **_kwargs):
+        self.lines.append((level, msg % args if args else msg))
+
+    def info(self, msg, *args, **kw):
+        self._add("info", msg, *args)
+
+    def warning(self, msg, *args, **kw):
+        self._add("warning", msg, *args)
+
+    def error(self, msg, *args, **kw):
+        self._add("error", msg, *args)
+
+    def exception(self, msg, *args, **kw):
+        self._add("exception", msg, *args)
+
+    def has(self, level: str, needle: str) -> bool:
+        return any(lv == level and needle in text for lv, text in self.lines)
+
+
+def _host(tmp_path: Path, name: str = "a", *, model: str = "test-model",
+          **overrides):
     """A stand-in for the app module: exactly the names the server reads."""
     sock = tmp_path / f"{name}.sock"
 
@@ -44,7 +72,7 @@ def _host(tmp_path: Path, name: str = "a", *, model: str = "test-model"):
         except FileNotFoundError:
             pass
 
-    return types.SimpleNamespace(
+    host = types.SimpleNamespace(
         __file__=str(tmp_path / "handsoff.py"),
         log=logging.getLogger(f"test-control-server-{name}"),
         CONTROL_SOCK=sock,
@@ -64,6 +92,8 @@ def _host(tmp_path: Path, name: str = "a", *, model: str = "test-model"):
         OLLAMA_MODEL=model,
         SETTINGS_APP=tmp_path / "absent-settings.py",
     )
+    vars(host).update(overrides)
+    return host
 
 
 class _Assistant:
@@ -78,6 +108,34 @@ class _Assistant:
 
     def announce_cap_refusal(self, report, detail) -> None:
         pass
+
+
+def _eventually(condition, timeout: float = 5.0) -> bool:
+    """Poll `condition` — the server runs on its own thread, so a fact about its
+    startup is true "soon", never "at the line after start()"."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return bool(condition())
+
+
+def _accepting(server, host) -> bool:
+    """True once the server is LISTENING, not merely once its path exists: the file
+    appears at bind(), before listen(), before the listener is recorded, and a
+    client that connects in that window is refused."""
+    if server._server is None or not host.CONTROL_SOCK.exists():
+        return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        with unix_address(host.CONTROL_SOCK) as address:
+            probe.connect(address)
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
 
 
 def _ask(host, request: str, timeout: float = 5.0) -> str:
@@ -108,11 +166,9 @@ def running(tmp_path):
         assistant = _Assistant()
         server = control_server.ControlServer(assistant, host)
         server.start()
-        deadline = time.time() + 5
-        while not host.CONTROL_SOCK.exists() and time.time() < deadline:
-            time.sleep(0.02)
-        assert host.CONTROL_SOCK.exists(), "the control socket never appeared"
         servers.append(server)
+        assert _eventually(lambda: _accepting(server, host)), (
+            "the control socket never started accepting")
         return server, host, assistant
 
     yield make
@@ -214,3 +270,169 @@ class TestWhatTheExtractionCouldHaveBroken:
         assert first is not None and first.is_alive()
         server.start()                                      # documented no-op
         assert server._thread is first
+
+
+class TestWhatTheMutationGateFoundUnpinned:
+    """The gate mutated the moved code and 14 of the first 40 mutants passed every
+    test in the project: the socket's mode, the `listen`/idle-poll constants, what
+    `stop()` does, the stale-path removal before a bind, the no-token path, the
+    unavailable path, the repeated start, and the cap-refusal recorders. Each is a
+    behaviour another process (or the next start) depends on, so each is pinned."""
+
+    def test_the_socket_file_is_private(self, running):
+        server, host, _assistant = running()
+        assert stat.S_IMODE(host.CONTROL_SOCK.stat().st_mode) == 0o600
+
+    def test_the_backlog_and_the_idle_poll_are_the_documented_ones(
+            self, tmp_path, monkeypatch):
+        calls: list[tuple[str, object]] = []
+        real = socket.socket
+
+        class Recording(real):
+            def listen(self, backlog=None):
+                calls.append(("listen", backlog))
+                return super().listen(backlog)
+
+            def settimeout(self, value):
+                calls.append(("settimeout", value))
+                return super().settimeout(value)
+
+        monkeypatch.setattr(control_server.socket, "socket", Recording)
+        host = _host(tmp_path)
+        server = control_server.ControlServer(_Assistant(), host)
+        server.start()
+        assert _eventually(lambda: server._server is not None)
+        try:
+            assert ("listen", 4) in calls, calls
+            # one lstat per idle SECOND is what notices a removed path
+            assert ("settimeout", 1.0) in calls, calls
+        finally:
+            server.stop()
+
+    def test_stop_ends_the_loop_quietly_and_closes_the_listener(self, running):
+        log = _Log()
+        server, host, _assistant = running(log=log)
+        listener = server._server
+        assert listener is not None and listener.fileno() >= 0
+        thread = server._thread
+        server.stop()
+        assert listener.fileno() == -1, "stop() left the listening socket open"
+        assert not thread.is_alive()
+        assert not log.has("exception", "accept failed"), (
+            "stop() did not mark the shutdown BEFORE closing the listener, so the "
+            f"accept loop reported its own shutdown as a failure: {log.lines}")
+
+    def test_stop_removes_the_path_and_survives_a_removal_that_raises(self, running):
+        log = _Log()
+        server, host, _assistant = running(log=log)
+        seen: list[str] = []
+
+        def failing_remove():
+            seen.append("called")
+            raise OSError("cannot remove")
+
+        host._remove_stale_control_socket = failing_remove
+        server.stop()                                   # must not raise
+        assert seen, "stop() never asked the host to remove the path"
+        assert log.has("exception", "could not remove control socket during shutdown")
+
+    def test_a_stale_socket_is_removed_before_the_bind(self, tmp_path):
+        host = _host(tmp_path)
+        relic = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with unix_address(host.CONTROL_SOCK) as address:
+            relic.bind(address)
+        relic.close()                                  # a SIGKILL relic: file, no owner
+        assert host.CONTROL_SOCK.exists()
+        server = control_server.ControlServer(_Assistant(), host)
+        server.start()
+        try:
+            deadline = time.time() + 5
+            reply = ""
+            while time.time() < deadline:
+                try:
+                    reply = _ask(host, "status")
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            assert reply.startswith("state=idle"), (
+                "the bind ran over a stale path it had not removed")
+        finally:
+            server.stop()
+
+    def test_no_token_means_read_only_verbs_only_and_the_journal_says_so(self, running):
+        log = _Log()
+        server, host, assistant = running(log=log, _rotate_control_token=lambda: None)
+        assert log.has("error", "no capability token could be written")
+        assert log.has("error", "(level status)")           # names what still works
+        assert _ask(host, "status").startswith("state=idle")
+        assert _ask(host, "token=anything\ntoggle").startswith("error: 'toggle' changes state")
+        assert assistant.commands == []
+
+    def test_a_normal_start_reports_no_error(self, running):
+        log = _Log()
+        running(log=log)
+        assert _eventually(lambda: log.has("info", "control socket at")), log.lines
+        assert not [line for line in log.lines if line[0] in ("error", "exception")], (
+            log.lines)
+
+    def test_an_unavailable_socket_is_logged_and_the_server_ends(self, tmp_path):
+        log = _Log()
+        host = _host(tmp_path, log=log, _prepare_runtime=lambda: False)
+        server = control_server.ControlServer(_Assistant(), host)
+        server.start()
+        deadline = time.time() + 5
+        while server._thread is not None and server._thread.is_alive() \
+                and time.time() < deadline:
+            time.sleep(0.02)
+        assert log.has("error", "control socket unavailable: runtime/config "
+                                "directories or files are not private"), log.lines
+        assert not host.CONTROL_SOCK.exists()
+
+    def test_a_repeated_start_says_it_is_already_accepting(self, running):
+        log = _Log()
+        server, host, _assistant = running(log=log)
+        server.start()
+        assert log.has("info", "control socket already accepting")
+
+    def test_a_second_diagnostic_is_refused_by_name_and_recorded_and_announced(
+            self, running):
+        recorded: list[dict] = []
+        announced: list[tuple] = []
+        server, host, assistant = running(
+            log=_Log(), _record_cap_refusal=recorded.append)
+        assistant.announce_cap_refusal = lambda report, detail: announced.append(
+            (report, detail))
+        release = threading.Event()
+        try:
+            with pytest.raises(TimeoutError, match="timed out"):
+                server._diagnostic_call(lambda: release.wait(10), 0.05)
+            with pytest.raises(TimeoutError, match="previous diagnostic is still running"):
+                server._diagnostic_call(lambda: 1, 1.0)
+        finally:
+            release.set()
+        assert recorded and recorded[0]["detail"] == "previous diagnostic still running"
+        assert announced and announced[0][1] == "previous diagnostic still running"
+        assert host.log.has("warning", "cap refusal")
+
+    def test_a_failing_recorder_or_announcer_does_not_hide_the_refusal(self, running):
+        log = _Log()
+
+        def broken_recorder(report):
+            raise RuntimeError("disk full")
+
+        server, host, assistant = running(log=log, _record_cap_refusal=broken_recorder)
+
+        def broken_announcer(report, detail):
+            raise RuntimeError("no speaker")
+
+        assistant.announce_cap_refusal = broken_announcer
+        release = threading.Event()
+        try:
+            with pytest.raises(TimeoutError):
+                server._diagnostic_call(lambda: release.wait(10), 0.05)
+            with pytest.raises(TimeoutError, match="previous diagnostic is still running"):
+                server._diagnostic_call(lambda: 1, 1.0)
+        finally:
+            release.set()
+        assert log.has("exception", "cap-refusal recorder failed"), log.lines
+        assert log.has("exception", "cap-refusal announcement failed"), log.lines
