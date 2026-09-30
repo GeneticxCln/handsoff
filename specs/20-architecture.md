@@ -9,7 +9,7 @@ copy a size out of it into prose.
 
 | Module | Lines | Owns | Must not import |
 |---|---|---|---|
-| `handsoff.py` | 11330 | bootstrap loader, `Assistant`, `ControlServer`, voice pipeline, memory, `main()` | — (host) |
+| `handsoff.py` | 10833 | bootstrap loader, `Assistant`, the `ControlServer` subclass (injects the app's globals), voice pipeline, memory, `main()` | — (host) |
 | `core/__init__.py` | 342 | `APP_MODULE_NAME="handsoff_core"`, `claim_app_instance`, `load_module`, origin rule, stdlib-shadow guard | app globals |
 | `core/tools.py` | 5267 | 52 `@tool`s, `ToolBelt`, `set_dependencies` (the host installs its runtime with this), `DecisionPolicy`, `BoundedJob`, whitelist, secret guard, `ToolResult` | `handsoff` (DI only) |
 | `core/bubble.py` | 4107 | `BubbleWidget`, 14 painters, palette, packs, preview TTL 6 s | app globals (injected `SETTINGS`) |
@@ -29,11 +29,12 @@ copy a size out of it into prose.
 | `hardware.py` | 607 | 13-section `snapshot()`, TTLs, injectable probers, `--preflight` | SETTINGS/Qt/audio |
 | `handsoff-settings.py` | 5623 | `SettingsWindow` — 6-tab GUI, offscreen-capable, loads schema without the bubble | bubble module |
 | `core/voice.py` | 570 | the STATELESS voice primitives the host binds with thin aliases: `SpeechGate` (energy VAD, adaptive floor), the wake vocabulary and matching rules (`norm_words`, `is_wake_utt`, `match_wake`, `skeleton_match`/`wake_skeleton`, `wake_anywhere` + `WAKE_FILLER`/`WAKE_ANYWHERE_WORDS`), `is_echo` + stopwords (the mic-from-speaker filter), `WakeSpotter` (openWakeWord pre-roll detector; model, clock and chunk size arrive as constructor params so the model cache and its test seams stay with the host), and the mic open/device primitives (`available_input_devices`, `device_is_available`, `open_input_unlocked`, `mic_device_to_open`, `stop_stream_owned`, `start_stream_owned` — sd, logger, mic lock and last-open record are parameters). ContinuousListener, Recorder and the host's `_speak` stay in `handsoff.py`: assistant/UI lifecycle state and health hooks | anything (stdlib + numpy locally; sd/logger/lock as parameters) |
+| `core/control_server.py` | 558 | the CONTROL SOCKET (`ControlServer`): the unix-socket listener that niri keybinds, `--ptt` and the settings app drive the bubble through — the capability token (constant-time compare, required for every verb that changes state, read-only verbs exempt), the peer-uid check (SO_PEERCRED, read by the host's `_peer_uid`), a whole-request read bounded in size and in time, one failing request costing that request and not the server (the client is told by name), the slow diagnostics in a one-slot worker under a timeout, the accept loop as a registry singleton slot, and a path removed under a live bubble re-bound (never over a foreign inode). It reads the app's names — socket and token paths, verb tables, the doctor, the model name, the logger — LIVE on every request from a `dependencies` object passed to the constructor: per INSTANCE, so no process-wide "current host" exists to be repointed by whichever app loaded last; the app's `ControlServer` is a thin subclass that injects its own globals. The path helpers (`_remove_stale_control_socket`, `_peer_uid`) and the `--ptt` client stay in `handsoff.py` | `handsoff`, Qt, audio (dependencies injected) |
 
 Dependency direction: `handsoff.py` → `core.*` via `_load_module` handles
 (`_core_tools`, `_core_bubble`, `_core_settings`, `_brain`, `_audio`,
 `_core_registry`, `_core_assistant`, `_core_lifecycle`, `_core_calendar`,
-`_core_doctor`, `_hardware`). Core modules reach back ONLY through injected
+`_core_doctor`, `_core_control_server`, `_hardware`). Core modules reach back ONLY through injected
 deps. `core/calendar.py` + `core/brain.py` + `core/registry.py` +
 `core/lifecycle.py` + `core/qs_desk.py` are dependency-free leaves.
 
@@ -92,8 +93,9 @@ is a transition, not a parking space.
 
 Monolith cut (in progress): (a) settings → `core/settings.py`, (4c) tool
 runtime → `core/tools.py` + host `ToolBelt` subclass, (4d) doctor →
-`core/doctor.py`, (4e) turn primitives → `core/lifecycle.py`. Still in
-`handsoff.py`: `Assistant`, `ControlServer`, listeners, memory, wiring.
+`core/doctor.py`, (4e) turn primitives → `core/lifecycle.py`, (4g) the
+control socket → `core/control_server.py`. Still in `handsoff.py`: `Assistant`,
+listeners, memory, the control-socket helpers and `--ptt` client, wiring.
 
 ## 3. Dependency injection seams
 
@@ -180,4 +182,4 @@ timeout are reported as WARNING with frame counts, never dropped silently.
   model `core.audio` no longer holds (ordering reviewed, not just tested).
 - `_DEPLOY_FILES` (8 entries, `handsoff.py:644`) is a FLOOR for
   manifest-less installs; the manifest glob is the ceiling. Any new module
-  MUST reach install.sh `CORE_REQUIRED` (16 names today) — see `90-audit.md`.
+  MUST reach install.sh `CORE_REQUIRED` (17 names today) — see `90-audit.md`.

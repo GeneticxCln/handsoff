@@ -843,34 +843,39 @@ class TestControlSocket:
         """
         H, _delivered, _app = server
         import ast
-        tree = ast.parse(inspect.getsource(H))
         arms: dict[str, set[str]] = {}
-        for cls in tree.body:
-            if not isinstance(cls, ast.ClassDef):
-                continue
-            found = set()
-            for node in ast.walk(cls):
-                if not isinstance(node, ast.If):
+        # The socket's dispatch lives in core/control_server.py (the app's
+        # `ControlServer` is a subclass that injects its globals), the
+        # `_on_command` arms in the app module: read both.
+        for module in (H, H._core_control_server):
+            tree = ast.parse(inspect.getsource(module))
+            for cls in tree.body:
+                if not isinstance(cls, ast.ClassDef):
                     continue
-                test = node.test
-                # `action == "x"` and `action in ("x", "y")` BOTH dispatch; the
-                # dictation verbs are a tuple membership test, and reading only
-                # the equality form reports three working verbs as unhandled.
-                targets: list[ast.expr] = []
-                if isinstance(test, ast.Compare) and len(test.ops) == 1:
-                    left = ast.unparse(test.left)
-                    if left == "action":
-                        if isinstance(test.ops[0], ast.In):
-                            targets = list(test.comparators)
-                        else:
-                            targets = [test.comparators[0]]
-                for target in targets:
-                    for sub in ast.walk(target):
-                        if (isinstance(sub, ast.Constant)
-                                and isinstance(sub.value, str)):
-                            found.add(sub.value)
-            if found:
-                arms[cls.name] = found
+                found = set()
+                for node in ast.walk(cls):
+                    if not isinstance(node, ast.If):
+                        continue
+                    test = node.test
+                    # `action == "x"` and `action in ("x", "y")` BOTH dispatch;
+                    # the dictation verbs are a tuple membership test, and
+                    # reading only the equality form reports three working
+                    # verbs as unhandled.
+                    targets: list[ast.expr] = []
+                    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+                        left = ast.unparse(test.left)
+                        if left == "action":
+                            if isinstance(test.ops[0], ast.In):
+                                targets = list(test.comparators)
+                            else:
+                                targets = [test.comparators[0]]
+                    for target in targets:
+                        for sub in ast.walk(target):
+                            if (isinstance(sub, ast.Constant)
+                                    and isinstance(sub.value, str)):
+                                found.add(sub.value)
+                if found:
+                    arms.setdefault(cls.name, set()).update(found)
         handled = arms.get("ControlServer", set()) | arms.get("Assistant", set())
         unhandled = sorted((H.PTT_ACTIONS - H.PTT_CLI_ONLY) - handled)
         assert not unhandled, (

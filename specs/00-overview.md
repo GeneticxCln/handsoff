@@ -45,10 +45,11 @@ desk verification stays in `ACCEPTANCE.md`, history stays in `GAP_ANALYSIS.md`.
 
 ## Scale
 
-- `core/`: 16 modules (sizes and ownership in `20-architecture.md` §1, which is
+- `core/`: 17 modules (sizes and ownership in `20-architecture.md` §1, which is
   GENERATED from the tree — a size copied into prose starts lying that day).
-- `handsoff.py` is the app: bootstrap, `Assistant`, `ControlServer`, voice
-  pipeline, memory, `main()`; `handsoff-settings.py` is the 6-tab GUI.
+- `handsoff.py` is the app: bootstrap, `Assistant`, the `ControlServer` subclass
+  (the socket itself is `core/control_server.py`), voice pipeline, memory,
+  `main()`; `handsoff-settings.py` is the 6-tab GUI.
 - The suite's own inventory is `60-test-plan.md` (where the counts are a dated
   snapshot and the file list is the contract).
 

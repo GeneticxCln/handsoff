@@ -69,7 +69,7 @@ vision/requirements/architecture/API/data/ops/test-plan. Created as
 
 1. **`_DEPLOY_FILES` drift — CLOSED (2026-09-16).** `handsoff.py:644` is still a
    top-level floor (the shipped top-level files plus three core modules), while
-   install.sh `CORE_REQUIRED` ships 16 core modules. A manifest-driven
+   install.sh `CORE_REQUIRED` ships 17 core modules. A manifest-driven
    install was already safe — the manifest glob is unioned over the tuple — so
    the exposure was the manifest-less or hand-rolled install, which compared
    only the floor and reported `in-sync` while modules differed.
