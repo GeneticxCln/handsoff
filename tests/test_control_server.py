@@ -610,6 +610,31 @@ class TestStartAndRestart:
         assert server._stop.is_set(), "a refused start cleared the shutdown flag"
 
 
+class TestTheAcceptSlotOnStop:
+    def test_stop_frees_the_slot_once_the_loop_is_gone(self, running):
+        server, host, _assistant = running()
+        server.stop()
+        assert server._thread is None, "the slot still names a dead accept loop"
+
+    def test_a_loop_that_outlives_the_join_budget_keeps_the_slot(self, tmp_path):
+        """A restart must not get a second acceptor beside one that is still
+        running: the slot is freed only once its occupant is really dead."""
+        host = _host(tmp_path)
+        server = control_server.ControlServer(_Assistant(), host)
+        release = threading.Event()
+        stuck = threading.Thread(target=release.wait, args=(30,), daemon=True)
+        stuck.start()
+        slot = server._runs.reserve(server.ACCEPT_SLOT, reclaim=lambda t: not t.is_alive())
+        with slot:
+            slot.commit(stuck)
+        try:
+            server.stop()                       # waits out its 2 s join budget
+            assert stuck.is_alive()
+            assert server._thread is stuck, "the slot was freed under a live loop"
+        finally:
+            release.set()
+
+
 class TestHowARequestIsRead:
     def test_the_request_is_cut_at_the_size_ceiling(self, running):
         server, host, assistant = running(_CONTROL_REQUEST_MAX=64, **_ALL_VERBS)
