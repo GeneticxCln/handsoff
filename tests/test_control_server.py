@@ -649,6 +649,50 @@ class TestHowARequestIsRead:
         assert _eventually(lambda: assistant.said == ["x" * 48]), assistant.said
         # 64 bytes in all, 16 of them the `token=…\nsay ` header
 
+    def test_the_reader_asks_only_for_what_is_left_under_the_ceiling(
+            self, tmp_path, monkeypatch):
+        """The loop checks BEFORE it reads, so a fixed 64 KiB asked for one more
+        chunk than the bound allowed (measured: 101,996 bytes dispatched for a
+        65,536-byte bound). The sizes it asks the kernel for ARE the bound: the
+        remainder each time, and no read at all once the ceiling is reached."""
+        asked: list[int] = []
+        real = socket.socket
+
+        class Recording(real):
+            def recv(self, bufsize, *args):
+                asked.append(bufsize)
+                return super().recv(bufsize, *args)
+
+        host = _host(tmp_path, _CONTROL_REQUEST_MAX=64, **_ALL_VERBS)
+        server = control_server.ControlServer(_Assistant(), host)
+        server.start()
+        try:
+            assert _eventually(lambda: _accepting(server, host))
+            _ask(host, "status")            # a full round trip: nothing left in flight
+            monkeypatch.setattr(control_server.socket, "socket", Recording)
+            client = real(socket.AF_UNIX, socket.SOCK_STREAM)     # a plain client
+            with unix_address(host.CONTROL_SOCK) as address:
+                client.connect(address)
+            client.sendall(b"x" * 40)       # 40 of the 64 arrive: ask for the 24 that are left
+            assert _eventually(lambda: asked == [64, 24]), asked
+            client.sendall(b"y" * 100)      # only 24 of it fits: the ceiling is reached...
+            time.sleep(0.3)                 # ...and a reader that asks once more would show here
+            assert asked == [64, 24], f"the reader asked for more than the ceiling: {asked}"
+            client.close()
+        finally:
+            server.stop()
+
+    def test_the_read_budget_expires_exactly_at_its_deadline(self, running, monkeypatch):
+        """`>=`, not `>`: a request whose budget is spent is cut AT the deadline.
+        The clock is stepped so the first check lands exactly on it."""
+        log = _Log()
+        server, host, _assistant = running(log=log, _CONTROL_READ_BUDGET=5.0, **_ALL_VERBS)
+        readings = iter([0.0, 5.0])
+        monkeypatch.setattr(control_server.time, "monotonic",
+                            lambda: next(readings, 5.0))
+        reply = _ask(host, "status")
+        assert log.has("warning", "did not finish within 5.0s"), (log.lines, reply)
+
     def test_a_request_that_dribbles_past_the_read_budget_is_cut_and_logged(self, running):
         log = _Log()
         server, host, _assistant = running(log=log, _CONTROL_READ_BUDGET=0.3, **_ALL_VERBS)
