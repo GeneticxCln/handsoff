@@ -1327,7 +1327,8 @@ def _socket_command(sock_path, command: str, timeout: float = 1.5) -> "str | Non
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
-        s.connect(str(sock_path))
+        with _core.unix_address(sock_path) as address:
+            s.connect(address)
         s.sendall(_control_request_bytes(command))
         s.shutdown(socket.SHUT_WR)
         buf = b""
@@ -5545,7 +5546,8 @@ drifting apart one forgotten key at a time.
             import socket as _socket
             sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
             sock.settimeout(2.0)
-            sock.connect(str(H.CONTROL_SOCK))
+            with _core.unix_address(H.CONTROL_SOCK) as address:
+                sock.connect(address)
             # This is the request that makes the bubble re-read settings.json,
             # so it carries the capability token like any other verb that
             # changes state — otherwise the save would appear to succeed and

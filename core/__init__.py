@@ -9,6 +9,7 @@ are unchanged; later steps peel audio/brain/tools/ui/doctor the same way.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import sys
@@ -299,6 +300,41 @@ def load_module(mod_name: str):
     raise ImportError(
         f"handsoff core: cannot load {mod_name!r} — expected "
         f"{_HERE / mod_name}.py beside this package or in the checkout root")
+
+
+# ------------------------------------------------------------ unix-socket paths
+# `sockaddr_un.sun_path` holds 108 bytes on Linux (107 plus the NUL). The control
+# socket lives under STATE_DIR, so a long HOME — or an XDG_STATE_HOME pointed at a
+# deep directory: a container, a CI scratch dir, a test sandbox — made `bind()`
+# raise "AF_UNIX path too long". The bubble logged one line and ran on WITHOUT a
+# control socket: push-to-talk (`--ptt`, the niri keybinding), the settings app's
+# live controls and "reload settings" all failed as "not running".
+_SUN_PATH_MAX = 107
+
+
+@contextlib.contextmanager
+def unix_address(path):
+    """The string to hand `bind()`/`connect()` for the socket file at `path`.
+
+    A path that fits is passed through untouched. One that does not is reached
+    through an `O_PATH` descriptor on its parent directory, addressed as
+    `/proc/self/fd/<n>/<name>`: the kernel resolves that to the same file with a
+    name of a few bytes, so the socket keeps living in the private state directory
+    (no second location to secure, and every path-based check — `lstat`, `chmod`,
+    the stale-socket sweep — still sees the real path). The descriptor is open
+    only for the duration of the `with`; `bind`/`connect` resolve the name when
+    called, so nothing needs it afterwards.
+    """
+    text = os.fspath(path)
+    if len(os.fsencode(text)) <= _SUN_PATH_MAX:
+        yield text
+        return
+    parent, name = os.path.split(text)
+    fd = os.open(parent or ".", os.O_PATH | os.O_DIRECTORY)
+    try:
+        yield f"/proc/self/fd/{fd}/{name}"
+    finally:
+        os.close(fd)
 
 
 _schema = load_module("settings_schema")

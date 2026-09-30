@@ -55,6 +55,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import struct
@@ -336,6 +337,7 @@ from core import load_module as _load_module
 from core import registry as _core_registry
 from core import APP_MODULE_NAME as _canonical_app_name
 from core import claim_app_instance as _claim_app_instance
+from core import unix_address as _unix_address
 
 
 # -------------------------------------------------------------------- identity
@@ -10568,7 +10570,8 @@ class ControlServer:
                     " ".join(sorted(PTT_READ_ONLY)))
             _remove_stale_control_socket()
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server.bind(str(CONTROL_SOCK))
+            with _unix_address(CONTROL_SOCK) as address:
+                server.bind(address)
             os.chmod(CONTROL_SOCK, 0o600)
             server.listen(4)
             server.settimeout(1.0)
@@ -10878,7 +10881,8 @@ class ControlServer:
             # non-socket at that path rather than unlinking it.
             _remove_stale_control_socket()
             fresh = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            fresh.bind(str(CONTROL_SOCK))
+            with _unix_address(CONTROL_SOCK) as address:
+                fresh.bind(address)
             os.chmod(CONTROL_SOCK, 0o600)
             fresh.listen(4)
             fresh.settimeout(1.0)
@@ -11001,7 +11005,8 @@ def ptt_client(argv: list[str]) -> int:
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(5.0)
-            s.connect(str(CONTROL_SOCK))
+            with _unix_address(CONTROL_SOCK) as address:
+                s.connect(address)
             s.sendall(b"doctor")
             s.shutdown(socket.SHUT_WR)
             reply = b""
@@ -11024,7 +11029,8 @@ def ptt_client(argv: list[str]) -> int:
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(5.0)
-        s.connect(str(CONTROL_SOCK))
+        with _unix_address(CONTROL_SOCK) as address:
+            s.connect(address)
         s.sendall(_control_payload(action, argv))
         s.shutdown(socket.SHUT_WR)
         reply = b""
@@ -11155,6 +11161,85 @@ def acquire_lock():
     return None
 
 
+_SHUTDOWN_SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP")
+
+
+class _SignalShutdown:
+    """SIGTERM, SIGINT and SIGHUP end the bubble through the orderly quit.
+
+    Nothing handled them. `systemctl stop` (and `handsoff-restart`, and the
+    settings app's "Quit bubble") sends SIGTERM, whose default action ends the
+    process on the spot: `aboutToQuit`, `ControlServer.stop` and
+    `Assistant.shutdown` never ran, so the control socket file, the notification
+    reader's child and any running tool watcher were left to the next start (or to
+    systemd's cgroup sweep). Measured against the real bubble: SIGTERM -> exit 143
+    with no shutdown; SIGINT (Ctrl-C in a terminal) was ignored outright, because
+    Python only runs a signal handler when the interpreter gets control and Qt's
+    event loop, sitting in C++, does not hand it over.
+
+    The fix that does not poll: the C-level handler writes the signal number to a
+    wake-up descriptor, and a `QSocketNotifier` on the other end of that socket
+    pair wakes Qt's own loop, which calls `app.quit()` — the path the bubble's
+    Quit menu already takes. Each signal is handled ONCE and then restored to its
+    default action, so a second Ctrl-C (or a second TERM) while a shutdown hangs
+    ends the process the old way.
+    """
+
+    def __init__(self, app) -> None:
+        from PySide6.QtCore import QSocketNotifier
+        self._app = app
+        self._numbers = [getattr(signal, name) for name in _SHUTDOWN_SIGNALS
+                         if hasattr(signal, name)]
+        self._read, self._write = socket.socketpair()
+        self._read.setblocking(False)
+        self._write.setblocking(False)
+        try:
+            self._previous_fd = signal.set_wakeup_fd(
+                self._write.fileno(), warn_on_full_buffer=False)
+        except ValueError:            # not the main thread: nothing installed
+            self._read.close()
+            self._write.close()
+            raise
+        for number in self._numbers:
+            # A Python-level handler is what makes the C handler write the byte;
+            # the handler itself has nothing to do.
+            signal.signal(number, lambda *_: None)
+        self._notifier = QSocketNotifier(
+            self._read.fileno(), QSocketNotifier.Type.Read)
+        self._notifier.activated.connect(self._on_readable)
+
+    def _on_readable(self, *_) -> None:
+        try:
+            received = self._read.recv(64)
+        except OSError:
+            return
+        names = []
+        for number in received:
+            try:
+                names.append(signal.Signals(number).name)
+                signal.signal(number, signal.SIG_DFL)
+            except (ValueError, OSError):
+                pass
+        if names:
+            log.info("received %s — shutting down", ", ".join(names))
+            self._app.quit()
+
+    def close(self) -> None:
+        try:
+            self._notifier.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            signal.set_wakeup_fd(self._previous_fd)
+        except (ValueError, OSError):
+            pass
+        for end in (self._read, self._write):
+            try:
+                end.close()
+            except OSError:
+                pass
+
+
 def main() -> int:
     if "--ptt" in sys.argv:
         return ptt_client(sys.argv[sys.argv.index("--ptt") + 1:])
@@ -11209,6 +11294,9 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)
     QGuiApplication.setDesktopFileName(APP_NAME)  # Wayland app-id → niri window rules
+    # Before anything slow is built: a stop that arrives while the models load
+    # is answered by the same orderly quit, once the loop is running.
+    signals = _SignalShutdown(app)
 
     assistant = Assistant()
     bubble = _core_bubble.BubbleWidget(assistant)
@@ -11223,6 +11311,7 @@ def main() -> int:
     finally:
         control.stop()
         assistant.shutdown()
+        signals.close()
         try:
             lock.close()
         except OSError:
