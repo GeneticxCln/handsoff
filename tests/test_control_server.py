@@ -20,6 +20,7 @@ What the extraction must not have changed is pinned by tests/test_lifecycle.py
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import os
 import socket
@@ -101,10 +102,27 @@ class _Assistant:
         self.state = "idle"
         self._handsfree = False
         self.commands: list[str] = []
+        self.said: list[str] = []
         self.sigCommand = types.SimpleNamespace(emit=self.commands.append)
 
     def level_snapshot(self) -> dict:
         return {"raw": 0.0}
+
+    def mic_health(self) -> dict:
+        return {"mic": "ok", "note": "café"}
+
+    def clear_history(self) -> int:
+        return 3
+
+    def say_preview(self, text: str) -> str:
+        self.said.append(text)
+        return f"ok: said {len(text)} chars"
+
+    def set_pack_preview(self, folder: str) -> str:
+        return f"ok: previewing {folder}"
+
+    def clear_pack_preview(self) -> str:
+        return "ok: preview cleared"
 
     def announce_cap_refusal(self, report, detail) -> None:
         pass
@@ -436,3 +454,383 @@ class TestWhatTheMutationGateFoundUnpinned:
             release.set()
         assert log.has("exception", "cap-refusal recorder failed"), log.lines
         assert log.has("exception", "cap-refusal announcement failed"), log.lines
+
+
+# Every verb the real socket carries. The default stand-in host knows four; the
+# tests below need the rest, so they pass this as overrides.
+_ALL_VERBS = dict(
+    PTT_ACTIONS={"status", "toggle", "selftest", "level", "health", "doctor",
+                 "clear-history", "say", "preview-pack", "preview-clear", "settings"},
+    PTT_READ_ONLY=frozenset({"status", "level", "health", "doctor"}),
+    PTT_CLI_ONLY=frozenset({"selftest"}),
+)
+
+
+class _Closer:
+    """A listener stand-in that only counts how often it is closed."""
+
+    def __init__(self):
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+class TestEveryVerbTheSocketCarries:
+    """Mutation gate, second pass: the verb arms had no test that ran them from
+    this module. Each arm answers another process, so each reply is pinned."""
+
+    def test_health_answers_the_snapshot_as_json_and_names_its_timeout(self, running):
+        server, host, _assistant = running(**_ALL_VERBS)
+        timeouts: list[float] = []
+        real = server._diagnostic_call
+        server._diagnostic_call = lambda fn, t: (timeouts.append(t), real(fn, t))[1]
+        reply = _ask(host, "health")
+        assert json.loads(reply) == {"mic": "ok", "note": "café"}
+        assert "café" in reply, "non-ASCII must not be escaped"
+        assert timeouts == [4.0]
+
+    def test_a_failing_health_snapshot_is_named_in_the_reply_and_the_journal(self, running):
+        log = _Log()
+        server, host, assistant = running(log=log, **_ALL_VERBS)
+
+        def boom():
+            raise RuntimeError("backend wedged")
+
+        assistant.mic_health = boom
+        assert _ask(host, "health") == "error: health snapshot failed: backend wedged\n"
+        assert log.has("exception", "health snapshot failed")
+
+    def test_doctor_answers_the_hosts_report_and_names_its_timeout(self, running):
+        server, host, _assistant = running(**_ALL_VERBS)
+        timeouts: list[float] = []
+        real = server._diagnostic_call
+        server._diagnostic_call = lambda fn, t: (timeouts.append(t), real(fn, t))[1]
+        assert _ask(host, "doctor") == "doctor ok\n"
+        assert timeouts == [4.5]
+
+    def test_a_failing_doctor_is_named_in_the_reply_and_the_journal(self, running):
+        log = _Log()
+
+        def boom():
+            raise RuntimeError("no nvidia-smi")
+
+        server, host, _assistant = running(log=log, run_doctor=boom, **_ALL_VERBS)
+        assert _ask(host, "doctor") == "error: doctor report failed: no nvidia-smi\n"
+        assert log.has("exception", "doctor report failed")
+
+    def test_level_and_clear_history_answer_from_the_assistant(self, running):
+        server, host, _assistant = running(**_ALL_VERBS)
+        assert json.loads(_ask(host, "level")) == {"raw": 0.0}
+        assert _ask(host, "token=tok-a\nclear-history") == "ok: cleared 3 history message(s)\n"
+
+    def test_say_keeps_the_text_exactly_as_typed(self, running):
+        server, host, assistant = running(**_ALL_VERBS)
+        reply = _ask(host, "token=tok-a\nSAY Hello World")
+        assert reply == "ok: said 11 chars\n"
+        assert assistant.said == ["Hello World"], "the verb is lowercased, the TEXT is not"
+
+    def test_the_pack_preview_verbs_pass_the_folder_through(self, running):
+        server, host, _assistant = running(**_ALL_VERBS)
+        assert _ask(host, "token=tok-a\npreview-pack /some/folder") == (
+            "ok: previewing /some/folder\n")
+        assert _ask(host, "token=tok-a\npreview-clear") == "ok: preview cleared\n"
+
+    def test_settings_launches_the_settings_app_detached_when_it_exists(
+            self, running, monkeypatch, tmp_path):
+        app = tmp_path / "settings-app.py"
+        app.write_text("")
+        launched: list[tuple] = []
+        monkeypatch.setattr(control_server.subprocess, "Popen",
+                            lambda argv, **kw: launched.append((argv, kw)))
+        server, host, _assistant = running(SETTINGS_APP=app, **_ALL_VERBS)
+        assert _ask(host, "token=tok-a\nsettings") == "ok: settings window launched\n"
+        argv, kwargs = launched[0]
+        assert argv[1:] == [str(app)]
+        assert kwargs["start_new_session"] is True
+        assert kwargs["stdout"] is control_server.subprocess.DEVNULL
+        assert kwargs["stderr"] is control_server.subprocess.DEVNULL
+
+    def test_settings_says_where_it_looked_when_the_app_is_missing(self, running, tmp_path):
+        missing = tmp_path / "no-such-settings.py"
+        server, host, _assistant = running(SETTINGS_APP=missing, **_ALL_VERBS)
+        assert _ask(host, "token=tok-a\nsettings") == (
+            f"ERROR: settings app missing at {missing}\n")
+
+    def test_a_failing_verb_is_journalled_by_name_and_the_reply_says_which(self, running):
+        log = _Log()
+        server, host, assistant = running(log=log, **_ALL_VERBS)
+        assistant.level_snapshot = lambda: 1 / 0
+        assert _ask(host, "level") == "error: level failed (ZeroDivisionError) — see the journal\n"
+        assert log.has("exception", "control socket: 'level' failed")
+        assert _ask(host, "status").startswith("state=idle")     # still serving
+
+
+class TestHowARequestIsRead:
+    def test_the_request_is_cut_at_the_size_ceiling(self, running):
+        server, host, assistant = running(_CONTROL_REQUEST_MAX=64, **_ALL_VERBS)
+        request = "token=tok-a\nsay " + "x" * 200
+        try:
+            _ask(host, request)
+        except OSError:
+            # past the ceiling the server stops reading and closes with the
+            # client's bytes unread, which the client sees as a reset (the
+            # class's own comment on why a request is read before it is judged)
+            pass
+        assert _eventually(lambda: assistant.said == ["x" * 48]), assistant.said
+        # 64 bytes in all, 16 of them the `token=…\nsay ` header
+
+    def test_a_request_that_dribbles_past_the_read_budget_is_cut_and_logged(self, running):
+        log = _Log()
+        server, host, _assistant = running(log=log, _CONTROL_READ_BUDGET=0.3, **_ALL_VERBS)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(5.0)
+        try:
+            with unix_address(host.CONTROL_SOCK) as address:
+                client.connect(address)
+            for byte in b"sta":                     # 0.75 s, a budget of 0.3 s
+                client.sendall(bytes([byte]))
+                time.sleep(0.25)
+            reply = client.recv(4096).decode()
+        finally:
+            client.close()
+        assert reply.startswith("error: unknown command 'sta'"), reply
+        assert log.has("warning", "did not finish within 0.3s"), log.lines
+
+    def test_a_connection_gets_a_five_second_read_timeout(self, tmp_path, monkeypatch):
+        timeouts: list[float] = []
+        real = socket.socket
+
+        class Recording(real):
+            def settimeout(self, value):
+                timeouts.append(value)
+                return super().settimeout(value)
+
+        host = _host(tmp_path)
+        server = control_server.ControlServer(_Assistant(), host)
+        monkeypatch.setattr(control_server.socket, "socket", Recording)
+        server.start()
+        try:
+            assert _eventually(lambda: _accepting(server, host))
+            _ask(host, "status", timeout=4.5)          # the client's own timeout differs
+            assert _eventually(lambda: 5.0 in timeouts), timeouts
+        finally:
+            server.stop()
+
+    def test_a_peer_that_is_not_us_is_refused_and_logged(self, running):
+        log = _Log()
+        server, host, assistant = running(log=log, _peer_uid=lambda conn: os.getuid() + 1)
+        assert _ask(host, "status") == "error: not permitted\n"
+        assert log.has("warning", f"refusing peer uid {os.getuid() + 1}"), log.lines
+        assert assistant.commands == []
+
+    def test_a_platform_that_cannot_report_the_peer_is_not_refused(self, running):
+        server, host, _assistant = running(_peer_uid=lambda conn: None)
+        assert _ask(host, "status").startswith("state=idle")
+
+
+class TestTheAcceptLoopWatchesItsPath:
+    """One lstat per idle second: the path can be removed or replaced under a live
+    bubble, and the loop has to notice, repair only what it bound, and never
+    unlink an inode that is not its own."""
+
+    def test_the_loop_ends_on_the_next_idle_second_when_asked_to_stop(self, running):
+        server, host, _assistant = running()
+        thread = server._thread
+        server._stop.set()                # without closing the listener
+        assert _eventually(lambda: not thread.is_alive(), timeout=4.0)
+        assert not host.CONTROL_SOCK.exists(), "the loop's own cleanup did not remove the path"
+
+    def test_an_idle_loop_keeps_serving(self, running):
+        server, host, _assistant = running()
+        time.sleep(2.3)                   # two idle timeouts
+        assert _ask(host, "status").startswith("state=idle")
+
+    def test_a_removed_path_is_rebound_and_served_again(self, running):
+        log = _Log()
+        server, host, _assistant = running(log=log)
+        old = server._server
+        host.CONTROL_SOCK.unlink()
+
+        def served():
+            try:
+                return _ask(host, "status", timeout=1.0).startswith("state=idle")
+            except OSError:
+                return False
+
+        assert _eventually(served, timeout=6.0), "the removed path was never re-bound"
+        assert log.has("warning", "was removed while running — re-bound"), log.lines
+        assert stat.S_IMODE(host.CONTROL_SOCK.stat().st_mode) == 0o600
+        assert server._server is not old and old.fileno() == -1
+        assert server._orphan_reported is False
+
+    def test_a_path_that_names_someone_elses_socket_is_reported_once_and_left_alone(
+            self, running):
+        log = _Log()
+        server, host, _assistant = running(log=log)
+        host.CONTROL_SOCK.unlink()
+        foreign = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with unix_address(host.CONTROL_SOCK) as address:
+            foreign.bind(address)
+        foreign.listen(1)
+        try:
+            ident = (host.CONTROL_SOCK.lstat().st_dev, host.CONTROL_SOCK.lstat().st_ino)
+            assert _eventually(lambda: log.has("error", "now belongs to another inode"),
+                               timeout=5.0), log.lines
+            time.sleep(2.3)               # two more idle seconds: the latch holds
+            said = [t for lv, t in log.lines if "now belongs to another inode" in t]
+            assert len(said) == 1, said
+            assert (host.CONTROL_SOCK.lstat().st_dev,
+                    host.CONTROL_SOCK.lstat().st_ino) == ident, "the foreign inode was replaced"
+        finally:
+            foreign.close()
+
+    def test_a_path_this_server_never_bound_is_not_repaired(self, running, tmp_path):
+        server, host, _assistant = running()
+        other = tmp_path / "somebody-elses.sock"
+        host.CONTROL_SOCK = other          # an embedder or a test reassigns the global
+        time.sleep(2.3)
+        assert not other.exists(), "the server created a socket at a path it never bound"
+
+    def test_an_accept_that_fails_outside_a_shutdown_is_journalled(self, running):
+        log = _Log()
+        server, host, _assistant = running(log=log)
+        thread = server._thread
+        server._server.close()             # the listener dies under the loop
+        assert _eventually(lambda: not thread.is_alive(), timeout=4.0)
+        assert log.has("exception", "control socket accept failed"), log.lines
+
+    def test_a_socket_that_cannot_be_bound_is_closed_again(self, tmp_path, monkeypatch):
+        closed: list[int] = []
+        real = socket.socket
+
+        class Recording(real):
+            def close(self):
+                closed.append(1)
+                return super().close()
+
+        monkeypatch.setattr(control_server.socket, "socket", Recording)
+        host = _host(tmp_path, log=_Log(), CONTROL_SOCK=tmp_path / "no-such-dir" / "c.sock")
+        server = control_server.ControlServer(_Assistant(), host)
+        server.start()
+        thread = server._thread
+        assert _eventually(lambda: not thread.is_alive(), timeout=4.0)
+        assert closed, "the half-made listener was leaked"
+        assert host.log.has("error", "control socket unavailable"), host.log.lines
+
+
+class TestWhatTheLoopLeavesBehind:
+    def test_after_the_loop_ends_nothing_is_left_open_or_registered(self, running):
+        log = _Log()
+        server, host, _assistant = running(log=log)
+        listener, thread = server._server, server._thread
+        removed: list[int] = []
+
+        def remove_and_fail():
+            removed.append(1)
+            raise OSError("cannot remove")
+
+        host._remove_stale_control_socket = remove_and_fail
+        server._stop.set()
+        assert _eventually(lambda: not thread.is_alive(), timeout=4.0)
+        assert server._server is None
+        assert listener.fileno() == -1
+        assert removed, "the loop's own cleanup never asked the host to remove the path"
+        assert log.has("exception", "could not remove control socket"), log.lines
+
+    def test_stop_closes_the_listener_it_holds(self, running):
+        server, host, _assistant = running()
+        real = server._server
+        closer = _Closer()
+        server._server = closer
+        server.stop()
+        assert closer.closed == 1, "stop() did not close the listener"
+        assert real.fileno() == -1        # the loop's own cleanup closed the real one
+
+
+class TestThePathStateAndTheRebind:
+    def test_the_identity_of_a_path_is_its_device_and_inode(self, tmp_path):
+        target = tmp_path / "f"
+        target.write_text("x")
+        info = target.lstat()
+        assert control_server.ControlServer._ident_of(target) == (info.st_dev, info.st_ino)
+        assert control_server.ControlServer._ident_of(tmp_path / "absent") is None
+
+    def test_the_state_of_the_path_is_ours_gone_or_foreign(self, running, tmp_path):
+        server, host, _assistant = running()
+        assert server._socket_path_state() == "ours"
+        server._sock_ident = (0, 0)                        # what we bound is not what is there
+        assert server._socket_path_state() == "foreign"
+        server._sock_ident = None                          # nothing recorded: cannot say
+        assert server._socket_path_state() == "ours"
+        host.CONTROL_SOCK = tmp_path / "gone.sock"
+        assert server._socket_path_state() == "gone"
+
+    def test_a_path_that_cannot_be_inspected_is_treated_as_ours(self, running):
+        server, host, _assistant = running()
+
+        class Unreadable:
+            def lstat(self):
+                raise PermissionError("no")
+
+        host.CONTROL_SOCK = Unreadable()
+        assert server._socket_path_state() == "ours"
+
+    def _idle_server(self, tmp_path, **overrides):
+        host = _host(tmp_path, log=_Log(), **overrides)
+        server = control_server.ControlServer(_Assistant(), host)
+        server._bound_path = str(host.CONTROL_SOCK)
+        old = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        return server, host, old
+
+    def test_a_rebind_makes_a_private_listening_socket_and_retires_the_old_one(
+            self, tmp_path):
+        server, host, old = self._idle_server(tmp_path)
+        fresh = server._rebind(old)
+        assert fresh is not None and server._server is fresh
+        assert old.fileno() == -1
+        assert stat.S_IMODE(host.CONTROL_SOCK.stat().st_mode) == 0o600
+        assert fresh.gettimeout() == 1.0
+        assert server._sock_ident == (host.CONTROL_SOCK.lstat().st_dev,
+                                      host.CONTROL_SOCK.lstat().st_ino)
+        assert host.log.has("warning", "re-bound at")
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            with unix_address(host.CONTROL_SOCK) as address:
+                client.connect(address)          # it LISTENS
+        finally:
+            client.close()
+            fresh.close()
+
+    def test_a_rebind_clears_a_stale_relic_first(self, tmp_path):
+        server, host, old = self._idle_server(tmp_path)
+        relic = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        with unix_address(host.CONTROL_SOCK) as address:
+            relic.bind(address)
+        relic.close()
+        fresh = server._rebind(old)
+        assert fresh is not None, "the stale relic blocked the re-bind"
+        fresh.close()
+
+    def test_a_rebind_that_fails_says_so_once_and_keeps_the_old_listener(self, tmp_path):
+        def refuse():
+            raise OSError("foreign owner")
+
+        server, host, old = self._idle_server(tmp_path, _remove_stale_control_socket=refuse)
+        assert server._rebind(old) is None
+        assert server._rebind(old) is None
+        said = [t for lv, t in host.log.lines if "could not be re-bound" in t]
+        assert len(said) == 1 and "foreign owner" in said[0], host.log.lines
+        assert server._orphan_reported is True and old.fileno() >= 0
+        old.close()
+
+    def test_a_rebind_is_refused_during_shutdown_and_for_a_path_never_bound(self, tmp_path):
+        server, host, old = self._idle_server(tmp_path)
+        server._stop.set()
+        assert server._rebind(old) is None and not host.CONTROL_SOCK.exists()
+        server._stop.clear()
+        server._bound_path = None
+        assert server._rebind(old) is None and not host.CONTROL_SOCK.exists()
+        server._bound_path = str(tmp_path / "some-other.sock")
+        assert server._rebind(old) is None and not host.CONTROL_SOCK.exists()
+        old.close()
