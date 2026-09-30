@@ -915,6 +915,27 @@ class TestThePathStateAndTheRebind:
             client.close()
             fresh.close()
 
+    def test_the_rebound_listener_has_the_same_backlog_as_the_first(
+            self, tmp_path, monkeypatch):
+        """A re-bind must not quietly become a different listener: the same
+        backlog the first bind asked for."""
+        calls: list = []
+        server, host, old = self._idle_server(tmp_path)   # made before the swap
+        real = socket.socket
+
+        class Recording(real):
+            def listen(self, backlog=None):
+                calls.append(backlog)
+                return super().listen(backlog)
+
+        monkeypatch.setattr(control_server.socket, "socket", Recording)
+        fresh = server._rebind(old)
+        assert fresh is not None
+        try:
+            assert calls == [4], calls
+        finally:
+            fresh.close()
+
     def test_a_rebind_clears_a_stale_relic_first(self, tmp_path):
         server, host, old = self._idle_server(tmp_path)
         relic = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
